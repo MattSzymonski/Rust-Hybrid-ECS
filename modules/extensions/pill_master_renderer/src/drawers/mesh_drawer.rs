@@ -34,6 +34,7 @@ use crate::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
         MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
     },
+    profiler::Profiler,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
     resources::{
         RendererCamera, RendererMaterialHandle, RendererMeshHandle, RendererResourceStorage,
@@ -317,6 +318,8 @@ impl MeshDrawer {
         render_queue: &[RenderQueueItem],
         ranges: &[Range<u32>],
         viewport: RenderViewport,
+        // Counts the pass's shader invocations, when GPU profiling is on.
+        profiler: Option<&Profiler>,
     ) -> Result<()> {
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -336,6 +339,9 @@ impl MeshDrawer {
         );
         render_pass.set_scissor_rect(viewport.x, viewport.y, viewport.width, viewport.height);
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+        let counting = profiler
+            .and_then(|profiler| profiler.begin_pipeline_statistics_query(&mut render_pass))
+            .is_some();
 
         let mut current_drawing_context = DrawingContext::default();
         // Key of the last item whose state was checked. It carries across
@@ -414,6 +420,9 @@ impl MeshDrawer {
         }
         // Whatever the last range accumulated.
         current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
+        if let (true, Some(profiler)) = (counting, profiler) {
+            profiler.end_pipeline_statistics_query(&mut render_pass);
+        }
 
         // Drop render_pass before returning: the borrow of the encoder has to
         // end here, and the caller finishes the encoder.
