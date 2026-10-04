@@ -295,6 +295,170 @@ mod enabled {
         #[inline]
         pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
     }
+    /// The graphics API a GPU timeline's timestamps come from, for its label
+    /// in Tracy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GpuApi {
+        /// Vulkan.
+        Vulkan,
+        /// Direct3D 12.
+        Direct3D12,
+        /// OpenGL.
+        OpenGL,
+        /// Anything Tracy has no label for.
+        Other,
+    }
+
+    /// A GPU timeline in Tracy: GPU work shown as zones on a track of its
+    /// own, beside the CPU threads.
+    ///
+    /// Every call into Tracy's C API happens in a function of this crate that
+    /// is never inlined, for the reason given on `DirectZone`: those functions
+    /// exist only inside `pill_core.dll`.
+    pub struct GpuTimeline {
+        context: ManuallyDrop<tracy_client::GpuContext>,
+    }
+
+    impl GpuTimeline {
+        /// Creates a timeline whose clock reads `gpu_timestamp` now, in ticks
+        /// of `period_nanoseconds` each. `None` when Tracy is not running, or
+        /// the process has used up Tracy's 255 GPU contexts.
+        #[inline(never)]
+        pub fn new(
+            name: &str,
+            api: GpuApi,
+            gpu_timestamp: i64,
+            period_nanoseconds: f32,
+        ) -> Option<Self> {
+            let context_type = match api {
+                GpuApi::Vulkan => tracy_client::GpuContextType::Vulkan,
+                GpuApi::Direct3D12 => tracy_client::GpuContextType::Direct3D12,
+                GpuApi::OpenGL => tracy_client::GpuContextType::OpenGL,
+                GpuApi::Other => tracy_client::GpuContextType::Invalid,
+            };
+            let context = Client::running()?
+                .new_gpu_context(Some(name), context_type, gpu_timestamp, period_nanoseconds)
+                .ok()?;
+            Some(Self {
+                context: ManuallyDrop::new(context),
+            })
+        }
+
+        /// Opens a GPU zone called `name`, recorded now on the calling thread.
+        /// Its GPU start and end arrive later through
+        /// [`GpuTimelineSpan::upload`]. `None` when Tracy has too many spans
+        /// waiting for their timestamps.
+        #[inline(never)]
+        pub fn begin_span(&self, name: &str, file: &str, line: u32) -> Option<GpuTimelineSpan> {
+            let span = self.context.span_alloc(name, "", file, line).ok()?;
+            Some(GpuTimelineSpan {
+                span: ManuallyDrop::new(span),
+            })
+        }
+    }
+
+    impl Drop for GpuTimeline {
+        #[inline(never)]
+        fn drop(&mut self) {
+            // SAFETY: `context` is dropped exactly once, here, and never used
+            // again: `self` is being dropped.
+            unsafe { ManuallyDrop::drop(&mut self.context) }
+        }
+    }
+
+    /// One GPU zone of a [`GpuTimeline`]: begun and ended as its commands are
+    /// recorded, timed once the GPU's timestamps are read back.
+    ///
+    /// A span dropped before its timestamps are uploaded is placed at the
+    /// timeline's start, out of the way of the real ones.
+    pub struct GpuTimelineSpan {
+        span: ManuallyDrop<tracy_client::GpuSpan>,
+    }
+
+    impl GpuTimelineSpan {
+        /// Marks the end of the zone's commands, recorded now.
+        #[inline(never)]
+        pub fn end(&mut self) {
+            self.span.end_zone();
+        }
+
+        /// Gives the zone the GPU timestamps, in ticks, of its start and end.
+        #[inline(never)]
+        pub fn upload(&self, start_timestamp: i64, end_timestamp: i64) {
+            self.span.upload_timestamp_start(start_timestamp);
+            self.span.upload_timestamp_end(end_timestamp);
+        }
+
+        /// Lets go of the zone without telling Tracy anything, for a zone whose
+        /// timeline the profiler no longer knows: dropping it would send its
+        /// end there.
+        pub fn discard(self) {
+            std::mem::forget(self);
+        }
+    }
+
+    impl Drop for GpuTimelineSpan {
+        #[inline(never)]
+        fn drop(&mut self) {
+            // SAFETY: `span` is dropped exactly once, here, and never used
+            // again: `self` is being dropped.
+            unsafe { ManuallyDrop::drop(&mut self.span) }
+        }
+    }
+
+    /// Whether a Tracy profiler is connected right now.
+    ///
+    /// Tracy runs on demand: until a profiler connects, every event is
+    /// dropped. Anything that sends a one-time setup event, such as a GPU
+    /// timeline's context, has to wait for a connection and send it again
+    /// after a reconnect, or later events refer to something the profiler
+    /// never saw (`tracy-capture` crashes on GPU zones of an unknown context).
+    #[inline(never)]
+    pub fn profiler_connected() -> bool {
+        Client::is_running() && Client::is_connected()
+    }
+
+    /// One geometry pass's pipeline statistics, for [`plot_gpu_statistics`].
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct GpuStatistics {
+        /// Vertex shader invocations.
+        pub vertex_invocations: u64,
+        /// Primitives that entered clipping.
+        pub clipper_invocations: u64,
+        /// Primitives that survived clipping and were rasterized.
+        pub clipper_primitives_out: u64,
+        /// Fragment shader invocations.
+        pub fragment_invocations: u64,
+    }
+
+    /// Adds one frame's pipeline statistics to Tracy's plots.
+    ///
+    /// The plot names are this crate's statics. Tracy reads a plot's name
+    /// through the pointer it is given, long after the call, so a name in a
+    /// DLL the host reloads would leave it reading unmapped memory.
+    #[inline(never)]
+    pub fn plot_gpu_statistics(statistics: GpuStatistics) {
+        let Some(client) = Client::running() else {
+            return;
+        };
+        client.plot(
+            tracy_client::plot_name!("GPU vertex shader invocations"),
+            statistics.vertex_invocations as f64,
+        );
+        client.plot(
+            tracy_client::plot_name!("GPU primitives in"),
+            statistics.clipper_invocations as f64,
+        );
+        client.plot(
+            tracy_client::plot_name!("GPU primitives rasterized"),
+            statistics.clipper_primitives_out as f64,
+        );
+        client.plot(
+            tracy_client::plot_name!("GPU fragment shader invocations"),
+            statistics.fragment_invocations as f64,
+        );
+    }
+
     /// Mark end of a frame for Tracy's frame-time graphs.
     #[inline]
     pub fn frame_mark() {
@@ -472,6 +636,81 @@ mod enabled {
     /// Opaque stand-in for `tracy_client::FrameName` when the crate isn't linked.
     #[doc(hidden)]
     pub struct OpaqueFrameName;
+
+    /// Compile-time stand-in for the graphics API a GPU timeline labels.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum GpuApi {
+        /// Vulkan.
+        Vulkan,
+        /// Direct3D 12.
+        Direct3D12,
+        /// OpenGL.
+        OpenGL,
+        /// Anything else.
+        Other,
+    }
+
+    /// Compile-time no-op GPU timeline: never created without Tracy.
+    pub struct GpuTimeline;
+
+    impl GpuTimeline {
+        /// Compile-time no-op: there is no Tracy to show a timeline in.
+        #[inline(always)]
+        pub fn new(
+            _name: &str,
+            _api: GpuApi,
+            _gpu_timestamp: i64,
+            _period_nanoseconds: f32,
+        ) -> Option<Self> {
+            None
+        }
+
+        /// Compile-time no-op: opens no zone.
+        #[inline(always)]
+        pub fn begin_span(&self, _name: &str, _file: &str, _line: u32) -> Option<GpuTimelineSpan> {
+            None
+        }
+    }
+
+    /// Compile-time no-op GPU zone.
+    pub struct GpuTimelineSpan;
+
+    impl GpuTimelineSpan {
+        /// Compile-time no-op: ends nothing.
+        #[inline(always)]
+        pub fn end(&mut self) {}
+
+        /// Compile-time no-op: uploads nothing.
+        #[inline(always)]
+        pub fn upload(&self, _start_timestamp: i64, _end_timestamp: i64) {}
+
+        /// Compile-time no-op: there is nothing to let go of.
+        #[inline(always)]
+        pub fn discard(self) {}
+    }
+
+    /// One geometry pass's pipeline statistics.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct GpuStatistics {
+        /// Vertex shader invocations.
+        pub vertex_invocations: u64,
+        /// Primitives that entered clipping.
+        pub clipper_invocations: u64,
+        /// Primitives that survived clipping and were rasterized.
+        pub clipper_primitives_out: u64,
+        /// Fragment shader invocations.
+        pub fragment_invocations: u64,
+    }
+
+    /// Compile-time no-op: no profiler can connect without Tracy.
+    #[inline(always)]
+    pub fn profiler_connected() -> bool {
+        false
+    }
+
+    /// Compile-time no-op: there are no plots without Tracy.
+    #[inline(always)]
+    pub fn plot_gpu_statistics(_statistics: GpuStatistics) {}
 
     /// Compile-time no-op: Tracy is never initialized.
     #[inline(always)]

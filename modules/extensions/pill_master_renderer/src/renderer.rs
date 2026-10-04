@@ -55,8 +55,8 @@ use crate::{
     Instance,
 };
 
-/// Frames between two GPU profiler reports. Each report blocks until the
-/// GPU finishes the frame, so it is not done every frame.
+/// Frames between two GPU profiler log reports. Tracy gets every frame;
+/// the log only a sample, so it stays readable.
 const GPU_REPORT_INTERVAL: u32 = 120;
 
 /// Colour every frame starts from, whatever the first pass is.
@@ -366,7 +366,7 @@ impl State {
         })?;
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
-        let gpu_profiler = create_gpu_profiler(&device, &queue);
+        let gpu_profiler = create_gpu_profiler(&device, &queue, surface.backend());
         Ok(Self {
             renderer_resource_storage,
             surface,
@@ -507,7 +507,7 @@ impl State {
                 label: Some("render_encoder"),
             });
         if let Some(profiler) = &mut self.gpu_profiler {
-            profiler.begin_frame();
+            profiler.begin_frame(&self.device, &self.queue);
         }
         // Once for the whole frame: every geometry pass draws from it.
         let upload_zone = pill_core::profile_scope!("renderer: upload instances");
@@ -697,7 +697,7 @@ impl State {
             self.frames_since_gpu_report += 1;
             if self.frames_since_gpu_report >= GPU_REPORT_INTERVAL {
                 self.frames_since_gpu_report = 0;
-                profiler.summarize_all_blocking(&self.device);
+                profiler.log_latest();
             }
         }
         Ok(())
@@ -706,7 +706,11 @@ impl State {
 
 /// The GPU profiler `PILL_GPU_PROFILE` asks for, or `None` when it was not
 /// asked for or the device lacks the features.
-fn create_gpu_profiler(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Profiler> {
+fn create_gpu_profiler(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    backend: wgpu::Backend,
+) -> Option<Profiler> {
     if !crate::profiler::gpu_profiling_requested() {
         return None;
     }
@@ -724,7 +728,7 @@ fn create_gpu_profiler(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Pro
         target: pill_core::telemetry::telemetry_target::RENDERING,
         "GPU profiling on: pass timings every {GPU_REPORT_INTERVAL} frames"
     );
-    Some(Profiler::new(
+    let mut profiler = Profiler::new(
         device,
         queue,
         // A timestamp before and after each pass.
@@ -736,7 +740,16 @@ fn create_gpu_profiler(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Pro
             | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
             | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
             | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
-    ))
+    );
+    // The pass timings also go to Tracy, on a GPU track of their own.
+    let api = match backend {
+        wgpu::Backend::Vulkan => pill_core::profiling::GpuApi::Vulkan,
+        wgpu::Backend::Dx12 => pill_core::profiling::GpuApi::Direct3D12,
+        wgpu::Backend::Gl => pill_core::profiling::GpuApi::OpenGL,
+        _ => pill_core::profiling::GpuApi::Other,
+    };
+    profiler.attach_timeline(api);
+    Some(profiler)
 }
 
 /// Writes a GPU timestamp named `label` between passes, when profiling.

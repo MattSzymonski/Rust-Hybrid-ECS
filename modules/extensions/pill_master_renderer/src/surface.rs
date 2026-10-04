@@ -111,6 +111,8 @@ pub struct Surface {
     /// The sRGB format of the views drawn into, which may differ from the
     /// configured format only by its sRGB-ness; see [`Surface::create`].
     format: wgpu::TextureFormat,
+    /// The graphics API the device runs on, for labelling GPU profiles.
+    backend: wgpu::Backend,
 }
 
 impl Surface {
@@ -182,6 +184,7 @@ impl Surface {
                 detail: error.to_string(),
             })?;
         let info = adapter.get_info();
+        let backend = info.backend;
         info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Using GPU: {} ({:?})", info.name, info.backend);
         let mut wanted = wgpu::Features::DEPTH_CLIP_CONTROL;
         // Only on request: the query features change nothing until used, but a
@@ -256,10 +259,16 @@ impl Surface {
                 surface,
                 configuration,
                 format: render_format,
+                backend,
             },
             device,
             queue,
         ))
+    }
+
+    /// The graphics API the device behind this surface runs on.
+    pub fn backend(&self) -> wgpu::Backend {
+        self.backend
     }
 
     /// The colour format every pipeline rendering to this surface declares,
