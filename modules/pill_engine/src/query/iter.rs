@@ -555,11 +555,35 @@ where
         };
 
         rayon::scope(|scope| {
-            for &(start_idx, count) in &iterator_work_groups {
+            let iterator_work_group_total = iterator_work_groups.len();
+            for (iterator_work_group_index, &(start_idx, count)) in
+                iterator_work_groups.iter().enumerate()
+            {
                 scope.spawn(move |_| {
-                    for &(arch_idx, start, end) in
-                        &iterator_slices_ref[start_idx..start_idx + count]
-                    {
+                    let iterator_work_group_slice =
+                        &iterator_slices_ref[start_idx..start_idx + count];
+                    // One zone per work group, on the thread that runs it, so
+                    // the work shows up on the Rayon workers in Tracy rather
+                    // than only as the caller waiting inside the parallel
+                    // scope. The name is only formatted while a profiler is
+                    // connected.
+                    let _zone = if let Some(sys) = scope_label {
+                        crate::profile_scope!(
+                            "{} group {}/{}",
+                            sys,
+                            iterator_work_group_index + 1,
+                            iterator_work_group_total;
+                            [("{} entities in this group", iterator_work_group_slice.iter().map(|(_, start, end)| end - start).sum::<usize>())]
+                        )
+                    } else {
+                        crate::profile_scope!(
+                            "thread group {}/{}",
+                            iterator_work_group_index + 1,
+                            iterator_work_group_total;
+                            [("{} entities in this group", iterator_work_group_slice.iter().map(|(_, start, end)| end - start).sum::<usize>())]
+                        )
+                    };
+                    for &(arch_idx, start, end) in iterator_work_group_slice {
                         let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
                         for index in start..end {
                             if F::matches(f_state, index) {
