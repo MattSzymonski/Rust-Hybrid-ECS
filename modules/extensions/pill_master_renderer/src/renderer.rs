@@ -48,11 +48,16 @@ use crate::{
     error::{capturing_validation, RendererError, Result},
     frame::{PassTarget, RenderFrame, ResolvedPass},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
+    profiler::Profiler,
     rendering_resources_manager::RenderingResourcesManager,
     resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
     surface::Surface,
     Instance,
 };
+
+/// Frames between two GPU profiler reports. Each report blocks until the
+/// GPU finishes the frame, so it is not done every frame.
+const GPU_REPORT_INTERVAL: u32 = 120;
 
 /// Colour every frame starts from, whatever the first pass is.
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
@@ -319,6 +324,11 @@ pub struct State {
     /// by either would be a lifetime the chain cannot express.
     pub(crate) offscreen: HashMap<String, RendererTexture>,
     mesh_drawer: MeshDrawer,
+    /// GPU timestamps and pipeline statistics, when `PILL_GPU_PROFILE` asked
+    /// for them and the device has the features.
+    gpu_profiler: Option<Profiler>,
+    /// Frames rendered since the GPU profiler last logged its numbers.
+    frames_since_gpu_report: u32,
     /// Layout every camera bind group is built from.
     pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -356,6 +366,7 @@ impl State {
         })?;
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
+        let gpu_profiler = create_gpu_profiler(&device, &queue);
         Ok(Self {
             renderer_resource_storage,
             surface,
@@ -365,6 +376,8 @@ impl State {
             depth_texture,
             offscreen: HashMap::new(),
             mesh_drawer,
+            gpu_profiler,
+            frames_since_gpu_report: 0,
             camera_bind_group_layout,
         })
     }
@@ -493,6 +506,9 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("render_encoder"),
             });
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.begin_frame();
+        }
         // Once for the whole frame: every geometry pass draws from it.
         let upload_zone = pill_core::profile_scope!("renderer: upload instances");
         self.mesh_drawer
@@ -541,6 +557,9 @@ impl State {
                 })
                 .collect();
 
+            // Whether a GPU timestamp was written before the pass, so the one
+            // after it closes a pair.
+            let timed;
             match entry {
                 PassPlan::Geometry {
                     label,
@@ -549,6 +568,7 @@ impl State {
                     pass_index,
                     ..
                 } => {
+                    timed = write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, label);
                     let depth_stencil_attachment = wgpu::RenderPassDepthStencilAttachment {
                         view: &self.depth_texture.texture_view,
                         depth_ops: Some(wgpu::Operations {
@@ -579,6 +599,7 @@ impl State {
                         queue,
                         ranges,
                         viewport,
+                        self.gpu_profiler.as_ref(),
                     )?;
                 }
                 PassPlan::Fullscreen {
@@ -590,6 +611,7 @@ impl State {
                     let Some(PassSlot::Drawable(pass)) = passes.get(*pass_index) else {
                         continue;
                     };
+                    timed = write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, label);
                     // A post-processing step has no depth: it overwrites every
                     // pixel it covers, and the depth left behind describes
                     // geometry that is not what this triangle is. A skybox reads
@@ -648,6 +670,13 @@ impl State {
                     render_pass.draw(0..3, 0..1);
                 }
             }
+            if timed {
+                write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, entry.label());
+            }
+        }
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.resolve_timestamp_queries(&self.device, &mut encoder);
+            profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);
         }
         // The last creation-class failure a frame can hit: wgpu validates a
         // command buffer when it is submitted, and a validation failure would
@@ -660,10 +689,67 @@ impl State {
             detail: format!("frame submission: {detail}"),
         })?;
         drop(queue_submit_zone);
-        let _present_zone = pill_core::profile_scope!("renderer: present");
+        let present_zone = pill_core::profile_scope!("renderer: present");
         surface_frame.present();
+        drop(present_zone);
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.end_frame();
+            self.frames_since_gpu_report += 1;
+            if self.frames_since_gpu_report >= GPU_REPORT_INTERVAL {
+                self.frames_since_gpu_report = 0;
+                profiler.summarize_all_blocking(&self.device);
+            }
+        }
         Ok(())
     }
+}
+
+/// The GPU profiler `PILL_GPU_PROFILE` asks for, or `None` when it was not
+/// asked for or the device lacks the features.
+fn create_gpu_profiler(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Profiler> {
+    if !crate::profiler::gpu_profiling_requested() {
+        return None;
+    }
+    if !device
+        .features()
+        .contains(crate::profiler::GPU_PROFILE_FEATURES)
+    {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "PILL_GPU_PROFILE is set, but this device has no timestamp or pipeline statistics queries"
+        );
+        return None;
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::RENDERING,
+        "GPU profiling on: pass timings every {GPU_REPORT_INTERVAL} frames"
+    );
+    Some(Profiler::new(
+        device,
+        queue,
+        // A timestamp before and after each pass.
+        64,
+        0,
+        // One per geometry pass.
+        8,
+        wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+            | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
+            | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+            | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+    ))
+}
+
+/// Writes a GPU timestamp named `label` between passes, when profiling.
+/// Returns whether one was written.
+fn write_gpu_timestamp(
+    profiler: &mut Option<Profiler>,
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+) -> bool {
+    profiler
+        .as_mut()
+        .and_then(|profiler| profiler.write_timestamp(encoder, label))
+        .is_some()
 }
 
 /// The colour a pass opens its target with, or the values already in it.

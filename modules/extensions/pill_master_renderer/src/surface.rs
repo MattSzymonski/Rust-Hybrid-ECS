@@ -183,7 +183,12 @@ impl Surface {
             })?;
         let info = adapter.get_info();
         info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Using GPU: {} ({:?})", info.name, info.backend);
-        let wanted = wgpu::Features::DEPTH_CLIP_CONTROL;
+        let mut wanted = wgpu::Features::DEPTH_CLIP_CONTROL;
+        // Only on request: the query features change nothing until used, but a
+        // device asks only for what it needs.
+        if crate::profiler::gpu_profiling_requested() {
+            wanted |= crate::profiler::GPU_PROFILE_FEATURES;
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pill renderer device"),

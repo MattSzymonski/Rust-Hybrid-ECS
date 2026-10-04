@@ -20,7 +20,7 @@ use std::cell::Cell;
 use pill_core::telemetry::log_block;
 use pill_core::{info, warn};
 use wgpu::{
-    Adapter, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
+    Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
     PipelineStatisticsTypes, PollType, QuerySet, QuerySetDescriptor, QueryType, Queue,
 };
 
@@ -55,6 +55,21 @@ This module provides GPU-side profiling capabilities using wgpu.
   Not available on the web (needs PIPELINE_STATISTICS_QUERY feature)
 */
 
+/// Environment variable that turns GPU profiling on (`PILL_GPU_PROFILE=1`).
+const GPU_PROFILE_VARIABLE: &str = "PILL_GPU_PROFILE";
+
+/// The device features GPU profiling needs: timestamps written between
+/// passes, and pipeline statistics counted inside them.
+pub(crate) const GPU_PROFILE_FEATURES: Features = Features::TIMESTAMP_QUERY
+    .union(Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    .union(Features::PIPELINE_STATISTICS_QUERY);
+
+/// Whether `PILL_GPU_PROFILE` asks for GPU profiling. Off by default: the
+/// queries cost GPU time, and the periodic readback stalls a frame.
+pub(crate) fn gpu_profiling_requested() -> bool {
+    std::env::var(GPU_PROFILE_VARIABLE).is_ok_and(|value| value != "0" && !value.is_empty())
+}
+
 /// How many frames we pipeline readbacks to avoid stalls.
 /// You can set this to 2-4 depending on your swapchain latency.
 const FRAMES_IN_FLIGHT: usize = 3;
@@ -83,9 +98,9 @@ pub struct Profiler {
     current_pipeline_statistics_query: Cell<u32>,
 
     // Resolve buffers (ring) for readback, one per in-flight frame
-    timestamp_buffers: Vec<Option<Buffer>>,
-    occlusion_buffers: Vec<Option<Buffer>>,
-    pipeline_buffers: Vec<Option<Buffer>>,
+    timestamp_buffers: Vec<Option<ResolveSlot>>,
+    occlusion_buffers: Vec<Option<ResolveSlot>>,
+    pipeline_buffers: Vec<Option<ResolveSlot>>,
 
     // Bytes per query result set
     timestamp_queries_result_bytes: u64,
@@ -100,23 +115,24 @@ pub struct Profiler {
 }
 
 impl Profiler {
-    /// Creates a profiler against `device`, `queue` and `adapter`.
+    /// Creates a profiler against `device` and `queue`.
     ///
     /// The three `max_*` arguments are per-frame caps: a recording past its
     /// cap is refused with a printed notice rather than overwriting an
     /// earlier query of the same kind. Query sets are only created for the
-    /// capabilities the adapter exposes, so on a device without timestamp or
-    /// pipeline statistics support the matching readers always answer `None`.
+    /// features the device was created with (an adapter offering one is not
+    /// enough: the device has to have requested it, see
+    /// [`GPU_PROFILE_FEATURES`]), so on a device without timestamp or pipeline
+    /// statistics support the matching readers always answer `None`.
     pub fn new(
         device: &Device,
         queue: &Queue,
-        adapter: &Adapter,
         max_timestamp_queries: u32, // Number of timestamp writes planned to record per frame (start/end of sections)
         max_occlusion_queries: u32, // Number of occlusion queries per frame
         max_pipeline_statistics_queries: u32, // Number of pipeline statistics queries per frame
         pipeline_statistics_types: PipelineStatisticsTypes, // Type of pipeline statistics to collect
     ) -> Self {
-        let features = adapter.features();
+        let features = device.features();
         // `write_timestamp` on an encoder is what this profiler calls, so the
         // inside-encoders bit is required, not just the query feature.
         let has_timestamps = features
@@ -271,14 +287,18 @@ impl Profiler {
 
             let index = self.frame_index;
             let slot = &mut self.timestamp_buffers[index];
-            let buffer = ensure_buffer_slot(
+            let buffers = ensure_buffer_slot(
                 device,
                 slot,
                 byte_len,
                 "gpu_profiler.timestamp_queries.resolve",
             );
 
-            encoder.resolve_query_set(query_set, 0..count, buffer, 0);
+            encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
+
+            // Resolved results are not mappable; copied into the buffer that is.
+
+            encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
     }
 
@@ -287,7 +307,7 @@ impl Profiler {
     /// convert them to milliseconds with [`Self::timestamp_ticks_to_ms`].
     pub fn read_timestamp_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = self.timestamp_buffers[index].as_ref()?;
+        let buffer = &self.timestamp_buffers[index].as_ref()?.readback;
         let slice = buffer.slice(..);
 
         // Map and wait. The callback's result is checked because
@@ -389,14 +409,18 @@ impl Profiler {
 
             let index = self.frame_index;
             let slot = &mut self.occlusion_buffers[index];
-            let buffer = ensure_buffer_slot(
+            let buffers = ensure_buffer_slot(
                 device,
                 slot,
                 byte_len,
                 "gpu_profiler.occlusion_queries.resolve",
             );
 
-            encoder.resolve_query_set(query_set, 0..count, buffer, 0);
+            encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
+
+            // Resolved results are not mappable; copied into the buffer that is.
+
+            encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
     }
 
@@ -408,7 +432,7 @@ impl Profiler {
     /// the query's region drew no visible fragments.
     pub fn read_occlusion_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = self.occlusion_buffers[index].as_ref()?;
+        let buffer = &self.occlusion_buffers[index].as_ref()?.readback;
         let slice = buffer.slice(..);
 
         // Map and wait; see the timestamp reader for why the result is checked.
@@ -590,14 +614,18 @@ impl Profiler {
 
             let index = self.frame_index;
             let slot = &mut self.pipeline_buffers[index];
-            let buffer = ensure_buffer_slot(
+            let buffers = ensure_buffer_slot(
                 device,
                 slot,
                 byte_len,
                 "gpu_profiler.pipeline_statistics_queries.resolve",
             );
 
-            encoder.resolve_query_set(query_set, 0..count, buffer, 0);
+            encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
+
+            // Resolved results are not mappable; copied into the buffer that is.
+
+            encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
     }
 
@@ -609,7 +637,7 @@ impl Profiler {
     /// [`Self::summarize_pipeline_statistics_queries`] expects.
     pub fn read_pipeline_statistics_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = self.pipeline_buffers[index].as_ref()?;
+        let buffer = &self.pipeline_buffers[index].as_ref()?.readback;
         let slice = buffer.slice(..);
 
         // Map and wait; see the timestamp reader for why the result is checked.
@@ -653,8 +681,16 @@ impl Profiler {
     }
 }
 
-/// Returns the ring slot's buffer, creating or replacing it when it cannot
-/// already hold `size` bytes.
+/// One ring slot's buffers: queries resolve into `resolve`, which is copied
+/// into `readback` for the CPU to map. wgpu only lets a mappable buffer be a
+/// copy destination, so a query cannot resolve straight into one.
+struct ResolveSlot {
+    resolve: Buffer,
+    readback: Buffer,
+}
+
+/// Returns the ring slot's buffers, creating or replacing them when they
+/// cannot already hold `size` bytes.
 ///
 /// A slot only ever grows: once a frame with many queries has asked for a
 /// large buffer, later smaller frames reuse that allocation instead of
@@ -662,18 +698,27 @@ impl Profiler {
 #[inline]
 fn ensure_buffer_slot<'a>(
     device: &wgpu::Device,
-    slot: &'a mut Option<wgpu::Buffer>,
+    slot: &'a mut Option<ResolveSlot>,
     size: u64,
     label: &str,
-) -> &'a wgpu::Buffer {
-    let need_new = slot.as_ref().map(|b| b.size() < size).unwrap_or(true);
+) -> &'a ResolveSlot {
+    let need_new = slot
+        .as_ref()
+        .map(|buffers| buffers.resolve.size() < size)
+        .unwrap_or(true);
     if need_new {
-        *slot = Some(device.create_buffer(&BufferDescriptor {
-            label: Some(label),
-            size,
-            usage: BufferUsages::COPY_SRC | BufferUsages::MAP_READ | BufferUsages::QUERY_RESOLVE,
-            mapped_at_creation: false,
-        }));
+        let buffer = |usage: BufferUsages| {
+            device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        *slot = Some(ResolveSlot {
+            resolve: buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC),
+            readback: buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST),
+        });
     }
     slot.as_ref().unwrap()
 }
