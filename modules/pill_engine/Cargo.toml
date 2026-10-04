@@ -53,6 +53,9 @@ profiling = [
 ]
 # Investigative fine-grained zones (`profile_scope_fine!` -> profile::fine).
 profiling-fine = ["profiling", "pill_core/profiling-fine"]
+# Tracy's memory view through a profiled global allocator. Only links into a
+# single-image build, see `ALLOC` in `src/lib.rs`.
+profiling-memory = ["profiling"]
 # Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
 profiling-minimal = [
     "dep:tracy-client",

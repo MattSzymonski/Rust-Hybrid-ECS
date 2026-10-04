@@ -216,8 +216,10 @@ impl PillRenderer for Renderer {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
+        let sync_zone = pill_core::profile_scope!("renderer: sync assets");
         self.rendering_resources_manager
             .sync(assets_manager, &mut self.state);
+        drop(sync_zone);
         self.pipeline.ensure(
             &frame.passes,
             assets_manager,
@@ -225,9 +227,11 @@ impl PillRenderer for Renderer {
             self.rendering_resources_manager
                 .chain_context(&mut self.state),
         );
+        let queue_zone = pill_core::profile_scope!("renderer: build queue");
         let render_queue = self
             .rendering_resources_manager
             .build_queue(frame, &self.state);
+        drop(queue_zone);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
@@ -237,6 +241,7 @@ impl PillRenderer for Renderer {
         // An empty chain is a game that asked for nothing, not a game that
         // asked for the built-in pass: the frame's writer puts that pass in the
         // chain itself.
+        let plan_zone = pill_core::profile_scope!("renderer: plan");
         let plan = self.pipeline.plan(
             &frame.passes,
             &render_queue,
@@ -246,7 +251,10 @@ impl PillRenderer for Renderer {
         self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
         self.metrics.passes = plan.len() as u32;
 
+        drop(plan_zone);
+
         let submitted = Instant::now();
+        let _submit_zone = pill_core::profile_scope!("renderer: submit");
         self.state.render(
             self.camera,
             &plan,

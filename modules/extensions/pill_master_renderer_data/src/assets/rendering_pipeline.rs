@@ -49,13 +49,25 @@ impl RenderingPipeline {
     }
 }
 
+/// The pinned shared name of [`RenderingPipeline`]; see the comment on its `Asset` impl.
+const RENDERING_PIPELINE_SHARED_NAME: &str = "pill_master_renderer::assets::RenderingPipeline";
+
 // Shared across binaries: the data module, the GPU module and every project
 // compile their own copy of this crate, each with its own `TypeId`. The pinned
 // name makes them one asset column (see `Asset::shared_name`); keep it
 // verbatim when moving the type.
 impl Asset for RenderingPipeline {
     fn shared_name() -> Option<&'static str> {
-        Some("pill_master_renderer::assets::RenderingPipeline")
+        Some(RENDERING_PIPELINE_SHARED_NAME)
+    }
+
+    fn shared_identity() -> Option<u128> {
+        // A `const`, so the name is hashed at compile time. The default hashes
+        // it on every call, and every `AssetManager` lookup makes that call:
+        // the renderer does it several times per drawn entity, every frame.
+        const IDENTITY: u128 =
+            pill_engine::component::shared_component_identity(RENDERING_PIPELINE_SHARED_NAME);
+        Some(IDENTITY)
     }
 }
 

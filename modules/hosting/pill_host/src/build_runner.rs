@@ -100,6 +100,17 @@ const HOST_MODULE_FEATURE_SET: &str =
         (false, false) => "no-rendering",
     };
 
+/// The host's profiling level, part of [`host_build_identity`] for the same
+/// reason as [`HOST_MODULE_FEATURE_SET`]: [`apply_cargo_host_overrides`]
+/// selects the anchor with it, which changes `pill_core`'s resolved features.
+const HOST_PROFILING_FEATURE_SET: &str = if cfg!(feature = "profiling-fine") {
+    "profiling-fine"
+} else if cfg!(feature = "profiling") {
+    "profiling"
+} else {
+    "no-profiling"
+};
+
 /// Host build identity: toolchain, feature set, cargo profile, target, and the
 /// environment every spawned build runs with.
 ///
@@ -126,7 +137,7 @@ fn host_build_identity() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{HOST_MODULE_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nanchor={:?}\nspawned_env={spawned_environment}",
+        "{HOST_MODULE_FEATURE_SET}\n{HOST_PROFILING_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nanchor={:?}\nspawned_env={spawned_environment}",
         crate::config::host_profile_name(),
         crate::config::host_target_triple().unwrap_or("native"),
         crate::config::MODULE_BUILD_TARGET_DIRECTORY,
@@ -407,6 +418,16 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         // graph belongs here for the same reason.
         if cfg!(feature = "rendering") {
             command.arg("--features").arg(format!("{anchor}/rendering"));
+        }
+        // Profiling turns on `pill_core`'s Tracy dependencies, which changes
+        // its metadata hash exactly as `rendering` does, so a profiling host
+        // could not load a single module built without it.
+        if cfg!(feature = "profiling-fine") {
+            command
+                .arg("--features")
+                .arg(format!("{anchor}/profiling-fine"));
+        } else if cfg!(feature = "profiling") {
+            command.arg("--features").arg(format!("{anchor}/profiling"));
         }
     }
     // Mirror the host's own `--target` when a launcher (the dioxus CLI) built
