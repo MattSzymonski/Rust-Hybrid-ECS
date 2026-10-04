@@ -32,8 +32,8 @@
 
 // Standard library
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
+    ops::Range,
 };
 
 // External crates
@@ -73,11 +73,15 @@ pub(crate) enum PassSlot {
 pub(crate) enum PassPlan<'a> {
     /// Instances, batched by material, into the pass's targets.
     ///
-    /// Borrowed when the pass takes the whole queue, which is the built-in
-    /// chain's shape; only a shader-filtered pass pays for a collection.
+    /// The pass draws the queue items in `ranges`: positions in the frame's
+    /// sorted queue, which are also the instances' positions in the instance
+    /// buffer. A pass that takes the whole queue, the built-in chain's shape,
+    /// is one range; a shader-filtered pass is one range per run of its
+    /// shader. Nothing is copied either way.
     Geometry {
         label: &'a str,
-        items: Cow<'a, [RenderQueueItem]>,
+        queue: &'a [RenderQueueItem],
+        ranges: Vec<Range<u32>>,
         outputs: Vec<PassOutput<'a>>,
         clear: bool,
         /// The pass's own pipeline, when it built one. `None` leaves each
@@ -119,11 +123,14 @@ impl PassPlan<'_> {
         }
     }
 
-    /// How many draws this pass records: one per instance batch, or the single
-    /// triangle a fullscreen pass is.
+    /// How many instances this pass draws, or the single triangle a
+    /// fullscreen pass is.
     pub(crate) fn draws(&self) -> usize {
         match self {
-            PassPlan::Geometry { items, .. } => items.len(),
+            PassPlan::Geometry { ranges, .. } => ranges
+                .iter()
+                .map(|range| (range.end - range.start) as usize)
+                .sum(),
             PassPlan::Fullscreen { .. } => 1,
         }
     }
@@ -305,33 +312,20 @@ impl ScriptableRenderingPipeline {
                         continue;
                     }
 
-                    let items: Cow<'a, [RenderQueueItem]> = match pass.shader {
+                    let ranges = match pass.shader {
                         // The pass draws the instances shaded by the shader it
                         // names, when that shader is still loaded. One that no
                         // longer is draws nothing: falling back to the default
                         // shader would hand this pass instances another pass
                         // already took.
                         Some(key) => match shader_handles.get(&key) {
-                            Some(handle) => {
-                                let index = handle.data().index as u8;
-                                Cow::Owned(
-                                    render_queue
-                                        .iter()
-                                        .copied()
-                                        .filter(|item| {
-                                            decompose_render_queue_key(item.key).shader_index
-                                                == index
-                                        })
-                                        .collect::<Vec<_>>(),
-                                )
-                            }
-                            None => Cow::Borrowed(&[] as &[RenderQueueItem]),
+                            Some(handle) => shader_ranges(render_queue, handle.data().index as u8),
+                            None => Vec::new(),
                         },
                         // No shader named: the pass draws every instance, each
                         // with the pipeline its own material names. This is the
-                        // built-in chain, and it borrows the queue rather than
-                        // copying it.
-                        None => Cow::Borrowed(render_queue),
+                        // built-in chain.
+                        None => whole_queue(render_queue),
                     };
                     let pass_index = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => Some(index),
@@ -339,7 +333,8 @@ impl ScriptableRenderingPipeline {
                     };
                     plan.push(PassPlan::Geometry {
                         label: pass.name.as_str(),
-                        items,
+                        queue: render_queue,
+                        ranges,
                         outputs,
                         clear: plan.is_empty(),
                         pass_index,
@@ -370,7 +365,8 @@ impl ScriptableRenderingPipeline {
         if plan.is_empty() {
             plan.push(PassPlan::Geometry {
                 label: "frame.clear",
-                items: Cow::default(),
+                queue: render_queue,
+                ranges: Vec::new(),
                 outputs: vec![PassOutput::Surface],
                 clear: true,
                 pass_index: None,
@@ -545,6 +541,35 @@ fn build_pass(
 /// slot order so a `HashMap`'s arbitrary order cannot make an unchanged chain
 /// look new - plus the resource epoch, which moves whenever a shader or texture
 /// the bind groups reference was recreated.
+/// The whole queue as one range, or none when the queue is empty.
+fn whole_queue(render_queue: &[RenderQueueItem]) -> Vec<Range<u32>> {
+    if render_queue.is_empty() {
+        Vec::new()
+    } else {
+        std::iter::once(0..render_queue.len() as u32).collect()
+    }
+}
+
+/// The runs of the queue drawn by the shader in slot `shader_index`.
+///
+/// The queue is sorted by draw order first and shader second, so one shader's
+/// items are one run per draw order they appear in: usually a single run.
+fn shader_ranges(render_queue: &[RenderQueueItem], shader_index: u8) -> Vec<Range<u32>> {
+    let mut ranges: Vec<Range<u32>> = Vec::new();
+    for (position, item) in render_queue.iter().enumerate() {
+        if decompose_render_queue_key(item.key).shader_index != shader_index {
+            continue;
+        }
+        let position = position as u32;
+        match ranges.last_mut() {
+            // Adjacent to the run before it: extend that run.
+            Some(run) if run.end == position => run.end += 1,
+            _ => ranges.push(position..position + 1),
+        }
+    }
+    ranges
+}
+
 fn chain_signature(chain: &[ResolvedPass], resource_epoch: u64) -> String {
     let mut signature = format!("e{resource_epoch}");
     for pass in chain {
@@ -702,16 +727,43 @@ mod tests {
         assert_eq!(plan.len(), 1);
         match &plan[0] {
             PassPlan::Geometry {
-                items, pass_index, ..
+                ranges, pass_index, ..
             } => {
-                // Borrowed, not copied: the built-in chain pays for nothing.
-                assert_eq!(items.len(), 2);
-                assert!(matches!(items, Cow::Borrowed(_)));
+                // The whole queue as one range: nothing is copied.
+                assert_eq!(ranges.len(), 1);
+                assert_eq!(ranges[0], 0..2);
                 // No pass pipeline of its own: each instance draws through the
                 // pipeline its material names.
                 assert!(pass_index.is_none());
             }
             PassPlan::Fullscreen { .. } => panic!("a geometry pass planned as fullscreen"),
         }
+    }
+
+    /// A queue item drawn by the shader in slot `shader_index`; only the
+    /// shader byte of the key matters to the ranges.
+    fn item_of_shader(shader_index: u8) -> RenderQueueItem {
+        RenderQueueItem {
+            key: u64::from(shader_index) << 48,
+            entity_index: 0,
+        }
+    }
+
+    #[test]
+    fn a_shader_draws_each_run_of_its_items_and_nothing_else() {
+        // Shader 2's items in two runs, as two draw orders would leave them.
+        let queue = [1, 2, 2, 3, 2, 2, 2, 1].map(item_of_shader);
+
+        assert_eq!(shader_ranges(&queue, 2), vec![1..3, 4..7]);
+        assert_eq!(shader_ranges(&queue, 1), vec![0..1, 7..8]);
+        assert_eq!(shader_ranges(&queue, 9), Vec::<Range<u32>>::new());
+    }
+
+    #[test]
+    fn an_empty_queue_draws_no_range() {
+        assert!(whole_queue(&[]).is_empty());
+        let ranges = whole_queue(&[item_of_shader(0)]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..1);
     }
 }

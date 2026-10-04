@@ -13,9 +13,11 @@ struct VertexInput
     [[vk::location(2)]] float3 vertex_normal         : NORMAL;
     [[vk::location(3)]] float3 vertex_tangent        : TANGENT;
     [[vk::location(4)]] float3 vertex_bitangent      : BINORMAL;
-    [[vk::location(5)]] float3 transform_position    : TEXCOORD1;
-    [[vk::location(6)]] float3 transform_rotation    : TEXCOORD2;
-    [[vk::location(7)]] float3 transform_scale       : TEXCOORD3;
+    // The instance's model matrix, as the top three rows of the affine
+    // world-from-model transform (the fourth row is always 0, 0, 0, 1).
+    [[vk::location(5)]] float4 model_row_0           : TEXCOORD1;
+    [[vk::location(6)]] float4 model_row_1           : TEXCOORD2;
+    [[vk::location(7)]] float4 model_row_2           : TEXCOORD3;
 };
 
 struct VertexOutput
@@ -63,62 +65,15 @@ float3x3 inverse_mat3(float3x3 m)
     return inv;
 }
 
-float4x4 compute_model_matrix(float3 position, float3 rotation, float3 scale)
-{
-    float4x4 scale_matrix = float4x4(
-        scale.x, 0,       0,       0,
-        0,       scale.y, 0,       0,
-        0,       0,       scale.z, 0,
-        0,       0,       0,       1
-    );
-
-    float cx = cos(rotation.x); float sx = sin(rotation.x);
-    float cy = cos(rotation.y); float sy = sin(rotation.y);
-    float cz = cos(rotation.z); float sz = sin(rotation.z);
-
-    // X-axis rotation (rotates +Y → +Z).
-    float4x4 rot_x = float4x4(
-        1, 0,    0,  0,
-        0, cx,   sx, 0,
-        0, -sx,  cx, 0,
-        0, 0,    0,  1
-    );
-
-    // Y-axis rotation (rotates +Z → +X).
-    float4x4 rot_y = float4x4(
-        cy,  0, -sy, 0,
-        0,   1, 0,   0,
-        sy,  0, cy,  0,
-        0,   0, 0,   1
-    );
-
-    // Z-axis rotation (rotates +X → +Y).
-    float4x4 rot_z = float4x4(
-        cz,  sz, 0, 0,
-        -sz, cz, 0, 0,
-        0,   0,  1, 0,
-        0,   0,  0, 1
-    );
-
-    float4x4 rotation_matrix = mul(rot_z, mul(rot_y, rot_x));
-
-    float4x4 translation_matrix = float4x4(
-        1, 0, 0, position.x,
-        0, 1, 0, position.y,
-        0, 0, 1, position.z,
-        0, 0, 0, 1
-    );
-
-    return mul(translation_matrix, mul(rotation_matrix, scale_matrix));
-}
-
 [shader("vertex")]
 VertexOutput vs_main(VertexInput input)
 {
-    float4x4 model_matrix = compute_model_matrix(
-        input.transform_position,
-        input.transform_rotation,
-        input.transform_scale
+    // Built once per instance on the CPU, so a vertex only assembles it.
+    float4x4 model_matrix = float4x4(
+        input.model_row_0,
+        input.model_row_1,
+        input.model_row_2,
+        float4(0.0, 0.0, 0.0, 1.0)
     );
 
     float3x3 model3x3 = (float3x3)model_matrix;

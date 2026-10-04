@@ -5,20 +5,20 @@
 //! - Track the shader, material, and mesh the bound GPU resources belong to,
 //!   flushing the accumulated instances when any of them changes
 //!   ([`DrawingContext`]).
-//! - Own the instance buffer, keep it large enough for a frame's batches, and
-//!   give each batch its own region of it ([`MeshDrawer`]).
-//! - Open the frame's render pass and record every draw the sorted queue
-//!   implies inside it ([`MeshDrawer::record_draw_commands`]).
+//! - Own the instance buffer, keep it large enough for a frame's instances,
+//!   and upload them once per frame ([`MeshDrawer::upload_instances`]).
+//! - Open a pass's render pass and record every draw its queue ranges imply
+//!   inside it ([`MeshDrawer::record_draw_commands`]).
 //!
 //! # Design
 //!
 //! The queue arrives sorted by its packed key - draw order first, then shader,
 //! material, and mesh - so items that agree on all three state handles are
 //! drawn as one instanced call, and draws are recorded only where the state
-//! changes or a batch ends. The instance data itself lives in one growable
-//! buffer: the staging vector and the buffer are reused frame after frame, and
-//! each batch writes its own region because every `write_buffer` of a frame
-//! lands before the command buffer runs.
+//! changes or a range ends. The frame's instances are uploaded once, in queue
+//! order, into one growable buffer, so a queue position is also an instance
+//! index: every pass draws straight from that upload, and nothing is copied
+//! or written per pass.
 
 // Standard library
 use std::{num::NonZeroU32, ops::Range};
@@ -32,10 +32,8 @@ use crate::{
     components::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-        INITIAL_INSTANCE_VECTOR_CAPACITY, MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-        MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
+        MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
     },
-    frame::RenderInstance,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
     resources::{
         RendererCamera, RendererMaterialHandle, RendererMeshHandle, RendererResourceStorage,
@@ -62,26 +60,20 @@ pub struct DrawingContext {
 
     accumulated_instance_range: Range<u32>,
     accumulated_instance_count: u32,
-
-    instance_batch_number: u32,
-    instance_batch_size: u32,
 }
 
 impl DrawingContext {
     /// Emits the telemetry line describing the draw just recorded.
     ///
-    /// Reports the batch number, the instance range, and the shader, material,
-    /// and mesh names, which is what makes a mis-batched frame traceable from
-    /// the log alone.
+    /// Reports the instance range and the shader, material, and mesh names,
+    /// which is what makes a mis-batched frame traceable from the log alone.
     pub fn log(&self) {
         debug!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
-            "Draw {} instance(s) {}->{}/{} command recorded [Batch: {}, Shader: {}, Material: {}, Mesh: {}]",
+            "Draw {} instance(s) {}->{} command recorded [Shader: {}, Material: {}, Mesh: {}]",
             self.accumulated_instance_count,
             self.accumulated_instance_range.start,
             self.accumulated_instance_range.end - 1,
-            self.instance_batch_size,
-            self.instance_batch_number,
             self.shader_name.name_style(),
             self.material_name.name_style(),
             self.mesh_name.name_style()
@@ -92,8 +84,8 @@ impl DrawingContext {
     /// draw, if there are any, then empties the range.
     ///
     /// It runs wherever the accumulated instances stop sharing the bound
-    /// state: before a shader, material, or mesh switch, and at the end of a
-    /// batch.
+    /// state: before a shader, material, or mesh switch, before a range of
+    /// instances that does not follow on, and at the end of the pass.
     pub fn record_draw_accumulated_instances(&mut self, render_pass: &mut wgpu::RenderPass) {
         if self.accumulated_instance_count > 0 {
             render_pass.draw_indexed(
@@ -112,12 +104,20 @@ impl DrawingContext {
     /// covers.
     ///
     /// One call per queue item, so the range grows instance by instance until
-    /// a state change or the end of the batch records it.
+    /// a state change or the end of the run records it.
     pub fn accumulate_instance(&mut self) {
         self.accumulated_instance_range =
             self.accumulated_instance_range.start..self.accumulated_instance_range.end + 1;
         self.accumulated_instance_count =
             self.accumulated_instance_range.end - self.accumulated_instance_range.start;
+    }
+
+    /// Draws what is accumulated, then starts accumulating at instance
+    /// `position`: the first instance of a range that need not follow on from
+    /// the one before it.
+    pub fn start_run(&mut self, render_pass: &mut wgpu::RenderPass, position: u32) {
+        self.record_draw_accumulated_instances(render_pass);
+        self.accumulated_instance_range = position..position;
     }
 
     /// Binds the pipeline and bind groups the given shader draws through.
@@ -234,51 +234,24 @@ impl DrawingContext {
 
 /// Owns the instance buffer and records a frame's mesh draws through it.
 ///
-/// One drawer lives for the renderer's lifetime: the staging vector and the
-/// buffer are reused every frame, and grow only when a frame brings more
-/// instances than the buffer holds.
+/// One drawer lives for the renderer's lifetime. The buffer is reused every
+/// frame and grows only when a frame brings more instances than it holds.
 pub struct MeshDrawer {
-    max_instance_batch_size: u32,
-    instances: Vec<Instance>,
+    /// How many instances the buffer grows by at a time.
+    capacity_step: usize,
     instance_buffer: wgpu::Buffer,
     /// How many instances the buffer has room for.
     instance_capacity: usize,
 }
 
-/// The region of the instance buffer one batch owns.
-///
-/// Every batch gets its own slice rather than sharing the front of the buffer:
-/// the writes and the draws they feed are recorded into one command buffer, so a
-/// shared region would leave every draw reading whichever batch was written
-/// last. `max_batch_size` - never the trailing chunk's own length - is what
-/// puts each region at a whole-batch offset, which also keeps it four-byte
-/// aligned the way `write_buffer` requires; `instance_count` is how many
-/// instances that batch actually holds.
-fn batch_region(
-    batch_index: usize,
-    max_batch_size: usize,
-    instance_count: usize,
-) -> std::ops::Range<u64> {
-    let stride = size_of::<Instance>();
-    let start = (batch_index * max_batch_size * stride) as u64;
-    start..start + (instance_count * stride) as u64
-}
-
 impl MeshDrawer {
-    /// Creates a drawer whose instance buffer has room for one full batch.
-    ///
-    /// `max_instance_batch_size` is both the batch chunk size and the initial
-    /// buffer capacity, so a frame no larger than one batch needs no
-    /// reallocation; larger frames grow the buffer in whole batches.
-    pub fn new(device: &wgpu::Device, max_instance_batch_size: u32) -> Self {
-        let capacity = max_instance_batch_size as usize;
-        let instance_buffer = Self::allocate(device, capacity);
-
+    /// Creates a drawer whose instance buffer has room for `capacity_step`
+    /// instances, and grows in steps of that many.
+    pub fn new(device: &wgpu::Device, capacity_step: usize) -> Self {
         MeshDrawer {
-            max_instance_batch_size,
-            instances: Vec::<Instance>::with_capacity(INITIAL_INSTANCE_VECTOR_CAPACITY),
-            instance_buffer,
-            instance_capacity: capacity,
+            capacity_step,
+            instance_buffer: Self::allocate(device, capacity_step),
+            instance_capacity: capacity_step,
         }
     }
 
@@ -291,29 +264,38 @@ impl MeshDrawer {
         })
     }
 
-    /// Make room for a frame's instances, one region per batch.
+    /// Uploads the frame's instances, in queue order, in one write.
     ///
-    /// The capacity grows in whole batches, so a frame that is one instance over
-    /// the limit reallocates once rather than on every frame after it.
-    fn ensure_capacity(&mut self, device: &wgpu::Device, instances: usize) {
-        if instances <= self.instance_capacity {
-            return;
+    /// Called once per frame before any pass records: every geometry pass
+    /// draws from this one upload, addressing instances by queue position.
+    /// Writes and the draws they feed land in one command buffer and every
+    /// write runs first, so a buffer written per pass would leave all passes
+    /// reading whichever pass wrote last.
+    pub fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        instances: &[Instance],
+    ) {
+        if instances.len() > self.instance_capacity {
+            // Grown in whole steps, so a frame one instance over the limit
+            // reallocates once rather than on every frame after it.
+            let capacity = instances.len().div_ceil(self.capacity_step) * self.capacity_step;
+            self.instance_buffer = Self::allocate(device, capacity);
+            self.instance_capacity = capacity;
         }
-
-        let batch_size = self.max_instance_batch_size as usize;
-        let capacity = instances.div_ceil(batch_size) * batch_size;
-        self.instance_buffer = Self::allocate(device, capacity);
-        self.instance_capacity = capacity;
+        if !instances.is_empty() {
+            queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        }
     }
 
-    /// Opens a render pass on `encoder` and records every draw the sorted
-    /// queue implies, then drops the pass before returning.
+    /// Opens a render pass on `encoder` and records the draws for the queue
+    /// positions in `ranges`, then drops the pass before returning.
     ///
-    /// Uploads and draws run in batches of `max_instance_batch_size`, each
-    /// batch through its own region of the instance buffer, so one buffer
-    /// write covers at most one batch's instances. Drawn state carries across
-    /// batch boundaries: a shader, material, or mesh shared by two adjacent
-    /// batches is not rebound just because the batch ended.
+    /// The instances were uploaded by [`MeshDrawer::upload_instances`] in queue
+    /// order, so a queue position is also the instance's index in the bound
+    /// buffer and nothing is copied here. Consecutive items that share their
+    /// shader, material and mesh become one instanced draw.
     ///
     /// # Errors
     ///
@@ -324,8 +306,6 @@ impl MeshDrawer {
     pub fn record_draw_commands(
         &mut self,
         // Resources
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         renderer_resource_storage: &RendererResourceStorage,
         label: &str,
@@ -335,7 +315,7 @@ impl MeshDrawer {
         // Rendering data
         camera: &RendererCamera,
         render_queue: &[RenderQueueItem],
-        instances: &[RenderInstance],
+        ranges: &[Range<u32>],
         viewport: RenderViewport,
     ) -> Result<()> {
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -355,54 +335,20 @@ impl MeshDrawer {
             1.0,
         );
         render_pass.set_scissor_rect(viewport.x, viewport.y, viewport.width, viewport.height);
+        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
 
         let mut current_drawing_context = DrawingContext::default();
         // Key of the last item whose state was checked. It carries across
-        // batches, like the bound state it stands for.
+        // ranges, like the bound state it stands for.
         let mut previous_key: Option<u64> = None;
 
-        self.ensure_capacity(device, render_queue.len());
-        let batch_size = self.max_instance_batch_size as usize;
+        for range in ranges {
+            // A range starts a new run of instance indices: whatever the
+            // previous range accumulated is drawn first.
+            current_drawing_context.start_run(&mut render_pass, range.start);
+            let items = &render_queue[range.start as usize..range.end as usize];
 
-        for (i, instance_batch) in render_queue.chunks(batch_size).enumerate() {
-            // The chunk's own length, kept apart from `batch_size`: regions are
-            // laid out in whole batches, and letting this shadow the configured
-            // size made a partial trailing batch overwrite an earlier one.
-            let instance_count = instance_batch.len();
-            current_drawing_context.instance_batch_number = i as u32;
-            current_drawing_context.instance_batch_size = instance_count as u32;
-
-            // Prepare instance data and load it to buffer
-            let instances_zone = pill_core::profile_scope!(
-                "mesh drawer: build instances",
-                [("{} instances", instance_count)]
-            );
-            self.instances.clear();
-            self.instances.reserve(instance_batch.len()); // Pre-allocate exact capacity
-
-            for render_queue_item in instance_batch {
-                let transform_component =
-                    &instances[render_queue_item.entity_index as usize].transform;
-                //println!("Creating new instance with transform component: {:?} {:?}", i, transform_component.position);
-                self.instances.push(Instance::new(transform_component));
-            }
-
-            let region = batch_region(i, batch_size, instance_count);
-            queue.write_buffer(
-                &self.instance_buffer,
-                region.start,
-                bytemuck::cast_slice(&self.instances),
-            ); // Update this batch's region of the instance buffer
-
-            drop(instances_zone);
-            let _record_zone = pill_core::profile_scope!("mesh drawer: record draws");
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(region)); // Set instance buffer
-
-            // Reset instance range for each batch
-            current_drawing_context.accumulated_instance_range = 0..0;
-            current_drawing_context.accumulated_instance_count = 0;
-
-            for (j, render_queue_item) in instance_batch.iter().enumerate() {
+            for render_queue_item in items {
                 // The key packs every handle the draw binds, so an item whose
                 // key equals the one before it needs nothing rebound: it only
                 // extends the current draw. The queue is sorted by key, so
@@ -410,9 +356,6 @@ impl MeshDrawer {
                 // rebuilding three handles for each was most of this loop.
                 if previous_key == Some(render_queue_item.key) {
                     current_drawing_context.accumulate_instance();
-                    if j == instance_count - 1 {
-                        current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
-                    }
                     continue;
                 }
                 previous_key = Some(render_queue_item.key);
@@ -467,65 +410,15 @@ impl MeshDrawer {
 
                 // Add new instance
                 current_drawing_context.accumulate_instance();
-
-                // If last in batch, draw accumulated instances
-                if j == instance_count - 1 {
-                    current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
-                }
             }
         }
+        // Whatever the last range accumulated.
+        current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
 
         // Drop render_pass before returning: the borrow of the encoder has to
         // end here, and the caller finishes the encoder.
         drop(render_pass);
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_batch_owns_a_region_of_its_own() {
-        let stride = size_of::<Instance>() as u64;
-
-        let first = batch_region(0, 4, 4);
-        let second = batch_region(1, 4, 4);
-        let last = batch_region(2, 4, 2);
-
-        assert_eq!(first, 0..4 * stride);
-        assert_eq!(second, 4 * stride..8 * stride);
-        assert_eq!(last, 8 * stride..10 * stride);
-        assert!(
-            first.end <= second.start && second.end <= last.start,
-            "two batches sharing a region is the bug this exists to prevent"
-        );
-    }
-
-    #[test]
-    fn a_region_starts_where_the_buffer_can_be_written() {
-        // `write_buffer` refuses an offset that is not a multiple of four, and
-        // an instance is not a power of two in size.
-        for batch in 0..4 {
-            assert_eq!(batch_region(batch, 3, 3).start % 4, 0);
-        }
-    }
-
-    /// The call site hands the function the configured batch size, not the
-    /// chunk's: a partial trailing batch must start at its own whole-batch
-    /// boundary, or it overwrites the batch before it.
-    #[test]
-    fn a_partial_batch_starts_on_a_whole_batch_boundary() {
-        let stride = size_of::<Instance>() as u64;
-
-        let full = batch_region(0, 4, 4);
-        let partial = batch_region(1, 4, 1);
-        assert_eq!(partial, 4 * stride..5 * stride);
-        assert!(
-            full.end <= partial.start,
-            "the partial batch overlapped the full one"
-        );
     }
 }

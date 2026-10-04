@@ -47,33 +47,79 @@ fn hash(point: Vec3) -> f32 {
     (value * 43_758.547).fract()
 }
 
-/// Smooth value noise: the lattice hashes around `point`, blended with a
-/// smoothstep in each axis.
-fn noise3d(point: Vec3) -> f32 {
-    let cell = point.floor();
-    let offset = point - cell;
-    let blend = offset * offset * (Vec3::splat(3.0) - 2.0 * offset);
-
-    let corner = |x: f32, y: f32, z: f32| hash(cell + Vec3::new(x, y, z));
-    let lerp = |from: f32, to: f32, amount: f32| from + (to - from) * amount;
-
-    let bottom_front = lerp(corner(0.0, 0.0, 0.0), corner(1.0, 0.0, 0.0), blend.x);
-    let top_front = lerp(corner(0.0, 1.0, 0.0), corner(1.0, 1.0, 0.0), blend.x);
-    let bottom_back = lerp(corner(0.0, 0.0, 1.0), corner(1.0, 0.0, 1.0), blend.x);
-    let top_back = lerp(corner(0.0, 1.0, 1.0), corner(1.0, 1.0, 1.0), blend.x);
-
-    let front = lerp(bottom_front, top_front, blend.y);
-    let back = lerp(bottom_back, top_back, blend.y);
-    lerp(front, back, blend.z)
+/// The eight lattice hashes around one cell of the noise lattice.
+///
+/// Hashing is the expensive part of the noise (each hash is a `sin`), and the
+/// curl samples six points within a few thousandths of each other, which
+/// nearly always share a cell. Keeping a cell's hashes lets every sample in it
+/// reuse them instead of hashing the same eight corners again.
+#[derive(Clone, Copy)]
+struct LatticeCell {
+    /// The cell's lowest corner: the sample point rounded down.
+    origin: Vec3,
+    /// Corner hashes indexed by `x + 2y + 4z`, each axis 0 or 1.
+    corners: [f32; 8],
 }
 
-/// The vector potential Ψ: three noise fields, offset to decorrelate them.
-fn potential(point: Vec3) -> Vec3 {
-    Vec3::new(
-        noise3d(point),
-        noise3d(point + Vec3::new(31.416, 0.0, 0.0)),
-        noise3d(point + Vec3::new(0.0, 67.254, 0.0)),
-    )
+impl LatticeCell {
+    /// Hashes the eight corners of the cell `origin` names.
+    fn at(origin: Vec3) -> Self {
+        let corner = |x: f32, y: f32, z: f32| hash(origin + Vec3::new(x, y, z));
+        Self {
+            origin,
+            corners: [
+                corner(0.0, 0.0, 0.0),
+                corner(1.0, 0.0, 0.0),
+                corner(0.0, 1.0, 0.0),
+                corner(1.0, 1.0, 0.0),
+                corner(0.0, 0.0, 1.0),
+                corner(1.0, 0.0, 1.0),
+                corner(0.0, 1.0, 1.0),
+                corner(1.0, 1.0, 1.0),
+            ],
+        }
+    }
+
+    /// Smooth value noise at `point`, which lies in this cell: the corner
+    /// hashes blended with a smoothstep in each axis.
+    fn noise(&self, point: Vec3) -> f32 {
+        let offset = point - self.origin;
+        let blend = offset * offset * (Vec3::splat(3.0) - 2.0 * offset);
+        let lerp = |from: f32, to: f32, amount: f32| from + (to - from) * amount;
+        let corners = &self.corners;
+
+        let bottom_front = lerp(corners[0], corners[1], blend.x);
+        let top_front = lerp(corners[2], corners[3], blend.x);
+        let bottom_back = lerp(corners[4], corners[5], blend.x);
+        let top_back = lerp(corners[6], corners[7], blend.x);
+
+        let front = lerp(bottom_front, top_front, blend.y);
+        let back = lerp(bottom_back, top_back, blend.y);
+        lerp(front, back, blend.z)
+    }
+}
+
+/// Offsets that decorrelate the three noise fields of the vector potential Ψ.
+const FIELD_OFFSETS: [Vec3; 3] = [
+    Vec3::ZERO,
+    Vec3::new(31.416, 0.0, 0.0),
+    Vec3::new(0.0, 67.254, 0.0),
+];
+
+/// The vector potential Ψ at `point`: three noise fields, offset to
+/// decorrelate them. `cells` holds a cell per field from a nearby point; a
+/// field whose point lies in it reuses its hashes, any other hashes its own.
+fn potential(point: Vec3, cells: &[LatticeCell; 3]) -> Vec3 {
+    let field = |index: usize| {
+        let field_point = point + FIELD_OFFSETS[index];
+        let origin = field_point.floor();
+        if origin == cells[index].origin {
+            cells[index].noise(field_point)
+        } else {
+            LatticeCell::at(origin).noise(field_point)
+        }
+    };
+    Vec3::new(field(0), field(1), field(2))
 }
 
 /// The curl of Ψ at `point`, by central differences, with the field scrolled
@@ -81,10 +127,15 @@ fn potential(point: Vec3) -> Vec3 {
 /// ∇ × Ψ = (∂ψ3/∂y - ∂ψ2/∂z, ∂ψ1/∂z - ∂ψ3/∂x, ∂ψ2/∂x - ∂ψ1/∂y).
 fn curl_noise(point: Vec3, time: f32, epsilon: f32, scale: f32) -> Vec3 {
     let animated = point * scale + Vec3::splat(time * FIELD_SCROLL_SPEED);
+    // The cell of each field around the centre point. The six samples are
+    // within `epsilon` of it, so they nearly always fall in these cells and
+    // the whole curl hashes 24 corners instead of 144.
+    let cells = FIELD_OFFSETS.map(|offset| LatticeCell::at((animated + offset).floor()));
 
     // The derivative of every component of Ψ along one axis.
     let derivative = |axis: Vec3| {
-        (potential(animated + axis * epsilon) - potential(animated - axis * epsilon))
+        (potential(animated + axis * epsilon, &cells)
+            - potential(animated - axis * epsilon, &cells))
             / (2.0 * epsilon)
     };
     let along_x = derivative(Vec3::X);
@@ -202,5 +253,103 @@ mod tests {
             / (2.0 * step);
         let magnitude = field(Vec3::ZERO).length().max(1.0);
         assert!(divergence.abs() < magnitude, "divergence {divergence}");
+    }
+
+    /// The noise as it was first written: every sample hashes its own eight
+    /// corners. Kept as the reference the shared-cell version must match.
+    mod reference {
+        use super::*;
+
+        fn noise3d(point: Vec3) -> f32 {
+            let cell = point.floor();
+            let offset = point - cell;
+            let blend = offset * offset * (Vec3::splat(3.0) - 2.0 * offset);
+
+            let corner = |x: f32, y: f32, z: f32| hash(cell + Vec3::new(x, y, z));
+            let lerp = |from: f32, to: f32, amount: f32| from + (to - from) * amount;
+
+            let bottom_front = lerp(corner(0.0, 0.0, 0.0), corner(1.0, 0.0, 0.0), blend.x);
+            let top_front = lerp(corner(0.0, 1.0, 0.0), corner(1.0, 1.0, 0.0), blend.x);
+            let bottom_back = lerp(corner(0.0, 0.0, 1.0), corner(1.0, 0.0, 1.0), blend.x);
+            let top_back = lerp(corner(0.0, 1.0, 1.0), corner(1.0, 1.0, 1.0), blend.x);
+
+            let front = lerp(bottom_front, top_front, blend.y);
+            let back = lerp(bottom_back, top_back, blend.y);
+            lerp(front, back, blend.z)
+        }
+
+        fn potential(point: Vec3) -> Vec3 {
+            Vec3::new(
+                noise3d(point),
+                noise3d(point + Vec3::new(31.416, 0.0, 0.0)),
+                noise3d(point + Vec3::new(0.0, 67.254, 0.0)),
+            )
+        }
+
+        /// The curl as the original computed it, sample by sample.
+        pub(super) fn curl_noise(point: Vec3, time: f32, epsilon: f32, scale: f32) -> Vec3 {
+            let animated = point * scale + Vec3::splat(time * FIELD_SCROLL_SPEED);
+            let derivative = |axis: Vec3| {
+                (potential(animated + axis * epsilon) - potential(animated - axis * epsilon))
+                    / (2.0 * epsilon)
+            };
+            let along_x = derivative(Vec3::X);
+            let along_y = derivative(Vec3::Y);
+            let along_z = derivative(Vec3::Z);
+            Vec3::new(
+                along_y.z - along_z.y,
+                along_z.x - along_x.z,
+                along_x.y - along_y.x,
+            )
+        }
+    }
+
+    /// Sharing a cell's hashes between samples changes no result: not for
+    /// points well inside a cell, nor for ones a sample's step carries into
+    /// the next cell, at the tuned epsilon or a much larger one.
+    #[test]
+    fn shared_cell_hashes_give_exactly_the_original_field() {
+        let demo_state = DemoState::default();
+        let scale = demo_state.curl_scale;
+        let mut checked = 0;
+        for index in 0..4_000 {
+            // A spread of points across the box, at a spread of times.
+            let fraction = index as f32 / 4_000.0;
+            let point = BOX_MINIMUM
+                + (BOX_MAXIMUM - BOX_MINIMUM)
+                    * Vec3::new(
+                        (fraction * 7.13).fract(),
+                        (fraction * 3.71).fract(),
+                        (fraction * 5.37).fract(),
+                    );
+            let time = fraction * 90.0;
+            for epsilon in [demo_state.curl_epsilon, 0.25] {
+                assert_eq!(
+                    curl_noise(point, time, epsilon, scale),
+                    reference::curl_noise(point, time, epsilon, scale),
+                    "point {point:?}, time {time}, epsilon {epsilon}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 8_000);
+    }
+
+    /// A point just below a cell boundary: its +epsilon sample lands in the
+    /// next cell, which has to hash its own corners.
+    #[test]
+    fn a_sample_across_a_cell_boundary_matches_the_original() {
+        let epsilon = DemoState::default().curl_epsilon;
+        // With scale 1 and time 0 the noise point is the point itself.
+        for boundary_point in [
+            Vec3::new(4.0 - epsilon * 0.5, 0.3, 0.6),
+            Vec3::new(0.2, -2.0 - epsilon * 0.5, 0.7),
+            Vec3::new(0.5, 0.5, 9.0 - epsilon * 0.5),
+        ] {
+            assert_eq!(
+                curl_noise(boundary_point, 0.0, epsilon, 1.0),
+                reference::curl_noise(boundary_point, 0.0, epsilon, 1.0)
+            );
+        }
     }
 }

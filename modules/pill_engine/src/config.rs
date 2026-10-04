@@ -84,6 +84,17 @@ impl ParallelProcessingConfig {
     /// latency (~10 µs) doesn't dominate.
     pub const TARGET_ITERATOR_WORK_GROUP_DURATION: u64 = 50_000;
 
+    /// Most parallel work groups per pool thread.
+    ///
+    /// More groups than threads lets a long loop balance itself when the
+    /// threads do not run equally fast (efficiency cores on a hybrid CPU, two
+    /// hyperthreads on one core): the faster threads take the groups the
+    /// slower ones have not reached yet. Measured on an i7-12700KF (8
+    /// performance cores with hyperthreading plus 4 efficiency cores) with one
+    /// group per thread, the threads were idle a third of every loop, waiting
+    /// for the group on the slowest one.
+    pub const WORK_GROUPS_PER_THREAD: usize = 4;
+
     /// Default entities per parallel work slice.
     ///
     /// This is an arbitrary but well-tested starting point.  Benchmarked
