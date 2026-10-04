@@ -429,7 +429,9 @@ impl State {
     ) -> Result<()> {
         // Both borrows are of separate fields, so the surface can reconfigure
         // itself against the device that created it.
+        let acquire_zone = pill_core::profile_scope!("renderer: acquire surface");
         let surface_frame = self.surface.acquire(&self.device)?;
+        drop(acquire_zone);
         let (width, height) = self.surface.size();
         // Through the sRGB view the pipelines were built for, which is not the
         // texture's own format on a surface without sRGB formats.
@@ -478,6 +480,11 @@ impl State {
         // One wgpu render pass per pass of the chain, into the same encoder: the
         // first clears the targets it writes, the rest add to what is there.
         for entry in plan {
+            let _pass_zone = pill_core::profile_scope!(
+                "renderer pass: {}",
+                entry.label();
+                [("{} draws", entry.draws())]
+            );
             // Every target the pass writes, in the order the shader's
             // `SV_TARGET` list names them.
             let mut views = Vec::with_capacity(entry.outputs().len());
@@ -625,12 +632,15 @@ impl State {
         // The last creation-class failure a frame can hit: wgpu validates a
         // command buffer when it is submitted, and a validation failure would
         // otherwise reach the uncaptured-error handler as a panic.
+        let queue_submit_zone = pill_core::profile_scope!("renderer: queue submit");
         capturing_validation(&self.device, || {
             self.queue.submit(std::iter::once(encoder.finish()));
         })
         .map_err(|detail| RendererError::Other {
             detail: format!("frame submission: {detail}"),
         })?;
+        drop(queue_submit_zone);
+        let _present_zone = pill_core::profile_scope!("renderer: present");
         surface_frame.present();
         Ok(())
     }

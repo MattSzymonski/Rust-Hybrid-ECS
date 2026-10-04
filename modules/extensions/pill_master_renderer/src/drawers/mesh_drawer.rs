@@ -357,6 +357,9 @@ impl MeshDrawer {
         render_pass.set_scissor_rect(viewport.x, viewport.y, viewport.width, viewport.height);
 
         let mut current_drawing_context = DrawingContext::default();
+        // Key of the last item whose state was checked. It carries across
+        // batches, like the bound state it stands for.
+        let mut previous_key: Option<u64> = None;
 
         self.ensure_capacity(device, render_queue.len());
         let batch_size = self.max_instance_batch_size as usize;
@@ -370,6 +373,10 @@ impl MeshDrawer {
             current_drawing_context.instance_batch_size = instance_count as u32;
 
             // Prepare instance data and load it to buffer
+            let instances_zone = pill_core::profile_scope!(
+                "mesh drawer: build instances",
+                [("{} instances", instance_count)]
+            );
             self.instances.clear();
             self.instances.reserve(instance_batch.len()); // Pre-allocate exact capacity
 
@@ -387,6 +394,8 @@ impl MeshDrawer {
                 bytemuck::cast_slice(&self.instances),
             ); // Update this batch's region of the instance buffer
 
+            drop(instances_zone);
+            let _record_zone = pill_core::profile_scope!("mesh drawer: record draws");
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(region)); // Set instance buffer
 
             // Reset instance range for each batch
@@ -394,6 +403,20 @@ impl MeshDrawer {
             current_drawing_context.accumulated_instance_count = 0;
 
             for (j, render_queue_item) in instance_batch.iter().enumerate() {
+                // The key packs every handle the draw binds, so an item whose
+                // key equals the one before it needs nothing rebound: it only
+                // extends the current draw. The queue is sorted by key, so
+                // that is nearly every item, and unpacking the key and
+                // rebuilding three handles for each was most of this loop.
+                if previous_key == Some(render_queue_item.key) {
+                    current_drawing_context.accumulate_instance();
+                    if j == instance_count - 1 {
+                        current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
+                    }
+                    continue;
+                }
+                previous_key = Some(render_queue_item.key);
+
                 let render_queue_key_fields = decompose_render_queue_key(render_queue_item.key);
 
                 // Recreate resource handles
