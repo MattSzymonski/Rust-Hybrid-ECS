@@ -95,3 +95,11 @@ opt-level = 3
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# Optimized development profile: the dev host with hot reload, at full speed.
+# `release` cannot host hot reload (its `lto = "fat"` refuses `-C prefer-dynamic`),
+# so measuring performance in a dev host needs a profile of its own. The host
+# builds every module with its own profile, so modules follow automatically.
+[profile.dev-optimized]
+inherits = "dev"
+opt-level = 3

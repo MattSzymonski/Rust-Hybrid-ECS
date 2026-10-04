@@ -24,9 +24,14 @@ extern crate self as pill_engine;
 
 /// Tracy profiled allocator that tracks allocations in Tracy's memory view.
 ///
-/// Only active when the `profiling` feature is enabled. The sampling rate is
+/// Only active with the opt-in `profiling-memory` feature. The sampling rate is
 /// controlled by [`crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
-#[cfg(feature = "profiling")]
+///
+/// Not part of `profiling`: the allocator is generic, so it is instantiated in
+/// every DLL that links this rlib and calls Tracy's C entry points directly.
+/// Those live inside `pill_core.dll`, which exports only Rust symbols, so any
+/// extension DLL fails to link with "undefined symbol ___tracy_emit_memory_*".
+#[cfg(feature = "profiling-memory")]
 #[global_allocator]
 static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(

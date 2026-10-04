@@ -2,11 +2,12 @@
 name = "pill_shipping_bundle"
 version = "0.0.0"
 edition = "2021"
-build = false
 
 [dependencies]
 pill_runtime = { path = "../../modules/hosting/pill_runtime" }
-project = { path = "../../examples/project_rs" }
+circus_demo = { path = "../../examples/circus_demo" }
 pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
-pill_spline = { path = "../../modules/extensions/pill_spline", default-features = false }
-pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }
+pill_master_renderer = { path = "../../modules/extensions/pill_master_renderer", default-features = false }
+
+[build-dependencies]
+pill_assets = { path = "../../modules/pill_assets" }

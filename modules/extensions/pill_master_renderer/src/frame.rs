@@ -29,7 +29,7 @@ pub use pill_renderer_api::frame::{
 
 // Current crate
 use crate::{
-    assets::asset_key,
+    assets::{asset_key, Material, Mesh},
     components::{CameraComponent, MeshRendererComponent, TransformComponent},
     resources::RenderingManager,
 };
@@ -259,23 +259,42 @@ pub fn rendering_system(
         frame.camera_transform = transform;
     }
 
+    // The last mesh and material pair resolved, with the draw order it gave
+    // (`None` when either handle was dead). Drawables that share a mesh and a
+    // material are usually many and adjacent in an archetype, so remembering
+    // one pair skips almost every asset lookup; with 50,000 pills those
+    // lookups were most of this system's time.
+    let mut last_resolved: Option<(Handle<Mesh>, Handle<Material>, Option<u8>)> = None;
     for (transform, renderer) in objects.iter_mut() {
-        // Handles with nothing behind them are dropped here, so a dangling
-        // handle draws nothing instead of failing the frame. The material is
-        // read rather than merely checked because the draw order it carries
-        // rides along with the instance; the renderer imposes that order when
-        // it composes the queue, so what is left here stays in traversal order.
-        let Some(material) = assets.get(renderer.material) else {
+        let rendering_order = match last_resolved {
+            Some((mesh, material, rendering_order))
+                if mesh == renderer.mesh && material == renderer.material =>
+            {
+                rendering_order
+            }
+            _ => {
+                // Handles with nothing behind them are dropped here, so a
+                // dangling handle draws nothing instead of failing the frame.
+                // The material is read rather than merely checked because the
+                // draw order it carries rides along with the instance; the
+                // renderer imposes that order when it composes the queue, so
+                // what is left here stays in traversal order.
+                let rendering_order = assets
+                    .get(renderer.material)
+                    .filter(|_| assets.contains(renderer.mesh))
+                    .map(|material| material.rendering_order);
+                last_resolved = Some((renderer.mesh, renderer.material, rendering_order));
+                rendering_order
+            }
+        };
+        let Some(rendering_order) = rendering_order else {
             continue;
         };
-        if !assets.contains(renderer.mesh) {
-            continue;
-        }
         frame.instances.push(RenderInstance {
             transform: *transform,
             mesh: asset_key(renderer.mesh),
             material: asset_key(renderer.material),
-            rendering_order: material.rendering_order,
+            rendering_order,
         });
     }
     Ok(())

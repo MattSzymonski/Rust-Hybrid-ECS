@@ -19,40 +19,35 @@ pub const STATIC_MODULES: &[StaticModule] = &[
         name: "pill_master_renderer_data",
         init: pill_master_renderer_data::register,
     },
-    StaticModule {
-        name: "pill_spline",
-        init: pill_spline::register,
-    },
-    StaticModule {
-        name: "pill_audio",
-        init: pill_audio::register,
-    },
 ];
 
 /// The project backend for this shipping project.
 pub fn project_backend() -> StaticProjectBackend {
     StaticProjectBackend::Native {
-        init: project::init,
+        init: circus_demo::init,
     }
 }
 
 /// The renderer this binary links, or `None` for a headless build.
 pub fn static_renderer() -> Option<StaticRenderer> {
-    None
+    Some(StaticRenderer {
+        init: pill_master_renderer::register,
+        attach: pill_master_renderer::attach,
+    })
 }
 
 /// The `logging:` section of `project_settings.yaml`.
 #[rustfmt::skip]
-const LOGGING: StaticLogging = StaticLogging::NONE;
+const LOGGING: StaticLogging = StaticLogging { level: None, timestamp: None, source_location: None, targets: &[("engine::rendering", "info")] };
 
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
-        name: "Bouncing Balls",
+        name: "Circus Demo",
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),
-        asset_pack: None,
+        asset_pack: Some(include_bytes!(concat!(env!("OUT_DIR"), "/assets.pillpack"))),
         logging: LOGGING,
     }
 }

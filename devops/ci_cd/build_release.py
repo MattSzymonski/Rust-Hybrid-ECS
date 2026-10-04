@@ -307,15 +307,20 @@ def apply_shipping_host_default(arguments: list, project_root) -> list:
 
 
 def copy_shipping_artifacts(
-    target_directory: Path, artifacts_directory: Path, build_binary_name: str
+    target_directory: Path,
+    artifacts_directory: Path,
+    build_binary_name: str,
+    profile_name: str,
 ) -> list:
     """Copies the built shipping binary and its sidecars into a dated directory.
 
     The binary and PDB are renamed to the project's `build_binary_name`;
-    sidecars keep theirs. Returns the names copied (empty when the build
-    produced nothing to copy).
+    sidecars keep theirs. Cargo writes each release profile into a directory
+    of its own name (`release`, `release-fast`, `release-with-debug`), so the
+    profile picks where to look. Returns the names copied (empty when the
+    build produced nothing to copy).
     """
-    release_directory = target_directory / "release"
+    release_directory = target_directory / profile_name
     extension = ".exe" if os.name == "nt" else ""
     artifacts_directory.mkdir(parents=True, exist_ok=True)
     copied = []
@@ -1076,7 +1081,10 @@ def main() -> int:
     copied_artifacts = []
     if completed.returncode == 0 and target_directory is not None:
         copied_artifacts = copy_shipping_artifacts(
-            target_directory, artifacts_directory, build_binary_name
+            target_directory,
+            artifacts_directory,
+            build_binary_name,
+            extract_profile(arguments),
         )
         # The managed side of a C# shipping build: the project assembly and
         # the C# runtime it references (or, with --csharp-aot, the single
