@@ -174,29 +174,72 @@ impl RenderingResourcesManager {
     /// shader of its own to the default shader. A partially-broken revision
     /// therefore still draws something, which is what the two defaults are for.
     pub(crate) fn build_queue(&self, frame: &RenderFrame, state: &State) -> Vec<RenderQueueItem> {
+        let resolve_zone = pill_core::profile_scope!("build queue: resolve instances");
         let mut queue = Vec::with_capacity(frame.instances.len());
+        // The last mesh and material keys resolved, with what they resolved to.
+        // Instances that share both are usually many and adjacent (one
+        // archetype's worth), so remembering one pair skips nearly every
+        // lookup: with 50,000 pills on one mesh and material, the lookups were
+        // almost all of this function's time. Nothing changes the caches
+        // during the call, so a remembered answer is the answer a fresh
+        // lookup would give.
+        let mut last_resolved = None;
         for (index, instance) in frame.instances.iter().enumerate() {
-            let Some(mesh) = self.mesh_handles.get(&instance.mesh).copied() else {
+            let resolved = match last_resolved {
+                Some((mesh_key, material_key, resolved))
+                    if mesh_key == instance.mesh && material_key == instance.material =>
+                {
+                    resolved
+                }
+                _ => {
+                    let resolved =
+                        self.resolve_draw_handles(instance.mesh, instance.material, state);
+                    last_resolved = Some((instance.mesh, instance.material, resolved));
+                    resolved
+                }
+            };
+            let Some((shader, material, mesh)) = resolved else {
                 continue;
             };
-            let material = self
-                .material_handles
-                .get(&instance.material)
-                .copied()
-                .unwrap_or(self.default_material);
-            let shader = state
-                .renderer_resource_storage
-                .materials
-                .get(material)
-                .map(|material| material.shader_handle)
-                .unwrap_or(self.default_shader);
             queue.push(RenderQueueItem {
                 key: compose_render_queue_key(instance.rendering_order, shader, material, mesh),
                 entity_index: index as u32,
             });
         }
+        drop(resolve_zone);
+        let _sort_zone = pill_core::profile_scope!("build queue: sort");
         queue.sort_unstable();
         queue
+    }
+
+    /// The shader, material and mesh objects one instance draws with, or `None`
+    /// when its mesh never uploaded.
+    ///
+    /// A material that never built falls back to the default material, and a
+    /// material with no shader of its own to the default shader.
+    fn resolve_draw_handles(
+        &self,
+        mesh_key: u64,
+        material_key: u64,
+        state: &State,
+    ) -> Option<(
+        RendererShaderHandle,
+        RendererMaterialHandle,
+        RendererMeshHandle,
+    )> {
+        let mesh = self.mesh_handles.get(&mesh_key).copied()?;
+        let material = self
+            .material_handles
+            .get(&material_key)
+            .copied()
+            .unwrap_or(self.default_material);
+        let shader = state
+            .renderer_resource_storage
+            .materials
+            .get(material)
+            .map(|material| material.shader_handle)
+            .unwrap_or(self.default_shader);
+        Some((shader, material, mesh))
     }
 
     /// The shader objects by key, for naming a pass's shader in the queue.
