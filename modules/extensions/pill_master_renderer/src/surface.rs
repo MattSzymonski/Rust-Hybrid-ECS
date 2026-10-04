@@ -5,7 +5,8 @@
 //! - Build the GPU bootstrap in the only order it can happen: instance,
 //!   surface, adapter, device, queue, configuration ([`Surface::create`]).
 //! - Keep the surface configured - at startup, on a resize, and on the
-//!   recovery path a lost or outdated swapchain needs.
+//!   recovery path a lost or outdated swapchain needs - in vsync unless
+//!   `PILL_PRESENT_MODE` asks for another present mode.
 //! - Hand out frames ([`Surface::acquire`]), and own the colour format every
 //!   pipeline that renders to it declares.
 //!
@@ -26,13 +27,46 @@
 //! this renderer, and what keeps a windowing crate out of this one.
 
 // External crates
-use pill_core::info;
+use pill_core::{info, warn};
 
 // External crates
 use pill_renderer_api::RawWindowData;
 
 // Current crate
 use crate::error::{captured, captured_now, CapturedErrors, RendererError, Result};
+
+/// Environment variable that asks for a present mode other than vsync.
+const PRESENT_MODE_VARIABLE: &str = "PILL_PRESENT_MODE";
+
+/// The present mode `PILL_PRESENT_MODE` asks for, when the surface lists it.
+///
+/// `immediate` presents without waiting (tearing possible), `mailbox` without
+/// waiting but replaces a queued frame instead of tearing, and `fifo` is
+/// vsync, the default. `None` when the variable is unset, names no mode, or
+/// names one the surface does not list, which is logged.
+fn requested_present_mode(available: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
+    let requested = std::env::var(PRESENT_MODE_VARIABLE).ok()?;
+    let present_mode = match requested.trim().to_ascii_lowercase().as_str() {
+        "immediate" => wgpu::PresentMode::Immediate,
+        "mailbox" => wgpu::PresentMode::Mailbox,
+        "fifo" => wgpu::PresentMode::Fifo,
+        _ => {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "{PRESENT_MODE_VARIABLE}={requested} is not a present mode (immediate, mailbox, fifo); using Fifo"
+            );
+            return None;
+        }
+    };
+    if !available.contains(&present_mode) {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "{PRESENT_MODE_VARIABLE} asked for {present_mode:?}, which this surface does not offer ({available:?}); using Fifo"
+        );
+        return None;
+    }
+    Some(present_mode)
+}
 
 /// The colour format every pipeline rendering to this surface declares.
 ///
@@ -183,9 +217,10 @@ impl Surface {
         // and then fails the flip-model swapchain with "Not enough memory
         // left", which reaches wgpu's uncaptured-error path and aborts the host
         // before a `RendererError` can be constructed. An uncapped mode stays
-        // an opt-in for a driver that has been verified to create one.
-        let present_mode = wgpu::PresentMode::Fifo;
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Present mode: {present_mode:?}");
+        // an opt-in for a driver that has been verified to create one
+        // (`PILL_PRESENT_MODE`, see `requested_present_mode`).
+        let requested = requested_present_mode(&capabilities.present_modes);
+        let present_mode = requested.unwrap_or(wgpu::PresentMode::Fifo);
         let mut configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: color_format,
@@ -196,7 +231,21 @@ impl Surface {
             alpha_mode,
             view_formats: vec![render_format],
         };
-        configure_first(&surface, &device, &mut configuration).await?;
+        // A requested mode the driver refuses falls back to `Fifo` instead of
+        // failing the renderer: the request is a development knob, and vsync
+        // is always creatable.
+        if let Err(error) = configure_first(&surface, &device, &mut configuration).await {
+            if configuration.present_mode == wgpu::PresentMode::Fifo {
+                return Err(error);
+            }
+            warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "present mode {:?} was refused ({error}); falling back to Fifo", configuration.present_mode
+            );
+            configuration.present_mode = wgpu::PresentMode::Fifo;
+            configure_first(&surface, &device, &mut configuration).await?;
+        }
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Present mode: {:?}", configuration.present_mode);
         Ok((
             Self {
                 surface,

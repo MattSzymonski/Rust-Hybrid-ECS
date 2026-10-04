@@ -494,14 +494,8 @@ where
         // thread processes ALL its work back-to-back. Groups are stored as
         // (start_index, count) ranges into the flat iterator_slices array
         // instead of copying slices with to_vec().
-        let iterator_work_group_count = if hint_ns > 0 {
-            let target = (hint_ns
-                / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
-                .clamp(1, pool_threads as u64) as usize;
-            target.min(iterator_slices.len()).max(1)
-        } else {
-            pool_threads.min(iterator_slices.len()).max(1)
-        };
+        let iterator_work_group_count =
+            iterator_work_group_count(hint_ns, pool_threads, iterator_slices.len());
 
         let base = iterator_slices.len() / iterator_work_group_count;
         let remainder = iterator_slices.len() % iterator_work_group_count;
@@ -690,14 +684,8 @@ where
         // contention, no 90µs gaps between chunks on the same thread.
         // Groups are stored as (start_index, count) ranges into the flat
         // iterator_slices array instead of copying slices with to_vec().
-        let iterator_work_group_count = if hint_ns > 0 {
-            let target = (hint_ns
-                / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
-                .clamp(1, num_threads as u64) as usize;
-            target.min(iterator_slices.len()).max(1)
-        } else {
-            num_threads.min(iterator_slices.len()).max(1)
-        };
+        let iterator_work_group_count =
+            iterator_work_group_count(hint_ns, num_threads, iterator_slices.len());
 
         let base = iterator_slices.len() / iterator_work_group_count;
         let remainder = iterator_slices.len() % iterator_work_group_count;
@@ -892,5 +880,54 @@ impl std::fmt::Display for ParForEachResult {
             ParForEachResult::Tracked(stats) => write!(f, "{}", stats),
             ParForEachResult::Untracked => write!(f, "Untracked"),
         }
+    }
+}
+
+/// How many Rayon tasks to split a parallel iteration into.
+///
+/// One task per `TARGET_ITERATOR_WORK_GROUP_DURATION` of the iteration's
+/// measured time, so short loops are not split into tasks that cost more to
+/// schedule than they save. At most `WORK_GROUPS_PER_THREAD` per pool thread
+/// and one per slice. Without a measurement yet, one per thread.
+///
+/// More tasks than threads is what keeps a long loop balanced on a CPU whose
+/// threads do not run equally fast: a hybrid CPU's efficiency cores, or two
+/// hyperthreads sharing one core. With exactly one equal task per thread, the
+/// loop waits for whichever task landed on the slowest thread; with several,
+/// the faster threads take the tasks the slower ones have not reached.
+fn iterator_work_group_count(hint_ns: u64, pool_threads: usize, slice_count: usize) -> usize {
+    let most = pool_threads * config::ParallelProcessingConfig::WORK_GROUPS_PER_THREAD;
+    let target = if hint_ns > 0 {
+        (hint_ns / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION) as usize
+    } else {
+        pool_threads
+    };
+    target.clamp(1, most.max(1)).min(slice_count).max(1)
+}
+
+#[cfg(test)]
+mod work_group_count_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_loop_splits_into_several_tasks_per_thread() {
+        // 30 ms of work on 20 threads: as many tasks as allowed, so the fast
+        // threads can take over the slow ones' share.
+        let most = 20 * config::ParallelProcessingConfig::WORK_GROUPS_PER_THREAD;
+        assert_eq!(iterator_work_group_count(30_000_000, 20, 1_000), most);
+    }
+
+    #[test]
+    fn a_short_loop_keeps_its_tasks_near_the_target_duration() {
+        // 200 us of work is four 50 us tasks, however many threads there are.
+        assert_eq!(iterator_work_group_count(200_000, 20, 1_000), 4);
+        assert_eq!(iterator_work_group_count(10_000, 20, 1_000), 1);
+    }
+
+    #[test]
+    fn tasks_never_outnumber_slices_and_start_at_one_per_thread() {
+        assert_eq!(iterator_work_group_count(30_000_000, 20, 50), 50);
+        assert_eq!(iterator_work_group_count(0, 20, 1_000), 20);
+        assert_eq!(iterator_work_group_count(0, 20, 0), 1);
     }
 }

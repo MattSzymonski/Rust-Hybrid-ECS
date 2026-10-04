@@ -88,6 +88,11 @@ pub struct Renderer {
     /// frame is recorded from.
     pipeline: ScriptableRenderingPipeline,
     metrics: RenderMetrics,
+    /// The frame's instances in queue order, as uploaded. Kept between frames
+    /// so its allocation is reused.
+    queued_instances: Vec<Instance>,
+    /// Builds `queued_instances`, remembering what that costs.
+    instance_builder: crate::instance::InstanceBuilder,
 }
 
 impl Renderer {
@@ -145,6 +150,8 @@ impl Renderer {
             minimized: width == 0 || height == 0,
             pipeline: ScriptableRenderingPipeline::new(),
             metrics: RenderMetrics::default(),
+            queued_instances: Vec::new(),
+            instance_builder: crate::instance::InstanceBuilder::default(),
         })
     }
 }
@@ -232,6 +239,13 @@ impl PillRenderer for Renderer {
             .rendering_resources_manager
             .build_queue(frame, &self.state);
         drop(queue_zone);
+        let instances_zone = pill_core::profile_scope!(
+            "renderer: build instances",
+            [("{} instances", render_queue.len())]
+        );
+        self.instance_builder
+            .build(&render_queue, &frame.instances, &mut self.queued_instances);
+        drop(instances_zone);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
@@ -260,6 +274,7 @@ impl PillRenderer for Renderer {
             &plan,
             self.pipeline.passes(),
             frame,
+            &self.queued_instances,
             self.viewport,
         )?;
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
@@ -340,7 +355,7 @@ impl State {
             detail: format!("camera bind group layout: {detail}"),
         })?;
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
-        let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE as u32);
+        let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
         Ok(Self {
             renderer_resource_storage,
             surface,
@@ -425,6 +440,7 @@ impl State {
         plan: &[PassPlan],
         passes: &[PassSlot],
         frame: &RenderFrame,
+        instances: &[Instance],
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
         // Both borrows are of separate fields, so the surface can reconfigure
@@ -477,6 +493,11 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("render_encoder"),
             });
+        // Once for the whole frame: every geometry pass draws from it.
+        let upload_zone = pill_core::profile_scope!("renderer: upload instances");
+        self.mesh_drawer
+            .upload_instances(&self.device, &self.queue, instances);
+        drop(upload_zone);
         // One wgpu render pass per pass of the chain, into the same encoder: the
         // first clears the targets it writes, the rest add to what is there.
         for entry in plan {
@@ -523,7 +544,8 @@ impl State {
             match entry {
                 PassPlan::Geometry {
                     label,
-                    items,
+                    queue,
+                    ranges,
                     pass_index,
                     ..
                 } => {
@@ -547,8 +569,6 @@ impl State {
                         _ => None,
                     });
                     self.mesh_drawer.record_draw_commands(
-                        &self.device,
-                        &self.queue,
                         &mut encoder,
                         &self.renderer_resource_storage,
                         label,
@@ -556,8 +576,8 @@ impl State {
                         &color_attachments,
                         depth_stencil_attachment,
                         camera,
-                        items,
-                        &frame.instances,
+                        queue,
+                        ranges,
                         viewport,
                     )?;
                 }
