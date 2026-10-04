@@ -18,7 +18,8 @@ workspace = true
 crate-type = ["rlib", "dylib"]
 
 [dependencies]
-glam = { version = "0.33", features = ["serde"] }
+# `bytemuck` is part of the feature pin below.
+glam = { version = "0.33", features = ["serde", "bytemuck"] }
 pill_core_macros = { path = "../pill_core_macros" }
 libloading = "0.8"
 notify = "6"
@@ -50,6 +51,29 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 tracing-tracy = { version = "0.11", optional = true }
 tracy-client = { version = "0.18", optional = true }
 metrics = { version = "0.24", optional = true }
+
+# Feature pin. pill_core is a `dylib`, and its exported symbol names hash the
+# features of every crate below it. Cargo enables features per build, so a
+# build that also contains, say, the renderer (whose graph turns on `glam/bytemuck`
+# and `smallvec/union`) would produce a `pill_core.dll` whose symbols a host
+# built without it cannot provide - modules then fail to load with "procedure
+# could not be found". Requesting here every feature any host, module or project
+# build adds keeps pill_core's resolution identical in all of them, so the host
+# does not need the renderer crates in its own graph. None of these crates is
+# used directly. Measured with `local/temp/pill_core_feature_union.py`; extend
+# the list if a new module adds a feature to pill_core's tree.
+bytemuck = { version = "1", features = [
+    "aarch64_simd",
+    "derive",
+    "extern_crate_alloc",
+    "min_const_generics",
+    "wasm_simd",
+] }
+crossbeam-utils = "0.8"
+libm = { version = "0.2", features = ["arch"] }
+memchr = "2"
+num-traits = { version = "0.2", features = ["libm", "std"] }
+smallvec = { version = "1", features = ["union"] }
 
 # The platform layer (`src/platform`) on native: the rolling log file and
 # blocking on a future.

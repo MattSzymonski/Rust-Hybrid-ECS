@@ -2600,16 +2600,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "host_project_project"
+name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
- "pill_audio",
- "pill_core",
+ "glam",
  "pill_engine",
  "pill_master_renderer_data",
- "pill_spline",
  "serde",
- "tracing",
+ "trait_type_map",
 ]
 
 [[package]]
@@ -4686,18 +4684,24 @@ dependencies = [
 name = "pill_core"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "chrono",
  "colored",
+ "crossbeam-utils",
  "glam",
  "libloading 0.8.9",
+ "libm",
  "log",
+ "memchr",
  "metrics",
  "miette",
  "notify",
+ "num-traits",
  "pill_core_macros",
  "pollster",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror 2.0.20",
  "tracing",
  "tracing-appender",
