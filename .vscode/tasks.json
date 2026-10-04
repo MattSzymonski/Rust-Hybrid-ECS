@@ -39,7 +39,7 @@
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "dev,rendering",
+                "hot_reload,rendering",
                 "--offline"
             ],
             "options": {
