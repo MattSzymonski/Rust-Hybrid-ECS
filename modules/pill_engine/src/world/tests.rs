@@ -2463,28 +2463,36 @@ fn test_per_label_duplicate_detection() {
     // Simulate iterator-1 with label "physics".
     {
         let mut t = timing.lock().unwrap();
-        assert!(!t.visited_iterator_labels.contains(&"physics"));
-        t.visited_iterator_labels.push("physics");
+        assert!(!t
+            .visited_iterator_labels
+            .iter()
+            .any(|label| label == "physics"));
+        t.visited_iterator_labels.push("physics".to_owned());
         t.per_iterator_label_average_duration
-            .insert("physics", 120_000);
+            .insert("physics".to_owned(), 120_000);
     }
 
     // Simulate iterator-2 with label "ai" - different label, no duplicate.
     {
         let mut t = timing.lock().unwrap();
-        assert!(!t.visited_iterator_labels.contains(&"ai"));
-        t.visited_iterator_labels.push("ai");
-        t.per_iterator_label_average_duration.insert("ai", 50_000);
+        assert!(!t.visited_iterator_labels.iter().any(|label| label == "ai"));
+        t.visited_iterator_labels.push("ai".to_owned());
+        t.per_iterator_label_average_duration
+            .insert("ai".to_owned(), 50_000);
     }
 
     // Simulate a second "physics" iterator - same label, DUPLICATE.
     {
         let mut t = timing.lock().unwrap();
-        assert!(t.visited_iterator_labels.contains(&"physics"));
-        t.visited_duplicated_iterator_labels.push("physics");
+        assert!(t
+            .visited_iterator_labels
+            .iter()
+            .any(|label| label == "physics"));
+        t.visited_duplicated_iterator_labels
+            .push("physics".to_owned());
         // Overwrites the splitting hint - exactly the problem we're detecting.
         t.per_iterator_label_average_duration
-            .insert("physics", 800_000);
+            .insert("physics".to_owned(), 800_000);
     }
 
     let t = timing.lock().unwrap();

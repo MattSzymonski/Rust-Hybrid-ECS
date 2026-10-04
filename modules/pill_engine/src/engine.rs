@@ -24,8 +24,9 @@ use std::time::Duration;
 
 // External crates
 use pill_core::platform::Instant;
+use pill_core::rayon;
+use pill_core::rayon::prelude::*;
 use pill_core::warn;
-use rayon::prelude::*;
 
 // Current crate
 use crate::commands::{CommandError, CommandQueue};

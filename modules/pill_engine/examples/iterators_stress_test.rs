@@ -280,7 +280,7 @@ fn main() {
     // Step 1: Create the engine and report the available Rayon threads.
     let mut engine = Engine::new();
 
-    pill_core::info!("Rayon threads: {}", rayon::current_num_threads());
+    pill_core::info!("Rayon threads: {}", pill_core::rayon::current_num_threads());
 
     // Register all component types before use
     engine.world_mut().register_component::<Transform>();
