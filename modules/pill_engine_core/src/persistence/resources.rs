@@ -128,7 +128,7 @@ impl World {
         // reload and across a process.
         let type_name = T::shared_name()
             .map(str::to_owned)
-            .unwrap_or_else(|| std::any::type_name::<T>().to_owned());
+            .unwrap_or_else(|| crate::type_names::stable_type_name::<T>().to_owned());
         self.register_persistable_resource_as::<T>(&type_name);
     }
 
@@ -432,7 +432,7 @@ where
         .unwrap_or_else(|_| "<schema-serialization-failed>".to_string());
 
     let mut hasher = DefaultHasher::new();
-    std::any::type_name::<T>().hash(&mut hasher);
+    crate::type_names::stable_type_name::<T>().hash(&mut hasher);
     std::mem::size_of::<T>().hash(&mut hasher);
     normalized_schema_string.hash(&mut hasher);
     hasher.finish()

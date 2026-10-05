@@ -64,8 +64,8 @@ impl SystemOwner {
     /// No reload path clears these: the host retires systems with
     /// [`Engine::clear_systems_owned_by`], naming the project or one module,
     /// and an engine-owned system is neither. That is what it is for - the
-    /// function pointer lives in the host's own copy of `pill_engine`, which is
-    /// never unloaded, so there is nothing to retire.
+    /// function pointer lives in `pill_engine_core.dll`, which is never
+    /// unloaded, so there is nothing to retire.
     ///
     /// `u64::MAX` so it cannot collide with [`Self::PROJECT`] or any
     /// [`Self::extension`]; reaching it that way would need 2^64 modules.
@@ -261,9 +261,6 @@ impl Engine {
         // Warm up the Rayon thread pool so the first parallel batch
         // does not pay thread-spawning costs (can be 1-10ms on some OS).
         rayon::broadcast(|_ctx| {});
-
-        // Report detected system hardware so users can tune config.
-        crate::config::print_system_specs();
 
         // Print the active parallel-iteration knobs.
         crate::config::print_parallel_config();

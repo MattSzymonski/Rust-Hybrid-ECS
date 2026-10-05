@@ -97,34 +97,47 @@ static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(windows)]
 const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
-/// Whether a module build produced an engine dylib different from the one the
-/// host has mapped, which means the module must load against its own copy.
+/// The engine's shared libraries, by file stem: every module, project and
+/// patch imports both, and each exists once per process unless a module needs
+/// the isolated copies (see [`engine_dylib_needs_isolation`]).
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 2] = ["pill_core", "pill_engine_core"];
+
+/// Whether a module build produced engine dylibs different from the ones the
+/// host has mapped, which means the module must load against its own copies.
 ///
-/// When the two are byte-identical (a plain CLI host whose feature closure
+/// When every pair is byte-identical (a plain CLI host whose feature closure
 /// matches the module build) the module keeps loading the host's single
-/// instance; only a host whose graph unions different features onto the shared
-/// engine crates (a GUI frontend) needs the isolated copy.
+/// instances; only a host whose graph unions different features onto the
+/// shared engine crates (a GUI frontend) needs the isolated copies. The two
+/// dylibs are isolated together: a module's `pill_engine_core.dll` imports
+/// `pill_core.dll`, and both must come from the same build.
 fn engine_dylib_needs_isolation(workspace_root: &Path) -> bool {
-    let Some(module_engine) = module_world_engine_dylib(workspace_root) else {
-        return false;
-    };
-    let host_engine = workspace_root
-        .join(crate::config::host_target_directory())
-        .join("pill_core.dll");
-    if !host_engine.is_file() {
-        return true;
-    }
-    !files_equal(&module_engine, &host_engine)
+    first_engine_dylib_mismatch(workspace_root).is_some()
+}
+
+/// The first engine dylib whose module-world copy differs from the host's, as
+/// `(host copy, module copy)`; `None` when every module-world copy matches the
+/// host's or no module build has produced one.
+fn first_engine_dylib_mismatch(workspace_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    ENGINE_DYLIB_STEMS.iter().find_map(|stem| {
+        let module_engine = module_world_engine_dylib(workspace_root, stem)?;
+        let host_engine = workspace_root
+            .join(crate::config::host_target_directory())
+            .join(format!("{stem}.dll"));
+        let matches = host_engine.is_file() && files_equal(&module_engine, &host_engine);
+        (!matches).then_some((host_engine, module_engine))
+    })
 }
 
 /// Explain a load failure that an engine-dylib mismatch accounts for.
 ///
 /// A missing export is almost never a missing export. The usual cause is that
-/// the artifact was linked against one `pill_core.dll` and is being loaded
-/// against another: cargo folds a dependency's resolved features into the
-/// dependent's `-C metadata`, that hash is part of every symbol name the dylib
-/// exports, and two builds that resolve different dependency graphs therefore
-/// disagree about names the loader can only report as "procedure not found".
+/// the artifact was linked against one `pill_core.dll` or
+/// `pill_engine_core.dll` and is being loaded against another: cargo folds a
+/// dependency's resolved features into the dependent's `-C metadata`, that hash
+/// is part of every symbol name the dylib exports, and two builds that resolve
+/// different dependency graphs therefore disagree about names the loader can
+/// only report as "procedure not found".
 ///
 /// Passing the original error through unchanged leaves the reader with
 /// `os error 127` and nothing to act on, so a failure that coincides with two
@@ -140,16 +153,19 @@ fn diagnose_load_failure(
     if !matches!(error, LibraryError::LoadFailed { .. }) {
         return error;
     }
-    let Some(module_engine) = module_world_engine_dylib(workspace_root) else {
+    // Every pair agrees, so whatever failed is not this.
+    let Some((host_engine, module_engine)) = first_engine_dylib_mismatch(workspace_root) else {
         return error;
     };
-    let host_engine = workspace_root
-        .join(crate::config::host_target_directory())
-        .join("pill_core.dll");
-    if host_engine.is_file() && files_equal(&module_engine, &host_engine) {
-        // The two agree, so whatever failed is not this.
-        return error;
-    }
+    // Differing bytes are not proof: two builds of one graph can still differ,
+    // and then the real cause is in the loader's own message, which the
+    // returned error replaces.
+    warn!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = module_name,
+        error = %error,
+        "load failed while the engine dylibs differ; the loader reported this"
+    );
     LibraryError::EngineDylibMismatch {
         subject: module_name.to_string(),
         host_engine: host_engine.display().to_string(),
@@ -157,48 +173,52 @@ fn diagnose_load_failure(
     }
 }
 
-/// Copy the module-world engine dylib into `directory` so a module loaded from
-/// there resolves it co-located instead of the host's copy.
+/// Copy the module-world engine dylibs into `directory` so a module loaded
+/// from there resolves them co-located instead of the host's copies.
 fn stage_module_engine_dylib(workspace_root: &Path, directory: &Path) {
-    let Some(source) = module_world_engine_dylib(workspace_root) else {
-        return;
-    };
     if std::fs::create_dir_all(directory).is_err() {
         return;
     }
-    let _ = std::fs::copy(&source, directory.join("pill_core.dll"));
+    for stem in ENGINE_DYLIB_STEMS {
+        let Some(source) = module_world_engine_dylib(workspace_root, stem) else {
+            continue;
+        };
+        let _ = std::fs::copy(&source, directory.join(format!("{stem}.dll")));
 
-    // Cargo stages the engine DLL in `target/hot`, but keeps its PDB in the
-    // private module artifact directory alongside the other host-spawned
-    // outputs. Keep the engine's symbols beside the co-located DLL too.
-    let direct_symbol = source.with_extension("pdb");
-    let artifact_symbol = workspace_root
-        .join(crate::config::module_build_artifact_directory())
-        .join("pill_core.pdb");
-    let symbol_source = if direct_symbol.is_file() {
-        direct_symbol
-    } else {
-        artifact_symbol
-    };
-    if symbol_source.is_file() {
-        let symbol_target = directory.join("pill_core.pdb");
-        let _ = std::fs::hard_link(&symbol_source, &symbol_target)
-            .or_else(|_| std::fs::copy(symbol_source, symbol_target).map(|_| ()));
+        // Cargo stages the engine DLL in `target/hot`, but keeps its PDB in the
+        // private module artifact directory alongside the other host-spawned
+        // outputs. Keep the engine's symbols beside the co-located DLL too.
+        let direct_symbol = source.with_extension("pdb");
+        let artifact_symbol = workspace_root
+            .join(crate::config::module_build_artifact_directory())
+            .join(format!("{stem}.pdb"));
+        let symbol_source = if direct_symbol.is_file() {
+            direct_symbol
+        } else {
+            artifact_symbol
+        };
+        if symbol_source.is_file() {
+            let symbol_target = directory.join(format!("{stem}.pdb"));
+            let _ = std::fs::hard_link(&symbol_source, &symbol_target)
+                .or_else(|_| std::fs::copy(symbol_source, symbol_target).map(|_| ()));
+        }
     }
 }
 
-/// Locate the engine dylib the module build produced: the staged hot-load copy
-/// when a build has run, otherwise the one still in the private build tree.
-fn module_world_engine_dylib(workspace_root: &Path) -> Option<PathBuf> {
+/// Locate the engine dylib `stem` the module build produced: the staged
+/// hot-load copy when a build has run, otherwise the one still in the private
+/// build tree.
+fn module_world_engine_dylib(workspace_root: &Path, stem: &str) -> Option<PathBuf> {
+    let file_name = format!("{stem}.dll");
     let staged = workspace_root
         .join(crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY)
-        .join("pill_core.dll");
+        .join(&file_name);
     if staged.is_file() {
         return Some(staged);
     }
     let built = workspace_root
         .join(crate::config::module_build_artifact_directory())
-        .join("pill_core.dll");
+        .join(&file_name);
     built.is_file().then_some(built)
 }
 
@@ -633,14 +653,16 @@ impl NativeLibrary {
         }
         .inspect_err(|_| {
             // The guard removes the copy when this function returns the error.
-            // The staged engine dylib it would have loaded against needs the
+            // The staged engine dylibs it would have loaded against need the
             // same treatment when this attempt asked for isolation, because
             // nothing else deletes it for the life of the process. A dylib a
             // live library maps cannot be deleted on Windows, so a removal
             // failure is ignored: another module may already be using it, and
             // the next attempt stages a fresh copy either way.
             if isolated_engine {
-                let _ = std::fs::remove_file(temporary_directory.join("pill_core.dll"));
+                for stem in ENGINE_DYLIB_STEMS {
+                    let _ = std::fs::remove_file(temporary_directory.join(format!("{stem}.dll")));
+                }
             }
         })
         .map_err(|error| diagnose_load_failure(error, workspace_root, module_name))?;

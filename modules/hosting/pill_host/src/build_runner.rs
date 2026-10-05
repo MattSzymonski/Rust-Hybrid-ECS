@@ -415,19 +415,31 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         // two unify alike by accident. That mirror is gone now that the renderer
         // has left `pill_engine`, so the anchor has to carry the feature
         // explicitly. Any future host-level feature that changes the dependency
-        // graph belongs here for the same reason.
-        if cfg!(feature = "rendering") {
-            command.arg("--features").arg(format!("{anchor}/rendering"));
-        }
-        // Profiling turns on `pill_core`'s Tracy dependencies, which changes
-        // its metadata hash exactly as `rendering` does, so a profiling host
-        // could not load a single module built without it.
-        if cfg!(feature = "profiling-fine") {
-            command
-                .arg("--features")
-                .arg(format!("{anchor}/profiling-fine"));
-        } else if cfg!(feature = "profiling") {
-            command.arg("--features").arg(format!("{anchor}/profiling"));
+        // graph belongs in `host_posture_features` for the same reason.
+        //
+        // The anchor's default features are dropped first. `pill_standalone`
+        // defaults to `hot_patch`, so a host built without it (a reload-only
+        // run) would otherwise get modules whose engine resolved
+        // `pill_engine/hot_patch`: harmless while every module embedded its
+        // own engine, but `pill_engine_core.dll` is shared now, its symbol
+        // names hash its features, and such a module cannot load. The flag
+        // applies to every package selected here, which is safe because
+        // modules and generated projects declare no default features.
+        if let Some(declared) = declared_features(workspace_root, &anchor) {
+            command.arg("--no-default-features");
+            for feature in host_posture_features() {
+                if declared.iter().any(|name| name == feature) {
+                    command.arg("--features").arg(format!("{anchor}/{feature}"));
+                }
+            }
+        } else {
+            // The anchor's manifest was not found: keep its defaults and add
+            // what the host is known to need.
+            for feature in host_posture_features() {
+                if feature != "dev" && feature != "hot_patch" {
+                    command.arg("--features").arg(format!("{anchor}/{feature}"));
+                }
+            }
         }
     }
     // Mirror the host's own `--target` when a launcher (the dioxus CLI) built
@@ -446,6 +458,79 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
             .arg("--config")
             .arg(format!("profile.{profile}.inherits=\"dev\""));
     }
+}
+
+/// The frontend features the running host was built with, as the names every
+/// host frontend declares (`pill_standalone`, the editor): its posture (`dev`,
+/// `hot_patch`), `rendering`, and profiling.
+///
+/// Profiling turns on `pill_core`'s Tracy dependencies, which changes its
+/// metadata hash exactly as `rendering` does, so a profiling host could not
+/// load a single module built without it.
+fn host_posture_features() -> Vec<&'static str> {
+    let mut features = vec!["dev"];
+    if cfg!(feature = "hot_patch") {
+        features.push("hot_patch");
+    }
+    if cfg!(feature = "rendering") {
+        features.push("rendering");
+    }
+    if cfg!(feature = "profiling-fine") {
+        features.push("profiling-fine");
+    } else if cfg!(feature = "profiling") {
+        features.push("profiling");
+    }
+    features
+}
+
+/// The feature names `package` declares, read from its manifest among the
+/// workspace members one or two directories below `workspace_root`; `None`
+/// when no such manifest is found.
+///
+/// Cached per package: the members do not change while a host runs.
+fn declared_features(workspace_root: &Path, package: &str) -> Option<Vec<String>> {
+    static DECLARED: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<Vec<String>>>>,
+    > = OnceLock::new();
+    let mut cache = DECLARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache
+        .entry(package.to_string())
+        .or_insert_with(|| read_declared_features(workspace_root, package))
+        .clone()
+}
+
+/// Uncached [`declared_features`]: scans `*/Cargo.toml` and `*/*/Cargo.toml`
+/// under `workspace_root` for the package named `package`.
+fn read_declared_features(workspace_root: &Path, package: &str) -> Option<Vec<String>> {
+    let mut manifests = Vec::new();
+    for first in std::fs::read_dir(workspace_root).ok()?.flatten() {
+        let directory = first.path();
+        manifests.push(directory.join("Cargo.toml"));
+        if let Ok(children) = std::fs::read_dir(&directory) {
+            manifests.extend(
+                children
+                    .flatten()
+                    .map(|child| child.path().join("Cargo.toml")),
+            );
+        }
+    }
+    manifests.into_iter().find_map(|manifest| {
+        let text = std::fs::read_to_string(&manifest).ok()?;
+        let document = text.parse::<toml_edit::DocumentMut>().ok()?;
+        let name = document.get("package")?.get("name")?.as_str()?;
+        if name != package {
+            return None;
+        }
+        let features = document
+            .get("features")
+            .and_then(|item| item.as_table_like())
+            .map(|table| table.iter().map(|(key, _)| key.to_string()).collect())
+            .unwrap_or_default();
+        Some(features)
+    })
 }
 
 // =============================================================================
@@ -1373,31 +1458,36 @@ fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildErr
     Ok(())
 }
 
-/// Stage the module-world engine dylib beside the hot-load copies.
+/// Stage the module-world engine dylibs beside the hot-load copies.
 ///
-/// Every native module and project imports `pill_core.dll`. The engine dylib a
-/// host-spawned build produces (in the private module build tree) can differ
-/// from the one the host binary itself maps from the regular target
-/// directory, since a GUI frontend unions extra features onto shared crates;
-/// the loader then gives modules their matching copy. When they are
-/// byte-identical (a plain CLI host) this staged copy simply stays unused and
-/// the loader keeps the host's single instance.
+/// Every native module and project imports `pill_core.dll` and
+/// `pill_engine_core.dll`. The engine dylibs a host-spawned build produces (in
+/// the private module build tree) can differ from the ones the host binary
+/// itself maps from the regular target directory, since a GUI frontend unions
+/// extra features onto shared crates; the loader then gives modules their
+/// matching copies. When they are byte-identical (a plain CLI host) these
+/// staged copies simply stay unused and the loader keeps the host's single
+/// instances.
 fn stage_engine_dylib(workspace_root: &Path) {
-    let source = workspace_root
-        .join(crate::config::module_build_artifact_directory())
-        .join("pill_core.dll");
-    if !source.is_file() {
-        return;
-    }
-    let destination = workspace_root
-        .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
-        .join("pill_core.dll");
-    if let Err(error) = std::fs::copy(source, destination) {
-        warn!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            error = %error,
-            "could not stage the module-world engine dylib into the hot-load directory"
-        );
+    for stem in crate::native_library::ENGINE_DYLIB_STEMS {
+        let file_name = format!("{stem}.dll");
+        let source = workspace_root
+            .join(crate::config::module_build_artifact_directory())
+            .join(&file_name);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = workspace_root
+            .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+            .join(&file_name);
+        if let Err(error) = std::fs::copy(source, destination) {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                error = %error,
+                dylib = %file_name,
+                "could not stage the module-world engine dylib into the hot-load directory"
+            );
+        }
     }
 }
 

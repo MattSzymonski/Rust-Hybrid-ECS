@@ -76,7 +76,9 @@ DEFAULT_PACKAGE = "pill_standalone"
 
 # The file whose mtime is bumped to force an incremental rebuild. Only the
 # timestamp changes - the file's bytes are never touched.
-INCREMENTAL_TOUCH_FILE = MODULES_ROOT / "pill_engine" / "src" / "lib.rs"
+# The engine core rather than the `pill_engine` facade, which re-exports it:
+# touching the core rebuilds the engine itself, as this case always measured.
+INCREMENTAL_TOUCH_FILE = MODULES_ROOT / "pill_engine_core" / "src" / "lib.rs"
 
 # Host startup can include a full module build after a clean, so it gets a
 # much larger budget than the reload suites use.
@@ -90,7 +92,7 @@ CASE_DESCRIPTIONS = {
         "target directory. Type-checking only, no codegen."
     ),
     "incremental_check": (
-        "cargo check after bumping the mtime of pill_engine/src/lib.rs, so "
+        "cargo check after bumping the mtime of pill_engine_core/src/lib.rs, so "
         "the engine and everything depending on it re-check."
     ),
     "clean_build": (
@@ -98,7 +100,7 @@ CASE_DESCRIPTIONS = {
         "target directory. This is the true cold compile."
     ),
     "incremental_build": (
-        "cargo build after bumping the mtime of pill_engine/src/lib.rs - the "
+        "cargo build after bumping the mtime of pill_engine_core/src/lib.rs - the "
         "edit-rebuild loop a developer sits through."
     ),
     "startup_cold": (

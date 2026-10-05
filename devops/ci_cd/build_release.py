@@ -9,9 +9,10 @@
 #   `cargo build --release` cannot do.
 #
 #   The obstacle is `-C prefer-dynamic` in `modules/.cargo/config.toml`. It is
-#   there so the host executable and every extension share one copy of
-#   `pill_engine`, which is what keeps its statics, thread-locals and tracing
-#   dispatcher single-instance across the DLL boundary. A release binary links
+#   there so the host executable and every extension share one copy of the
+#   engine's dylibs (`pill_core`, `pill_engine_core`), which is what keeps
+#   their statics, thread-locals and tracing dispatcher single-instance across
+#   the DLL boundary. A release binary links
 #   everything into one image and needs none of that - and rustc refuses
 #   `-C prefer-dynamic` together with the release profile's `lto = "fat"` when
 #   targeting Windows, so the flag has to go for a release build to happen at
@@ -586,6 +587,7 @@ def render_tree_lines(root_label: str, branches: list) -> list:
 # treated as an extension.
 ENGINE_LIBRARIES = {
     "pill_engine",
+    "pill_engine_core",
     "pill_core",
     "pill_host",
     "pill_runtime",

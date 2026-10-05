@@ -118,6 +118,17 @@ STEPS: List[Step] = [
         quick=True,
     ),
     Step(
+        "engine-layout",
+        "Engine layout (the core never links the facade or reads a registry)",
+        # The self test first proves the checker still catches each break.
+        [
+            [PYTHON, "devops/tests/test_engine_layout.py", "--self-test"],
+            [PYTHON, "devops/tests/test_engine_layout.py"],
+        ],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
+    Step(
         "asset-metadata",
         "Asset metadata (orphans, duplicate guids)",
         # The self test first proves the checker still catches each mistake.
@@ -127,6 +138,22 @@ STEPS: List[Step] = [
         ],
         working_directory=REPOSITORY_ROOT,
         quick=True,
+    ),
+    Step(
+        "engine-exports",
+        "Engine dylib export counts (Windows limit 65,535)",
+        # Builds the two engine dylibs, then reads their export directories.
+        [
+            ["cargo", "build", "-p", "pill_core", "-p", "pill_engine_core"],
+            [PYTHON, "../devops/tests/test_engine_exports.py", "--self-test"],
+            [PYTHON, "../devops/tests/test_engine_exports.py"],
+        ],
+    ),
+    Step(
+        "engine-feature-drift",
+        "Engine dylib feature drift (host vs module and project builds)",
+        [[PYTHON, "devops/tests/test_engine_feature_drift.py"]],
+        working_directory=REPOSITORY_ROOT,
     ),
     Step("doc", "Documentation", [["cargo", "doc", "--workspace", "--no-deps"]]),
     Step(

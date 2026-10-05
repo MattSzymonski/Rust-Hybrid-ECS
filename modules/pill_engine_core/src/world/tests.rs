@@ -2622,7 +2622,7 @@ fn registered_components_lists_every_type_sorted() {
 /// A tiny helper to get a component's registered type name without
 /// depending on the registry ordering in this test module.
 fn type_name_of<T: 'static>() -> String {
-    std::any::type_name::<T>().to_string()
+    crate::type_names::stable_type_name::<T>().to_string()
 }
 
 // -------------------------------------------------------------------------
@@ -2825,7 +2825,9 @@ fn recycled_bit_does_not_alias_archetypes() {
         .build()
         .unwrap();
 
-    let dropped = world.drop_forgotten_components(&[std::any::type_name::<Velocity>().to_string()]);
+    let dropped = world.drop_forgotten_components(&[
+        crate::type_names::stable_type_name::<Velocity>().to_string(),
+    ]);
     assert_eq!(dropped, 1, "the entity's velocity row was rehomed out");
     assert_eq!(
         world.component_registry().get_bit(&velocity_id),

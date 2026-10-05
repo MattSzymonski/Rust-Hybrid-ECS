@@ -23,11 +23,12 @@
 //! Renderer-specific mesh, camera and material contracts live in the rendering
 //! extension. These general gameplay data types remain usable without it.
 //!
-//! The types are a deliberately shared ABI. `pill_engine` is an rlib, so every
-//! binary that links it gets its own `TypeId` for these structs; consumers
-//! that must reach another binary's rows resolve them by stable type name and
-//! verified `repr(C)` size instead of by `TypeId`. Keeping the definition in
-//! one crate is what makes that name agree across every artifact.
+//! The types are a deliberately shared ABI. Consumers that must reach another
+//! binary's rows resolve them by stable type name and verified `repr(C)` size
+//! rather than by `TypeId`, which was distinct per binary while every DLL
+//! embedded its own copy of the engine, and which separately built artifacts
+//! still cannot rely on. Keeping the definition in one crate is what makes that
+//! name agree across every artifact.
 //!
 //! [`TransformComponent`] came here from the renderer's data crate, because a
 //! placement is not a rendering concept. It keeps the shared name it was pinned

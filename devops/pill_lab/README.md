@@ -223,7 +223,7 @@ Four separate concepts, never conflated:
 | Case | What it is |
 | --- | --- |
 | `clean_check` / `clean_build` | after a targeted clean of the workspace's own packages |
-| `incremental_check` / `incremental_build` | after an mtime bump of `pill_engine/src/lib.rs` |
+| `incremental_check` / `incremental_build` | after an mtime bump of `pill_engine_core/src/lib.rs` |
 | `startup_cold` / `startup_warm` | host launch to "Entering project loop", with modules to build and on the up-to-date fast path |
 | `engine_init` | the `pill_engine` smoke binary end to end (spawn + `Engine::new` + print) |
 

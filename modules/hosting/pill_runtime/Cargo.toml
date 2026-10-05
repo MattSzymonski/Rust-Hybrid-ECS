@@ -23,6 +23,9 @@ pill_engine = { path = "../../pill_engine" }
 # The renderer contract - the backend trait, the frame, window handles as data.
 pill_renderer_api = { path = "../pill_renderer_api" }
 tracing = "0.1"
+# The start-up system report (`system_specs`). Here, not in the engine core:
+# see that module for why.
+sysinfo = "0.39"
 metrics = { version = "0.24", optional = true }
 
 [features]

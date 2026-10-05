@@ -103,29 +103,26 @@ const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
 // `increment_change_tick` serves it without touching the shared counter.
 //
 // In sequential mode both overrides stay None, so queries fall back to the
-// shared world fields - no thread-local overhead.
+// shared world fields.
+//
+// The thread-locals live in `pill_core::system_ticks`, not here. The scheduler
+// writes them from the host's engine code, but a system's queries read them
+// from the DLL that declares the system (`Query` is generic). With the
+// thread-locals in this rlib each DLL had its own copy, and a module's
+// systems never saw the scheduler's values.
 
-thread_local! {
-    /// Each thread's private "my system last ran at tick ___" value.
-    /// `None` means "not in a parallel batch - use the world field."
-    static PER_THREAD_LAST_RUN_TICK: std::cell::Cell<Option<Tick>> =
-        const { std::cell::Cell::new(None) };
-
-    /// The tick reserved for the system running on this thread.
-    /// `None` means "bump the shared counter"; `Some` is the one value the
-    /// engine allocated for this batch member before dispatch.
-    static PER_THREAD_THIS_RUN_TICK: std::cell::Cell<Option<Tick>> =
-        const { std::cell::Cell::new(None) };
-}
-
+/// This thread's "my system last ran at tick ___" value; `None` outside a
+/// parallel batch.
 #[inline]
 fn per_thread_last_run_tick() -> Option<Tick> {
-    PER_THREAD_LAST_RUN_TICK.with(|cell| cell.get())
+    pill_core::system_ticks::last_run_tick().map(Tick::new)
 }
 
+/// The tick the engine reserved for the system running on this thread;
+/// `None` means "bump the shared counter".
 #[inline]
 fn per_thread_this_run_tick() -> Option<Tick> {
-    PER_THREAD_THIS_RUN_TICK.with(|cell| cell.get())
+    pill_core::system_ticks::this_run_tick().map(Tick::new)
 }
 
 /// Whether a size and alignment can describe a foreign resource's allocation.
@@ -145,14 +142,14 @@ fn is_valid_foreign_layout(size: usize, align: usize) -> bool {
 /// caller can restore it when the system finishes (RAII-style).
 #[inline]
 pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> {
-    PER_THREAD_LAST_RUN_TICK.with(|cell| cell.replace(value))
+    pill_core::system_ticks::replace_last_run_tick(value.map(Tick::get)).map(Tick::new)
 }
 
 /// Store the tick reserved for the system about to run on this thread,
 /// returning the old value so the caller can restore it afterwards.
 #[inline]
 pub(crate) fn set_per_thread_this_run_tick(value: Option<Tick>) -> Option<Tick> {
-    PER_THREAD_THIS_RUN_TICK.with(|cell| cell.replace(value))
+    pill_core::system_ticks::replace_this_run_tick(value.map(Tick::get)).map(Tick::new)
 }
 
 // =============================================================================
@@ -498,6 +495,13 @@ pub struct World {
     /// into dotted leaf rows (`World::record_component_field_layout`), so a
     /// nested colour or vector is editable channel by channel.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
+    /// Finds a `#[derive(PillMirror)]` value type's layout while a layout is
+    /// recorded, so its nested fields expand. Installed by the facade's
+    /// `register_all_components` for the duration of its loop, and `None`
+    /// otherwise: the value types belong to the registering DLL, and a
+    /// resolver left installed would point into it after it unloads.
+    pub(crate) value_type_layout_resolver:
+        Option<crate::component_registry::ValueTypeLayoutResolver>,
     /// First component-registration failure of the current init pass, if any.
     ///
     /// Set when the 128-type ceiling is hit (or any other registry error
@@ -551,6 +555,7 @@ impl World {
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
             component_field_layouts: HashMap::new(),
+            value_type_layout_resolver: None,
             registration_error: None,
         }
     }
