@@ -85,8 +85,9 @@ pub use tracing;
 
 /// The `rayon` crate, re-exported so every DLL runs parallel work on the one
 /// global thread pool inside `pill_core.dll`, which no reload unmaps. Use
-/// it through this path; a direct `rayon` dependency would link a second
-/// copy, with a pool of its own, into the DLL that has it.
+/// it through this path. A module must not build a pool of its own
+/// (`ThreadPoolBuilder::build`): its threads would park in the module's
+/// code, which a reload unmaps.
 pub use rayon;
 
 // Permanent logging macros. `error` coexists with the `pub mod error` module:

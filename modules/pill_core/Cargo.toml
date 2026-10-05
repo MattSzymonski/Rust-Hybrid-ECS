@@ -40,8 +40,10 @@ tracing-log = "0.2"
 # single copy, statics and all. Rayon's global thread pool is such a
 # static. With a copy per DLL, every project generation started a pool of
 # its own whose idle workers stayed parked in that DLL's code, and the host
-# crashed when the reload graveyard unmapped it. Nothing else may depend on
-# `rayon` directly.
+# crashed when the reload graveyard unmapped it. A crate that names `rayon`
+# itself still gets this copy (rustc links a crate once, and this dylib
+# already holds it), but only while the versions match: keep a second
+# Rayon major version out of the graph.
 rayon = "1.10"
 # The default `tracing-log` feature would auto-bridge `log` inside
 # `SubscriberInitExt::init`; the bridge is owned explicitly in the telemetry
