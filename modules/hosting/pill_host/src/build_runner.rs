@@ -45,7 +45,14 @@ use crate::{ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig};
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the build watchdog checks for completion and cancellation.
-const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+///
+/// Small on purpose: a fresh module build answers in a few hundred ms, so a
+/// coarse interval becomes dead time on every module's load - a hundred ms
+/// here is a hundred ms per module, and a module set of any size multiplies
+/// it. The check is a `try_wait` plus one memory sample, cheap enough to run
+/// this often, and the finer granularity also makes a cancellation land
+/// sooner during a reload.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Subdirectory, relative to the workspace root, where a host-spawned build
 /// writes its freshly compiled artifacts.
@@ -594,13 +601,13 @@ fn read_declared_features(workspace_root: &Path, package: &str) -> Option<Vec<St
 /// is a terminal, because cargo turns it off for a pipe.
 #[cfg(feature = "hot_patch")]
 struct VerboseCapture {
-    /// Crate name to look for, which is the module's name.
-    crate_name: String,
-    /// Workspace the build runs in, so the flags cache lands in that
+    /// Crate names to look for: the modules one invocation builds.
+    crate_names: Vec<String>,
+    /// Workspace the build runs in, so the flags caches land in that
     /// workspace's own build tree rather than a shared temporary directory.
     workspace_root: PathBuf,
-    /// Reader thread and the line it found, once joined.
-    reader: Option<std::thread::JoinHandle<Option<crate::hot_patch::CargoRustcLine>>>,
+    /// Reader thread and the lines it found, once joined.
+    reader: Option<std::thread::JoinHandle<Vec<(String, crate::hot_patch::CargoRustcLine)>>>,
 }
 
 #[cfg(feature = "hot_patch")]
@@ -608,14 +615,15 @@ impl VerboseCapture {
     /// Turn `command` into a verbose, pipe-reading build, for cargo only.
     ///
     /// Returns `None` for a non-cargo build (the managed backend's `dotnet`),
-    /// which has no rustc line to harvest and must keep its inherited streams.
+    /// which has no rustc line to harvest and must keep its inherited streams,
+    /// and when nothing asked for a capture.
     fn arm(
         command: &mut Command,
         program: &str,
-        name: &str,
+        names: &[&str],
         workspace_root: &Path,
     ) -> Option<Self> {
-        if program != "cargo" {
+        if program != "cargo" || names.is_empty() {
             return None;
         }
         use std::io::IsTerminal;
@@ -624,7 +632,7 @@ impl VerboseCapture {
         }
         command.arg("-v").stderr(std::process::Stdio::piped());
         Some(Self {
-            crate_name: name.to_string(),
+            crate_names: names.iter().map(|name| (*name).to_string()).collect(),
             workspace_root: workspace_root.to_path_buf(),
             reader: None,
         })
@@ -635,12 +643,12 @@ impl VerboseCapture {
         let Some(stderr) = child.stderr.take() else {
             return self;
         };
-        let crate_name = self.crate_name.clone();
+        let crate_names = self.crate_names.clone();
         self.reader = std::thread::Builder::new()
             .name("pill-build-capture".to_string())
             .spawn(move || {
                 use std::io::{BufRead, BufReader, Write};
-                let mut found = None;
+                let mut found: Vec<(String, crate::hot_patch::CargoRustcLine)> = Vec::new();
                 let mut reader = BufReader::new(stderr);
                 let mut line = Vec::new();
                 // Read bytes rather than `lines()`: compiler output is not
@@ -648,8 +656,17 @@ impl VerboseCapture {
                 // error must not truncate the build log.
                 while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
                     let text = String::from_utf8_lossy(&line);
-                    if found.is_none() {
-                        found = crate::hot_patch::parse_rustc_line(&text, &crate_name);
+                    if found.len() < crate_names.len() {
+                        for name in &crate_names {
+                            if found.iter().any(|(found_name, _)| found_name == name) {
+                                continue;
+                            }
+                            if let Some(found_line) =
+                                crate::hot_patch::parse_rustc_line(&text, name)
+                            {
+                                found.push((name.clone(), found_line));
+                            }
+                        }
                     }
                     if !is_verbose_only_line(&text) {
                         let _ = std::io::stderr().write_all(&line);
@@ -663,32 +680,42 @@ impl VerboseCapture {
         self
     }
 
-    /// Join the reader and cache whatever it found.
+    /// Join the reader and cache every line it found.
     ///
     /// A build that recompiled nothing prints no invocation, which is not a
     /// failure: the cached line from when the crate WAS compiled still
     /// describes it, and the patch pipeline's own freshness check decides that.
-    fn finish(self, name: &str, build_command: &[String]) {
+    /// `commands` pairs every requested name with the build command its flags
+    /// cache records.
+    fn finish(self, commands: &[(&str, &[String])]) {
         let Some(reader) = self.reader else {
             return;
         };
-        let Ok(Some(line)) = reader.join() else {
+        let Ok(found) = reader.join() else {
             return;
         };
-        let cache = crate::hot_patch::flags_cache_path(&self.workspace_root, name);
-        match line.save(&cache, build_command) {
-            Ok(()) => debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = name,
-                cache = %cache.display(),
-                "captured the patch compiler flags from this build"
-            ),
-            Err(error) => debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = name,
-                error = %error,
-                "could not cache the patch compiler flags; the next patch will re-capture"
-            ),
+        for (name, line) in found {
+            let Some((_, build_command)) = commands
+                .iter()
+                .find(|(command_name, _)| *command_name == name)
+            else {
+                continue;
+            };
+            let cache = crate::hot_patch::flags_cache_path(&self.workspace_root, &name);
+            match line.save(&cache, build_command) {
+                Ok(()) => debug!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = name.as_str(),
+                    cache = %cache.display(),
+                    "captured the patch compiler flags from this build"
+                ),
+                Err(error) => debug!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = name.as_str(),
+                    error = %error,
+                    "could not cache the patch compiler flags; the next patch will re-capture"
+                ),
+            }
         }
     }
 }
@@ -1091,7 +1118,9 @@ fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
 ///
 /// With the `hot_patch` feature this also harvests the compiler flags the fast
 /// patch pipeline needs, out of the build it was going to run anyway - see
-/// [`VerboseCapture`].
+/// [`VerboseCapture`]; `capture_entries` names the crates to harvest and pairs
+/// each with the build command its flags cache records. An empty or absent
+/// list skips the harvest and keeps the child's streams inherited.
 ///
 /// # Errors
 ///
@@ -1102,6 +1131,7 @@ pub(crate) fn run_build_command(
     name: &str,
     build_command: &[String],
     build_environment: &[(String, String)],
+    capture_entries: Option<&[(&str, &[String])]>,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<(), BuildError> {
     // Step 1: Split the configured command into its executable and arguments.
@@ -1135,7 +1165,15 @@ pub(crate) fn run_build_command(
     // Ask this build to say which rustc invocation it used, so the fast patch
     // pipeline never has to run a build of its own to find out.
     #[cfg(feature = "hot_patch")]
-    let capture = VerboseCapture::arm(&mut command, program, name, workspace_root);
+    let capture_names: Vec<&str> = capture_entries
+        .into_iter()
+        .flatten()
+        .map(|(captured_name, _)| *captured_name)
+        .collect();
+    #[cfg(feature = "hot_patch")]
+    let capture = VerboseCapture::arm(&mut command, program, &capture_names, workspace_root);
+    #[cfg(not(feature = "hot_patch"))]
+    let _ = capture_entries;
     // The tree is created before the spawn so the child can never run outside
     // it, and joined immediately after: a process started between the two
     // would survive a cancellation of the rest.
@@ -1205,7 +1243,7 @@ pub(crate) fn run_build_command(
     // with flags that never produced the artifact now on disk.
     #[cfg(feature = "hot_patch")]
     if let Some(capture) = capture {
-        capture.finish(name, build_command);
+        capture.finish(capture_entries.unwrap_or(&[]));
     }
     analytics::record_build_command(
         name,
@@ -1289,6 +1327,7 @@ pub(crate) fn build_csharp_compiler(workspace_root: &Path) -> Result<PathBuf, Bu
         crate::config::CSHARP_COMPILER_ASSEMBLY_NAME,
         &build_command,
         &[],
+        None,
         None,
     )?;
     if !output_path.exists() {
@@ -1387,6 +1426,7 @@ pub(crate) fn build_project_module(
         &config.name,
         &build_command,
         &config.build_environment,
+        Some(&[(config.name.as_str(), build_command.as_slice())]),
         cancel_flag,
     )?;
 
@@ -1768,6 +1808,102 @@ fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
     }
 }
 
+/// Extension names whose artifacts one batch invocation validated for this
+/// process, consumed by the module's own load so it skips a second build.
+static BATCH_VALIDATED_EXTENSIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+/// Build every extension wrapper in one cargo invocation.
+///
+/// Every module build otherwise pays cargo's fixed cost - process start,
+/// workspace resolve, fingerprint scan - once per module, and that cost grows
+/// with the workspace, so a project with hundreds of modules would restart
+/// cargo hundreds of times per start. The wrappers differ only in `--package`,
+/// so one invocation selects them all; its flags mirror a single module's
+/// build exactly, which keeps every unit's fingerprints identical to a
+/// per-module build's. The modules it validated skip their own build when
+/// they load (see [`take_batch_validation`]); an edit later still rebuilds a
+/// module on its own, and the first patch of a module the batch recompiled
+/// re-captures its compiler flags on demand.
+///
+/// Feature unification is the one difference from per-module builds: a
+/// selected extension that depends on another selected extension would
+/// receive the union of both feature requests. Independent modules - the
+/// common case, and the case in every project this workspace ships - see no
+/// union at all.
+///
+/// Returns whether the batch ran and validated the modules. A failure is not
+/// an error: the modules then build individually, which keeps per-module
+/// failure reporting exactly as it was.
+pub(crate) fn build_extension_batch(workspace_root: &Path, configs: &[ExtensionConfig]) -> bool {
+    if configs.len() < 2 {
+        return false;
+    }
+    let mut command = vec!["cargo".to_string(), "build".to_string()];
+    for config in configs {
+        command.push("--package".to_string());
+        command.push(config.wrapper_library_name.clone());
+    }
+    command.push("--offline".to_string());
+    command.push("--profile".to_string());
+    command.push(crate::config::host_profile_name().to_string());
+    if crate::config::cargo_timings_enabled() {
+        command.push("--timings".to_string());
+    }
+    if cfg!(feature = "hot_patch") {
+        command.push("--features".to_string());
+        command.push("pill_engine/hot_patch".to_string());
+    }
+    let entries: Vec<(&str, &[String])> = configs
+        .iter()
+        .map(|config| (config.name.as_str(), config.build_command.as_slice()))
+        .collect();
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        modules = configs.len(),
+        "building every extension in one cargo invocation"
+    );
+    match run_build_command(
+        workspace_root,
+        "extension batch",
+        &command,
+        &crate::config::spawned_build_environment(),
+        Some(&entries),
+        None,
+    ) {
+        Ok(()) => {
+            let mut validated = BATCH_VALIDATED_EXTENSIONS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for config in configs {
+                validated.insert(config.name.clone());
+            }
+            true
+        }
+        Err(error) => {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                error = %error,
+                "the batch extension build failed; each module builds on its own"
+            );
+            false
+        }
+    }
+}
+
+/// Whether the batch invocation already validated `name`'s artifact.
+///
+/// Consumed per module: the token belongs to the startup load, so a reload of
+/// the same module builds on its own.
+fn take_batch_validation(name: &str) -> bool {
+    BATCH_VALIDATED_EXTENSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(name)
+}
+
 /// Build one extension and return its expected output artifact.
 ///
 /// Extensions are workspace members, so their output always follows the
@@ -1824,13 +1960,20 @@ pub(crate) fn build_extension(
     // Extensions carry no per-module environment of their own, but they
     // need the same profile-driven `RUSTFLAGS` handling the project gets: an
     // optimized build must not inherit `-C prefer-dynamic`.
-    run_build_command(
-        workspace_root,
-        &config.name,
-        &config.build_command,
-        &crate::config::spawned_build_environment(),
-        cancel_flag,
-    )?;
+    //
+    // One batch invocation may already have built this module with these exact
+    // flags (see [`build_extension_batch`]). The token covers that one startup
+    // load only: a reload finds no token and always builds on its own.
+    if !take_batch_validation(&config.name) {
+        run_build_command(
+            workspace_root,
+            &config.name,
+            &config.build_command,
+            &crate::config::spawned_build_environment(),
+            Some(&[(config.name.as_str(), config.build_command.as_slice())]),
+            cancel_flag,
+        )?;
+    }
 
     // Stage the freshly built wrapper library into the hot-load directory,
     // under the extension's name. The shared per-crate slot may later hold a

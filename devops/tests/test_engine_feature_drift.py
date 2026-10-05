@@ -167,6 +167,27 @@ def spawned_builds(frontend):
             selection += ["--package", anchor_package, "--no-default-features", "--features"]
             selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
         builds[f"module {module}"] = selection
+    # The startup batch invocation selects every wrapper at once (see
+    # `build_runner::build_extension_batch`); its engine resolution must match
+    # the host just like the per-module builds'. Only generated wrappers can
+    # be selected: a host batches exactly the modules it loads, whose wrappers
+    # it wrote on startup.
+    wrappers = [
+        f"host_module_{module}"
+        for module in module_names()
+        if (MODULES / "extensions" / f"host_module_{module}").is_dir()
+    ]
+    if len(wrappers) > 1:
+        batch = []
+        for wrapper in wrappers:
+            batch += ["--package", wrapper]
+        if engine_features:
+            batch += ["--features", ",".join(engine_features)]
+        if anchor:
+            anchor_package, anchor_features = anchor
+            batch += ["--package", anchor_package, "--no-default-features", "--features"]
+            batch += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
+        builds["extension batch"] = batch
     for project in project_names():
         project_features = ["--features", ",".join(engine_features)] if engine_features else []
         selection = ["--package", project, *project_features]
