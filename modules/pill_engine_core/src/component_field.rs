@@ -724,9 +724,11 @@ impl World {
     /// The tag is the path as written at the field site, which is usually an
     /// imported short name (`Color`), so an exact match is tried first and a
     /// unique `::<path>` suffix match second. Candidates are the world's
-    /// registered component layouts and the artifact's `#[derive(PillMirror)]`
-    /// value types. An ambiguous suffix resolves to `None` - an opaque field
-    /// is readable, a wrong one is not.
+    /// registered component layouts and the registering DLL's
+    /// `#[derive(PillMirror)]` value types, reached through the installed
+    /// [`ValueTypeLayoutResolver`](crate::component_registry::ValueTypeLayoutResolver).
+    /// An ambiguous suffix resolves to `None` - an opaque field is readable, a
+    /// wrong one is not.
     fn resolve_nested_layout(&self, path: &str) -> Option<Vec<ComponentFieldDescriptor>> {
         let suffix = format!("::{path}");
 
@@ -751,25 +753,25 @@ impl World {
             return component_hit;
         }
 
-        // Artifact value types, exact match then unique suffix match.
-        let mut value_hit = None;
-        let mut value_suffix_matches = 0usize;
-        for descriptor in crate::component_registry::value_type_descriptors() {
-            if descriptor.type_name == path {
-                return Some(descriptor.fields.to_vec());
-            }
-            if descriptor.type_name.ends_with(&suffix) {
-                value_suffix_matches += 1;
-                if value_suffix_matches == 1 {
-                    value_hit = Some(descriptor.fields.to_vec());
-                }
-            }
-        }
-        if value_suffix_matches == 1 {
-            return value_hit;
-        }
+        // The registering DLL's value types, through the resolver it installed;
+        // it applies the same exact-then-unique-suffix rule.
+        let resolver = self.value_type_layout_resolver?;
+        resolver(path).map(<[ComponentFieldDescriptor]>::to_vec)
+    }
 
-        None
+    /// Install `resolver` as the way value-type layouts are found while
+    /// component layouts are recorded; returns the previous one so the caller
+    /// can restore it.
+    ///
+    /// Called by the facade's `register_all_components` around its loop, with
+    /// the resolver compiled into the registering DLL. Not meant for other
+    /// callers.
+    #[doc(hidden)]
+    pub fn replace_value_type_layout_resolver(
+        &mut self,
+        resolver: Option<crate::component_registry::ValueTypeLayoutResolver>,
+    ) -> Option<crate::component_registry::ValueTypeLayoutResolver> {
+        std::mem::replace(&mut self.value_type_layout_resolver, resolver)
     }
 }
 
@@ -1282,13 +1284,40 @@ mod tests {
     }
     impl Component for NestedInner {}
 
-    /// A value type whose layout reaches components through the mirror
-    /// inventory rather than through a component registration of its own.
+    /// A value type whose layout reaches components through the installed
+    /// value-type resolver rather than through a component registration of
+    /// its own. The facade's `register_all_components` installs one over its
+    /// DLL's `#[derive(PillMirror)]` registry; this test installs its own.
     #[repr(C)]
-    #[derive(Debug, Clone, Copy, crate::PillMirror)]
+    #[derive(Debug, Clone, Copy)]
     struct ProbeVector {
         x: f32,
         y: f32,
+    }
+
+    /// `ProbeVector`'s layout, as `#[derive(PillMirror)]` would declare it.
+    static PROBE_VECTOR_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "x",
+            type_tag: "f32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+        ComponentFieldDescriptor {
+            name: "y",
+            type_tag: "f32",
+            offset: 4,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+    ];
+
+    /// The test's value-type resolver: knows `ProbeVector` only.
+    fn probe_value_types(path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
+        (path == "ProbeVector").then_some(PROBE_VECTOR_FIELDS)
     }
 
     /// Carries one nested component field and one nested value-type field.
@@ -1402,8 +1431,10 @@ mod tests {
 
     fn nested_world() -> World {
         let mut world = World::new();
+        world.replace_value_type_layout_resolver(Some(probe_value_types));
         world.register_component_with_layout::<NestedInner>(NESTED_INNER_FIELDS);
         world.register_component_with_layout::<NestedOuter>(NESTED_OUTER_FIELDS);
+        world.replace_value_type_layout_resolver(None);
         world
     }
 

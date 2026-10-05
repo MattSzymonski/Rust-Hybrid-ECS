@@ -64,6 +64,8 @@ pub mod profiling;
 pub mod slot_map;
 /// `PillStyle` string-styling vocabulary for terminal output.
 pub mod style;
+/// Per-thread change ticks of the running system, shared by every artifact.
+pub mod system_ticks;
 /// Telemetry foundation: static targets, formatter, and subscriber builder.
 pub mod telemetry;
 /// Small general-purpose helpers shared by Pill crates.

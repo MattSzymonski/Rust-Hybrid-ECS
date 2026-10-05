@@ -1,226 +1,39 @@
-//! High-performance Entity Component System with archetype-based storage.
+//! The Pill engine, as projects and extensions see it.
 //!
 //! # Responsibilities
 //!
-//! - Re-exports all public types for convenient single-import usage (`use pill_engine::*`).
-//! - Declares all public modules that compose the ECS library.
-//! - Configures the Tracy profiled allocator when the `profiling` feature is active.
+//! - Re-export the engine core (`pill_engine_core`) under the same paths, so
+//!   `use pill_engine::*` and every `::pill_engine::...` path the macros emit
+//!   resolve as before.
+//! - Own the per-DLL `inventory` registries ([`component_registry`],
+//!   [`hot_patch`]) and re-export the `submit!` macro the derives expand to.
 //!
 //! # Design
 //!
-//! The crate root is a thin re-export layer. All implementation lives in
-//! submodules ([`world`], [`query`], [`scheduler`], etc.). Users import
-//! everything from `pill_engine` without needing deep module paths.
-//!
-//! The module ABI is **Rust-to-Rust by design**: a loaded project or module
-//! receives an [`EngineApi`] carrying a pointer to the host's engine and calls
-//! the typed API through it. There is no language-neutral plugin table - see
-//! [`api`] for why one was removed rather than completed.
-// The derive macros expand to `::pill_engine::...` paths, so the crate itself
-// needs its name in scope to use its own derives - `Position` and `Color`
-// derive `PillLayout` here rather than carrying hand-written offsets.
+//! This crate is an `rlib` compiled into every DLL, while the engine core holds
+//! what is the same for every DLL. The registries are here because their
+//! questions are per DLL ("every component this artifact declares", "the
+//! function's address in this artifact"): each DLL's copy of this crate reads
+//! that DLL's own lists. The core never reads them, and never depends on this
+//! crate; what it needs from a registry, code here passes in.
+
+// The derive macros expand to `::pill_engine::...` paths; this lets the
+// crate's own tests use them.
 extern crate self as pill_engine;
-// ===== Constants =====
 
-/// Tracy profiled allocator that tracks allocations in Tracy's memory view.
-///
-/// Only active with the opt-in `profiling-memory` feature. The sampling rate is
-/// controlled by [`crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
-///
-/// Not part of `profiling`: the allocator is generic, so it is instantiated in
-/// every DLL that links this rlib and calls Tracy's C entry points directly.
-/// Those live inside `pill_core.dll`, which exports only Rust symbols, so any
-/// extension DLL fails to link with "undefined symbol ___tracy_emit_memory_*".
-#[cfg(feature = "profiling-memory")]
-#[global_allocator]
-static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
-    tracy_client::ProfiledAllocator::new(
-        std::alloc::System,
-        crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
-    );
+/// Everything in the engine core, under the paths it has always had.
+pub use pill_engine_core::*;
 
-// ===== Public Modules =====
-
-/// The module entry-point contract passed to hot-reloadable artifacts.
-pub mod api;
-
-/// Archetype-based component storage with structure-of-arrays layout.
-pub mod archetype;
-
-/// Many-per-type asset storage addressed by generational handle.
-///
-/// The counterpart to [`resource`] for data a world holds several of - meshes,
-/// textures, materials - where the type alone does not name one value. The
-/// store is itself a resource, so it reaches systems through the existing
-/// `Res` / `ResMut` parameters.
-pub mod asset;
-
-/// The C ABI of importing an asset, shared by the C# bridge's import exports.
-pub mod asset_ffi;
-
-/// Importing assets by file extension, for code that does not know their type.
-pub mod asset_import_registry;
-
-/// Metadata files beside an asset's source (`<asset_name>.meta`).
-pub mod asset_metadata;
-
-/// Saved references to assets, by guid, that resolve in a later run.
-pub mod asset_reference;
-
-/// Assets stored as their own file in `res`, with no source file.
-pub mod asset_standalone;
-
-/// Where asset paths resolve: mounted packs and the filesystem.
-pub mod asset_store;
-
-/// Deferred command queue for structural ECS mutations.
-pub mod commands;
-
-/// Component trait, type identification, and change-detection primitives.
-pub mod component;
-
-/// Compile-time component registry driven by `#[derive(PillComponent)]`.
+/// Per-DLL component, value-type, method, accessor and export registries.
 pub mod component_registry;
 
-/// Components the engine defines because more than one consumer needs them.
-pub mod common_components;
-
-/// Generic type-erased component field access for editor-style tools.
-pub mod component_field;
-
-/// Centralised configuration constants and hardware detection.
-pub mod config;
-
-/// Periodic ECS state report, registered by the engine and printed every N
-/// frames.
-pub mod diagnostics;
-
-/// Engine-owned native dynamic buffer, re-exported from `pill_core`.
-///
-/// The type lives beside the allocation service that owns its blocks, so a
-/// module can name it without depending on the whole ECS. Re-exported here
-/// because a component field is what it is for, and every existing
-/// `pill_engine::DynamicBuffer` import keeps resolving.
-pub mod dynamic_buffer {
-    pub use pill_core::dynamic_buffer::*;
-}
-
-/// System registration, frame execution, and parallel dispatch orchestration.
-pub mod engine;
-
-/// Lightweight entity handles with generation-based invalidation.
-pub mod entity;
-
-/// Typed error system for the ECS engine.
-pub mod error;
-
-/// Constants shared between the host and extensions.
-pub mod module_abi;
-
-/// Component persistence and schema migration for hot-reload.
-pub mod persistence;
-
-/// Re-exports the profiling API from `pill_core`.
-pub mod profiling;
-
-/// Query system for efficient iteration over entities with specific components.
-pub mod query;
-
-/// Singleton resources stored in the [`World`], not attached to entities.
-pub mod resource;
-
-/// Dependency analysis and parallel batch scheduling for system execution.
-pub mod scheduler;
-
-/// Script components with deferred structural mutation safety.
-pub mod scripting;
-
-/// Per-function hot patching: stable dispatch slots for registered systems.
+/// Per-DLL hot-patch registries over the core's hot-patch machinery.
 pub mod hot_patch;
 
-/// Advanced system parameter infrastructure with automatic parameter resolution.
-pub mod system;
+// The descriptor types the hot-patch macros submit, at the crate root as
+// before.
+pub use hot_patch::{PillHotFunctionDescriptor, PillHotSlotDescriptor};
 
-/// Keyboard, mouse and gamepad state maintained by the engine and read through
-/// `Res<Input>`.
-pub mod input;
-
-/// Frame timing maintained by the engine and read through `Res<Time>`.
-pub mod time;
-
-/// Central ECS state container - entities, archetypes, components, and resources.
-pub mod world;
-// ===== Public Re-exports =====
-
-// Core engine types re-exported for single-import usage.
-pub use api::EngineApi;
-pub use asset::{
-    Asset, AssetBindingError, AssetBindingResult, AssetGuid, AssetLoadError, AssetLoadResult,
-    AssetLoader, AssetManager, Handle,
-};
-pub use asset_import_registry::{
-    ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
-};
-pub use asset_metadata::{
-    AssetImport, AssetImportError, ImportOutcome, ImportedAsset, MetadataPolicy, MetadataSource,
-    ReimportOutcome,
-};
-pub use asset_reference::AssetReference;
-pub use asset_standalone::{render_standalone, StandaloneAsset};
-pub use commands::{CommandError, Commands};
-pub use common_components::{register_common_components, Color, Position, TransformComponent};
-pub use component::{Component, ComponentId, ComponentTicks, Tick};
-pub use component_field::{ComponentFieldError, FieldValue};
-pub use engine::{Engine, SystemOwner, SystemSnapshot};
-pub use entity::Entity;
-pub use error::{EngineError, SystemError, SystemFailure};
-pub use hot_patch::{
-    HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor, PillHotSlotDescriptor,
-    PlainSlot,
-};
-pub use input::{
-    ButtonState, GamepadAxis, GamepadButton, Input, InputEvent, KeyCode, MouseButton, PlayerId,
-    RumbleRequest, ScrollDelta,
-};
-pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
-pub use pill_core::DynamicBuffer;
-pub use query::{
-    Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
-};
-pub use resource::{ResHandle, Resource, ResourceId};
-pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
-pub use scripting::{ScriptComponent, ScriptContext};
-pub use time::Time;
-
-// Serde derives re-exported so downstream components can derive serialization without a direct dependency.
-pub use serde::{Deserialize, Serialize};
-
-// Tracing re-exported to keep telemetry under a single flat namespace.
-pub use tracing;
-
-// Registration macros + the inventory submit macro they expand to, re-exported
-// so module/project crates need no dependency beyond `pill_engine` itself.
+// The inventory submit macro the derives and attribute macros expand to, so
+// module and project crates need no dependency beyond `pill_engine` itself.
 pub use inventory::submit;
-pub use pill_engine_macros::{
-    pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_impl, pill_mirror_method, pill_module,
-    pill_project, pill_value_type, PillComponent, PillLayout, PillMirror,
-};
-
-// World container and its entity-builder and error types.
-pub use world::{
-    AddComponentError, BuildError, EntityBuilder, EntityRow, RemoveComponentError, World,
-};
-
-// ----------------------------------------------------------------------------
-// Profiling macro re-exports
-//
-// The profiling implementation and all its `#[macro_export]` macros live in
-// `pill_core::profiling`. Re-exporting the macros at the crate root keeps the
-// 100+ `crate::profile_scope!` call sites inside this crate compiling while
-// preserving a single flat namespace for downstream users.
-// ----------------------------------------------------------------------------
-pub use pill_core::{
-    profile_error, profile_frame_mark, profile_init, profile_message, profile_non_continuous_frame,
-    profile_plot, profile_plot_config, profile_scope, profile_scope_detail, profile_scope_fine,
-    profile_secondary_frame_mark, profile_thread, profile_warn,
-};

@@ -307,7 +307,7 @@ impl Spline {
                 // is observable through a cascade reload; shipping builds
                 // compute only the curve.
                 #[cfg(feature = "test-hooks")]
-                let base = Vector3f::new(base.x, base.y + 0.0, base.z);
+                let base = Vector3f::new(base.x, base.y + SAMPLE_VERTICAL_OFFSET, base.z);
                 base
             }
         }

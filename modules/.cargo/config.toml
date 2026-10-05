@@ -1,8 +1,11 @@
 # Link Rust dependencies dynamically wherever a `dylib` artifact exists, so the
-# host executable and every extension built from this workspace share one
-# copy of `pill_engine` instead of each embedding a private one. Sharing the
-# engine is what keeps its statics, thread-locals and the tracing dispatcher
-# single-instance across the DLL boundary.
+# host executable and every extension, project and hot patch built from this
+# workspace share one copy of the engine's two dylibs, `pill_core` and
+# `pill_engine_core`, instead of each embedding a private one. Sharing them is
+# what keeps the engine's statics, thread-locals, Rayon pool and the tracing
+# dispatcher single-instance across the DLL boundary. The `pill_engine` facade
+# stays an `rlib` on purpose: its per-DLL registries must be embedded in each
+# DLL.
 #
 # Scope: this applies to crates built from inside `modules/`, which is every
 # crate that shares this workspace's `Cargo.lock`. Shared dynamic linkage

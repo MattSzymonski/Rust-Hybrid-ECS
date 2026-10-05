@@ -1,11 +1,14 @@
-//! Compile-time component registry driven by `#[derive(PillComponent)]`.
+//! Per-DLL component, value-type, method, accessor and export registries.
 //!
 //! # Responsibilities
 //!
-//! - Declare the `PillComponentDescriptor` type that the derive macro submits
-//!   into the [`inventory`] collection.
-//! - Provide the artifact-wide registration loop and the aggregate schema
-//!   fingerprint that the module/project entry-point macros call.
+//! - Re-export the engine core's field layouts
+//!   (`pill_engine_core::component_registry`) under this path.
+//! - Declare the descriptor types the derive and attribute macros submit into
+//!   [`inventory`] collections, and the collections themselves.
+//! - Provide the artifact-wide registration loop, the aggregate schema
+//!   fingerprint, and the readers the module/project entry-point macros and the
+//!   host call.
 //!
 //! # Design
 //!
@@ -17,14 +20,25 @@
 //! is never re-registered from a stale copy, and a generation DLL that is
 //! evicted takes its descriptors with it (nothing else references them).
 //!
+//! It is per artifact because this crate is: `pill_engine` is embedded in every
+//! DLL, while the engine core (`pill_engine_core`) holds what is the same for
+//! all of them. The core never reads these collections; what it needs from one
+//! (a value type's layout) it receives from the calling DLL.
+//!
 //! Registration order is unspecified (linker/initializer order), which is
 //! harmless: component registration is keyed by `TypeId` and idempotent.
 
+// Standard library
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+// Current crate
 use crate::error::WorldError;
 use crate::World;
+
+/// Field layouts, the layout trait and the value-type resolver, which are the
+/// same for every DLL.
+pub use pill_engine_core::component_registry::*;
 
 /// One component type declared with `#[derive(PillComponent)]`.
 ///
@@ -40,55 +54,6 @@ pub struct PillComponentDescriptor {
     pub fields: &'static [ComponentFieldDescriptor],
     /// Registers the component into a world.
     pub register: fn(&mut World),
-}
-
-/// One named field of a `#[derive(PillComponent)]` component or a
-/// `#[derive(PillMirror)]` value type, captured at compile time so the host
-/// can emit a typed C# mirror instead of an opaque ABI blob.
-///
-/// Every value is const-constructible (`offset_of!`/`size_of!`/`align_of!`),
-/// so a descriptor array can live in a static inside the declaring artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ComponentFieldDescriptor {
-    /// Rust field name (snake_case); the C# codegen maps it to PascalCase.
-    pub name: &'static str,
-    /// Type tag from a closed vocabulary — `f32`, `u32`, `bool`, ...
-    /// `array:<inner>`, `struct:<path>`, `vec:<element>`, `dynbuf:<element>`,
-    /// `string` — that the C# codegen maps to a concrete C# type. See
-    /// `pill_host/src/csharp/codegen.rs`.
-    ///
-    /// `vec:<element>` and `string` describe Rust-owned heap fields, which
-    /// carry no C# field of their own: managed code reaches them through the
-    /// accessor members the codegen emits, whose trampolines are declared with
-    /// [`PillFieldAccessorDescriptor`]. `dynbuf:<element>` describes an
-    /// engine-owned native buffer, whose `(ptr, len, cap)` handle is mirrorable
-    /// as plain words — managed code reads it in place, and only resizing goes
-    /// through an accessor.
-    pub type_tag: &'static str,
-    /// Byte offset of the field within the type (`core::mem::offset_of!`).
-    pub offset: usize,
-    /// Byte size of the field's type.
-    pub size: usize,
-    /// Byte alignment of the field's type.
-    pub align: usize,
-    /// Number of elements for an `array:` field; zero for non-array fields.
-    /// Computed from the array length expression at compile time, so const
-    /// and literal lengths alike resolve here.
-    pub element_count: usize,
-}
-
-/// The compile-time field layout of a type, as the derive macros emit it.
-///
-/// Implemented by `#[derive(PillLayout)]`, `#[derive(PillComponent)]` and
-/// `#[derive(PillMirror)]`; lets a layout reach
-/// [`World::register_component_with_layout`] without restating the
-/// descriptors. The shorthand for the same list is the type's inherent
-/// `FIELD_LAYOUT` const.
-///
-/// [`World::register_component_with_layout`]: crate::World::register_component_with_layout
-pub trait ComponentLayout {
-    /// The declared field list, in declaration order.
-    const FIELDS: &'static [ComponentFieldDescriptor];
 }
 
 /// A plain value type (not a component) declared with `#[derive(PillMirror)]`.
@@ -288,16 +253,50 @@ pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor>
 /// registration code runs, so entity seeding and system registration can rely
 /// on every component type already being known to the world.
 ///
+/// While the loop runs, this artifact's value types are installed as the
+/// world's [`ValueTypeLayoutResolver`], so a component field of a
+/// `#[derive(PillMirror)]` type expands into editable rows. The previous
+/// resolver is restored afterwards, so none is left pointing into this DLL.
+///
 /// # Errors
 ///
 /// Returns the first registration failure recorded during the loop (currently
 /// only the 128-type ceiling) so the generated `init` can fail the reload
 /// transactionally instead of running with a half-registered component set.
 pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
+    let previous = world.replace_value_type_layout_resolver(Some(resolve_value_type_layout));
     for descriptor in inventory::iter::<PillComponentDescriptor> {
         (descriptor.register)(world);
     }
+    world.replace_value_type_layout_resolver(previous);
     world.take_registration_error().map_or(Ok(()), Err)
+}
+
+/// The layout of the value type a `struct:<path>` field tag names, among the
+/// ones this artifact declares with `#[derive(PillMirror)]`.
+///
+/// The tag is the path as written at the field site, usually an imported
+/// short name (`Color`), so an exact type name is tried first and a unique
+/// `::<path>` suffix second. An ambiguous suffix resolves to `None`: an opaque
+/// field is readable, a wrong one is not.
+pub fn resolve_value_type_layout(path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
+    let suffix = format!("::{path}");
+    let mut suffix_hit = None;
+    let mut suffix_matches = 0usize;
+    for descriptor in value_type_descriptors() {
+        if descriptor.type_name == path {
+            return Some(descriptor.fields);
+        }
+        if descriptor.type_name.ends_with(&suffix) {
+            suffix_matches += 1;
+            suffix_hit = Some(descriptor.fields);
+        }
+    }
+    if suffix_matches == 1 {
+        suffix_hit
+    } else {
+        None
+    }
 }
 
 /// Aggregate schema fingerprint of every persistable component.
@@ -327,10 +326,8 @@ mod tests {
     use super::*;
     use crate::{Component, ComponentId, World};
 
-    // The derive macro cannot be used inside `pill_engine` itself (its
-    // generated code refers to `::pill_engine`, which does not resolve in the
-    // defining crate), so these components declare everything the derive would
-    // generate, by hand, and submit descriptors exactly as the macro does.
+    // These components declare by hand everything the derive would generate,
+    // and submit descriptors exactly as the macro does.
 
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct TestPersistableComponent {
@@ -374,11 +371,11 @@ mod tests {
         register_all_components(&mut world).expect("registration must succeed");
 
         assert!(world
-            .component_registry
+            .component_registry()
             .get_bit(&ComponentId::of::<TestPersistableComponent>())
             .is_some());
         assert!(world
-            .component_registry
+            .component_registry()
             .get_bit(&ComponentId::of::<TestPlainComponent>())
             .is_some());
     }
@@ -391,57 +388,9 @@ mod tests {
         register_all_components(&mut world).expect("re-registration must succeed");
 
         assert!(world
-            .component_registry
+            .component_registry()
             .get_bit(&ComponentId::of::<TestPersistableComponent>())
             .is_some());
-    }
-
-    /// A compile-time field layout registered with a component is retrievable,
-    /// while a component registered without one reports no layout.
-    #[test]
-    fn field_layouts_are_stored_and_queryable() {
-        static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
-            name: "value",
-            type_tag: "u32",
-            offset: 0,
-            size: 4,
-            align: 4,
-            element_count: 0,
-        }];
-
-        let mut with_layout = World::new();
-        with_layout.register_component_with_layout::<TestPlainComponent>(FIELDS);
-        assert_eq!(
-            with_layout.component_field_layout(ComponentId::of::<TestPlainComponent>()),
-            Some(FIELDS)
-        );
-
-        let mut without_layout = World::new();
-        without_layout.register_component::<TestPlainComponent>();
-        assert!(without_layout
-            .component_field_layout(ComponentId::of::<TestPlainComponent>())
-            .is_none());
-    }
-
-    /// The persistable with-layout variant stores the layout after the
-    /// standard persistable registration.
-    #[test]
-    fn persistable_field_layout_is_stored() {
-        static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
-            name: "value",
-            type_tag: "u32",
-            offset: 0,
-            size: 4,
-            align: 4,
-            element_count: 0,
-        }];
-
-        let mut world = World::new();
-        world.register_persistable_component_with_layout::<TestPersistableComponent>(FIELDS);
-        assert_eq!(
-            world.component_field_layout(ComponentId::of::<TestPersistableComponent>()),
-            Some(FIELDS)
-        );
     }
 
     /// Mirrored-method descriptors submitted through the inventory are
@@ -500,37 +449,5 @@ mod tests {
         let first = persistable_schema_fingerprint();
         let second = persistable_schema_fingerprint();
         assert_eq!(first, second);
-    }
-
-    /// Registering the same type first as plain, then as persistable, stays
-    /// idempotent: one registry entry, one bit. This pins the invariant the
-    /// unified per-type registration (audit 4.2) must preserve.
-    #[test]
-    fn plain_then_persistable_registration_stays_idempotent() {
-        let mut world = World::new();
-        world.register_component::<TestPersistableComponent>();
-        let bit_before = world
-            .component_registry
-            .get_bit(&ComponentId::of::<TestPersistableComponent>());
-        assert!(bit_before.is_some(), "plain registration must assign a bit");
-
-        world.register_persistable_component::<TestPersistableComponent>();
-        let bit_after = world
-            .component_registry
-            .get_bit(&ComponentId::of::<TestPersistableComponent>());
-        assert_eq!(
-            bit_before, bit_after,
-            "persistable re-registration must reuse the existing bit"
-        );
-
-        let entry_count = world
-            .component_registry
-            .registered_components()
-            .filter(|(id, _, _)| *id == ComponentId::of::<TestPersistableComponent>())
-            .count();
-        assert_eq!(
-            entry_count, 1,
-            "one logical type must occupy exactly one registry entry"
-        );
     }
 }

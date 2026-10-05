@@ -129,6 +129,8 @@ impl Runtime {
     /// A runtime around an empty engine, for a host that registers modules and
     /// the project itself (the development host).
     pub fn new() -> Self {
+        // Report detected system hardware so users can tune config.
+        crate::system_specs::print_system_specs();
         Self {
             engine: Box::new(Engine::new()),
             _project_guard: None,

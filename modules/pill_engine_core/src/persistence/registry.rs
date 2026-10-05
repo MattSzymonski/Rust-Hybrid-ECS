@@ -552,7 +552,7 @@ where
     // Step 2: Combine the type name, size, and normalized schema into a
     // stable 64-bit hash for comparing schemas across reloads.
     let mut hasher = DefaultHasher::new();
-    std::any::type_name::<T>().hash(&mut hasher);
+    crate::type_names::stable_type_name::<T>().hash(&mut hasher);
     std::mem::size_of::<T>().hash(&mut hasher);
     normalized_schema_string.hash(&mut hasher);
 

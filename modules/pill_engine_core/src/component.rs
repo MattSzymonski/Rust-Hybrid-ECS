@@ -872,14 +872,15 @@ impl ComponentRegistry {
 
     /// The name a component type is registered under.
     ///
-    /// Its declared shared name when it has one, otherwise
-    /// [`std::any::type_name`]. A shared component must be findable by the
+    /// Its declared shared name when it has one, otherwise its
+    /// [`stable_type_name`](crate::type_names::stable_type_name) (the engine's
+    /// own types read `pill_engine::...`). A shared component must be findable by the
     /// name both binaries wrote down rather than by one binary's rendering of
     /// its Rust path.
     pub fn registered_name<T: Component>() -> String {
         T::shared_name()
             .map(str::to_string)
-            .unwrap_or_else(|| std::any::type_name::<T>().to_string())
+            .unwrap_or_else(|| crate::type_names::stable_type_name::<T>().to_string())
     }
 
     /// Register a component whose concrete type is defined outside Rust.

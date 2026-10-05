@@ -119,7 +119,9 @@ mod tests {
     }
     impl Component for DropTestSupersedingComponent {
         fn shared_name() -> Option<&'static str> {
-            Some(std::any::type_name::<DropTestForgottenComponent>())
+            Some(crate::type_names::stable_type_name::<
+                DropTestForgottenComponent,
+            >())
         }
     }
 
@@ -140,7 +142,7 @@ mod tests {
     }
     impl Component for LayoutWidenedComponent {
         fn shared_name() -> Option<&'static str> {
-            Some(std::any::type_name::<LayoutHostComponent>())
+            Some(crate::type_names::stable_type_name::<LayoutHostComponent>())
         }
     }
 
@@ -154,7 +156,7 @@ mod tests {
     }
     impl Component for LayoutGrownComponent {
         fn shared_name() -> Option<&'static str> {
-            Some(std::any::type_name::<LayoutHostComponent>())
+            Some(crate::type_names::stable_type_name::<LayoutHostComponent>())
         }
     }
 
@@ -179,7 +181,7 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<LayoutHostComponent>();
         let host_id = ComponentId::of::<LayoutHostComponent>();
-        let type_name = std::any::type_name::<LayoutHostComponent>().to_string();
+        let type_name = crate::type_names::stable_type_name::<LayoutHostComponent>().to_string();
         let entity = world
             .create_entity()
             .with(LayoutHostComponent { a: 1, b: 2 })
@@ -233,7 +235,7 @@ mod tests {
     fn a_size_change_that_keeps_the_alignment_registers() {
         let mut world = World::new();
         world.register_persistable_component::<LayoutHostComponent>();
-        let type_name = std::any::type_name::<LayoutHostComponent>().to_string();
+        let type_name = crate::type_names::stable_type_name::<LayoutHostComponent>().to_string();
         let _ = world.take_registration_error();
 
         world.supersede_persist_registrations(std::slice::from_ref(&type_name));
@@ -282,7 +284,8 @@ mod tests {
             2
         );
 
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
         let dropped = world.drop_forgotten_components(std::slice::from_ref(&type_name));
         assert_eq!(dropped, 2, "both entities carried the forgotten component");
 
@@ -330,7 +333,8 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
         let first_id = ComponentId::of::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         let first_entity = world
             .create_entity()
@@ -410,7 +414,8 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
         let stranded_id = ComponentId::of::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         let entity = world
             .create_entity()
@@ -486,7 +491,8 @@ mod tests {
         assert_eq!(world.persist_inserters.len(), 1);
         assert!(world.persist_inserters.contains_key(&component_id));
 
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
         assert_eq!(world.persist_deserializers.len(), 1);
         assert!(world.persist_deserializers.contains_key(&type_name));
         assert_eq!(world.persist_schema_hashes.len(), 1);
@@ -506,7 +512,8 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
         let native_id = ComponentId::of::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         // Give the native column a live row, which is what makes the second
         // registration a peer rather than a dead generation.
@@ -556,7 +563,8 @@ mod tests {
     fn a_same_name_registration_over_an_empty_column_still_succeeds() {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         // No entity is created, so the native column holds nothing.
         assert_eq!(
@@ -587,7 +595,8 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
         let predecessor_id = ComponentId::of::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
         world
             .create_entity()
             .with(DropTestForgottenComponent { value: 7 })
@@ -770,7 +779,7 @@ mod tests {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
         let component_id = ComponentId::of::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>();
+        let type_name = crate::type_names::stable_type_name::<DropTestForgottenComponent>();
 
         assert_eq!(
             world.resolve_component_id_by_name(type_name).unwrap(),
@@ -789,7 +798,8 @@ mod tests {
     fn a_name_claimed_twice_resolves_to_an_ambiguity_error() {
         let mut world = World::new();
         world.register_persistable_component::<DropTestForgottenComponent>();
-        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let type_name =
+            crate::type_names::stable_type_name::<DropTestForgottenComponent>().to_string();
 
         // The native column is empty, so a second claim on the name registers
         // (see the empty-column test above) and both are now visible to the
@@ -941,7 +951,7 @@ mod tests {
         );
         assert!(
             snapshot
-                .payload(std::any::type_name::<PersistProbeScore>())
+                .payload(crate::type_names::stable_type_name::<PersistProbeScore>())
                 .is_some(),
             "and it is the one that opted in"
         );

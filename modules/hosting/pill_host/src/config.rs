@@ -538,17 +538,21 @@ impl ExtensionConfig {
         // on the module while the anchor's presence unifies the shared engine
         // crates with whatever host binary is running - a GUI frontend unions
         // extra features onto those crates, and a module compiled against a
-        // differently featured engine cannot resolve its `pill_core.dll`
-        // imports against the single instance the host has loaded.
+        // differently featured engine cannot resolve its `pill_core.dll` and
+        // `pill_engine_core.dll` imports against the single instances the
+        // host has loaded.
         let mut module_features = vec![format!("{name}/module-abi")];
         // `rendering` used to be mirrored here too, because the engine's
         // renderer feature changed its public type layout. The renderer now
         // lives in `pill_master_renderer`, which only the host links, so the
         // engine a module compiles against is the same either way.
-        // Hot patching must be mirrored for a different reason: `pill_engine` is
-        // an rlib, so the module links its own copy of `register_system`. Built
-        // without the feature, that copy creates no dispatch slot and every
-        // patch is refused with "no hot-patchable system registered".
+        // Hot patching must be mirrored too. The engine core is a shared
+        // dylib whose symbol names hash its features, so a module built
+        // without the feature imports names the host's `pill_engine_core.dll`
+        // does not export. And `register_system` is generic, so the module
+        // compiles its own instance of it: built without the feature, that
+        // instance creates no dispatch slot and every patch is refused with
+        // "no hot-patchable system registered".
         if cfg!(feature = "hot_patch") {
             module_features.push("pill_engine/hot_patch".to_string());
         }
@@ -1039,15 +1043,16 @@ impl ProjectModuleConfig {
             build_command.push("--timings".to_string());
         }
         // Mirror the host's engine feature set into the project build, for the
-        // same reason extensions do: `pill_engine` is an rlib, so the
-        // project links its own copy and must be configured identically.
+        // same reason extensions do: the project imports the host's
+        // `pill_engine_core.dll`, whose symbol names hash its features, and
+        // compiles its own instances of the engine's generic code.
         //
         // `rendering` used to be mirrored here as well, package-qualified onto
         // the generated project member. It is gone because the renderer left
         // `pill_engine`, so the engine a project compiles against no longer
         // depends on it.
         let mut project_features: Vec<String> = Vec::new();
-        // Without this the project's copy of `register_system` compiles the
+        // Without this the project's instance of `register_system` compiles the
         // no-slot path, and every patch is refused with "no hot-patchable
         // system registered" - which is exactly how this was found.
         if cfg!(feature = "hot_patch") {

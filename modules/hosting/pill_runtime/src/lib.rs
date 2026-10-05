@@ -42,6 +42,9 @@ mod rendering;
 mod runtime;
 /// Statically linked project and module registration.
 mod static_project;
+
+/// The start-up report of the machine the engine runs on.
+mod system_specs;
 /// Application telemetry bootstrap for every frontend.
 mod telemetry;
 
