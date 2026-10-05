@@ -25,14 +25,17 @@ libloading = "0.8"
 notify = "6"
 # `FixedString64` serializes through `#[serde(into/from)]`; glam pulls serde
 # in already, but naming it here is what lets this crate's own types derive.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["alloc", "derive"] }
 serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive", "fancy"] }
 colored = "2"
 # The local date and time in log lines. `clock` reads the time zone on every
 # target; the web build adds `wasmbind` below to read it from the browser.
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "std",
+] }
 tracing = "0.1"
 tracing-log = "0.2"
 # The one Rayon every DLL uses, re-exported as `pill_core::rayon`, for the
@@ -71,7 +74,10 @@ metrics = { version = "0.24", optional = true }
 # build adds keeps pill_core's resolution identical in all of them, so the host
 # does not need the renderer crates in its own graph. None of these crates is
 # used directly. Measured with `local/temp/pill_core_feature_union.py`; extend
-# the list if a new module adds a feature to pill_core's tree.
+# the list if a new module adds a feature to pill_core's tree. The editor is
+# the other source: its dioxus graph unions `either/std`, `proc-macro2`'s
+# `span-locations`, `syn`'s `full`+`visit-mut`, `time/macros`, `serde`'s
+# `alloc` and the two `windows-sys` feature sets pinned below.
 bytemuck = { version = "1", features = [
     "aarch64_simd",
     "derive",
@@ -80,10 +86,59 @@ bytemuck = { version = "1", features = [
     "wasm_simd",
 ] }
 crossbeam-utils = "0.8"
+either = { version = "1", features = ["std", "use_std"] }
 libm = { version = "0.2", features = ["arch"] }
 memchr = "2"
-num-traits = { version = "0.2", features = ["libm", "std"] }
-smallvec = { version = "1", features = ["union"] }
+num-traits = { version = "0.2", features = ["i128", "libm", "std"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde_core = { version = "1", features = ["alloc"] }
+smallvec = { version = "1", features = ["const_generics", "union"] }
+syn = { version = "3", features = ["full", "visit-mut"] }
+time = { version = "0.3", features = ["macros"] }
+
+# `windows-sys` appears three times in the workspace graph (0.59, 0.60 and
+# 0.61, from different dependents); all are pinned for the same reason as the
+# list above - the editor's own dependencies union Win32 features onto them.
+# Windows-only, so the web build never sees them.
+[target.'cfg(windows)'.dependencies]
+windows-sys-059 = { package = "windows-sys", version = "0.59", features = [
+    "Win32_Graphics",
+    "Win32_Graphics_Gdi",
+    "Win32_System_SystemServices",
+    "Win32_UI",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys-060 = { package = "windows-sys", version = "0.60", features = [
+    "Win32_Globalization",
+    "Win32_Graphics",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_UI",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys-061 = { package = "windows-sys", version = "0.61", features = [
+    "Win32_Security_Authentication",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_UI",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # The platform layer (`src/platform`) on native: the rolling log file and
 # blocking on a future.

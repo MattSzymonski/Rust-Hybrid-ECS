@@ -14,20 +14,11 @@ workspace = true
 # it hundreds of wrong candidates. `pill_hot_scan` reads this key to know
 # which file is the root and emits no module segment for it.
 path = "src/pill_test.rs"
-# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept so a monolithic release build can link the same module statically
-# instead, with no second copy of the source.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_test` wrapper, which links this crate as a library.
+crate-type = ["rlib"]
 
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
 serde = { version = "1", features = ["derive"] }
-
-[features]
-# `module-abi` is opt-in, not a default (see the other extensions): the
-# host passes `--features module-abi` when it builds the loadable module, and
-# the feature keeps the `#[no_mangle]` exports out of any build that links
-# this crate statically.
-default = []
-module-abi = []

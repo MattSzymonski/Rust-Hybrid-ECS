@@ -79,11 +79,11 @@ SAMPLE_OFFSET_PATTERN = re.compile(
     r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
 )
 
-# Vertical position the probe reports before any offset is applied: the
-# project-owned reference spline's Catmull-Rom midpoint at t = 0.5 (one
-# decimal). The reference spans five collinear spawn points 150 apart from
-# x=90 at y=120, so the midpoint is the middle point, (390, 120); the same
-# geometry the cascade suite documents.
+# The probe's baseline midpoint at t = 0.5 (one decimal): the project's
+# reference spline spans the ball spawn points, and the middle spawn point
+# sits at (990, 120). The vertical position moves with the module's sample
+# offset; the horizontal one does not.
+BASE_PROBE_MIDPOINT_X = 990.0
 BASE_PROBE_MIDPOINT_Y = 120.0
 
 ORIGINAL_CONTENT: str = ""
@@ -129,7 +129,7 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
     new_offset_text = f"{new_offset:.1f}"
     new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset_text};"
     new_y = BASE_PROBE_MIDPOINT_Y + new_offset
-    return match.group(0), new_line, f"midpoint (390.0, {new_y:.1f})"
+    return match.group(0), new_line, f"midpoint ({BASE_PROBE_MIDPOINT_X:.1f}, {new_y:.1f})"
 
 
 # =============================================================================

@@ -59,7 +59,7 @@ When an agent runs a suite, it goes through `.agents/tools/agent_run.py`
 | Workflow | Runs |
 | --- | --- |
 | `ci.yml`, every push | `verify.py` steps. From this directory only the static checks: `test_coding_standards.py`, `test_renderer_boundaries.py` and `test_asset_metadata.py` (the last two with `--self-test` first). |
-| `nightly.yml`, 04:00 UTC | Builds the windowed host, then `test_hot_reload_migration.py` and `test_hot_reload_suite.py`, and the hot-reload benchmark. The main suite runs with `continue-on-error` because its session B has a known fixture drift. Logs are uploaded as an artifact. |
+| `nightly.yml`, 04:00 UTC | Builds the windowed host, then `test_hot_reload_migration.py` and `test_hot_reload_suite.py`, and the hot-reload benchmark. Logs are uploaded as an artifact. |
 
 Every other end-to-end suite is local only. Run the ones that cover the area
 you changed (see the reference below, or the `pill-run-and-reload` skill).
@@ -141,6 +141,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_hot_reload_assets.py` | In `examples/master_renderer_test/res/`: `textures/helmet_emissive.jpg` (overwritten with junk bytes), its `.meta`, `materials/helmet.material`; moves the image pair into `textures/moved_by_suite/` and back. Also `pill_master_renderer_data.rs` (a comment appended to force a rebuild) | `BackupRegistry`, fresh timestamp; the move is undone in its own `finally` |
 | `test_hot_patch_coverage.py` | One function body in every crate listed in `examples/project_rs/project_settings.yaml`, plus the project | `BackupRegistry`, original bytes and timestamp |
 | `test_patch_bookkeeping.py` | A system in `examples/project_rs/src/` (a body edit, then a broken tail); creates `modules/target/hot/rollback.request` | `BackupRegistry`, fresh timestamp; the request file is deleted |
+| `test_wrapper_entry_points.py` | Writes `modules/extensions/host_module_wrapper_probe/` (a generated-namespace crate) | Deleted at the end unless `--keep-probe`; a host run prunes it as a stale wrapper too |
 | `test_web_smoke.py` | Regenerates `build/pill_shipping_bundle/`; writes `examples/master_renderer_test/build/web/` | The bundle is snapshotted and restored |
 | `test_shipping_smoke.py` | Regenerates `build/pill_shipping_bundle/` (gitignored) | Not restored |
 
@@ -196,6 +197,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_coding_standards.py` | The comment and layout rules over every `.rs` file: `//!` header with `# Responsibilities`, `// SAFETY:` on `unsafe`, `///` on `pub` items, ordered import groups, `mod tests` last. Exit 0 clean, 1 violations, 2 usage error. |
 | `test_renderer_boundaries.py` | The renderer split's dependency rules from the Cargo manifests: only a GPU module depends on `wgpu`, `pill_renderer_api` stays renderer-free, the host reaches renderer crates only through `*_dependency_graph` dependencies, and no project or data crate depends on a GPU module. `--self-test` proves each rule fails on a generated broken tree. |
 | `test_asset_metadata.py` | Under `examples/*/res`: no orphaned `.meta` files and no two assets sharing a guid. `--self-test` proves it catches both. |
+| `test_wrapper_entry_points.py` | The wrapper path exports the whole loadable-artifact entry-point set: writes a throwaway `host_module_wrapper_probe` crate around `pill_dummy_color`, builds it and compares its PE export directory against the expected names. `--self-test` covers the reader; Windows-only. |
 | `test_csharp_analyzer.py` | The `PILLxxxx` Roslyn analyzer rules (needs .NET 8 SDK): the real C# project builds with no PILL diagnostic, and a temporary probe that breaks every rule produces every diagnostic and fails the build. |
 
 ### End-to-end suites (start a host, edit files)
@@ -276,8 +278,6 @@ the regenerated file.
 
 ## Known quirks
 
-- **Session B of `test_hot_reload_suite.py` fails on a drifted fixture value.**
-  The nightly runs it with `continue-on-error` until the fixture is fixed.
 - **Two crates named `project`.** `devops/tests/project` and
   `examples/project_rs` both build `target/debug/project.dll`, so a DLL left
   from the other project can be loaded before the fresh build replaces it

@@ -66,6 +66,7 @@ SUITE_ORDER: Sequence[str] = (
     "test_coding_standards.py",
     "test_renderer_boundaries.py",
     "test_log_contract.py",
+    "test_wrapper_entry_points.py",
     "test_csharp_analyzer.py",
     "test_hot_reload_suite.py",
     "test_hot_reload_migration.py",

@@ -453,6 +453,15 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
+    /// The generated workspace member that wraps an extension as a loadable
+    /// artifact could not be created or written.
+    #[message("failed to create generated host module wrapper at ", name_style(path))]
+    HostModuleMemberCreationFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A `path` dependency in the project manifest does not resolve to an
     /// existing directory once rewritten for the generated workspace member.
     ///

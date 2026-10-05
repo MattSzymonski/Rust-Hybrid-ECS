@@ -545,13 +545,19 @@ impl NativeLibrary {
                 .unwrap_or_else(|| std::ffi::OsStr::new("module.dll")),
         );
 
-        // Step 2: Copy the built library to the unique temporary path.
-        std::fs::copy(build_output, &temporary_path).map_err(|source| {
-            LibraryError::CopyFailed {
-                source_path: build_output.display().to_string(),
-                target_path: temporary_path.display().to_string(),
-                source,
-            }
+        // Step 2: Give this generation its own handle on the built library.
+        // A hard link is preferred: both paths are under the workspace root,
+        // so it shares the file the staging already wrote - a fresh copy would
+        // pay the platform's first-access scan again on every load, link or
+        // not - and a later staging replaces the hot copy by rename, which
+        // leaves this generation's file intact. A cross-volume workspace falls
+        // back to the copy this always was.
+        let temporary = std::fs::hard_link(build_output, &temporary_path)
+            .or_else(|_| std::fs::copy(build_output, &temporary_path).map(|_| ()));
+        temporary.map_err(|source| LibraryError::CopyFailed {
+            source_path: build_output.display().to_string(),
+            target_path: temporary_path.display().to_string(),
+            source,
         })?;
         // Step 2a: Place the module's debug symbols beside the copy.
         //

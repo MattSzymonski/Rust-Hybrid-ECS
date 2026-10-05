@@ -7,9 +7,8 @@
 //! - Log the GPU errors nothing captured ([`report_uncaptured_errors`]),
 //!   instead of wgpu's default of panicking.
 //! - Capture the errors a block of GPU work provoked: awaited while the
-//!   renderer is built ([`captured`]), and - with `validation-capture`, the
-//!   development capability - blocked on for work done during a frame
-//!   (`capturing_validation`).
+//!   renderer is built ([`captured`]), and, in a native development build,
+//!   blocked on for work done during a frame (`capturing_validation`).
 //!
 //! # Design
 //!
@@ -75,9 +74,9 @@ pub(crate) async fn captured<T>(
 
 /// Run `make` with wgpu's errors captured, blocking until they are known.
 ///
-/// The development capability (`validation-capture`): only a native build can
-/// block, and only development needs to survive a refused edit.
-#[cfg(feature = "validation-capture")]
+/// Native development builds only: only a native build can block on a frame's
+/// error scope, and only development needs to survive a refused edit.
+#[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
 pub(crate) fn captured_now<T>(
     device: &wgpu::Device,
     make: impl FnOnce() -> T,
@@ -85,9 +84,9 @@ pub(crate) fn captured_now<T>(
     pill_core::platform::futures::block_on(captured(device, make))
 }
 
-/// Run `make` without capturing: without `validation-capture`, an error it
-/// provokes goes to the handler [`report_uncaptured_errors`] installed.
-#[cfg(not(feature = "validation-capture"))]
+/// Run `make` without capturing: elsewhere an error it provokes goes to the
+/// handler [`report_uncaptured_errors`] installed.
+#[cfg(any(not(debug_assertions), target_arch = "wasm32"))]
 pub(crate) fn captured_now<T>(
     _device: &wgpu::Device,
     make: impl FnOnce() -> T,
@@ -102,9 +101,9 @@ pub(crate) fn captured_now<T>(
 /// with no return value to check. Capturing the errors here turns them into a
 /// message the caller can attach to whatever asked for the work - the pass,
 /// the shader, the material - which is the difference between "this frame
-/// failed" and "this pass is not drawn, and here is why". Without
-/// `validation-capture` the block's value is always returned and a refusal is
-/// logged by the handler instead.
+/// failed" and "this pass is not drawn, and here is why". Elsewhere the
+/// block's value is always returned and a refusal is logged by the handler
+/// instead.
 ///
 /// # Errors
 ///

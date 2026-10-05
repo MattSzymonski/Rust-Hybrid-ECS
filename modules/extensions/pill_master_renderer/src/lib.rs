@@ -67,8 +67,11 @@ pub mod resources;
 mod surface;
 
 /// The C ABI a host drives this renderer through when it loads it as a module.
-#[cfg(feature = "module-abi")]
-mod module_entry;
+///
+/// Public so the wrapper crate's expansion of `__pill_renderer_entry_points!`
+/// can call into it; the exported symbols come from that macro.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod module_entry;
 
 // External crates
 use pill_engine::{pill_module, Engine};
@@ -79,7 +82,7 @@ pub use pill_master_renderer_data::{
     ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
 };
 pub use pill_renderer_api::{
-    FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
+    FrameOutcome, HeadlessRenderer, PillRenderer, RawWindowData, RenderCapabilities, RenderMetrics,
 };
 
 // Current crate
@@ -99,8 +102,9 @@ pub use resources::RenderingManager;
 ///
 /// The system is registered under whatever scope the caller opened: a host
 /// loading this module scopes it to the module's own owner, so a reload clears
-/// exactly this system and the next generation registers its own. With
-/// `module-abi` on, `#[pill_module]` also exports this as `pill_module_init`.
+/// exactly this system and the next generation registers its own. The
+/// generated `host_module_pill_master_renderer` wrapper carries this as
+/// `pill_module_init` by expanding `__pill_module_entry_points!`.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     if engine.is_system_enabled("rendering").is_none() {

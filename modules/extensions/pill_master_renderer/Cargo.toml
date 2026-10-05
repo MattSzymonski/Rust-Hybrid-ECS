@@ -9,7 +9,11 @@ workspace = true
 # `cdylib` for the host to load and reload as a module; `rlib` for its tests
 # and a shipping build that links it statically.
 [lib]
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_master_renderer` wrapper, which links this crate as a
+# library; `pill_host` reaches the same hashed build through
+# `renderer_dependency_graph`.
+crate-type = ["rlib"]
 
 [dependencies]
 pill_core = { path = "../../pill_core" }
@@ -31,17 +35,3 @@ pill_renderer_api = { path = "../../hosting/pill_renderer_api" }
 # This renderer's data crate: its components, assets, pipelines and shaders.
 # Everything wgpu-free that is specific to the master renderer lives there.
 pill_master_renderer_data = { path = "../pill_master_renderer_data" }
-
-[features]
-default = []
-# The C ABI exports (`pill_module_init`, `pill_renderer_attach`,
-# `pill_renderer_detach`). Opt-in, like every module's: the host's module build
-# turns it on, and a crate linking this as an rlib never exports the symbols.
-module-abi = ["validation-capture"]
-# Block on wgpu's error scopes during a frame, so a pipeline, bind group or
-# texture the device refuses - an edited shader, most often - is reported and
-# skipped instead of reaching the device's error handler. A development
-# capability: only a native build can block, and a loaded module is always a
-# development build, so `module-abi` turns it on. Without it the handler logs
-# the error.
-validation-capture = []

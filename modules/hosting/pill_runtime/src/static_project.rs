@@ -69,9 +69,9 @@ pub struct StaticModule {
     pub name: &'static str,
     /// The function `#[pill_module]` was written on.
     ///
-    /// A module built with the `module-abi` feature also exports this as
-    /// `pill_module_init`; statically the function itself is called instead, so
-    /// the module does **not** need that feature.
+    /// The generated wrapper for a loaded module calls the same function
+    /// through its `pill_module_init` export; statically it is called
+    /// directly, with no export involved either way.
     pub init: fn(&mut Engine) -> u32,
 }
 

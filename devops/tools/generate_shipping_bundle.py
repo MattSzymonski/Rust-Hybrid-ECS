@@ -457,7 +457,7 @@ def build_cargo_manifest(
     if renderer:
         # The renderer, linked statically: the bundle is the only crate that
         # depends on it for real, and hands the host its two entry points.
-        # `module-abi` stays off - nothing loads this binary as a module.
+        # Nothing loads this binary as a module, so it carries no wrapper.
         renderer_path = manifest_relative_path(
             bundle_directory, root / EXTENSION_DIRECTORY / renderer
         )

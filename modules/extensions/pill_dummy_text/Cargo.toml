@@ -14,27 +14,12 @@ workspace = true
 # it hundreds of wrong candidates. `pill_hot_scan` reads this key to know
 # which file is the root and emits no module segment for it.
 path = "src/pill_dummy_text.rs"
-# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept so a monolithic release build can link the same module statically
-# instead, with no second copy of the source.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_dummy_text` wrapper, which links this crate as a library.
+# A project linking it directly then compiles one identical copy of the
+# sources.
+crate-type = ["rlib"]
 
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
-
-[features]
-# `module-abi` is opt-in, not a default: building every member in one cargo
-# invocation (e.g. `cargo build --workspace`) must not turn on the
-# `#[no_mangle]` `pill_module_*` exports for a module's dependency copies.
-# Cargo's feature unification would otherwise leak the default onto those
-# copies and produce duplicate symbols whenever one module links another in
-# the same build. The host passes `--features module-abi` itself when it
-# builds the loadable module.
-default = []
-# Gates the `pill_module_*` C-ABI exports. A crate linked directly into another
-# binary (e.g. the project) keeps this off, since two crates exporting the same
-# `#[no_mangle]` symbol names into one binary is a linker error; the standalone
-# build the host hot-loads passes `--features module-abi` so it stays
-# discoverable.
-module-abi = []

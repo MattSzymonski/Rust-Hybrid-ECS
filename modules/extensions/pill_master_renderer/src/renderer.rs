@@ -101,8 +101,9 @@ pub struct Renderer {
 impl Renderer {
     /// Creates the renderer synchronously, blocking on [`Renderer::new_async`].
     ///
-    /// For the module export, which crosses a C ABI no future can: loaded
-    /// modules exist only in a native development build, which can block.
+    /// For the renderer module's attach export, which crosses a C ABI no
+    /// future can: loaded modules exist only in a native development build,
+    /// which can block.
     ///
     /// # Errors
     ///
@@ -112,7 +113,7 @@ impl Renderer {
     ///
     /// As [`Renderer::new_async`]: `window` must name a live window that
     /// outlives the renderer.
-    #[cfg(feature = "module-abi")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
         // SAFETY: forwarded from this function's own contract.
         pill_core::platform::futures::block_on(unsafe { Self::new_async(window, width, height) })

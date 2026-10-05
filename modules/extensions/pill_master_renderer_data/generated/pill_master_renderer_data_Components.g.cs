@@ -47,10 +47,12 @@ public partial struct CameraComponent
 namespace pill_master_renderer.component {
 
 [StructLayout(LayoutKind.Explicit, Size = 16)]
-public partial struct MeshRendererComponent
+public partial struct DirectionalLightComponent
 {
-    [FieldOffset(0)] public Handle Mesh;
-    [FieldOffset(8)] public Handle Material;
+    [FieldOffset(0)] public float Color0;
+    [FieldOffset(4)] public float Color1;
+    [FieldOffset(8)] public float Color2;
+    [FieldOffset(12)] public float Intensity;
     /// Live ABI bytes of this component row (safe code).
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
@@ -62,12 +64,10 @@ public partial struct MeshRendererComponent
 namespace pill_master_renderer.component {
 
 [StructLayout(LayoutKind.Explicit, Size = 16)]
-public partial struct DirectionalLightComponent
+public partial struct MeshRendererComponent
 {
-    [FieldOffset(0)] public float Color0;
-    [FieldOffset(4)] public float Color1;
-    [FieldOffset(8)] public float Color2;
-    [FieldOffset(12)] public float Intensity;
+    [FieldOffset(0)] public Handle Mesh;
+    [FieldOffset(8)] public Handle Material;
     /// Live ABI bytes of this component row (safe code).
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));

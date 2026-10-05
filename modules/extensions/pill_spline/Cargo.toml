@@ -14,10 +14,11 @@ workspace = true
 # it hundreds of wrong candidates. `pill_hot_scan` reads this key to know
 # which file is the root and emits no module segment for it.
 path = "src/pill_spline.rs"
-# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept both for monolithic release builds and so another module or the project
-# can depend on this crate directly to use the `Spline` type.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_spline` wrapper, which links this crate as a library, and
+# another module or the project can depend on it directly to use the `Spline`
+# type. All of them compile one identical copy of the sources.
+crate-type = ["rlib"]
 
 [build-dependencies]
 pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
@@ -26,34 +27,16 @@ pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
 serde = { version = "1", features = ["derive"] }
-# `default-features = false` keeps `pill_dummy_color`'s `pill_module_*` exports
-# off in this build. Since `module-abi` is opt-in (not a default) this is a
-# no-op today, but it stays as a defensive guard so a future change cannot
-# accidentally pull the exports into this cdylib and duplicate the symbols this
-# crate itself exports.
+# `default-features = false` is a defensive no-op today (`pill_dummy_color`
+# declares no defaults); it stays so a default added there cannot pull extra
+# code into this crate's copies behind its back.
 pill_dummy_color = { path = "../pill_dummy_color", default-features = false }
 
 [features]
-# `module-abi` is opt-in, not a default: building every member in one cargo
-# invocation (e.g. `cargo build --workspace`) must not turn on the
-# `#[no_mangle]` `pill_module_*` exports for a module's dependency copies.
-# Cargo's feature unification would otherwise leak the default onto those
-# copies and produce duplicate symbols whenever one module links another (e.g.
-# pill_spline -> pill_dummy_color) in the same build. The host passes
-# `--features module-abi` itself when it builds the loadable module.
 default = []
-# Gates the `pill_module_*` C-ABI exports. A crate linked directly into another
-# binary (e.g. the project) keeps this off, since two crates exporting the same
-# `#[no_mangle]` symbol names into one binary is a linker error; the standalone
-# build the host hot-loads passes `--features module-abi` so it stays
-# discoverable.
-#
-# It implies `test-hooks` because the hot-reload and C# bridge suites drive
-# loadable module builds through this feature and assert the demo math (the
-# mirrored `get_sum` value, the moving sampled midpoint). A statically linked
-# shipping build passes neither feature and computes only the documented math.
-module-abi = ["test-hooks"]
 # Gates the demo observables the integration suites edit: the sampled height
 # offset, the mirrored sum shift and the hot-patchable colour offset. Off by
-# default, so a shipping crate carries no scaffolding to explain away.
+# default, so a shipping crate carries no scaffolding to explain away. The
+# generated `host_module_pill_spline` wrapper enables every declared feature,
+# so the module build and the project build compute the same demo math.
 test-hooks = []

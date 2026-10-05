@@ -207,14 +207,14 @@ impl CargoRustcLine {
         // applies: the spawned-build environment (profile-driven `RUSTFLAGS`
         // handling, and under the dioxus CLI the mirror of dx's
         // `RUSTC_WORKSPACE_WRAPPER`), plus the shared overrides (the private
-        // target directory, the host anchor package and the custom profile
-        // definition). Missing the profile definition makes cargo reject a
-        // launcher-injected profile such as `desktop-dev`; an environment that
-        // differs from the module build's instead compiles the crate with
-        // different codegen flags or a different wrapper hash than the module
-        // was built with, which changes every metadata hash and makes the
-        // captured `--extern` closure disagree with the staged rlib - rustc
-        // then reports `error[E0463]` and every edit falls back to a full
+        // target directory, the host's explicit engine features and the custom
+        // profile definition). Missing the profile definition makes cargo
+        // reject a launcher-injected profile such as `desktop-dev`; an
+        // environment that differs from the module build's instead compiles the
+        // crate with different codegen flags or a different wrapper hash than
+        // the module was built with, which changes every metadata hash and
+        // makes the captured `--extern` closure disagree with the staged rlib -
+        // rustc then reports `error[E0463]` and every edit falls back to a full
         // reload.
         if program == "cargo" {
             command.envs(crate::config::spawned_build_environment());
@@ -523,26 +523,44 @@ fn patch_linker_value(value: &str) -> String {
 /// asks every non-dx build in this repository to use.
 const PATCH_LINKER: &str = "rust-lld";
 
-/// Point one `--extern name=path` at its staged copy, when there is one.
+/// Point one `--extern name=path` at the artifact a patch can actually use.
 ///
-/// Only a shared per-crate slot is redirected - a `.rlib` whose filename carries
-/// no `-<16 hex digits>` metadata suffix. Everything else is returned unchanged,
-/// including entries this cannot parse: linking the original path is what
-/// happened before staging existed, so an unrecognized entry degrades to the old
-/// behaviour rather than to a broken command line.
+/// Two rewrites happen here. First, a metadata-only entry (`.rmeta`) is
+/// retargeted at the sibling `.rlib` cargo writes beside it: a patch is
+/// linked, and rustc refuses to link against metadata alone, while cargo's
+/// recorded line can name the `.rmeta` for a dependency whose rlib exists all
+/// the same. Missing sibling: the entry stays as it was.
+///
+/// Second, a shared per-crate slot is redirected to its staged copy. Only a
+/// `.rlib` whose filename carries no `-<16 hex digits>` metadata suffix counts
+/// as shared. Everything else is returned unchanged, including entries this
+/// cannot parse: linking the original path is what happened before staging
+/// existed, so an unrecognized entry degrades to the old behaviour rather than
+/// to a broken command line.
 fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
     let Some((name, path)) = entry.split_once('=') else {
         return entry.to_string();
     };
-    let Some(file_name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+    let path = match path.strip_suffix(".rmeta") {
+        Some(stem) => {
+            let sibling = format!("{stem}.rlib");
+            if Path::new(&sibling).is_file() {
+                sibling
+            } else {
+                path.to_string()
+            }
+        }
+        None => path.to_string(),
+    };
+    let Some(file_name) = Path::new(&path).file_name().and_then(|name| name.to_str()) else {
         return entry.to_string();
     };
     if !is_shared_slot_rlib(file_name) {
-        return entry.to_string();
+        return format!("{name}={path}");
     }
     let staged = staged_dependencies.join(file_name);
     if !staged.is_file() {
-        return entry.to_string();
+        return format!("{name}={path}");
     }
     format!("{name}={}", staged.display())
 }
@@ -817,7 +835,7 @@ mod tests {
         let arguments = [
             // The shape that broke: nested double quotes inside the value.
             r#"cfg(feature, values("rendering"))"#,
-            r#"cfg(feature, values("default", "module-abi", "rendering"))"#,
+            r#"cfg(feature, values("default", "test-hooks", "rendering"))"#,
             // No features: no nested quotes, which is why some crates worked.
             "cfg(docsrs,test)",
             // Windows paths - backslashes everywhere, and spaces in some.
@@ -1018,6 +1036,48 @@ mod tests {
         assert_eq!(redirect_extern("no_equals_sign", &staged), "no_equals_sign");
 
         let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    /// A `.rmeta` entry is retargeted at the sibling rlib that can be linked,
+    /// and only when that sibling exists.
+    #[test]
+    fn a_metadata_only_extern_prefers_the_rlib_beside_it() {
+        let directory = std::env::temp_dir().join("pill_rmeta_extern_test");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create dir");
+        let staged = directory.join("staged");
+        std::fs::create_dir_all(&staged).expect("create staging dir");
+        std::fs::write(
+            directory.join("libpill_engine-190d6c0e2d2eaf24.rlib"),
+            b"rlib",
+        )
+        .expect("write sibling rlib");
+
+        // The sibling exists: the entry now names the rlib.
+        let retargeted = redirect_extern(
+            &format!(
+                "pill_engine={}",
+                directory
+                    .join("libpill_engine-190d6c0e2d2eaf24.rmeta")
+                    .display()
+            ),
+            &staged,
+        );
+        assert!(
+            retargeted.ends_with("libpill_engine-190d6c0e2d2eaf24.rlib"),
+            "got: {retargeted}"
+        );
+
+        // No sibling: the entry is left exactly as it was.
+        let orphan = format!(
+            "pill_engine={}",
+            directory
+                .join("libpill_missing-0000000000000000.rmeta")
+                .display()
+        );
+        assert_eq!(redirect_extern(&orphan, &staged), orphan);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The redirect reaches `replay_args`, which is where it has to happen.

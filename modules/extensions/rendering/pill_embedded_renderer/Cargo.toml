@@ -11,7 +11,7 @@ workspace = true
 # renderer needs per-frame `World` access and a frontend driving it; the module
 # ABI is a one-shot component registration, so loading this as a DLL would mean
 # inventing a per-frame render ABI for no benefit. Same crate shape as
-# `pill_wgpu_renderer`: plain `rlib`, no `module-abi`, no build script, not
+# `pill_wgpu_renderer`: plain `rlib`, no C-ABI exports, no build script, not
 # listed in any `project_settings.yaml`.
 crate-type = ["rlib"]
 

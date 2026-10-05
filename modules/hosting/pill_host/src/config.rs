@@ -115,7 +115,17 @@ const EXTENSION_DIRECTORY: &str = "extensions";
 /// The member lives under [`EXTENSION_DIRECTORY`], so the existing
 /// `extensions/*` workspace glob discovers it without any entry in the workspace
 /// manifest; only the package name differs per project.
-const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
+pub(crate) const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
+
+/// Name prefix of the generated workspace member that builds one extension's
+/// loadable artifact.
+///
+/// One wrapper is materialized per loaded extension under
+/// [`EXTENSION_DIRECTORY`], so the same `extensions/*` glob discovers it. The
+/// wrapper is the `cdylib`; the extension itself stays a plain library inside
+/// it, which is what lets the module build and every project build compile
+/// one identical copy of the extension.
+pub(crate) const HOST_MODULE_MEMBER_PREFIX: &str = "host_module_";
 
 /// Cargo profile directory this host was compiled into, recorded by `build.rs`.
 ///
@@ -224,8 +234,13 @@ const DX_RUSTC_WRAPPER_ENVIRONMENT: &str = "DX_RUSTC";
 /// and launches (dioxus-cli `build/builder.rs` `child_environment_variables`).
 /// A plain `cargo run`/`cargo build` never sets it, which is what separates
 /// the dx-built editor - whose engine dylibs carry dx's workspace-wrapper
-/// hash - from every other host.
-fn running_under_dioxus_cli() -> bool {
+/// hash - from every other host. Also read by
+/// [`crate::build_runner::apply_cargo_host_overrides`], which keeps the cargo
+/// anchor for dx hosts only: the editor's own macro graph unions features
+/// onto the host (proc-macro) units of `proc-macro2`/`quote`/`syn` that cannot
+/// be enumerated in the engine manifests, so only selecting the editor
+/// package as the anchor reproduces them.
+pub(crate) fn running_under_dioxus_cli() -> bool {
     env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
 }
 
@@ -463,8 +478,11 @@ pub struct ProjectModuleConfig {
 
 /// Build, watch and load description for one extension.
 ///
-/// Extensions are workspace members of the engine workspace, built as
-/// `cdylib` and loaded by the host at runtime. They share the workspace's
+/// Extensions are workspace members of the engine workspace. Each is built
+/// through a generated `host_module_<name>` wrapper crate
+/// ([`materialize_host_module_wrapper`]) whose `cdylib` carries the
+/// loadable-artifact entry points, with the extension itself compiled inside
+/// it as a plain library. Wrapper and extension share the workspace's
 /// lockfile and Cargo configuration, which is what lets them link the engine
 /// dynamically and share one copy of its statics with the host.
 #[non_exhaustive]
@@ -473,8 +491,14 @@ pub struct ExtensionConfig {
     /// Crate directory name, also the log field and temporary-copy prefix.
     pub name: String,
 
-    /// Library name without the platform prefix or suffix.
+    /// Library name of the artifact the host loads, which is the extension's
+    /// own name: the wrapper's DLL is staged under it, and the host addresses
+    /// the module by it in logs, analytics and the reload graveyard.
     pub library_name: String,
+
+    /// Library name of the generated wrapper crate the build command selects;
+    /// the artifact it produces is staged under [`Self::library_name`].
+    pub wrapper_library_name: String,
 
     /// Directory to watch for source changes, relative to the workspace root.
     pub watch_directory: String,
@@ -492,25 +516,26 @@ pub struct ExtensionConfig {
 }
 
 impl ExtensionConfig {
-    /// Derive the configuration of a module crate from its directory name.
+    /// Derive the configuration of an extension from its directory name.
     ///
-    /// Extensions live under [`EXTENSION_DIRECTORY`] inside the
-    /// engine workspace, which a glob in the workspace manifest picks up
+    /// Extensions live under [`EXTENSION_DIRECTORY`] inside the engine
+    /// workspace, which a glob in the workspace manifest picks up
     /// automatically, so a new module needs no manifest edit. The directory
     /// name determines everything else: sources in `<directory>/<name>/src`,
-    /// the loadable artifact staged into the private `target/hot` hot-load
-    /// directory, and a plain package selection for the build.
+    /// the generated `host_module_<name>` wrapper that carries the loadable
+    /// artifact, and the private `target/hot` directory it is staged into.
     ///
     /// Building inside the workspace is required rather than convenient. It
     /// makes the module resolve the identical dependency graph as the host,
     /// which is what keeps component type identities and the mangled symbol
     /// names of the shared `pill_core` library in agreement.
     pub fn workspace_member(name: &str) -> Self {
+        let wrapper_library_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
         let mut build_command = vec![
             "cargo".to_string(),
             "build".to_string(),
             "--package".to_string(),
-            name.to_string(),
+            wrapper_library_name.clone(),
             // Never touch the registry: every dependency is already cached in
             // the workspace. Skipping the index avoids the ~/.cargo package
             // cache lock (which rust-analyzer's cargo check can hold for long
@@ -526,42 +551,33 @@ impl ExtensionConfig {
         if cargo_timings_enabled() {
             build_command.push("--timings".to_string());
         }
-        // Enable the module's C-ABI exports explicitly. The feature is opt-in
-        // (not a default) so that building every member in one cargo
-        // invocation never leaks the `#[no_mangle]` `pill_module_*` exports
-        // onto a module's dependency copies via feature unification.
-        //
-        // The features are package-qualified because the host frontend is
-        // selected as an anchor package in the same invocation (see
-        // `run_build_command`): a plain `module-abi` would have to exist on
-        // every selected package. Qualifying keeps the module's own features
-        // on the module while the anchor's presence unifies the shared engine
-        // crates with whatever host binary is running - a GUI frontend unions
-        // extra features onto those crates, and a module compiled against a
-        // differently featured engine cannot resolve its `pill_core.dll` and
-        // `pill_engine_core.dll` imports against the single instances the
-        // host has loaded.
-        let mut module_features = vec![format!("{name}/module-abi")];
-        // `rendering` used to be mirrored here too, because the engine's
-        // renderer feature changed its public type layout. The renderer now
-        // lives in `pill_master_renderer`, which only the host links, so the
-        // engine a module compiles against is the same either way.
-        // Hot patching must be mirrored too. The engine core is a shared
-        // dylib whose symbol names hash its features, so a module built
+        // The wrapper's manifest enables the extension's own features on its
+        // dependency edge (`materialize_host_module_wrapper`); the command
+        // line must only mirror the hot-patch feature. The engine core is a
+        // shared dylib whose symbol names hash its features, so a module built
         // without the feature imports names the host's `pill_engine_core.dll`
         // does not export. And `register_system` is generic, so the module
         // compiles its own instance of it: built without the feature, that
         // instance creates no dispatch slot and every patch is refused with
         // "no hot-patchable system registered".
+        //
+        // The feature is package-qualified because a spawned build may select
+        // more than one package and it must land on the engine, not on
+        // whatever else is selected. The shared `pill_engine_core.dll` hashes
+        // its features into its exported names, so a module built without it
+        // cannot resolve its imports against the instance the host has loaded.
+        // The rest of the host's engine features (profiling, metrics,
+        // `dev-logs`) travel with every spawned build through
+        // `apply_cargo_host_overrides`.
         if cfg!(feature = "hot_patch") {
-            module_features.push("pill_engine/hot_patch".to_string());
+            build_command.push("--features".to_string());
+            build_command.push("pill_engine/hot_patch".to_string());
         }
-        build_command.push("--features".to_string());
-        build_command.push(module_features.join(","));
 
         Self {
             name: name.to_string(),
             library_name: name.to_string(),
+            wrapper_library_name,
             watch_directory: format!("{EXTENSION_DIRECTORY}/{name}/src"),
             build_command,
             output_subdirectory: "target/hot".to_string(),
@@ -734,7 +750,8 @@ impl HostConfig {
         // of the extension list and of the required `name` /
         // `build_binary_name`, so a missing file is a configuration error
         // reported as such, not masked as a missing field.
-        let project_root = engine_workspace_root()?.join(&project_path);
+        let workspace_root = engine_workspace_root()?;
+        let project_root = workspace_root.join(&project_path);
         let settings_path = project_root.join(PROJECT_SETTINGS_FILE);
         let project_settings = read_project_settings_file(&project_root)?.ok_or(
             ConfigError::ProjectSettingsFileMissing {
@@ -772,12 +789,29 @@ impl HostConfig {
         // `extensions/`, is a configuration error here rather than a watch on
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
-        let extensions_root = engine_workspace_root()?.join(EXTENSION_DIRECTORY);
+        let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
         let renderer =
             Self::resolve_renderer(project_settings.renderer.as_deref(), &extensions_root)?;
         let module_names =
             Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
         let extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
+
+        // Step 5: Write every loaded extension's wrapper crate before the
+        // first build, and clear wrappers for extensions this project no
+        // longer loads. The renderer module gets one too, with its renderer
+        // ABI entry points added to the generated source.
+        for name in &module_names {
+            materialize_host_module_wrapper(&workspace_root, name, false)?;
+        }
+        if let Some(renderer_name) = renderer.as_deref() {
+            materialize_host_module_wrapper(&workspace_root, renderer_name, true)?;
+        }
+        let mut kept_wrappers = module_names.clone();
+        if let Some(renderer_name) = renderer.as_deref() {
+            kept_wrappers.push(renderer_name.to_string());
+        }
+        prune_stale_host_module_wrappers(&workspace_root, &kept_wrappers);
+
         let logging = project_settings.logging.validate(&settings_path)?;
         Ok(Self {
             name: project_name,
@@ -1698,6 +1732,176 @@ fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
         if is_generated {
             let _ = std::fs::remove_dir_all(&path);
         }
+    }
+}
+
+/// Materialize the wrapper workspace member that builds one extension's
+/// loadable artifact.
+///
+/// The wrapper is a generated crate under `extensions/` - discovered by the
+/// same workspace glob as everything else - whose `cdylib` is the artifact the
+/// host loads, staged and addressed under the extension's own name. The
+/// extension stays a plain library inside it, so its sources compile once per
+/// configuration: the module build and every project build share one rlib.
+///
+/// The generated manifest enables every feature the extension declares, so
+/// the wrapper's copy of the extension always matches the copy projects link.
+/// The generated `lib.rs` expands the extension's entry-point macro - and,
+/// for the renderer module, also its renderer ABI macro - because a crate
+/// linked into several artifacts cannot define the `#[no_mangle]` symbols
+/// itself.
+///
+/// Like the generated project member, this is rewritten on every startup and
+/// left untouched when unchanged.
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] when the member directory or either generated
+/// file cannot be written.
+fn materialize_host_module_wrapper(
+    workspace_root: &Path,
+    name: &str,
+    is_renderer: bool,
+) -> Result<(), ConfigError> {
+    let member_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
+    let member_directory = workspace_root.join(EXTENSION_DIRECTORY).join(&member_name);
+    let extension_directory = workspace_root.join(EXTENSION_DIRECTORY).join(name);
+    let engine_directory = workspace_root.join("pill_engine");
+
+    // Everything the extension declares except the `default` key. A wrapper
+    // that enabled fewer features than a project's dependency edge would
+    // compile a second, differently featured copy of the extension - the
+    // collision the wrapper exists to remove.
+    let mut features =
+        crate::build_runner::declared_features(workspace_root, name).unwrap_or_default();
+    features.retain(|feature| feature != "default");
+    features.sort();
+    let feature_entry = if features.is_empty() {
+        String::new()
+    } else {
+        let list = features
+            .iter()
+            .map(|feature| format!("\"{feature}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(", features = [{list}]")
+    };
+
+    let manifest = format!(
+        "# Generated by the host for the `{name}` extension; rewritten on every run.\n\
+         [package]\n\
+         name = \"{member_name}\"\n\
+         version = \"0.1.0\"\n\
+         edition = \"2021\"\n\
+         \n\
+         [lints]\n\
+         workspace = true\n\
+         \n\
+         [lib]\n\
+         name = \"{member_name}\"\n\
+         crate-type = [\"cdylib\", \"rlib\"]\n\
+         \n\
+         [dependencies]\n\
+         pill_engine = {{ path = \"{engine_path}\" }}\n\
+         {name} = {{ path = \"{extension_path}\", default-features = false{feature_entry} }}\n",
+        engine_path = render_manifest_path(&engine_directory),
+        extension_path = render_manifest_path(&extension_directory),
+    );
+
+    let crate_name = name.replace('-', "_");
+    let renderer_bullet = if is_renderer {
+        format!(
+            "//! - Also carries the renderer ABI (`pill_renderer_attach` and\n\
+             //!   `pill_renderer_detach`) by expanding\n\
+             //!   `{crate_name}::__pill_renderer_entry_points!()`.\n"
+        )
+    } else {
+        String::new()
+    };
+    let renderer_entry = if is_renderer {
+        format!("{crate_name}::__pill_renderer_entry_points!();\n")
+    } else {
+        String::new()
+    };
+    let source = format!(
+        "//! Loadable-artifact wrapper for the `{name}` extension.\n\
+         //!\n\
+         //! # Responsibilities\n\
+         //!\n\
+         //! - Builds the cdylib the host loads as `{name}`, with the extension\n\
+         //!   compiled inside it as a plain library.\n\
+         //! - Carries the loadable-artifact entry points by expanding\n\
+         //!   `{crate_name}::__pill_module_entry_points!()`.\n\
+         {renderer_bullet}\
+         //!\n\
+         //! Generated by the host on startup; rewritten on every run, never\n\
+         //! edited by hand.\n\
+         \n\
+         {crate_name}::__pill_module_entry_points!();\n\
+         {renderer_entry}"
+    );
+
+    for (relative_path, contents) in [("Cargo.toml", manifest), ("src/lib.rs", source)] {
+        let path = member_directory.join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| {
+                ConfigError::HostModuleMemberCreationFailed {
+                    path: parent.display().to_string(),
+                    source,
+                }
+            })?;
+        }
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|existing| existing == contents)
+            .unwrap_or(false);
+        if unchanged {
+            continue;
+        }
+        std::fs::write(&path, contents).map_err(|source| {
+            ConfigError::HostModuleMemberCreationFailed {
+                path: path.display().to_string(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Removes generated extension wrappers left behind by earlier runs.
+///
+/// Every directory under `extensions/` whose name carries
+/// [`HOST_MODULE_MEMBER_PREFIX`] was written by
+/// [`materialize_host_module_wrapper`], so any one whose extension is not in
+/// `keep` belongs to a project the host is no longer running. Leaving it in
+/// place is not harmless: the `extensions/*` glob still picks it up as a
+/// workspace member whose dependency paths may not resolve, and Cargo then
+/// fails to load the workspace at all. This is the module-side twin of
+/// [`prune_stale_host_project_members`].
+///
+/// Failures are ignored rather than propagated, for the same reason they are
+/// there: a stale member the host cannot remove is a housekeeping problem,
+/// not a reason to refuse to start.
+fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[String]) {
+    let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&extensions_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(extension) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(HOST_MODULE_MEMBER_PREFIX))
+        else {
+            continue;
+        };
+        if keep.iter().any(|name| name == extension) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 

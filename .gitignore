@@ -39,6 +39,7 @@ modules/pill_standalone_temp/
 
 # Host-generated project workspace member (created at runtime)
 modules/extensions/host_project_*/
+modules/extensions/host_module_*/
 
 # Generated build scratch (shipping bundle contents, build metadata).
 #

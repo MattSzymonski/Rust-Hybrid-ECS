@@ -24,8 +24,8 @@
 //! An asset is only rewritten when the new text differs from what it holds, so
 //! a save that changes nothing costs no GPU work.
 //!
-//! Compiled only into a loaded module (`module-abi`) and the tests: a shipping
-//! build has no sources to watch and no host to deliver edits.
+//! Compiled into native development builds and the tests: a shipping build has
+//! no sources to watch and no host to deliver edits.
 
 // Standard library
 use std::slice;
@@ -96,7 +96,7 @@ pub fn apply_shader_source<'a>(
 /// `world` must be null or point at a live `World` no one else is using for
 /// the call's duration. `path`/`wgsl` must reference their declared lengths in
 /// readable memory, unless the matching length is zero.
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_shader_changed(
     world: *mut World,
     path: *const u8,

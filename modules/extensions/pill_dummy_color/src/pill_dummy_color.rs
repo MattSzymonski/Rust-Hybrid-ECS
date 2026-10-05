@@ -13,9 +13,8 @@
 //! statically into a monolithic build.
 
 // External crates
-// `pill_module` must resolve in every build (the attribute is applied to
-// `register` in source); `Engine` is only needed by the module-abi build,
-// where `register` is actually compiled in.
+// `pill_module` and `Engine` must resolve in every build: the attribute is
+// applied to `register` in source, and `register` is compiled everywhere.
 use pill_engine::Engine;
 use pill_engine::{pill_hot_fn, pill_module};
 
@@ -80,10 +79,9 @@ pub fn get_color_a() -> f32 {
 ///
 /// Must be idempotent: the host calls it once per loaded generation and rolls
 /// back to the previous library when it reports a non-zero status.
-/// Public so a statically linked build can call it directly. With
-/// `module-abi` on, `#[pill_module]` also exports it as
-/// `pill_module_init` for the host to find in a loaded DLL; a shipping
-/// build has no DLL and calls this function itself.
+/// Public so a statically linked build can call it directly, and so the
+/// generated `host_module_pill_dummy_color` wrapper can carry it as
+/// `pill_module_init` for the host to find in a loaded DLL.
 #[pill_module]
 pub fn register(_engine: &mut Engine) -> u32 {
     0

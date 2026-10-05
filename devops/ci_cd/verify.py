@@ -155,6 +155,13 @@ STEPS: List[Step] = [
         [[PYTHON, "devops/tests/test_engine_feature_drift.py"]],
         working_directory=REPOSITORY_ROOT,
     ),
+    Step(
+        "wrapper-entry-points",
+        "Wrapper entry points (the wrapper exports the full entry-point set)",
+        # Builds the fixture extension both ways and compares PE export names.
+        [[PYTHON, "devops/tests/test_wrapper_entry_points.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
     Step("doc", "Documentation", [["cargo", "doc", "--workspace", "--no-deps"]]),
     Step(
         "wasm-clippy",

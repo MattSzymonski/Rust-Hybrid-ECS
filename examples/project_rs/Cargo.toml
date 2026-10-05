@@ -16,13 +16,13 @@ pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
 # The master renderer's data only - components, assets, pipelines. The GPU
 # renderer is the host's; a project that linked it would carry wgpu in its own
-# DLL. `default-features = false`, as for every extension, keeps its module
-# exports out of this project's DLL.
+# DLL. `default-features = false` documents that this edge chooses its
+# features explicitly (the crate declares no defaults today).
 pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `init` about why this crate must not also be loaded as a module.
-# `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
-# so the `pill_module_*` exports stay off in this build either way.
+# `default-features = false` is a defensive no-op: the crate declares no
+# defaults, and the feature list below is the explicit choice.
 # `test-hooks` keeps the module's demo observables - the sampled height
 # offset, the `GetSum` shift - that the hot-reload and bridge suites edit and
 # watch for; a default build of the module computes only the documented math.
