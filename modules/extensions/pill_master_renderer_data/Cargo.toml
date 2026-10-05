@@ -14,9 +14,10 @@ workspace = true
 # Named after the crate rather than `lib.rs`, like every extension, so the
 # debugger's file-name fallback has one candidate.
 path = "src/pill_master_renderer_data.rs"
-# `cdylib` for the host to load as an extension (from stage 6 of the renderer
-# data split); `rlib` for the GPU module, projects and shipping builds.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_master_renderer_data` wrapper, which links this crate as a
+# library, and the GPU module links the same build.
+crate-type = ["rlib"]
 
 [dependencies]
 pill_core = { path = "../../pill_core" }
@@ -48,16 +49,6 @@ image = { version = "0.25", default-features = false, features = [
 # format every backend can filter, so their texels are packed to `f16` here.
 half = "2"
 tobj = "3"
-
-[features]
-default = []
-# The `pill_module_*` C-ABI exports. Opt-in like every module's: the host's
-# module build turns it on, and a crate linking this as an rlib never exports
-# the symbols (two copies in one binary would collide at link time).
-# Also compiles the development shader reload export
-# (`pill_render_data_shader_changed`): only a loaded module has a host watching
-# its shaders, so a shipping build never carries it.
-module-abi = []
 
 [dev-dependencies]
 # Tests check the metadata files' JSON form. Test-only, and the workspace's

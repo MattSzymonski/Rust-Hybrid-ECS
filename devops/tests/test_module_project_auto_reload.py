@@ -84,7 +84,7 @@ SAMPLE_OFFSET_PATTERN = re.compile(
     r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
 )
 
-# The probe's report line, e.g. "midpoint (390.0, 288.8)". The expectation is
+# The probe's report line, e.g. "midpoint (990.0, 288.8)". The expectation is
 # derived from the baseline report rather than written down here: the value is
 # the module's math applied to the project's spawn geometry, and pinning it as
 # a literal means re-calibrating this suite every time either side is edited.

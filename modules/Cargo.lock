@@ -626,16 +626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "circus_demo"
-version = "0.1.0"
-dependencies = [
- "glam",
- "pill_engine",
- "pill_master_renderer_data",
- "serde",
-]
-
-[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2610,6 +2600,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "host_module_pill_audio"
+version = "0.1.0"
+dependencies = [
+ "pill_audio",
+ "pill_engine",
+]
+
+[[package]]
+name = "host_module_pill_master_renderer"
+version = "0.1.0"
+dependencies = [
+ "pill_engine",
+ "pill_master_renderer",
+]
+
+[[package]]
+name = "host_module_pill_master_renderer_data"
+version = "0.1.0"
+dependencies = [
+ "pill_engine",
+ "pill_master_renderer_data",
+]
+
+[[package]]
+name = "host_module_pill_spline"
+version = "0.1.0"
+dependencies = [
+ "pill_engine",
+ "pill_spline",
+]
+
+[[package]]
 name = "host_project_project"
 version = "0.1.0"
 dependencies = [
@@ -3038,6 +3060,18 @@ name = "is_ci"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
+
+[[package]]
+name = "italian_brainrot"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "pill_assets",
+ "pill_engine",
+ "pill_master_renderer_data",
+ "serde",
+ "trait_type_map",
+]
 
 [[package]]
 name = "itertools"
@@ -4700,6 +4734,7 @@ dependencies = [
  "chrono",
  "colored",
  "crossbeam-utils",
+ "either",
  "glam",
  "libloading 0.8.9",
  "libm",
@@ -4711,11 +4746,15 @@ dependencies = [
  "num-traits",
  "pill_core_macros",
  "pollster",
+ "proc-macro2",
  "rayon",
  "serde",
+ "serde_core",
  "serde_json",
  "smallvec",
+ "syn 3.0.5",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "tracing-appender",
  "tracing-log",
@@ -4726,6 +4765,9 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
+ "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4820,6 +4862,7 @@ dependencies = [
  "tracing",
  "tracy-client",
  "trait_type_map",
+ "zerocopy",
 ]
 
 [[package]]
@@ -4941,7 +4984,7 @@ dependencies = [
 name = "pill_shipping_bundle"
 version = "0.0.0"
 dependencies = [
- "circus_demo",
+ "italian_brainrot",
  "pill_assets",
  "pill_master_renderer",
  "pill_master_renderer_data",

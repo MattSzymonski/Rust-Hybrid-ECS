@@ -22,6 +22,12 @@ DESCRIPTION
                         `pill_engine_core/src` names `inventory::` outside a
                         comment. Once the core is shared, a registry read from
                         it would see every DLL's entries.
+      3. no module-abi - the removed `module-abi` feature is not named anywhere
+                        under `modules/` (manifests, sources; generated
+                        members excluded). It was the marker for the in-crate
+                        loadable artifact; the generated `host_module_*`
+                        wrappers replaced it, and a build that turned it back
+                        on would duplicate the entry-point symbols.
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -129,6 +135,34 @@ def registry_uses(core_directory):
     return found
 
 
+# Every reference to the removed `module-abi` feature: a manifest that
+# declares or enables it, or a non-comment source line naming it (rule 3).
+# Host-generated members are skipped: the host writes them at runtime, and a
+# stale one must fail the build, not this check.
+def module_abi_references(root):
+    modules = root / "modules"
+    found = []
+    generated = ("host_project_", "host_module_")
+    for manifest in sorted(modules.rglob("Cargo.toml")):
+        relative = manifest.relative_to(root).as_posix()
+        if "target/" in relative or "pill_standalone_temp/" in relative:
+            continue
+        if manifest.parent.name.startswith(generated):
+            continue
+        if "module-abi" in manifest.read_text(encoding="utf-8"):
+            found.append(f"{relative} names the removed `module-abi` feature")
+    for source in sorted(modules.rglob("*.rs")):
+        relative = source.relative_to(root).as_posix()
+        if "target/" in relative or "pill_standalone_temp/" in relative:
+            continue
+        if any(part.startswith(generated) for part in source.parts):
+            continue
+        for number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+            if "module-abi" in line and not line.lstrip().startswith("//"):
+                found.append(f"{relative}:{number} names the removed `module-abi` feature")
+    return found
+
+
 # Runs every rule against the repository at `root`; returns the failures.
 def check(root):
     core_directory = root / "modules" / CORE_CRATE
@@ -140,6 +174,10 @@ def check(root):
     ]
     failures.extend(
         f"no registry: {use} (registries belong in the facade)" for use in registry_uses(core_directory)
+    )
+    failures.extend(
+        f"no module-abi: {reference} (the wrappers replaced the feature)"
+        for reference in module_abi_references(root)
     )
     return failures
 
@@ -186,6 +224,18 @@ def self_test():
             {"pill_engine_core": "// the facade walks inventory::iter, the core never does\n"},
             0,
         ),
+        (
+            "a cfg on the removed feature fails",
+            {"pill_engine_core": []},
+            {"pill_engine_core": '#[cfg(feature = "module-abi")]\nfn x() {}\n'},
+            1,
+        ),
+        (
+            "a comment naming the removed feature passes",
+            {"pill_engine_core": []},
+            {"pill_engine_core": "// wrappers replaced the module-abi feature\n"},
+            0,
+        ),
     ]
     passed = True
     for description, crates, sources, expected_failures in cases:
@@ -197,6 +247,20 @@ def self_test():
         outcome = "PASS" if len(failures) == expected_failures else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # A manifest declaring the removed feature fails too.
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        write_crate(root, "pill_dummy_color", [])
+        manifest = root / "modules" / "pill_dummy_color" / "Cargo.toml"
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8") + "\n[features]\nmodule-abi = []\n",
+            encoding="utf-8",
+        )
+        failures = check(root)
+    outcome = "PASS" if len(failures) == 1 else "FAIL"
+    passed &= outcome == "PASS"
+    print(f"  {outcome}  a manifest declaring the removed feature fails")
     return 0 if passed else 1
 
 
@@ -216,7 +280,7 @@ def main():
         print(f"  FAIL  {failure}")
     if failures:
         return 1
-    print("  PASS  engine layout: the core does not link the facade and reads no registry")
+    print("  PASS  engine layout: the core does not link the facade, reads no registry, and module-abi is gone")
     return 0
 
 

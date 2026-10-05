@@ -11,6 +11,10 @@ workspace = true
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
+# `span-locations` for the same reason as in `pill_engine_macros`: the
+# editor's macro graph unifies it onto proc-macro2, and proc-macro deps
+# resolve separately from the target ones, so it must be requested here for
+# module builds to carry the editor's macro-host metadata.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }

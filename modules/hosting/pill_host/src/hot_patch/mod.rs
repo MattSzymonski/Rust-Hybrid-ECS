@@ -1443,12 +1443,20 @@ impl HotPatchSession {
     /// compile, which is the same outcome as leaving it stale, and the module's
     /// next real build restages it correctly.
     fn refresh_staged_rlib(&self) -> Result<(), String> {
-        let built = self
-            .workspace_root
-            .join(crate::config::module_build_artifact_directory())
-            .join(format!("lib{}.rlib", self.package));
-        let Ok(built_metadata) = std::fs::metadata(&built) else {
+        // A wrapper build compiles the extension as a dependency, so the
+        // newest rlib under the build's `deps` directory is the one that
+        // build produced; a direct build leaves an unhashed copy the same
+        // helper finds.
+        let Some(built) = crate::build_runner::newest_extension_rlib(
+            &self
+                .workspace_root
+                .join(crate::config::module_build_artifact_directory()),
+            &self.package,
+        ) else {
             // Cargo has not produced one; the staged copy is all there is.
+            return Ok(());
+        };
+        let Ok(built_metadata) = std::fs::metadata(&built) else {
             return Ok(());
         };
         if let Ok(staged_metadata) = std::fs::metadata(&self.package_rlib) {
@@ -1491,24 +1499,25 @@ impl HotPatchSession {
             // The crate's own freshly built rlib IS included, though. The flags
             // describe the dependency closure this crate links, and that
             // closure only changes when the crate is rebuilt - at startup, on a
-            // module reload, or whenever the feature unification with the host
-            // anchor moves (under the dioxus CLI, engine crates can carry two
-            // different metadata hashes side by side for the module and the
-            // editor anchor; a cache captured against one goes silently stale
-            // against the other and rustc reports `error[E0463]` when the patch
-            // tries to link the freshly staged rlib against the old externs).
-            // The rlib's mtime moves exactly when that happens, so keying on it
-            // re-captures precisely when the world changed and stays hot across
-            // plain source edits and patches.
+            // module reload, or whenever the engine feature set the build
+            // resolves with changes (a host rebuilt with profiling or another
+            // engine feature moves it; a cache captured against one feature set
+            // goes silently stale against another and rustc reports
+            // `error[E0463]` when the patch tries to link the freshly staged
+            // rlib against the old externs). The rlib's mtime moves exactly
+            // when that happens, so keying on it re-captures precisely when the
+            // world changed and stays hot across plain source edits and
+            // patches.
+            //
+            // The staged copy, not a build-tree path: a wrapper build leaves
+            // the extension's rlib under a hashed name the session cannot
+            // know, and the staged file is refreshed from it right before this
+            // runs - it is also what the patch actually links.
             let mut freshness = vec![
                 self.workspace_root.join("Cargo.toml"),
                 self.workspace_root.join("Cargo.lock"),
             ];
-            freshness.push(
-                self.workspace_root
-                    .join(crate::config::module_build_artifact_directory())
-                    .join(format!("lib{}.rlib", self.package)),
-            );
+            freshness.push(self.package_rlib.clone());
             // The cargo configuration and the pinned toolchain decide the same
             // flags from outside the manifest: a wrapper, a target directory
             // override, or a toolchain switch changes what a replayed line

@@ -10,35 +10,31 @@ DESCRIPTION
     Pins the one property that makes a component type usable from two binaries
     at once: `pill_spline::Spline` is linked BOTH by the project (which depends
     on the crate directly, so it can write `Query<&Spline>`) and by the module
-    DLL the host loads alongside it. Those are separate compilation units, so
-    each gets its own `TypeId` for what the programmer wrote as one type, and
-    identifying the component by `TypeId` therefore splits it into two
-    components with two columns that cannot see each other's entities.
+    DLL the host loads alongside it. Under module wrappers both binaries
+    compile the same rlib, so the type's ordinary identity is already equal;
+    `#[pill(shared)]` still replaces it with one derived from a declared name,
+    which every binary computes identically no matter how many copies its
+    build produced.
 
-    `#[pill(shared)]` replaces that identity with one derived from a declared
-    name, which both binaries compute identically and without coordination.
-
-    Two scenarios, and the second is what gives the first its meaning:
+    Two scenarios pin the arrangement:
 
     1. `shared_identity_binds_both_binaries` - with the attribute in place, the
        engine's own ECS report shows exactly ONE `pill_spline::Spline` column
        and lists the component under `shared identity`. One column is the whole
        claim.
 
-    2. `distinct_type_ids_are_proven_by_removing_it` - the control. Removing
-       `#[pill(shared)]` must make startup FAIL with the peer-collision error,
-       because the two registrations now arrive under different `TypeId`s with
-       the same type name while the first still holds live rows.
-
-       This is what proves the `TypeId`s genuinely differ rather than happening
-       to coincide. If they were equal, the second registration would be an
-       ordinary idempotent re-registration and nothing would be reported; the
-       collision can only happen because they are not.
-
-       It is also the regression this guards: before the collision guard
-       existed, that second registration silently evicted the first's persist
-       entries, and every row the evicted side owned was dropped at the next
-       hot reload with no error at all.
+    2. `one_compiled_copy_needs_no_declaration` - the control, reworked for
+       the wrapper. It used to prove the two `TypeId`s genuinely differed:
+       removing `#[pill(shared)]` made the peer registration collide, and
+       equal identities would have made the second registration an ordinary
+       idempotent re-registration instead. The wrapper ended that arrangement
+       on purpose - the project and the module compile ONE copy of the
+       extension, so the collision cannot happen at all. The scenario pins the
+       new contract instead: without the attribute the host still starts, and
+       the module's registration still binds to the column the project
+       registered, because the identity now comes from the build rather than
+       from a declaration. (The peer-collision guard itself stays covered by
+       the engine's unit tests on `WorldError::ComponentNameCollision`.)
 
 USAGE
   python tests/test_shared_component_identity.py [--timeout-scale S]
@@ -518,13 +514,10 @@ def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
     # `rendering` is required, not a preference. `examples/project_rs` links
-    # `pill_master_renderer` directly, so building the project drags wgpu into
-    # its dependency graph and turns on features in crates `pill_core` also
-    # depends on. The host selects itself as a cargo anchor to unify features
-    # for that build, so an anchor without `rendering` resolves `pill_core`
-    # differently from the project and the project DLL fails to load with "The
-    # specified procedure could not be found" (os error 127). See
-    # `apply_cargo_host_overrides` in `pill_host/src/build_runner.rs`.
+    # `pill_master_renderer` directly, so the project build resolves the wgpu
+    # graph, and the host's engine dylibs must match the resolution every
+    # spawned build gets (`apply_cargo_host_overrides` in
+    # `pill_host/src/build_runner.rs` mirrors the host's engine features).
     return launch_process(
         ["cargo", "run", "--package", "pill_standalone", "--features", "rendering"],
         MODULES_ROOT,
@@ -716,66 +709,71 @@ def scenario_shared_identity_binds_both_binaries() -> bool:
         common.terminate_process(process, monitor)
 
 
-def scenario_distinct_type_ids_are_proven_by_removing_it() -> bool:
-    """Without the attribute, the two registrations collide.
+def scenario_one_compiled_copy_needs_no_declaration() -> bool:
+    """Without the attribute, one compiled copy still means one component.
 
-    The collision is only possible because the two `TypeId`s differ: equal ones
-    would make the second registration idempotent and silent.
+    Reworked from the old collision control: the two `TypeId`s can no longer
+    differ, because the project and the module compile the extension from one
+    rlib. What the scenario pins now is the replacement guarantee - with
+    `#[pill(shared)]` removed, the host starts, reports no peer collision, and
+    (when frames run) shows exactly one column for the component.
     """
-    print("\n  [TEST] Control: removing shared identity must collide.")
+    print("\n  [TEST] Control: no declaration, one compiled copy, one component.")
     set_shared_identity(False)
 
     process, monitor = launch_host()
     try:
-        # The host is expected to fail setup and exit, so this waits for the
-        # exit rather than for a token: `wait_for*` returns `None` as soon as
-        # the process is gone, whether or not the token was printed, and the
-        # collision is printed milliseconds before that exit.
-        deadline = time.monotonic() + COLLISION_TIMEOUT
-        reached_loop = False
-        while time.monotonic() < deadline:
-            if STARTUP_TOKEN in monitor.output_since(0):
-                reached_loop = True
-                break
-            if not monitor.process_alive():
-                break
-            time.sleep(0.2)
+        start_index = monitor.line_count
+        if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
+            # Name the likely cause rather than only the symptom, as in the
+            # first scenario: a collision aborts the project's init before
+            # the loop ever runs.
+            if COLLISION_TOKEN in monitor.output_since(0):
+                print(
+                    "  [FAIL] Startup aborted on a peer collision without "
+                    "`#[pill(shared)]`. The project and the module must compile "
+                    "one copy of the extension; a collision means they did not."
+                )
+            else:
+                print("  [FAIL] Host did not reach the project loop.")
+            print(f"  Output tail:\n{monitor.output_since(0)[-2000:]}")
+            return False
+        print("  [OK] Host started with the project and the module loaded.")
 
         output = monitor.output_since(0)
-
-        if reached_loop:
+        if COLLISION_TOKEN in output:
             print(
-                "  [FAIL] The host started cleanly without `#[pill(shared)]`. "
-                "Two registrations of one type name should have collided, so "
-                "either the two `TypeId`s no longer differ (and this suite is "
-                "not testing what it claims), or the peer-collision guard in "
-                "`register_persistable_component` has stopped reporting."
+                "  [FAIL] A peer collision was reported without "
+                "`#[pill(shared)]`; one compiled copy of the extension must "
+                "make the two registrations one identity."
             )
             return False
+        print("  [OK] No peer collision: the one compiled copy is one identity.")
 
-        if COLLISION_TOKEN not in output:
-            print("  [FAIL] No peer collision reported, and no project loop either.")
-            print(f"  Output tail:\n{output[-2000:]}")
-            return False
-        print("  [OK] Peer collision reported, so the two `TypeId`s genuinely differ.")
-
-        if SHARED_COMPONENT_NAME not in output:
-            print(f"  [FAIL] The collision did not name {SHARED_COMPONENT_NAME}.")
-            return False
-        print(f"  [OK] The collision names {SHARED_COMPONENT_NAME}.")
-
-        # The registration must fail the init rather than evicting the peer,
-        # which is the silent data-loss path this guard replaced.
-        if SETUP_FAILED_TOKEN not in output:
+        # Direct confirmation when frames happen to run, exactly as in the
+        # first scenario: one column for the component.
+        if monitor.wait_for(ECS_REPORT_TOKEN, REPORT_SAMPLE_TIMEOUT, start_index):
+            report = extract_latest_report(monitor.output_since(start_index))
+            if report is None:
+                print("  [FAIL] An ECS report was printed but could not be parsed.")
+                return False
+            bits = columns_named(report, SHARED_COMPONENT_NAME)
+            if len(bits) != 1:
+                print(
+                    f"  [FAIL] Expected exactly 1 {SHARED_COMPONENT_NAME} column, "
+                    f"found {len(bits)} (mask bits {bits})."
+                )
+                print("  Report:\n" + "\n".join(report))
+                return False
+            print(f"  [OK] ECS report confirms one column at mask bit {bits[0]}.")
+        else:
             print(
-                "  [FAIL] The collision was reported but setup continued; it must "
-                "fail the init rather than evict the peer's persist entries."
+                f"  [NOTE] No ECS report within {REPORT_SAMPLE_TIMEOUT}s "
+                f"(a windowed host runs frames only while it has input); the "
+                f"column-count confirmation was skipped."
             )
-            print(f"  Output tail:\n{output[-2000:]}")
-            return False
-        print("  [OK] Setup failed loudly instead of silently dropping the peer's rows.")
 
-        print("  [PASS] Distinct `TypeId`s confirmed; the guard catches the collision.")
+        print("  [PASS] One compiled copy binds one component without a declaration.")
         return True
     finally:
         common.terminate_process(process, monitor)
@@ -1166,8 +1164,8 @@ def scenario_a_failing_module_start_releases_its_resource() -> bool:
 
 SCENARIOS = {
     "shared_identity_binds_both_binaries": scenario_shared_identity_binds_both_binaries,
-    "distinct_type_ids_are_proven_by_removing_it": (
-        scenario_distinct_type_ids_are_proven_by_removing_it
+    "one_compiled_copy_needs_no_declaration": (
+        scenario_one_compiled_copy_needs_no_declaration
     ),
     "a_shared_component_survives_a_module_reload": (
         scenario_a_shared_component_survives_a_module_reload

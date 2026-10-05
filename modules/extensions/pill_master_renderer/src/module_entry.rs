@@ -20,8 +20,11 @@
 //! `pill_renderer_api` in one dependency graph - the rule the workspace
 //! already enforces for `pill_core.dll`.
 //!
-//! Compiled only with `module-abi`, like every other module export, so a crate
-//! that links this one as an rlib never exports the symbols itself.
+//! The functions here are plain library code. The `#[no_mangle]` symbols come
+//! from `__pill_renderer_entry_points!`, which the renderer's wrapper crate
+//! expands. The library itself cannot carry them unmangled: every renderer
+//! declares the same two names, and this crate is linked into the host's
+//! dependency graph.
 
 // Standard library
 use std::ffi::c_void;
@@ -45,9 +48,8 @@ use crate::renderer::Renderer;
 ///
 /// `window`, when non-null, points to a valid [`RawWindowData`] naming a live
 /// window, and the caller keeps that window alive until it has passed the
-/// returned pointer to [`pill_renderer_detach`].
-#[no_mangle]
-pub unsafe extern "C" fn pill_renderer_attach(
+/// returned pointer to [`detach_backend`].
+pub unsafe extern "C" fn attach_to_window(
     window: *const RawWindowData,
     width: u32,
     height: u32,
@@ -86,16 +88,15 @@ pub unsafe extern "C" fn pill_renderer_attach(
     }
 }
 
-/// Drop a renderer returned by [`pill_renderer_attach`], inside this image.
+/// Drop a renderer returned by [`attach_to_window`], inside this image.
 ///
 /// A null `backend` is ignored.
 ///
 /// # Safety
 ///
-/// `backend` is null or a pointer [`pill_renderer_attach`] of this same image
+/// `backend` is null or a pointer [`attach_to_window`] of this same image
 /// returned, not already detached, and not used again afterwards.
-#[no_mangle]
-pub unsafe extern "C" fn pill_renderer_detach(backend: *mut c_void) {
+pub unsafe extern "C" fn detach_backend(backend: *mut c_void) {
     if backend.is_null() {
         return;
     }
@@ -108,4 +109,51 @@ pub unsafe extern "C" fn pill_renderer_detach(backend: *mut c_void) {
             "the renderer panicked while detaching; its GPU state may have leaked"
         );
     }
+}
+
+/// Expands to this crate's renderer ABI exports, `pill_renderer_attach` and
+/// `pill_renderer_detach`.
+///
+/// A wrapper crate compiles the renderer as a plain library and is itself the
+/// artifact the host loads, so the symbols must land there: this library is in
+/// the host's dependency graph, and every renderer declares the same two
+/// names.
+#[macro_export]
+macro_rules! __pill_renderer_entry_points {
+    () => {
+        /// Builds a renderer on the window the host describes; the loadable
+        /// counterpart of `module_entry::attach_to_window`, whose contract
+        /// this function carries.
+        ///
+        /// # Safety
+        ///
+        /// `window`, when non-null, points to a valid `RawWindowData` naming a
+        /// live window, and the caller keeps that window alive until it has
+        /// passed the returned pointer to `pill_renderer_detach`.
+        #[no_mangle]
+        pub unsafe extern "C" fn pill_renderer_attach(
+            window: *const $crate::RawWindowData,
+            width: u32,
+            height: u32,
+        ) -> *mut ::core::ffi::c_void {
+            // SAFETY: this function's contract is the one `attach_to_window`
+            // states; the call forwards it.
+            unsafe { $crate::module_entry::attach_to_window(window, width, height) }
+        }
+
+        /// Drops a renderer built by `pill_renderer_attach`; the loadable
+        /// counterpart of `module_entry::detach_backend`.
+        ///
+        /// # Safety
+        ///
+        /// `backend` is null or a pointer `pill_renderer_attach` of this same
+        /// image returned, not already detached, and not used again
+        /// afterwards.
+        #[no_mangle]
+        pub unsafe extern "C" fn pill_renderer_detach(backend: *mut ::core::ffi::c_void) {
+            // SAFETY: this function's contract is the one `detach_backend`
+            // states; the call forwards it.
+            unsafe { $crate::module_entry::detach_backend(backend) }
+        }
+    };
 }

@@ -46,10 +46,9 @@ use serde::{Deserialize, Serialize};
 /// Fixed so the component stays plain data; see the module documentation.
 pub const MAX_CONTROL_POINTS: usize = 16;
 
-/// Number of demo splines the module keeps in the world.
+/// Number of demo splines [`register`] keeps in the world.
 ///
-/// Used only by the module-abi registration path; the project build compiles
-/// that path out, so the constant is gated with it to stay warning-free.
+/// Used only by the registration path, which every build compiles.
 const DEMO_SPLINE_COUNT: usize = 1;
 
 /// Extra vertical offset applied to every sampled position.
@@ -395,8 +394,8 @@ pub fn catmull_rom(
 
 /// A demonstration path used to populate the world on first load.
 ///
-/// Like [`DEMO_SPLINE_COUNT`], this exists for the module-abi registration path
-/// and is compiled out of the project build with it.
+/// Like [`DEMO_SPLINE_COUNT`], this exists for the registration path, which
+/// every build compiles.
 fn demo_spline() -> Spline {
     Spline::from_points(&[
         Vector3f::new(0.0, 0.0, 0.0),
@@ -418,10 +417,9 @@ fn demo_spline() -> Spline {
 ///
 /// The module registers no system: it contributes a component type and the math
 /// to sample it, leaving movement along a path to whoever owns that behaviour.
-/// Public so a statically linked build can call it directly. With
-/// `module-abi` on, `#[pill_module]` also exports it as
-/// `pill_module_init` for the host to find in a loaded DLL; a shipping
-/// build has no DLL and calls this function itself.
+/// Public so a statically linked build can call it directly, and so the
+/// generated `host_module_pill_spline` wrapper can carry it as
+/// `pill_module_init` for the host to find in a loaded DLL.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     // Fill up to the target count rather than spawning a new path on every
@@ -444,9 +442,6 @@ pub fn register(engine: &mut Engine) -> u32 {
         }
     }
 
-    // Fully qualified: the import would be unused in the project build, where
-    // this module-abi registration path is compiled out.
-    //
     // NOTE: this line is asserted on. `MODULE_REGISTERED_MESSAGE` in
     // `devops/core/suite_common.py` matches the message text against the
     // host's stdout, and scenarios in `devops/tests/test_hot_reload_suite.py`

@@ -26,8 +26,8 @@
 //!
 //! The shaders live at the crate root (`shaders/`), not under `src/`, so a
 //! shader edit is not a Rust source edit. In development the host watches and
-//! re-cooks them, and hands each result to [`shader_hot_reload`]'s export,
-//! compiled only into a loaded module (`module-abi`).
+//! re-cooks them, and hands each result to [`shader_hot_reload`]'s export -
+//! compiled into native development builds.
 
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
@@ -45,7 +45,7 @@ pub mod config;
 mod rendering_manager;
 
 /// Development shader reload: puts WGSL the host re-cooked into the shader assets built from it.
-#[cfg(any(test, feature = "module-abi"))]
+#[cfg(any(test, all(debug_assertions, not(target_arch = "wasm32"))))]
 pub mod shader_hot_reload;
 
 // External crates
@@ -69,8 +69,9 @@ pub use rendering_manager::RenderingManager;
 /// engine, and installs its default pipeline; returns zero.
 ///
 /// Registers no system: filling the frame and drawing it is the GPU module's
-/// (`pill_master_renderer`), and a headless engine has neither. With
-/// `module-abi` on, `#[pill_module]` also exports it as `pill_module_init`.
+/// (`pill_master_renderer`), and a headless engine has neither. The generated
+/// `host_module_pill_master_renderer_data` wrapper carries this as
+/// `pill_module_init` for the host.
 ///
 /// Components go in through [`register_components`]; the six asset types and
 /// the two resources are declared so their per-type tables are re-pointed at

@@ -85,13 +85,11 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 /// it changes the engine each module links.
 ///
 /// `rendering` no longer touches the module's own engine - the renderer left
-/// `pill_engine` - but it still belongs here. A windowed host links
-/// `pill_master_renderer` and the whole wgpu graph, and
-/// [`apply_cargo_host_overrides`] selects the anchor package WITH that
-/// feature so module builds resolve the same graph. The resolution reaches
-/// `pill_core.dll`, so artifacts built under one setting still cannot be
-/// loaded by a host running the other - it presents as os error 127, with
-/// nothing naming a feature.
+/// `pill_engine`, and module builds resolve the engine crates from
+/// `pill_core`'s feature pin plus the host's explicit engine features (see
+/// [`host_engine_features`]). It still belongs here: a windowed host loads
+/// the wgpu renderer beside its engine dylibs, and a cached module artifact
+/// is only trusted for the posture it was built for.
 const HOST_MODULE_FEATURE_SET: &str =
     match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch")) {
         (true, true) => "rendering+hot_patch",
@@ -101,8 +99,9 @@ const HOST_MODULE_FEATURE_SET: &str =
     };
 
 /// The host's profiling level, part of [`host_build_identity`] for the same
-/// reason as [`HOST_MODULE_FEATURE_SET`]: [`apply_cargo_host_overrides`]
-/// selects the anchor with it, which changes `pill_core`'s resolved features.
+/// reason as [`HOST_MODULE_FEATURE_SET`]: it changes `pill_core`'s resolved
+/// features, and every spawned build mirrors it through
+/// [`host_engine_features`].
 const HOST_PROFILING_FEATURE_SET: &str = if cfg!(feature = "profiling-fine") {
     "profiling-fine"
 } else if cfg!(feature = "profiling") {
@@ -137,40 +136,49 @@ fn host_build_identity() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{HOST_MODULE_FEATURE_SET}\n{HOST_PROFILING_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nanchor={:?}\nspawned_env={spawned_environment}",
+        "{HOST_MODULE_FEATURE_SET}\n{HOST_PROFILING_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nengine_features={}\nspawned_env={spawned_environment}",
         crate::config::host_profile_name(),
         crate::config::host_target_triple().unwrap_or("native"),
         crate::config::MODULE_BUILD_TARGET_DIRECTORY,
-        host_anchor_package()
+        host_engine_features().join(",")
     )
 }
 
-/// The workspace package name to anchor module builds to.
+/// The engine features every host-spawned build must mirror from the running
+/// host.
 ///
-/// Cargo unifies features across every selected package, so module builds
-/// select the running host binary's own package (`-p <name>`) to force the
-/// shared engine crates onto the host's feature universe. The package name is
-/// normally the executable's file stem (`editor` -> package `editor`), but the
-/// Dioxus CLI (`dx`) stages the built binary under a cargo-metadata-hash
-/// suffixed name such as `editor-d6d95e94.exe`; trim that trailing `-<hex>`
-/// suffix so the anchor still resolves to the real package.
-fn host_anchor_package() -> Option<String> {
-    let stem = std::env::current_exe()
-        .ok()?
-        .file_stem()?
-        .to_str()?
-        .to_owned();
-    if let Some((base, suffix)) = stem.rsplit_once('-') {
-        let is_metadata_hash = !suffix.is_empty()
-            && suffix.len() <= 16
-            && suffix
-                .chars()
-                .all(|character| character.is_ascii_hexdigit());
-        if is_metadata_hash {
-            return Some(base.to_owned());
-        }
+/// `pill_core.dll` and `pill_engine_core.dll` are loaded once per process and
+/// their exported names hash the features their dependency trees resolved, so
+/// a module or project compiled with a different engine feature set imports
+/// names the loaded instances do not export and fails to load with
+/// "The specified procedure could not be found" (os error 127). The names are
+/// all declared as `pill_host` features, so `cfg!` sees exactly the posture
+/// the running binary was built with.
+fn host_engine_features() -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if cfg!(feature = "hot_patch") {
+        features.push("pill_engine/hot_patch");
     }
-    Some(stem)
+    if cfg!(feature = "profiling")
+        || cfg!(feature = "profiling-fine")
+        || cfg!(feature = "profiling-verify")
+    {
+        features.push("pill_core/tracy");
+    }
+    if cfg!(feature = "profiling-fine") {
+        features.push("pill_engine/profiling-fine");
+    } else if cfg!(feature = "profiling-verify") {
+        features.push("pill_engine/profiling-verify");
+    } else if cfg!(feature = "profiling") {
+        features.push("pill_engine/profiling");
+    }
+    if cfg!(feature = "metrics") {
+        features.push("pill_engine/metrics");
+    }
+    if cfg!(feature = "dev-logs") {
+        features.push("pill_core/dev-logs");
+    }
+    features
 }
 
 // =============================================================================
@@ -370,16 +378,14 @@ fn confirm_staged_artifacts(
 /// - `CARGO_TARGET_DIR` redirects into the private module build tree so cargo
 ///   never has to delete a DLL the host has mapped, and both paths share one
 ///   artifact set (see [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]).
-/// - The running host binary is selected as an anchor package. Cargo resolves
-///   features across every selected package, so the module's engine crates
-///   (`pill_core` and its transitive deps) unify to the SAME feature universe
-///   the host itself was built with - a GUI frontend like the editor unions
-///   extra features onto those crates, and a module compiled against a
-///   differently featured engine cannot resolve its `pill_core.dll` imports
-///   against the single instance the host already has loaded (Windows
-///   deduplicates loaded modules by name). The anchor's own artifacts are
-///   already fresh inside the private tree after the first build, so this only
-///   costs feature resolution, not a rebuild of the frontend.
+/// - The host's own engine features ([`host_engine_features`]) are passed to
+///   the build explicitly. `pill_core.dll` and `pill_engine_core.dll` are
+///   loaded once per process and their exported names hash the features their
+///   dependency trees resolved, so a module or project built with a different
+///   engine feature set cannot resolve its imports against the single
+///   instances the host already has loaded (Windows deduplicates loaded
+///   modules by name). `devops/tests/test_engine_feature_drift.py` checks
+///   that every posture agrees.
 /// - A launcher-injected profile (the dioxus CLI builds the editor under
 ///   `--profile desktop-dev`) is not declared in the module workspaces, so
 ///   cargo would reject `--profile <name>` here. It is defined on the spawned
@@ -395,51 +401,46 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         "CARGO_TARGET_DIR",
         workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
     );
-    if let Some(anchor) = host_anchor_package() {
-        command.arg("--package").arg(&anchor);
-        // Select the anchor with the SAME features the running host was built
-        // with, not merely the same package.
-        //
-        // Selecting the package is what makes cargo unify features across the
-        // whole graph; selecting it with the wrong features unifies it to a
-        // different answer. A windowed host links `pill_master_renderer` and the
-        // whole wgpu graph, which turns on extra features in crates `pill_core`
-        // also depends on - and cargo folds a dependency's resolved features
-        // into the dependent's `-C metadata`. So a module built against a
-        // feature-poorer anchor links a `pill_core.dll` whose symbol names do
-        // not match the one the host has already loaded, and every module load
-        // dies with "The specified procedure could not be found" (os error 127).
-        //
-        // This used to be masked: the host mirrored `rendering` onto the module
-        // itself, which dragged wgpu into the module's graph too and made the
-        // two unify alike by accident. That mirror is gone now that the renderer
-        // has left `pill_engine`, so the anchor has to carry the feature
-        // explicitly. Any future host-level feature that changes the dependency
-        // graph belongs in `host_posture_features` for the same reason.
-        //
-        // The anchor's default features are dropped first. `pill_standalone`
-        // defaults to `hot_patch`, so a host built without it (a reload-only
-        // run) would otherwise get modules whose engine resolved
-        // `pill_engine/hot_patch`: harmless while every module embedded its
-        // own engine, but `pill_engine_core.dll` is shared now, its symbol
-        // names hash its features, and such a module cannot load. The flag
-        // applies to every package selected here, which is safe because
-        // modules and generated projects declare no default features.
-        if let Some(declared) = declared_features(workspace_root, &anchor) {
-            command.arg("--no-default-features");
-            for feature in host_posture_features() {
-                if declared.iter().any(|name| name == feature) {
-                    command.arg("--features").arg(format!("{anchor}/{feature}"));
+    if crate::config::running_under_dioxus_cli() {
+        // The dioxus editor keeps the cargo anchor. Its own macro graph
+        // (dioxus' procedural macros) unions features onto the HOST units of
+        // `proc-macro2`/`quote`/`syn` - a resolution cargo keeps separate
+        // from the target side - and those unions change the metadata of the
+        // derive-macro crates (`serde_derive`, `thiserror_impl`, ...), which
+        // cascades into `pill_core`'s and `pill_engine_core`'s exported
+        // symbol hashes. Only selecting the editor package reproduces the
+        // exact graph; enumerating its unions is not possible.
+        if let Some(anchor) = host_anchor_package() {
+            command.arg("--package").arg(&anchor);
+            // Select the anchor with the SAME features the running host was
+            // built with, not merely the same package. The anchor's default
+            // features are dropped first, because cargo would otherwise
+            // resolve `pill_standalone`'s defaults (`hot_patch`) onto a host
+            // built without them.
+            if let Some(declared) = declared_features(workspace_root, &anchor) {
+                command.arg("--no-default-features");
+                for feature in host_posture_features() {
+                    if declared.iter().any(|name| name == feature) {
+                        command.arg("--features").arg(format!("{anchor}/{feature}"));
+                    }
+                }
+            } else {
+                // The anchor's manifest was not found: keep its defaults and
+                // add what the host is known to need.
+                for feature in host_posture_features() {
+                    if feature != "dev" && feature != "hot_patch" {
+                        command.arg("--features").arg(format!("{anchor}/{feature}"));
+                    }
                 }
             }
-        } else {
-            // The anchor's manifest was not found: keep its defaults and add
-            // what the host is known to need.
-            for feature in host_posture_features() {
-                if feature != "dev" && feature != "hot_patch" {
-                    command.arg("--features").arg(format!("{anchor}/{feature}"));
-                }
-            }
+        }
+    } else {
+        // Every other host receives its engine features explicitly, so the
+        // spawned build resolves `pill_core.dll` and `pill_engine_core.dll`
+        // exactly as the loaded host instances did - and nothing it does not
+        // need. See [`host_engine_features`].
+        for feature in host_engine_features() {
+            command.arg("--features").arg(feature);
         }
     }
     // Mirror the host's own `--target` when a launcher (the dioxus CLI) built
@@ -460,13 +461,37 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
     }
 }
 
-/// The frontend features the running host was built with, as the names every
-/// host frontend declares (`pill_standalone`, the editor): its posture (`dev`,
-/// `hot_patch`), `rendering`, and profiling.
+/// The workspace package name to anchor dx-hosted module builds to.
 ///
-/// Profiling turns on `pill_core`'s Tracy dependencies, which changes its
-/// metadata hash exactly as `rendering` does, so a profiling host could not
-/// load a single module built without it.
+/// Cargo unifies features across every selected package, so module builds
+/// under the dioxus CLI select the editor's own package (`-p editor`) to
+/// force the shared engine crates onto the editor's exact feature universe.
+/// The package name is normally the executable's file stem (`editor` ->
+/// package `editor`), but the Dioxus CLI (`dx`) stages the built binary under
+/// a cargo-metadata-hash suffixed name such as `editor-d6d95e94.exe`; trim
+/// that trailing `-<hex>` suffix so the anchor still resolves to the real
+/// package.
+fn host_anchor_package() -> Option<String> {
+    let stem = std::env::current_exe()
+        .ok()?
+        .file_stem()?
+        .to_str()?
+        .to_owned();
+    if let Some((base, suffix)) = stem.rsplit_once('-') {
+        let is_metadata_hash = !suffix.is_empty()
+            && suffix.len() <= 16
+            && suffix
+                .chars()
+                .all(|character| character.is_ascii_hexdigit());
+        if is_metadata_hash {
+            return Some(base.to_owned());
+        }
+    }
+    Some(stem)
+}
+
+/// The frontend features the running host was built with, used to pick the
+/// anchor's feature selection under the dioxus CLI.
 fn host_posture_features() -> Vec<&'static str> {
     let mut features = vec!["dev"];
     if cfg!(feature = "hot_patch") {
@@ -487,8 +512,10 @@ fn host_posture_features() -> Vec<&'static str> {
 /// workspace members one or two directories below `workspace_root`; `None`
 /// when no such manifest is found.
 ///
-/// Cached per package: the members do not change while a host runs.
-fn declared_features(workspace_root: &Path, package: &str) -> Option<Vec<String>> {
+/// Cached per package: the members do not change while a host runs. Used by
+/// the host's wrapper generation, which copies the extension's declared
+/// features onto the wrapper's dependency edge.
+pub(crate) fn declared_features(workspace_root: &Path, package: &str) -> Option<Vec<String>> {
     static DECLARED: OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, Option<Vec<String>>>>,
     > = OnceLock::new();
@@ -545,11 +572,11 @@ fn read_declared_features(workspace_root: &Path, package: &str) -> Option<Vec<St
 /// the patch links the identical dependency closure. Discovering that line
 /// costs a `cargo build -v`, and cargo only prints the invocation when it
 /// actually compiles - so when the crate is already fresh the discovery path
-/// has to TOUCH the crate root and force a rebuild of the module and of
-/// everything the host anchor drags in. Measured, that is 1.8-3.4 s under the
-/// standalone host and up to ~15 s under the editor, paid on the first patch
-/// after every module reload, because a reload is exactly what makes the
-/// cached line stale.
+/// has to TOUCH the crate root and force a rebuild of the module crate.
+/// Measured before the wrapper layout, that was 1.8-3.4 s under the standalone
+/// host and up to ~15 s under the editor (the old cargo anchor rebuilt the
+/// frontend beside the module), paid on the first patch after every module
+/// reload, because a reload is exactly what makes the cached line stale.
 ///
 /// The build the host just ran compiled that crate for real. Asking it for
 /// `-v` and reading the line out of its output makes the discovery free and
@@ -1448,7 +1475,28 @@ fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildErr
         target_path: hot_output.display().to_string(),
         source,
     })?;
-    std::fs::copy(build_output, hot_output).map_err(|source| {
+    // Skip a copy whose destination already is this build's output. A re-copy
+    // renews the destination's timestamp, and on Windows opening a freshly
+    // written DLL pays the platform's first-access scan - a cost every load of
+    // an unchanged module would then pay again. Unchanged builds leave the
+    // source's timestamps alone, so the steady state is a pair of `stat`s.
+    if staged_copy_is_current(build_output, hot_output) {
+        return Ok(());
+    }
+    // Replace through a private staging file and a rename. A previous
+    // generation may still have the destination mapped - a load copy shares
+    // its file - and Windows refuses to open a mapped image for writing, while
+    // a rename replaces the directory entry and leaves the mapped file intact.
+    let staged_output = hot_output.with_extension("staged");
+    std::fs::copy(build_output, &staged_output).map_err(|source| {
+        BuildError::HotArtifactCopyFailed {
+            source_path: build_output.display().to_string(),
+            target_path: hot_output.display().to_string(),
+            source,
+        }
+    })?;
+    std::fs::rename(&staged_output, hot_output).map_err(|source| {
+        let _ = std::fs::remove_file(&staged_output);
         BuildError::HotArtifactCopyFailed {
             source_path: build_output.display().to_string(),
             target_path: hot_output.display().to_string(),
@@ -1480,6 +1528,15 @@ fn stage_engine_dylib(workspace_root: &Path) {
         let destination = workspace_root
             .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
             .join(&file_name);
+        // Copy only when the staged copy is stale. A re-copy renews the
+        // destination's timestamp, and on Windows opening a freshly written
+        // DLL pays the platform's first-access scan - a cost the isolation
+        // check would then pay on every module's load. The source only
+        // changes when a build produced a new engine, so the steady state is
+        // a pair of `stat` calls.
+        if staged_copy_is_current(&source, &destination) {
+            continue;
+        }
         if let Err(error) = std::fs::copy(source, destination) {
             warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -1539,6 +1596,47 @@ fn stage_build_outputs(
     Ok(produced)
 }
 
+/// The newest rlib cargo wrote for `package` into `build_directory`.
+///
+/// A wrapper build compiles the extension as a dependency, so its rlib sits
+/// under the build's `deps` directory - metadata-hashed, or in the unhashed
+/// workspace-member slot, whichever this cargo version uplifts - and some
+/// configurations also leave a copy in the profile root. The host stages
+/// whichever file was written last, which is the one the build that just ran
+/// produced; a patch links it to reach the module's types. `None` when the
+/// build wrote none, which leaves the per-function fast path idle for that
+/// module.
+pub(crate) fn newest_extension_rlib(build_directory: &Path, package: &str) -> Option<PathBuf> {
+    let library_name = package.replace('-', "_");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut consider = |path: PathBuf| {
+        let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
+            return;
+        };
+        if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
+            newest = Some((modified, path));
+        }
+    };
+    if let Ok(entries) = std::fs::read_dir(build_directory.join("deps")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let stem = file_name
+                .strip_prefix("lib")
+                .unwrap_or(file_name)
+                .strip_suffix(".rlib")
+                .unwrap_or(file_name);
+            if stem == library_name || stem.starts_with(&format!("{library_name}-")) {
+                consider(path);
+            }
+        }
+    }
+    consider(build_directory.join(format!("lib{library_name}.rlib")));
+    newest.map(|(_, path)| path)
+}
+
 /// Where the shared per-crate dependency rlibs are staged for patch linking.
 ///
 /// A sibling of the artifacts already staged in `target/hot`, and private to the
@@ -1593,6 +1691,12 @@ pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
         if !is_shared_slot_rlib(file_name) {
             continue;
         }
+        // Generated member crates write unhashed rlibs too, but nothing ever
+        // links them: a wrapper's rlib is not a patch target, and a generated
+        // project member's rlib is rebuilt by every project build anyway.
+        if is_generated_member_rlib(file_name) {
+            continue;
+        }
         let staged = staged_directory.join(file_name);
         if staged_copy_is_current(&path, &staged) {
             continue;
@@ -1632,11 +1736,23 @@ fn is_shared_slot_rlib(file_name: &str) -> bool {
     }
 }
 
+/// Whether a `deps` filename is the rlib of a host-generated member crate.
+///
+/// Their crate names all carry a generated prefix. Nothing links the rlib of
+/// a wrapper or of a generated project member, so the dependency staging skips
+/// them instead of snapshotting files no patch can use.
+#[cfg(feature = "hot_patch")]
+fn is_generated_member_rlib(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".rlib").unwrap_or(file_name);
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    stem.starts_with(crate::config::HOST_PROJECT_MEMBER_PREFIX)
+        || stem.starts_with(crate::config::HOST_MODULE_MEMBER_PREFIX)
+}
+
 /// Whether a staged copy already matches its source.
 ///
-/// Same size and no older, which is the comparison the module rlib staging
-/// already uses. Anything unknown counts as out of date, so the copy happens.
-#[cfg(feature = "hot_patch")]
+/// Same size and no older. Used by the shared-rlib staging and the engine
+/// dylib staging; anything unknown counts as out of date, so the copy happens.
 fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
     let (Ok(source_metadata), Ok(staged_metadata)) =
         (std::fs::metadata(source), std::fs::metadata(staged))
@@ -1679,30 +1795,31 @@ pub(crate) fn build_extension(
     // Cargo writes the freshly compiled cdylib into the shared per-crate
     // output slot, while the host loads from the private hot-load copy.
     // Keeping these paths distinct is what resolves the "one crate name, two
-    // feature sets" collision: the project build may overwrite the shared
-    // slot with the module's export-stripped dependency variant, but the
-    // loaded generation always comes from the untouched hot copy.
+    // feature sets" collision: a project build may overwrite the shared slot
+    // with the extension's export-stripped dependency variant, but the loaded
+    // generation always comes from the untouched hot copy.
+    //
+    // The built crate is the generated wrapper; the staged artifact carries
+    // the extension's own name, which is how the host addresses the module.
     let build_output = workspace_root
         .join(cargo_module_output_subdirectory())
-        .join(native_library_filename(&config.library_name));
+        .join(native_library_filename(&config.wrapper_library_name));
     let hot_output = workspace_root
         .join(&config.output_subdirectory)
         .join(native_library_filename(&config.library_name));
 
-    // The module's `rlib`, staged for the same reason the project's is: a
-    // generated patch links it to reach the module's types, and cargo writes it
-    // to an unhashed per-crate path that any other build of the same package
-    // overwrites - including with a different feature set. Optional, because a
-    // module that declares only a `cdylib` has none, which simply leaves the
-    // fast path idle for that module.
-    let (rlib_build_output, rlib_output) = (
-        workspace_root
-            .join(cargo_module_output_subdirectory())
-            .join(format!("lib{}.rlib", config.name)),
-        workspace_root
-            .join(&config.output_subdirectory)
-            .join(format!("lib{}.rlib", config.name)),
+    // The extension's `rlib`, staged for the same reason the project's is: a
+    // generated patch links it to reach the module's types. The wrapper build
+    // compiles the extension as a dependency, so its rlib sits under cargo's
+    // hashed (or workspace-uplifted) name in the build's `deps` directory;
+    // the newest one is from the build that just ran.
+    let rlib_build_output = newest_extension_rlib(
+        &workspace_root.join(cargo_module_output_subdirectory()),
+        &config.name,
     );
+    let rlib_output = workspace_root
+        .join(&config.output_subdirectory)
+        .join(format!("lib{}.rlib", config.name));
 
     // Extensions carry no per-module environment of their own, but they
     // need the same profile-driven `RUSTFLAGS` handling the project gets: an
@@ -1715,19 +1832,21 @@ pub(crate) fn build_extension(
         cancel_flag,
     )?;
 
-    // Stage the freshly built standalone library into the hot-load directory.
-    // The build command produced the module-abi variant (with its
-    // `pill_module_*` exports); the shared slot may later be overwritten by
-    // the project's build of the export-stripped dependency variant, which is
-    // exactly why the loadable copy lives apart from it.
+    // Stage the freshly built wrapper library into the hot-load directory,
+    // under the extension's name. The shared per-crate slot may later hold a
+    // differently featured copy of the extension's dependency rlib, which is
+    // exactly why the loadable artifact lives apart from it.
     //
-    // A module declaring only a `cdylib` has no rlib, which is not an error -
-    // it just leaves the per-function fast path idle for that module.
+    // The extension's rlib is staged beside it for the per-function fast
+    // path; a build that produced none is not an error - it just leaves the
+    // fast path idle for that module.
     let stage_started = Instant::now();
     let produced = stage_build_outputs(
         workspace_root,
         (&build_output, &hot_output),
-        Some((&rlib_build_output, &rlib_output)),
+        rlib_build_output
+            .as_deref()
+            .map(|built| (built, rlib_output.as_path())),
         false,
     )?;
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;

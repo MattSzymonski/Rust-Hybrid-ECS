@@ -127,8 +127,9 @@ pub use sound_type::SoundType;
 
 /// Registers this module's components, resource and system with the engine.
 ///
-/// Called directly by a monolithic build. With `module-abi` on, `#[pill_module]`
-/// also exports it as `pill_module_init` for the host to find in a loaded DLL.
+/// Called directly by a monolithic build; the generated
+/// `host_module_pill_audio` wrapper carries it as `pill_module_init` for the
+/// host to find in a loaded DLL.
 ///
 /// Installing the [`AudioManager`] is conditional: a machine with no audio
 /// device gets the components and the system but no manager, and the system

@@ -9,9 +9,9 @@
 //! - Import a texture or a mesh from `res` through its metadata file, one
 //!   named export per type, through [`pill_engine::asset_ffi`].
 //! - Offer each as a named C-ABI function the host's C# bridge finds by name:
-//!   as a `#[no_mangle]` export when this crate is a loaded module
-//!   (`module-abi`), and through a [`PillExportDescriptor`] when it is linked
-//!   statically.
+//!   always as a `#[no_mangle]` export (each name is unique to this crate, so
+//!   a statically linked build pays nothing for it), and through a
+//!   [`PillExportDescriptor`] when it is linked statically.
 //! - Define the native argument shapes and status codes these functions share
 //!   with the managed side.
 //!
@@ -218,7 +218,7 @@ unsafe fn with_assets<R>(
 /// the call's duration. `name`/`bytes` must reference their declared lengths
 /// in readable memory (unless the matching length is zero), and
 /// `out_index`/`out_generation` must be writable.
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_load_mesh_obj(
     world: *mut World,
     name: *const u8,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn pill_render_data_load_mesh_obj(
 /// # Safety
 ///
 /// Same contract as [`pill_render_data_load_mesh_obj`].
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_load_texture_png(
     world: *mut World,
     name: *const u8,
@@ -332,7 +332,7 @@ pub unsafe extern "C" fn pill_render_data_load_texture_png(
 /// outputs; `parameters`/`textures` must reference `parameters_len`/
 /// `textures_len` valid, aligned elements (unless zero), and every name pointer
 /// nested inside them must itself satisfy the same contract.
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_load_shader(
     world: *mut World,
     name: *const u8,
@@ -451,7 +451,7 @@ pub unsafe extern "C" fn pill_render_data_load_shader(
 ///
 /// Same contract as [`pill_render_data_load_shader`], applied to `name`,
 /// `textures`/`scalars`/`colors` and the name pointers nested inside them.
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_create_material(
     world: *mut World,
     name: *const u8,
@@ -555,7 +555,7 @@ pub unsafe extern "C" fn pill_render_data_create_material(
 /// # Safety
 ///
 /// The contract of [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi).
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_import_texture(
     world: *mut World,
     path: *const u8,
@@ -585,7 +585,7 @@ pub unsafe extern "C" fn pill_render_data_import_texture(
 /// # Safety
 ///
 /// The contract of [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi).
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_render_data_import_mesh(
     world: *mut World,
     path: *const u8,

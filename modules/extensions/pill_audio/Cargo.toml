@@ -14,10 +14,11 @@ workspace = true
 # it hundreds of wrong candidates. `pill_hot_scan` reads this key to know
 # which file is the root and emits no module segment for it.
 path = "src/pill_audio.rs"
-# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept both for monolithic release builds and so a project can depend on this
-# crate directly to name `AudioSource` in a query.
-crate-type = ["cdylib", "rlib"]
+# `rlib` only: the artifact the host loads is built by the generated
+# `host_module_pill_audio` wrapper, which links this crate as a library, and a
+# project can depend on it directly to name `AudioSource` in a query. Both
+# compile one identical copy of the sources.
+crate-type = ["rlib"]
 
 [build-dependencies]
 pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
@@ -35,14 +36,3 @@ serde = { version = "1", features = ["derive"] }
 # would only be a way for the two to disagree. A project that wants no audio
 # stack in its dependency graph leaves the module out.
 rodio = "0.20"
-
-[features]
-default = []
-# `module-abi` is opt-in, not a default: building every member in one cargo
-# invocation (e.g. `cargo build --workspace`) must not turn on the
-# `#[no_mangle]` `pill_module_*` exports for a module's dependency copies.
-# Cargo's feature unification would otherwise leak the default onto those
-# copies and produce duplicate symbols whenever one module links another in
-# the same build. The host passes `--features module-abi` itself when it
-# builds the loadable module.
-module-abi = []

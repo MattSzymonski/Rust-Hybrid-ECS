@@ -42,7 +42,7 @@ const REPORT_INTERVAL_FRAMES: u64 = 300;
 
 /// Fixed time step folded into the accumulated time of every entity.
 ///
-/// Used only by [`module_test_processor`], which the module-abi build registers.
+/// Used only by [`module_test_processor`], which [`register`] installs.
 const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
 
 // =============================================================================
@@ -102,10 +102,9 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
 /// Returns zero on success. Must be idempotent: the host calls it once per
 /// loaded generation and rolls back to the previous library when it reports a
 /// non-zero status, which re-runs this function on the older generation.
-/// Public so a statically linked build can call it directly. With
-/// `module-abi` on, `#[pill_module]` also exports it as
-/// `pill_module_init` for the host to find in a loaded DLL; a shipping
-/// build has no DLL and calls this function itself.
+/// Public so a statically linked build can call it directly, and so the
+/// generated `host_module_pill_test` wrapper can carry it as
+/// `pill_module_init` for the host to find in a loaded DLL.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     engine.register_system("module_test_processor", module_test_processor);

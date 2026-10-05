@@ -722,8 +722,9 @@ impl RenderingHost {
     /// The export is resolved again on every delivery, from the data module
     /// generation current at this frame boundary, so a shader edit made while
     /// the data crate was rebuilding lands in the generation that replaced it.
-    /// A data crate that does not export it (built without `module-abi`)
-    /// leaves the edits undelivered, with a warning.
+    /// A data crate without the export (a shipping build, where the shader
+    /// reload path is compiled out) leaves the edits undelivered, with a
+    /// warning.
     fn deliver_shader_changes(&mut self, data_extension: Option<&str>) {
         let Some(watcher) = &self.shader_watcher else {
             return;

@@ -88,6 +88,9 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "[analytics] reload pill_spline":
         "Composed at runtime: the '[analytics] reload' prefix is followed by "
         "the subject name held in a variable.",
+    "[render] First frame: Presented; camera=true":
+        "Composed at runtime: `pill_runtime/rendering.rs` formats the frame "
+        "outcome, camera state and instance counts into one line.",
     "'project::FrameCounter' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
     "'project::SpatialPosition' -> migrating":

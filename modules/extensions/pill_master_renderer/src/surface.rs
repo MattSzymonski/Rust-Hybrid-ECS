@@ -391,11 +391,11 @@ async fn configure_first(
 /// Reconfigure the surface during a frame (resize, a lost swapchain), with the
 /// same `Opaque` fallback as [`configure_first`].
 ///
-/// A frame cannot await, so the error scopes are blocked on only where the
-/// build can capture (`validation-capture`, development). Elsewhere a refusal
-/// reaches the device's error handler, which logs it, and the frame probe
-/// still reports it here - the alpha mode reused is the one the first
-/// configuration proved, so this is the rare path.
+/// A frame cannot await, so the error scopes are blocked on only in a native
+/// development build. Elsewhere a refusal reaches the device's error handler,
+/// which logs it, and the frame probe still reports it here - the alpha mode
+/// reused is the one the first configuration proved, so this is the rare
+/// path.
 fn configure(
     surface: &wgpu::Surface<'static>,
     device: &wgpu::Device,

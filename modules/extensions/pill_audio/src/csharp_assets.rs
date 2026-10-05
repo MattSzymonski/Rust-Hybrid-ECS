@@ -4,9 +4,9 @@
 //!
 //! - Import a sound from `res` through its metadata file for a managed caller
 //!   ([`pill_audio_import_sound`]), through [`pill_engine::asset_ffi`].
-//! - Offer it by name: as a `#[no_mangle]` export when this crate is a loaded
-//!   module (`module-abi`), and through a [`PillExportDescriptor`] when it is
-//!   linked statically.
+//! - Offer it by name: always as a `#[no_mangle]` export (the name is unique
+//!   to this crate, so it costs nothing in a statically linked build either),
+//!   and through a [`PillExportDescriptor`] when it is linked statically.
 //!
 //! # Design
 //!
@@ -31,7 +31,7 @@ use crate::Sound;
 /// # Safety
 ///
 /// The contract of [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi).
-#[cfg_attr(feature = "module-abi", no_mangle)]
+#[no_mangle]
 pub unsafe extern "C" fn pill_audio_import_sound(
     world: *mut World,
     path: *const u8,

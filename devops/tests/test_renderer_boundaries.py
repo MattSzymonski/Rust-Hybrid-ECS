@@ -174,13 +174,23 @@ def check(repository: Path):
                     relative = source.relative_to(repository).as_posix()
                     problems.append((3, f"{relative} names the graph-only dependency `{key}` ({package})"))
 
-    # Rule 4: no project depends on a GPU module.
-    projects = example_projects(repository) + [crate for crate in members if crate.directory.name.startswith("host_project_")]
+    # Rule 4: no project depends on a GPU module. The one generated crate
+    # allowed to is the renderer's own wrapper (host_module_<renderer>), whose
+    # whole job is to carry that GPU module's loadable artifact; a wrapper for
+    # any other module, like every project, must not.
+    projects = example_projects(repository) + [
+        crate for crate in members
+        if crate.directory.name.startswith(("host_project_", "host_module_"))
+    ]
     for project in projects:
+        directory_name = project.directory.name
         for _, package, _ in project.dependencies():
-            if package in gpu_modules:
-                relative = project.manifest_path.relative_to(repository).as_posix()
-                problems.append((4, f"{relative} depends on the GPU module {package}"))
+            if package not in gpu_modules:
+                continue
+            if directory_name == f"host_module_{package}":
+                continue
+            relative = project.manifest_path.relative_to(repository).as_posix()
+            problems.append((4, f"{relative} depends on the GPU module {package}"))
 
     # Rule 5: no data crate depends on a GPU module.
     for name in sorted(data_crates):
@@ -223,6 +233,7 @@ VALID_TREE = {
     "modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\npill_host = { path = "x" }\n',
     "modules/extensions/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
     "modules/extensions/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\npill_renderer_api = { path = "x" }\n',
+    "modules/extensions/host_module_r/Cargo.toml": '[package]\nname = "host_module_r"\n[dependencies]\nr = { path = "x" }\n',
     "modules/extensions/rendering/old/Cargo.toml": '[package]\nname = "old"\n[dependencies]\nwgpu = "26"\n',
     "examples/p/Cargo.toml": '[package]\nname = "p"\n[dependencies]\nr_data = { path = "x" }\n',
 }
@@ -236,6 +247,7 @@ BROKEN_VARIANTS = [
     (3, {"modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\nr_data = { path = "x" }\n'}),
     (3, {"modules/pill_host/src/lib.rs": "//! Host.\nuse renderer_data_dependency_graph::Mesh;\n"}),
     (4, {"examples/p/Cargo.toml": '[package]\nname = "p"\n[dependencies]\nr = { path = "x" }\n'}),
+    (4, {"modules/extensions/host_module_o/Cargo.toml": '[package]\nname = "host_module_o"\n[dependencies]\nr = { path = "x" }\n'}),
     (5, {"modules/extensions/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nr = { path = "x" }\n'}),
 ]
 

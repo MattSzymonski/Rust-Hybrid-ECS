@@ -26,13 +26,20 @@ thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
 # Random asset guids (`AssetGuid::random`). Already in the graph at this
-# version through `trait_type_map` -> `ahash`, and named with no features, so
-# the resolved graph the host and every project share does not change.
-getrandom = "0.3"
+# version through `trait_type_map` -> `ahash`; `std` is the feature the
+# editor's graph unions onto it, pinned here so the host, every module and
+# every project resolve it alike (see pill_core's feature-pin note).
+#
+# Pin: a crate in this dylib's subtree that some build's graph unions
+# features onto. Not used directly.
+zerocopy = { version = "0.8", features = ["derive"] }
 
 # On the web, `getrandom` has no default source of randomness; `wasm_js` makes
 # it read the browser's crypto. Target-only, so native builds - and the
 # host/project dependency graph - do not change.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = { version = "0.3", features = ["std"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 

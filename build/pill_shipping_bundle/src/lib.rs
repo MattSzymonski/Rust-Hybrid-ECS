@@ -24,7 +24,7 @@ pub const STATIC_MODULES: &[StaticModule] = &[
 /// The project backend for this shipping project.
 pub fn project_backend() -> StaticProjectBackend {
     StaticProjectBackend::Native {
-        init: circus_demo::init,
+        init: italian_brainrot::init,
     }
 }
 
@@ -38,12 +38,12 @@ pub fn static_renderer() -> Option<StaticRenderer> {
 
 /// The `logging:` section of `project_settings.yaml`.
 #[rustfmt::skip]
-const LOGGING: StaticLogging = StaticLogging { level: None, timestamp: None, source_location: None, targets: &[("engine::rendering", "info")] };
+const LOGGING: StaticLogging = StaticLogging::NONE;
 
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
-        name: "Circus Demo",
+        name: "Italian Brainrot",
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),

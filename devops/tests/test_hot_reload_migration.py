@@ -963,10 +963,9 @@ def build_workspace() -> bool:
     print("\n  [PREP] Building standalone host...")
     try:
         result = subprocess.run(
-            # `--package pill_standalone` instead of `--workspace`: building
-            # every extension together re-enables `module-abi` on crates
-            # like `pill_dummy_color` that other modules depend on with it
-            # disabled, which collides with their `pill_module_*` exports.
+            # `--package pill_standalone`, not `--workspace`: the host is all
+            # this suite needs built, and it keeps the suite independent of
+            # whatever else a full workspace build would pull in.
             # `hot_patch` is a default feature now; pin the reload-only posture
             # so this suite measures migration, not patching.
             [

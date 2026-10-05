@@ -17,15 +17,21 @@ DESCRIPTION
     `hot_patch`, windowed `pill_standalone`, the editor), this resolves each
     engine dylib's subtree for the host alone, then for every extension's
     module build and every generated project build as the host runs them: the
-    frontend selected as the anchor package, without its default features and
-    with the host's own (`build_runner::apply_cargo_host_overrides`), beside the
-    module (`<module>/module-abi`, plus `pill_engine/hot_patch` for a
-    `hot_patch` host) or the project. Any crate whose features differ from the
-    host's own resolution is reported.
+    extension - through its generated `host_module_<name>` wrapper when that
+    exists, and otherwise selected directly with the feature set the wrapper
+    would enable - or the project, plus the engine features
+    `build_runner::host_engine_features` mirrors from the running host. Any
+    crate whose features differ from the host's own resolution is reported.
 
-    Extensions are found by convention (a `module-abi` feature under
-    `extensions/*`), and generated projects are the `host_project_*` crates
-    present at the time.
+    The editor adds one thing to every spawned build: the cargo anchor
+    `build_runner::apply_cargo_host_overrides` keeps for dioxus hosts, which
+    selects the editor package itself (probed here with
+    `--no-default-features` and the host's `hot_patch`/`rendering`) so the
+    editor's host-side macro-graph unions are reproduced exactly.
+
+    Extensions are found by convention (every `extensions/*` crate that is not
+    a host-generated member), and generated projects are the `host_project_*`
+    crates present at the time.
 
 USAGE
   python devops/tests/test_engine_feature_drift.py [--verbose]
@@ -49,22 +55,28 @@ MODULES = Path(__file__).resolve().parents[2] / "modules"
 # The shared engine libraries whose subtrees must resolve identically.
 ENGINE_DYLIBS = ("pill_core", "pill_engine_core")
 
-# The host postures a module build can be anchored to: the host's own cargo
-# selection, the frontend's features as `pill_host` names them for the anchor
-# (`build_runner::host_posture_features`, without the anchor's defaults), and
-# whether the host has `hot_patch` (which `pill_host` mirrors as
-# `pill_engine/hot_patch` onto module and project builds).
+# The host postures module and project builds run under: the host's own cargo
+# selection, and the engine features `build_runner::host_engine_features`
+# mirrors from that host (the engine-affecting features `pill_host` declares:
+# `hot_patch`, the profiling levels, `metrics`, `dev-logs`). The editor is the
+# one posture that keeps a cargo anchor (see
+# `build_runner::apply_cargo_host_overrides`): its macro graph unions host-side
+# features that cannot be enumerated, so its builds also select the editor
+# package, without its defaults and with the features the running host was
+# built with.
 FRONTENDS = {
-    "headless": (["--package", "pill_standalone"], "pill_standalone", ["dev", "hot_patch"], True),
+    "headless": (["--package", "pill_standalone"], ["pill_engine/hot_patch"], None),
     "headless reload-only": (
         ["--package", "pill_standalone", "--no-default-features", "--features", "dev"],
-        "pill_standalone", ["dev"], False,
+        [],
+        None,
     ),
     "windowed": (
         ["--package", "pill_standalone", "--features", "pill_standalone/rendering"],
-        "pill_standalone", ["dev", "hot_patch", "rendering"], True,
+        ["pill_engine/hot_patch"],
+        None,
     ),
-    "editor": (["--package", "editor"], "editor", ["hot_patch", "rendering"], True),
+    "editor": (["--package", "editor"], ["pill_engine/hot_patch"], ("editor", ["hot_patch", "rendering"])),
 }
 
 # One `cargo tree --prefix depth -f "{p}|{f}"` line: depth, package, features.
@@ -101,16 +113,28 @@ def dylib_tree(dylib, selection):
     return packages
 
 
-# Every extension built as a module: a crate under `extensions/` declaring a
-# `module-abi` feature.
+# Every extension built as a loadable module: a crate under `extensions/`
+# that is not a host-generated member. (`extensions/rendering` holds the old
+# renderers, excluded from the workspace.)
 def module_names():
     names = []
     for manifest in sorted(MODULES.glob("extensions/*/Cargo.toml")):
-        if manifest.parent.name.startswith("host_project_"):
+        name = manifest.parent.name
+        if name.startswith(("host_project_", "host_module_")) or name == "rendering":
             continue
-        if re.search(r"^module-abi\s*=", manifest.read_text(encoding="utf-8"), re.MULTILINE):
-            names.append(manifest.parent.name)
+        names.append(name)
     return names
+
+
+# The feature names an extension declares, minus the `default` key: the set a
+# generated wrapper enables on its dependency edge.
+def wrapper_features(name):
+    text = (MODULES / "extensions" / name / "Cargo.toml").read_text(encoding="utf-8")
+    section = re.search(r"^\[features\]\s*$(.*?)(^\[|\Z)", text, re.MULTILINE | re.DOTALL)
+    if not section:
+        return []
+    declared = re.findall(r"^([A-Za-z0-9_-]+)\s*=", section.group(1), re.MULTILINE)
+    return [feature for feature in declared if feature != "default"]
 
 
 # Every generated project crate currently present.
@@ -118,19 +142,39 @@ def project_names():
     return [path.parent.name for path in sorted(MODULES.glob("extensions/host_project_*/Cargo.toml"))]
 
 
-# The builds a host anchored to `frontend` runs, as {label: cargo selection}.
-def anchored_builds(frontend):
-    _, anchor_package, anchor_features, hot_patch = FRONTENDS[frontend]
-    anchor = ["--package", anchor_package, "--no-default-features",
-              "--features", ",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
-    engine_features = ["pill_engine/hot_patch"] if hot_patch else []
+# The builds a host running `frontend` spawns, as {label: cargo selection}.
+#
+# An extension is measured through its generated wrapper when one exists (the
+# host writes those on startup, so a checkout that ran the host covers this
+# path), and otherwise through the extension selected directly with the same
+# feature set the wrapper would enable.
+def spawned_builds(frontend):
+    _, engine_features, anchor = FRONTENDS[frontend]
     builds = {}
     for module in module_names():
-        builds[f"module {module}"] = [
-            "--package", module, "--features", ",".join([f"{module}/module-abi", *engine_features]), *anchor]
+        wrapper = f"host_module_{module}"
+        if (MODULES / "extensions" / wrapper).is_dir():
+            selection = ["--package", wrapper]
+            features = list(engine_features)
+        else:
+            selection = ["--package", module]
+            features = [f"{module}/{feature}" for feature in wrapper_features(module)]
+            features += engine_features
+        if features:
+            selection += ["--features", ",".join(features)]
+        if anchor:
+            anchor_package, anchor_features = anchor
+            selection += ["--package", anchor_package, "--no-default-features", "--features"]
+            selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
+        builds[f"module {module}"] = selection
     for project in project_names():
         project_features = ["--features", ",".join(engine_features)] if engine_features else []
-        builds[f"project {project}"] = ["--package", project, *project_features, *anchor]
+        selection = ["--package", project, *project_features]
+        if anchor:
+            anchor_package, anchor_features = anchor
+            selection += ["--package", anchor_package, "--no-default-features", "--features"]
+            selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
+        builds[f"project {project}"] = selection
     return builds
 
 
@@ -157,9 +201,9 @@ def main():
     measured_count = 0
     try:
         for dylib in ENGINE_DYLIBS:
-            for frontend, (selection, _, _, _) in FRONTENDS.items():
+            for frontend, (selection, _, _) in FRONTENDS.items():
                 reference = dylib_tree(dylib, selection)
-                for label, build in anchored_builds(frontend).items():
+                for label, build in spawned_builds(frontend).items():
                     measured_count += 1
                     for package, description in differences(reference, dylib_tree(dylib, build)).items():
                         drift.setdefault((dylib, package, description), []).append(f"{label} ({frontend})")
@@ -175,7 +219,7 @@ def main():
             print(f"        from: {', '.join(builds)}")
     if drift:
         return 1
-    print(f"  PASS  {', '.join(ENGINE_DYLIBS)} resolve identically in every anchored build")
+    print(f"  PASS  {', '.join(ENGINE_DYLIBS)} resolve identically in every spawned build")
     return 0
 
 

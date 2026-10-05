@@ -308,9 +308,6 @@ pub fn register(engine: &mut Engine) -> u32 {
         }
     }
 
-    // Fully qualified: the import would be unused in the project build, where
-    // this module-abi registration path is compiled out.
-    //
     // NOTE: this line is asserted on. `MODULE_REGISTERED_MESSAGE` in
     // `devops/core/suite_common.py` matches the message text against the
     // host's stdout, and scenarios in `devops/tests/test_hot_reload_suite.py`
@@ -328,43 +325,48 @@ pub fn register(engine: &mut Engine) -> u32 {
     0
 }"""
 
+# The struct preamble of `Spline` as committed. Dropping `PillComponent` - and
+# its `#[pill(...)]` helper, which without the derive is an unknown attribute -
+# is what lets a stubbed module avoid auto-registering the type while the
+# project's copy of the same sources keeps deriving it:
+# `register_all_components` reads this artifact's own inventory, and without
+# the derive that inventory holds nothing for `Spline`. The hand-written
+# `Component` impl gives the type the identity the derive would have, so the
+# rest of both builds compiles and every other type-keyed behavior is
+# unchanged.
+SPLINE_DERIVE_ORIGINAL = """\
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(persistable, shared)]
+pub struct Spline {"""
+
+SPLINE_DERIVE_STUB_NO_REGISTRATION = """\
+impl ::pill_engine::component::Component for Spline {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_spline::Spline")
+    }
+
+    fn shared_identity() -> Option<u128> {
+        const IDENTITY: u128 =
+            ::pill_engine::component::shared_component_identity("pill_spline::Spline");
+        Some(IDENTITY)
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Spline {"""
+
 SPLINE_REGISTER_STUB_NO_REGISTRATION = """\
-// Suite stub: the persistable registration is disabled so the module loads
-// WITHOUT registering `Spline`. The `#[pill_module]` attribute is dropped too,
-// so no compile-time auto-registration runs; the ABI exports are written out
-// by hand to keep the module loadable. `DEMO_SPLINE_COUNT`/`demo_spline` are
-// referenced only to keep the dead-code lint quiet in this stub build.
-#[cfg(feature = "module-abi")]
-const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
-
-#[cfg(feature = "module-abi")]
-const PILL_MODULE_NAME: &[u8] = b"pill_spline\0";
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_abi_version() -> u32 {
-    PILL_MODULE_ABI_VERSION
-}
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_name() -> *const ::core::ffi::c_char {
-    PILL_MODULE_NAME.as_ptr() as *const ::core::ffi::c_char
-}
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
-    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-        let api = unsafe { &*api };
-        let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-        register(engine)
-    }));
-    result.unwrap_or(u32::MAX)
-}
-
-#[cfg(feature = "module-abi")]
-fn register(engine: &mut Engine) -> u32 {
+// Suite stub: the module loads WITHOUT registering `Spline`. The attribute
+// stays - the wrapper crate expands its `__pill_module_entry_points!` macro
+// and init still runs `register_all_components` - so what removes the
+// registration is the derive edit that goes with this stub
+// (`SPLINE_DERIVE_STUB_NO_REGISTRATION`): this artifact's inventory then holds
+// nothing for `Spline`. `DEMO_SPLINE_COUNT`/`demo_spline` stay referenced only
+// to keep the dead-code lint quiet in this stub build.
+#[pill_module]
+pub fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
     pill_core::info!(
@@ -376,40 +378,12 @@ fn register(engine: &mut Engine) -> u32 {
 
 SPLINE_REGISTER_STUB_INIT_FAILURE = """\
 // Suite stub: deliberately fail init so the host rolls back to the previous
-// generation. The `#[pill_module]` attribute is dropped (hand-written exports
-// below), and `DEMO_SPLINE_COUNT`/`demo_spline` are referenced only to keep
-// the dead-code lint quiet in this stub build.
-#[cfg(feature = "module-abi")]
-const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
-
-#[cfg(feature = "module-abi")]
-const PILL_MODULE_NAME: &[u8] = b"pill_spline\0";
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_abi_version() -> u32 {
-    PILL_MODULE_ABI_VERSION
-}
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_name() -> *const ::core::ffi::c_char {
-    PILL_MODULE_NAME.as_ptr() as *const ::core::ffi::c_char
-}
-
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
-    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-        let api = unsafe { &*api };
-        let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-        register(engine)
-    }));
-    result.unwrap_or(u32::MAX)
-}
-
-#[cfg(feature = "module-abi")]
-fn register(engine: &mut Engine) -> u32 {
+// generation. The attribute stays - the wrapper crate expands its
+// `__pill_module_entry_points!` macro and init auto-registration runs as usual
+// - so the stub only changes the body. `DEMO_SPLINE_COUNT`/`demo_spline` stay
+// referenced to keep the dead-code lint quiet in this stub build.
+#[pill_module]
+pub fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
     1
@@ -582,7 +556,11 @@ SESSION_A_SCENARIOS = [
                             (
                                 SPLINE_REGISTER_ORIGINAL,
                                 SPLINE_REGISTER_STUB_NO_REGISTRATION,
-                            )
+                            ),
+                            (
+                                SPLINE_DERIVE_ORIGINAL,
+                                SPLINE_DERIVE_STUB_NO_REGISTRATION,
+                            ),
                         ],
                     )
                 ],
@@ -663,14 +641,14 @@ SESSION_B_SCENARIOS = [
                     "1 spline(s)",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                # The probe samples a reference spline over the project's spawn
-                # geometry - five collinear points 150 apart from x=90, all at
-                # y=120 - so its Catmull-Rom midpoint is the middle point,
-                # (390, 120), plus the module's vertical offset, which this
-                # phase moves from 0.0 to 10.0. The value is stable because the
-                # reference curve does not move with the balls; the sameness is
-                # the point, since the token below has to name it in advance.
-                wait_after=[("midpoint (390.0, 130.0", PROBE_TIMEOUT)],
+                # The probe samples a reference spline over the project's ball
+                # spawn geometry, whose Catmull-Rom midpoint at t=0.5 is the
+                # middle spawn point, (990, 120), plus the module's vertical
+                # offset, which this phase moves from 0.0 to 10.0. The value is
+                # stable because the spawn geometry is source constants; the
+                # sameness is the point, since the token below has to name it
+                # in advance.
+                wait_after=[("midpoint (990.0, 130.0", PROBE_TIMEOUT)],
             )
         ],
         restore_after=[SPLINE_LIB_RS],

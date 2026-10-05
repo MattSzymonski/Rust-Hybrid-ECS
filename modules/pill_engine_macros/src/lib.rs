@@ -2297,13 +2297,13 @@ fn hot_patch_resolver_export(
 /// rather than in a contract, so the entry point is written once here and each
 /// attribute supplies only the `#[cfg]` gate its artifact needs.
 ///
-/// `gate` is empty for a project, which is always built as its own artifact,
-/// and `#[cfg(feature = "module-abi")]` for a module, which may instead be
-/// linked into one as an ordinary dependency - where a second definition of a
-/// `#[no_mangle]` symbol is a link error.
+/// `gate` is empty in both emissions: a project is always built as its own
+/// artifact, and a module's entry points are emitted by the wrapper macro
+/// (where `init_fn` is the path `$crate::register`), so the one body serves
+/// both.
 fn module_init_export(
     gate: &proc_macro2::TokenStream,
-    init_fn: &proc_macro2::Ident,
+    init_fn: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     quote! {
         /// Registers this artifact against the host engine; returns zero on
@@ -2393,53 +2393,46 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 /// - wraps the whole init in `catch_unwind` so a panic becomes a non-zero
 ///   status and the host rolls back instead of unwinding across the C ABI.
 ///
-/// Everything generated is gated behind `#[cfg(feature = "module-abi")]`, and
-/// the same gate is applied to the wrapped function, so a crate linked into
-/// the project build (where the feature is off) exports no `#[no_mangle]`
-/// symbols and leaves no dead code behind.
+/// The `#[no_mangle]` exports come from `__pill_module_entry_points!`, the
+/// macro this attribute emits: the loadable artifact is the generated
+/// `host_module_<name>` wrapper crate, which compiles this one as a plain
+/// library and expands the macro, so a crate linked into several artifacts
+/// never defines a symbol more than once. The wrapped function itself is
+/// always compiled, since a statically linked build calls it directly.
 #[proc_macro_attribute]
 pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
-    // Gated twice over. `module-abi`, because a crate linked directly into
-    // another binary must not export these `#[no_mangle]` symbols twice.
-    // `debug_assertions`, because hot patching is a development facility and a
-    // shipped artifact should carry no trace of it.
-    let hot_patch_resolver = hot_patch_resolver_export(
-        &format_ident!("pill_hot_resolve"),
-        &quote! { #[cfg(all(feature = "module-abi", debug_assertions))] },
-    );
-    // The loadable-artifact contract, gated: a module crate is often linked
-    // into another artifact as an ordinary dependency, where a second
-    // definition of a `#[no_mangle]` symbol is a link error.
-    let module_abi_gate = quote! { #[cfg(feature = "module-abi")] };
-    let abi_version_export = module_abi_version_export(&module_abi_gate);
-    let init_export = module_init_export(&module_abi_gate, fn_ident);
+    // The entry points are written once, as the body of the macro below: the
+    // loadable artifact is always a generated wrapper crate, which compiles
+    // this one as a plain library, so the symbols cannot be emitted by this
+    // crate itself - a crate linked into several artifacts would define each
+    // one more than once.
+    fn entry_points(
+        init_fn: &proc_macro2::TokenStream,
+        name_bytes: &proc_macro2::TokenStream,
+    ) -> proc_macro2::TokenStream {
+        // The resolver stays behind `debug_assertions`: hot patching is a
+        // development facility and a shipped artifact should carry no trace of
+        // it.
+        let hot_patch_resolver = hot_patch_resolver_export(
+            &format_ident!("pill_hot_resolve"),
+            &quote! { #[cfg(debug_assertions)] },
+        );
+        let abi_version_export = module_abi_version_export(&quote! {});
+        let init_export = module_init_export(&quote! {}, init_fn);
 
-    let expanded = quote! {
-        // Emitted unconditionally. What `module-abi` gates is the `#[no_mangle]`
-        // exports below: those must stay off when this crate is linked as an
-        // ordinary dependency, or one symbol ends up with two definitions. The
-        // user's own function has no such problem, and a statically linked
-        // build calls it directly - without this it would not be compiled at
-        // all, and a shipping binary would have no way to initialize the module
-        // it just linked in.
-        #item_fn
-
-        #hot_patch_resolver
+        quote! {
+            #hot_patch_resolver
 
         #abi_version_export
 
         /// Name reported to the host for diagnostics; null-terminated for the
-        /// C ABI. Derived from the crate name so it can never drift from the
-        /// package the host builds.
-        #[cfg(feature = "module-abi")]
-        const PILL_MODULE_NAME: &[u8] =
-            ::core::concat!(::core::env!("CARGO_PKG_NAME"), "\0").as_bytes();
+        /// C ABI.
+        const PILL_MODULE_NAME: &[u8] = #name_bytes;
 
         /// Human-readable module name used in host log messages.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub extern "C" fn pill_module_name() -> *const ::core::ffi::c_char {
             PILL_MODULE_NAME.as_ptr() as *const ::core::ffi::c_char
@@ -2447,7 +2440,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 
         /// Number of `#[derive(PillMirror)]` value-type descriptors this
         /// artifact declares, letting the host size its copy buffer.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub extern "C" fn pill_value_type_descriptor_count() -> u32 {
             ::pill_engine::component_registry::value_type_descriptors().len() as u32
@@ -2463,7 +2455,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         /// `out` must point at `max` writable
         /// [`PillValueTypeDescriptor`](::pill_engine::component_registry::PillValueTypeDescriptor)
         /// slots owned by the host for the duration of this call.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub unsafe extern "C" fn pill_copy_value_type_descriptors(
             out: *mut ::pill_engine::component_registry::PillValueTypeDescriptor,
@@ -2482,7 +2473,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 
         /// Number of `#[pill_mirror_method]` descriptors this artifact
         /// declares, letting the host size its copy buffer.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub extern "C" fn pill_mirror_method_descriptor_count() -> u32 {
             ::pill_engine::component_registry::mirror_method_descriptors().len() as u32
@@ -2498,7 +2488,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         /// `out` must point at `max` writable
         /// [`PillMethodDescriptor`](::pill_engine::component_registry::PillMethodDescriptor)
         /// slots owned by the host for the duration of this call.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub unsafe extern "C" fn pill_copy_mirror_method_descriptors(
             out: *mut ::pill_engine::component_registry::PillMethodDescriptor,
@@ -2517,7 +2506,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 
         /// Number of heap-field accessor descriptors this artifact declares,
         /// letting the host size its copy buffer.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub extern "C" fn pill_field_accessor_descriptor_count() -> u32 {
             ::pill_engine::component_registry::field_accessor_descriptors().len() as u32
@@ -2534,7 +2522,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         /// `out` must point at `max` writable
         /// [`PillFieldAccessorDescriptor`](::pill_engine::component_registry::PillFieldAccessorDescriptor)
         /// slots owned by the host for the duration of this call.
-        #[cfg(feature = "module-abi")]
         #[no_mangle]
         pub unsafe extern "C" fn pill_copy_field_accessor_descriptors(
             out: *mut ::pill_engine::component_registry::PillFieldAccessorDescriptor,
@@ -2551,7 +2538,43 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             count
         }
 
-        #init_export
+            #init_export
+        }
+    }
+
+    let entry_point_items = entry_points(
+        &quote! { $crate::#fn_ident },
+        &quote! { $crate::PILL_MODULE_NAME_BYTES },
+    );
+
+    let expanded = quote! {
+        // Emitted unconditionally: a statically linked build calls this
+        // directly, and without it a shipping binary would have no way to
+        // initialize the module it just linked in.
+        #item_fn
+
+        /// Null-terminated crate name the entry-point macro reports, so the
+        /// artifact the host loads carries the extension's name rather than a
+        /// wrapper's package name.
+        #[doc(hidden)]
+        pub const PILL_MODULE_NAME_BYTES: &[u8] =
+            ::core::concat!(::core::env!("CARGO_PKG_NAME"), "\0").as_bytes();
+
+        /// Expands to this crate's loadable-artifact entry points.
+        ///
+        /// The loadable artifact is the generated `host_module_<name>` wrapper
+        /// crate, which compiles the extension as a plain library and expands
+        /// this macro: the entry points cannot come from this crate directly,
+        /// because a crate linked into several artifacts would define each
+        /// `#[no_mangle]` symbol more than once. `$crate` roots everything the
+        /// expansion generates back in this crate, its name included.
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! __pill_module_entry_points {
+            () => {
+                #entry_point_items
+            };
+        }
     };
 
     expanded.into()
@@ -2592,7 +2615,7 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     // collide with.
     let ungated = quote! {};
     let abi_version_export = module_abi_version_export(&ungated);
-    let init_export = module_init_export(&ungated, fn_ident);
+    let init_export = module_init_export(&ungated, &quote! { #fn_ident });
 
     let expanded = quote! {
         #item_fn
