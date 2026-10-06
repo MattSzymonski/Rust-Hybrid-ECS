@@ -169,7 +169,12 @@ impl RendererModule {
     /// crate into its own image, so it must be rebuilt against the new source
     /// before it may read the data again. A no-op when no renderer is selected.
     pub(crate) fn request_rebuild(&self) {
-        if self.config.is_some() {
+        if let Some(config) = &self.config {
+            // The startup batch may have validated the renderer's artifact;
+            // a rebuild request means the reason it must rebuild (a reloaded
+            // data crate) happened after the batch, so its token must not
+            // let the next load skip the compile.
+            crate::build_runner::forget_batch_validation(&config.name);
             self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
         }
     }

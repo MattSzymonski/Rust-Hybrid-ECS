@@ -167,27 +167,30 @@ def spawned_builds(frontend):
             selection += ["--package", anchor_package, "--no-default-features", "--features"]
             selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
         builds[f"module {module}"] = selection
-    # The startup batch invocation selects every wrapper at once (see
-    # `build_runner::build_extension_batch`); its engine resolution must match
-    # the host just like the per-module builds'. Only generated wrappers can
-    # be selected: a host batches exactly the modules it loads, whose wrappers
-    # it wrote on startup.
-    wrappers = [
+    # The startup batch invocation selects, in one cargo call, every wrapper
+    # the host will load plus its native project member (and, in a windowed
+    # host, the renderer's wrapper - among the wrappers below). See
+    # `build_runner::build_extension_batch`; its engine resolution must match
+    # the host just like the per-module builds'. Only generated members can be
+    # selected: a host batches exactly the modules it loads, whose members it
+    # wrote on startup.
+    batch_packages = [
         f"host_module_{module}"
         for module in module_names()
         if (MODULES / "extensions" / f"host_module_{module}").is_dir()
     ]
-    if len(wrappers) > 1:
+    batch_packages += project_names()
+    if len(batch_packages) > 1:
         batch = []
-        for wrapper in wrappers:
-            batch += ["--package", wrapper]
+        for package in batch_packages:
+            batch += ["--package", package]
         if engine_features:
             batch += ["--features", ",".join(engine_features)]
         if anchor:
             anchor_package, anchor_features = anchor
             batch += ["--package", anchor_package, "--no-default-features", "--features"]
             batch += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
-        builds["extension batch"] = batch
+        builds["startup batch"] = batch
     for project in project_names():
         project_features = ["--features", ",".join(engine_features)] if engine_features else []
         selection = ["--package", project, *project_features]

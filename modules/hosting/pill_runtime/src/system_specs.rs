@@ -29,10 +29,19 @@ use pill_core::telemetry::log_block;
 /// Called by [`Runtime::new`](crate::Runtime::new), before it creates the
 /// engine.
 pub(crate) fn print_system_specs() {
-    use sysinfo::{Disks, System};
+    use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, RefreshKind, System};
 
     // Step 1: Snapshot system state and derive RAM, swap, and CPU figures.
-    let system = System::new_all();
+    //
+    // Targeted refresh, never `System::new_all()`: the report reads memory and
+    // CPU figures only, while `new_all` also enumerates every process on the
+    // machine - measured ~300 ms on a busy Windows session, paid in the middle
+    // of start-up for information nothing here consumes.
+    let system = System::new_with_specifics(
+        RefreshKind::nothing()
+            .with_memory(MemoryRefreshKind::everything())
+            .with_cpu(CpuRefreshKind::everything()),
+    );
     let disks = Disks::new_with_refreshed_list();
 
     let total_ram_gb = system.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
