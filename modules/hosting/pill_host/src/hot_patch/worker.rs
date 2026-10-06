@@ -48,8 +48,10 @@ pub(crate) struct PatchAttempt {
     /// Timings so far; the worker and the activation add theirs.
     pub(super) stages: PatchStages,
     /// When the attempt began, so the LIVE report spans preparation, the
-    /// build and the wait for the next frame boundary.
-    pub(super) started: Instant,
+    /// build and the wait for the next frame boundary. The frame loop also
+    /// spans its analytics total from here: the build runs between frames, so
+    /// the frame that collects the attempt cannot time the total itself.
+    pub(crate) started: Instant,
 }
 
 /// One changed body, ready to compile.
