@@ -21,7 +21,7 @@ pub(crate) fn rotation_system(
         } else {
             glam::Quat::IDENTITY
         };
-        transform.rotation = (step * current * 5.0).normalize().to_array();
+        transform.rotation = (step * current * 55.0).normalize().to_array();
     }
     Ok(())
 }

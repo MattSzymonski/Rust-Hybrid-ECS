@@ -76,8 +76,8 @@ metrics = { version = "0.24", optional = true }
 # used directly. Measured with `local/temp/pill_core_feature_union.py`; extend
 # the list if a new module adds a feature to pill_core's tree. The editor is
 # the other source: its dioxus graph unions `either/std`, `proc-macro2`'s
-# `span-locations`, `syn`'s `full`+`visit-mut`, `time/macros`, `serde`'s
-# `alloc` and the two `windows-sys` feature sets pinned below.
+# `span-locations`, `syn`'s `full`+`visit-mut`, `time/macros` and `serde`'s
+# `alloc`.
 bytemuck = { version = "1", features = [
     "aarch64_simd",
     "derive",
@@ -96,49 +96,16 @@ smallvec = { version = "1", features = ["const_generics", "union"] }
 syn = { version = "3", features = ["full", "visit-mut"] }
 time = { version = "0.3", features = ["macros"] }
 
-# `windows-sys` appears three times in the workspace graph (0.59, 0.60 and
-# 0.61, from different dependents); all are pinned for the same reason as the
-# list above - the editor's own dependencies union Win32 features onto them.
-# Windows-only, so the web build never sees them.
-[target.'cfg(windows)'.dependencies]
-windows-sys-059 = { package = "windows-sys", version = "0.59", features = [
-    "Win32_Graphics",
-    "Win32_Graphics_Gdi",
-    "Win32_System_SystemServices",
-    "Win32_UI",
-    "Win32_UI_Input",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-windows-sys-060 = { package = "windows-sys", version = "0.60", features = [
-    "Win32_Globalization",
-    "Win32_Graphics",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_System_SystemServices",
-    "Win32_UI",
-    "Win32_UI_Accessibility",
-    "Win32_UI_Controls",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
-] }
-windows-sys-061 = { package = "windows-sys", version = "0.61", features = [
-    "Win32_Security_Authentication",
-    "Win32_Security_Authentication_Identity",
-    "Win32_Security_Credentials",
-    "Win32_Security_Cryptography",
-    "Win32_System_Com",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_UI",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-    "Win32_UI_WindowsAndMessaging",
-] }
+# Three `windows-sys` pins (0.59, 0.60, 0.61) stood here until 2026-10-06;
+# they are gone for cost, not for drift: `test_engine_feature_drift.py` passes
+# with none of them, and 0.60 had no dependent left in this crate's tree at
+# all. Every hot patch links this crate's dylib, and each pinned version made
+# rustc generate one import library per DLL its features name - 68 per patch
+# link against 24 through the crates that genuinely use windows-sys
+# (colored -> 0.59; terminal_size, nu-ansi-term, winapi-util -> 0.61). That
+# cost ~100-160 ms of `rustc` link setup on every patch. Before re-adding any
+# pin here, count the `_imports_indirect.lib` entries in a patch link and keep
+# it near 24.
 
 # The platform layer (`src/platform`) on native: the rolling log file and
 # blocking on a future.
