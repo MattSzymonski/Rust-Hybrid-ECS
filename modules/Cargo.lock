@@ -2600,14 +2600,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "host_module_pill_audio"
-version = "0.1.0"
-dependencies = [
- "pill_audio",
- "pill_engine",
-]
-
-[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -2624,24 +2616,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_module_pill_spline"
+name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
- "pill_engine",
- "pill_spline",
-]
-
-[[package]]
-name = "host_project_project"
-version = "0.1.0"
-dependencies = [
- "pill_audio",
- "pill_core",
+ "glam",
+ "pill_dummy_color",
  "pill_engine",
  "pill_master_renderer_data",
- "pill_spline",
  "serde",
- "tracing",
+ "trait_type_map",
 ]
 
 [[package]]
@@ -4765,9 +4748,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "web-time",
- "windows-sys 0.59.0",
- "windows-sys 0.60.2",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
