@@ -219,7 +219,7 @@ public static class RotationSystem
         float deltaSeconds = simulation.DeltaSeconds * 30.0f;
 
         var color = pill_dummy_color.PillDummyColor.GetColorA();
-        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond - 300.0f + color) * deltaSeconds;
+        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond - 100.0f + color) * deltaSeconds;
         Quaternion step = Quaternion.CreateFromAxisAngle(Vector3.UnitY, angle);
 
         foreach (var row in models.Rows())
