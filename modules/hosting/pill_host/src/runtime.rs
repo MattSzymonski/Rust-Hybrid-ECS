@@ -1145,13 +1145,24 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
     crate::build_progress::announce_plan(&host_config.name, planned_builds);
 
-    // Step 3b: Build every extension in ONE cargo invocation. Each module
-    // build otherwise pays cargo's fixed process-and-resolve cost again, which
-    // is what made a start scale linearly in cargo invocations; the batch
-    // shares it. Modules whose artifacts the batch validated skip their own
-    // build when they load below (Step 4) - an edit later still rebuilds a
-    // module on its own.
-    crate::build_runner::build_extension_batch(&workspace_root, &host_config.extensions);
+    // Step 3b: Build every native module in ONE cargo invocation: the
+    // extensions, the project's member and - in a windowed host - the
+    // renderer's wrapper, which is an ordinary wrapper build whose load waits
+    // for the window. Each module build otherwise pays cargo's fixed
+    // process-and-resolve cost again, which is what made a start scale
+    // linearly in cargo invocations; the batch shares it. Modules whose
+    // artifacts the batch validated skip their own build when they load below
+    // (Step 4) - an edit later still rebuilds a module on its own.
+    crate::build_runner::build_extension_batch(
+        &workspace_root,
+        &host_config.extensions,
+        Some(&module_config),
+        if cfg!(feature = "rendering") {
+            host_config.renderer.as_deref()
+        } else {
+            None
+        },
+    );
 
     // Step 4: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely

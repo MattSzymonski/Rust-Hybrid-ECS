@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // External crates
 #[cfg(feature = "hot_patch")]
@@ -1410,8 +1410,9 @@ pub(crate) fn build_project_module(
     // to keep its own freshness engine - modification-time stamps, a toolchain
     // marker, a recursive walk of every path dependency - which duplicated
     // cargo's fingerprint check and had to model features, targets and
-    // environment overrides by hand. Cargo now always runs; a fresh workspace
-    // answers in a few hundred milliseconds with `Finished`.
+    // environment overrides by hand. Cargo still owns freshness: every build
+    // runs unless the startup batch already ran it (the token below), and a
+    // fresh workspace answers in a few hundred milliseconds with `Finished`.
 
     // A managed build also captures the compiler command line MSBuild computed,
     // so a later hot reload can replay it in-process instead of paying for
@@ -1421,14 +1422,23 @@ pub(crate) fn build_project_module(
     #[cfg(not(feature = "hot_reload"))]
     let build_command = config.build_command.clone();
 
-    run_build_command(
-        workspace_root,
-        &config.name,
-        &build_command,
-        &config.build_environment,
-        Some(&[(config.name.as_str(), build_command.as_slice())]),
-        cancel_flag,
-    )?;
+    // The startup batch may already have built this project with these exact
+    // flags (see [`build_extension_batch`]); the token covers that first load
+    // only, so a later reload always builds. A managed project never joins the
+    // batch - its `dotnet` build shares none of cargo's fixed cost - and this
+    // token must not skip that build either.
+    let batch_validated = matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. })
+        && take_batch_validation(&config.name, &workspace_root.join(&config.watch_directory));
+    if !batch_validated {
+        run_build_command(
+            workspace_root,
+            &config.name,
+            &build_command,
+            &config.build_environment,
+            Some(&[(config.name.as_str(), build_command.as_slice())]),
+            cancel_flag,
+        )?;
+    }
 
     // Step 3: Stage the freshly built artifacts into the private hot-load
     // directory, so what the host loads is never the slot other builds write
@@ -1808,39 +1818,102 @@ fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
     }
 }
 
-/// Extension names whose artifacts one batch invocation validated for this
-/// process, consumed by the module's own load so it skips a second build.
-static BATCH_VALIDATED_EXTENSIONS: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    OnceLock::new();
+/// What one startup batch invocation validated, and when it finished.
+#[derive(Debug)]
+struct BatchValidation {
+    /// When the batch invocation returned successfully.
+    ///
+    /// A token is only honoured while no file under the module's watch
+    /// directory is newer than this instant: the batch validated exactly the
+    /// sources cargo saw, and a save after it must rebuild.
+    completed_at: SystemTime,
+    /// Module names whose artifacts the batch built or confirmed.
+    names: std::collections::HashSet<String>,
+}
 
-/// Build every extension wrapper in one cargo invocation.
+/// One startup batch invocation's validation, consumed per module.
+///
+/// One batch runs per process, before anything loads; each name is consumed
+/// by its startup load, so a later reload always builds on its own.
+static BATCH_VALIDATION: OnceLock<std::sync::Mutex<Option<BatchValidation>>> = OnceLock::new();
+
+/// Run `callback` with exclusive access to the batch validation state.
+fn with_batch_validation<T>(callback: impl FnOnce(&mut Option<BatchValidation>) -> T) -> T {
+    callback(
+        &mut BATCH_VALIDATION
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Build every module of the startup plan in one cargo invocation.
 ///
 /// Every module build otherwise pays cargo's fixed cost - process start,
 /// workspace resolve, fingerprint scan - once per module, and that cost grows
 /// with the workspace, so a project with hundreds of modules would restart
-/// cargo hundreds of times per start. The wrappers differ only in `--package`,
-/// so one invocation selects them all; its flags mirror a single module's
-/// build exactly, which keeps every unit's fingerprints identical to a
-/// per-module build's. The modules it validated skip their own build when
-/// they load (see [`take_batch_validation`]); an edit later still rebuilds a
-/// module on its own, and the first patch of a module the batch recompiled
-/// re-captures its compiler flags on demand.
+/// cargo hundreds of times per start. The extensions' wrappers, the native
+/// project's member and the renderer's wrapper (windowed postures only)
+/// differ only in `--package`, so one invocation selects them all; its flags
+/// mirror a single module's build exactly, which keeps every unit's
+/// fingerprints identical to a per-module build's. The modules it validated
+/// skip their own build when they load (see [`take_batch_validation`]); an
+/// edit later still rebuilds a module on its own, and the first patch of a
+/// module the batch recompiled re-captures its compiler flags on demand.
+///
+/// A managed (C#) project is never selected: its `dotnet` build shares none
+/// of cargo's fixed cost. The renderer's wrapper joins the batch because it
+/// is an ordinary wrapper build; only its load waits for the window (see
+/// `crate::renderer_module`), and a rebuild request drops its token so a
+/// reloaded data crate still forces a compile.
 ///
 /// Feature unification is the one difference from per-module builds: a
-/// selected extension that depends on another selected extension would
-/// receive the union of both feature requests. Independent modules - the
-/// common case, and the case in every project this workspace ships - see no
-/// union at all.
+/// selected package that depends on another selected package would receive
+/// the union of both feature requests. Independent modules - the common case,
+/// and the case in every project this workspace ships - see no union at all.
 ///
 /// Returns whether the batch ran and validated the modules. A failure is not
 /// an error: the modules then build individually, which keeps per-module
 /// failure reporting exactly as it was.
-pub(crate) fn build_extension_batch(workspace_root: &Path, configs: &[ExtensionConfig]) -> bool {
-    if configs.len() < 2 {
+pub(crate) fn build_extension_batch(
+    workspace_root: &Path,
+    configs: &[ExtensionConfig],
+    project: Option<&ProjectModuleConfig>,
+    renderer: Option<&str>,
+) -> bool {
+    // Only a native project shares cargo's fixed cost; a managed build's
+    // `dotnet` invocation is its own machinery, and selecting its member here
+    // would fail on a missing cargo package.
+    let project_package = project.and_then(|project| match &project.backend {
+        ProjectModuleBackend::NativeLibrary { .. } => Some(format!(
+            "{}{}",
+            crate::config::HOST_PROJECT_MEMBER_PREFIX,
+            project.name
+        )),
+        ProjectModuleBackend::CSharp(_) => None,
+    });
+    // The renderer's wrapper is built exactly like an extension's.
+    // Constructed from the name alone, which is all `RendererModule` needs to
+    // load it.
+    let renderer_config = renderer.map(ExtensionConfig::workspace_member);
+    let total = configs.len()
+        + usize::from(project_package.is_some())
+        + usize::from(renderer_config.is_some());
+    // One package has no fixed cost to share; its own step builds it.
+    if total < 2 {
         return false;
     }
+
     let mut command = vec!["cargo".to_string(), "build".to_string()];
     for config in configs {
+        command.push("--package".to_string());
+        command.push(config.wrapper_library_name.clone());
+    }
+    if let Some(package) = &project_package {
+        command.push("--package".to_string());
+        command.push(package.clone());
+    }
+    if let Some(config) = &renderer_config {
         command.push("--package".to_string());
         command.push(config.wrapper_library_name.clone());
     }
@@ -1854,54 +1927,132 @@ pub(crate) fn build_extension_batch(workspace_root: &Path, configs: &[ExtensionC
         command.push("--features".to_string());
         command.push("pill_engine/hot_patch".to_string());
     }
-    let entries: Vec<(&str, &[String])> = configs
+    // One capture entry per selected package, so the patch pipeline harvests
+    // every module's `rustc` line from this single invocation.
+    let mut entries: Vec<(&str, &[String])> = configs
         .iter()
         .map(|config| (config.name.as_str(), config.build_command.as_slice()))
         .collect();
+    if let (Some(project), Some(_)) = (project, project_package.as_ref()) {
+        entries.push((project.name.as_str(), project.build_command.as_slice()));
+    }
+    if let Some(config) = &renderer_config {
+        entries.push((config.name.as_str(), config.build_command.as_slice()));
+    }
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        modules = configs.len(),
-        "building every extension in one cargo invocation"
+        modules = total,
+        "building every module in one cargo invocation"
     );
     match run_build_command(
         workspace_root,
-        "extension batch",
+        "startup batch",
         &command,
         &crate::config::spawned_build_environment(),
         Some(&entries),
         None,
     ) {
         Ok(()) => {
-            let mut validated = BATCH_VALIDATED_EXTENSIONS
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut validation = BatchValidation {
+                completed_at: SystemTime::now(),
+                names: Default::default(),
+            };
             for config in configs {
-                validated.insert(config.name.clone());
+                validation.names.insert(config.name.clone());
             }
+            if let (Some(project), Some(_)) = (project, project_package.as_ref()) {
+                validation.names.insert(project.name.clone());
+            }
+            if let Some(config) = &renderer_config {
+                validation.names.insert(config.name.clone());
+            }
+            with_batch_validation(|state| *state = Some(validation));
             true
         }
         Err(error) => {
             warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 error = %error,
-                "the batch extension build failed; each module builds on its own"
+                "the startup batch build failed; each module builds on its own"
             );
             false
         }
     }
 }
 
-/// Whether the batch invocation already validated `name`'s artifact.
+/// Whether the startup batch already validated `name`'s artifact.
 ///
 /// Consumed per module: the token belongs to the startup load, so a reload of
-/// the same module builds on its own.
-fn take_batch_validation(name: &str) -> bool {
-    BATCH_VALIDATED_EXTENSIONS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(name)
+/// the same module builds on its own. Any file under `watch_directory` newer
+/// than the batch also invalidates it - the batch validated exactly the
+/// sources cargo saw, and a save after it must rebuild rather than load stale
+/// code. The window between the batch and a load is largest for the renderer,
+/// which loads when the window opens.
+fn take_batch_validation(name: &str, watch_directory: &Path) -> bool {
+    with_batch_validation(|state| {
+        let Some(validation) = state.as_mut() else {
+            return false;
+        };
+        if !validation.names.remove(name) {
+            return false;
+        }
+        if source_newer_than(watch_directory, validation.completed_at) {
+            pill_core::debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = name,
+                "source changed after the startup batch; the module builds on its own"
+            );
+            return false;
+        }
+        true
+    })
+}
+
+/// Drop `name`'s batch token, so its next load builds instead of skipping.
+///
+/// The renderer's rebuild request uses this: a reloaded data crate makes the
+/// artifact the batch built stale even though no renderer source changed.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+pub(crate) fn forget_batch_validation(name: &str) {
+    with_batch_validation(|state| {
+        if let Some(validation) = state.as_mut() {
+            validation.names.remove(name);
+        }
+    });
+}
+
+/// Whether any entry under `directory` was modified after `time`.
+///
+/// Watch directories hold module sources - small trees - so the walk is cheap
+/// per load. Anything unreadable counts as newer, which costs one build and
+/// can never load stale code.
+fn source_newer_than(directory: &Path, time: SystemTime) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return true;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            return true;
+        };
+        let was_modified = metadata
+            .modified()
+            .ok()
+            .is_none_or(|modified| modified > time);
+        if metadata.is_dir() {
+            if was_modified || source_newer_than(&path, time) {
+                return true;
+            }
+            continue;
+        }
+        if was_modified {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build one extension and return its expected output artifact.
@@ -1963,8 +2114,9 @@ pub(crate) fn build_extension(
     //
     // One batch invocation may already have built this module with these exact
     // flags (see [`build_extension_batch`]). The token covers that one startup
-    // load only: a reload finds no token and always builds on its own.
-    if !take_batch_validation(&config.name) {
+    // load only: a reload finds no token and always builds on its own, and a
+    // save newer than the batch invalidates it.
+    if !take_batch_validation(&config.name, &workspace_root.join(&config.watch_directory)) {
         run_build_command(
             workspace_root,
             &config.name,
@@ -2050,6 +2202,69 @@ fn native_library_filename(library_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token guard: a file written after the batch invalidates the token,
+    /// one written before it does not, and a missing directory counts as
+    /// changed.
+    #[test]
+    fn source_newer_than_watches_file_times() {
+        let directory =
+            std::env::temp_dir().join(format!("pill_batch_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("nested")).expect("create the test directory");
+        let before_write = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(directory.join("nested").join("edited.rs"), "// edited")
+            .expect("write the test file");
+        assert!(
+            source_newer_than(&directory, before_write),
+            "a file written after the batch must invalidate the token"
+        );
+        let after_write = SystemTime::now();
+        assert!(
+            !source_newer_than(&directory, after_write),
+            "files older than the batch keep the token valid"
+        );
+        assert!(
+            source_newer_than(&directory.join("missing"), after_write),
+            "a missing watch directory counts as changed"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The token itself: refused when the sources moved on, consumed once.
+    #[test]
+    fn batch_validation_is_consumed_once() {
+        let directory =
+            std::env::temp_dir().join(format!("pill_batch_token_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create the test directory");
+        let stale_moment = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(directory.join("lib.rs"), "// module").expect("write the test file");
+        with_batch_validation(|state| {
+            *state = Some(BatchValidation {
+                completed_at: stale_moment,
+                names: ["batch_guard_expiring".to_string()].into_iter().collect(),
+            });
+        });
+        assert!(
+            !take_batch_validation("batch_guard_expiring", &directory),
+            "a source newer than the batch must force the module's own build"
+        );
+        with_batch_validation(|state| {
+            *state = Some(BatchValidation {
+                completed_at: SystemTime::now(),
+                names: ["batch_guard_once".to_string()].into_iter().collect(),
+            });
+        });
+        assert!(take_batch_validation("batch_guard_once", &directory));
+        assert!(
+            !take_batch_validation("batch_guard_once", &directory),
+            "the token belongs to one load only"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     /// Build a throwaway workspace containing one module, a path dependency,
     /// and a freshly produced artifact, and return the workspace root plus the
