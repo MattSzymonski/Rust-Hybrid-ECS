@@ -304,6 +304,11 @@ pub(super) struct CsEngineApi {
         extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
     asset_import_sound:
         extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
+    /// Drop the active invocation's world rendering pipeline, returning the
+    /// renderer to its built-in pass. `0` succeeded; see
+    /// `pill_master_renderer_data::csharp_assets` for the rest. Appended at the
+    /// end like every earlier slot.
+    asset_clear_render_pipeline: extern "C" fn() -> u8,
 }
 
 impl CsEngineApi {
@@ -345,6 +350,7 @@ impl CsEngineApi {
             asset_import_texture: super::assets::ffi_asset_import_texture,
             asset_import_mesh: super::assets::ffi_asset_import_mesh,
             asset_import_sound: super::assets::ffi_asset_import_sound,
+            asset_clear_render_pipeline: super::assets::ffi_asset_clear_render_pipeline,
         }
     }
 }

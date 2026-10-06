@@ -2733,13 +2733,14 @@ fn a_managed_resource_publishes_its_field_layout() {
 // =============================================================================
 
 /// The export names the C# asset entry points forward to.
-const ASSET_EXPORTS: [&str; 6] = [
+const ASSET_EXPORTS: [&str; 7] = [
     "pill_render_data_load_mesh_obj",
     "pill_render_data_load_texture_png",
     "pill_render_data_load_shader",
     "pill_render_data_create_material",
     "pill_render_data_import_texture",
     "pill_render_data_import_mesh",
+    "pill_render_data_clear_render_pipeline",
 ];
 
 /// A binary that links the renderer data crate finds every asset function the
@@ -2810,6 +2811,41 @@ fn a_mesh_loads_through_the_forwarded_call() {
         .handle_by_name::<pill_master_renderer_data::Mesh>(name)
         .expect("the mesh is stored under its name");
     assert_eq!((handle.index(), handle.generation()), (index, generation));
+}
+
+/// Inside an invocation, the forwarded clear drops the renderer's default PBR
+/// pipeline, returning the world to the built-in frame.
+#[test]
+fn the_render_pipeline_clears_through_the_forwarded_call() {
+    let mut engine = Engine::new();
+    pill_master_renderer_data::register(&mut engine);
+    // As in the mesh test: the host publishes after loading the extensions,
+    // and this binary's own descriptors stand in for the loaded module.
+    #[cfg(feature = "hot_reload")]
+    crate::publish_asset_exports(pill_engine::component_registry::find_export);
+    let manager = engine
+        .world()
+        .get_resource::<pill_master_renderer_data::RenderingManager>()
+        .expect("register inserts the manager");
+    assert!(
+        manager.pipeline().is_some(),
+        "register installs the PBR chain as the default"
+    );
+    let bindings = ComponentBindings::default();
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        let status = super::assets::ffi_asset_clear_render_pipeline();
+        assert_eq!(status, 0, "the forwarded clear succeeds");
+    }
+
+    let manager = engine
+        .world()
+        .get_resource::<pill_master_renderer_data::RenderingManager>()
+        .expect("register inserts the manager");
+    assert!(
+        manager.pipeline().is_none(),
+        "the pipeline handle is gone and the renderer falls back to its built-in frame"
+    );
 }
 
 /// A module that registers a component twice - explicitly and through its

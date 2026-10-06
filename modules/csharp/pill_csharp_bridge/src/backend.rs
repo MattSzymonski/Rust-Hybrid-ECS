@@ -109,12 +109,14 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// `CsEngineApi`. Bumped to 12 by the version and size header that opens
 /// `CsEngineApi`, which the managed side checks before copying the table.
 /// Bumped to 13 by the three asset import slots appended to `CsEngineApi`.
+/// Bumped to 14 by the rendering pipeline clear slot appended to
+/// `CsEngineApi`.
 ///
 /// Collapsing the four length/copy export pairs into one pair keyed by a
 /// payload-kind number would save six exports here and six resolutions
 /// across the two export constructors. It was proposed and declined: see
 /// the design note in `LoaderInterop.cs` for why the named exports are kept.
-pub const INTEROP_CONTRACT_VERSION: u32 = 13;
+pub const INTEROP_CONTRACT_VERSION: u32 = 14;
 
 // =============================================================================
 // Types + Impls
