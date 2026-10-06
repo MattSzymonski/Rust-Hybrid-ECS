@@ -27,6 +27,17 @@ pub struct TagAlphaComponent;
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
     pill_master_renderer_data::register(engine);
+    // The showcase is the three shading styles, one material each, so this
+    // project runs the renderer's built-in frame: a single geometry pass that
+    // draws every instance through its own material's shader. `register` only
+    // points the manager at the PBR chain as a default - that chain draws
+    // materials built for its `pill_pbr` shader alone - so clearing the
+    // manager returns the renderer to the built-in pass the styles need.
+    engine
+        .world_mut()
+        .get_resource_mut::<pill_master_renderer_data::RenderingManager>()
+        .expect("register inserts the RenderingManager resource")
+        .clear();
     __pill_register_TagAlphaComponent(engine.world_mut());
 
     let assets = match asset_loading::load(engine.world_mut()) {

@@ -16,5 +16,6 @@ pill_engine = { path = "../../modules/pill_engine" }
 pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 serde = { version = "1", features = ["derive"] }
 trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
+pill_dummy_color = { path = "../../modules/extensions/pill_dummy_color", default-features = false }
 
 [features]
