@@ -1754,17 +1754,22 @@ fn start_patch_build(
 /// deliver the edit never runs. A collected success returns `false`, because a
 /// save that arrived while the build ran is a fresh edit the fast path may
 /// handle immediately.
+///
+/// The second element is when the collected transaction began - the attempt's
+/// own start. The build runs between frames, so the frame that reports it
+/// cannot measure the analytics total from its own beginning; `run_reload_steps`
+/// spans its total back to this instant. `None` when nothing was collected.
 #[cfg(feature = "hot_patch")]
-fn advance_patch_attempt(host: &mut DevHost) -> bool {
+fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
     let Some(mut in_flight) = host.patch_attempt.take() else {
-        return false;
+        return (false, None);
     };
     let (attempt, outcomes) = match in_flight.receiver.try_recv() {
         Ok(report) => report,
         Err(mpsc::TryRecvError::Empty) => {
             // Still compiling; put the state back and let the frame run.
             host.patch_attempt = Some(in_flight);
-            return false;
+            return (false, None);
         }
         Err(mpsc::TryRecvError::Disconnected) => {
             // The worker died without a report. Nothing is consumed, so the
@@ -1775,12 +1780,16 @@ fn advance_patch_attempt(host: &mut DevHost) -> bool {
                 target: telemetry_target::HOT_RELOAD,
                 "the patch build stopped unexpectedly; falling back to a reload"
             );
-            return true;
+            return (true, None);
         }
     };
     if let Some(thread) = in_flight.thread.take() {
         let _ = thread.join();
     }
+    // The transaction this frame's analytics line describes began when this
+    // attempt did: the build ran between frames, so the frame collecting it
+    // cannot time the total from its own start.
+    let attempt_started = attempt.started;
 
     let patched;
     {
@@ -1805,7 +1814,7 @@ fn advance_patch_attempt(host: &mut DevHost) -> bool {
                 target: telemetry_target::HOT_RELOAD,
                 "the patch build's session is gone; falling back to a reload"
             );
-            return true;
+            return (true, Some(attempt_started));
         };
         let targets = patch_targets(loaded_project, extensions);
         let outcome = session.activate_attempt(engine, &targets, loaded_patches, attempt, outcomes);
@@ -1831,13 +1840,13 @@ fn advance_patch_attempt(host: &mut DevHost) -> bool {
         // A patch replaced live code; the editor must refresh its metadata.
         host.bump_editor_revision();
     }
-    !patched
+    (!patched, Some(attempt_started))
 }
 
 /// See the `hot_patch` version above; without the feature nothing is built.
 #[cfg(not(feature = "hot_patch"))]
-fn advance_patch_attempt(_host: &mut DevHost) -> bool {
-    false
+fn advance_patch_attempt(_host: &mut DevHost) -> (bool, Option<Instant>) {
+    (false, None)
 }
 
 /// Whether a patch build is running on its own thread right now.
@@ -2075,8 +2084,10 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // project's systems, entities, or resources.
     // The reload transaction begins here so the analytics total line spans
     // the whole cascade (edited module + queued project reload), not just the
-    // last transaction.
-    let reload_started = Instant::now();
+    // last transaction. A collected patch transaction is the exception: its
+    // build ran between frames, so the mark moves back to the attempt's own
+    // start below.
+    let mut reload_started = Instant::now();
 
     // This is the thread that owns the frame boundary, and therefore the only
     // one allowed to rewrite live code.
@@ -2089,7 +2100,16 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // a later frame. A build that came back without installing its patch also
     // blocks new attempts for this frame, so the reload below gets to deliver
     // the edit - the order the in-line pipeline had.
-    let failed_attempt = advance_patch_attempt(host);
+    let (failed_attempt, collected_patch_started) = advance_patch_attempt(host);
+    if let Some(started) = collected_patch_started {
+        // The collected build ran while earlier frames kept rendering; the
+        // transaction began when its attempt did, so the total spans the
+        // build instead of only the milliseconds this frame spent installing
+        // it.
+        if started < reload_started {
+            reload_started = started;
+        }
+    }
     if patch_attempt_in_flight(host) {
         return Vec::new();
     }
