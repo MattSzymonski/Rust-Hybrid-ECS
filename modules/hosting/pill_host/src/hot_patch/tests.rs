@@ -11,6 +11,10 @@
 //! implementation half of the module reads as implementation.
 //! Private items stay reachable through `use super::*`.
 
+// External crates
+use libloading::Library;
+
+// Current crate
 use super::*;
 
 /// A fan-out that reaches no copy is reported rather than treated as

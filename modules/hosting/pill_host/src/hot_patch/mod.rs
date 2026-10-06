@@ -46,7 +46,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 // External crates
-use libloading::Library;
 use pill_core::platform::Instant;
 use pill_core::{debug, info, warn};
 use pill_engine::Engine;
@@ -58,6 +57,8 @@ pub(crate) mod compile;
 pub(crate) mod generations;
 /// Patch routes: where a body is installed and how calls reach it.
 pub(crate) mod routes;
+/// Patch builds: compiling and loading a patch away from the frame thread.
+mod worker;
 
 // A function's patch history and the routes back through it.
 pub(crate) use generations::Generation;
@@ -67,6 +68,10 @@ pub use generations::PatchGeneration;
 // a module build harvests the same line this pipeline would otherwise pay a
 // second `cargo build -v` to discover.
 pub(crate) use compile::{flags_cache_path, parse_rustc_line};
+
+// One background build's pieces, re-exported for the frame loop that starts a
+// build and installs its product at a later frame boundary.
+pub(crate) use worker::{build_attempt, BodyOutcome, PatchAttempt};
 
 // The three install routes and the patch-image plumbing they share. Re-exported
 // rather than referenced through `routes::` at every call site, so the session
@@ -234,6 +239,35 @@ pub(crate) enum PatchOutcome {
     },
 }
 
+/// What starting a patch attempt found, and whether a build is owed.
+///
+/// The frame loop reads these the same way it read the in-line pipeline's
+/// outcomes: `Unchanged` and `NotPatchable` leave the pending edit for the
+/// reload path, `Failed` reports what is still running, and `Ready` hands the
+/// build to a worker whose product is installed by
+/// [`HotPatchSession::activate_attempt`].
+pub(crate) enum BeginOutcome {
+    /// Nothing relevant changed.
+    Unchanged,
+    /// The change is real but out of scope; the caller should reload normally.
+    NotPatchable {
+        /// Stable code and the sentence explaining it.
+        refusal: PatchRefusal,
+    },
+    /// Preparing the replacement failed; the caller should reload normally.
+    Failed {
+        /// Which function was being prepared.
+        function: String,
+        /// Which generation is still running, so the console says what the
+        /// process is executing rather than only what did not happen.
+        active_generation: u32,
+        /// Stable code and the first line of the failure.
+        failure: PatchRefusal,
+    },
+    /// A build is owed: hand it to a worker, then activate its product.
+    Ready(worker::PatchAttempt),
+}
+
 /// Where one patch spent its time, in milliseconds.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PatchStages {
@@ -282,11 +316,11 @@ impl PatchStages {
 // HotPatchSession
 // =============================================================================
 
-/// What one successful [`HotPatchSession::apply`] produced.
+/// What one successfully installed body produced.
 ///
-/// Named for the call that returns it rather than for the act of installing:
-/// the installation is one step inside `apply`, and the generation number,
-/// artifact size and route below describe the whole attempt.
+/// Named for the install rather than for the whole attempt: one attempt may
+/// carry several bodies, and the generation number, artifact size and route
+/// below describe this one.
 struct ApplyResult {
     /// Which generation this became.
     generation: u32,
@@ -524,78 +558,61 @@ impl HotPatchSession {
         self.snapshot_taken_at = SystemTime::now();
     }
 
-    /// Try to satisfy a pending source change with a patch instead of a reload.
+    /// Prepare a build for a pending source change, without compiling it.
     ///
-    /// Called at the frame boundary, before the normal reload transaction, so
-    /// no system is executing when a slot is written.
-    pub(crate) fn try_patch(
-        &mut self,
-        engine: &mut Engine,
-        targets: &[(&str, &NativeLibrary)],
-        patches: &mut Vec<LoadedPatch>,
-    ) -> PatchOutcome {
+    /// Everything here stays on the calling thread and touches only this
+    /// session and the filesystem: classification, source generation, the
+    /// staged rlib, the replayed compiler line. None of it touches the engine
+    /// or a loaded artifact, which is what lets the caller hand the result to
+    /// another thread and install it at a later frame boundary.
+    ///
+    /// The expensive half - `rustc` and `LoadLibrary` - is
+    /// [`worker::build_attempt`]'s job; the product is installed by
+    /// [`Self::activate_attempt`].
+    pub(crate) fn begin_attempt(&mut self) -> BeginOutcome {
         let started = Instant::now();
         let mut stages = PatchStages::default();
 
-        // Step 1: Find which annotated function's body changed, if exactly one
-        // did and nothing else moved.
+        // Step 1: Find which functions' bodies changed, if the edit is
+        // body-only and nothing else moved.
         let classify_started = Instant::now();
         let classified = self.classify();
         stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
 
         let edit = match classified {
             Ok(Some(found)) => found,
-            Ok(None) => return PatchOutcome::Unchanged,
-            Err(refusal) => return PatchOutcome::NotPatchable { refusal },
+            Ok(None) => return BeginOutcome::Unchanged,
+            Err(refusal) => return BeginOutcome::NotPatchable { refusal },
         };
         let path = edit.path;
 
-        // Step 2: Generate, compile, load and install each changed body in
-        // turn. A failure part-way leaves the bodies already installed live -
-        // they are independent replacements, and undoing them would discard
-        // work that succeeded - but the snapshot is not advanced, so the next
-        // change retries the whole file.
-        let mut last: Option<ApplyResult> = None;
-        let mut patched_names: Vec<String> = Vec::new();
-        // Several bodies in one file are patched in sequence and need not share
-        // a route: an annotated and an un-annotated function in the same save
-        // take different ones. Both are reported, because an edit is only as
-        // provable as its weakest body.
-        let mut routes: Vec<crate::analytics::PatchRoute> = Vec::new();
-        let mut copies = 0usize;
-        for declaration in &edit.declarations {
+        // Step 2: Generate each changed body's source and collect its build
+        // inputs. A failure here leaves nothing of this attempt live - the
+        // running implementation is untouched - so the caller reloads, the
+        // same outcome the in-line pipeline reported for it.
+        let mut bodies = Vec::with_capacity(edit.declarations.len());
+        for declaration in edit.declarations {
             // The path the running artifact recorded for this function, which
             // is what both the engine registry and a slot are keyed by.
             // Derived from the file's position under the source root, so a
             // function in a submodule resolves as `crate::module::function`.
-            let qualified = self.qualified_name(&path, declaration);
+            let qualified = self.qualified_name(&path, &declaration);
             // The slot route asks under a different name; see
             // `slot_lookup_name`.
-            let slot_name = self.slot_lookup_name(&path, declaration);
-
-            match self.apply(
-                engine,
-                targets,
-                patches,
+            let slot_name = self.slot_lookup_name(&path, &declaration);
+            match self.prepare_body(
                 &edit.new_contents,
-                declaration,
+                &declaration,
                 &qualified,
                 &slot_name,
                 &mut stages,
             ) {
-                Ok(installed) => {
-                    patched_names.push(qualified);
-                    if !routes.contains(&installed.route) {
-                        routes.push(installed.route);
-                    }
-                    copies += installed.copies;
-                    last = Some(installed);
-                }
+                Ok(body) => bodies.push(body),
                 // The running implementation is untouched, so the console
-                // reports which generation is still executing rather than only
-                // what failed.
+                // reports which generation is still executing rather than
+                // only what failed.
                 Err(failure) => {
-                    return PatchOutcome::Failed {
+                    return BeginOutcome::Failed {
                         active_generation: self.active_generation(&qualified),
                         function: qualified,
                         failure,
@@ -604,32 +621,14 @@ impl HotPatchSession {
             }
         }
 
-        let Some(installed) = last else {
-            return PatchOutcome::Unchanged;
-        };
-
-        // Only record the new contents once every body is live, so a partial
-        // failure is retried on the next change rather than treated as done.
-        // The time recorded is the one read WITH these contents, never a fresh
-        // stat: a save that landed during the compile must leave the snapshot
-        // stale, or the next attempt skips it as already delivered.
-        self.snapshots.insert(
+        BeginOutcome::Ready(worker::PatchAttempt {
             path,
-            Snapshot {
-                contents: edit.new_contents,
-                modified: edit.modified,
-            },
-        );
-        PatchOutcome::Patched {
-            function: patched_names.join(", "),
-            generation: installed.generation,
-            elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+            new_contents: edit.new_contents,
+            modified: edit.modified,
+            bodies,
             stages,
-            artifact_bytes: installed.artifact_bytes,
-            exports: installed.exports,
-            routes,
-            copies,
-        }
+            started,
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -852,31 +851,22 @@ impl HotPatchSession {
     // Generation, compilation, activation
     // -------------------------------------------------------------------------
 
-    /// Build and install the replacement for one function.
-    // Nine arguments, each a distinct collaborator rather than a field of some
-    // implicit struct: the engine, the artifacts, the loaded patches, the source,
-    // the declaration, its two names, and the stage timings. Grouping them would
-    // hide what they are rather than clarify it.
-    #[allow(clippy::too_many_arguments)]
-    fn apply(
+    /// Generate one body's patch source and collect everything its build
+    /// needs, up to but not including running `rustc`.
+    ///
+    /// `slot_name` is carried, not read: activation files the slot route
+    /// under it. `totals` receives this body's timings once preparation
+    /// succeeds, so a failed body's partial cost stays out of the report -
+    /// the same rule the in-line pipeline had.
+    fn prepare_body(
         &mut self,
-        engine: &mut Engine,
-        targets: &[(&str, &NativeLibrary)],
-        patches: &mut Vec<LoadedPatch>,
         new_contents: &str,
         declaration: &source::HotFunction,
         qualified: &str,
         slot_name: &str,
         totals: &mut PatchStages,
-    ) -> Result<ApplyResult, PatchRefusal> {
-        // Per-body timings. `apply` runs once per changed body while the
-        // caller's accumulator spans the whole save, so each body fills its
-        // own struct and merges it into the total on success; writing the
-        // total directly made the reported breakdown describe the last body
-        // alone whenever one save changed several.
+    ) -> Result<worker::PreparedBody, PatchRefusal> {
         let mut stages = PatchStages::default();
-        let function = declaration.name.as_str();
-        let kind = declaration.kind;
         self.counter += 1;
         // The package name is part of it because every session counts from one
         // and patch libraries are never unloaded. Without it, the first patch of
@@ -911,17 +901,13 @@ impl HotPatchSession {
         })?;
         stages.generate = generate_started.elapsed().as_secs_f64() * 1000.0;
 
-        // Compile, replaying cargo's own flags plus the crate's rlib. The
-        // extern entry is built before borrowing the cached line, which needs
-        // `&mut self` on first use.
         // Keep the crate's own rlib in step with the dependency rlibs the
         // replayed line names, so the two halves of the link closure agree.
         self.refresh_staged_rlib()
             .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?;
-        // Cloned before the cached compiler line is borrowed mutably below.
         let package = self.package.clone();
 
-        let artifact = scratch.join(format!("{crate_name}.dll"));
+        let artifact_path = scratch.join(format!("{crate_name}.dll"));
         let extra_externs = vec![format!("{}={}", self.package, self.package_rlib.display())];
         // Dependency rlibs staged when the host last built this package, which
         // is the only set guaranteed to match the module rlib being linked. The
@@ -931,93 +917,147 @@ impl HotPatchSession {
             .workspace_root
             .join(crate::build_runner::STAGED_DEPENDENCY_SUBDIRECTORY);
         let flags_started = Instant::now();
+        // Cloned out of the cache rather than borrowed: the build that replays
+        // it runs on another thread, which cannot hold a borrow of this
+        // session.
         let line = self
             .rustc_line()
-            .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?;
+            .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?
+            .clone();
         stages.flags = flags_started.elapsed().as_secs_f64() * 1000.0;
-        let compile_started = Instant::now();
-        let output = line
-            .replay(
-                &source_path,
-                &artifact,
-                &crate_name,
-                &extra_externs,
-                Some(staged_dependencies.as_path()),
-            )
-            .output()
-            .map_err(|error| {
-                PatchRefusal::new(failure_code::COMPILE, format!("cannot run rustc: {error}"))
-            })?;
-        stages.compile = compile_started.elapsed().as_secs_f64() * 1000.0;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // A link failure reports `error: linking with ... failed` first and
-            // says nothing useful until the linker's own line further down, so
-            // that one is preferred when present.
-            let linker = stderr
-                .lines()
-                .map(str::trim)
-                .find(|line| line.contains("rust-lld: error:") || line.contains("LNK"));
-            let first = stderr
-                .lines()
-                .find(|line| line.starts_with("error"))
-                .unwrap_or("rustc rejected the generated patch");
-            let package = package.as_str();
-            let detail = match linker {
-                Some(linker) => format!("{first} - {linker}"),
-                // `can't find crate for <this crate>` names the crate being
-                // patched, which reads as though its rlib is missing. It is
-                // there; it no longer matches the dependency rlibs the replayed
-                // line points at, because one of them was rebuilt.
-                None if first.contains("E0463") && first.contains(package) => format!(
-                    "{first} - the staged rlib no longer matches the dependency \
-                     rlibs it links against; a crate `{package}` depends on was \
-                     rebuilt after it was staged"
-                ),
-                None => first.to_string(),
+        totals.merge(&stages);
+
+        Ok(worker::PreparedBody {
+            declaration: declaration.clone(),
+            qualified: qualified.to_string(),
+            slot_name: slot_name.to_string(),
+            crate_name,
+            source_path,
+            artifact_path,
+            extra_externs,
+            staged_dependencies,
+            line,
+            package,
+        })
+    }
+
+    /// Install a finished build at the frame boundary.
+    ///
+    /// The compile and the load ran on another thread; `outcomes` is its
+    /// report, one entry per body in order, stopping at the first failure.
+    /// Everything that touches the engine, the loaded artifacts or a dispatch
+    /// slot happens here, on the thread that owns the frame boundary - a
+    /// requirement rather than a preference, because the prologue route
+    /// rewrites live code.
+    pub(crate) fn activate_attempt(
+        &mut self,
+        engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
+        patches: &mut Vec<LoadedPatch>,
+        attempt: worker::PatchAttempt,
+        outcomes: Vec<worker::BodyOutcome>,
+    ) -> PatchOutcome {
+        let worker::PatchAttempt {
+            path,
+            new_contents,
+            modified,
+            bodies,
+            mut stages,
+            started,
+        } = attempt;
+        let mut last: Option<ApplyResult> = None;
+        let mut patched_names: Vec<String> = Vec::new();
+        // Several bodies in one file are patched in sequence and need not share
+        // a route: an annotated and an un-annotated function in the same save
+        // take different ones. Both are reported, because an edit is only as
+        // provable as its weakest body.
+        let mut routes: Vec<crate::analytics::PatchRoute> = Vec::new();
+        let mut copies = 0usize;
+        for (body, outcome) in bodies.into_iter().zip(outcomes) {
+            let installed = match outcome {
+                worker::BodyOutcome::Built(built) => {
+                    match self.install_body(engine, targets, patches, &body, built, &mut stages) {
+                        Ok(installed) => installed,
+                        // The running implementation is untouched, so the
+                        // console reports which generation is still executing
+                        // rather than only what failed.
+                        Err(failure) => {
+                            return PatchOutcome::Failed {
+                                active_generation: self.active_generation(&body.qualified),
+                                function: body.qualified,
+                                failure,
+                            };
+                        }
+                    }
+                }
+                worker::BodyOutcome::Failed(failure) => {
+                    return PatchOutcome::Failed {
+                        active_generation: self.active_generation(&body.qualified),
+                        function: body.qualified,
+                        failure,
+                    };
+                }
             };
-            // The exact command, so a failure can be reproduced by hand rather
-            // than guessed at. DEBUG because it is long and only wanted when
-            // something has already gone wrong.
-            debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                command = line
-                    .replay_args(
-                        &source_path,
-                        &artifact,
-                        &crate_name,
-                        &extra_externs,
-                        Some(staged_dependencies.as_path()),
-                    )
-                    .join(" ")
-                    .as_str(),
-                "the patch compile that failed"
-            );
-            return Err(PatchRefusal::new(failure_code::COMPILE, detail));
+            patched_names.push(body.qualified);
+            if !routes.contains(&installed.route) {
+                routes.push(installed.route);
+            }
+            copies += installed.copies;
+            last = Some(installed);
         }
 
-        // Load. Never unloaded: a slot will hold an address inside this image.
-        let load_started = Instant::now();
-        // SAFETY: the file was just produced by rustc from a generated source
-        // and is a complete native module.
-        let library = unsafe { Library::new(&artifact) }.map_err(|error| {
-            PatchRefusal::new(
-                failure_code::LOAD,
-                format!("cannot load the patch library: {error}"),
-            )
-        })?;
-        stages.load = load_started.elapsed().as_secs_f64() * 1000.0;
-        let activate_started = Instant::now();
+        let Some(installed) = last else {
+            return PatchOutcome::Unchanged;
+        };
 
-        // Measured before installing, so the analytics line carries the same
-        // two numbers a module reload does. Both are best-effort: a patch is
-        // still correct when its size or export table cannot be read.
-        let artifact_bytes = std::fs::metadata(&artifact)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let exports = crate::analytics::inspect_pe(&artifact)
-            .map(|inspection| inspection.exports.len())
-            .unwrap_or(0);
+        // Only record the new contents once every body is live, so a partial
+        // failure is retried on the next change rather than treated as done.
+        // The time recorded is the one read WITH these contents, never a fresh
+        // stat: a save that landed during the compile must leave the snapshot
+        // stale, or the next attempt skips it as already delivered.
+        self.snapshots.insert(
+            path,
+            Snapshot {
+                contents: new_contents,
+                modified,
+            },
+        );
+        PatchOutcome::Patched {
+            function: patched_names.join(", "),
+            generation: installed.generation,
+            elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+            stages,
+            artifact_bytes: installed.artifact_bytes,
+            exports: installed.exports,
+            routes,
+            copies,
+        }
+    }
+
+    /// Install one built patch: park the image, resolve the replacement and
+    /// write it into the running artifact(s).
+    ///
+    /// One iteration of what used to be `apply`, from the mapped image to the
+    /// recorded generation. The compile, the load and the artifact inspection
+    /// that used to precede it run on a worker thread now; what remains is
+    /// exactly the part that must happen at the frame boundary.
+    fn install_body(
+        &mut self,
+        engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
+        patches: &mut Vec<LoadedPatch>,
+        body: &worker::PreparedBody,
+        built: worker::BuiltBody,
+        totals: &mut PatchStages,
+    ) -> Result<ApplyResult, PatchRefusal> {
+        let declaration = &body.declaration;
+        let function = declaration.name.as_str();
+        let kind = declaration.kind;
+        let qualified = body.qualified.as_str();
+        let slot_name = body.slot_name.as_str();
+        let crate_name = body.crate_name.as_str();
+        let mut stages = PatchStages::default();
+        let activate_started = Instant::now();
 
         // Filled in by whichever route runs below, and recorded on the
         // generation so a rollback can reinstall exactly this address without
@@ -1053,7 +1093,7 @@ impl HotPatchSession {
         patches.push(LoadedPatch {
             function: qualified.to_string(),
             generation,
-            library,
+            library: built.library,
         });
         let library = &patches[patches.len() - 1].library;
         let existing_patches = &patches[..patches.len() - 1];
@@ -1160,8 +1200,8 @@ impl HotPatchSession {
 
         Ok(ApplyResult {
             generation,
-            artifact_bytes,
-            exports,
+            artifact_bytes: built.artifact_bytes,
+            exports: built.exports,
             route,
             copies,
         })
