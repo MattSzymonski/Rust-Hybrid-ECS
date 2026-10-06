@@ -309,6 +309,26 @@ pub(super) struct CsEngineApi {
     /// `pill_master_renderer_data::csharp_assets` for the rest. Appended at the
     /// end like every earlier slot.
     asset_clear_render_pipeline: extern "C" fn() -> u8,
+    /// Import a standalone material file, inserted into the active
+    /// invocation's `AssetManager`. `0` succeeded; see
+    /// `pill_master_renderer_data::csharp_assets` for the rest. Appended at
+    /// the end like every earlier slot.
+    asset_import_material: extern "C" fn(*const u8, u32, *mut u32, *mut u32) -> u8,
+    /// Draw a material as the sky behind the PBR chain, or turn the sky off
+    /// with the `u32::MAX` handle halves. Appended at the end.
+    asset_set_skybox: extern "C" fn(u32, u32) -> u8,
+    /// Whether a key, by its [`KeyCode`](pill_engine::KeyCode) discriminant,
+    /// is held this frame. Appended at the end.
+    input_key_held: extern "C" fn(u8) -> u8,
+    /// Whether a mouse button, by discriminant, is held this frame.
+    input_mouse_button_held: extern "C" fn(u8) -> u8,
+    /// Write this frame's mouse motion (physical pixels) to the two outputs;
+    /// `1` when written. Appended at the end.
+    input_mouse_delta: extern "C" fn(*mut f32, *mut f32) -> u8,
+    /// The frame's clamped delta in seconds; `0.0` with no clock.
+    time_delta_seconds: extern "C" fn() -> f32,
+    /// Seconds since the engine started; `0.0` with no clock.
+    time_elapsed_seconds: extern "C" fn() -> f32,
 }
 
 impl CsEngineApi {
@@ -351,6 +371,13 @@ impl CsEngineApi {
             asset_import_mesh: super::assets::ffi_asset_import_mesh,
             asset_import_sound: super::assets::ffi_asset_import_sound,
             asset_clear_render_pipeline: super::assets::ffi_asset_clear_render_pipeline,
+            asset_import_material: super::assets::ffi_asset_import_material,
+            asset_set_skybox: super::assets::ffi_asset_set_skybox,
+            input_key_held: super::frame_state::ffi_input_key_held,
+            input_mouse_button_held: super::frame_state::ffi_input_mouse_button_held,
+            input_mouse_delta: super::frame_state::ffi_input_mouse_delta,
+            time_delta_seconds: super::frame_state::ffi_time_delta_seconds,
+            time_elapsed_seconds: super::frame_state::ffi_time_elapsed_seconds,
         }
     }
 }

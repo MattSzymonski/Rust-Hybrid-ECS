@@ -36,8 +36,9 @@ mod loaded {
 
     // Current crate
     use crate::build_runner::build_project_module;
-    use crate::csharp::CSharpProject;
+    use crate::csharp::{CSharpProject, POLL_REJECTED, POLL_RELOADED};
     use crate::native_library::NativeLibrary;
+    use crate::watcher::SourceTrigger;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
     // =============================================================================
@@ -238,6 +239,11 @@ mod loaded {
                 // caller records bookkeeping only then.
                 Self::CSharp(runtime) => {
                     if !recompile_csharp(runtime, workspace_root, config, cancel_flag) {
+                        // A failed or cancelled rebuild replaces nothing;
+                        // dropping the arm keeps a later swap - whichever
+                        // attempt produced it - from being attributed to this
+                        // dead signal.
+                        runtime.abandon_reload_timing();
                         return false;
                     }
                     info!(
@@ -276,6 +282,18 @@ mod loaded {
             false
         }
 
+        /// Arm the managed backend's reload timing for the reload this signal
+        /// starts.
+        ///
+        /// A native project has no managed reload to time, so it ignores the
+        /// signal; the entry is still consumed, which is what keeps the
+        /// watcher's log bounded on native projects.
+        pub(crate) fn arm_managed_reload_timing(&mut self, trigger: Option<SourceTrigger>) {
+            if let Self::CSharp(project) = self {
+                project.arm_reload_timing(trigger);
+            }
+        }
+
         /// Invoke the native compatibility update hook after scheduler systems.
         pub(crate) fn update(&self, engine_api: &EngineApi) {
             // C# gameplay is represented entirely by registered ECS systems. Only
@@ -300,7 +318,31 @@ mod loaded {
     /// console is the worst outcome available here, so it is logged loudly.
     fn managed_poll_replaced_assembly(runtime: &mut CSharpProject, engine: &mut Engine) -> bool {
         match runtime.poll_reload(engine) {
-            Ok(status) => status == crate::csharp::POLL_RELOADED,
+            Ok(status) if status == POLL_RELOADED => {
+                // The swap is the end of the reload: report the whole span,
+                // from the save's timestamp to this instant, in phases.
+                if let Some(summary) = runtime.finish_reload_timing() {
+                    info!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        total_ms = format!("{:.1}", summary.total_ms).as_str(),
+                        detect_ms = format!("{:.1}", summary.detect_ms).as_str(),
+                        queue_ms = format!("{:.1}", summary.queue_ms).as_str(),
+                        build_ms = format!("{:.1}", summary.build_ms).as_str(),
+                        swap_ms = format!("{:.1}", summary.swap_ms).as_str(),
+                        build = summary.build_kind,
+                        "C# hot reload timing"
+                    );
+                }
+                true
+            }
+            Ok(status) => {
+                if status == POLL_REJECTED {
+                    // The loader refused the arriving assembly, so this
+                    // attempt ends without a swap.
+                    runtime.abandon_reload_timing();
+                }
+                false
+            }
             Err(error) => {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -324,13 +366,14 @@ mod loaded {
     /// that every reload used to run. That build also refreshes the capture,
     /// which is what makes the reload after it fast again.
     fn recompile_csharp(
-        runtime: &CSharpProject,
+        runtime: &mut CSharpProject,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
     ) -> bool {
         let fallback_reason = match runtime.fast_compile(workspace_root, &config.watch_directory) {
             Some(crate::csharp::FastCompileOutcome::Compiled { milliseconds }) => {
+                runtime.record_assembly_rebuilt("roslyn");
                 info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = config.name.as_str(),
@@ -364,7 +407,10 @@ mod loaded {
             "falling back to a full C# build"
         );
         match build_project_module(workspace_root, config, cancel_flag) {
-            Ok(_) => true,
+            Ok(_) => {
+                runtime.record_assembly_rebuilt("msbuild");
+                true
+            }
             Err(error) => {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

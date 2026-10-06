@@ -44,6 +44,8 @@ mod config;
 mod context;
 /// Low-level .NET hosting bootstrap used by the C# project backend.
 mod csharp_runtime;
+/// Read-only frame state for managed code: input and time.
+mod frame_state;
 /// The two-call protocol every managed payload crosses the boundary through.
 mod managed_buffer;
 /// C# component manifest schema, field validation, and engine type mapping.

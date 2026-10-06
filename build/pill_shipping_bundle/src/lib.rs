@@ -23,9 +23,17 @@ pub const STATIC_MODULES: &[StaticModule] = &[
 
 /// The project backend for this shipping project.
 pub fn project_backend() -> StaticProjectBackend {
-    StaticProjectBackend::Native {
-        init: italian_brainrot::init,
-    }
+    StaticProjectBackend::External(std::sync::Arc::new(
+        pill_csharp_bridge::CSharpBackend::coreclr(
+            pill_csharp_bridge::CSharpModuleConfig::new(
+                "csharp_runtime",
+                "csharp/pill_csharp_runtime/bin/Release/net8.0",
+                "circus_demo_cs",
+                "../examples/circus_demo_cs/bin/Release/net8.0",
+            ),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../modules"),
+        ),
+    ))
 }
 
 /// The renderer this binary links, or `None` for a headless build.
@@ -38,12 +46,12 @@ pub fn static_renderer() -> Option<StaticRenderer> {
 
 /// The `logging:` section of `project_settings.yaml`.
 #[rustfmt::skip]
-const LOGGING: StaticLogging = StaticLogging::NONE;
+const LOGGING: StaticLogging = StaticLogging { level: None, timestamp: None, source_location: None, targets: &[("engine::rendering", "info")] };
 
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
-        name: "Italian Brainrot",
+        name: "Circus Demo (C#)",
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),

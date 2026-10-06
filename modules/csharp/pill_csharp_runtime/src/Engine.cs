@@ -970,6 +970,94 @@ public static unsafe class Engine
     }
 
     /// <summary>
+    /// Imports the standalone material file at <paramref name="path"/>
+    /// (relative to <c>res</c>).
+    /// </summary>
+    /// <remarks>
+    /// A material file is the asset: no <c>.meta</c> file is involved, and the
+    /// guid in its header is what the loaded material is keyed by. Its shader
+    /// and maps resolve by guid from the shaders and textures already loaded,
+    /// so import those first. Same invocation contract as
+    /// <see cref="LoadMeshObj"/>.
+    /// </remarks>
+    public static AssetHandle ImportMaterial(string path)
+    {
+        byte[] pathBytes = Encoding.UTF8.GetBytes(path);
+        uint index, generation;
+        byte status;
+        fixed (byte* pathPointer = pathBytes)
+        {
+            status = _api.AssetImportMaterial(
+                pathPointer, (uint)pathBytes.Length, &index, &generation);
+        }
+        ValidateAssetStatus(status, $"import material \"{path}\"");
+        return new AssetHandle(index, generation);
+    }
+
+    /// <summary>
+    /// Draws <paramref name="material"/> as the sky behind the PBR chain's lit
+    /// surface, or turns the sky off when it is <c>null</c>.
+    /// </summary>
+    /// <remarks>
+    /// The material is a sky material: one of the chain's skybox shaders with
+    /// its <c>sky</c> slot bound. Imports nothing, so the material must already
+    /// be loaded. Same invocation contract as <see cref="LoadMeshObj"/>.
+    /// </remarks>
+    public static void SetSkybox(AssetHandle? material)
+    {
+        byte status = _api.AssetSetSkybox(
+            material?.Index ?? uint.MaxValue,
+            material?.Generation ?? uint.MaxValue);
+        ValidateAssetStatus(status, "set the sky material");
+    }
+
+    /// <summary>
+    /// The engine clock, as the frame being processed sees it; a managed
+    /// system reads the same values a native one does.
+    /// </summary>
+    public static class Time
+    {
+        /// <summary>The frame's clamped delta in seconds; 0 outside a frame.</summary>
+        public static float DeltaSeconds =>
+            _api.TimeDeltaSeconds == null ? 0.0f : _api.TimeDeltaSeconds();
+
+        /// <summary>Seconds since the engine started; 0 outside a frame.</summary>
+        public static float ElapsedSeconds =>
+            _api.TimeElapsedSeconds == null ? 0.0f : _api.TimeElapsedSeconds();
+    }
+
+    /// <summary>
+    /// The input state of the frame being processed. Headless runs never
+    /// receive events, so every query reads as released there.
+    /// </summary>
+    public static class Input
+    {
+        /// <summary>Whether <paramref name="key"/> is held this frame.</summary>
+        public static bool KeyHeld(KeyCode key) =>
+            _api.InputKeyHeld != null && _api.InputKeyHeld((byte)key) != 0;
+
+        /// <summary>Whether <paramref name="button"/> is held this frame.</summary>
+        public static bool MouseButtonHeld(MouseButton button) =>
+            _api.InputMouseButtonHeld != null && _api.InputMouseButtonHeld((byte)button) != 0;
+
+        /// <summary>
+        /// Mouse motion since the previous frame, in physical pixels; keeps
+        /// reporting at the window border, so it is the value for mouse-look.
+        /// </summary>
+        public static (float X, float Y) MouseDelta
+        {
+            get
+            {
+                if (_api.InputMouseDelta == null)
+                    return (0.0f, 0.0f);
+                float x, y;
+                _api.InputMouseDelta(&x, &y);
+                return (x, y);
+            }
+        }
+    }
+
+    /// <summary>
     /// Imports the source at <paramref name="path"/> (relative to <c>res</c>)
     /// through its <c>.meta</c> file with the import slot <paramref name="kind"/>
     /// selects. <see cref="Assets.Import{T}"/> is the public face of this.
@@ -1026,6 +1114,7 @@ public static unsafe class Engine
             12 => "the initial settings JSON does not fit this asset type",
             13 => "the metadata policy is not a known one",
             14 => "the engine's RenderingManager resource is missing",
+            15 => "the sky material could not be set (no such material, or the PBR chain will not install)",
             _ => $"native status {status}",
         };
         throw new InvalidOperationException($"Could not {operation}: {reason}.");

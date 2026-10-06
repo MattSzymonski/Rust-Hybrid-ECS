@@ -2600,14 +2600,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "host_module_pill_dummy_color"
-version = "0.1.0"
-dependencies = [
- "pill_dummy_color",
- "pill_engine",
-]
-
-[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -3051,18 +3043,6 @@ name = "is_ci"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7655c9839580ee829dfacba1d1278c2b7883e50a277ff7541299489d6bdfdc45"
-
-[[package]]
-name = "italian_brainrot"
-version = "0.1.0"
-dependencies = [
- "glam",
- "pill_assets",
- "pill_engine",
- "pill_master_renderer_data",
- "serde",
- "trait_type_map",
-]
 
 [[package]]
 name = "itertools"
@@ -4972,8 +4952,8 @@ dependencies = [
 name = "pill_shipping_bundle"
 version = "0.0.0"
 dependencies = [
- "italian_brainrot",
  "pill_assets",
+ "pill_csharp_bridge",
  "pill_master_renderer",
  "pill_master_renderer_data",
  "pill_runtime",

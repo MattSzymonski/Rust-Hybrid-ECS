@@ -111,6 +111,14 @@ pub struct DevHost {
     queued_reload_generation: u64,
     /// The `queued_reload_generation` value the frame loop last rebuilt for.
     last_processed_queued_reload: u64,
+    /// The project watcher's recent signals, so the reload this loop starts
+    /// can be timed from the save that caused it.
+    ///
+    /// The project's watcher is the only producer: the module and renderer
+    /// watchers pass `None`, because nothing times a reload from their
+    /// signals. Entries are consumed by generation, so each signal times
+    /// exactly one reload.
+    source_triggers: Arc<crate::watcher::TriggerLog>,
     /// Owners whose systems this host suspended because their binary was built
     /// against a shared component layout another reload has replaced.
     ///
@@ -1205,6 +1213,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             &module_config.name,
             &module_config.watch_directory,
             module_generation,
+            None,
         ) {
             return Err(fail_setup(runtime, error.into()));
         }
@@ -1255,11 +1264,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     };
 
     let source_edit_generation = Arc::new(AtomicU64::new(0));
+    let source_triggers = Arc::new(crate::watcher::TriggerLog::new());
     if let Err(error) = spawn_source_watcher(
         workspace_root.clone(),
         &module_config.name,
         &module_config.watch_directory,
         Arc::clone(&source_edit_generation),
+        Some(Arc::clone(&source_triggers)),
     ) {
         return Err(fail_setup(runtime, error.into()));
     }
@@ -1337,6 +1348,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         last_processed_source_edit: 0,
         queued_reload_generation: 0,
         last_processed_queued_reload: 0,
+        source_triggers,
         stale_suspended_owners: Vec::new(),
         #[cfg(feature = "hot_patch")]
         hot_patch,
@@ -2296,6 +2308,14 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             queued = queued_reloads,
             "hot reload triggered"
         );
+
+        // Attribute the reload to the watcher signal that asked for it, so
+        // the managed backend can time the whole save-to-swap span. The entry
+        // is consumed here because it belongs to exactly this reload; a
+        // cascade the pipeline queued itself has no source trigger and times
+        // from the frame instead.
+        host.loaded_project
+            .arm_managed_reload_timing(host.source_triggers.take(source_edits));
 
         // The project image about to be replaced unmaps two generations later,
         // so every recorded prologue address inside it goes stale the moment

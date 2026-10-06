@@ -61,13 +61,15 @@ const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
 /// (`pill_master_renderer_data::csharp_assets`) and the audio module's
 /// (`pill_audio::csharp_assets`).
 #[cfg(feature = "hot_reload")]
-pub(crate) const ASSET_EXPORT_NAMES: [&str; 8] = [
+pub(crate) const ASSET_EXPORT_NAMES: [&str; 10] = [
     "pill_render_data_load_mesh_obj",
     "pill_render_data_load_texture_png",
     "pill_render_data_load_shader",
     "pill_render_data_create_material",
     "pill_render_data_import_texture",
     "pill_render_data_import_mesh",
+    "pill_render_data_import_material",
+    "pill_render_data_set_skybox",
     "pill_render_data_clear_render_pipeline",
     "pill_audio_import_sound",
 ];
@@ -170,6 +172,10 @@ type ImportAsset =
 
 /// A module's pipeline clear: world only.
 type ClearRenderPipeline = unsafe extern "C" fn(*mut World) -> u8;
+/// The data crate's standalone material import: world, path, handle outputs.
+type ImportMaterial = unsafe extern "C" fn(*mut World, *const u8, u32, *mut u32, *mut u32) -> u8;
+/// The data crate's skybox setter: world, the material handle halves.
+type SetSkybox = unsafe extern "C" fn(*mut World, u32, u32) -> u8;
 
 /// The data crate's function named `name`, as the function pointer type `F`.
 ///
@@ -511,5 +517,43 @@ pub(super) extern "C" fn ffi_asset_clear_render_pipeline() -> u8 {
             "pill_render_data_clear_render_pipeline",
             |function, world| function(world),
         )
+    }
+}
+
+/// Imports a standalone material file into the active invocation's
+/// `AssetManager`.
+///
+/// # Safety
+///
+/// `path` must reference its declared length in readable memory (unless zero),
+/// and `out_index`/`out_generation` must be writable.
+pub(super) extern "C" fn ffi_asset_import_material(
+    path: *const u8,
+    path_length: u32,
+    out_index: *mut u32,
+    out_generation: *mut u32,
+) -> u8 {
+    // SAFETY: `ImportMaterial` is the export's signature, and every argument
+    // comes from this function's own contract unchanged.
+    unsafe {
+        forward::<ImportMaterial>("pill_render_data_import_material", |function, world| {
+            function(world, path, path_length, out_index, out_generation)
+        })
+    }
+}
+
+/// Draws a material as the sky behind the PBR chain, or turns the sky off when
+/// both handle halves are `u32::MAX`.
+///
+/// # Safety
+///
+/// No pointer crosses here; the world comes from the active invocation.
+pub(super) extern "C" fn ffi_asset_set_skybox(index: u32, generation: u32) -> u8 {
+    // SAFETY: `SetSkybox` is the export's signature, and both arguments come
+    // from this function's own contract unchanged.
+    unsafe {
+        forward::<SetSkybox>("pill_render_data_set_skybox", |function, world| {
+            function(world, index, generation)
+        })
     }
 }

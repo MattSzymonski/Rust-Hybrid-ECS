@@ -156,6 +156,45 @@ public unsafe struct EngineApi
     /// earlier slot.
     /// </summary>
     public delegate* unmanaged[Cdecl]<byte> AssetClearRenderPipeline;
+
+    /// <summary>
+    /// Import a standalone material file. Takes the path bytes and writes the
+    /// handle through the two outputs; returns the shared asset status byte.
+    /// Appended at the end like every earlier slot.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, uint*, uint*, byte> AssetImportMaterial;
+
+    /// <summary>
+    /// Draw a material as the sky behind the PBR chain, or turn the sky off
+    /// when both handle halves are <c>uint.MaxValue</c>. Appended at the end.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<uint, uint, byte> AssetSetSkybox;
+
+    /// <summary>
+    /// Whether a key, by its <see cref="KeyCode"/> value, is held this frame.
+    /// Returns `1` while held and `0` otherwise. Appended at the end.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte, byte> InputKeyHeld;
+
+    /// <summary>
+    /// Whether a mouse button, by its <see cref="MouseButton"/> value, is held
+    /// this frame; shaped like <see cref="InputKeyHeld"/>.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte, byte> InputMouseButtonHeld;
+
+    /// <summary>
+    /// Write the mouse motion since the previous frame, in physical pixels, to
+    /// the two outputs; returns `1` when written. Appended at the end.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<float*, float*, byte> InputMouseDelta;
+
+    /// <summary>
+    /// The frame's clamped delta in seconds; `0` with no clock.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<float> TimeDeltaSeconds;
+
+    /// <summary>Seconds since the engine started; `0` with no clock.</summary>
+    public delegate* unmanaged[Cdecl]<float> TimeElapsedSeconds;
 }
 
 /// <summary>

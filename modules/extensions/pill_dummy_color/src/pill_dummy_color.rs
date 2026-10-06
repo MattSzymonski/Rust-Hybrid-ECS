@@ -5,10 +5,11 @@
 //! - Defines the [`Tint`] struct with two dummy color-blending methods.
 //! - Exposes the [`grayscale`] free function and the hot-patchable
 //!   [`get_color_a`].
-//! - Declares [`Tint`] for the managed mirror and mirrors [`get_color_a`] to
-//!   C# as `pill_dummy_color.PillDummyColor.GetColorA()` - the module's own
-//!   C#-callable surface, proving the free-function and standalone-value-type
-//!   codegen paths.
+//! - Declares [`Tint`] and [`TestStruct`] for the managed mirror, mirrors
+//!   [`get_color_a`] to C# as `pill_dummy_color.PillDummyColor.GetColorA()`,
+//!   and mirrors `TestStruct::aaa` through a qualified `pill_mirror_method`
+//!   marker - the module's own C#-callable surface, proving the free-function,
+//!   standalone-value-type and mirrored-method codegen paths.
 //! - Registers through the extension ABI when the host loads it.
 //!
 //! # Design
@@ -31,6 +32,29 @@ include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 // =============================================================================
 // Struct
 // =============================================================================
+
+/// A plain value type with a mirrored method.
+///
+/// [`PillMirror`] puts it in the managed mirror even though no component
+/// exposes it, and the impl block below adds `aaa` to the module's mirrored
+/// method table - the third codegen path beside the free function and the
+/// method-less value type. The method marker is spelled with its full path
+/// on purpose: a qualified `pill_engine::pill_mirror_method` must register
+/// exactly like the bare one.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PillMirror)]
+pub struct TestStruct {
+    pub value: i32,
+}
+
+#[pill_mirror_impl]
+impl TestStruct {
+    /// A mirrored method on a mirrored value type.
+    #[pill_engine::pill_mirror_method]
+    pub fn aaa(&self) -> u64 {
+        self.value as u64
+    }
+}
 
 /// Dummy RGB color used for blending demos.
 ///

@@ -31,6 +31,7 @@ use crate::asset::{AssetLoadError, AssetManager};
 use crate::asset_metadata::{
     AssetImport, AssetImportError, ImportedAsset, MetadataPolicy, MetadataSource,
 };
+use crate::asset_standalone::StandaloneAsset;
 use crate::world::World;
 
 /// Status codes an import export returns. `0` is success; `1` to `7` are the
@@ -152,6 +153,69 @@ pub unsafe fn import_for_ffi<T: ImportedAsset>(
         return import_status::ASSET_MANAGER_MISSING;
     };
     match assets.import(request) {
+        Ok(outcome) => {
+            let guid = outcome.guid.value();
+            // SAFETY: checked non-null above; the caller's contract makes it
+            // writable.
+            unsafe {
+                *output = NativeImportedAsset {
+                    index: outcome.handle.index(),
+                    generation: outcome.handle.generation(),
+                    guid_low: guid as u64,
+                    guid_high: (guid >> 64) as u64,
+                    already_loaded: u8::from(outcome.already_loaded),
+                    metadata_source: match outcome.metadata {
+                        MetadataSource::ReadFromFile => 0,
+                        MetadataSource::CreatedOnDisk => 1,
+                        MetadataSource::InMemoryOnly => 2,
+                    },
+                };
+            }
+            import_status::OK
+        }
+        Err(error) => {
+            pill_core::warn!("import of `{}` failed: {error}", Path::new(&path).display());
+            status_of(&error)
+        }
+    }
+}
+
+/// Import the standalone asset at `path` as a `T`, from raw C arguments, and
+/// write the result to `output`.
+///
+/// Standalone assets have no metadata file - the file *is* the asset, its guid
+/// in its own header - so there is no policy and no initial settings to pass.
+/// The output is the same [`NativeImportedAsset`] shape [`import_for_ffi`]
+/// writes, and the status codes are the same [`import_status`] ones.
+///
+/// # Safety
+///
+/// `world` must be null or point at a live `World` no one else uses for the
+/// call's duration. `path` must reference its declared length in readable
+/// memory (unless the length is zero), and `output` must be null or writable.
+pub unsafe fn import_standalone_for_ffi<T: StandaloneAsset>(
+    world: *mut World,
+    path: *const u8,
+    path_length: u32,
+    output: *mut NativeImportedAsset,
+) -> u8 {
+    if output.is_null() {
+        return import_status::NULL_OUTPUT;
+    }
+    // SAFETY: forwarded from this function's contract.
+    let path = match unsafe { read_utf8(path, path_length) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+
+    // SAFETY: the caller's contract: null, or a live world used exclusively.
+    let Some(world) = (unsafe { world.as_mut() }) else {
+        return import_status::NO_ACTIVE_SCOPE;
+    };
+    let Some(assets) = world.get_resource_mut::<AssetManager>() else {
+        return import_status::ASSET_MANAGER_MISSING;
+    };
+    match assets.import_standalone::<T>(Path::new(&path)) {
         Ok(outcome) => {
             let guid = outcome.guid.value();
             // SAFETY: checked non-null above; the caller's contract makes it

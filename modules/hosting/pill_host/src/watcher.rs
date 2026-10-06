@@ -7,6 +7,8 @@
 //! - Classify file events and paths so only real source edits trigger reloads.
 //! - Bump a reload generation counter when relevant file events are
 //!   detected, letting the main thread perform a hot reload.
+//! - Record when each signal fired, so the frame loop can time the reload it
+//!   starts from the save that caused it.
 //! - Report which files changed so reloads are debuggable.
 //! - Handle cross-platform file notification differences through `notify`.
 //!
@@ -24,13 +26,14 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 // External crates
 use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
+use pill_core::platform::Instant;
 use pill_core::{error, info};
 
 // =============================================================================
@@ -76,6 +79,12 @@ const HIDDEN_FILE_PREFIX: &str = ".";
 
 /// Maximum number of changed paths printed per reload report.
 const REPORTED_PATH_LIMIT: usize = 5;
+
+/// How many recent triggers [`TriggerLog`] keeps for the frame loop.
+///
+/// The loop consumes the generation it acts on, so the bound only has to
+/// cover signals that were superseded before they were ever read.
+const TRIGGER_LOG_CAPACITY: usize = 16;
 
 // =============================================================================
 // Free Functions
@@ -189,6 +198,69 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 }
 
+/// One debounce window's outcome: when its signal fired and how long the save
+/// had already sat before it did.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourceTrigger {
+    /// The generation this trigger published, which is the value the frame
+    /// loop compares its own counter against.
+    pub(crate) generation: u64,
+    /// Monotonic instant the signal was published.
+    pub(crate) fired_at: Instant,
+    /// Milliseconds from the newest edited file's modification time to the
+    /// signal, debounce included; `NaN` when no timestamp could be read.
+    pub(crate) detection_delay_ms: f64,
+}
+
+/// The project watcher's most recent triggers.
+///
+/// Lets the frame loop measure a reload from the save that caused it: the
+/// signal's instant bounds the pipeline, and the modification-time delay the
+/// watcher already reports bounds the wait before the signal even fired.
+/// Only the project watcher publishes here; the module and renderer watchers
+/// pass `None`, because nothing times a reload from their signals.
+pub(crate) struct TriggerLog {
+    /// Newest last. Guarded because the watcher thread writes while the frame
+    /// thread reads.
+    entries: Mutex<Vec<SourceTrigger>>,
+}
+
+impl TriggerLog {
+    /// An empty log.
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record one fired trigger, evicting the oldest past the bound.
+    fn record(&self, trigger: SourceTrigger) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.len() >= TRIGGER_LOG_CAPACITY {
+            entries.remove(0);
+        }
+        entries.push(trigger);
+    }
+
+    /// Take the trigger that published `generation`, if it is still logged.
+    ///
+    /// Taken rather than read, so one signal is attributed to exactly one
+    /// reload - the reload that consumed its generation.
+    pub(crate) fn take(&self, generation: u64) -> Option<SourceTrigger> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = entries
+            .iter()
+            .position(|entry| entry.generation == generation)?;
+        Some(entries.remove(index))
+    }
+}
+
 /// Watch the configured source tree and signal reloads from a worker thread.
 ///
 /// # Errors
@@ -200,6 +272,7 @@ pub(crate) fn spawn_source_watcher(
     module_name: &str,
     watch_directory: &str,
     reload_generation: Arc<AtomicU64>,
+    triggers: Option<Arc<TriggerLog>>,
 ) -> Result<(), WatcherError> {
     // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
@@ -330,7 +403,17 @@ pub(crate) fn spawn_source_watcher(
             // the last processed value, so signals are never overwritten.
             // Release publishing makes every earlier write on this thread
             // visible to the Acquire read on the frame loop.
-            reload_generation.fetch_add(1, Ordering::Release);
+            let generation = reload_generation.fetch_add(1, Ordering::Release) + 1;
+            // Publish the signal's instant beside the counter, so the frame
+            // loop can attribute the reload it starts to this save rather
+            // than to the frame it noticed it on.
+            if let Some(triggers) = triggers.as_ref() {
+                triggers.record(SourceTrigger {
+                    generation,
+                    fired_at: Instant::now(),
+                    detection_delay_ms,
+                });
+            }
         }
     });
 
@@ -454,6 +537,38 @@ mod tests {
         assert!(is_relevant_path(&inside_file, &watch_root));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Verifies that the trigger log hands each generation back exactly once
+    /// and stays bounded when a caller never reads it.
+    #[test]
+    fn trigger_log_takes_each_generation_once_and_stays_bounded() {
+        let log = TriggerLog::new();
+        log.record(SourceTrigger {
+            generation: 1,
+            fired_at: Instant::now(),
+            detection_delay_ms: 5.0,
+        });
+        let taken = log.take(1).expect("the recorded trigger is handed back");
+        assert_eq!(taken.generation, 1);
+        assert_eq!(taken.detection_delay_ms, 5.0);
+        assert!(
+            log.take(1).is_none(),
+            "a taken generation cannot be taken twice"
+        );
+
+        for generation in 2..=(TRIGGER_LOG_CAPACITY as u64 + 4) {
+            log.record(SourceTrigger {
+                generation,
+                fired_at: Instant::now(),
+                detection_delay_ms: f64::NAN,
+            });
+        }
+        assert!(
+            log.take(2).is_none(),
+            "entries beyond the bound are evicted oldest first"
+        );
+        assert!(log.take(TRIGGER_LOG_CAPACITY as u64 + 4).is_some());
     }
 
     /// Verifies that non-UTF-8 file names stay relevant instead of being

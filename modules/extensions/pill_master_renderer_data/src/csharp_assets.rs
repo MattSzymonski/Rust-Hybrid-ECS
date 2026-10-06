@@ -33,11 +33,12 @@
 //! exclusively for the call.
 
 // External crates
-use pill_engine::asset_ffi::{import_for_ffi, NativeImportedAsset};
+use pill_engine::asset_ffi::{import_for_ffi, import_standalone_for_ffi, NativeImportedAsset};
 use pill_engine::component_registry::{ExportAddress, PillExportDescriptor};
 use pill_engine::{AssetLoader, AssetManager, Handle, World};
 
 // Current crate
+use crate::config::pbr_pipeline;
 use crate::{
     Material, Mesh, RenderingManager, Shader, ShaderParameterSlot, ShaderParameterType,
     ShaderTextureSlot, Texture, TextureType,
@@ -127,6 +128,9 @@ pub const STATUS_NAME_IN_USE: u8 = 7;
 /// codes (`8`-`13`, `pill_engine::asset_ffi::import_status`) so every code
 /// the managed side's table maps stays distinct.
 pub const STATUS_RENDER_MANAGER_MISSING: u8 = 14;
+/// The skybox could not be set: the handle names no live material, or the PBR
+/// chain refuses to install.
+pub const STATUS_SKYBOX_FAILED: u8 = 15;
 
 // =============================================================================
 // Argument readers
@@ -616,6 +620,89 @@ pub unsafe extern "C" fn pill_render_data_import_mesh(
     }
 }
 
+/// Imports the standalone material file at `path` (relative to `res`) and
+/// writes its handle to `out_index`/`out_generation`.
+///
+/// A material file is the asset: no `.meta` file is involved, and the guid in
+/// its header is what the loaded material is keyed by. Its shader and maps are
+/// resolved by guid from the shaders and textures already loaded, so those
+/// load first; see
+/// [`import_standalone_for_ffi`](pill_engine::asset_ffi::import_standalone_for_ffi)
+/// for the status codes.
+///
+/// # Safety
+///
+/// The contract of
+/// [`import_standalone_for_ffi`](pill_engine::asset_ffi::import_standalone_for_ffi),
+/// applied to `out_index`/`out_generation` as well.
+#[no_mangle]
+pub unsafe extern "C" fn pill_render_data_import_material(
+    world: *mut World,
+    path: *const u8,
+    path_length: u32,
+    out_index: *mut u32,
+    out_generation: *mut u32,
+) -> u8 {
+    if out_index.is_null() || out_generation.is_null() {
+        return STATUS_NULL_OUTPUT;
+    }
+    let mut imported = NativeImportedAsset::default();
+    // SAFETY: forwarded from this function's contract.
+    let status =
+        unsafe { import_standalone_for_ffi::<Material>(world, path, path_length, &mut imported) };
+    if status == STATUS_OK {
+        // SAFETY: checked non-null above, and the caller's contract makes both
+        // outputs writable; the import wrote a live handle.
+        unsafe {
+            *out_index = imported.index;
+            *out_generation = imported.generation;
+        }
+    }
+    status
+}
+
+/// Draws `index`/`generation`'s material as the sky behind the PBR chain's lit
+/// surface; [`NO_HANDLE`] (the two `u32::MAX` halves) turns the sky off.
+///
+/// Imports nothing: the material must already be loaded when this arrives.
+///
+/// Returns a status code (see the `STATUS_*` constants).
+///
+/// # Safety
+///
+/// `world` must be null or point at a live `World` no one else is using for
+/// the call's duration.
+#[no_mangle]
+pub unsafe extern "C" fn pill_render_data_set_skybox(
+    world: *mut World,
+    index: u32,
+    generation: u32,
+) -> u8 {
+    // SAFETY: the caller's contract: null, or a live world used exclusively.
+    let Some(world) = (unsafe { world.as_mut() }) else {
+        return STATUS_NO_ACTIVE_SCOPE;
+    };
+    let Some(assets) = world.get_resource_mut::<AssetManager>() else {
+        return STATUS_ASSET_MANAGER_MISSING;
+    };
+    let material = if index == NO_HANDLE && generation == NO_HANDLE {
+        None
+    } else {
+        let handle = Handle::<Material>::from_raw(index, generation);
+        if assets.get(handle).is_none() {
+            return STATUS_SKYBOX_FAILED;
+        }
+        Some(handle)
+    };
+    match pbr_pipeline::set_skybox(assets, material) {
+        Ok(_) => STATUS_OK,
+        Err(error) => {
+            pill_engine::tracing::warn!("setting the sky material failed: {error}");
+            STATUS_SKYBOX_FAILED
+        }
+    }
+}
+
 /// Drops the pipeline the world's `RenderingManager` holds, returning the
 /// renderer to its built-in chain: a single geometry pass that draws every
 /// instance through its own material's shader.
@@ -685,5 +772,17 @@ pill_engine::submit! {
     PillExportDescriptor {
         name: "pill_render_data_clear_render_pipeline",
         address: ExportAddress(pill_render_data_clear_render_pipeline as *const ()),
+    }
+}
+pill_engine::submit! {
+    PillExportDescriptor {
+        name: "pill_render_data_import_material",
+        address: ExportAddress(pill_render_data_import_material as *const ()),
+    }
+}
+pill_engine::submit! {
+    PillExportDescriptor {
+        name: "pill_render_data_set_skybox",
+        address: ExportAddress(pill_render_data_set_skybox as *const ()),
     }
 }
