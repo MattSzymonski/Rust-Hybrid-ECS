@@ -21,7 +21,11 @@
 // Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "hot_patch")]
+use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "hot_patch")]
+use std::thread;
 
 // External crates
 use pill_core::error::{CSharpError, HostError};
@@ -48,6 +52,8 @@ use crate::analytics;
 use crate::config::project_depends_on_crate;
 use crate::csharp::ModuleExposedComponent;
 use crate::extension::{ExtensionSlot, ReloadOutcome};
+#[cfg(feature = "hot_patch")]
+use crate::hot_patch::{BeginOutcome, PatchOutcome};
 use crate::native_library::cleanup_temporary_files;
 use crate::project_module::LoadedProject;
 use crate::watcher::spawn_source_watcher;
@@ -126,6 +132,14 @@ pub struct DevHost {
     /// has not opted in costs nothing beyond one source scan at startup.
     #[cfg(feature = "hot_patch")]
     module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>>,
+    /// The patch build running on its own thread, when one is.
+    ///
+    /// Every reload step defers while this is `Some`: a reload rebuilds the
+    /// rlibs the build links against, and a second attempt would race the
+    /// first for the same pending edit. The compile no longer freezes the
+    /// frame loop, which is the reason it runs there at all.
+    #[cfg(feature = "hot_patch")]
+    patch_attempt: Option<InFlightPatch>,
     /// Every patch library loaded in this process, newest last.
     ///
     /// Process-wide rather than per-session on purpose: a patch links its own
@@ -1329,6 +1343,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         #[cfg(feature = "hot_patch")]
         module_hot_patch,
         #[cfg(feature = "hot_patch")]
+        patch_attempt: None,
+        #[cfg(feature = "hot_patch")]
         loaded_patches: Vec::new(),
         asset_watcher: start_asset_watcher(host_config.asset_directory.as_deref()),
         asset_directory: host_config.asset_directory.clone(),
@@ -1628,6 +1644,214 @@ fn arm_patching_thread() {
 #[cfg(not(feature = "hot_patch"))]
 fn arm_patching_thread() {}
 
+/// Which session an in-flight patch build belongs to.
+#[cfg(feature = "hot_patch")]
+#[derive(Clone, Copy)]
+enum PatchSubject {
+    /// The project's own session.
+    Project,
+    /// The extension at this index.
+    Module(usize),
+}
+
+/// One patch build running on its own thread.
+///
+/// The build compiles and maps the patch; installing it stays on the frame
+/// thread, which is what [`advance_patch_attempt`] does when the report
+/// arrives. The thread is joined on collection, on teardown, and nowhere
+/// else - a build that outlived its host would be a thread parked in code
+/// that is about to be unloaded.
+#[cfg(feature = "hot_patch")]
+struct InFlightPatch {
+    /// Which session the build is for, and who consumes its pending
+    /// generation once the patch is live.
+    subject: PatchSubject,
+    /// The generation counter captured when the build started. A save that
+    /// lands while it compiles advances the counter past this value and must
+    /// stay pending.
+    pending: u64,
+    /// The build's report, once it has one.
+    receiver: mpsc::Receiver<(
+        crate::hot_patch::PatchAttempt,
+        Vec<crate::hot_patch::BodyOutcome>,
+    )>,
+    /// The worker, joined when the report is collected or this value drops.
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "hot_patch")]
+impl Drop for InFlightPatch {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Start a patch build on its own thread.
+///
+/// The attempt travels through its own channel rather than the closure's
+/// capture, so a thread that cannot start leaves it here to build inline
+/// instead of losing it with the closure.
+#[cfg(feature = "hot_patch")]
+fn start_patch_build(
+    attempt: crate::hot_patch::PatchAttempt,
+    subject: PatchSubject,
+    pending: u64,
+) -> InFlightPatch {
+    let (report_sender, receiver) = mpsc::channel();
+    let fallback_sender = report_sender.clone();
+    let (job_sender, job_receiver) = mpsc::channel::<crate::hot_patch::PatchAttempt>();
+    let thread = thread::Builder::new()
+        .name("pill-patch-build".to_string())
+        .spawn(move || {
+            let Ok(attempt) = job_receiver.recv() else {
+                return;
+            };
+            let report = crate::hot_patch::build_attempt(attempt);
+            // A receiver that has gone away means the host is shutting down;
+            // the report's job is then nobody's.
+            let _ = report_sender.send(report);
+        });
+    match thread {
+        Ok(thread) => {
+            // Sent after the thread exists; it blocks on this receive.
+            let _ = job_sender.send(attempt);
+            InFlightPatch {
+                subject,
+                pending,
+                receiver,
+                thread: Some(thread),
+            }
+        }
+        Err(_) => {
+            // Building on this thread blocks the frame the way the old
+            // pipeline did, which is the safe direction for a spawn failure.
+            let report = crate::hot_patch::build_attempt(attempt);
+            let _ = fallback_sender.send(report);
+            InFlightPatch {
+                subject,
+                pending,
+                receiver,
+                thread: None,
+            }
+        }
+    }
+}
+
+/// Collect a finished patch build and install it at this frame boundary.
+///
+/// Activation happens here rather than on the worker because a dispatch slot
+/// write belongs to the thread that owns the frame boundary; the worker only
+/// compiled and mapped the image. While the build is still running nothing is
+/// consumed - the pending generation stays pending, so the reload the frame
+/// loop would otherwise perform still owes it.
+///
+/// Returns `true` when this frame must not start another attempt: a build
+/// that came back without installing its patch leaves the edit for the reload
+/// path below, exactly the order the in-line pipeline had. Without that, a
+/// patch that cannot compile is retried forever and the reload that would
+/// deliver the edit never runs. A collected success returns `false`, because a
+/// save that arrived while the build ran is a fresh edit the fast path may
+/// handle immediately.
+#[cfg(feature = "hot_patch")]
+fn advance_patch_attempt(host: &mut DevHost) -> bool {
+    let Some(mut in_flight) = host.patch_attempt.take() else {
+        return false;
+    };
+    let (attempt, outcomes) = match in_flight.receiver.try_recv() {
+        Ok(report) => report,
+        Err(mpsc::TryRecvError::Empty) => {
+            // Still compiling; put the state back and let the frame run.
+            host.patch_attempt = Some(in_flight);
+            return false;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => {
+            // The worker died without a report. Nothing is consumed, so the
+            // frame loop falls back to the reload path - the same place a
+            // refusal would have led - and it must not be raced by a fresh
+            // attempt this frame.
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                "the patch build stopped unexpectedly; falling back to a reload"
+            );
+            return true;
+        }
+    };
+    if let Some(thread) = in_flight.thread.take() {
+        let _ = thread.join();
+    }
+
+    let patched;
+    {
+        let DevHost {
+            hot_patch,
+            module_hot_patch,
+            extensions,
+            loaded_patches,
+            loaded_project,
+            runtime,
+            ..
+        } = &mut *host;
+        let engine = runtime.engine_mut();
+        let session = match in_flight.subject {
+            PatchSubject::Project => hot_patch.as_mut(),
+            PatchSubject::Module(index) => module_hot_patch
+                .get_mut(index)
+                .and_then(|slot| slot.as_mut()),
+        };
+        let Some(session) = session else {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                "the patch build's session is gone; falling back to a reload"
+            );
+            return true;
+        };
+        let targets = patch_targets(loaded_project, extensions);
+        let outcome = session.activate_attempt(engine, &targets, loaded_patches, attempt, outcomes);
+        // The borrow of the module list ends here, so the slot below can be
+        // updated.
+        drop(targets);
+        patched = report_patch_outcome(outcome);
+        if patched {
+            // The generation this build was started for is handled now; a
+            // save that arrived while it compiled bumped the counter past it
+            // and stays pending.
+            if let PatchSubject::Module(index) = in_flight.subject {
+                if let Some(slot) = extensions.get_mut(index) {
+                    slot.consume_pending_reload(in_flight.pending);
+                }
+            }
+        }
+    }
+    if patched {
+        if matches!(in_flight.subject, PatchSubject::Project) {
+            host.last_processed_source_edit = in_flight.pending;
+        }
+        // A patch replaced live code; the editor must refresh its metadata.
+        host.bump_editor_revision();
+    }
+    !patched
+}
+
+/// See the `hot_patch` version above; without the feature nothing is built.
+#[cfg(not(feature = "hot_patch"))]
+fn advance_patch_attempt(_host: &mut DevHost) -> bool {
+    false
+}
+
+/// Whether a patch build is running on its own thread right now.
+#[cfg(feature = "hot_patch")]
+fn patch_attempt_in_flight(host: &DevHost) -> bool {
+    host.patch_attempt.is_some()
+}
+
+/// See the `hot_patch` version above; without the feature there is none.
+#[cfg(not(feature = "hot_patch"))]
+fn patch_attempt_in_flight(_host: &DevHost) -> bool {
+    false
+}
+
 /// Try to deliver every pending extension edit by patching, not rebuilding.
 ///
 /// A module's plain functions are compiled into every artifact that links the
@@ -1642,49 +1866,65 @@ fn arm_patching_thread() {}
 /// A no-op without the `hot_patch` feature, so the frame loop reads the same in
 /// both configurations rather than carrying a `cfg` of its own.
 #[cfg(feature = "hot_patch")]
-fn try_module_fast_path(host: &mut DevHost) {
-    let mut any_patch_applied = false;
-    {
-        let DevHost {
-            extensions,
-            module_hot_patch,
-            loaded_patches,
-            loaded_project,
-            runtime,
-            ..
-        } = &mut *host;
-        let engine = runtime.engine_mut();
+fn try_module_fast_path(host: &mut DevHost, may_start: bool) {
+    // `may_start` is false for the frame that just collected a failed build:
+    // the reload below owes the edit, and a fresh attempt would race it
+    // forever.
+    if !may_start || host.patch_attempt.is_some() {
+        return;
+    }
+    // Disjoint field borrows, as the reload steps below do.
+    let DevHost {
+        extensions,
+        module_hot_patch,
+        patch_attempt,
+        ..
+    } = &mut *host;
 
-        for index in 0..module_hot_patch.len() {
-            // Captured before the patch runs: a save that lands while it
-            // compiles advances the counter past this value and must stay
-            // pending, because nothing has delivered it.
-            let Some(pending) = extensions[index].pending_reload_generation() else {
-                continue;
-            };
-            let Some(session) = module_hot_patch[index].as_mut() else {
-                continue;
-            };
-            let targets = patch_targets(loaded_project, extensions);
-            let outcome = session.try_patch(engine, &targets, loaded_patches);
-            // The borrow of the module list ends here, so the slot below can
-            // be updated.
-            drop(targets);
-            if report_patch_outcome(outcome) {
-                extensions[index].consume_pending_reload(pending);
-                any_patch_applied = true;
+    for index in 0..module_hot_patch.len() {
+        // Captured before the attempt begins: a save that lands while it
+        // compiles advances the counter past this value and must stay
+        // pending, because nothing has delivered it.
+        let Some(pending) = extensions[index].pending_reload_generation() else {
+            continue;
+        };
+        let Some(session) = module_hot_patch[index].as_mut() else {
+            continue;
+        };
+        match session.begin_attempt() {
+            BeginOutcome::Unchanged => {}
+            BeginOutcome::NotPatchable { refusal } => {
+                report_patch_outcome(PatchOutcome::NotPatchable { refusal });
+            }
+            BeginOutcome::Failed {
+                function,
+                active_generation,
+                failure,
+            } => {
+                report_patch_outcome(PatchOutcome::Failed {
+                    function,
+                    active_generation,
+                    failure,
+                });
+            }
+            BeginOutcome::Ready(attempt) => {
+                // The build runs on its own thread; the pending generation is
+                // consumed only once its replacement is installed, and every
+                // reload step waits for that outcome.
+                *patch_attempt = Some(start_patch_build(
+                    attempt,
+                    PatchSubject::Module(index),
+                    pending,
+                ));
+                break;
             }
         }
-    }
-    if any_patch_applied {
-        // A patch replaced live code; the editor must refresh its metadata.
-        host.bump_editor_revision();
     }
 }
 
 /// See the `hot_patch` version above; without the feature there is no fast path.
 #[cfg(not(feature = "hot_patch"))]
-fn try_module_fast_path(_host: &mut DevHost) {}
+fn try_module_fast_path(_host: &mut DevHost, _may_start: bool) {}
 
 /// Try to deliver a pending project edit by patching, not rebuilding.
 ///
@@ -1693,7 +1933,12 @@ fn try_module_fast_path(_host: &mut DevHost) {}
 /// A successful patch consumes the pending generation, which is what skips the
 /// full rebuild; anything refused falls through to it.
 #[cfg(feature = "hot_patch")]
-fn try_project_fast_path(host: &mut DevHost) {
+fn try_project_fast_path(host: &mut DevHost, may_start: bool) {
+    // As in the module path: a frame that just collected a failed build lets
+    // the reload below deliver the edit instead of racing it.
+    if !may_start || host.patch_attempt.is_some() {
+        return;
+    }
     let pending = host.source_edit_generation.load(Ordering::Acquire);
     if pending == host.last_processed_source_edit {
         return;
@@ -1702,35 +1947,39 @@ fn try_project_fast_path(host: &mut DevHost) {
     // Disjoint field borrows, as the module path does.
     let DevHost {
         hot_patch,
-        extensions,
-        loaded_patches,
-        loaded_project,
-        runtime,
+        patch_attempt,
         ..
     } = &mut *host;
-    let engine = runtime.engine_mut();
-    let mut patched = false;
-    if let Some(session) = hot_patch {
-        let targets = patch_targets(loaded_project, extensions);
-        let outcome = session.try_patch(engine, &targets, loaded_patches);
-        drop(targets);
-        patched = report_patch_outcome(outcome);
-    }
-    if patched {
-        // The edit is fully accounted for; skip the rebuild. Recorded as the
-        // generation observed above rather than a fresh read: a save that
-        // arrived while the patch compiled is a different edit that nothing has
-        // delivered, and must stay pending. Only the source-edit counter is
-        // consumed here; a queued reload is not an edit any patch could have
-        // delivered, so it stays owed.
-        host.last_processed_source_edit = pending;
-        host.bump_editor_revision();
+    let Some(session) = hot_patch else {
+        return;
+    };
+    match session.begin_attempt() {
+        BeginOutcome::Unchanged => {}
+        BeginOutcome::NotPatchable { refusal } => {
+            report_patch_outcome(PatchOutcome::NotPatchable { refusal });
+        }
+        BeginOutcome::Failed {
+            function,
+            active_generation,
+            failure,
+        } => {
+            report_patch_outcome(PatchOutcome::Failed {
+                function,
+                active_generation,
+                failure,
+            });
+        }
+        BeginOutcome::Ready(attempt) => {
+            // The edit is consumed only once the replacement is installed;
+            // that is what lets a save landing mid-build stay pending.
+            *patch_attempt = Some(start_patch_build(attempt, PatchSubject::Project, pending));
+        }
     }
 }
 
 /// See the `hot_patch` version above; without the feature there is no fast path.
 #[cfg(not(feature = "hot_patch"))]
-fn try_project_fast_path(_host: &mut DevHost) {}
+fn try_project_fast_path(_host: &mut DevHost, _may_start: bool) {}
 
 /// Re-sync the patch baselines of every subject a reload has just rebuilt.
 ///
@@ -1812,6 +2061,11 @@ fn regenerate_module_csharp_mirror(
 /// Run every reload step of one frame: module reloads, the per-function fast
 /// paths, a pending project reload, and the analytics drain that reports them.
 ///
+/// Runs in two parts around a background patch build: with nothing in flight
+/// it prepares one and starts it, and while one is running every step here is
+/// deferred - the frame keeps rendering and the build is collected and
+/// activated at the first boundary after it finishes.
+///
 /// Separated from [`run_one_frame`] so the reload work reads as one sequence,
 /// apart from the frame the runtime runs after it.
 fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
@@ -1828,6 +2082,18 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // one allowed to rewrite live code.
     arm_patching_thread();
 
+    // Collect a background patch build that has finished. While one is still
+    // running, every step below defers: a reload rebuilds the rlibs the build
+    // links against, and a second attempt would race this one for the same
+    // pending edit. Rendering and systems continue; the build is collected on
+    // a later frame. A build that came back without installing its patch also
+    // blocks new attempts for this frame, so the reload below gets to deliver
+    // the edit - the order the in-line pipeline had.
+    let failed_attempt = advance_patch_attempt(host);
+    if patch_attempt_in_flight(host) {
+        return Vec::new();
+    }
+
     // Step 2: Honour a rollback request, at the same frame boundary the
     // patch installs use - the prologue route rewrites live code, so this is a
     // requirement rather than a convenience.
@@ -1835,7 +2101,11 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
 
     // Step 3: Try the per-function fast path for the extensions, before
     // the reload below turns a pending change into a full module rebuild.
-    try_module_fast_path(host);
+    try_module_fast_path(host, !failed_attempt);
+    if patch_attempt_in_flight(host) {
+        // A build was started; the pending edit waits for its outcome.
+        return Vec::new();
+    }
 
     // Destructure so the module list, the engine and the API table are borrowed
     // as disjoint fields rather than through the whole host.
@@ -1981,7 +2251,11 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
 
     // Step 4: Try the per-function fast path for the project, before the
     // reload below turns a pending change into a full rebuild.
-    try_project_fast_path(host);
+    try_project_fast_path(host, !failed_attempt);
+    if patch_attempt_in_flight(host) {
+        // A build was started; the pending edit waits for its outcome.
+        return Vec::new();
+    }
 
     // Step 5: Process a pending project reload before running systems.
     // Two counters feed this, one meaning each. The watcher's source-edit
