@@ -50,12 +50,12 @@ use pill_runtime::{FrameDriver, FrameReport, Runtime};
 // Current crate
 use crate::analytics;
 use crate::config::project_depends_on_crate;
-use crate::csharp::ModuleExposedComponent;
+use crate::csharp::{BuildCollection, BuildOutcome, BuildReport, ModuleExposedComponent};
 use crate::extension::{ExtensionSlot, ReloadOutcome};
 #[cfg(feature = "hot_patch")]
 use crate::hot_patch::{BeginOutcome, PatchOutcome};
 use crate::native_library::cleanup_temporary_files;
-use crate::project_module::LoadedProject;
+use crate::project_module::{LoadedProject, ManagedReloadStart};
 use crate::watcher::spawn_source_watcher;
 use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
@@ -2082,6 +2082,109 @@ fn regenerate_module_csharp_mirror(
 /// Run every reload step of one frame: module reloads, the per-function fast
 /// paths, a pending project reload, and the analytics drain that reports them.
 ///
+/// Collect a finished C# assembly build and complete its reload at this frame
+/// boundary.
+///
+/// The build ran on its own thread with the frame free; everything that
+/// touches the boundary - telling the managed loader the assembly settled,
+/// polling it for the swap, and the bookkeeping a replaced image invalidates -
+/// happens here. A worker that stopped without a report falls back to
+/// building on the frame thread, the way every reload used to run.
+fn advance_managed_build(host: &mut DevHost) {
+    match host.loaded_project.collect_managed_build() {
+        BuildCollection::Pending => {}
+        BuildCollection::Finished(report) => finish_managed_build(host, report),
+        BuildCollection::Died => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                "the C# assembly build stopped unexpectedly; building on the frame thread instead"
+            );
+            let replaced = host.loaded_project.reload(
+                host.runtime.engine_mut(),
+                &host.engine_api,
+                &host.workspace_root,
+                &host.module_config,
+                None,
+            );
+            if replaced {
+                forget_prologue_records(host);
+            }
+            resync_patch_baselines(host, true, &[]);
+            host.bump_editor_revision();
+        }
+    }
+}
+
+/// Finish a managed reload whose assembly build reported.
+///
+/// Mirrors what the in-line reload did after its compile: report the compile,
+/// collapse the loader's debounce, poll for the swap, and run the bookkeeping
+/// a replaced image invalidates. A failed compile keeps the running assembly,
+/// abandons the armed timing, and still refreshes the editor revision - the
+/// in-line pipeline did the same.
+fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
+    let mut replaced = false;
+    match report.outcome {
+        BuildOutcome::Compiled { milliseconds } => {
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                module = host.module_config.name.as_str(),
+                compile_ms = format!("{milliseconds:.1}").as_str(),
+                "C# compiled in-process"
+            );
+            host.loaded_project
+                .record_assembly_rebuilt_at(report.finished_at, "roslyn");
+            host.loaded_project.notify_assembly_replaced();
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                "C# build complete; polling managed loader"
+            );
+            replaced = host
+                .loaded_project
+                .poll_managed_reload(host.runtime.engine_mut());
+        }
+        BuildOutcome::Failed { diagnostics } => {
+            // Errors in the developer's own source; a full build would spend
+            // seconds reaching the same diagnostics.
+            error!(
+                target: telemetry_target::HOT_RELOAD,
+                "{}",
+                pill_core::telemetry::log_block(
+                    "C# compilation failed; keeping the currently loaded C# project assembly",
+                    diagnostics.lines()
+                )
+            );
+            host.loaded_project.abandon_managed_reload_timing();
+        }
+        BuildOutcome::Full(Ok(())) => {
+            host.loaded_project
+                .record_assembly_rebuilt_at(report.finished_at, "msbuild");
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                "C# build complete; polling managed loader"
+            );
+            replaced = host
+                .loaded_project
+                .poll_managed_reload(host.runtime.engine_mut());
+        }
+        BuildOutcome::Full(Err(message)) => {
+            error!(
+                target: telemetry_target::HOT_RELOAD,
+                error = message.as_str(),
+                "C# build failed; keeping the currently loaded C# project assembly"
+            );
+            host.loaded_project.abandon_managed_reload_timing();
+        }
+    }
+    if replaced {
+        forget_prologue_records(host);
+    }
+    // The project now runs the sources on disk, so the patch classifier's
+    // baseline has to say so too, and the editor must refresh its metadata.
+    resync_patch_baselines(host, true, &[]);
+    host.bump_editor_revision();
+}
+
 /// Runs in two parts around a background patch build: with nothing in flight
 /// it prepares one and starts it, and while one is running every step here is
 /// deferred - the frame keeps rendering and the build is collected and
@@ -2123,6 +2226,16 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         }
     }
     if patch_attempt_in_flight(host) {
+        return Vec::new();
+    }
+
+    // Collect a background C# assembly build that has finished, and defer
+    // every step below while one is running: the compile reads the generated
+    // mirror files a module reload rewrites, so nothing else may reload under
+    // it. Rendering and systems continue; the build is collected on a later
+    // frame.
+    advance_managed_build(host);
+    if host.loaded_project.managed_build_in_flight() {
         return Vec::new();
     }
 
@@ -2317,25 +2430,38 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         host.loaded_project
             .arm_managed_reload_timing(host.source_triggers.take(source_edits));
 
-        // The project image about to be replaced unmaps two generations later,
-        // so every recorded prologue address inside it goes stale the moment
-        // the swap commits - the same clear a module reload performs, gated
-        // the same way.
-        let replaced = host.loaded_project.reload(
-            host.runtime.engine_mut(),
-            &host.engine_api,
+        // A managed project builds its assembly on a worker thread, so the
+        // frame keeps rendering while Roslyn runs; the build is collected at a
+        // later boundary, which is where its poll and bookkeeping happen. A
+        // native project - or a worker thread that could not start - reloads
+        // right here, the way every reload used to run.
+        let start = host.loaded_project.start_managed_reload(
             &host.workspace_root,
             &host.module_config,
-            // A save during the build advances the generation beyond this
-            // baseline, which cancels the in-flight compilation; the next
-            // frame observes the newer generation and rebuilds.
-            Some((&host.source_edit_generation, source_edits)),
+            Some((Arc::clone(&host.source_edit_generation), source_edits)),
         );
-        // A failed or refused reload keeps the current image, whose patches
-        // are still installed and whose recorded prologues are still their
-        // rollback route, so the records are dropped only on a real swap.
-        if replaced {
-            forget_prologue_records(host);
+        let building_on_worker = matches!(start, ManagedReloadStart::Building);
+        if !building_on_worker {
+            // The project image about to be replaced unmaps two generations later,
+            // so every recorded prologue address inside it goes stale the moment
+            // the swap commits - the same clear a module reload performs, gated
+            // the same way.
+            let replaced = host.loaded_project.reload(
+                host.runtime.engine_mut(),
+                &host.engine_api,
+                &host.workspace_root,
+                &host.module_config,
+                // A save during the build advances the generation beyond this
+                // baseline, which cancels the in-flight compilation; the next
+                // frame observes the newer generation and rebuilds.
+                Some((&host.source_edit_generation, source_edits)),
+            );
+            // A failed or refused reload keeps the current image, whose patches
+            // are still installed and whose recorded prologues are still their
+            // rollback route, so the records are dropped only on a real swap.
+            if replaced {
+                forget_prologue_records(host);
+            }
         }
         // The baseline the reload ran against, not a fresh read. A save during
         // the build advances the counter past it and cancels the compilation
@@ -2348,12 +2474,17 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         // bumps the counter again.
         host.last_processed_queued_reload = queued_reloads;
 
-        // The project now runs the sources on disk, so the patch classifier's
-        // baseline has to say so too. Skipping this is what makes one refused
-        // patch disable the fast path for the rest of the session.
-        resync_patch_baselines(host, true, &[]);
-        // A project reload replaced the running image; the editor must refresh.
-        host.bump_editor_revision();
+        // The patch classifier baseline and the editor revision refresh once
+        // the attempt has done its work: right here for a synchronous reload,
+        // and in `finish_managed_build` when a worker build reports.
+        if !building_on_worker {
+            // The project now runs the sources on disk, so the patch classifier's
+            // baseline has to say so too. Skipping this is what makes one refused
+            // patch disable the fast path for the rest of the session.
+            resync_patch_baselines(host, true, &[]);
+            // A project reload replaced the running image; the editor must refresh.
+            host.bump_editor_revision();
+        }
     }
 
     // Step 6: A reload above may have re-laid out a shared component other

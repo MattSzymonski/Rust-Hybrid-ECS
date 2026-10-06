@@ -21,22 +21,29 @@
 // entry point is called once at setup and there is no library object to keep -
 // so nothing here is compiled without `hot_reload`.
 #[cfg(feature = "hot_reload")]
-pub(crate) use loaded::LoadedProject;
+pub(crate) use loaded::{LoadedProject, ManagedReloadStart};
 
 #[cfg(feature = "hot_reload")]
 mod loaded {
     // Standard library
     use std::path::Path;
     use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
 
     // External crates
     use pill_core::error::{HostError, LibraryError};
+    use pill_core::platform::Instant;
     use pill_core::{error, info};
     use pill_engine::{Engine, EngineApi, SystemOwner};
 
     // Current crate
     use crate::build_runner::build_project_module;
-    use crate::csharp::{CSharpProject, POLL_REJECTED, POLL_RELOADED};
+    use crate::csharp::{
+        BuildCollection, BuildOutcome, BuildReport, CSharpProject, FastCompileOutcome,
+        POLL_REJECTED, POLL_RELOADED,
+    };
     use crate::native_library::NativeLibrary;
     use crate::watcher::SourceTrigger;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
@@ -44,6 +51,24 @@ mod loaded {
     // =============================================================================
     // Constants
     // =============================================================================
+
+    // =============================================================================
+    // ManagedReloadStart
+    // =============================================================================
+
+    /// What starting a reload through the managed path produced.
+    pub(crate) enum ManagedReloadStart {
+        /// The project's backend is native; the caller reloads it on the
+        /// frame thread.
+        NotManaged,
+        /// A worker thread is building the assembly. The frame keeps running;
+        /// the finish lands when [`LoadedProject::collect_managed_build`]
+        /// reports the build.
+        Building,
+        /// The build thread could not start; the caller must reload on the
+        /// frame thread, the way every reload used to run.
+        Unavailable,
+    }
 
     // =============================================================================
     // LoadedProject
@@ -294,6 +319,63 @@ mod loaded {
             }
         }
 
+        /// Drop an armed managed reload timing whose reload produced no swap.
+        pub(crate) fn abandon_managed_reload_timing(&mut self) {
+            if let Self::CSharp(project) = self {
+                project.abandon_reload_timing();
+            }
+        }
+
+        /// Record a managed assembly rebuild that finished at `at`.
+        pub(crate) fn record_assembly_rebuilt_at(&mut self, at: Instant, kind: &'static str) {
+            if let Self::CSharp(project) = self {
+                project.record_assembly_rebuilt_at(at, kind);
+            }
+        }
+
+        /// Collapse the managed loader's debounce after the in-process
+        /// compiler wrote a settled assembly.
+        pub(crate) fn notify_assembly_replaced(&mut self) {
+            if let Self::CSharp(project) = self {
+                project.notify_assembly_replaced();
+            }
+        }
+
+        /// Start a managed reload: the assembly builds on its own thread while
+        /// the frame loop keeps running, and the finish lands when the build
+        /// reports. See [`ManagedReloadStart`].
+        pub(crate) fn start_managed_reload(
+            &mut self,
+            workspace_root: &Path,
+            config: &ProjectModuleConfig,
+            cancel: Option<(Arc<AtomicU64>, u64)>,
+        ) -> ManagedReloadStart {
+            match self {
+                Self::CSharp(project) => {
+                    start_csharp_assembly_build(project, workspace_root, config, cancel)
+                }
+                Self::Native { .. } => ManagedReloadStart::NotManaged,
+            }
+        }
+
+        /// Try to collect a finished managed assembly build without waiting.
+        ///
+        /// A native project never has one.
+        pub(crate) fn collect_managed_build(&mut self) -> BuildCollection {
+            match self {
+                Self::CSharp(project) => project.collect_build(),
+                Self::Native { .. } => BuildCollection::Pending,
+            }
+        }
+
+        /// Whether a managed assembly build is running on its own thread.
+        pub(crate) fn managed_build_in_flight(&self) -> bool {
+            match self {
+                Self::CSharp(project) => project.build_in_flight(),
+                Self::Native { .. } => false,
+            }
+        }
+
         /// Invoke the native compatibility update hook after scheduler systems.
         pub(crate) fn update(&self, engine_api: &EngineApi) {
             // C# gameplay is represented entirely by registered ECS systems. Only
@@ -420,6 +502,99 @@ mod loaded {
                 false
             }
         }
+    }
+
+    /// Start a C# assembly build on its own worker thread.
+    ///
+    /// The worker owns everything the build needs and touches nothing that
+    /// belongs to the frame boundary: it runs the in-process compiler, or the
+    /// full `dotnet build` fallback when the captured command line cannot
+    /// answer the reload, and reports what it produced. Compiling the project
+    /// is the hundreds of milliseconds that used to freeze the frame loop on
+    /// every save; from here the frame keeps rendering and the report is
+    /// collected at a later boundary.
+    fn start_csharp_assembly_build(
+        project: &mut CSharpProject,
+        workspace_root: &Path,
+        config: &ProjectModuleConfig,
+        cancel: Option<(Arc<AtomicU64>, u64)>,
+    ) -> ManagedReloadStart {
+        let compiler = project.compiler_handle();
+        let workspace = workspace_root.to_path_buf();
+        let watch_directory = config.watch_directory.clone();
+        let build_config = config.clone();
+        let (sender, receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("pill-csharp-build".to_string())
+            .spawn(move || {
+                let outcome = match compiler {
+                    Some(compiler) => match compiler.compile(&workspace, &watch_directory) {
+                        FastCompileOutcome::Compiled { milliseconds } => {
+                            BuildOutcome::Compiled { milliseconds }
+                        }
+                        FastCompileOutcome::Failed { diagnostics } => {
+                            BuildOutcome::Failed { diagnostics }
+                        }
+                        FastCompileOutcome::Unavailable { reason } => {
+                            info!(
+                                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                                reason = reason.as_str(),
+                                "falling back to a full C# build"
+                            );
+                            BuildOutcome::Full(run_full_project_build(
+                                &workspace,
+                                &build_config,
+                                cancel,
+                            ))
+                        }
+                    },
+                    None => {
+                        info!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            reason = "no in-process compiler is loaded",
+                            "falling back to a full C# build"
+                        );
+                        BuildOutcome::Full(run_full_project_build(
+                            &workspace,
+                            &build_config,
+                            cancel,
+                        ))
+                    }
+                };
+                // A receiver that has gone away means the host is shutting
+                // down; the report's job is then nobody's.
+                let _ = sender.send(BuildReport {
+                    outcome,
+                    finished_at: Instant::now(),
+                });
+            });
+        match thread {
+            Ok(thread) => {
+                project.track_build(receiver, thread);
+                ManagedReloadStart::Building
+            }
+            Err(_) => {
+                // Building on this thread blocks the frame the way the in-line
+                // pipeline did, which is the safe direction for a spawn
+                // failure.
+                ManagedReloadStart::Unavailable
+            }
+        }
+    }
+
+    /// Run the full `dotnet build` for a reload the captured command line
+    /// could not answer, reporting its error as text for the reload log.
+    fn run_full_project_build(
+        workspace_root: &Path,
+        config: &ProjectModuleConfig,
+        cancel: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<(), String> {
+        let cancel_flag = cancel
+            .as_ref()
+            .map(|(generation, baseline)| (generation.as_ref(), *baseline));
+        build_project_module(workspace_root, config, cancel_flag)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Reload one native generation and migrate components whose persisted schema

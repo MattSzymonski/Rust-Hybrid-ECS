@@ -17,6 +17,9 @@
 
 // Standard library
 use std::path::Path;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 // External crates
 use pill_core::error::CSharpError;
@@ -58,8 +61,17 @@ pub(crate) struct CSharpProject {
     /// The in-process Roslyn compiler, when one could be loaded.
     ///
     /// `None` leaves every reload on the ordinary `dotnet build` path, the
-    /// fallback when the compiler cannot be built or loaded.
-    fast_compiler: Option<fast_compile::FastCompiler>,
+    /// fallback when the compiler cannot be built or loaded. Shared behind an
+    /// `Arc` because a reload hands it to a build thread; its own state is a
+    /// set of export addresses and paths, so it travels safely.
+    fast_compiler: Option<Arc<fast_compile::FastCompiler>>,
+    /// The assembly build running on its own thread, when one is.
+    ///
+    /// The build compiles and writes the assembly; nothing else may run while
+    /// it does, because the captured source list includes the generated
+    /// mirror files a module reload rewrites. Collecting it is what swaps the
+    /// new assembly in.
+    build: Option<InFlightAssemblyBuild>,
     /// Timing of the managed reload currently in flight, when one is armed.
     ///
     /// Armed when the frame loop consumes the source signal that starts a
@@ -95,12 +107,14 @@ impl CSharpProject {
             module_exposed,
             mirror_methods,
             &mut |dotnet| {
-                fast_compiler = fast_compile::FastCompiler::try_new(dotnet, workspace_root, config);
+                fast_compiler = fast_compile::FastCompiler::try_new(dotnet, workspace_root, config)
+                    .map(Arc::new);
             },
         )?;
         Ok(Self {
             runtime,
             fast_compiler,
+            build: None,
             reload_timing: None,
         })
     }
@@ -157,12 +171,69 @@ impl CSharpProject {
     /// and the full `dotnet build` fallback (`"msbuild"`). The build phase of
     /// the armed span ends here.
     pub(crate) fn record_assembly_rebuilt(&mut self, kind: &'static str) {
+        self.record_assembly_rebuilt_at(Instant::now(), kind);
+    }
+
+    /// Record an assembly rebuild that finished at `at`, and how it was
+    /// produced.
+    ///
+    /// The worker-side build reports the instant it finished, so a build that
+    /// ran between frames still contributes its own duration to the total
+    /// rather than the frame wait that collected it.
+    pub(crate) fn record_assembly_rebuilt_at(&mut self, at: Instant, kind: &'static str) {
         if let Some(timing) = &mut self.reload_timing {
-            timing.rebuilt = Some(RebuiltAssembly {
-                at: Instant::now(),
-                kind,
-            });
+            timing.rebuilt = Some(RebuiltAssembly { at, kind });
         }
+    }
+
+    /// Hand the in-process compiler to a build thread, or `None` when there is
+    /// none; the fallback `dotnet build` runs instead.
+    pub(crate) fn compiler_handle(&self) -> Option<Arc<fast_compile::FastCompiler>> {
+        self.fast_compiler.clone()
+    }
+
+    /// Store a build that a worker thread just reported, so the frame loop can
+    /// pick it up and complete the reload.
+    pub(crate) fn track_build(&mut self, receiver: Receiver<BuildReport>, thread: JoinHandle<()>) {
+        self.build = Some(InFlightAssemblyBuild {
+            receiver,
+            thread: Some(thread),
+        });
+    }
+
+    /// Whether an assembly build is running on its own thread right now.
+    pub(crate) fn build_in_flight(&self) -> bool {
+        self.build.is_some()
+    }
+
+    /// Try to collect a finished build report without waiting.
+    ///
+    /// A report collects the worker and clears the in-flight state; a worker
+    /// that stopped without one is reported as [`BuildCollection::Died`], so
+    /// the caller can fall back to building on the frame thread.
+    pub(crate) fn collect_build(&mut self) -> BuildCollection {
+        let Some(in_flight) = self.build.as_mut() else {
+            return BuildCollection::Pending;
+        };
+        match in_flight.receiver.try_recv() {
+            Ok(report) => {
+                in_flight.join();
+                self.build = None;
+                BuildCollection::Finished(report)
+            }
+            Err(TryRecvError::Empty) => BuildCollection::Pending,
+            Err(TryRecvError::Disconnected) => {
+                in_flight.join();
+                self.build = None;
+                BuildCollection::Died
+            }
+        }
+    }
+
+    /// Collapse the managed loader's debounce after the in-process compiler
+    /// wrote a settled assembly; see [`CSharpRuntime::notify_assembly_replaced`].
+    pub(crate) fn notify_assembly_replaced(&mut self) {
+        self.runtime.notify_assembly_replaced();
     }
 
     /// Drop an armed timing whose reload produced no swap.
@@ -258,4 +329,71 @@ pub(crate) struct ManagedReloadSummary {
 /// `duration` in milliseconds.
 fn milliseconds(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+/// One assembly build running on its own worker thread.
+///
+/// The thread is joined when its report is collected, when the worker is
+/// found dead, and on teardown - a build that outlived its host would be a
+/// thread parked in code the host is about to drop.
+struct InFlightAssemblyBuild {
+    /// The build's report, once the worker has one.
+    receiver: Receiver<BuildReport>,
+    /// The worker, joined by [`Self::join`] or on drop.
+    thread: Option<JoinHandle<()>>,
+}
+
+impl InFlightAssemblyBuild {
+    /// Join the worker. Returns immediately when it already finished, which
+    /// is the case whenever a report was received.
+    fn join(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for InFlightAssemblyBuild {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+/// What one worker-side build produced.
+pub(crate) enum BuildOutcome {
+    /// The in-process compiler rebuilt the assembly.
+    Compiled {
+        /// Wall-clock cost of the compile, for the reload log.
+        milliseconds: f64,
+    },
+    /// The project does not compile; the diagnostics say why.
+    Failed {
+        /// Compiler and analyzer errors, already formatted the way csc prints them.
+        diagnostics: String,
+    },
+    /// The captured command line could not answer the reload, so the full
+    /// `dotnet build` ran instead.
+    Full(Result<(), String>),
+}
+
+/// A finished assembly build: what it produced, and when it finished on the
+/// worker's clock, so the reload log can span the build itself rather than
+/// the frame that collected it.
+pub(crate) struct BuildReport {
+    /// What the build produced.
+    pub(crate) outcome: BuildOutcome,
+    /// When the worker finished the build, in milliseconds-scale monotonic
+    /// time shared with the frame thread.
+    pub(crate) finished_at: Instant,
+}
+
+/// What one collection attempt found.
+pub(crate) enum BuildCollection {
+    /// The worker is still building; nothing was collected.
+    Pending,
+    /// The worker stopped without a report; the caller falls back to building
+    /// on the frame thread.
+    Died,
+    /// The build finished; the report carries what it produced.
+    Finished(BuildReport),
 }
