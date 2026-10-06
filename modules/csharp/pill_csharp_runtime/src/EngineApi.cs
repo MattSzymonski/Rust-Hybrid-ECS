@@ -148,6 +148,14 @@ public unsafe struct EngineApi
 
     /// <summary>Import a sound, shaped like <see cref="AssetImportTexture"/>.</summary>
     public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportSound;
+
+    /// <summary>
+    /// Drop the rendering pipeline the world's <c>RenderingManager</c> holds,
+    /// returning the renderer to its built-in chain. Takes no arguments;
+    /// returns the shared asset status byte. Appended at the end like every
+    /// earlier slot.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte> AssetClearRenderPipeline;
 }
 
 /// <summary>

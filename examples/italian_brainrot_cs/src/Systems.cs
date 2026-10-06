@@ -117,6 +117,15 @@ public static class SceneStartup
     [EcsStartup]
     public static void Start(Commands commands)
     {
+        // The showcase is the three shading styles, one material each, so this
+        // project runs the renderer's built-in frame: a single geometry pass
+        // that draws every instance through its own material's shader. The
+        // renderer registers the PBR chain as the manager's default - that
+        // chain draws materials built for its `pill_pbr` shader alone - so
+        // clearing the manager returns the renderer to the built-in pass the
+        // styles need.
+        Engine.ClearRenderPipeline();
+
         AssetHandle mesh = Engine.LoadMeshObj(
             "italian_brainrot.mesh", ReadRes(Path.Combine("models", "chimpanzini_bananini.obj")));
         AssetHandle color = Engine.LoadTexturePng(
@@ -200,7 +209,7 @@ public static class RotationSystem
         SimulationClock.Stamp(ref simulation);
         float deltaSeconds = simulation.DeltaSeconds * 30.0f;
 
-        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond) * deltaSeconds;
+        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond - 100.0f) * deltaSeconds;
         Quaternion step = Quaternion.CreateFromAxisAngle(Vector3.UnitY, angle);
 
         foreach (var row in models.Rows())

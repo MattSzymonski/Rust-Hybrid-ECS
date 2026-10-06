@@ -951,6 +951,25 @@ public static unsafe class Engine
     }
 
     /// <summary>
+    /// Drops the pipeline the world's <c>RenderingManager</c> holds, returning
+    /// the renderer to its built-in chain: a single geometry pass that draws
+    /// every instance through its own material's shader.
+    /// </summary>
+    /// <remarks>
+    /// The renderer registers the PBR chain as the manager's default, and that
+    /// chain draws only materials built for its <c>pill_pbr</c> shader - a
+    /// project with its own shading styles clears the manager so the built-in
+    /// pass draws them. The managed equivalent of the Rust project fetching
+    /// the resource and calling <c>clear</c> on it. Same invocation contract
+    /// as <see cref="LoadMeshObj"/>.
+    /// </remarks>
+    public static void ClearRenderPipeline()
+    {
+        byte status = _api.AssetClearRenderPipeline();
+        ValidateAssetStatus(status, "clear the render pipeline");
+    }
+
+    /// <summary>
     /// Imports the source at <paramref name="path"/> (relative to <c>res</c>)
     /// through its <c>.meta</c> file with the import slot <paramref name="kind"/>
     /// selects. <see cref="Assets.Import{T}"/> is the public face of this.
@@ -1006,6 +1025,7 @@ public static unsafe class Engine
             11 => "its .meta file's guid belongs to another loaded asset (a copied .meta?)",
             12 => "the initial settings JSON does not fit this asset type",
             13 => "the metadata policy is not a known one",
+            14 => "the engine's RenderingManager resource is missing",
             _ => $"native status {status}",
         };
         throw new InvalidOperationException($"Could not {operation}: {reason}.");

@@ -5,7 +5,8 @@
 //!
 //! - Publish the asset entry points the managed runtime calls (load a mesh,
 //!   texture or shader; create a material; import a texture, mesh or sound
-//!   through its `.meta` file) in `CsEngineApi`.
+//!   through its `.meta` file; clear the world's rendering pipeline) in
+//!   `CsEngineApi`.
 //! - Find the renderer data crate's function for each by name and call it with
 //!   the active managed invocation's world.
 //! - Report a missing invocation or a missing function with the status codes
@@ -60,13 +61,14 @@ const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
 /// (`pill_master_renderer_data::csharp_assets`) and the audio module's
 /// (`pill_audio::csharp_assets`).
 #[cfg(feature = "hot_reload")]
-pub(crate) const ASSET_EXPORT_NAMES: [&str; 7] = [
+pub(crate) const ASSET_EXPORT_NAMES: [&str; 8] = [
     "pill_render_data_load_mesh_obj",
     "pill_render_data_load_texture_png",
     "pill_render_data_load_shader",
     "pill_render_data_create_material",
     "pill_render_data_import_texture",
     "pill_render_data_import_mesh",
+    "pill_render_data_clear_render_pipeline",
     "pill_audio_import_sound",
 ];
 
@@ -165,6 +167,9 @@ type CreateMaterial = unsafe extern "C" fn(
 /// A module's import export: world, path, policy, settings JSON, output.
 type ImportAsset =
     unsafe extern "C" fn(*mut World, *const u8, u32, u8, *const u8, u32, *mut c_void) -> u8;
+
+/// A module's pipeline clear: world only.
+type ClearRenderPipeline = unsafe extern "C" fn(*mut World) -> u8;
 
 /// The data crate's function named `name`, as the function pointer type `F`.
 ///
@@ -487,6 +492,24 @@ pub(super) extern "C" fn ffi_asset_import_sound(
             settings,
             settings_length,
             output,
+        )
+    }
+}
+
+/// Drops the active invocation's world rendering pipeline, returning the
+/// renderer to its built-in pass.
+///
+/// # Safety
+///
+/// No argument crosses here; the world comes from the active invocation, as in
+/// every other entry point.
+pub(super) extern "C" fn ffi_asset_clear_render_pipeline() -> u8 {
+    // SAFETY: `ClearRenderPipeline` is the export's signature, and it receives
+    // only the active invocation's world.
+    unsafe {
+        forward::<ClearRenderPipeline>(
+            "pill_render_data_clear_render_pipeline",
+            |function, world| function(world),
         )
     }
 }

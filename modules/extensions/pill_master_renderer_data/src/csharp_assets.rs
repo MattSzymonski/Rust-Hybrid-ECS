@@ -8,6 +8,9 @@
 //!   inserting each into a world's `AssetManager`.
 //! - Import a texture or a mesh from `res` through its metadata file, one
 //!   named export per type, through [`pill_engine::asset_ffi`].
+//! - Drop the pipeline the world's `RenderingManager` holds, so a project
+//!   that loads its own shading styles returns the renderer to its built-in
+//!   pass.
 //! - Offer each as a named C-ABI function the host's C# bridge finds by name:
 //!   always as a `#[no_mangle]` export (each name is unique to this crate, so
 //!   a statically linked build pays nothing for it), and through a
@@ -36,8 +39,8 @@ use pill_engine::{AssetLoader, AssetManager, Handle, World};
 
 // Current crate
 use crate::{
-    Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture,
-    TextureType,
+    Material, Mesh, RenderingManager, Shader, ShaderParameterSlot, ShaderParameterType,
+    ShaderTextureSlot, Texture, TextureType,
 };
 
 // =============================================================================
@@ -120,6 +123,10 @@ pub const STATUS_NULL_OUTPUT: u8 = 5;
 pub const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
 /// The name is already bound to a live asset.
 pub const STATUS_NAME_IN_USE: u8 = 7;
+/// The world has no `RenderingManager` resource. Continues past the import
+/// codes (`8`-`13`, `pill_engine::asset_ffi::import_status`) so every code
+/// the managed side's table maps stays distinct.
+pub const STATUS_RENDER_MANAGER_MISSING: u8 = 14;
 
 // =============================================================================
 // Argument readers
@@ -609,6 +616,33 @@ pub unsafe extern "C" fn pill_render_data_import_mesh(
     }
 }
 
+/// Drops the pipeline the world's `RenderingManager` holds, returning the
+/// renderer to its built-in chain: a single geometry pass that draws every
+/// instance through its own material's shader.
+///
+/// The managed equivalent of the Rust project fetching the resource and
+/// calling `clear` on it; a project needs it because the registered default
+/// chain (the PBR one) replaces the built-in pass with its own.
+///
+/// Returns a status code (see the `STATUS_*` constants).
+///
+/// # Safety
+///
+/// `world` must be null or point at a live `World` no one else is using for
+/// the call's duration.
+#[no_mangle]
+pub unsafe extern "C" fn pill_render_data_clear_render_pipeline(world: *mut World) -> u8 {
+    // SAFETY: the caller's contract: null, or a live world used exclusively.
+    let Some(world) = (unsafe { world.as_mut() }) else {
+        return STATUS_NO_ACTIVE_SCOPE;
+    };
+    let Some(manager) = world.get_resource_mut::<RenderingManager>() else {
+        return STATUS_RENDER_MANAGER_MISSING;
+    };
+    manager.clear();
+    STATUS_OK
+}
+
 // Offer every function to a host that links this crate statically; a loaded
 // module offers them through the `#[no_mangle]` exports above instead.
 pill_engine::submit! {
@@ -645,5 +679,11 @@ pill_engine::submit! {
     PillExportDescriptor {
         name: "pill_render_data_import_mesh",
         address: ExportAddress(pill_render_data_import_mesh as *const ()),
+    }
+}
+pill_engine::submit! {
+    PillExportDescriptor {
+        name: "pill_render_data_clear_render_pipeline",
+        address: ExportAddress(pill_render_data_clear_render_pipeline as *const ()),
     }
 }
