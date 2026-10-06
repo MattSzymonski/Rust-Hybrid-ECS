@@ -9,10 +9,14 @@
 # startup and the shipping bundle generator reads it at build time, so adding
 # or removing a module is a single edit here.
 #
-# This project needs none: it loads its own mesh, texture and shaders at
-# startup through the managed asset-loading bridge (`Engine.LoadMeshObj` and
-# friends in `pill_csharp_runtime`), the same way the Rust project's
-# `asset_loading::load` does from Rust.
+# This project loads its own mesh, texture and shaders at startup through the
+# managed asset-loading bridge (`Engine.LoadMeshObj` and friends in
+# `pill_csharp_runtime`), the same way the Rust project's `asset_loading::load`
+# does from Rust. It lists `pill_dummy_color` so the module is loaded AND its
+# mirrored surface reaches C#: `RotationSystem` calls
+# `PillDummyColor.GetColorA()` - the module's mirrored `#[pill_hot_fn]` - and
+# editing that function's body under modules/extensions/pill_dummy_color
+# hot-patches the value the system prints, with no restart or reload.
 
 name: "Italian Brainrot (C#)"
 build_binary_name: "ItalianBrainrotCs"
@@ -20,5 +24,5 @@ version: "0.1.0"
 author: "Matt Szymonski"
 description: "Managed port of the three rotating Chimpanzini Bananini entities."
 
-modules: []
+modules: ["pill_dummy_color"]
 

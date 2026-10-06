@@ -91,7 +91,8 @@ pub use components::ModuleExposedComponent;
 /// every configuration.
 #[derive(Clone, Debug)]
 pub struct ResolvedMirrorMethod {
-    /// Fully-qualified Rust type name the method belongs to.
+    /// Fully-qualified Rust type name the method belongs to - or, for a free
+    /// function (`is_free_function`), the path of the module declaring it.
     pub type_name: String,
     /// Rust method name, snake_case.
     pub method_name: String,
@@ -105,6 +106,15 @@ pub struct ResolvedMirrorMethod {
     pub arg_names: Vec<String>,
     /// Address of the exported C-ABI trampoline.
     pub address: usize,
+    /// Whether the declaration is a `#[pill_mirror_fn]` free function; the
+    /// codegen then emits a static method on a static class named after the
+    /// declaring module instead of an instance method on a struct mirror.
+    pub is_free_function: bool,
+    /// The package that declared the method, from `env!("CARGO_PKG_NAME")` at
+    /// the macro's expansion site. The host keeps only the entries whose
+    /// `crate_name` matches the module being generated or published, so one
+    /// artifact linking another crate's code cannot claim its declarations.
+    pub crate_name: String,
 }
 
 /// One heap-field accessor resolved to callable addresses, shared by the
@@ -165,6 +175,8 @@ pub fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorM
                     arg_tags: Vec::new(),
                     arg_names: Vec::new(),
                     address,
+                    is_free_function: false,
+                    crate_name: String::new(),
                 });
             }
         };

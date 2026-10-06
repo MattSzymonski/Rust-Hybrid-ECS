@@ -15,8 +15,9 @@ DESCRIPTION
 
       1. csharp_bridge_startup  - the host starts the C# backend, the host
           auto-generates the module's C# mirror file (exact namespace, size,
-          alignment pad), a component-less dummy module writes NO mirror, the
-          managed build is warning-free (no CS8019 unused-using), and the
+          alignment pad), a component-less dummy module still generates a
+          mirror from its standalone value type and mirrored free function,
+          the managed build is warning-free (no CS8019 unused-using), and the
           bridge probe proves both directions of the Rust <-> C# connection:
             * Rust -> C#: C# reads the spline the Rust module seeded
               (sees 1 spline, first P0.X=0, count=4);
@@ -95,8 +96,9 @@ COMMITTED_MIRROR_BYTES = None
 PROJECT_CS_PROBE_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "BridgeProbe.cs"
 
 # The C# project plus a component-less dummy module: the dummy exercises the
-# empty-exposure codegen path (no mirror file must be written) inside the same
-# session that asserts the real module's mirror.
+# codegen paths a module without components takes - a standalone
+# `#[derive(PillMirror)]` value type and a `#[pill_mirror_fn]` free function -
+# inside the same session that asserts the real module's component mirror.
 CSHARP_SETTINGS = """\
 name: "C# Bridge Test"
 build_binary_name: "CSharpBridgeTest"
@@ -198,10 +200,15 @@ public static class ModuleSplineBridgeDemo
         ulong omoA = omo.GetA();
         ulong omoB = omo.GetB();
 
+        // The dummy module's mirrored free function: a plain static C# call
+        // into Rust, resolved through the module's exported trampoline with
+        // no component row involved.
+        float alpha = global::pill_dummy_color.PillDummyColor.GetColorA();
+
         Console.WriteLine(
             $"[project_cs] cs spline bridge: sees {visibleSplines} spline(s), " +
             $"first P0.X={firstPointX}, count={firstPointCount}, " +
-            $"omo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB}");
+            $"omo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB} alpha={alpha}");
     }
 }
 '''
@@ -252,8 +259,10 @@ CSHARP_MIRROR_REGEN_TOKEN = "module reload changed the C# mirror surface; queuin
 #   GetA()    = x + 1200   = 1212
 #   GetB()    = y + 1200   = 1234
 #   GetE()    = x + 9000   = 9012 (added live by the regeneration scenario)
-OMO_PROBE_SUM_A_B = "omo=(12,34) sum=47 a=1212 b=1234"
-OMO_PROBE_WITH_E = "omo=(12,34) sum=47 a=1212 b=1234 e=9012"
+#   alpha=1 is the dummy module's mirrored free function `get_color_a`,
+#   reached from C# as `pill_dummy_color.PillDummyColor.GetColorA()`.
+OMO_PROBE_SUM_A_B = "omo=(12,34) sum=47 a=1212 b=1234 alpha=1"
+OMO_PROBE_WITH_E = "omo=(12,34) sum=47 a=1212 b=1234 e=9012 alpha=1"
 
 # =============================================================================
 # Scenario model (same shape as the native hot-reload suite)
@@ -466,12 +475,23 @@ def verify_startup(
     ):
         return False
 
-    # A component-less dummy module must NOT produce a mirror file (no
-    # unused-using warnings, no binding for a component that never existed).
+    # The component-less dummy module still gets a mirror: with no component
+    # to anchor it, the file carries the module's standalone value type and
+    # its mirrored free function - the surface C# calls statically.
     if not verify_generated_mirror(
         DUMMY_GENERATED_FILE,
-        (),
-        should_exist=False,
+        [
+            "namespace pill_dummy_color {",
+            "public partial struct Tint",
+            "[FieldOffset(0)] public float R;",
+            "[FieldOffset(8)] public float B;",
+            "public partial struct TestStruct",
+            "public ulong Aaa()",
+            "public static class PillDummyColor",
+            "public static float GetColorA()",
+            "global::TracyLive.MirrorMethods.Resolve<PillDummyColorGetColorADelegate>(\"pill_dummy_color\", \"get_color_a\")",
+        ],
+        should_exist=True,
         description="pill_dummy_color mirror",
     ):
         return False
@@ -1025,8 +1045,8 @@ SESSION_SCENARIOS = [
                             "ulong omoB = omo.GetB();\n        ulong omoE = omo.GetE();",
                         ),
                         (
-                            'b={omoB}");',
-                            'b={omoB} e={omoE}");',
+                            'b={omoB} alpha={alpha}");',
+                            'b={omoB} e={omoE} alpha={alpha}");',
                         ),
                     ],
                 )],

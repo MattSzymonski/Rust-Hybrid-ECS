@@ -711,6 +711,7 @@ impl NativeLibrary {
         let mut descriptors = vec![
             PillValueTypeDescriptor {
                 type_name: "",
+                crate_name: "",
                 size: 0,
                 align: 0,
                 fields: &[],
@@ -748,6 +749,8 @@ impl NativeLibrary {
         let mut descriptors = vec![
             PillMethodDescriptor {
                 type_name: "",
+                is_free_function: false,
+                crate_name: "",
                 name: "",
                 symbol: "",
                 return_tag: "",
@@ -785,6 +788,8 @@ impl NativeLibrary {
                     .map(|name| name.to_string())
                     .collect(),
                 address,
+                is_free_function: descriptor.is_free_function,
+                crate_name: descriptor.crate_name.to_string(),
             });
         }
         resolved
