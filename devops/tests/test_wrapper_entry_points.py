@@ -73,6 +73,10 @@ EXPECTED_ENTRY_POINTS = frozenset({
     "pill_copy_value_type_descriptors",
     "pill_mirror_method_descriptor_count",
     "pill_copy_mirror_method_descriptors",
+    # The fixture's `#[pill_mirror_fn]` free function and the `#[pill_mirror_impl]`
+    # method trampoline: both are resolved by symbol and handed to the C# runtime.
+    "pill_mirror_fn_get_color_a",
+    "pill_mirror_TestStruct_aaa",
     "pill_field_accessor_descriptor_count",
     "pill_copy_field_accessor_descriptors",
 })

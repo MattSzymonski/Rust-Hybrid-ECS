@@ -426,17 +426,39 @@ mod slot {
 
         /// The current generation's `#[derive(PillMirror)]` value-type
         /// descriptors, used by the C# codegen to resolve nested struct tags.
+        ///
+        /// Only descriptors this module's own package declared: an artifact
+        /// also carries the submissions of every crate it links (an extension
+        /// depending on an extension), and those belong to the module that
+        /// owns them - emitting them here would duplicate the owner's
+        /// generated file with a second C# type of the same name.
         pub(crate) fn value_type_descriptors(
             &self,
         ) -> Vec<pill_engine::component_registry::PillValueTypeDescriptor> {
-            self.current.value_type_descriptors()
+            let module_name = self.name();
+            self.current
+                .value_type_descriptors()
+                .into_iter()
+                .filter(|descriptor| descriptor.crate_name == module_name)
+                .collect()
         }
 
         /// The current generation's `#[pill_mirror_method]` entries, each with
         /// the resolved address of its C-ABI trampoline, used by the C#
         /// codegen and the managed runtime's method table.
+        ///
+        /// Filtered to this module's own declarations for the same reason as
+        /// [`Self::value_type_descriptors`]: the managed table is keyed by the
+        /// declaring names, and a linked dependency's copy of the same
+        /// trampoline would shadow the owner's address - a patch reaches the
+        /// owner's copy, so the managed call would read stale code.
         pub(crate) fn mirror_methods(&self) -> Vec<crate::csharp::ResolvedMirrorMethod> {
-            self.current.mirror_methods()
+            let module_name = self.name();
+            self.current
+                .mirror_methods()
+                .into_iter()
+                .filter(|method| method.crate_name == module_name)
+                .collect()
         }
 
         /// The current generation's heap-field accessors, each with the

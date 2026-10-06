@@ -210,8 +210,8 @@ pub use tracing;
 // them. The `inventory::submit` they expand to is re-exported by the facade,
 // which owns the registries.
 pub use pill_engine_macros::{
-    pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_impl, pill_mirror_method, pill_module,
-    pill_project, pill_value_type, PillComponent, PillLayout, PillMirror,
+    pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_fn, pill_mirror_impl, pill_mirror_method,
+    pill_module, pill_project, pill_value_type, PillComponent, PillLayout, PillMirror,
 };
 
 // World container and its entity-builder and error types.

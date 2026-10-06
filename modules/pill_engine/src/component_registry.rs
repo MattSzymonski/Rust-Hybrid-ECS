@@ -67,6 +67,14 @@ pub struct PillComponentDescriptor {
 pub struct PillValueTypeDescriptor {
     /// Fully-qualified type name, as `std::any::type_name` would report it.
     pub type_name: &'static str,
+    /// The package that declared the type, from `env!("CARGO_PKG_NAME")` at
+    /// the macro's expansion site.
+    ///
+    /// The host uses it to attribute a declaration to the module that owns
+    /// it: one artifact that links another crate (an extension depending on
+    /// an extension) carries the dependency's submissions too, and only the
+    /// owning module's mirror may emit them.
+    pub crate_name: &'static str,
     /// Byte size of the value type (`size_of::<T>()`).
     pub size: usize,
     /// Byte alignment of the value type (`align_of::<T>()`).
@@ -129,24 +137,40 @@ pub struct PillFieldAccessorDescriptor {
 }
 
 /// One mirrored method of a `#[derive(PillMirror)]` value type, submitted by
-/// the `#[pill_mirror_impl]` attribute macro on the type's `impl` block.
+/// the `#[pill_mirror_impl]` attribute macro on the type's `impl` block, or
+/// one mirrored free function, submitted by `#[pill_mirror_fn]` (see
+/// [`PillMethodDescriptor::is_free_function`] for how the codegen tells the
+/// two apart).
 ///
 /// The macro generates a `#[no_mangle] extern "C"` trampoline for each marked
-/// method (so the C ABI is fixed regardless of the Rust method's calling
+/// function (so the C ABI is fixed regardless of the Rust function's calling
 /// convention) and records it here. The host resolves the trampoline's exported
 /// symbol address, hands the table to the C# runtime, and the mirror codegen
-/// emits a typed C# instance method that calls it.
+/// emits a typed C# method that calls it - an instance method on the value
+/// type's struct mirror for a method, a static method on a static class named
+/// after the declaring module for a free function.
 ///
 /// v1 supports a deliberately narrow contract: a `&self` receiver (read-only;
-/// writes cannot propagate through the C# pinned-box call), primitive
-/// arguments and return values (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`,
-/// `usize`, `isize`), and a `()` return. Everything else is rejected at
-/// compile time by the macro.
+/// writes cannot propagate through the C# pinned-box call) for methods and no
+/// receiver for free functions, primitive arguments and return values
+/// (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`, `usize`, `isize`), and a `()`
+/// return. Everything else is rejected at compile time by the macro.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillMethodDescriptor {
     /// Fully-qualified type name the method belongs to, as `std::any::type_name`
     /// would report it (`pill_spline::OmoMO`).
     pub type_name: &'static str,
+    /// Whether the declaration is a free function (`#[pill_mirror_fn]`) rather
+    /// than a method (`#[pill_mirror_impl]`). A free-function entry's
+    /// `type_name` is the path of the module declaring it (the crate root for
+    /// a top-level function), and the C# codegen emits a static method on a
+    /// static class named after that module instead of an instance method on a
+    /// struct mirror.
+    pub is_free_function: bool,
+    /// The package that declared the method, from `env!("CARGO_PKG_NAME")` at
+    /// the macro's expansion site; see
+    /// [`PillValueTypeDescriptor::crate_name`] for how the host uses it.
+    pub crate_name: &'static str,
     /// Rust method name, snake_case (`get_sum`); the codegen maps it to
     /// PascalCase for the C# instance method.
     pub name: &'static str,
@@ -400,6 +424,8 @@ mod tests {
         crate::submit! {
             PillMethodDescriptor {
                 type_name: "pill_engine::test::Zulu",
+                is_free_function: false,
+                crate_name: "pill_engine",
                 name: "alpha",
                 symbol: "pill_mirror_Zulu_alpha",
                 return_tag: "u64",
@@ -410,6 +436,8 @@ mod tests {
         crate::submit! {
             PillMethodDescriptor {
                 type_name: "pill_engine::test::Alpha",
+                is_free_function: false,
+                crate_name: "pill_engine",
                 name: "beta",
                 symbol: "pill_mirror_Alpha_beta",
                 return_tag: "u32",

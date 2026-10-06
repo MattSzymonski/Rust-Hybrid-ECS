@@ -21,7 +21,9 @@
 // `asset_loading.rs` does.
 
 using System.Numerics;
-
+// The module's mirrored free function and value type, generated from its Rust
+// declarations.
+using pill_dummy_color;
 // The renderer's components, generated from their Rust registration.
 using pill_master_renderer.component;
 
@@ -200,6 +202,13 @@ public static class SceneStartup
 /// <summary>Rotates each tagged entity around its local Y axis at 90 degrees per second.</summary>
 public static class RotationSystem
 {
+    // PILL0301 warns that mutable statics in a system-declaring type are what a
+    // parallel batch races on. Only this one system touches the field, and the
+    // reset it takes on a reload is what makes the next value print again.
+#pragma warning disable PILL0301
+    private static float _reportedAlpha = float.NaN;
+#pragma warning restore PILL0301
+
     [EcsSystem]
     public static void Run(
         ResMut<SimulationTime> time,
@@ -209,7 +218,8 @@ public static class RotationSystem
         SimulationClock.Stamp(ref simulation);
         float deltaSeconds = simulation.DeltaSeconds * 30.0f;
 
-        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond - 100.0f) * deltaSeconds;
+        var color = pill_dummy_color.PillDummyColor.GetColorA();
+        float angle = float.DegreesToRadians(ProjectConstants.RotationDegreesPerSecond - 100.0f + color) * deltaSeconds;
         Quaternion step = Quaternion.CreateFromAxisAngle(Vector3.UnitY, angle);
 
         foreach (var row in models.Rows())
