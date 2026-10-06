@@ -85,6 +85,8 @@ __pycache__/
 .claude/skills/*
 AGENTS.md
 
+/examples/circus_demo_cs
+
 # Profiling and benchmark artifacts
 graphify-out/
 performance_benchmarks/cache/artifacts/

@@ -13,7 +13,7 @@ pub(crate) fn rotation_system(
     let Some(time) = time.get() else {
         return Ok(());
     };
-    let step = glam::Quat::from_rotation_y(90.0_f32.to_radians() * time.delta_seconds());
+    let step = glam::Quat::from_rotation_y(90.0_f32.to_radians() * time.delta_seconds() + 0.0);
     for (mut transform, _) in models.iter_mut() {
         let current = glam::Quat::from_array(transform.rotation);
         let current = if current.is_finite() && current.length_squared() > 1.0e-8 {
@@ -21,7 +21,7 @@ pub(crate) fn rotation_system(
         } else {
             glam::Quat::IDENTITY
         };
-        transform.rotation = (step * current * 55.0).normalize().to_array();
+        transform.rotation = (step * current * 255.0).normalize().to_array();
     }
     Ok(())
 }

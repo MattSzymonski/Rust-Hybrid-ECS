@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 pill_runtime = { path = "../../modules/hosting/pill_runtime" }
-italian_brainrot = { path = "../../examples/master_renderer_test" }
+pill_csharp_bridge = { path = "../../modules/csharp/pill_csharp_bridge" }
 pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 pill_master_renderer = { path = "../../modules/extensions/pill_master_renderer", default-features = false }
 

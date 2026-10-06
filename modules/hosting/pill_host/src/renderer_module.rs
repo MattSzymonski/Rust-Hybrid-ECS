@@ -140,6 +140,7 @@ impl RendererModule {
             &config.name,
             &config.watch_directory,
             Arc::clone(&source_edit_generation),
+            None,
         )?;
         let mut module = Self {
             slot: None,

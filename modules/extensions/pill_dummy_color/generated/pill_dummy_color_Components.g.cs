@@ -21,18 +21,6 @@ public partial struct TestStruct
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 
-    /// Calls the Rust method `pill_dummy_color::TestStruct::aa22a` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong TestStructAa22aDelegate(global::TracyLive.RowPointer self);
-
-    public ulong Aa22a()
-    {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<TestStructAa22aDelegate>("pill_dummy_color::TestStruct", "aa22a");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
-    }
-
     /// Calls the Rust method `pill_dummy_color::TestStruct::aaa` through its
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.

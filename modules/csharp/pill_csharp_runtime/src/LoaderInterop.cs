@@ -110,9 +110,10 @@ public static unsafe class LoaderInterop
     /// which <see cref="Engine.Bind(EngineApi*)"/> checks before copying it.
     /// Bumped to 13 by the three asset import slots appended to the API table.
     /// Bumped to 14 by the rendering pipeline clear slot appended to the API
-    /// table.
+    /// table. Bumped to 15 by the standalone-material import and skybox slots,
+    /// and the input and time query slots, appended to the API table.
     /// </summary>
-    public const uint InteropContractVersion = 14;
+    public const uint InteropContractVersion = 15;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT
