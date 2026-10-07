@@ -195,6 +195,18 @@ public unsafe struct EngineApi
 
     /// <summary>Seconds since the engine started; `0` with no clock.</summary>
     public delegate* unmanaged[Cdecl]<float> TimeElapsedSeconds;
+
+    /// <summary>
+    /// Run the managed trampoline for every index in <c>0..count</c> on the
+    /// host's shared thread pool; returns after every invocation finished.
+    /// Status <c>0</c> ran every index, <c>3</c> no managed system is
+    /// scheduled on the calling thread, <c>4</c> called from inside a
+    /// parallel callback, <c>5</c> an internal dispatch failure.
+    /// <paramref name="state"/> is opaque and travels back to the callback
+    /// untouched. Appended after <see cref="TimeElapsedSeconds"/> for the
+    /// same reason every earlier addition was: a new slot goes at the end.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<nint, uint, void>, nint, uint, byte> ParallelFor;
 }
 
 /// <summary>

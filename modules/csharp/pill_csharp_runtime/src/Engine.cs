@@ -352,6 +352,22 @@ public static unsafe class Engine
         _api.CurrentScopeToken == null ? 0u : _api.CurrentScopeToken();
 
     /// <summary>
+    /// Run the host's parallel dispatch slot: one callback invocation per work
+    /// item, on the host's shared thread pool, returning after every item
+    /// finished.
+    /// </summary>
+    /// <remarks>
+    /// Statuses are interpreted by <see cref="ParallelDispatch"/>; a null slot
+    /// would mean the host predates this runtime's contract, which
+    /// <see cref="Bind(EngineApi*)"/> already refuses at binding time.
+    /// </remarks>
+    internal static byte ParallelFor(
+        delegate* unmanaged[Cdecl]<nint, uint, void> callback, nint state, uint count) =>
+        _api.ParallelFor == null
+            ? ParallelDispatch.DispatchFailed
+            : _api.ParallelFor(callback, state, count);
+
+    /// <summary>
     /// Reject a chunk that was issued to an earlier managed invocation.
     /// </summary>
     /// <remarks>
@@ -1888,6 +1904,82 @@ public ref struct QueryEnumerator
 
     /// <summary>Index of the current row inside the joined chunk.</summary>
     internal int RowIndex => _row;
+
+    /// <summary>
+    /// Run one slice per contiguous row range of every matched chunk across
+    /// the host's shared pool, joining before returning.
+    /// </summary>
+    /// <remarks>
+    /// Resolution - walking chunks, joining columns, validating scope tokens -
+    /// runs here on the calling thread exactly as the sequential walk does.
+    /// Workers then see only the snapshot (<see cref="ParallelSegment"/>), and
+    /// a slice body must not call engine APIs: workers carry no managed
+    /// invocation scope and every entry point refuses them.
+    ///
+    /// A single work item runs inline on this thread (no FFI, no pool hop).
+    /// <paramref name="rowsPerSlice"/> is clamped to
+    /// <see cref="ParallelRows.MinimumRowsPerSlice"/>. The enumerator is
+    /// consumed, like the sequential walk: create it fresh per call.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// The calling thread has no managed invocation scope, or a parallel pass
+    /// is already running on it.
+    /// </exception>
+    public void ForEachSliceParallel(
+        ParallelSliceRunner runner, int rowsPerSlice = ParallelRows.DefaultRowsPerSlice)
+    {
+        ArgumentNullException.ThrowIfNull(runner);
+        ParallelRows.EnterPass();
+        try
+        {
+            if (rowsPerSlice < ParallelRows.MinimumRowsPerSlice)
+                rowsPerSlice = ParallelRows.MinimumRowsPerSlice;
+
+            var items = new List<ParallelWorkItem>();
+            while (MoveToNextChunk())
+            {
+                ParallelSegment segment = SnapshotSegment();
+                for (var start = 0; start < segment.RowCount; start += rowsPerSlice)
+                {
+                    items.Add(new ParallelWorkItem(
+                        segment, start, Math.Min(rowsPerSlice, segment.RowCount - start)));
+                }
+            }
+            if (items.Count == 0)
+                return;
+            ParallelRows.RunSlices(items.ToArray(), runner);
+        }
+        finally
+        {
+            ParallelRows.ExitPass();
+        }
+    }
+
+    /// <summary>Snapshot the current joined chunk into a worker-safe segment.</summary>
+    private ParallelSegment SnapshotSegment()
+    {
+        var data = new IntPtr[8];
+        var ticks = new IntPtr[8];
+        var present = new bool[8];
+        var changeTick = new uint[8];
+        for (var i = 0; i < _terms.Length; i++)
+        {
+            QueryColumn column = _columns[i];
+            data[i] = column.Data;
+            ticks[i] = column.Ticks;
+            present[i] = column.Present;
+            changeTick[i] = column.ChangeTick;
+            if (column.Present)
+            {
+                // The check QueryRow's typed accessors make lazily, done once
+                // here: workers inherit pointers that were validated already.
+                Engine.ValidateChunkScope(
+                    column.ScopeToken,
+                    column.Term.ComponentType?.FullName ?? "component");
+            }
+        }
+        return new ParallelSegment(data, ticks, present, changeTick, _length);
+    }
 }
 
 // =============================================================================

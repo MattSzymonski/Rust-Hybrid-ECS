@@ -473,15 +473,12 @@ impl<'de, T: Copy + Deserialize<'de>> Deserialize<'de> for DynamicBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serializes tests that assert on the shared block accounting.
-    static ACCOUNTING_GUARD: Mutex<()> = Mutex::new(());
-
+    /// The crate-wide accounting lock: `native_buffer`'s tests assert on the
+    /// same process-wide counters, so both modules must take one lock; a guard
+    /// of this module's own would leave the two interleaving.
     fn guarded() -> std::sync::MutexGuard<'static, ()> {
-        ACCOUNTING_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        native_buffer::accounting_guard::lock()
     }
 
     /// The mirror and the C# side both depend on the handle being exactly

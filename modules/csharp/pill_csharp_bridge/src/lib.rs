@@ -54,6 +54,8 @@ mod manifest;
 mod manifest_apply;
 /// The rules that name a generated mirror's fields, for generation and binding checks.
 mod mirror_naming;
+/// Parallel dispatch of managed callbacks onto the shared Rayon pool.
+mod parallel;
 /// A shipped C# project as the runtime's external project backend.
 mod project_backend;
 /// Native callbacks used by C# query enumerators.

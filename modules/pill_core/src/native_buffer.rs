@@ -202,19 +202,39 @@ pub unsafe fn reference_count(elements: *mut u8, element_align: usize) -> usize 
 // Tests
 // =============================================================================
 
+/// One lock for every test in the crate that asserts on the allocation
+/// accounting.
+///
+/// The counters are process-wide, so a guard each test module keeps to itself
+/// still lets the modules interleave: an exact-count assertion would capture
+/// the other module's live blocks as its baseline and then watch them
+/// disappear. Shared, each holder sees a process in which only its own test
+/// allocates.
+#[cfg(test)]
+pub(crate) mod accounting_guard {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Held for the body of any test asserting on `live_bytes`/`live_blocks`.
+    static GUARD: Mutex<()> = Mutex::new(());
+
+    /// Take the lock.
+    ///
+    /// Poisoning means an earlier holder panicked, which is already reported;
+    /// it is recovered rather than turned into a cascade of secondary
+    /// failures in every later test.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The accounting statics are process-wide, so tests that assert on them
-    /// take turns.
-    static ACCOUNTING_GUARD: Mutex<()> = Mutex::new(());
 
     fn guarded() -> std::sync::MutexGuard<'static, ()> {
-        ACCOUNTING_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        accounting_guard::lock()
     }
 
     /// The header is at least one word and always a multiple of the element

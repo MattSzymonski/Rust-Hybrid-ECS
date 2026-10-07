@@ -329,6 +329,14 @@ pub(super) struct CsEngineApi {
     time_delta_seconds: extern "C" fn() -> f32,
     /// Seconds since the engine started; `0.0` with no clock.
     time_elapsed_seconds: extern "C" fn() -> f32,
+    /// Run the managed trampoline for every index in `0..count` on the shared
+    /// Rayon pool, joining before returning. Status `0` ran every index, `3`
+    /// no managed system is scheduled on the calling thread, `4` the call
+    /// came from inside a parallel callback, `5` a panic escaped the dispatch.
+    /// `state` is opaque and travels back to `callback` untouched. Appended at
+    /// the end like every earlier slot.
+    parallel_for:
+        extern "C" fn(super::parallel::ParallelCallback, *mut std::ffi::c_void, u32) -> u8,
 }
 
 impl CsEngineApi {
@@ -378,6 +386,7 @@ impl CsEngineApi {
             input_mouse_delta: super::frame_state::ffi_input_mouse_delta,
             time_delta_seconds: super::frame_state::ffi_time_delta_seconds,
             time_elapsed_seconds: super::frame_state::ffi_time_elapsed_seconds,
+            parallel_for: super::parallel::ffi_parallel_for,
         }
     }
 }

@@ -8,9 +8,12 @@
 // This generator closes the gap: it scans every method that takes a closed
 // `Query<...>` parameter, and for each distinct shape emits
 //
-//   * a `Rows()` extension on the query, and
+//   * a `Rows()` extension on the query,
 //   * a per-shape iterator and row with one named member per term
-//     (`row.PhysicsState`, `row.Position`, `row.MeshRendererComponent`, `row.Entity`).
+//     (`row.PhysicsState`, `row.Position`, `row.MeshRendererComponent`, `row.Entity`),
+//   * a `ForEachParallel()` extension pair plus a per-shape body delegate,
+//     whose ref/in parameters bind the caller's lambda to the runtime's
+//     parallel pass (`QueryEnumerator.ForEachSliceParallel`).
 //
 // The generated row wraps the runtime's own typed row, so it inherits the
 // same semantics: `Write<T>` terms return `ref T` and stamp the change tick,
@@ -236,11 +239,101 @@ namespace PillIterationGenerators
             source.AppendLine("using System.Runtime.CompilerServices;");
             source.AppendLine();
 
+            // The parallel entry point's shape: a body delegate whose ref/in
+            // parameters replace the ref-struct row, because a worker lambda
+            // cannot capture a ref struct. Slots are term positions.
+            List<string> bodyParameters = new List<string>();
+            List<string> bodyArguments = new List<string>();
+            for (int index = 0; index < shape.Terms.Length; index++)
+            {
+                TermInfo term = shape.Terms[index];
+                switch (term.Kind)
+                {
+                    case TermKind.Write:
+                        bodyParameters.Add($"ref {term.PayloadDisplay} {term.MemberName}");
+                        bodyArguments.Add($"ref {term.MemberName}");
+                        break;
+                    case TermKind.Read:
+                        bodyParameters.Add($"in {term.PayloadDisplay} {term.MemberName}");
+                        bodyArguments.Add($"in {term.MemberName}");
+                        break;
+                    case TermKind.OptionalWrite:
+                        bodyParameters.Add($"global::TracyLive.OptionalWriteRef<{term.PayloadDisplay}> {term.MemberName}");
+                        bodyArguments.Add(term.MemberName);
+                        break;
+                    case TermKind.OptionalRead:
+                        bodyParameters.Add($"global::TracyLive.OptionalReadRef<{term.PayloadDisplay}> {term.MemberName}");
+                        bodyArguments.Add(term.MemberName);
+                        break;
+                    case TermKind.Entity:
+                        bodyParameters.Add($"global::TracyLive.Entity {term.MemberName}");
+                        bodyArguments.Add(term.MemberName);
+                        break;
+                }
+            }
+            string bodyParameterList = string.Join(", ", bodyParameters);
+            string bodyArgumentList = string.Join(", ", bodyArguments);
+
+            source.AppendLine($"/// <summary>Body of a parallel pass over `{shape.QueryDisplay}`: one call per row.</summary>");
+            source.AppendLine("/// <remarks>Runs on worker threads - touch only the references handed in, call no engine APIs or Commands, start no nested pass; row order is undefined.</remarks>");
+            source.AppendLine($"{shape.Accessibility} delegate void {name}ParallelBody({bodyParameterList});");
+            source.AppendLine();
+
             source.AppendLine($"/// <summary>Entry point for `{shape.QueryDisplay}`: iterate with named per-term accessors.</summary>");
             source.AppendLine($"{shape.Accessibility} static class {name}Extensions");
             source.AppendLine("{");
             source.AppendLine("    /// <summary>Iterate the query with named, strongly typed accessors.</summary>");
             source.AppendLine($"    {shape.Accessibility} static {name}Rows Rows(this {shape.QueryDisplay} query) => new(query.GetEnumerator());");
+            source.AppendLine();
+            source.AppendLine("    /// <summary>Run a parallel pass over every matched row on the host's shared thread pool.</summary>");
+            source.AppendLine("    /// <remarks>");
+            source.AppendLine("    /// The body runs on worker threads: it may touch only the references it is handed,");
+            source.AppendLine("    /// must not call engine APIs or Commands, must not start another parallel pass, and");
+            source.AppendLine("    /// row order is undefined. The call returns after every row finished; the first");
+            source.AppendLine("    /// exception a row throws is rethrown on the calling thread after the join.");
+            source.AppendLine("    /// </remarks>");
+            source.AppendLine($"    {shape.Accessibility} static void ForEachParallel(this {shape.QueryDisplay} query, {name}ParallelBody body) =>");
+            source.AppendLine("        ForEachParallel(query, global::TracyLive.ParallelRows.DefaultRowsPerSlice, body);");
+            source.AppendLine();
+            source.AppendLine("    /// <summary>Run a parallel pass with a caller-chosen rows-per-slice size (clamped to the runtime minimum).</summary>");
+            source.AppendLine($"    {shape.Accessibility} static void ForEachParallel(this {shape.QueryDisplay} query, int rowsPerSlice, {name}ParallelBody body)");
+            source.AppendLine("    {");
+            source.AppendLine("        // The runner captures only `body`: nothing here may keep an enumerator or");
+            source.AppendLine("        // query reference beyond the frame-thread resolution that made the segments.");
+            source.AppendLine("        ((global::TracyLive.QueryBase)query).GetEnumerator().ForEachSliceParallel(");
+            source.AppendLine("            (segment, start, count) =>");
+            source.AppendLine("            {");
+            source.AppendLine("                for (int row = start; row < start + count; row++)");
+            source.AppendLine("                {");
+            for (int index = 0; index < shape.Terms.Length; index++)
+            {
+                TermInfo term = shape.Terms[index];
+                switch (term.Kind)
+                {
+                    case TermKind.Write:
+                        // Stamp like the sequential row does when its writable
+                        // accessor is fetched, then hand out the reference.
+                        source.AppendLine($"                    segment.MarkChanged({index}, row);");
+                        source.AppendLine($"                    ref {term.PayloadDisplay} {term.MemberName} = ref segment.Get<{term.PayloadDisplay}>({index}, row);");
+                        break;
+                    case TermKind.Read:
+                        source.AppendLine($"                    ref readonly {term.PayloadDisplay} {term.MemberName} = ref segment.Get<{term.PayloadDisplay}>({index}, row);");
+                        break;
+                    case TermKind.OptionalWrite:
+                        source.AppendLine($"                    global::TracyLive.OptionalWriteRef<{term.PayloadDisplay}> {term.MemberName} = segment.GetOptionalWrite<{term.PayloadDisplay}>({index}, row);");
+                        break;
+                    case TermKind.OptionalRead:
+                        source.AppendLine($"                    global::TracyLive.OptionalReadRef<{term.PayloadDisplay}> {term.MemberName} = segment.GetOptionalRead<{term.PayloadDisplay}>({index}, row);");
+                        break;
+                    case TermKind.Entity:
+                        source.AppendLine($"                    global::TracyLive.Entity {term.MemberName} = segment.GetEntity({index}, row);");
+                        break;
+                }
+            }
+            source.AppendLine($"                    body({bodyArgumentList});");
+            source.AppendLine("                }");
+            source.AppendLine("            }, rowsPerSlice);");
+            source.AppendLine("    }");
             source.AppendLine("}");
             source.AppendLine();
 

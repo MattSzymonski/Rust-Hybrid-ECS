@@ -682,6 +682,7 @@ mod tests {
     /// which is the path the Inspector uses to edit materials live.
     #[test]
     fn set_field_on_renderer_light_updates_intensity() {
+        use pill_engine::Component as _;
         use pill_master_renderer_data::{register_components, DirectionalLightComponent};
         let mut engine = Engine::new();
         register_components(engine.world_mut());
@@ -691,7 +692,12 @@ mod tests {
             .with(DirectionalLightComponent::default())
             .build()
             .unwrap();
-        let name = std::any::type_name::<DirectionalLightComponent>().to_string();
+        // The registered name, not the Rust type path: the renderer pins
+        // `shared_name()` so the component keeps the identity it carried
+        // before it moved crates.
+        let name = DirectionalLightComponent::shared_name()
+            .expect("the renderer light pins its shared name")
+            .to_string();
         let failures = EditorCommand::apply(
             &mut engine,
             &[EditorCommand::SetField {

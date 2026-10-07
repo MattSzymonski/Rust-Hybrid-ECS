@@ -36,6 +36,12 @@ namespace PillScriptAnalyzers
         private const string EcsSystemAttribute = "TracyLive.EcsSystemAttribute";
         private const string EcsStartupAttribute = "TracyLive.EcsStartupAttribute";
 
+        /// <summary>The managed Commands type; a body may not reference it.</summary>
+        private const string CommandsType = "TracyLive.Commands";
+
+        /// <summary>The engine facade; a body may not reference it.</summary>
+        private const string EngineFacadeType = "TracyLive.Engine";
+
         /// <summary>Matches the loader's own parameter budget.</summary>
         private const int MaxSystemParameters = 6;
 
@@ -62,6 +68,7 @@ namespace PillScriptAnalyzers
                 PillDiagnostics.MustReturnVoid,
                 PillDiagnostics.ParameterBudget,
                 PillDiagnostics.NoAsyncSystem,
+                PillDiagnostics.NoEngineCallsInParallelBody,
                 PillDiagnostics.MutableStaticState,
                 PillDiagnostics.StaticEventBlocksUnload,
                 PillDiagnostics.BackgroundWorkBlocksUnload,
@@ -84,6 +91,8 @@ namespace PillScriptAnalyzers
                 AnalyzeObjectCreation, OperationKind.ObjectCreation);
             context.RegisterOperationAction(
                 AnalyzeInvocation, OperationKind.Invocation);
+            context.RegisterSyntaxNodeAction(
+                AnalyzeParallelBody, SyntaxKind.InvocationExpression);
         }
 
         // ------------------------------------------------------------------
@@ -171,6 +180,76 @@ namespace PillScriptAnalyzers
             return name.EndsWith("Attribute")
                 ? name.Substring(0, name.Length - "Attribute".Length)
                 : name;
+        }
+
+        // ------------------------------------------------------------------
+        // Parallel row bodies
+        // ------------------------------------------------------------------
+
+        /// <summary>Reject engine and Commands use inside a parallel row body.</summary>
+        /// <remarks>
+        /// A `ForEachParallel` body runs on pool worker threads, where workers
+        /// carry no scheduled scope and every engine entry point refuses the
+        /// call - typically as a per-frame error storm from inside the pass.
+        /// The rule is a best effort: it inspects lambda arguments of calls
+        /// named `ForEachParallel` and flags the first identifier whose symbol
+        /// is the enclosing system's `Commands` parameter or the `Engine`
+        /// facade. Arbitrary aliasing into the body is out of scope - the
+        /// runtime refusal remains the enforcement of record.
+        /// </remarks>
+        private static void AnalyzeParallelBody(SyntaxNodeAnalysisContext context)
+        {
+            var invocation = (InvocationExpressionSyntax)context.Node;
+            if (MethodNameOf(invocation.Expression) != "ForEachParallel")
+                return;
+
+            foreach (ArgumentSyntax argument in invocation.ArgumentList.Arguments)
+            {
+                if (argument.Expression is not AnonymousFunctionExpressionSyntax lambda)
+                    continue;
+                SyntaxNode? body = lambda.Body;
+                if (body is null)
+                    continue;
+
+                foreach (SyntaxNode node in body.DescendantNodesAndSelf())
+                {
+                    if (node is not IdentifierNameSyntax identifier)
+                        continue;
+                    ISymbol? symbol = context.SemanticModel
+                        .GetSymbolInfo(identifier, context.CancellationToken)
+                        .Symbol;
+                    bool touchesEngine =
+                        (symbol is IParameterSymbol parameter &&
+                         parameter.Type.ToDisplayString() == CommandsType) ||
+                        (symbol is INamedTypeSymbol type &&
+                         type.ToDisplayString() == EngineFacadeType);
+                    if (!touchesEngine)
+                        continue;
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        PillDiagnostics.NoEngineCallsInParallelBody,
+                        identifier.GetLocation(),
+                        identifier.Identifier.ValueText));
+                    // One finding per body: the first names the pattern, and
+                    // the edit that fixes it usually removes the rest.
+                    return;
+                }
+            }
+        }
+
+        /// <summary>The simple name a call expression names, or null.</summary>
+        private static string? MethodNameOf(ExpressionSyntax expression)
+        {
+            switch (expression)
+            {
+                case IdentifierNameSyntax identifier:
+                    return identifier.Identifier.ValueText;
+                case GenericNameSyntax generic:
+                    return generic.Identifier.ValueText;
+                case MemberAccessExpressionSyntax member:
+                    return MethodNameOf(member.Name);
+                default:
+                    return null;
+            }
         }
 
         // ------------------------------------------------------------------
