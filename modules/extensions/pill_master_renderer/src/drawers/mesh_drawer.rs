@@ -50,7 +50,7 @@ use crate::{
 /// empty through `Default` makes the first item count as a change, so its
 /// resources are bound before anything is drawn.
 #[derive(Debug, Clone, Default)]
-pub struct DrawingContext {
+pub(crate) struct DrawingContext {
     shader_handle: Option<RendererShaderHandle>,
     shader_name: String,
     material_handle: Option<RendererMaterialHandle>,
@@ -237,7 +237,7 @@ impl DrawingContext {
 ///
 /// One drawer lives for the renderer's lifetime. The buffer is reused every
 /// frame and grows only when a frame brings more instances than it holds.
-pub struct MeshDrawer {
+pub(crate) struct MeshDrawer {
     /// How many instances the buffer grows by at a time.
     capacity_step: usize,
     instance_buffer: wgpu::Buffer,
@@ -318,7 +318,8 @@ impl MeshDrawer {
         render_queue: &[RenderQueueItem],
         ranges: &[Range<u32>],
         viewport: RenderViewport,
-        // Counts the pass's shader invocations, when GPU profiling is on.
+        // Counts the pass's visible coverage and shader invocations, when GPU
+        // profiling is on.
         profiler: Option<&Profiler>,
     ) -> Result<()> {
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -326,7 +327,7 @@ impl MeshDrawer {
             color_attachments,
             depth_stencil_attachment: Some(depth_stencil_attachment),
             timestamp_writes: None,
-            occlusion_query_set: None,
+            occlusion_query_set: profiler.and_then(|profiler| profiler.get_occlusion_query_set()),
         });
 
         render_pass.set_viewport(
@@ -341,6 +342,9 @@ impl MeshDrawer {
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         let counting = profiler
             .and_then(|profiler| profiler.begin_pipeline_statistics_query(&mut render_pass))
+            .is_some();
+        let occluding = profiler
+            .and_then(|profiler| profiler.begin_occlusion_query(&mut render_pass))
             .is_some();
 
         let mut current_drawing_context = DrawingContext::default();
@@ -422,6 +426,9 @@ impl MeshDrawer {
         current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
         if let (true, Some(profiler)) = (counting, profiler) {
             profiler.end_pipeline_statistics_query(&mut render_pass);
+        }
+        if let (true, Some(profiler)) = (occluding, profiler) {
+            profiler.end_occlusion_query(&mut render_pass);
         }
 
         // Drop render_pass before returning: the borrow of the encoder has to

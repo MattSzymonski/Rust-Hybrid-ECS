@@ -1209,17 +1209,11 @@ impl Engine {
                 self.system_failures
                     .push(SystemFailure::new(registered_system.name.clone(), error));
             }
-            // Record the tick that was current at system entry so the next
-            // run sees mutations that happened during this run.
-            registered_system.last_run = started_at;
-            // Update splitting hint of execution time.
-            let elapsed = system_start.elapsed().as_nanos() as u64;
-            let old_avg = registered_system.average_duration;
-            let delta = elapsed as i64 - old_avg as i64;
-            registered_system.average_duration =
-                (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
-            // Store instantaneous duration for utilization metric.
-            registered_system.last_duration = elapsed;
+            record_system_run(
+                registered_system,
+                started_at,
+                system_start.elapsed().as_nanos() as u64,
+            );
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -1292,16 +1286,11 @@ impl Engine {
                     self.system_failures
                         .push(SystemFailure::new(registered.name.clone(), error));
                 }
-                registered.last_run = started_at;
-                // Update splitting hint of execution time.
-                let elapsed = system_start.elapsed().as_nanos() as u64;
-                let old_avg = registered.average_duration;
-                let delta = elapsed as i64 - old_avg as i64;
-                registered.average_duration = (old_avg as i64
-                    + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW)
-                    as u64;
-                // Store instantaneous duration for utilization metric.
-                registered.last_duration = elapsed;
+                record_system_run(
+                    registered,
+                    started_at,
+                    system_start.elapsed().as_nanos() as u64,
+                );
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -1443,14 +1432,11 @@ impl Engine {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .push((system_names[i].to_string(), error));
                         }
-                        // Update splitting hint of execution time.
-                        let elapsed = system_start.elapsed().as_nanos() as u64;
-                        let old_avg = registered_system.average_duration;
-                        let delta = elapsed as i64 - old_avg as i64;
-                        registered_system.average_duration =
-                            (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
-                        // Store instantaneous duration for utilization metric.
-                        registered_system.last_duration = elapsed;
+                        record_system_run(
+                            registered_system,
+                            started_at,
+                            system_start.elapsed().as_nanos() as u64,
+                        );
                     }
 
                     set_per_thread_this_run_tick(previous_this_run);
@@ -1489,6 +1475,31 @@ impl Engine {
         }
         self.world.system_last_run = 0;
     }
+}
+
+/// Apply the bookkeeping every dispatch path owes a system that just ran.
+///
+/// One definition for the sequential path, the single-system batch lane and
+/// the parallel batch closure: the change-detection baseline advances to the
+/// tick captured at system entry (so the next run sees mutations that
+/// happened during this run), the splitting hint tracks the observed
+/// duration with the configured smoothing window, and the instantaneous
+/// duration feeds the utilization metric. The batch-wide `last_run` advance
+/// after the closure stays where it is: it also covers disabled members,
+/// which never enter a worker task.
+fn record_system_run(
+    registered_system: &mut RegisteredSystem,
+    started_at: u32,
+    elapsed_nanos: u64,
+) {
+    registered_system.last_run = started_at;
+    // Update splitting hint of execution time.
+    let old_avg = registered_system.average_duration;
+    let delta = elapsed_nanos as i64 - old_avg as i64;
+    registered_system.average_duration =
+        (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
+    // Store instantaneous duration for utilization metric.
+    registered_system.last_duration = elapsed_nanos;
 }
 
 impl Default for Engine {

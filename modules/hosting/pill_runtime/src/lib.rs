@@ -29,9 +29,6 @@
 mod error;
 /// How modules, the project and the renderer register with the engine.
 pub mod registration;
-/// Renderer assets kept beside the engine.
-#[cfg(feature = "rendering")]
-mod render_assets;
 /// Attaching a renderer to a frontend's window, through its handles as data.
 #[cfg(feature = "rendering")]
 mod render_window;
@@ -62,8 +59,6 @@ pub use telemetry::{apply_logging_settings, init_telemetry, LoggingSettings};
 
 #[cfg(feature = "rendering")]
 pub use error::RenderingError;
-#[cfg(feature = "rendering")]
-pub use render_assets::NativeAssets;
 #[cfg(feature = "rendering")]
 pub use render_window::RendererWindow;
 #[cfg(feature = "rendering")]

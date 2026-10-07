@@ -189,16 +189,9 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
     let mut create_folder = use_signal(String::new);
     let mut create_error = use_signal(String::new);
 
-    let poll_editor = Arc::clone(&editor);
-    use_future(move || {
-        let poll_editor = Arc::clone(&poll_editor);
-        async move {
-            loop {
-                entries.set(poll_editor.asset_entries());
-                selected.set(poll_editor.selected_asset());
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        entries.set(editor.asset_entries());
+        selected.set(editor.selected_asset());
     });
 
     let rows = entries.read().clone();
@@ -396,9 +389,14 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
 /// Remounted per path (the Inspector keys it by path), so the form always
 /// starts from the selected asset's file. Saving writes the file and the dev
 /// host's asset watcher reimports the asset into the running scene; moving
-/// renames both files and the watcher follows the move.
+/// renames both files and the watcher follows the move. The entry comes from
+/// the parent's poll rather than a per-render walk of the asset tree.
 #[component]
-pub(crate) fn AssetInspector(editor: Arc<EditorContext>, path: String) -> Element {
+pub(crate) fn AssetInspector(
+    editor: Arc<EditorContext>,
+    path: String,
+    entry: Option<AssetEntry>,
+) -> Element {
     let initial = {
         let editor = Arc::clone(&editor);
         let path = path.clone();
@@ -408,10 +406,6 @@ pub(crate) fn AssetInspector(editor: Arc<EditorContext>, path: String) -> Elemen
     let mut move_target = use_signal(|| path.clone());
     let mut status = use_signal(String::new);
 
-    let entry = editor
-        .asset_entries()
-        .into_iter()
-        .find(|entry| entry.path == path);
     let summary = entry.as_ref().map(row_subtitle).unwrap_or_default();
     let is_asset = entry
         .as_ref()

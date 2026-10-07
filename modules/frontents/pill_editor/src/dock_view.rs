@@ -124,12 +124,7 @@ pub fn DockView(
     let dock_css = live_dock_css();
     let model_value = model.read();
     let move_snapshot = snapshot.clone();
-    let active_tabset = model_value.active_tabset.or_else(|| {
-        model_value
-            .nodes
-            .iter()
-            .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id))
-    });
+    let active_tabset = model_value.resolved_active_tabset();
     let closed_panels = [
         PanelKind::Hierarchy,
         PanelKind::Inspector,

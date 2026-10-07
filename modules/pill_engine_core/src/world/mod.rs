@@ -709,29 +709,6 @@ impl World {
         Ok(entity)
     }
 
-    /// The type-independent half of [`Self::claim_shared_resource_name`].
-    ///
-    /// A declaration from another language has no Rust type to ask, so it hands
-    /// over the same four facts its manifest carries. `foreign` decides one
-    /// thing: whether the declaring names are compared. Two Rust types reaching
-    /// one shared name are a collision, and their own names are what tells two
-    /// copies of one type from two different types. A foreign declaration has
-    /// no Rust name to compare against a final path segment, and writing the
-    /// shared name down *is* its statement of which resource it means - so
-    /// there the layout is the check.
-    ///
-    /// The recorded claim deliberately keeps its Rust declarer when a foreign
-    /// declaration joins: that record is what a later Rust arrival is compared
-    /// against, and a managed name would make every later arrival look
-    /// different. A Rust arrival to a foreign claim does take the record, for
-    /// the same reason in reverse.
-    ///
-    /// Returns the error, and does not record it: the Rust wrapper above
-    /// records what its drain has to see, while a foreign declaration's caller
-    /// is the one that must act on the refusal.
-    // Seven facts about one declaration, each of them read from the manifest
-    // or the Rust type rather than derived: grouping them into a struct would
-    // hide that every field is a separate claim about the same resource.
     /// Check if an entity exists and is valid (not destroyed/recycled)
     ///
     /// Returns true if the entity exists in the world with the correct generation.

@@ -210,8 +210,6 @@ pub(crate) enum PatchOutcome {
         stages: PatchStages,
         /// Size of the compiled patch, for the analytics line.
         artifact_bytes: u64,
-        /// Exports the compiled patch carries, for the analytics line.
-        exports: usize,
         /// Which mechanisms delivered this edit. More than one when a single
         /// save changed both an annotated and an un-annotated body.
         routes: Vec<crate::analytics::PatchRoute>,
@@ -326,8 +324,6 @@ struct ApplyResult {
     generation: u32,
     /// Size of the compiled patch on disk.
     artifact_bytes: u64,
-    /// Exports the compiled patch carries.
-    exports: usize,
     /// Which of the three mechanisms delivered it. Reported rather than
     /// inferred downstream: an annotated and an un-annotated plain function are
     /// the same `HotFunctionKind` but take completely different routes.
@@ -1028,7 +1024,6 @@ impl HotPatchSession {
             elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
             stages,
             artifact_bytes: installed.artifact_bytes,
-            exports: installed.exports,
             routes,
             copies,
         }
@@ -1201,7 +1196,6 @@ impl HotPatchSession {
         Ok(ApplyResult {
             generation,
             artifact_bytes: built.artifact_bytes,
-            exports: built.exports,
             route,
             copies,
         })
@@ -1496,18 +1490,14 @@ impl HotPatchSession {
             // Cargo has not produced one; the staged copy is all there is.
             return Ok(());
         };
-        let Ok(built_metadata) = std::fs::metadata(&built) else {
+        if std::fs::metadata(&built).is_err() {
             return Ok(());
-        };
-        if let Ok(staged_metadata) = std::fs::metadata(&self.package_rlib) {
-            let same_size = staged_metadata.len() == built_metadata.len();
-            let staged_is_current = match (staged_metadata.modified(), built_metadata.modified()) {
-                (Ok(staged), Ok(built)) => staged >= built,
-                _ => false,
-            };
-            if same_size && staged_is_current {
-                return Ok(());
-            }
+        }
+        // The same "same size and not older" rule the shared-rlib staging
+        // applies, so a staged copy either path leaves behind satisfies the
+        // other.
+        if crate::build_runner::staged_copy_is_current(&built, &self.package_rlib) {
+            return Ok(());
         }
 
         std::fs::copy(&built, &self.package_rlib).map_err(|error| {

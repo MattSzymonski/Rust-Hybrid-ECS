@@ -448,8 +448,16 @@ pub fn hot_function_names(source: &str) -> Vec<String> {
 /// type whose `impl` block encloses it.
 pub fn hot_functions(source: &str) -> Vec<HotFunction> {
     let mask = code_mask(source);
-    let bytes = source.as_bytes();
     let blocks = inherent_impl_blocks(source, &mask);
+    hot_functions_in(source, &mask, &blocks)
+}
+
+/// [`hot_functions`] against a code mask and impl blocks a caller already has.
+///
+/// Building both scans the whole file, so the all-functions scan - which needs
+/// the annotated set too - passes its own rather than paying for them twice.
+fn hot_functions_in(source: &str, mask: &[bool], blocks: &[ImplBlock]) -> Vec<HotFunction> {
+    let bytes = source.as_bytes();
     let mut found: Vec<HotFunction> = Vec::new();
     let mut index = 0usize;
 
@@ -506,27 +514,15 @@ pub fn hot_functions(source: &str) -> Vec<HotFunction> {
                     .min_by_key(|block| block.body.1 - block.body.0);
                 let self_type = enclosing.map(|block| block.type_name.clone());
                 let trait_name = enclosing.and_then(|block| block.trait_name.clone());
-                found.push(HotFunction {
+                found.push(descriptor_at(
+                    source,
+                    mask,
+                    declaration_start,
                     name,
                     kind,
-                    self_type,
-                    trait_name,
-                    takes_receiver: declaration_takes_receiver(source, &mask, declaration_start),
-                    signature: normalized_signature(source, &mask, declaration_start),
-                    cfg_gated: declaration_is_cfg_gated(source, &mask, declaration_start),
-                    inline_always: declaration_has_attribute(
-                        source,
-                        &mask,
-                        declaration_start,
-                        "#[inline(always)]",
-                    ),
-                    abi_entry_point: declaration_is_abi_entry_point(
-                        source,
-                        &mask,
-                        declaration_start,
-                    ),
-                    annotated: true,
-                });
+                    (self_type, trait_name),
+                    true,
+                ));
             }
         }
         index = attribute_start + 1;
@@ -550,7 +546,7 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
     let mask = code_mask(source);
     let bytes = source.as_bytes();
     let blocks = inherent_impl_blocks(source, &mask);
-    let annotated: HashMap<String, HotFunctionKind> = hot_functions(source)
+    let annotated: HashMap<String, HotFunctionKind> = hot_functions_in(source, &mask, &blocks)
         .into_iter()
         .map(|function| (function.name, function.kind))
         .collect();
@@ -598,23 +594,16 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                             .get(&name)
                             .copied()
                             .unwrap_or(HotFunctionKind::PlainFunction);
-                        found.push(HotFunction {
-                            name: name.clone(),
+                        let is_annotated = annotated.contains_key(&name);
+                        found.push(descriptor_at(
+                            source,
+                            &mask,
+                            index,
+                            name,
                             kind,
-                            self_type,
-                            trait_name,
-                            takes_receiver: declaration_takes_receiver(source, &mask, index),
-                            signature: normalized_signature(source, &mask, index),
-                            cfg_gated: declaration_is_cfg_gated(source, &mask, index),
-                            inline_always: declaration_has_attribute(
-                                source,
-                                &mask,
-                                index,
-                                "#[inline(always)]",
-                            ),
-                            abi_entry_point: declaration_is_abi_entry_point(source, &mask, index),
-                            annotated: annotated.contains_key(&name),
-                        });
+                            (self_type, trait_name),
+                            is_annotated,
+                        ));
                     }
                 }
             }
@@ -622,6 +611,43 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
         index += 1;
     }
     found
+}
+
+/// Build one descriptor from a declaration byte offset.
+///
+/// Both scans resolve the same per-declaration facts the same way - receiver,
+/// signature, cfg gate, `#[inline(always)]` and ABI-entry status - so this is
+/// that one path rather than a constructor written out twice.
+///
+// Eight named facts stay clearer than a temporary struct each scan builds and
+// this one immediately takes apart.
+#[allow(clippy::too_many_arguments)]
+fn descriptor_at(
+    source: &str,
+    mask: &[bool],
+    declaration_start: usize,
+    name: String,
+    kind: HotFunctionKind,
+    enclosing: (Option<String>, Option<String>),
+    annotated: bool,
+) -> HotFunction {
+    HotFunction {
+        name,
+        kind,
+        self_type: enclosing.0,
+        trait_name: enclosing.1,
+        takes_receiver: declaration_takes_receiver(source, mask, declaration_start),
+        signature: normalized_signature(source, mask, declaration_start),
+        cfg_gated: declaration_is_cfg_gated(source, mask, declaration_start),
+        inline_always: declaration_has_attribute(
+            source,
+            mask,
+            declaration_start,
+            "#[inline(always)]",
+        ),
+        abi_entry_point: declaration_is_abi_entry_point(source, mask, declaration_start),
+        annotated,
+    }
 }
 
 /// One `impl` block whose methods can be attributed to a named type.

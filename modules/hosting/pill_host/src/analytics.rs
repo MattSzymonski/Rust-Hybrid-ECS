@@ -8,7 +8,7 @@
 //!   and schema migration.
 //! - Measure the host process and the cargo child process memory (working set
 //!   and peak high-water mark).
-//! - Inspect each loaded DLL: artifact size, PE exports, and imported DLLs.
+//! - Inspect each loaded DLL: artifact size, image size and imported DLLs.
 //! - Read each module's direct cargo dependencies from the `.fingerprint` JSON.
 //! - Parse cargo `--timings` HTML for per-crate compile+link wall time.
 //! - Print a full startup report and a compact line per hot reload.
@@ -101,19 +101,20 @@ impl ModuleKind {
 
 /// The interesting parts of a Windows PE executable header.
 pub(crate) struct PeInspection {
-    /// Named exports from the export directory.
-    pub exports: Vec<String>,
     /// DLL names referenced by the import directory.
     pub import_dlls: Vec<String>,
     /// `SizeOfImage` from the optional header, in bytes.
     pub image_size: u64,
 }
 
-/// Parse a Windows PE file's export and import directories.
+/// Parse a Windows PE file's import directory and image size.
 ///
 /// Returns `None` for anything that is not a PE32/PE32+ image (including
 /// `.so` and `.dylib` on other platforms). Pure byte parsing: no OS calls, so
 /// it compiles and runs everywhere even though it only understands PE files.
+/// The export directory is deliberately not walked: the report keeps the
+/// image size and the imported DLLs, and an unexercised export parser is
+/// maintenance cost with no reader.
 pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     let data = std::fs::read(path).ok()?;
     if data.len() < 0x40 || &data[0..2] != b"MZ" {
@@ -145,16 +146,6 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     if data_directory_offset + 16 > data.len() {
         return None;
     }
-    let export_rva = u32::from_le_bytes(
-        data[data_directory_offset..data_directory_offset + 4]
-            .try_into()
-            .ok()?,
-    );
-    let export_size = u32::from_le_bytes(
-        data[data_directory_offset + 4..data_directory_offset + 8]
-            .try_into()
-            .ok()?,
-    );
     let import_rva = u32::from_le_bytes(
         data[data_directory_offset + 8..data_directory_offset + 12]
             .try_into()
@@ -193,41 +184,6 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
         None
     };
 
-    // Export directory: the number of named exports and the name pointer table.
-    let exports = if export_rva != 0 && export_size != 0 {
-        let mut names = Vec::new();
-        if let Some(directory) = rva_to_offset(export_rva) {
-            if directory + 40 <= data.len() {
-                let number_of_names =
-                    u32::from_le_bytes(data[directory + 24..directory + 28].try_into().ok()?);
-                let address_of_names =
-                    u32::from_le_bytes(data[directory + 32..directory + 36].try_into().ok()?);
-                if let Some(name_table) = rva_to_offset(address_of_names) {
-                    for index in 0..number_of_names {
-                        let entry = name_table + index as usize * 4;
-                        if entry + 4 > data.len() {
-                            break;
-                        }
-                        let name_rva = u32::from_le_bytes(data[entry..entry + 4].try_into().ok()?);
-                        if let Some(offset) = rva_to_offset(name_rva) {
-                            let end = data[offset..]
-                                .iter()
-                                .position(|&byte| byte == 0)
-                                .map(|position| offset + position)
-                                .unwrap_or(offset);
-                            if let Ok(name) = std::str::from_utf8(&data[offset..end]) {
-                                names.push(name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        names
-    } else {
-        Vec::new()
-    };
-
     // Import directory: a null-terminated list of image import descriptors,
     // each naming one imported DLL.
     let import_dlls = if import_rva != 0 && import_size != 0 {
@@ -263,7 +219,6 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     };
 
     Some(PeInspection {
-        exports,
         import_dlls,
         image_size,
     })
@@ -549,7 +504,6 @@ struct ModuleAnalytics {
     migrate_ms: f64,
     artifact_bytes: u64,
     image_size: u64,
-    exports: Vec<String>,
     import_dlls: Vec<String>,
     cargo_deps: Vec<String>,
     cargo_unit_ms: Option<u64>,
@@ -568,7 +522,6 @@ impl ModuleAnalytics {
             migrate_ms: 0.0,
             artifact_bytes: 0,
             image_size: 0,
-            exports: Vec::new(),
             import_dlls: Vec::new(),
             cargo_deps: Vec::new(),
             cargo_unit_ms: None,
@@ -660,7 +613,6 @@ struct ReloadEvent {
     init_ms: f64,
     migrate_ms: f64,
     artifact_bytes: u64,
-    exports: usize,
     reload_count: u32,
     /// Crates that actually compiled or linked in this reload's cargo
     /// invocation(s), with their wall times, sorted by time descending. This
@@ -772,10 +724,10 @@ fn find_or_create(collector: &mut Analytics, name: &str, kind: ModuleKind) -> us
 ///
 /// Called by `build_extension` and `build_project_module` after the real build
 /// branch, with the artifact path being the DLL the host actually loads (the
-/// hot copy for extensions). Also inspects the DLL's PE exports and imports,
-/// reads the crate's direct cargo dependencies, and — when timing reports are
-/// enabled — pulls the per-crate compile+link time from the newest cargo
-/// `--timings` report.
+/// hot copy for extensions). Also inspects the DLL's PE image size and
+/// imports, reads the crate's direct cargo dependencies, and — when timing
+/// reports are enabled — pulls the per-crate compile+link time from the newest
+/// cargo `--timings` report.
 pub(crate) fn record_module_artifact(
     name: &str,
     kind: ModuleKind,
@@ -794,7 +746,6 @@ pub(crate) fn record_module_artifact(
         module.artifact_bytes = metadata.len();
     }
     if let Some(inspection) = inspect_pe(artifact_path) {
-        module.exports = inspection.exports;
         module.import_dlls = inspection.import_dlls;
         module.image_size = inspection.image_size;
     }
@@ -899,7 +850,6 @@ pub(crate) fn record_reload(name: &str) {
             init_ms: module.init_ms,
             migrate_ms: module.migrate_ms,
             artifact_bytes: module.artifact_bytes,
-            exports: module.exports.len(),
             reload_count: reloads,
             cargo_crates,
         }
@@ -926,7 +876,6 @@ pub(crate) fn record_patch(
     load_ms: f64,
     activate_ms: f64,
     artifact_bytes: u64,
-    exports: usize,
     routes: &[PatchRoute],
     copies: usize,
 ) {
@@ -944,7 +893,6 @@ pub(crate) fn record_patch(
         init_ms: activate_ms,
         migrate_ms: 0.0,
         artifact_bytes,
-        exports,
         // A function's generation IS its patch count, so the shared
         // `(reload #N)` column stays meaningful for both kinds.
         reload_count: generation,
@@ -1251,15 +1199,6 @@ fn render_startup_report(collector: &Analytics) -> String {
             total: format_bytes(modules.iter().map(|module| module.artifact_bytes).sum()),
         },
         ReportColumn {
-            header: "exports",
-            left_aligned: false,
-            cells: modules
-                .iter()
-                .map(|module| count(module.exports.len()))
-                .collect(),
-            total: String::new(),
-        },
-        ReportColumn {
             header: "imports",
             left_aligned: false,
             cells: modules
@@ -1468,7 +1407,7 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     for event in &events {
         lines.push(format!(
             "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
-             migrate={}ms | size={} | exports={} | kind={}{}",
+             migrate={}ms | size={} | kind={}{}",
             "[analytics]".cyan().bold(),
             event.name.cyan().bold(),
             format!("(reload #{})", event.reload_count).dimmed(),
@@ -1488,7 +1427,6 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
                 "-".to_string()
             }
             .yellow(),
-            event.exports.to_string().yellow(),
             event.kind.label().yellow(),
             // Appended rather than folded into `kind=`, so the field the
             // harness already parses keeps its exact meaning and vocabulary.
@@ -1798,7 +1736,6 @@ const CONCURRENCY_DATA = [
             init_ms: 1.0,
             migrate_ms: 0.0,
             artifact_bytes: 1024,
-            exports: 4,
             reload_count: 1,
             cargo_crates: Vec::new(),
         };

@@ -22,7 +22,7 @@
 // External crates
 use pill_core::telemetry::telemetry_target;
 use pill_engine::archetype::ArchetypeId;
-use pill_engine::Entity;
+use pill_engine::{ComponentId, ComponentTicks, Entity};
 
 // Current crate
 use super::abi::ComponentChunk;
@@ -52,6 +52,101 @@ fn record_served_archetype(status: u8, output: *mut ComponentChunk) {
         ((chunk.archetype_high as u128) << 64) | chunk.archetype_low as u128,
     ));
 }
+
+/// Write one component column chunk into the managed caller's output buffer.
+///
+/// `data` and `ticks` stay owned by the active world's archetype and are only
+/// valid for the managed invocation that requested the chunk, exactly as
+/// [`ComponentChunk`] documents.
+// Eight fields of one ABI struct rather than an implicit grouping: a wrapper
+// struct over them would exist only to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
+fn write_component_chunk(
+    output: *mut ComponentChunk,
+    archetype: ArchetypeId,
+    data: *mut u8,
+    len: usize,
+    element_size: usize,
+    ticks: *mut ComponentTicks,
+    change_tick: u32,
+    scope_token: u32,
+) {
+    let bits = archetype.0;
+    // SAFETY: `output` is non-null, checked by the caller, and points at a
+    // caller-owned slot; `data` and `ticks` point into a live column of the
+    // active world and stay valid for the duration of the managed invocation.
+    unsafe {
+        output.write(ComponentChunk {
+            archetype_low: bits as u64,
+            archetype_high: (bits >> 64) as u64,
+            data: data.cast(),
+            entities: std::ptr::null(),
+            len: len as u32,
+            element_size: element_size as u32,
+            ticks,
+            change_tick,
+            scope_token,
+        });
+    }
+}
+
+/// Write one archetype's entity column chunk into the managed caller's output
+/// buffer.
+///
+/// Entity rows arrive through the const `entities` slot with null `data` and
+/// `ticks`, the read-only contract the ABI documents, so a managed write
+/// through an entity column cannot be expressed.
+fn write_entity_chunk(
+    output: *mut ComponentChunk,
+    archetype: ArchetypeId,
+    entities: &[Entity],
+    change_tick: u32,
+    scope_token: u32,
+) {
+    let bits = archetype.0;
+    // SAFETY: `output` is non-null, checked by the caller, and points at a
+    // caller-owned slot; the entity slice stays borrowed from the active world
+    // for the duration of the managed invocation.
+    unsafe {
+        output.write(ComponentChunk {
+            archetype_low: bits as u64,
+            archetype_high: (bits >> 64) as u64,
+            data: std::ptr::null_mut(),
+            entities: entities.as_ptr().cast(),
+            len: entities.len() as u32,
+            element_size: std::mem::size_of::<Entity>() as u32,
+            ticks: std::ptr::null_mut(),
+            change_tick,
+            scope_token,
+        });
+    }
+}
+
+/// Whether a module's native binding still matches the live column's layout.
+///
+/// The binding was built from a layout the live column no longer matches - the
+/// module reloaded with a new schema, or a mirror arrived against a stale one.
+/// A wrong-size chunk would be read as the managed mirror's fields, so the
+/// request fails closed here; this replaces a `debug_assert_eq!` that aborted
+/// debug hosts and vanished entirely in release.
+fn module_binding_matches_live_column(
+    component_id: ComponentId,
+    binding_size: usize,
+    column_size: usize,
+) -> bool {
+    if column_size == binding_size {
+        return true;
+    }
+    pill_core::error!(
+        target: telemetry_target::ECS,
+        component_id = ?component_id,
+        binding_size = binding_size,
+        column_size = column_size,
+        "module native binding size disagrees with the live column"
+    );
+    false
+}
+
 /// Return a component chunk to managed code after validating scheduler access.
 ///
 /// Status codes are interpreted by `Engine.TryGetChunk`: `0` ends iteration,
@@ -96,27 +191,16 @@ fn ffi_get_component_chunk_guarded(
             else {
                 return 0;
             };
-            // The archetype's 128-bit pattern is split into two `u64` halves
-            // to match the ABI layout of `ComponentChunk`.
-            let bits = archetype.0;
-            // SAFETY: output is non-null and all pointers remain owned by the
-            // active world's archetype for the managed invocation. The managed
-            // side must not retain the pointers beyond that invocation and
-            // must respect the declared access mode. The u32 length ceiling
-            // is documented on `ComponentChunk`.
-            unsafe {
-                output.write(ComponentChunk {
-                    archetype_low: bits as u64,
-                    archetype_high: (bits >> 64) as u64,
-                    data: data.cast(),
-                    entities: std::ptr::null(),
-                    len: len as u32,
-                    element_size: live_size as u32,
-                    ticks: ticks.as_mut_ptr(),
-                    change_tick,
-                    scope_token,
-                });
-            }
+            write_component_chunk(
+                output,
+                archetype,
+                data,
+                len,
+                live_size,
+                ticks.as_mut_ptr(),
+                change_tick,
+                scope_token,
+            );
             1
         }
         Some(ComponentBinding::ModuleNative {
@@ -131,38 +215,19 @@ fn ffi_get_component_chunk_guarded(
             else {
                 return 0;
             };
-            // The binding was built from a layout the live column no longer
-            // matches - the module reloaded with a new schema, or a mirror
-            // arrived against a stale one. A wrong-size chunk would be read
-            // as the managed mirror's fields, so the request fails closed
-            // here; this replaces a `debug_assert_eq!` that aborted debug
-            // hosts and vanished entirely in release.
-            if element_size != size {
-                pill_core::error!(
-                    target: telemetry_target::ECS,
-                    component_id = ?component_id,
-                    binding_size = size,
-                    column_size = element_size,
-                    "module native binding size disagrees with the live column"
-                );
+            if !module_binding_matches_live_column(component_id, size, element_size) {
                 return 2;
             }
-            let bits = archetype.0;
-            // SAFETY: identical to the descriptor arm above - pointers stay owned
-            // by the active world's archetype for the managed invocation.
-            unsafe {
-                output.write(ComponentChunk {
-                    archetype_low: bits as u64,
-                    archetype_high: (bits >> 64) as u64,
-                    data: data.cast(),
-                    entities: std::ptr::null(),
-                    len: len as u32,
-                    element_size: element_size as u32,
-                    ticks: ticks.as_mut_ptr(),
-                    change_tick,
-                    scope_token,
-                });
-            }
+            write_component_chunk(
+                output,
+                archetype,
+                data,
+                len,
+                element_size,
+                ticks.as_mut_ptr(),
+                change_tick,
+                scope_token,
+            );
             1
         }
         None => 2,
@@ -233,24 +298,13 @@ fn ffi_get_archetype_chunk_guarded(
             let Some((archetype, entities)) = world.entity_chunk_in_archetype(archetype_id) else {
                 return 0;
             };
-            let bits = archetype.0;
-            // SAFETY: `output` was checked above and the entity slice remains
-            // borrowed only for the active managed system invocation. Entity
-            // rows are exposed through the const `entities` slot, so nothing
-            // managed can write through them.
-            unsafe {
-                output.write(ComponentChunk {
-                    archetype_low: bits as u64,
-                    archetype_high: (bits >> 64) as u64,
-                    data: std::ptr::null_mut(),
-                    entities: entities.as_ptr().cast(),
-                    len: entities.len() as u32,
-                    element_size: std::mem::size_of::<Entity>() as u32,
-                    ticks: std::ptr::null_mut(),
-                    change_tick: world.change_tick().get(),
-                    scope_token: active_scope_token(),
-                });
-            }
+            write_entity_chunk(
+                output,
+                archetype,
+                entities,
+                world.change_tick().get(),
+                active_scope_token(),
+            );
             1
         })
         .unwrap_or(3);
@@ -283,23 +337,16 @@ fn ffi_get_archetype_chunk_guarded(
             else {
                 return 0;
             };
-            let bits = archetype.0;
-            // SAFETY: `output` is non-null and the pointers stay owned by the
-            // active world's archetype for the managed invocation, exactly as
-            // in the index-based callback above.
-            unsafe {
-                output.write(ComponentChunk {
-                    archetype_low: bits as u64,
-                    archetype_high: (bits >> 64) as u64,
-                    data: data.cast(),
-                    entities: std::ptr::null(),
-                    len: len as u32,
-                    element_size: live_size as u32,
-                    ticks: ticks.as_mut_ptr(),
-                    change_tick,
-                    scope_token,
-                });
-            }
+            write_component_chunk(
+                output,
+                archetype,
+                data,
+                len,
+                live_size,
+                ticks.as_mut_ptr(),
+                change_tick,
+                scope_token,
+            );
             1
         }
         Some(ComponentBinding::ModuleNative {
@@ -312,33 +359,19 @@ fn ffi_get_archetype_chunk_guarded(
             else {
                 return 0;
             };
-            // As in the index-based callback above: a binding that no longer
-            // matches the live column fails closed instead of asserting.
-            if element_size != size {
-                pill_core::error!(
-                    target: telemetry_target::ECS,
-                    component_id = ?component_id,
-                    binding_size = size,
-                    column_size = element_size,
-                    "module native binding size disagrees with the live column"
-                );
+            if !module_binding_matches_live_column(component_id, size, element_size) {
                 return 2;
             }
-            let bits = archetype.0;
-            // SAFETY: identical to the descriptor arm above.
-            unsafe {
-                output.write(ComponentChunk {
-                    archetype_low: bits as u64,
-                    archetype_high: (bits >> 64) as u64,
-                    data: data.cast(),
-                    entities: std::ptr::null(),
-                    len: len as u32,
-                    element_size: element_size as u32,
-                    ticks: ticks.as_mut_ptr(),
-                    change_tick,
-                    scope_token,
-                });
-            }
+            write_component_chunk(
+                output,
+                archetype,
+                data,
+                len,
+                element_size,
+                ticks.as_mut_ptr(),
+                change_tick,
+                scope_token,
+            );
             1
         }
         None => 2,
@@ -392,26 +425,13 @@ fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -
         let Some((archetype, entities)) = world.entity_chunk(chunk_index as usize) else {
             return 0;
         };
-        // The archetype's 128-bit pattern is split into two `u64` halves to
-        // match the ABI layout of `ComponentChunk`.
-        let bits = archetype.0;
-        // SAFETY: `output` was checked above and the entity slice remains
-        // borrowed only for the active managed system invocation. Entity rows
-        // are exposed through the const `entities` slot, so nothing managed can
-        // write through them.
-        unsafe {
-            output.write(ComponentChunk {
-                archetype_low: bits as u64,
-                archetype_high: (bits >> 64) as u64,
-                data: std::ptr::null_mut(),
-                entities: entities.as_ptr().cast(),
-                len: entities.len() as u32,
-                element_size: std::mem::size_of::<Entity>() as u32,
-                ticks: std::ptr::null_mut(),
-                change_tick: world.change_tick().get(),
-                scope_token: active_scope_token(),
-            });
-        }
+        write_entity_chunk(
+            output,
+            archetype,
+            entities,
+            world.change_tick().get(),
+            active_scope_token(),
+        );
         record_observed_archetype(archetype);
         1
     })

@@ -152,28 +152,32 @@ impl LoggingConfig {
             .with_directive("naga", LevelFilter::WARN)
     }
 
-    /// Parse a complete `RUST_LOG`-style filter string strictly.
+    /// Validate a complete `RUST_LOG`-style filter string strictly.
+    ///
+    /// The filter a project configures is applied by building a
+    /// [`LoggingConfig`] from its settings and calling
+    /// [`LoggingConfig::build_env_filter`]; this checks the same string early,
+    /// so a mistyped configuration fails loudly instead of silently degrading.
     ///
     /// # Errors
     ///
     /// Returns a [`TelemetryError::InvalidFilter`] when any directive cannot
-    /// be parsed, so a mistyped configuration fails loudly instead of
-    /// silently degrading.
+    /// be parsed.
     ///
     /// # Examples
     ///
     /// ```
     /// use pill_core::telemetry::LoggingConfig;
     ///
-    /// let config = LoggingConfig::parse("engine=debug,wgpu=warn")
+    /// LoggingConfig::validate_filter("engine=debug,wgpu=warn")
     ///     .expect("valid RUST_LOG-style string");
     /// ```
-    pub fn parse(strict_filter: &str) -> Result<Self, TelemetryError> {
+    pub fn validate_filter(strict_filter: &str) -> Result<(), TelemetryError> {
         EnvFilter::try_new(strict_filter).map_err(|source| TelemetryError::InvalidFilter {
             filter: strict_filter.to_owned(),
             source: Box::new(source),
         })?;
-        Ok(Self::new())
+        Ok(())
     }
 
     /// Build a strict [`EnvFilter`] from this configuration.
@@ -1084,8 +1088,8 @@ mod tests {
     /// An invalid RUST_LOG-style string is a strict configuration error.
     #[test]
     fn invalid_filter_string_is_a_configuration_error() {
-        assert!(LoggingConfig::parse("engine=info, ====").is_err());
-        assert!(LoggingConfig::parse("engine=debug,wgpu=warn").is_ok());
+        assert!(LoggingConfig::validate_filter("engine=info, ====").is_err());
+        assert!(LoggingConfig::validate_filter("engine=debug,wgpu=warn").is_ok());
     }
 
     /// The terminal formatter renders level, target, and message text.

@@ -125,14 +125,12 @@ impl CameraParametersData {
     /// keeps the camera at a finite pose instead.
     fn calculate_view_matrix(transform_component: &TransformComponent) -> Matrix4f {
         let position = Vector3f::from_array(transform_component.translation);
-        let rotation = glam::Quat::from_array(transform_component.rotation);
-        // Only a finite, non-zero quaternion normalizes into a usable basis;
-        // anything else would decide the view direction with NaNs.
-        let rotation = if rotation.is_finite() && rotation.length_squared() > 1e-8 {
-            rotation.normalize()
-        } else {
-            glam::Quat::IDENTITY
-        };
+        // The shared normalize-or-identity rule reads a non-finite or near-zero
+        // quaternion as identity, so the view direction is never decided by
+        // NaNs.
+        let rotation = glam::Quat::from_array(
+            pill_engine::common_components::rotation_or_identity(transform_component.rotation),
+        );
         glam::camera::rh::view::look_to_mat4(
             position,
             rotation * Vector3f::NEG_Z,

@@ -220,9 +220,22 @@ public static class RotationSystem
         foreach (var row in models.Rows())
         {
             ref var transform = ref row.TransformComponent;
-            var current = transform.Rotation;
-            current = current.LengthSquared() > 1.0e-8f ? Quaternion.Normalize(current) : Quaternion.Identity;
+            // The same normalize-or-identity rule the Rust side shares: a
+            // non-finite or near-zero quaternion reads as identity, so a
+            // broken component never spreads NaN through the transform chain.
+            var current = RotationOrIdentity(transform.Rotation);
             transform.Rotation = Quaternion.Normalize(step * current);
         }
+    }
+
+    /// <summary>
+    /// Normalize a rotation, or read a non-finite or near-zero one as identity.
+    /// </summary>
+    private static Quaternion RotationOrIdentity(Quaternion rotation)
+    {
+        float lengthSquared = rotation.LengthSquared();
+        return float.IsFinite(lengthSquared) && lengthSquared > 1.0e-8f
+            ? Quaternion.Normalize(rotation)
+            : Quaternion.Identity;
     }
 }

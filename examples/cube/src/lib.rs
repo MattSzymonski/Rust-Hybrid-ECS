@@ -160,12 +160,9 @@ fn rotate_cubes_system(
     let [x, y, z] = SPIN_RADIANS_PER_SECOND;
     let step = glam::Quat::from_euler(glam::EulerRot::XYZ, x * delta, y * delta, z * delta);
     for (mut transform, _) in cubes.iter_mut() {
-        let current = glam::Quat::from_array(transform.rotation);
-        let current = if current.is_finite() && current.length_squared() > 1.0e-8 {
-            current.normalize()
-        } else {
-            glam::Quat::IDENTITY
-        };
+        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
+            transform.rotation,
+        ));
         transform.rotation = (step * current).normalize().to_array();
     }
     Ok(())

@@ -40,12 +40,17 @@ This module provides GPU-side profiling capabilities using wgpu.
     - Frame time analysis: Helps understand how much time each rendering stage takes.
 
 - Occlusion queries:
-  Measures: How many fragments(pixels) passed depth/stencil during the draw region maked with begin_occlusion_tracking/end_occlusion_tracking.
+  Measures: How many samples (pixels at 1x sampling) passed the depth/stencil tests
+  during the draw region bracketed with begin_occlusion_query/end_occlusion_query.
   Result: Vector of u64 counts, one per query. Will be 0 if fully occluded.
   Learnings:
-    - Overdraw insights: If you see high occlusion counts, it means many fragments were discarded by depth test.
-    - Visibility culling: Can be used to skip rendering objects that are fully occluded.
-    - Bound analysis: Can help understand how many pixels are actually visible in the scene.
+    - Visible coverage: the samples that survived depth testing are the pixels the
+      pass actually shaded, so the count over a pass is its real coverage (not
+      overdraw - fragments failing the depth test are never counted).
+    - Visibility culling: a pass or object with a steady 0 is fully occluded by
+      everything drawn before it.
+    - Bound analysis: coverage far below the viewport means most of the scene is
+      off-screen or hidden.
 
 - Pipeline statistics:
   Collects various pipeline statistics like:
@@ -83,35 +88,34 @@ const FRAMES_IN_FLIGHT: usize = 8;
 
 /// GPU-side profiling using wgpu query sets.
 ///
-/// Owns one query set per category (timestamps, occlusion, pipeline
-/// statistics) plus a three-slot ring of resolve buffers per category, so a
-/// readback can map the previous frame while the current one still records.
+/// Owns one query set per category (timestamps, occlusion and pipeline
+/// statistics) plus a ring of resolve buffers per category, so a readback can
+/// map the previous frame while the current one still records.
 pub struct Profiler {
     // Query sets (optional if feature unsupported)
     timestamp_query_set: Option<QuerySet>,
     timestamp_query_names: Vec<String>, // To store names associated with each timestamp
-    occlusion_query_set: Option<QuerySet>,
     pipeline_statistics_query_set: Option<QuerySet>,
     pipeline_statistics_types: PipelineStatisticsTypes,
+    occlusion_query_set: Option<QuerySet>,
 
     // Maximum queries we allow per frame for each kind
     max_timestamp_queries: u32,
-    max_occlusion_queries: u32,
     max_pipeline_statistics_queries: u32,
+    max_occlusion_queries: u32,
 
     // Rolling per-frame indices
     current_timestamp_query: Cell<u32>,
-    current_occlusion_query: Cell<u32>,
     current_pipeline_statistics_query: Cell<u32>,
+    current_occlusion_query: Cell<u32>,
 
     // Resolve buffers (ring) for readback, one per in-flight frame
     timestamp_buffers: Vec<Option<ResolveSlot>>,
-    occlusion_buffers: Vec<Option<ResolveSlot>>,
     pipeline_buffers: Vec<Option<ResolveSlot>>,
+    occlusion_buffers: Vec<Option<ResolveSlot>>,
 
     // Bytes per query result set
     timestamp_queries_result_bytes: u64,
-    occlusion_queries_result_bytes: u64,
     pipeline_statistics_queries_result_bytes: u64,
 
     // Frame index for the ring
@@ -135,6 +139,8 @@ pub struct Profiler {
     // The most recent results read back, for `log_latest`.
     latest_timings: Vec<(String, f32)>,
     latest_statistics: Vec<GpuStatistics>,
+    // One sample count per occlusion query read back, in pass order.
+    latest_occlusion: Vec<u64>,
 }
 
 /// Where one readback buffer's `map_async` stands.
@@ -154,9 +160,11 @@ struct FrameRecord {
     timestamp_names: Vec<String>,
     timestamp_count: u32,
     statistics_count: u32,
-    /// The timestamp and statistics readbacks in flight, each `MAP_*`.
+    occlusion_count: u32,
+    /// The timestamp, statistics and occlusion readbacks in flight, each `MAP_*`.
     timestamp_map: Option<Arc<AtomicU8>>,
     statistics_map: Option<Arc<AtomicU8>>,
+    occlusion_map: Option<Arc<AtomicU8>>,
 }
 
 impl FrameRecord {
@@ -166,12 +174,17 @@ impl FrameRecord {
             map.as_ref()
                 .is_none_or(|state| state.load(Ordering::Acquire) != MAP_PENDING)
         };
-        self.is_waiting() && finished(&self.timestamp_map) && finished(&self.statistics_map)
+        self.is_waiting()
+            && finished(&self.timestamp_map)
+            && finished(&self.statistics_map)
+            && finished(&self.occlusion_map)
     }
 
     /// Whether this slot still waits for a readback.
     fn is_waiting(&self) -> bool {
-        self.timestamp_map.is_some() || self.statistics_map.is_some()
+        self.timestamp_map.is_some()
+            || self.statistics_map.is_some()
+            || self.occlusion_map.is_some()
     }
 }
 
@@ -205,20 +218,22 @@ fn take_mapped(buffer: &Buffer, state: &AtomicU8, count: usize) -> Vec<u64> {
 impl Profiler {
     /// Creates a profiler against `device` and `queue`.
     ///
-    /// The three `max_*` arguments are per-frame caps: a recording past its
+    /// The `max_*` arguments are per-frame caps: a recording past its
     /// cap is refused with a printed notice rather than overwriting an
-    /// earlier query of the same kind. Query sets are only created for the
-    /// features the device was created with (an adapter offering one is not
-    /// enough: the device has to have requested it, see
-    /// [`GPU_PROFILE_FEATURES`]), so on a device without timestamp or pipeline
-    /// statistics support the matching readers always answer `None`.
+    /// earlier query of the same kind. Query sets for the feature-gated
+    /// categories are only created for the features the device was created
+    /// with (an adapter offering one is not enough: the device has to have
+    /// requested it, see [`GPU_PROFILE_FEATURES`]), so on a device without
+    /// timestamp or pipeline statistics support the matching readers always
+    /// answer `None`. Occlusion queries are core in wgpu and need no feature,
+    /// so only the cap decides whether that set exists.
     pub fn new(
         device: &Device,
         queue: &Queue,
         max_timestamp_queries: u32, // Number of timestamp writes planned to record per frame (start/end of sections)
-        max_occlusion_queries: u32, // Number of occlusion queries per frame
         max_pipeline_statistics_queries: u32, // Number of pipeline statistics queries per frame
         pipeline_statistics_types: PipelineStatisticsTypes, // Type of pipeline statistics to collect
+        max_occlusion_queries: u32, // Number of occlusion queries per frame (one per geometry pass)
     ) -> Self {
         let features = device.features();
         // `write_timestamp` on an encoder is what this profiler calls, so the
@@ -238,17 +253,6 @@ impl Profiler {
             None
         };
 
-        // Occlusion query set
-        let occlusion_query_set = if max_occlusion_queries > 0 {
-            Some(device.create_query_set(&QuerySetDescriptor {
-                label: Some("gpu_profiler.occlusion_query_set"),
-                ty: QueryType::Occlusion,
-                count: max_occlusion_queries,
-            }))
-        } else {
-            None
-        };
-
         // Pipeline statistics query set
         let pipeline_statistics_query_set =
             if has_pipeline_statistics && !pipeline_statistics_types.is_empty() {
@@ -261,9 +265,21 @@ impl Profiler {
                 None
             };
 
+        // Occlusion query set: one query per geometry pass counts the samples
+        // that survived its depth and stencil tests. Core in wgpu, so no
+        // feature check - only the cap can leave it out.
+        let occlusion_query_set = if max_occlusion_queries > 0 {
+            Some(device.create_query_set(&QuerySetDescriptor {
+                label: Some("gpu_profiler.occlusion_query_set"),
+                ty: QueryType::Occlusion,
+                count: max_occlusion_queries,
+            }))
+        } else {
+            None
+        };
+
         // Bytes per query result entry
         let timestamp_queries_result_bytes = std::mem::size_of::<u64>() as u64;
-        let occlusion_queries_result_bytes = std::mem::size_of::<u64>() as u64;
         let pipeline_statistics_fields = pipeline_statistics_types.bits().count_ones() as u64;
         let pipeline_statistics_queries_result_bytes = if pipeline_statistics_fields == 0 {
             0
@@ -273,8 +289,8 @@ impl Profiler {
 
         // Resolve buffers ring (created lazily on first use)
         let timestamp_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
-        let occlusion_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
         let pipeline_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
+        let occlusion_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
 
         // Timestamp period
         let timestamp_period_ns = if has_timestamps {
@@ -286,24 +302,23 @@ impl Profiler {
         Self {
             timestamp_query_set,
             timestamp_query_names: Vec::new(),
-            occlusion_query_set,
             pipeline_statistics_query_set,
             pipeline_statistics_types,
+            occlusion_query_set,
 
             max_timestamp_queries,
-            max_occlusion_queries,
             max_pipeline_statistics_queries: max_pipeline_statistics_queries.max(1),
+            max_occlusion_queries: max_occlusion_queries.max(1),
 
             current_timestamp_query: Cell::new(0),
-            current_occlusion_query: Cell::new(0),
             current_pipeline_statistics_query: Cell::new(0),
+            current_occlusion_query: Cell::new(0),
 
             timestamp_buffers,
-            occlusion_buffers,
             pipeline_buffers,
+            occlusion_buffers,
 
             timestamp_queries_result_bytes,
-            occlusion_queries_result_bytes,
             pipeline_statistics_queries_result_bytes,
 
             frame_index: 0,
@@ -318,6 +333,7 @@ impl Profiler {
             skipping_frame: false,
             latest_timings: Vec::new(),
             latest_statistics: Vec::new(),
+            latest_occlusion: Vec::new(),
         }
     }
 
@@ -388,8 +404,8 @@ impl Profiler {
         self.follow_profiler_connection(device, queue);
         self.skipping_frame = self.frames[self.frame_index].is_waiting();
         self.current_timestamp_query.set(0);
-        self.current_occlusion_query.set(0);
         self.current_pipeline_statistics_query.set(0);
+        self.current_occlusion_query.set(0);
         self.timestamp_query_names.clear();
     }
 
@@ -403,29 +419,37 @@ impl Profiler {
             let slot = self.frame_index;
             let timestamp_count = self.current_timestamp_query.get();
             let statistics_count = self.current_pipeline_statistics_query.get();
+            let occlusion_count = self.current_occlusion_query.get();
             let timestamp_buffer = self.timestamp_buffers[slot]
                 .as_ref()
                 .map(|buffers| &buffers.readback);
             let statistics_buffer = self.pipeline_buffers[slot]
                 .as_ref()
                 .map(|buffers| &buffers.readback);
+            let occlusion_buffer = self.occlusion_buffers[slot]
+                .as_ref()
+                .map(|buffers| &buffers.readback);
             let record = &mut self.frames[slot];
             record.timestamp_names = self.timestamp_query_names.clone();
             record.timestamp_count = timestamp_count;
             record.statistics_count = statistics_count;
+            record.occlusion_count = occlusion_count;
             record.timestamp_map = timestamp_buffer
                 .filter(|_| timestamp_count > 0)
                 .map(map_for_reading);
             record.statistics_map = statistics_buffer
                 .filter(|_| statistics_count > 0)
                 .map(map_for_reading);
+            record.occlusion_map = occlusion_buffer
+                .filter(|_| occlusion_count > 0)
+                .map(map_for_reading);
         }
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
     }
 
     /// Reads back every ring slot whose results arrived: uploads its
-    /// timestamps to its Tracy zones, plots its statistics, and keeps both
-    /// for [`Self::log_latest`].
+    /// timestamps to its Tracy zones, plots its statistics, and keeps the
+    /// timings, statistics and occlusion counts for [`Self::log_latest`].
     fn collect_finished_frames(&mut self) {
         for slot in 0..FRAMES_IN_FLIGHT {
             if !self.frames[slot].is_ready() {
@@ -488,19 +512,52 @@ impl Profiler {
                     self.latest_statistics = statistics;
                 }
             }
+
+            if let (Some(state), Some(buffers)) =
+                (&record.occlusion_map, &self.occlusion_buffers[slot])
+            {
+                let samples =
+                    take_mapped(&buffers.readback, state, record.occlusion_count as usize);
+                if !samples.is_empty() {
+                    self.latest_occlusion = samples;
+                }
+            }
             // The record's zones drop here, every one uploaded.
         }
     }
 
-    /// Logs the most recent pass timings and pipeline statistics read back,
-    /// without waiting for the GPU.
-    pub fn log_latest(&self) {
+    /// Logs the most recent pass timings, occlusion samples and pipeline
+    /// statistics read back, without waiting for the GPU.
+    ///
+    /// `viewport_pixels` is the frame's drawable area in pixels; the occlusion
+    /// block reports each geometry pass's samples against it. Pass `0` to
+    /// report the raw counts without a percentage.
+    pub fn log_latest(&self, viewport_pixels: u64) {
         if !self.latest_timings.is_empty() {
             let lines = self
                 .latest_timings
                 .iter()
                 .map(|(label, ms)| format!("{label:<24}: {ms:6.3} ms"));
             info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
+        }
+        if !self.latest_occlusion.is_empty() {
+            let total: u64 = self.latest_occlusion.iter().sum();
+            let coverage = if viewport_pixels > 0 {
+                format!(
+                    "{:.1}% of {viewport_pixels} px",
+                    total as f64 * 100.0 / viewport_pixels as f64
+                )
+            } else {
+                "viewport unknown".to_string()
+            };
+            let mut lines: Vec<String> = self
+                .latest_occlusion
+                .iter()
+                .enumerate()
+                .map(|(pass, samples)| format!("{:<24}: {samples} samples", format!("pass {pass}")))
+                .collect();
+            lines.push(format!("{:<24}: {total} samples ({coverage})", "visible"));
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU occlusion", lines));
         }
         if !self.latest_statistics.is_empty() {
             let lines = self
@@ -608,188 +665,9 @@ impl Profiler {
         }
     }
 
-    /// Blocking readback of all timestamps for the frame that was resolved into the previous ring slot.
-    /// Returns the raw u64 ticks, or `None` when nothing was resolved into that slot;
-    /// convert them to milliseconds with [`Self::timestamp_ticks_to_ms`].
-    pub fn read_timestamp_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
-        let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = &self.timestamp_buffers[index].as_ref()?.readback;
-        let slice = buffer.slice(..);
-
-        // Map and wait. The callback's result is checked because
-        // `get_mapped_range` aborts on an unmapped range: a failed map has to
-        // come back as "no numbers", not as a panic.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        if device.poll(PollType::Wait).is_err() {
-            return None;
-        }
-        if receiver.recv().ok()?.is_err() {
-            return None;
-        }
-        let data = slice.get_mapped_range();
-        let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
-
-        drop(data);
-        buffer.unmap();
-        Some(values)
-    }
-
     /// Convert a delta of timestamp ticks to milliseconds.
     pub fn timestamp_ticks_to_ms(&self, delta_ticks: u64) -> f32 {
         (delta_ticks as f32 * self.timestamp_period_ns) / 1_000_000.0
-    }
-
-    /// Logs one line per resolved region with its GPU time in milliseconds, as
-    /// one block.
-    ///
-    /// `ticks` are the raw values as read back, written in pairs - start and
-    /// end around each region - so a slice with fewer than two entries logs
-    /// a notice instead. Regions are labelled from the names gathered by
-    /// [`Self::write_timestamp`] when the counts line up; otherwise they fall
-    /// back to `Section N` placeholders.
-    pub fn summarize_timestamp_queries(&self, ticks: &[u64]) {
-        if ticks.len() < 2 {
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no timestamp sections recorded");
-            return;
-        }
-        // Written in pairs - before and after each region - so the sections are
-        // the pairs, and a pair's first name is the region's own.
-        let use_default = self.timestamp_query_names.len() != ticks.len();
-
-        let lines = ticks.chunks_exact(2).enumerate().map(|(index, pair)| {
-            let ms = self.timestamp_ticks_to_ms(pair[1] - pair[0]);
-            let label = if use_default {
-                format!("Section {index}")
-            } else {
-                self.timestamp_query_names[index * 2].clone()
-            };
-            format!("{label:<24}: {ms:6.3} ms")
-        });
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
-    }
-
-    // --- Occlusion ---
-
-    /// Expose the occlusion query set for putting into `RenderPassDescriptor.occlusion_query_set`.
-    pub fn get_occlusion_query_set(&self) -> Option<&QuerySet> {
-        self.occlusion_query_set.as_ref()
-    }
-
-    /// Begin an occlusion query within a render pass. Returns query index.
-    pub fn begin_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) -> Option<u32> {
-        if let Some(_query_set) = &self.occlusion_query_set {
-            // Check if there is space for another occlusion query
-            if self.current_occlusion_query.get() >= self.max_occlusion_queries {
-                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: occlusion queries are full for this frame");
-                return None;
-            }
-
-            let index = self.current_occlusion_query.get();
-            self.current_occlusion_query.set(index + 1);
-            render_pass.begin_occlusion_query(index);
-            Some(index)
-        } else {
-            None
-        }
-    }
-
-    /// Ends the occlusion query most recently begun in `render_pass`.
-    ///
-    /// Pairs with [`Self::begin_occlusion_query`]; the sample counts become
-    /// readable once the frame's queries are resolved and read back.
-    pub fn end_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        render_pass.end_occlusion_query();
-    }
-
-    /// Resolve occlusion queries recorded this frame.
-    pub fn resolve_occlusion_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
-        if let Some(query_set) = &self.occlusion_query_set {
-            let count = self.current_occlusion_query.get();
-            if count == 0 {
-                return;
-            }
-            let byte_len = self.occlusion_queries_result_bytes * count as u64;
-
-            let index = self.frame_index;
-            let slot = &mut self.occlusion_buffers[index];
-            let buffers = ensure_buffer_slot(
-                device,
-                slot,
-                byte_len,
-                "gpu_profiler.occlusion_queries.resolve",
-            );
-
-            encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
-
-            // Resolved results are not mappable; copied into the buffer that is.
-
-            encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
-        }
-    }
-
-    /// Blocking readback of the occlusion sample counts resolved for the
-    /// previous frame, one `u64` per query.
-    ///
-    /// Returns `None` while nothing has been resolved into that ring slot -
-    /// no occlusion query has been begun and resolved yet. A count of 0 means
-    /// the query's region drew no visible fragments.
-    pub fn read_occlusion_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
-        let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = &self.occlusion_buffers[index].as_ref()?.readback;
-        let slice = buffer.slice(..);
-
-        // Map and wait; see the timestamp reader for why the result is checked.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        if device.poll(PollType::Wait).is_err() {
-            return None;
-        }
-        if receiver.recv().ok()?.is_err() {
-            return None;
-        }
-        let data = slice.get_mapped_range();
-        let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
-
-        drop(data);
-        buffer.unmap();
-        Some(values)
-    }
-
-    /// Logs each occlusion query's sample count, tagged visible or
-    /// occluded, followed by a visible/total line.
-    ///
-    /// An empty slice means the blocking reader had nothing to hand over and
-    /// logs a "no occlusion queries recorded" notice instead.
-    pub fn summarize_occlusion_queries(&self, samples: &[u64]) {
-        if samples.is_empty() {
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no occlusion queries recorded");
-            return;
-        }
-        let mut visible = 0usize;
-        let mut lines = Vec::with_capacity(samples.len() + 1);
-        for (i, &sample) in samples.iter().enumerate() {
-            let is_visible = sample > 0;
-            if is_visible {
-                visible += 1;
-            }
-            lines.push(format!(
-                "occlusion[{:02}] = {:>12}  {}",
-                i,
-                sample,
-                if is_visible {
-                    "(visible)"
-                } else {
-                    "(occluded)"
-                }
-            ));
-        }
-        lines.push(format!("visible: {}/{}", visible, samples.len()));
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU occlusion queries", lines));
     }
 
     // --- Pipeline statistics ---
@@ -824,74 +702,6 @@ impl Profiler {
         } else {
             None
         }
-    }
-
-    /// Logs the requested pipeline statistics counters grouped per query.
-    ///
-    /// `raw` is the flat readback: one `u64` per requested statistic per
-    /// query, in the order of the mask the profiler was built with. An empty
-    /// slice or an empty mask logs a notice instead.
-    pub fn summarize_pipeline_statistics_queries(&self, raw: &[u64]) {
-        let mask = self.pipeline_statistics_types;
-        if raw.is_empty() || mask.is_empty() {
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no pipeline statistics recorded");
-            return;
-        }
-
-        let mut layout: Vec<(&'static str, wgpu::PipelineStatisticsTypes)> = Vec::new();
-        let push = |v: &mut Vec<_>, name, flag, mask: wgpu::PipelineStatisticsTypes| {
-            if mask.contains(flag) {
-                v.push((name, flag));
-            }
-        };
-        push(
-            &mut layout,
-            "VS invocations",
-            wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS,
-            mask,
-        );
-        push(
-            &mut layout,
-            "Clipper invocations",
-            wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS,
-            mask,
-        );
-        push(
-            &mut layout,
-            "Clipper primitives out",
-            wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT,
-            mask,
-        );
-        push(
-            &mut layout,
-            "FS invocations",
-            wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
-            mask,
-        );
-        push(
-            &mut layout,
-            "CS invocations",
-            wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,
-            mask,
-        );
-
-        let stride = layout.len();
-        if stride == 0 {
-            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: the pipeline statistics mask is empty");
-            return;
-        }
-
-        let mut lines = Vec::new();
-        for (query, chunk) in raw.chunks(stride).enumerate() {
-            if chunk.len() < stride {
-                break;
-            }
-            lines.push(format!("query {query}:"));
-            for ((name, _flag), &value) in layout.iter().zip(chunk.iter()) {
-                lines.push(format!("  {name:>24}: {value}"));
-            }
-        }
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
     }
 
     /// Ends the pipeline statistics query most recently begun in
@@ -938,54 +748,73 @@ impl Profiler {
         }
     }
 
-    /// Blocking readback of the raw statistic counters resolved for the
-    /// previous frame.
+    // --- Occlusion ---
+
+    /// Exposes the occlusion query set for a geometry pass's
+    /// `RenderPassDescriptor.occlusion_query_set`.
     ///
-    /// Returns `None` when the feature is unsupported or no query has been
-    /// resolved yet. The values are the flat layout
-    /// [`Self::summarize_pipeline_statistics_queries`] expects.
-    pub fn read_pipeline_statistics_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
-        let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
-        let buffer = &self.pipeline_buffers[index].as_ref()?.readback;
-        let slice = buffer.slice(..);
-
-        // Map and wait; see the timestamp reader for why the result is checked.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        if device.poll(PollType::Wait).is_err() {
-            return None;
-        }
-        if receiver.recv().ok()?.is_err() {
-            return None;
-        }
-        let data = slice.get_mapped_range();
-        let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
-
-        drop(data);
-        buffer.unmap();
-        Some(values)
+    /// `None` when the feature is unsupported or the cap was zero. A pass
+    /// only begins queries through [`Self::begin_occlusion_query`], which is
+    /// also what refuses during a skipped frame.
+    pub fn get_occlusion_query_set(&self) -> Option<&QuerySet> {
+        self.occlusion_query_set.as_ref()
     }
 
-    // --- Misc ---
-
-    /// Reads back and prints all three profiling categories in one call.
+    /// Begins the next occlusion query in `render_pass`; returns its index.
     ///
-    /// Each reader blocks on the GPU in turn, so this is a debugging aid
-    /// rather than something to run every frame. Categories with nothing
-    /// resolved are skipped entirely - their readers answer `None`.
-    pub fn summarize_all_blocking(&self, device: &wgpu::Device) {
-        if let Some(timestamp_queries) = self.read_timestamp_queries_blocking(device) {
-            self.summarize_timestamp_queries(&timestamp_queries);
+    /// One query per geometry pass counts the samples that passed the depth
+    /// and stencil tests while it was open, so the pass's visible coverage is
+    /// read back as one number.
+    pub fn begin_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) -> Option<u32> {
+        if self.skipping_frame || self.occlusion_query_set.is_none() {
+            return None;
         }
-        if let Some(occlusion_queries) = self.read_occlusion_queries_blocking(device) {
-            self.summarize_occlusion_queries(&occlusion_queries);
+        if self.current_occlusion_query.get() >= self.max_occlusion_queries {
+            warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: occlusion queries are full for this frame");
+            return None;
         }
-        if let Some(pipeline_statistics_queries) =
-            self.read_pipeline_statistics_queries_blocking(device)
-        {
-            self.summarize_pipeline_statistics_queries(&pipeline_statistics_queries);
+        let index = self.current_occlusion_query.get();
+        self.current_occlusion_query.set(index + 1);
+        render_pass.begin_occlusion_query(index);
+        Some(index)
+    }
+
+    /// Ends the occlusion query most recently begun in `render_pass`.
+    ///
+    /// Pairs with [`Self::begin_occlusion_query`]; the sample counts become
+    /// readable once the frame's queries are resolved.
+    pub fn end_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        render_pass.end_occlusion_query();
+    }
+
+    /// Resolves the occlusion queries recorded this frame into the current
+    /// ring slot.
+    ///
+    /// A no-op when the feature is unsupported or no query was begun this
+    /// frame, mirroring [`Self::resolve_pipeline_statistics_queries`].
+    pub fn resolve_occlusion_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
+        if let Some(query_set) = &self.occlusion_query_set {
+            let count = self.current_occlusion_query.get();
+            if count == 0 {
+                return;
+            }
+            // One u64 per occlusion query.
+            let byte_len = std::mem::size_of::<u64>() as u64 * count as u64;
+
+            let index = self.frame_index;
+            let slot = &mut self.occlusion_buffers[index];
+            let buffers = ensure_buffer_slot(
+                device,
+                slot,
+                byte_len,
+                "gpu_profiler.occlusion_queries.resolve",
+            );
+
+            encoder.resolve_query_set(query_set, 0..count, &buffers.resolve, 0);
+
+            // Resolved results are not mappable; copied into the buffer that is.
+
+            encoder.copy_buffer_to_buffer(&buffers.resolve, 0, &buffers.readback, 0, byte_len);
         }
     }
 }

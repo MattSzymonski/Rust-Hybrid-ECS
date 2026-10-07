@@ -336,11 +336,6 @@ mod slot {
             outcome
         }
 
-        /// Invoke the optional per-frame hook, when the module exports one.
-        pub(crate) fn update(&self, engine_api: &EngineApi) {
-            self.current.call_update(engine_api);
-        }
-
         /// Name of this module, used for reporting.
         pub(crate) fn name(&self) -> &str {
             &self.config.name

@@ -28,7 +28,6 @@ use pill_renderer_api::{
 };
 
 // Current crate
-use crate::render_assets::NativeAssets;
 use crate::render_window::{attach_window, attach_window_async, AttachedWindow, RendererWindow};
 use crate::{FrameDriver, FrameReport, RenderingError, Runtime, StaticProject};
 
@@ -268,8 +267,6 @@ pub struct RenderingRuntime {
     runtime: Runtime,
     /// The linked renderer's backend on the window.
     display: AttachedRenderer,
-    /// Renderer assets prepared beside the engine.
-    assets: NativeAssets,
 }
 
 impl RenderingRuntime {
@@ -310,7 +307,6 @@ impl RenderingRuntime {
     ///
     /// Returns a [`RendererError`] when the renderer fails.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
-        self.assets.update(self.runtime.engine_mut())?;
         let report = self.runtime.run_frame();
         self.display.render(self.runtime.engine().world())?;
         Ok(report)
@@ -396,12 +392,7 @@ pub async fn attach_renderer<W: RendererWindow>(
         attach_linked(linked, window_data, width, height)
     })
     .await?;
-    let assets = NativeAssets::prepare(None)?;
-    Ok(RenderingRuntime {
-        runtime,
-        display,
-        assets,
-    })
+    Ok(RenderingRuntime { runtime, display })
 }
 
 /// Start a statically linked project and attach its renderer to `window`.

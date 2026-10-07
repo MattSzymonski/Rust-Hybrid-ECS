@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "pill_assets",
+    "pill_asset_format",
     "pill_engine",
     "pill_engine_core",
     "pill_engine_macros",

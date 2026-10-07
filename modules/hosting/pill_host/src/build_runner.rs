@@ -1772,9 +1772,12 @@ pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
 /// Cargo appends `-<16 hex digits>` to a crate's filename when the artifact is
 /// specific to one resolved configuration. A name without that suffix is the
 /// shared slot every build of that crate name writes to, and is the only kind
-/// another build can silently replace.
+/// another build can silently replace. The patch linker (`hot_patch::compile`)
+/// and the dependency staging below must agree about which files are shared,
+/// or a file is staged and never linked, or linked and never staged - so this
+/// is the single implementation both call.
 #[cfg(feature = "hot_patch")]
-fn is_shared_slot_rlib(file_name: &str) -> bool {
+pub(crate) fn is_shared_slot_rlib(file_name: &str) -> bool {
     let Some(stem) = file_name.strip_suffix(".rlib") else {
         return false;
     };
@@ -1801,9 +1804,11 @@ fn is_generated_member_rlib(file_name: &str) -> bool {
 
 /// Whether a staged copy already matches its source.
 ///
-/// Same size and no older. Used by the shared-rlib staging and the engine
-/// dylib staging; anything unknown counts as out of date, so the copy happens.
-fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
+/// Same size and no older. Used by the shared-rlib staging, the engine dylib
+/// staging and the patch session's rlib refresh, so a copy either path leaves
+/// behind satisfies the other; anything unknown counts as out of date, so the
+/// copy happens.
+pub(crate) fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
     let (Ok(source_metadata), Ok(staged_metadata)) =
         (std::fs::metadata(source), std::fs::metadata(staged))
     else {
@@ -1904,29 +1909,17 @@ pub(crate) fn build_extension_batch(
         return false;
     }
 
-    let mut command = vec!["cargo".to_string(), "build".to_string()];
-    for config in configs {
-        command.push("--package".to_string());
-        command.push(config.wrapper_library_name.clone());
-    }
+    let mut packages: Vec<String> = configs
+        .iter()
+        .map(|config| config.wrapper_library_name.clone())
+        .collect();
     if let Some(package) = &project_package {
-        command.push("--package".to_string());
-        command.push(package.clone());
+        packages.push(package.clone());
     }
     if let Some(config) = &renderer_config {
-        command.push("--package".to_string());
-        command.push(config.wrapper_library_name.clone());
+        packages.push(config.wrapper_library_name.clone());
     }
-    command.push("--offline".to_string());
-    command.push("--profile".to_string());
-    command.push(crate::config::host_profile_name().to_string());
-    if crate::config::cargo_timings_enabled() {
-        command.push("--timings".to_string());
-    }
-    if cfg!(feature = "hot_patch") {
-        command.push("--features".to_string());
-        command.push("pill_engine/hot_patch".to_string());
-    }
+    let command = crate::config::host_cargo_command(&packages);
     // One capture entry per selected package, so the patch pipeline harvests
     // every module's `rustc` line from this single invocation.
     let mut entries: Vec<(&str, &[String])> = configs

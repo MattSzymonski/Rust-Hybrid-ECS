@@ -243,20 +243,12 @@ pub struct CSharpRuntime {
     /// Discards the parked version when its manifest cannot be applied.
     #[cfg(feature = "hot_reload")]
     abort_reload: AbortReloadFn,
-    /// Unmanaged export reporting the number of registered scheduler systems.
-    system_count: SystemCountFn,
-    /// Unmanaged export reporting how many accesses one system declared.
-    access_count: SystemAccessCountFn,
-    /// Unmanaged export copying one system's reflected accesses into a buffer.
-    get_access: GetSystemAccessFn,
-    /// Unmanaged export reporting whether one system declares a Commands parameter.
-    system_uses_commands: SystemUsesCommandsFn,
-    /// Every export a re-registration pass needs.
+    /// Every export a re-registration pass needs, including the ones the
+    /// reload's cheap metadata comparison reads one system at a time.
     ///
     /// Held so a reload can rebuild the scheduler's managed systems from the
-    /// arriving assembly. The four fields above duplicate members of this
-    /// bundle because the reload's cheap comparison path reads them directly,
-    /// one system at a time, without cloning anything.
+    /// arriving assembly, and so that comparison and the re-registration read
+    /// the same descriptors.
     exports: SystemExports,
     #[cfg(feature = "hot_reload")]
     /// Outcome of the most recent reload poll, for one-shot rejection logging.
@@ -274,16 +266,6 @@ pub struct CSharpRuntime {
     manifest_applied_without_assembly: bool,
     /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
-    /// Unmanaged export reporting the current component manifest's length.
-    manifest_length: ComponentManifestLengthFn,
-    /// Unmanaged export copying that manifest into a host buffer.
-    copy_manifest: CopyComponentManifestFn,
-    /// Serialized manifest the bindings below were built from.
-    ///
-    /// A reload compares the swapped assembly's manifest against this one before
-    /// it considers applying anything, so an ordinary behaviour-only swap costs
-    /// one copy and one comparison.
-    applied_manifest: Vec<u8>,
     /// The live component-binding table, shared with every registered system.
     ///
     /// Shared rather than cloned per system so a reload can rewrite it in
@@ -972,15 +954,10 @@ impl CSharpRuntime {
 
         Ok(Self {
             poll_reload: exports.poll_reload,
-            system_count: exports.system_count,
-            access_count: exports.access_count,
-            get_access: exports.get_access,
-            system_uses_commands: exports.system_uses_commands,
             exports: system_exports,
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
-            manifest_length: exports.manifest_length,
             #[cfg(feature = "hot_reload")]
             pending_manifest_length: exports.pending_manifest_length,
             #[cfg(feature = "hot_reload")]
@@ -989,8 +966,6 @@ impl CSharpRuntime {
             commit_reload: exports.commit_reload,
             #[cfg(feature = "hot_reload")]
             abort_reload: exports.abort_reload,
-            copy_manifest: exports.copy_manifest,
-            applied_manifest: manifest,
             bindings,
             #[cfg(feature = "hot_reload")]
             manifest_applied_without_assembly: false,
@@ -1098,7 +1073,6 @@ impl CSharpRuntime {
                 "C# reload rejected: component or system signatures changed; restart the host to rebuild the native component registry and scheduler"
             );
         }
-        #[cfg(feature = "hot_reload")]
         if status == POLL_MANIFEST_PENDING {
             return self.decide_parked_manifest(engine);
         }
@@ -1115,10 +1089,16 @@ impl CSharpRuntime {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "C# hot reload complete"
             );
-            // The swap is done and the manifest it carried may differ.
-            // Applying it here, before the frame's systems run, is what puts a
-            // migrated row in place before the new generation reads one.
-            self.apply_manifest_if_changed(engine);
+            // No post-swap manifest check runs here: a version whose manifest
+            // differs never reaches this arm. The managed loader parks such a
+            // version instead (POLL_MANIFEST_PENDING), and that handshake
+            // applies the manifest before the swap commits, while the outgoing
+            // assembly is still the running one. The re-read this arm used to
+            // perform therefore compared two payloads that were equal by
+            // construction. If that managed refusal is ever relaxed, re-read
+            // the swapped assembly's manifest here and apply it before the
+            // frame's systems run, so a migrated row is in place before the
+            // new generation reads one.
         }
         self.last_poll_status = status;
         Ok(status)
@@ -1176,7 +1156,6 @@ impl CSharpRuntime {
                 if !self.verify_systems_unchanged() {
                     self.reregister_systems(engine)?;
                 }
-                self.applied_manifest = manifest;
                 info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     added = report.added.len(),
@@ -1225,54 +1204,7 @@ impl CSharpRuntime {
         }
     }
 
-    /// Apply the swapped assembly's component manifest when it differs from the
-    /// one the bindings were built from.
-    ///
-    /// The managed loader still refuses a manifest change at the swap itself
-    /// (plan §4.4), so today this compares two identical payloads and returns.
-    /// It is here so that relaxing that refusal becomes a managed-side change:
-    /// the host already knows how to migrate what a new manifest asks for - a
-    /// reshaped descriptor component is relaid out, a new one is registered, and a
-    /// native mirror or a vanished component is refused with a typed error.
-    #[cfg(feature = "hot_reload")]
-    fn apply_manifest_if_changed(&mut self, engine: &mut Engine) {
-        let Some(manifest) = read_reported_manifest(
-            || (self.manifest_length)(),
-            |pointer, length| (self.copy_manifest)(pointer, length),
-            "reloaded",
-            "; keeping the applied manifest",
-        ) else {
-            return;
-        };
-        if manifest == self.applied_manifest {
-            return;
-        }
-
-        match apply_component_manifest_on_reload(engine, &manifest, &self.bindings) {
-            Ok(report) => {
-                info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    added = report.added.len(),
-                    migrated = report.migrated.len(),
-                    renamed = report.renamed.len(),
-                    retired = report.retired.len(),
-                    resources_added = report.resources_added.len(),
-                    resources_migrated = report.resources_migrated.len(),
-                    resources_renamed = report.resources_renamed.len(),
-                    resources_retired = report.resources_retired.len(),
-                    "applied the reloaded assembly's component and resource manifest"
-                );
-                self.applied_manifest = manifest;
-            }
-            Err(error) => error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                error = %error,
-                "component manifest refused; the reloaded assembly's component definitions are not in force"
-            ),
-        }
-    }
-
-    /// Rebuild the scheduler's managed systems from the arriving assembly.
+    /// Rebuilds the scheduler's managed systems from the arriving assembly.
     ///
     /// Only the project's systems are cleared, so a module's survive untouched
     /// (the same scoping a module reload relies on). This runs between frames,
@@ -1319,13 +1251,13 @@ impl CSharpRuntime {
     /// edit a system body, not its signature.
     #[cfg(feature = "hot_reload")]
     fn verify_systems_unchanged(&self) -> bool {
-        let count = (self.system_count)();
+        let count = (self.exports.system_count)();
         if count as usize != self.system_snapshot.len() {
             return false;
         }
         for system_index in 0..count {
             let snapshot = &self.system_snapshot[system_index as usize];
-            let access_count = (self.access_count)(system_index);
+            let access_count = (self.exports.access_count)(system_index);
             if access_count as usize != snapshot.accesses.len() {
                 return false;
             }
@@ -1336,14 +1268,14 @@ impl CSharpRuntime {
                     mode: 0,
                     kind: 0,
                 };
-                if (self.get_access)(system_index, access_index, &mut item) == 0 {
+                if (self.exports.get_access)(system_index, access_index, &mut item) == 0 {
                     return false;
                 }
                 if item != snapshot.accesses[access_index as usize] {
                     return false;
                 }
             }
-            if ((self.system_uses_commands)(system_index) != 0) != snapshot.uses_commands {
+            if ((self.exports.system_uses_commands)(system_index) != 0) != snapshot.uses_commands {
                 return false;
             }
             // Resolved the same way registration resolves it, fallback
@@ -1368,21 +1300,14 @@ impl CSharpRuntime {
 
 /// Whether a managed-reported poll status is one this host understands.
 ///
-/// The three codes are the loader's whole vocabulary; the set is a helper so a
+/// The four codes are the loader's whole vocabulary; the set is a helper so a
 /// test can pin it without a live runtime.
 #[cfg(feature = "hot_reload")]
 pub(super) fn poll_status_is_known(status: u8) -> bool {
-    #[cfg(feature = "hot_reload")]
-    {
-        matches!(
-            status,
-            POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED | POLL_MANIFEST_PENDING
-        )
-    }
-    #[cfg(not(feature = "hot_reload"))]
-    {
-        matches!(status, POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED)
-    }
+    matches!(
+        status,
+        POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED | POLL_MANIFEST_PENDING
+    )
 }
 
 /// Read one reported component manifest, reporting why not in the caller's own

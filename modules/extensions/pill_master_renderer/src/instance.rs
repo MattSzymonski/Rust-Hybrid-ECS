@@ -56,12 +56,9 @@ impl Instance {
     /// one a script broke) draws unrotated instead of producing a degenerate
     /// matrix.
     pub fn new(transform_component: &TransformComponent) -> Instance {
-        let rotation = Quat::from_array(transform_component.rotation);
-        let rotation = if rotation.is_finite() && rotation.length_squared() > 1e-8 {
-            rotation.normalize()
-        } else {
-            Quat::IDENTITY
-        };
+        let rotation = Quat::from_array(pill_engine::common_components::rotation_or_identity(
+            transform_component.rotation,
+        ));
         let model = glam::Affine3A::from_scale_rotation_translation(
             Vec3::from_array(transform_component.scale),
             rotation,

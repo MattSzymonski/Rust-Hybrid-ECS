@@ -429,6 +429,34 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         QueryIterMut::new(self.world as *mut World, matching, this_run, last_run)
     }
 
+    /// The first matching archetype holding at least one row, in the same
+    /// order [`iter_mut`](Self::iter_mut) visits archetypes.
+    ///
+    /// The matching cache is snapshotted first, so the borrow ends before the
+    /// caller visits archetypes mutably; every aggregate's fast path goes
+    /// through this one lookup so they cannot disagree about which archetypes
+    /// match or in what order.
+    fn first_non_empty_matching_archetype(&mut self) -> Option<ArchetypeId> {
+        let matching = self.matching_archetype_ids().to_vec();
+        matching.into_iter().find(|archetype_id| {
+            self.world
+                .archetypes
+                .get(archetype_id)
+                .is_some_and(|archetype| !archetype.is_empty())
+        })
+    }
+
+    /// Total rows across every matching archetype, in the same order
+    /// [`iter_mut`](Self::iter_mut) visits them.
+    fn matching_row_count(&mut self) -> usize {
+        let matching = self.matching_archetype_ids().to_vec();
+        matching
+            .iter()
+            .filter_map(|archetype_id| self.world.archetypes.get(archetype_id))
+            .map(|archetype| archetype.len())
+            .sum()
+    }
+
     /// Returns the components of the first entity matching this query, if
     /// any exists.
     ///
@@ -460,19 +488,12 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         // order, so `first` could disagree with `iter_mut().next()`.
         if F::ACCEPTS_ALL {
             let this_run = self.world.increment_change_tick();
-            // Snapshot the cache the way `iter_mut` does, so the borrow ends
-            // before the archetypes are visited mutably.
-            let matching = self.matching_archetype_ids().to_vec();
-            for archetype_id in matching {
-                let Some(archetype) = self.world.archetypes.get_mut(&archetype_id) else {
-                    continue;
-                };
-                if !archetype.is_empty() {
-                    let state = Q::init_state(archetype, this_run);
-                    return Some(Q::fetch_with_state(&state, 0));
-                }
-            }
-            return None;
+            // The same snapshot-and-walk `iter_mut` uses, so `first` cannot
+            // disagree with `iter_mut().next()` about order or membership.
+            let archetype_id = self.first_non_empty_matching_archetype()?;
+            let archetype = self.world.archetypes.get_mut(&archetype_id)?;
+            let state = Q::init_state(archetype, this_run);
+            return Some(Q::fetch_with_state(&state, 0));
         }
         self.iter_mut().next()
     }
@@ -501,13 +522,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         // pairs alone is not proof of that (`F::ACCEPTS_ALL` is), because a
         // row-level filter declares no archetype scoping either.
         if F::ACCEPTS_ALL {
-            let matching = self.matching_archetype_ids().to_vec();
-            return !matching.iter().any(|id| {
-                self.world
-                    .archetypes
-                    .get(id)
-                    .is_some_and(|arch| !arch.is_empty())
-            });
+            return self.first_non_empty_matching_archetype().is_none();
         }
         // Slow path: need per-row filter evaluation.
         self.iter_mut().next().is_none()
@@ -537,12 +552,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         // Fast path: a filter that accepts every row - sum the matching
         // archetypes the cache already scoped for that filter.
         if F::ACCEPTS_ALL {
-            let matching = self.matching_archetype_ids().to_vec();
-            return matching
-                .iter()
-                .filter_map(|id| self.world.archetypes.get(id))
-                .map(|arch| arch.len())
-                .sum();
+            return self.matching_row_count();
         }
         // Slow path: need per-row filter evaluation.
         self.iter_mut().count()

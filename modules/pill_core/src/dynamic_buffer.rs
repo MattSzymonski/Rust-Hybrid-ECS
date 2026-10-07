@@ -295,6 +295,22 @@ impl<T: Copy> DynamicBuffer<T> {
         }
         .cast::<T>();
 
+        // SAFETY: `new_ptr` owns a fresh block holding `new_capacity` (at
+        // least `self.len`) elements with this element alignment, distinct
+        // from any block this handle holds.
+        self.swap_block(new_ptr);
+        self.cap = new_capacity;
+    }
+
+    /// Replace this handle's block with `new_ptr`, copying the live elements
+    /// over and giving up its reference to the old block.
+    ///
+    /// The one place the copy/release/swap sequence lives: [`Self::grow_to`]
+    /// and [`Self::ensure_unique`] differ only in how the new block is
+    /// obtained. `new_ptr` must own the new block's single reference and
+    /// point at room for at least `self.len` elements; the old block must
+    /// still be described by `self.cap` elements of this type.
+    fn swap_block(&mut self, new_ptr: *mut T) {
         if self.len > 0 {
             // SAFETY: both blocks hold `len` initialised elements of the same
             // type, the source is alive (this handle holds a reference to it),
@@ -314,7 +330,6 @@ impl<T: Copy> DynamicBuffer<T> {
             }
         }
         self.ptr = new_ptr;
-        self.cap = new_capacity;
     }
 
     /// Make this handle the only referent before writing through it.
@@ -333,18 +348,10 @@ impl<T: Copy> DynamicBuffer<T> {
         // SAFETY: the capacity is non-zero (a block exists) and the element
         // size is non-zero, so the allocation request is valid.
         let new_ptr = unsafe { native_buffer::allocate(bytes, Self::ELEMENT_ALIGN) }.cast::<T>();
-        if self.len > 0 {
-            // SAFETY: as in `grow_to`: same element type, `len <= cap`
-            // initialised elements on both sides, distinct allocations.
-            unsafe { std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len) };
-        }
-        // SAFETY: this handle owns one reference to the shared block; the
-        // reference count was above one, so the block survives for the other
-        // referents and the stored capacity still describes it.
-        unsafe {
-            native_buffer::release(self.ptr.cast::<u8>(), bytes, Self::ELEMENT_ALIGN);
-        }
-        self.ptr = new_ptr;
+        // SAFETY: `new_ptr` owns a fresh block holding `self.cap` elements
+        // with this element alignment, distinct from the shared block; the
+        // release inside leaves that block alive for its other referents.
+        self.swap_block(new_ptr);
     }
 }
 

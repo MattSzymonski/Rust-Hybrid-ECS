@@ -34,7 +34,10 @@ pub use pill_master_renderer_data::{assets, components, config};
 pub use pill_renderer_api::api;
 
 /// The mesh drawer: batches queued entities and records the instanced draws.
-pub mod drawers;
+///
+/// Crate-private: `renderer.rs` is the only consumer, and the renderer's
+/// extension ABI is what other crates compile against, not these helpers.
+pub(crate) mod drawers;
 
 /// Renderer failures, re-exported, and the wgpu validation capture.
 pub mod error;

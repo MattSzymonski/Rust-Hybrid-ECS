@@ -74,29 +74,13 @@ use super::manifest_apply::{
 pub(super) struct ResourceBinding {
     /// Engine id the resource was registered under.
     pub(super) resource_id: ResourceId,
-    /// Declared name the registration was made under, kept so a retirement
-    /// can report what the manifest stopped naming.
-    pub(super) name: String,
-    /// Width of the declared layout in bytes.
-    pub(super) size: usize,
-    /// Alignment of the declared layout in bytes.
+    /// The declaration this registration was made from.
     ///
-    /// Remembered beside the width because a rollback re-registers the
-    /// predecessor from this record alone, and the engine needs both.
-    pub(super) align: usize,
-    /// Hash of the managed field schema the registration was made with.
-    ///
-    /// Carried here rather than read back from the engine so a reload can tell
-    /// a resource whose fields changed from one whose bytes merely moved; size
-    /// and alignment can agree while the shape underneath them does not.
-    pub(super) schema_hash: u64,
-    /// The field layout this registration declared.
-    ///
-    /// The engine stores no field table for a foreign resource - a column has
-    /// one so the editor can show its rows, and a resource has no rows - so the
-    /// outgoing layout is remembered here. It is the only record of where each
-    /// field used to sit, and a reload's byte plan is measured against it.
-    pub(super) fields: Vec<ResourceFieldLayout>,
+    /// The one record of the resource's shape - name, size, alignment, schema
+    /// hash and field layout - so a reload compares, migrates and rolls back
+    /// against the same data the registration was made from rather than a
+    /// second copy that could drift from it.
+    pub(super) declaration: ManagedResourceDeclaration,
 }
 
 /// One field of a managed resource, as the manifest described it.
@@ -241,38 +225,10 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
     with_bindings(|table| {
         table
             .get(&key)
-            .map(|binding| (binding.resource_id, binding.size))
+            .map(|binding| (binding.resource_id, binding.declaration.size))
     })
 }
 
-/// Apply a reloaded generation's resource declarations to the live world.
-///
-/// Three outcomes per resource, decided by comparing the arriving declaration
-/// with the binding the previous generation left behind:
-///
-/// - **unchanged** - same schema hash, so the stored bytes are still valid
-///   under the arriving struct and nothing is touched, which is what keeps a
-///   resource's value across an ordinary reload;
-/// - **added** - no binding yet, so it is registered exactly as at startup;
-/// - **reshaped** - the schema hash moved, so the stored bytes are migrated
-///   field by field into the new layout, matched by name.
-///
-/// What this path cannot do at all - a resource entry an alias claims as
-/// someone else's past - is refused before anything is applied; a declaration
-/// the manifest merely stopped naming is retired after the rest of the apply,
-/// through `drop_resources`, which skips a value another subject still claims.
-/// What can still fail while
-/// applying is handled differently from the component path, which unwinds an
-/// undo journal: a relayout moves bytes into a narrower shape, so reversing it
-/// would invent the bytes it dropped. Instead the binding table is published on
-/// every exit, so it never describes a layout the engine no longer holds, and
-/// the failure is logged as one that needs a host restart.
-///
-/// # Errors
-///
-/// Returns a [`CSharpError`] when the engine refuses a registration or a
-/// relayout, or when one entry collects predecessors through more than one
-/// alias.
 /// Apply a reloaded generation's resource declarations to the live world.
 ///
 /// Five outcomes per resource, decided by the shared pipeline from the arriving
@@ -291,6 +247,12 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
 ///
 /// The ordering that makes those safe - aliases first, retirement last - is the
 /// pipeline's, and it is the same ordering managed components run through.
+///
+/// A failure part-way through is handled differently from the component path,
+/// which unwinds an undo journal: a relayout moves bytes into a narrower shape,
+/// so reversing it would invent the bytes it dropped. Instead the binding table
+/// is published on every exit, so it never describes a layout the engine no
+/// longer holds, and the failure is logged as one that needs a host restart.
 ///
 /// # Errors
 ///
@@ -351,7 +313,7 @@ pub(super) const RESOURCE_SUBJECT: ManifestSubject<
     identity: |resource| stable_component_id(&resource.full_name),
     name: |resource| resource.full_name.as_str(),
     aliases: |resource| &resource.aliases,
-    binding_name: |_engine, binding| binding.name.clone(),
+    binding_name: |_engine, binding| binding.declaration.full_name.clone(),
     // Every entry in the resource table is a managed declaration: unlike
     // components, there is no native lane sharing the map.
     is_governed: |_binding| true,
@@ -366,7 +328,7 @@ pub(super) const RESOURCE_SUBJECT: ManifestSubject<
     // needs no counterpart on the Rust side.
     check_addable: |_resource| Ok(()),
     settle: |_engine, binding, resource| {
-        Ok(if binding.schema_hash == resource.schema_hash {
+        Ok(if binding.declaration.schema_hash == resource.schema_hash {
             Settlement::Unchanged
         } else {
             Settlement::Reshaped
@@ -408,7 +370,7 @@ fn rename_resource_entry(
     resource: &ManagedResourceDeclaration,
 ) -> Result<(ResourceBinding, Option<ResourceUndo>), CSharpError> {
     let resource_id = register_one(engine, resource)?;
-    let plan = resource_field_plan(&predecessor.binding.fields, &resource.fields);
+    let plan = resource_field_plan(&predecessor.binding.declaration.fields, &resource.fields);
     let retyped = plan.retyped_fields().to_vec();
     engine
         .world_mut()
@@ -463,20 +425,17 @@ fn undo_resource_entry(engine: &mut Engine, undo: ResourceUndo) {
         successor_id,
         successor_fields,
     } = undo;
-    let declaration = ManagedResourceDeclaration {
-        full_name: predecessor.name.clone(),
-        size: predecessor.size,
-        align: predecessor.align,
-        schema_hash: predecessor.schema_hash,
-        aliases: Vec::new(),
-        fields: predecessor.fields.clone(),
-    };
+    let predecessor_name = predecessor.declaration.full_name.clone();
+    // The predecessor's own declaration rebuilds its registration; the alias
+    // list the arriving generation carried is not part of the shape.
+    let mut declaration = predecessor.declaration;
+    declaration.aliases = Vec::new();
     let restored_id = match register_one(engine, &declaration) {
         Ok(resource_id) => resource_id,
         Err(error) => {
             error!(
                 target: telemetry_target::HOT_RELOAD,
-                resource = %predecessor.name,
+                resource = %predecessor_name,
                 error = %error.to_plain_message(),
                 "could not re-register a renamed resource's predecessor during rollback"
             );
@@ -485,14 +444,14 @@ fn undo_resource_entry(engine: &mut Engine, undo: ResourceUndo) {
     };
     // The inverse plan: the successor's declared shape is the source and the
     // predecessor's remembered one is the destination.
-    let plan = resource_field_plan(&successor_fields, &predecessor.fields);
+    let plan = resource_field_plan(&successor_fields, &declaration.fields);
     if let Err(error) = engine
         .world_mut()
         .remap_foreign_resource(successor_id, restored_id, &plan)
     {
         error!(
             target: telemetry_target::HOT_RELOAD,
-            resource = %predecessor.name,
+            resource = %predecessor_name,
             error = %error.to_plain_message(),
             "could not move a renamed resource's value back during rollback"
         );
@@ -500,7 +459,7 @@ fn undo_resource_entry(engine: &mut Engine, undo: ResourceUndo) {
     }
     info!(
         target: telemetry_target::HOT_RELOAD,
-        resource = %predecessor.name,
+        resource = %predecessor_name,
         "rolled back a managed resource rename"
     );
 }
@@ -594,7 +553,7 @@ fn relayout_one(
     existing: &ResourceBinding,
     arriving: &ManagedResourceDeclaration,
 ) -> Result<(), CSharpError> {
-    let plan = resource_field_plan(&existing.fields, &arriving.fields);
+    let plan = resource_field_plan(&existing.declaration.fields, &arriving.fields);
     let retyped = plan.retyped_fields().to_vec();
     engine
         .world_mut()
@@ -693,11 +652,7 @@ fn layout_field(field: &ResourceFieldLayout) -> LayoutField<'_> {
 fn binding_for(resource_id: ResourceId, resource: &ManagedResourceDeclaration) -> ResourceBinding {
     ResourceBinding {
         resource_id,
-        name: resource.full_name.clone(),
-        size: resource.size,
-        align: resource.align,
-        schema_hash: resource.schema_hash,
-        fields: resource.fields.clone(),
+        declaration: resource.clone(),
     }
 }
 

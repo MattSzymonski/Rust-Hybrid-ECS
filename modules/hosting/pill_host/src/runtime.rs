@@ -44,7 +44,7 @@ use pill_engine::{InputEvent, RumbleRequest};
 use pill_renderer_api::{PillRenderer, RenderViewport, RendererError};
 use pill_runtime::registration::extension_owner;
 #[cfg(feature = "rendering")]
-use pill_runtime::{AttachedRenderer, NativeAssets, RendererWindow};
+use pill_runtime::{AttachedRenderer, RendererWindow};
 use pill_runtime::{FrameDriver, FrameReport, Runtime};
 
 // Current crate
@@ -456,8 +456,6 @@ pub struct RenderingHost {
     display: AttachedRenderer,
     /// The renderer module the backend lives in.
     renderer_module: RendererModule,
-    /// Renderer assets prepared beside the engine.
-    assets: NativeAssets,
     /// Why rendering is paused, or `None` while it runs.
     ///
     /// Set when the renderer's data crate reloaded with a different component
@@ -880,8 +878,7 @@ impl RenderingHost {
         // after every swap of this boundary.
         self.deliver_shader_changes(data_extension.as_deref());
 
-        // Step 3: Asset sync, then the frame's systems.
-        self.assets.update(self.host.engine_mut())?;
+        // Step 3: The frame's systems.
         let report = run_frame_phase(&mut self.host, frame_start);
 
         // Step 4: While paused the live renderer must not read the world.
@@ -899,92 +896,22 @@ impl RenderingHost {
         Ok(report)
     }
 
-    /// Read live frame statistics for UI overlays without affecting the
-    /// lower-frequency report returned by [`Self::run_one_frame`].
-    pub fn current_frame_report(&self) -> FrameReport {
-        self.host.current_frame_report()
-    }
-
-    /// Read-only engine access for frontend diagnostics and editor snapshots.
-    pub fn engine(&self) -> &Engine {
-        self.host.engine()
-    }
-
-    /// Mutable engine access for frontend-owned, frame-boundary work.
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        self.host.engine_mut()
-    }
-
-    /// Monotonic reload/rollback/patch counter; see [`DevHost::revision`].
-    pub fn revision(&self) -> u64 {
-        self.host.revision()
-    }
-
-    /// Loaded extension names in `SystemOwner` order; see
-    /// [`DevHost::extension_names`].
-    pub fn extension_names(&self) -> Vec<String> {
-        self.host.extension_names()
-    }
-
-    /// The project's `res` tree; see [`DevHost::asset_entries`].
-    pub fn asset_entries(&self) -> Vec<crate::asset_browser::AssetEntry> {
-        self.host.asset_entries()
-    }
-
-    /// An asset's settings as JSON; see [`DevHost::asset_settings`].
+    /// The wrapped development host.
     ///
-    /// # Errors
-    ///
-    /// As [`DevHost::asset_settings`].
-    pub fn asset_settings(&self, path: &str) -> Result<serde_json::Value, String> {
-        self.host.asset_settings(path)
+    /// The editor and other embedded frontends reach the engine, assets and
+    /// diagnostics through this one accessor. A passthrough per call would be
+    /// a second surface to keep in step with `DevHost`'s, and the methods it
+    /// would mirror protect no invariant - they are straight calls.
+    pub fn host(&self) -> &DevHost {
+        &self.host
     }
 
-    /// Save an asset's settings; see [`DevHost::save_asset_settings`].
+    /// The wrapped development host, mutably.
     ///
-    /// # Errors
-    ///
-    /// As [`DevHost::save_asset_settings`].
-    pub fn save_asset_settings(
-        &mut self,
-        path: &str,
-        settings: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        self.host.save_asset_settings(path, settings)
-    }
-
-    /// Keep every source asset paired with a `.meta`; see
-    /// [`DevHost::set_ensure_asset_metadata`].
-    pub fn set_ensure_asset_metadata(&mut self, enabled: bool) {
-        self.host.set_ensure_asset_metadata(enabled);
-    }
-
-    /// The standalone asset types; see [`DevHost::standalone_asset_types`].
-    pub fn standalone_asset_types(&self) -> Vec<crate::asset_browser::StandaloneType> {
-        self.host.standalone_asset_types()
-    }
-
-    /// Create a standalone asset; see [`DevHost::create_standalone_asset`].
-    ///
-    /// # Errors
-    ///
-    /// As [`DevHost::create_standalone_asset`].
-    pub fn create_standalone_asset(
-        &mut self,
-        type_name: &str,
-        folder: &str,
-        name: &str,
-    ) -> Result<String, String> {
-        self.host.create_standalone_asset(type_name, folder, name)
-    }
-
-    /// Move an asset with its `.meta`; see [`DevHost::move_asset`].
-    ///
-    /// # Errors
-    ///
-    /// As [`DevHost::move_asset`].
-    pub fn move_asset(&self, from: &str, to: &str) -> Result<(), String> {
-        self.host.move_asset(from, to)
+    /// Used for the frame-boundary work frontends own: applying command
+    /// batches and asset edits between frames.
+    pub fn host_mut(&mut self) -> &mut DevHost {
+        &mut self.host
     }
 }
 
@@ -1005,11 +932,11 @@ impl FrameDriver for RenderingHost {
     }
 
     fn push_input(&mut self, event: InputEvent) {
-        self.engine_mut().push_input_event(event);
+        self.host.engine_mut().push_input_event(event);
     }
 
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
-        self.engine_mut().take_rumble_requests()
+        self.host.engine_mut().take_rumble_requests()
     }
 }
 
@@ -1572,19 +1499,11 @@ where
         "attaching the engine renderer to the window surface"
     );
     let (renderer_module, display) = attach_renderer_module(&mut host, window, width, height)?;
-    let project_root = host
-        .workspace_root
-        .join(&host.module_config.watch_directory)
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let assets = NativeAssets::prepare(Some(&project_root))?;
     let shader_watcher = start_shader_watcher(&host);
     Ok(RenderingHost {
         host,
         display,
         renderer_module,
-        assets,
         paused: None,
         shader_watcher,
         unsupported_data_check_pending: true,
@@ -2076,18 +1995,12 @@ fn advance_managed_build(host: &mut DevHost) {
                 target: telemetry_target::HOT_RELOAD,
                 "the C# assembly build stopped unexpectedly; building on the frame thread instead"
             );
-            let replaced = host.loaded_project.reload(
-                host.runtime.engine_mut(),
-                &host.engine_api,
-                &host.workspace_root,
-                &host.module_config,
-                None,
-            );
-            if replaced {
-                forget_prologue_records(host);
+            let report =
+                host.loaded_project
+                    .build_now(&host.workspace_root, &host.module_config, None);
+            if let Some(report) = report {
+                finish_managed_build(host, report);
             }
-            resync_patch_baselines(host, true, &[]);
-            host.bump_editor_revision();
         }
     }
 }
@@ -2410,27 +2323,56 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
             &host.module_config,
             Some((Arc::clone(&host.source_edit_generation), source_edits)),
         );
-        let building_on_worker = matches!(start, ManagedReloadStart::Building);
-        if !building_on_worker {
-            // The project image about to be replaced unmaps two generations later,
-            // so every recorded prologue address inside it goes stale the moment
-            // the swap commits - the same clear a module reload performs, gated
-            // the same way.
-            let replaced = host.loaded_project.reload(
-                host.runtime.engine_mut(),
-                &host.engine_api,
-                &host.workspace_root,
-                &host.module_config,
-                // A save during the build advances the generation beyond this
-                // baseline, which cancels the in-flight compilation; the next
-                // frame observes the newer generation and rebuilds.
-                Some((&host.source_edit_generation, source_edits)),
-            );
-            // A failed or refused reload keeps the current image, whose patches
-            // are still installed and whose recorded prologues are still their
-            // rollback route, so the records are dropped only on a real swap.
-            if replaced {
-                forget_prologue_records(host);
+        match start {
+            // A worker thread is building the assembly; its report is
+            // collected by `advance_managed_build` at a later boundary.
+            ManagedReloadStart::Building => {}
+            // A native project has no assembly to build: its reload owns the
+            // DLL transaction on this thread.
+            ManagedReloadStart::NotManaged => {
+                // The project image about to be replaced unmaps two generations later,
+                // so every recorded prologue address inside it goes stale the moment
+                // the swap commits - the same clear a module reload performs, gated
+                // the same way.
+                let replaced = host.loaded_project.reload(
+                    host.runtime.engine_mut(),
+                    &host.engine_api,
+                    &host.workspace_root,
+                    &host.module_config,
+                    // A save during the build advances the generation beyond this
+                    // baseline, which cancels the in-flight compilation; the next
+                    // frame observes the newer generation and rebuilds.
+                    Some((&host.source_edit_generation, source_edits)),
+                );
+                // A failed or refused reload keeps the current image, whose patches
+                // are still installed and whose recorded prologues are still their
+                // rollback route, so the records are dropped only on a real swap.
+                if replaced {
+                    forget_prologue_records(host);
+                }
+                // The project now runs the sources on disk, so the patch classifier's
+                // baseline has to say so too. Skipping this is what makes one refused
+                // patch disable the fast path for the rest of the session.
+                resync_patch_baselines(host, true, &[]);
+                // A project reload replaced the running image; the editor must refresh.
+                host.bump_editor_revision();
+            }
+            // The build worker could not start, so the build runs on this
+            // thread; its report goes through the same handler the worker's
+            // reports go through, so there is one outcome path with one set
+            // of log lines.
+            ManagedReloadStart::Unavailable => {
+                let report = host.loaded_project.build_now(
+                    &host.workspace_root,
+                    &host.module_config,
+                    // A save during the build advances the generation beyond this
+                    // baseline, which cancels the in-flight compilation; the next
+                    // frame observes the newer generation and rebuilds.
+                    Some((Arc::clone(&host.source_edit_generation), source_edits)),
+                );
+                if let Some(report) = report {
+                    finish_managed_build(host, report);
+                }
             }
         }
         // The baseline the reload ran against, not a fresh read. A save during
@@ -2443,18 +2385,6 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         // The rebuild the cascade asked for has happened; a later module swap
         // bumps the counter again.
         host.last_processed_queued_reload = queued_reloads;
-
-        // The patch classifier baseline and the editor revision refresh once
-        // the attempt has done its work: right here for a synchronous reload,
-        // and in `finish_managed_build` when a worker build reports.
-        if !building_on_worker {
-            // The project now runs the sources on disk, so the patch classifier's
-            // baseline has to say so too. Skipping this is what makes one refused
-            // patch disable the fast path for the rest of the session.
-            resync_patch_baselines(host, true, &[]);
-            // A project reload replaced the running image; the editor must refresh.
-            host.bump_editor_revision();
-        }
     }
 
     // Step 6: A reload above may have re-laid out a shared component other
@@ -2742,27 +2672,15 @@ fn apply_asset_changes(host: &mut DevHost) {
     }
 }
 
-/// One scheduler frame and its reporting, run by the wrapped runtime, with
-/// the native update hooks after the systems.
+/// One scheduler frame and its reporting, run by the wrapped runtime.
 pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) -> Option<FrameReport> {
-    let DevHost {
-        runtime,
-        engine_api,
-        loaded_project,
-        extensions,
-        ..
-    } = host;
+    let DevHost { runtime, .. } = host;
     runtime.run_frame_with(frame_start, |_| {
-        // The native compatibility update, after the scheduler systems.
-        // Managed games run entirely as scheduler systems; native games keep
-        // this optional hook (`pill_module_update`), which a statically linked
-        // build does not have. Extensions may export one too, and run after
-        // the project so a module observes the world the project's systems
-        // produced.
-        loaded_project.update(engine_api);
-        for slot in extensions.iter() {
-            slot.update(engine_api);
-        }
+        // The per-frame native update hooks the loader once offered ran here.
+        // Nothing in the workspace generates that optional export: a project
+        // and every extension run entirely through their registered scheduler
+        // systems, so this phase has nothing of its own left to do. The
+        // closure stays as the seam a future per-frame hook would use.
     })
 }
 
@@ -2956,7 +2874,6 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
             elapsed_milliseconds,
             stages,
             artifact_bytes,
-            exports,
             routes,
             copies,
         } => {
@@ -3006,7 +2923,6 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 stages.load,
                 stages.activate,
                 artifact_bytes,
-                exports,
                 &routes,
                 copies,
             );

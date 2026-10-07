@@ -329,15 +329,9 @@ fn normalize(model: &mut LayoutModel) -> Result<(), LayoutError> {
         .unwrap_or(0)
         .saturating_add(1);
 
-    if model
-        .active_tabset
-        .is_none_or(|id| model.tabset(id).is_none())
-    {
-        model.active_tabset = model
-            .nodes
-            .iter()
-            .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id));
-    }
+    // The fallback rule lives on the model, so this normalisation, the view
+    // and the shell cannot disagree about which tabset is active.
+    model.active_tabset = model.resolved_active_tabset();
     Ok(())
 }
 
@@ -601,5 +595,18 @@ mod tests {
         let scene = tab_for(&model, PanelKind::Scene);
         assert!(model.apply(LayoutAction::CloseTab { tab: scene }).is_err());
         assert_eq!(model, original);
+    }
+
+    #[test]
+    fn normalize_falls_back_to_the_first_tabset_when_none_is_active() {
+        let mut model = LayoutModel::default_editor();
+        model.active_tabset = None;
+        normalize(&mut model).unwrap();
+        let first_tabset = model
+            .nodes
+            .iter()
+            .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id));
+        assert_eq!(model.active_tabset, first_tabset);
+        assert_eq!(model.active_tabset, model.resolved_active_tabset());
     }
 }

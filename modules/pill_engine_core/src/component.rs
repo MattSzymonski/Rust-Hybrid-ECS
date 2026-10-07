@@ -383,10 +383,10 @@ impl ComponentId {
 }
 
 // =============================================================================
-// ComponentLayout
+// ComponentRegistration
 // =============================================================================
 
-/// The memory shape of one registered component type.
+/// The registration record of one component's layout.
 ///
 /// Recorded per [`ComponentId`] so a second registration of the same component
 /// can be checked against the first. For an ordinary component that check is a
@@ -398,7 +398,7 @@ impl ComponentId {
 /// [`ColumnLayout`](crate::archetype::ColumnLayout) is that one, and its
 /// `schema_hash` is a plain `u64` rather than the `Option` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ComponentLayout {
+pub struct ComponentRegistration {
     /// Byte size of one component value.
     pub size: usize,
     /// Byte alignment of one component value.
@@ -408,7 +408,7 @@ pub struct ComponentLayout {
     pub schema_hash: Option<u64>,
 }
 
-impl ComponentLayout {
+impl ComponentRegistration {
     /// Build the layout record for `T` from its declared field descriptors.
     ///
     /// An empty `fields` slice records no schema hash rather than the hash of
@@ -572,7 +572,7 @@ pub struct ComponentRegistry {
     /// Type name of each registered component, used for diagnostics and tooling.
     names: HashMap<ComponentId, String>,
     /// Size in bytes of each registered component type.
-    layouts: HashMap<ComponentId, ComponentLayout>,
+    layouts: HashMap<ComponentId, ComponentRegistration>,
     /// Rust type name that claimed each shared identity, so a second claim by a
     /// *different* type can be told apart from the same type compiled twice.
     ///
@@ -710,7 +710,7 @@ impl ComponentRegistry {
         // registered, after checking that both registrations describe the
         // same memory shape.
         let component_id = ComponentId::of::<T>();
-        let layout = ComponentLayout::of::<T>(fields);
+        let layout = ComponentRegistration::of::<T>(fields);
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             // A shared name is a process-wide identity, so two types holding
             // it are one component: one bit, one column, and every write
@@ -919,7 +919,7 @@ impl ComponentRegistry {
         // only what it is asked for here.
         self.layouts.insert(
             component_id,
-            ComponentLayout {
+            ComponentRegistration {
                 size,
                 align: 1,
                 schema_hash: None,
@@ -988,7 +988,7 @@ impl ComponentRegistry {
     }
 
     /// Get the recorded memory layout of a registered component type.
-    pub fn get_layout(&self, component_id: &ComponentId) -> Option<ComponentLayout> {
+    pub fn get_layout(&self, component_id: &ComponentId) -> Option<ComponentRegistration> {
         self.layouts.get(component_id).copied()
     }
 

@@ -271,7 +271,7 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 # =============================================================================
 
 # [analytics] reload <name> (reload #N) | build=<..> | stage=..ms | load=..ms
-#   | init=..ms | migrate=..ms | size=.. | exports=N | kind=reload|patch
+#   | init=..ms | migrate=..ms | size=.. | kind=reload|patch
 #   [ | route=<route>[+<route>] | copies=N ]
 #
 # `kind` distinguishes a whole-artifact reload from an in-place function patch.
@@ -298,7 +298,7 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 RELOAD_LINE_RE = re.compile(
     r"\[analytics\] reload (.+?) \(reload #\d+\) \| build=(\S+) \| stage=([\d.]+)ms"
     r" \| load=([\d.]+)ms \| init=([\d.]+)ms \| migrate=([\d.]+)ms \| size=(\S+)"
-    r" \| exports=(\d+)(?: \| kind=(\w+))?"
+    r"(?: \| exports=\d+)?(?: \| kind=(\w+))?"
     r"(?: \| route=([\w+-]+) \| copies=(\d+))?"
 )
 
@@ -391,9 +391,9 @@ def parse_reload_breakdown(
     timing.init_ms = float(match.group(5))
     timing.migrate_ms = float(match.group(6))
     # Absent on a host built before the field existed; a plain reload then.
-    timing.kind = match.group(9) or "reload"
-    timing.route = match.group(10)
-    timing.copies = int(match.group(11)) if match.group(11) else None
+    timing.kind = match.group(8) or "reload"
+    timing.route = match.group(9)
+    timing.copies = int(match.group(10)) if match.group(10) else None
     following = output[line_end + 1 :]
     next_reload = following.find("[analytics] reload ")
     window = following[: next_reload if next_reload >= 0 else 2000]

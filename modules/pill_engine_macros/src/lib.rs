@@ -227,7 +227,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
             fn declared_schema_hash() -> ::core::option::Option<u64> {
                 // The same descriptors registration hashes, so a type agrees
                 // with its own registration by construction. An empty layout
-                // declares nothing, matching `ComponentLayout::of`.
+                // declares nothing, matching `ComponentRegistration::of`.
                 let fields: &[::pill_engine::component_registry::ComponentFieldDescriptor] =
                     #layout_reference;
                 (!fields.is_empty())
@@ -878,6 +878,21 @@ fn emit_heap_field_accessor(
     }
 }
 
+/// Flatten a path's segments into one string, joined by `separator`.
+///
+/// The spelling is a wire format in three places: the `struct:` tag a
+/// component field's nested type carries, and the mirrored declaration's
+/// descriptor name and synthetic static, which the C# side matches against
+/// the artifact registries. One implementation keeps those spellings from
+/// drifting apart.
+fn flattened_path(path: &syn::Path, separator: &str) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
 /// Map a Rust field type to the closed C#-mirror type-tag vocabulary.
 ///
 /// Primitives and fixed-size arrays are expressible; any other path type is
@@ -996,13 +1011,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                     // an un-resolvable struct and renders opaque). Tagged by
                     // its fully-qualified path so `PillMirror` descriptors
                     // resolve by name.
-                    let qualified = path
-                        .path
-                        .segments
-                        .iter()
-                        .map(|segment| segment.ident.to_string())
-                        .collect::<Vec<_>>()
-                        .join("::");
+                    let qualified = flattened_path(&path.path, "::");
                     Ok(format!("struct:{qualified}"))
                 }
             }
@@ -1200,13 +1209,7 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
     // generated `static` unique - two declarations whose paths end in the
     // same segment would collide under the raw name - so the full path is
     // flattened into the identifier.
-    let flat_name = declaration
-        .type_path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("_");
+    let flat_name = flattened_path(&declaration.type_path, "_");
     let synthetic_ident = syn::Ident::new(&flat_name, declaration.type_path.span());
     let field_names = declaration.fields.iter().map(|field| &field.name);
     let field_types = declaration.fields.iter().map(|field| &field.ty);
@@ -1227,13 +1230,7 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
 
     // Joined the same way the field tag is, so the descriptor name matches
     // what a component field spelled with this path produces.
-    let type_name = declaration
-        .type_path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::");
+    let type_name = flattened_path(&declaration.type_path, "::");
     let type_path = &declaration.type_path;
     let last_field = declaration
         .fields

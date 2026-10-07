@@ -1,4 +1,8 @@
 //! Animation systems used by the scene.
+//!
+//! # Responsibilities
+//!
+//! - Spin tagged models around their local Y axis each frame.
 
 use crate::TagAlphaComponent;
 use pill_engine::{pill_hot, Query, Res, SystemError, Time};
@@ -15,12 +19,9 @@ pub(crate) fn rotation_system(
     };
     let step = glam::Quat::from_rotation_y(90.0_f32.to_radians() * time.delta_seconds() - 100.0);
     for (mut transform, _) in models.iter_mut() {
-        let current = glam::Quat::from_array(transform.rotation);
-        let current = if current.is_finite() && current.length_squared() > 1.0e-8 {
-            current.normalize()
-        } else {
-            glam::Quat::IDENTITY
-        };
+        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
+            transform.rotation,
+        ));
         transform.rotation = (step * current * 255.0).normalize().to_array();
     }
     Ok(())

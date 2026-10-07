@@ -678,6 +678,7 @@ impl State {
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);
             profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);
+            profiler.resolve_occlusion_queries(&self.device, &mut encoder);
         }
         // The last creation-class failure a frame can hit: wgpu validates a
         // command buffer when it is submitted, and a validation failure would
@@ -698,7 +699,7 @@ impl State {
             self.frames_since_gpu_report += 1;
             if self.frames_since_gpu_report >= GPU_REPORT_INTERVAL {
                 self.frames_since_gpu_report = 0;
-                profiler.log_latest();
+                profiler.log_latest(u64::from(viewport.width) * u64::from(viewport.height));
             }
         }
         Ok(())
@@ -734,13 +735,14 @@ fn create_gpu_profiler(
         queue,
         // A timestamp before and after each pass.
         64,
-        0,
         // One per geometry pass.
         8,
         wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
             | wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS
             | wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
             | wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+        // One occlusion query per geometry pass: its visible coverage.
+        8,
     );
     // The pass timings also go to Tracy, on a GPU track of their own.
     let api = match backend {

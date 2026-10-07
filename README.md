@@ -116,8 +116,7 @@ existing; nothing lists it by name.
 
 1. Create `modules/extensions/<name>/` with a `Cargo.toml` declaring
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
-2. Export `pill_module_abi_version` and `pill_module_init`, optionally
-  `pill_module_update`.
+2. Export `pill_module_abi_version` and `pill_module_init`.
 3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from

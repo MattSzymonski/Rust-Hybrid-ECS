@@ -162,6 +162,31 @@ impl Default for TransformComponent {
     }
 }
 
+/// Squared length below which a rotation quaternion is read as identity.
+///
+/// Normalizing a near-zero quaternion would amplify rounding noise rather
+/// than an angle, so anything at or under this is not a usable orientation.
+pub const ROTATION_IDENTITY_EPSILON: f32 = 1.0e-8;
+
+/// Read a [`TransformComponent::rotation`] value as a normalize-or-identity
+/// quaternion array.
+///
+/// The one implementation of the rule the field's documentation states: a
+/// non-finite or zero-length value reads as identity instead of being used
+/// as-is, and everything else is normalized. Systems, projects and the
+/// renderer share this rule and its tolerance rather than each spelling
+/// their own.
+pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
+    let length_squared: f32 = rotation.iter().map(|value| value * value).sum();
+    if rotation.iter().all(|value| value.is_finite()) && length_squared > ROTATION_IDENTITY_EPSILON
+    {
+        let inverse_length = length_squared.sqrt().recip();
+        rotation.map(|value| value * inverse_length)
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
 // =============================================================================
 // Registration
 // =============================================================================

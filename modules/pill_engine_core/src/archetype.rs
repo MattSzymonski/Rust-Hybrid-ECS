@@ -124,10 +124,10 @@ pub struct Blittability {
 impl Blittability {
     /// The witness a manifest-driven registration carries.
     ///
-    /// `pill_csharp_bridge::components` calls this only after its
-    /// `BLITTABLE_FIELD_TYPES` check rejected every field type that is not a
-    /// blittable value type, so holding one of these means the fields were
-    /// vetted. The name records where the check ran.
+    /// `pill_csharp_bridge::components` calls this only after its blittable
+    /// vocabulary check rejected every field type that is not a blittable
+    /// value type, so holding one of these means the fields were vetted. The
+    /// name records where the check ran.
     pub fn from_manifest_fields() -> Self {
         Self { _private: () }
     }
@@ -327,14 +327,9 @@ impl ColumnOps {
 ///
 /// Describes the memory footprint of an opaque component column so its rows
 /// can be copied in and out as raw bytes without knowing the concrete type.
-///
-/// Not to be confused with [`ComponentLayout`](crate::component::ComponentLayout),
-/// which is the registry's record of a registration. The difference is in the
-/// schema hash: a column always has one, because a column only exists once
-/// something described the rows well enough to store them, while a
-/// registration's is `Option` and is `None` for a hand-registered or unit
-/// type. Holding this one, `schema_hash` is always evidence; holding that one,
-/// its absence is the case the shared-component check has to tolerate.
+/// The schema hash is always present here: a column only exists once something
+/// described the rows well enough to store them, so holding one of these, the
+/// hash is evidence rather than an option.
 #[derive(Debug, Clone)]
 pub struct ColumnLayout {
     /// Size in bytes of a single component instance.
@@ -1811,8 +1806,8 @@ impl ComponentColumn {
 //
 // 1. Every field of a descriptor component is a blittable value type. The
 //    evidence is held by the engine: every `ColumnLayout` carries a
-//    `Blittability` witness, the host builds its own only after
-//    `BLITTABLE_FIELD_TYPES` vetted the manifest's fields, and no column can
+//    `Blittability` witness, the host builds its own only after the managed
+//    blittable vocabulary vetted the manifest's fields, and no column can
 //    be constructed without a layout. This is what makes the raw `ptr::copy`
 //    in `swap_remove` and the destructor-free paths below correct: there is no
 //    ownership to duplicate or release.

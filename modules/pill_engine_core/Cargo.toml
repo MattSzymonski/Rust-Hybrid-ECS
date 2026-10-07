@@ -14,6 +14,7 @@ edition = "2021"
 workspace = true
 
 [dependencies]
+pill_asset_format = { path = "../pill_asset_format" }
 pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 pill_engine_macros = { path = "../pill_engine_macros" }

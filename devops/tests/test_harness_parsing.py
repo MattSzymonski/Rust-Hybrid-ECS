@@ -80,20 +80,21 @@ basic = load_module("tests/test_basic.py", "test_basic")
 REAL_ANALYTICS_LINES = [
     # A whole-artifact reload.
     "[analytics] reload project (reload #1) | build=1.91s | stage=3.2ms | load=90.2ms"
-    " | init=0.4ms | migrate=0.0ms | size=767.5KB | exports=9 | kind=reload",
+    " | init=0.4ms | migrate=0.0ms | size=767.5KB | kind=reload",
     # A patch through a per-artifact slot, with the route fields.
     "[analytics] reload pill_dummy_color::get_color_a (reload #1) | build=479ms"
     " | stage=28.0ms | load=24.1ms | init=0.3ms | migrate=0.0ms | size=45.5KB"
-    " | exports=15 | kind=patch | route=artifact-slot | copies=3",
+    " | kind=patch | route=artifact-slot | copies=3",
     # A trait method: the name contains spaces inside `<Type as Trait>`.
     "[analytics] reload pill_spline::<Spline as ColorTweak>::tweak (reload #1)"
     " | build=507ms | stage=99.6ms | load=49.6ms | init=1.6ms | migrate=0.0ms"
-    " | size=516.0KB | exports=16 | kind=patch | route=prologue | copies=2",
+    " | size=516.0KB | kind=patch | route=prologue | copies=2",
     # Two bodies patched in one save: the name contains a comma and a space.
     "[analytics] reload pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix"
     " (reload #1) | build=360ms | stage=22.7ms | load=19.8ms | init=1.6ms"
-    " | migrate=0.0ms | size=45.5KB | exports=15 | kind=patch",
-    # A host predating the kind/route fields: both groups are optional.
+    " | migrate=0.0ms | size=45.5KB | kind=patch",
+    # A host predating the kind/route fields, and predating the export-column
+    # removal: the optional groups are what keep stored measurements readable.
     "[analytics] reload pill_spline (reload #2) | build=401ms | stage=3.2ms"
     " | load=76.6ms | init=0.3ms | migrate=0.0ms | size=510.0KB | exports=9",
 ]
@@ -181,16 +182,16 @@ def check_optional_fields_are_really_optional() -> None:
     old_line = next(line for line in REAL_ANALYTICS_LINES if "kind=" not in line)
     match = harness.RELOAD_LINE_RE.search(old_line)
     assert match is not None, "a line without the optional fields must still match"
-    assert match.group(9) is None, "kind must be absent, not defaulted"
-    assert match.group(10) is None, "route must be absent, not defaulted"
+    assert match.group(8) is None, "kind must be absent, not defaulted"
+    assert match.group(9) is None, "route must be absent, not defaulted"
 
 
 def check_route_is_read_only_when_present() -> None:
     """`route` and `copies` parse together, or not at all."""
     with_route = next(line for line in REAL_ANALYTICS_LINES if "route=" in line)
     match = harness.RELOAD_LINE_RE.search(with_route)
-    assert match.group(10) == "artifact-slot", f"route was {match.group(10)!r}"
-    assert match.group(11) == "3", f"copies was {match.group(11)!r}"
+    assert match.group(9) == "artifact-slot", f"route was {match.group(9)!r}"
+    assert match.group(10) == "3", f"copies was {match.group(10)!r}"
 
 
 def check_provable_routes_match_the_engine() -> None:

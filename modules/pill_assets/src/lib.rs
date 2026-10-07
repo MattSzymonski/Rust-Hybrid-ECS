@@ -52,6 +52,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use pill_asset_format::{ASSET_PACK_MAGIC, ASSET_PACK_VERSION};
+
 /// The cooking rules this crate ships: the always-on shader rule, and whatever
 /// a caller resolves to add to it.
 pub mod rules;
@@ -380,12 +382,6 @@ pub fn walk_files(directory: &Path) -> Result<Vec<PathBuf>, CookError> {
     files.sort();
     Ok(files)
 }
-
-/// The first bytes of an asset pack; the engine reads the same constant.
-const ASSET_PACK_MAGIC: &[u8; 8] = b"PILLPACK";
-
-/// The asset pack format version written here.
-const ASSET_PACK_VERSION: u32 = 1;
 
 /// Write every file below `source` into one asset pack at `output`, and return
 /// the files packed - for a build script to report to cargo.

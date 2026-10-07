@@ -28,18 +28,11 @@ pub(crate) fn EntitiesTab(editor: Arc<EditorContext>) -> Element {
     let mut snapshot = use_signal(EditorSnapshot::default);
     let mut context_menu = use_signal(|| None::<Entity>);
 
-    // Every VirtualDom polls the shared context into its own signal, exactly
-    // like the detached-window stats loop, so this component works identically
-    // in the main dock and in a pop-out.
-    let poll_editor = Arc::clone(&editor);
-    use_future(move || {
-        let poll_editor = Arc::clone(&poll_editor);
-        async move {
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                snapshot.set(poll_editor.snapshot());
-            }
-        }
+    // Every VirtualDom polls the shared context into its own signal through
+    // the shared hook, so this component works identically in the main dock
+    // and in a pop-out.
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        snapshot.set(editor.snapshot());
     });
 
     // Clicking a row selects it for the Inspector; right-click opens the
