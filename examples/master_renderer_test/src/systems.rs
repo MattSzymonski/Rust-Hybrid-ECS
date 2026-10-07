@@ -1,4 +1,8 @@
 //! The helmet's spin.
+//!
+//! # Responsibilities
+//!
+//! - Rotate helmet-tagged entities around their local Y axis each frame.
 
 use crate::TagHelmet;
 use pill_engine::{pill_hot, Query, Res, SystemError, Time};
@@ -19,12 +23,9 @@ pub(crate) fn rotation_system(
     };
     let step = glam::Quat::from_rotation_y(TURN_RADIANS_PER_SECOND * time.delta_seconds());
     for (mut transform, _) in helmets.iter_mut() {
-        let current = glam::Quat::from_array(transform.rotation);
-        let current = if current.is_finite() && current.length_squared() > 1.0e-8 {
-            current.normalize()
-        } else {
-            glam::Quat::IDENTITY
-        };
+        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
+            transform.rotation,
+        ));
         transform.rotation = (step * current).normalize().to_array();
     }
     Ok(())

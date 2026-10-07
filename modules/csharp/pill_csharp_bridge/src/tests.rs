@@ -128,8 +128,8 @@ fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
 /// The witness these tests hand to `register_component_descriptor`.
 ///
 /// The shapes registered here are four-byte integers named literally, which is
-/// the same evidence the production path earns by running
-/// `BLITTABLE_FIELD_TYPES` over a manifest.
+/// the same evidence the production path earns by running the blittable
+/// vocabulary over a manifest.
 fn test_witness() -> pill_engine::archetype::Blittability {
     pill_engine::archetype::Blittability::from_manifest_fields()
 }
@@ -859,6 +859,50 @@ fn module_native_binding_rejects_live_layout_mismatch() {
         ),
         2,
         "a wrong-size binding reports failure instead of aborting"
+    );
+}
+
+/// The archetype-scoped native arm refuses a stale binding the same way the
+/// index-based one does.
+#[test]
+fn archetype_scoped_module_native_binding_rejects_live_layout_mismatch() {
+    let mut engine = Engine::new();
+    let mut bindings = shared_component_bindings(&mut engine);
+    let renderable_stable_id = test_stable_id("MeshRendererComponent");
+    bindings.insert(
+        renderable_stable_id,
+        ComponentBinding::ModuleNative {
+            component_id: ComponentId::of::<MeshRendererComponent>(),
+            // Deliberately not the live layout, so the arm has to refuse.
+            size: 64,
+            align: 4,
+            field_signature: None,
+        },
+    );
+    engine
+        .world_mut()
+        .create_entity()
+        .with(MeshRendererComponent::default())
+        .build()
+        .unwrap();
+    let accesses = [native_access("MeshRendererComponent", 1)];
+    let mut entity_chunk = empty_chunk();
+    let mut chunk = empty_chunk();
+    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    // The archetype is learned from the entity column, exactly as the managed
+    // enumerator learns it from its driver chunk.
+    assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), ABI_SUCCESS);
+    assert_eq!(
+        ffi_get_archetype_chunk(
+            entity_chunk.archetype_low,
+            entity_chunk.archetype_high,
+            renderable_stable_id.0 as u64,
+            (renderable_stable_id.0 >> 64) as u64,
+            1,
+            &mut chunk,
+        ),
+        2,
+        "the archetype-scoped native arm fails closed on a wrong-size binding"
     );
 }
 

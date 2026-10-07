@@ -42,7 +42,7 @@ mod loaded {
     use crate::build_runner::build_project_module;
     use crate::csharp::{
         BuildCollection, BuildOutcome, BuildReport, CSharpProject, FastCompileOutcome,
-        POLL_REJECTED, POLL_RELOADED,
+        FastCompiler, POLL_REJECTED, POLL_RELOADED,
     };
     use crate::native_library::NativeLibrary;
     use crate::watcher::SourceTrigger;
@@ -65,8 +65,9 @@ mod loaded {
         /// the finish lands when [`LoadedProject::collect_managed_build`]
         /// reports the build.
         Building,
-        /// The build thread could not start; the caller must reload on the
-        /// frame thread, the way every reload used to run.
+        /// The build thread could not start; the caller builds on the frame
+        /// thread through [`LoadedProject::build_now`] and consumes the report
+        /// through the same handler the worker's reports go through.
         Unavailable,
     }
 
@@ -237,51 +238,16 @@ mod loaded {
                     config,
                     cancel_flag,
                 ),
-                // C# source changes are compiled by the host. The collectible
-                // managed loader validates the rebuilt assembly's component
-                // manifest and system signatures before swapping; poll_reload
-                // reports the outcome and logs any rejection.
-                //
-                // TWO DELIBERATE MECHANISMS, ONE SWAP. The swap itself always
-                // happens inside the managed loader's `PollReload`; what
-                // differs is when the host asks for it:
-                //
-                // - The `dotnet build` fallback has no completion signal the
-                //   loader can trust - it watches the assembly file, which a
-                //   build may rewrite at any point - so the frame loop polls
-                //   once per frame and the loader's 500 ms interval decides
-                //   when the bytes are settled. That is why
-                //   `poll_managed_reload` exists on the frame path.
-                // - The in-process compiler wrote the file itself through an
-                //   atomic rename and calls `NotifyAssemblyReplaced`, which
-                //   collapses that interval so the swap lands in the same
-                //   frame as the build.
-                //
-                // Neither path may assume the build implies the swap: a
-                // rejection keeps the previous assembly, and a slow swap is
-                // observed by a later frame. `managed_poll_replaced_assembly`
-                // therefore reports what this poll actually landed, and the
-                // caller records bookkeeping only then.
-                Self::CSharp(runtime) => {
-                    if !recompile_csharp(runtime, workspace_root, config, cancel_flag) {
-                        // A failed or cancelled rebuild replaces nothing;
-                        // dropping the arm keeps a later swap - whichever
-                        // attempt produced it - from being attributed to this
-                        // dead signal.
-                        runtime.abandon_reload_timing();
-                        return false;
-                    }
-                    info!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        "C# build complete; polling managed loader"
-                    );
-                    // A refusal keeps the currently loaded assembly;
-                    // `poll_reload` logs it once per distinct status.
-                    // The loader's debounce can outlive this call, in
-                    // which case the swap lands in a later frame's
-                    // `poll_managed_reload`; only a swap this poll
-                    // reports counts as a replacement here.
-                    managed_poll_replaced_assembly(runtime, engine)
+                // Managed reloads never route through here. A reload of a
+                // C# project produces a [`BuildReport`] - from the build
+                // worker, or from [`Self::build_now`] when the worker could
+                // not start - and every outcome is consumed by the host's one
+                // `finish_managed_build` handler, which owns the record,
+                // notify and poll sequence and its log lines. Reaching this
+                // arm would mean a caller bypassed that one handler.
+                Self::CSharp(_) => {
+                    debug_assert!(false, "managed reload bypassed finish_managed_build");
+                    false
                 }
             }
         }
@@ -368,20 +334,40 @@ mod loaded {
             }
         }
 
+        /// Build the managed assembly on the frame thread and report the
+        /// outcome.
+        ///
+        /// The synchronous twin of the build worker: the same compiler/MSBuild
+        /// selection, wrapping the result as a [`BuildReport`] so the caller
+        /// consumes it through the one outcome handler the worker's reports
+        /// also go through. Used when the worker could not start, or when one
+        /// stopped without reporting. `None` for a native project, which has
+        /// no assembly to build.
+        pub(crate) fn build_now(
+            &mut self,
+            workspace_root: &Path,
+            config: &ProjectModuleConfig,
+            cancel: Option<(Arc<AtomicU64>, u64)>,
+        ) -> Option<BuildReport> {
+            match self {
+                Self::CSharp(project) => Some(BuildReport {
+                    outcome: build_csharp_outcome(
+                        project.compiler_handle(),
+                        workspace_root,
+                        config,
+                        cancel,
+                    ),
+                    finished_at: Instant::now(),
+                }),
+                Self::Native { .. } => None,
+            }
+        }
+
         /// Whether a managed assembly build is running on its own thread.
         pub(crate) fn managed_build_in_flight(&self) -> bool {
             match self {
                 Self::CSharp(project) => project.build_in_flight(),
                 Self::Native { .. } => false,
-            }
-        }
-
-        /// Invoke the native compatibility update hook after scheduler systems.
-        pub(crate) fn update(&self, engine_api: &EngineApi) {
-            // C# gameplay is represented entirely by registered ECS systems. Only
-            // native modules retain the legacy explicit per-frame callback.
-            if let Self::Native { current, .. } = self {
-                current.call_update(engine_api);
             }
         }
     }
@@ -436,70 +422,44 @@ mod loaded {
         }
     }
 
-    /// Produce a new C# project assembly, in-process when that is possible.
-    ///
-    /// Returns whether an assembly the managed loader can pick up now exists.
+    /// Produce one managed build outcome with the compiler/MSBuild selection
+    /// shared by the build worker and the synchronous fallback.
     ///
     /// The in-process compiler replays the compiler command line the startup
     /// build captured, which takes tens of milliseconds where a `dotnet build`
     /// of the same edit takes one to three seconds. It cannot answer every
     /// reload - a source file added or removed changes the command line itself -
-    /// and it may not exist at all, so both cases fall through to the full build
-    /// that every reload used to run. That build also refreshes the capture,
-    /// which is what makes the reload after it fast again.
-    fn recompile_csharp(
-        runtime: &mut CSharpProject,
+    /// and it may not exist at all, so both cases fall through to the full
+    /// build that every reload used to run. That build also refreshes the
+    /// capture, which is what makes the reload after it fast again.
+    fn build_csharp_outcome(
+        compiler: Option<Arc<FastCompiler>>,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
-        cancel_flag: Option<(&AtomicU64, u64)>,
-    ) -> bool {
-        let fallback_reason = match runtime.fast_compile(workspace_root, &config.watch_directory) {
-            Some(crate::csharp::FastCompileOutcome::Compiled { milliseconds }) => {
-                runtime.record_assembly_rebuilt("roslyn");
+        cancel: Option<(Arc<AtomicU64>, u64)>,
+    ) -> BuildOutcome {
+        match compiler {
+            Some(compiler) => match compiler.compile(workspace_root, &config.watch_directory) {
+                FastCompileOutcome::Compiled { milliseconds } => {
+                    BuildOutcome::Compiled { milliseconds }
+                }
+                FastCompileOutcome::Failed { diagnostics } => BuildOutcome::Failed { diagnostics },
+                FastCompileOutcome::Unavailable { reason } => {
+                    info!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        reason = reason.as_str(),
+                        "falling back to a full C# build"
+                    );
+                    BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel))
+                }
+            },
+            None => {
                 info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    module = config.name.as_str(),
-                    compile_ms = format!("{milliseconds:.1}").as_str(),
-                    "C# compiled in-process"
+                    reason = "no in-process compiler is loaded",
+                    "falling back to a full C# build"
                 );
-                return true;
-            }
-            // Errors in the developer's own source. Reported as-is and not
-            // retried through MSBuild: a full build would spend seconds
-            // reaching the same diagnostics.
-            Some(crate::csharp::FastCompileOutcome::Failed { diagnostics }) => {
-                // The compiler's diagnostics are the body of one error block.
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    "{}",
-                    pill_core::telemetry::log_block(
-                        "C# compilation failed; keeping the currently loaded C# project assembly",
-                        diagnostics.lines()
-                    )
-                );
-                return false;
-            }
-            Some(crate::csharp::FastCompileOutcome::Unavailable { reason }) => reason,
-            None => "no in-process compiler is loaded".to_string(),
-        };
-
-        info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            reason = fallback_reason.as_str(),
-            "falling back to a full C# build"
-        );
-        match build_project_module(workspace_root, config, cancel_flag) {
-            Ok(_) => {
-                runtime.record_assembly_rebuilt("msbuild");
-                true
-            }
-            Err(error) => {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    error = %error,
-                    "C# build failed; keeping the currently loaded C# project assembly"
-                );
-                false
+                BuildOutcome::Full(run_full_project_build(workspace_root, config, cancel))
             }
         }
     }
@@ -521,46 +481,12 @@ mod loaded {
     ) -> ManagedReloadStart {
         let compiler = project.compiler_handle();
         let workspace = workspace_root.to_path_buf();
-        let watch_directory = config.watch_directory.clone();
         let build_config = config.clone();
         let (sender, receiver) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("pill-csharp-build".to_string())
             .spawn(move || {
-                let outcome = match compiler {
-                    Some(compiler) => match compiler.compile(&workspace, &watch_directory) {
-                        FastCompileOutcome::Compiled { milliseconds } => {
-                            BuildOutcome::Compiled { milliseconds }
-                        }
-                        FastCompileOutcome::Failed { diagnostics } => {
-                            BuildOutcome::Failed { diagnostics }
-                        }
-                        FastCompileOutcome::Unavailable { reason } => {
-                            info!(
-                                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                                reason = reason.as_str(),
-                                "falling back to a full C# build"
-                            );
-                            BuildOutcome::Full(run_full_project_build(
-                                &workspace,
-                                &build_config,
-                                cancel,
-                            ))
-                        }
-                    },
-                    None => {
-                        info!(
-                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                            reason = "no in-process compiler is loaded",
-                            "falling back to a full C# build"
-                        );
-                        BuildOutcome::Full(run_full_project_build(
-                            &workspace,
-                            &build_config,
-                            cancel,
-                        ))
-                    }
-                };
+                let outcome = build_csharp_outcome(compiler, &workspace, &build_config, cancel);
                 // A receiver that has gone away means the host is shutting
                 // down; the report's job is then nobody's.
                 let _ = sender.send(BuildReport {

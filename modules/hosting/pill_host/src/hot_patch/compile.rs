@@ -555,7 +555,7 @@ fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
     let Some(file_name) = Path::new(&path).file_name().and_then(|name| name.to_str()) else {
         return entry.to_string();
     };
-    if !is_shared_slot_rlib(file_name) {
+    if !crate::build_runner::is_shared_slot_rlib(file_name) {
         return format!("{name}={path}");
     }
     let staged = staged_dependencies.join(file_name);
@@ -563,24 +563,6 @@ fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
         return format!("{name}={path}");
     }
     format!("{name}={}", staged.display())
-}
-
-/// Whether a `deps` filename is a shared per-crate slot rather than one
-/// qualified by a metadata hash.
-///
-/// Kept beside [`redirect_extern`] and mirrored by the staging side in
-/// `build_runner`: the two must agree about which files are shared, or a file
-/// is staged and never linked, or linked and never staged.
-fn is_shared_slot_rlib(file_name: &str) -> bool {
-    let Some(stem) = file_name.strip_suffix(".rlib") else {
-        return false;
-    };
-    match stem.rsplit_once('-') {
-        Some((_, suffix)) => {
-            !(suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        }
-        None => true,
-    }
 }
 
 /// Bump a file's modification time without touching its contents.

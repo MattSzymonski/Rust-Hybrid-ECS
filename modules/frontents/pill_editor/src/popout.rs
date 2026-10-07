@@ -119,15 +119,8 @@ fn DetachedPanelWindow(props: DetachedPanelProps) -> Element {
 
     // A pop-out has its own VirtualDom, so refresh only its local statistics
     // signal rather than coupling it to main-window reconciliation.
-    let stats_editor = Arc::clone(&editor);
-    use_future(move || {
-        let stats_editor = Arc::clone(&stats_editor);
-        async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                stats.set(stats_editor.current_stats());
-            }
-        }
+    crate::polling::use_poll_editor(&editor, Duration::from_millis(100), move |editor| {
+        stats.set(editor.current_stats());
     });
 
     // Scene owns the current renderer surface while detached. Resize events

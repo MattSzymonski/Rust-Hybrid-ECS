@@ -22,15 +22,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) fn ConsoleTab(editor: Arc<EditorContext>) -> Element {
     let mut snapshot = use_signal(EditorSnapshot::default);
 
-    let poll_editor = Arc::clone(&editor);
-    use_future(move || {
-        let poll_editor = Arc::clone(&poll_editor);
-        async move {
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                snapshot.set(poll_editor.snapshot());
-            }
-        }
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        snapshot.set(editor.snapshot());
     });
 
     let errors = snapshot.read().errors.clone();

@@ -39,13 +39,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 // External crates
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
 use pill_core::platform::Instant;
-use pill_core::{error, info, warn};
+use pill_core::{info, warn};
 
 // Current crate
-use crate::watcher::{debounce_duration, is_relevant_event};
+use crate::watcher::{is_relevant_event, spawn_settled_watcher};
 
 /// Extension of the sources whose edits start a cook.
 const SOURCE_EXTENSION: &str = "hlsl";
@@ -83,72 +82,38 @@ impl ShaderWatcher {
             return Ok(None);
         }
 
-        // Step 1: Forward every `.hlsl` edit to the worker.
-        let (edit_sender, edits) = channel::<PathBuf>();
-        let mut watcher = RecommendedWatcher::new(
-            move |result: Result<Event, notify::Error>| match result {
-                Ok(event) if is_relevant_event(&event.kind) => {
-                    for path in event.paths {
-                        if path
-                            .extension()
-                            .is_some_and(|extension| extension == SOURCE_EXTENSION)
-                        {
-                            // Failure only means the worker has shut down.
-                            let _ = edit_sender.send(path);
-                        }
-                    }
-                }
-                Ok(_) => {}
-                // Never panic inside the callback, which some backends run on
-                // their own threads; report and continue.
-                Err(error) => {
-                    error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        error = %error,
-                        "shader watcher error"
-                    );
-                }
-            },
-            Config::default(),
-        )
-        .map_err(|source| WatcherError::CreationFailed { source })?;
-        watcher
-            .watch(&shaders_directory, RecursiveMode::Recursive)
-            .map_err(|source| WatcherError::RegistrationFailed {
-                path: shaders_directory.display().to_string(),
-                source,
-            })?;
+        // Step 1: Spawn the shared watcher worker with the shader acceptance
+        // (`.hlsl` sources only; the cooked `.wgsl` files are written beside
+        // them and would otherwise feed back in as edits) and the cook step.
+        let (cooked_sender, cooked) = channel::<CookedShader>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             module = crate_name,
             directory = %shaders_directory.display(),
             "watching renderer shader sources for edits"
         );
-
-        // Step 2: The worker: settle, cook, queue. It starts from the outputs as
-        // they are now, which is what the running data module embedded.
+        // The worker starts from the outputs as they are now, which is what
+        // the running data module embedded.
         let mut known_outputs = read_outputs(&shaders_directory);
-        let (cooked_sender, cooked) = channel::<CookedShader>();
-        std::thread::Builder::new()
-            .name("pill shader watcher".to_owned())
-            .spawn(move || {
-                // Owned here so the watch lasts exactly as long as the worker.
-                let _watcher = watcher;
-                while let Ok(first_edit) = edits.recv() {
-                    std::thread::sleep(debounce_duration());
-                    let mut edited = vec![first_edit];
-                    edited.extend(edits.try_iter());
-                    for shader in cook(&shaders_directory, &edited, &mut known_outputs) {
-                        if cooked_sender.send(shader).is_err() {
-                            // The host dropped the watcher: stop.
-                            return;
-                        }
+        spawn_settled_watcher(
+            shaders_directory,
+            "pill shader watcher",
+            "shader watcher error",
+            is_relevant_event,
+            |path: &Path| {
+                path.extension()
+                    .is_some_and(|extension| extension == SOURCE_EXTENSION)
+            },
+            move |root, edited| {
+                for shader in cook(root, &edited, &mut known_outputs) {
+                    if cooked_sender.send(shader).is_err() {
+                        // The host dropped the watcher: stop.
+                        return false;
                     }
                 }
-            })
-            .map_err(|source| WatcherError::CreationFailed {
-                source: notify::Error::io(source),
-            })?;
+                true
+            },
+        )?;
 
         Ok(Some(Self { cooked }))
     }

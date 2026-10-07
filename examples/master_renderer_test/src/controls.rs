@@ -77,12 +77,9 @@ pub(crate) fn helmet_control_system(
 
     let turn = glam::Quat::from_rotation_y(yaw) * glam::Quat::from_rotation_x(pitch);
     for (mut transform, _) in helmets.iter_mut() {
-        let current = glam::Quat::from_array(transform.rotation);
-        let current = if current.is_finite() && current.length_squared() > 1.0e-8 {
-            current.normalize()
-        } else {
-            glam::Quat::IDENTITY
-        };
+        let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
+            transform.rotation,
+        ));
         transform.rotation = (turn * current).normalize().to_array();
     }
     Ok(())

@@ -100,8 +100,8 @@ extern "C" fn ffi_csharp_zone_end(token: u64) {
 /// Set once per C# runtime startup by [`CsEngineApi::new`]; the two FFI
 /// callbacks below read it. It is replaced on every (re)start, and the strings
 /// are kept alive alongside the table for its whole lifetime. `Send`-safe by
-/// construction (no raw pointers are stored; rows reference owned strings by
-/// index), so the table can live in a `static`.
+/// construction (every row owns its strings; no raw pointers are stored), so
+/// the table can live in a `static`.
 static MIRROR_METHOD_TABLE: std::sync::Mutex<Option<MirrorMethodTable>> =
     std::sync::Mutex::new(None);
 
@@ -112,22 +112,19 @@ static MIRROR_METHOD_TABLE: std::sync::Mutex<Option<MirrorMethodTable>> =
 /// for the assembly swap that would normally carry a rebind.
 static MIRROR_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// One send-safe row of the mirror-method table.
+/// One row of the mirror-method table.
 struct MirrorMethodRow {
-    /// Index into [`MirrorMethodTable::names`] of the fully-qualified Rust
-    /// type name.
-    type_name_index: usize,
-    /// Index into [`MirrorMethodTable::names`] of the Rust method name.
-    method_index: usize,
+    /// Fully-qualified Rust type name, NUL-terminated.
+    type_name: std::ffi::CString,
+    /// Rust method name, NUL-terminated.
+    method: std::ffi::CString,
     /// Address of the exported `#[no_mangle]` C-ABI trampoline.
     address: usize,
 }
 
 /// Owned backing store for the mirror-method table exposed to managed code.
 struct MirrorMethodTable {
-    /// NUL-terminated names, kept alive so the exposed pointers stay valid.
-    names: Vec<std::ffi::CString>,
-    /// Send-safe rows; the copy callback materializes the C-ABI entries.
+    /// Rows the copy callback materializes into C-ABI entries.
     rows: Vec<MirrorMethodRow>,
 }
 
@@ -177,8 +174,8 @@ extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> 
     let count = (table.rows.len() as u32).min(max);
     for (index, row) in table.rows.iter().take(count as usize).enumerate() {
         let entry = MirrorMethodEntry {
-            type_name: table.names[row.type_name_index].as_ptr(),
-            method: table.names[row.method_index].as_ptr(),
+            type_name: row.type_name.as_ptr(),
+            method: row.method.as_ptr(),
             address: row.address,
         };
         // SAFETY: `index < count <= max`, so `out.add(index)` stays inside the
@@ -337,10 +334,9 @@ impl CsEngineApi {
 /// the module a new image (and therefore new addresses), and a reloaded module
 /// may have added or removed mirrored methods.
 pub fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
-    // Two NUL-terminated names per method, stored so the exposed pointers stay
-    // valid for as long as the table lives. Rows reference the names by index
-    // so the stored table stays `Send`.
-    let mut names: Vec<std::ffi::CString> = Vec::new();
+    // Each row owns its two NUL-terminated names, so the pointers the copy
+    // callback exposes stay valid for as long as the table lives and the table
+    // stays `Send` without an index into a shared arena.
     let mut rows: Vec<MirrorMethodRow> = Vec::new();
     for method in mirror_methods
         .iter()
@@ -353,14 +349,12 @@ pub fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
             continue;
         };
         rows.push(MirrorMethodRow {
-            type_name_index: names.len(),
-            method_index: names.len() + 1,
+            type_name,
+            method: method_name,
             address: method.address,
         });
-        names.push(type_name);
-        names.push(method_name);
     }
-    *MIRROR_METHOD_TABLE.lock().unwrap() = Some(MirrorMethodTable { names, rows });
+    *MIRROR_METHOD_TABLE.lock().unwrap() = Some(MirrorMethodTable { rows });
     // Bumped after the rows are stored, so a managed refresh triggered by this
     // value copies the new table rather than the one it replaced.
     MIRROR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);

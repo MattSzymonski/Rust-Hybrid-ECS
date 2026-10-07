@@ -426,8 +426,7 @@ pub(crate) const RENDERER_DATA_SUFFIX: &str = "_data";
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ProjectModuleBackend {
-    /// A native shared library exporting `pill_module_init` and, optionally,
-    /// `pill_module_update`.
+    /// A native shared library exporting `pill_module_init`.
     NativeLibrary {
         /// Library name without the platform prefix or suffix.
         library_name: String,
@@ -531,48 +530,11 @@ impl ExtensionConfig {
     /// names of the shared `pill_core` library in agreement.
     pub fn workspace_member(name: &str) -> Self {
         let wrapper_library_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
-        let mut build_command = vec![
-            "cargo".to_string(),
-            "build".to_string(),
-            "--package".to_string(),
-            wrapper_library_name.clone(),
-            // Never touch the registry: every dependency is already cached in
-            // the workspace. Skipping the index avoids the ~/.cargo package
-            // cache lock (which rust-analyzer's cargo check can hold for long
-            // stretches) and halves the fixed per-build cargo overhead.
-            "--offline".to_string(),
-            // Build into the host's own profile. Stated explicitly rather than
-            // left to cargo's default, because the default is only correct for
-            // a debug host; a release host that loads a debug module fails
-            // inside `LoadLibrary` on mismatched crate-metadata hashes.
-            "--profile".to_string(),
-            host_profile_name().to_string(),
-        ];
-        if cargo_timings_enabled() {
-            build_command.push("--timings".to_string());
-        }
         // The wrapper's manifest enables the extension's own features on its
         // dependency edge (`materialize_host_module_wrapper`); the command
-        // line must only mirror the hot-patch feature. The engine core is a
-        // shared dylib whose symbol names hash its features, so a module built
-        // without the feature imports names the host's `pill_engine_core.dll`
-        // does not export. And `register_system` is generic, so the module
-        // compiles its own instance of it: built without the feature, that
-        // instance creates no dispatch slot and every patch is refused with
-        // "no hot-patchable system registered".
-        //
-        // The feature is package-qualified because a spawned build may select
-        // more than one package and it must land on the engine, not on
-        // whatever else is selected. The shared `pill_engine_core.dll` hashes
-        // its features into its exported names, so a module built without it
-        // cannot resolve its imports against the instance the host has loaded.
-        // The rest of the host's engine features (profiling, metrics,
-        // `dev-logs`) travel with every spawned build through
-        // `apply_cargo_host_overrides`.
-        if cfg!(feature = "hot_patch") {
-            build_command.push("--features".to_string());
-            build_command.push("pill_engine/hot_patch".to_string());
-        }
+        // line only mirrors the hot-patch feature, which
+        // [`host_cargo_command`] applies for every host-spawned build.
+        let build_command = host_cargo_command(std::slice::from_ref(&wrapper_library_name));
 
         Self {
             name: name.to_string(),
@@ -1052,50 +1014,15 @@ impl ProjectModuleConfig {
         // inherits the workspace's `-C prefer-dynamic` rustflags, matching the
         // extensions, because a shared crate keeps one metadata identity
         // (and therefore one `TypeId`) only when every side is compiled with
-        // the same inputs. When the host renders, the project is built with
-        // the same feature so both sides share renderer components.
-        let mut build_command = vec![
-            "cargo".to_string(),
-            "build".to_string(),
-            "--package".to_string(),
-            // The generated member, not the project package it was copied
-            // from: the two are distinct packages so a shipping binary can link
-            // the project directly without colliding with this one.
-            format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"),
-            // Never touch the registry: every dependency is already cached in
-            // the workspace. Skipping the index avoids the ~/.cargo package
-            // cache lock (which rust-analyzer's cargo check can hold for long
-            // stretches) and halves the fixed per-build cargo overhead.
-            "--offline".to_string(),
-            // Build into the host's own profile, for the same reason the
-            // extensions do: a profile mismatch across the DLL boundary
-            // is a load failure, not a performance difference.
-            "--profile".to_string(),
-            host_profile_name().to_string(),
-        ];
-        if cargo_timings_enabled() {
-            build_command.push("--timings".to_string());
-        }
-        // Mirror the host's engine feature set into the project build, for the
-        // same reason extensions do: the project imports the host's
-        // `pill_engine_core.dll`, whose symbol names hash its features, and
-        // compiles its own instances of the engine's generic code.
+        // the same inputs.
         //
-        // `rendering` used to be mirrored here as well, package-qualified onto
-        // the generated project member. It is gone because the renderer left
-        // `pill_engine`, so the engine a project compiles against no longer
-        // depends on it.
-        let mut project_features: Vec<String> = Vec::new();
-        // Without this the project's instance of `register_system` compiles the
-        // no-slot path, and every patch is refused with "no hot-patchable
-        // system registered" - which is exactly how this was found.
-        if cfg!(feature = "hot_patch") {
-            project_features.push("pill_engine/hot_patch".to_string());
-        }
-        if !project_features.is_empty() {
-            build_command.push("--features".to_string());
-            build_command.push(project_features.join(","));
-        }
+        // The generated member, not the project package it was copied from:
+        // the two are distinct packages so a shipping binary can link the
+        // project directly without colliding with this one. The mirrored
+        // engine features - the package-qualified hot-patch feature among
+        // them - are applied by [`host_cargo_command`].
+        let build_command =
+            host_cargo_command(&[format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}")]);
 
         Ok(Self {
             name: package_name,
@@ -1181,6 +1108,50 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 /// so the flag cannot be set on one side and silently unread on the other.
 pub(crate) fn cargo_timings_enabled() -> bool {
     std::env::var_os(CARGO_TIMINGS_ENVIRONMENT_VARIABLE).is_some()
+}
+
+/// Build the host's cargo command for one or more selected packages.
+///
+/// Every host-spawned build - a single extension wrapper, the native project
+/// member, or the startup batch - assembles its command here, so the flags
+/// cargo hashes into a unit's fingerprint cannot drift between a per-module
+/// build and the batch. The order is: the package selections, `--offline`,
+/// the host's own profile, the optional timings flag, then the
+/// package-qualified hot-patch feature.
+///
+/// `--offline` skips the registry index, which avoids the `~/.cargo` package
+/// cache lock (rust-analyzer's `cargo check` can hold it for long stretches)
+/// and halves the fixed per-build cargo overhead. The profile is stated
+/// explicitly because the default is only correct for a debug host: a release
+/// host that loads a debug module fails inside `LoadLibrary` on mismatched
+/// crate-metadata hashes.
+///
+/// The engine core is a shared dylib whose symbol names hash its features, so
+/// a module or project built without `hot_patch` imports names the host's
+/// `pill_engine_core.dll` does not export, and its own instance of the
+/// generic `register_system` creates no dispatch slot - every patch is then
+/// refused with "no hot-patchable system registered". The feature is
+/// package-qualified because one invocation may select several packages and
+/// it must land on the engine. The rest of the host's engine features
+/// (profiling, metrics, `dev-logs`) travel through
+/// `apply_cargo_host_overrides` instead.
+pub(crate) fn host_cargo_command(packages: &[String]) -> Vec<String> {
+    let mut command = vec!["cargo".to_string(), "build".to_string()];
+    for package in packages {
+        command.push("--package".to_string());
+        command.push(package.clone());
+    }
+    command.push("--offline".to_string());
+    command.push("--profile".to_string());
+    command.push(host_profile_name().to_string());
+    if cargo_timings_enabled() {
+        command.push("--timings".to_string());
+    }
+    if cfg!(feature = "hot_patch") {
+        command.push("--features".to_string());
+        command.push("pill_engine/hot_patch".to_string());
+    }
+    command
 }
 
 /// MSBuild configuration the managed project is built in, from
@@ -2267,6 +2238,41 @@ serde = { version = "1", features = ["derive"] }
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every host-spawned build emits the same common flag sequence, in the
+    /// same order, with its package selections up front.
+    #[test]
+    fn host_cargo_command_emits_the_common_flag_sequence() {
+        let command = host_cargo_command(&["first".to_string(), "second".to_string()]);
+        let expected: Vec<String> = [
+            "cargo",
+            "build",
+            "--package",
+            "first",
+            "--package",
+            "second",
+            "--offline",
+            "--profile",
+            host_profile_name(),
+        ]
+        .iter()
+        .map(|part| part.to_string())
+        .collect();
+        assert_eq!(command[..expected.len()], expected[..]);
+        assert_eq!(
+            command.contains(&"--timings".to_string()),
+            cargo_timings_enabled(),
+            "the timings flag follows the same gate the analytics collector reads"
+        );
+        #[cfg(feature = "hot_patch")]
+        assert_eq!(
+            &command[command.len() - 2..],
+            ["--features", "pill_engine/hot_patch"],
+            "the hot-patch feature is package-qualified onto the engine and comes last"
+        );
+        #[cfg(not(feature = "hot_patch"))]
+        assert!(!command.contains(&"--features".to_string()));
     }
 
     // =========================================================================

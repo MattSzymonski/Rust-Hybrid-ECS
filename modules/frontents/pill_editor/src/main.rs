@@ -27,6 +27,7 @@ mod entities_tab;
 mod error;
 mod inspector;
 mod layout;
+mod polling;
 mod popout;
 mod scene_input;
 mod systems_tab;
@@ -270,15 +271,7 @@ fn restore_detached_panels(mut model: Signal<layout::LayoutModel>, panels: Vec<P
             {
                 continue;
             }
-            current
-                .active_tabset
-                .filter(|id| current.tabset(*id).is_some())
-                .or_else(|| {
-                    current
-                        .nodes
-                        .iter()
-                        .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id))
-                })
+            current.resolved_active_tabset()
         };
         let Some(target_tabset) = target_tabset else {
             continue;
@@ -372,7 +365,7 @@ impl EditorContext {
         FrameDriver::set_render_viewport(&mut host, Some(RenderViewport::default()));
         // The editor keeps every source asset in `res` paired with a `.meta`
         // file, so each one has a guid from the moment it is in the project.
-        host.set_ensure_asset_metadata(true);
+        host.host_mut().set_ensure_asset_metadata(true);
 
         Ok(Self {
             host: RefCell::new(host),
@@ -458,7 +451,7 @@ impl EditorContext {
 
     /// Snapshot engine statistics for a detached panel's isolated VirtualDom.
     pub(crate) fn current_stats(&self) -> Stats {
-        let report = self.host.borrow().current_frame_report();
+        let report = self.host.borrow().host().current_frame_report();
         Stats {
             fps: report.fps,
             entity_count: report.entity_count,
@@ -473,17 +466,17 @@ impl EditorContext {
     /// Registered component types for the Inspector's add picker.
     pub(crate) fn registered_components(&self) -> Vec<editor_state::RegisteredComponent> {
         let host = self.host.borrow();
-        editor_state::registered_components(host.engine().world())
+        editor_state::registered_components(host.host().engine().world())
     }
 
     /// The project's `res` tree, for the Assets panel.
     pub(crate) fn asset_entries(&self) -> Vec<pill_host::AssetEntry> {
-        self.host.borrow().asset_entries()
+        self.host.borrow().host().asset_entries()
     }
 
     /// An asset's import settings (or standalone document) as JSON.
     pub(crate) fn asset_settings(&self, path: &str) -> Result<serde_json::Value, String> {
-        self.host.borrow().asset_settings(path)
+        self.host.borrow().host().asset_settings(path)
     }
 
     /// Save an asset's settings; the running scene picks them up at the next
@@ -493,12 +486,15 @@ impl EditorContext {
         path: &str,
         settings: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        self.host.borrow_mut().save_asset_settings(path, settings)
+        self.host
+            .borrow_mut()
+            .host_mut()
+            .save_asset_settings(path, settings)
     }
 
     /// The standalone asset types the Create dialog offers.
     pub(crate) fn standalone_asset_types(&self) -> Vec<pill_host::StandaloneType> {
-        self.host.borrow().standalone_asset_types()
+        self.host.borrow().host().standalone_asset_types()
     }
 
     /// Create and load a new standalone asset; returns its path in `res`.
@@ -510,12 +506,13 @@ impl EditorContext {
     ) -> Result<String, String> {
         self.host
             .borrow_mut()
+            .host_mut()
             .create_standalone_asset(type_name, folder, name)
     }
 
     /// Move an asset with its `.meta` inside `res`.
     pub(crate) fn move_asset(&self, from: &str, to: &str) -> Result<(), String> {
-        self.host.borrow().move_asset(from, to)
+        self.host.borrow().host().move_asset(from, to)
     }
 
     /// Queue one editor command; it is applied at the next frame boundary.
@@ -575,7 +572,7 @@ impl EditorContext {
                         >= STATS_UPDATE_INTERVAL
                     {
                         self.last_stats_update.set(now);
-                        Some(host.current_frame_report())
+                        Some(host.host().current_frame_report())
                     } else {
                         None
                     };
@@ -609,7 +606,7 @@ impl EditorContext {
             return;
         }
         let mut host = self.host.borrow_mut();
-        let failures = EditorCommand::apply(host.engine_mut(), &commands);
+        let failures = EditorCommand::apply(host.host_mut().engine_mut(), &commands);
         if !failures.is_empty() {
             let mut errors = self.last_command_errors.borrow_mut();
             for (_, message) in failures {
@@ -634,9 +631,9 @@ impl EditorContext {
         let errors = std::mem::take(&mut *self.last_command_errors.borrow_mut());
 
         let host = self.host.borrow();
-        let module_names = host.extension_names();
-        let revision = host.revision();
-        let engine = host.engine();
+        let module_names = host.host().extension_names();
+        let revision = host.host().revision();
+        let engine = host.host().engine();
         let mut fresh = EditorSnapshot::capture_list(engine, revision, &module_names, errors);
         let Some(selected) = self.selection.get() else {
             *self.snapshot.borrow_mut() = fresh;

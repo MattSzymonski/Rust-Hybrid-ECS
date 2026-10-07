@@ -174,6 +174,22 @@ impl LayoutModel {
         }
     }
 
+    /// The active tabset, falling back to the first tabset in node order.
+    ///
+    /// `active_tabset` can legitimately be `None` - before any selection or
+    /// after a layout reset - and the fallback rule is what the view draws
+    /// focus by, what the shell docks panels into and what the reducer
+    /// normalises to, so it is derived here once rather than three times.
+    pub fn resolved_active_tabset(&self) -> Option<NodeId> {
+        self.active_tabset
+            .filter(|id| self.tabset(*id).is_some())
+            .or_else(|| {
+                self.nodes
+                    .iter()
+                    .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id))
+            })
+    }
+
     /// Hand out the next monotonic node id.
     pub(crate) fn allocate_id(&mut self) -> NodeId {
         let id = NodeId(self.next_id);

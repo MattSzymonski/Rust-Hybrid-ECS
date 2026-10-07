@@ -51,6 +51,9 @@ pub(crate) use pill_csharp_bridge::{
 pub(crate) use codegen::generate_module_components_csharp;
 /// What one in-process compile attempt produced, reported to the reload path.
 pub(crate) use fast_compile::FastCompileOutcome;
+/// The in-process Roslyn compiler, shared with build threads and the
+/// synchronous fallback build.
+pub(crate) use fast_compile::FastCompiler;
 
 // =============================================================================
 // CSharpProject
@@ -131,28 +134,6 @@ impl CSharpProject {
         self.runtime.poll_reload(engine)
     }
 
-    /// Recompile the project in-process, when a compiler could be loaded.
-    ///
-    /// `None` means there is no fast path at all and the caller must build
-    /// normally; a [`FastCompileOutcome::Unavailable`] means the fast path
-    /// exists but cannot answer this particular reload.
-    pub(crate) fn fast_compile(
-        &self,
-        workspace_root: &Path,
-        watch_directory: &str,
-    ) -> Option<FastCompileOutcome> {
-        let outcome = self
-            .fast_compiler
-            .as_ref()?
-            .compile(workspace_root, watch_directory);
-        // This compile wrote the assembly itself, so the loader's next poll
-        // need not wait for the file to settle.
-        if matches!(outcome, FastCompileOutcome::Compiled { .. }) {
-            self.runtime.notify_assembly_replaced();
-        }
-        Some(outcome)
-    }
-
     /// Arm reload timing for the reload this signal starts.
     ///
     /// `trigger` is the project watcher's record of the save that fired the
@@ -166,15 +147,6 @@ impl CSharpProject {
             triggered_at: Instant::now(),
             rebuilt: None,
         });
-    }
-
-    /// Record that the assembly rebuild finished, and how it was produced.
-    ///
-    /// Called on both compile routes: the in-process compiler (`"roslyn"`)
-    /// and the full `dotnet build` fallback (`"msbuild"`). The build phase of
-    /// the armed span ends here.
-    pub(crate) fn record_assembly_rebuilt(&mut self, kind: &'static str) {
-        self.record_assembly_rebuilt_at(Instant::now(), kind);
     }
 
     /// Record an assembly rebuild that finished at `at`, and how it was

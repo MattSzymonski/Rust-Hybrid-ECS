@@ -19,43 +19,40 @@ pub const STATIC_MODULES: &[StaticModule] = &[
         name: "pill_master_renderer_data",
         init: pill_master_renderer_data::register,
     },
+    StaticModule {
+        name: "pill_spline",
+        init: pill_spline::register,
+    },
+    StaticModule {
+        name: "pill_audio",
+        init: pill_audio::register,
+    },
 ];
 
 /// The project backend for this shipping project.
 pub fn project_backend() -> StaticProjectBackend {
-    StaticProjectBackend::External(std::sync::Arc::new(
-        pill_csharp_bridge::CSharpBackend::coreclr(
-            pill_csharp_bridge::CSharpModuleConfig::new(
-                "csharp_runtime",
-                "csharp/pill_csharp_runtime/bin/Release/net8.0",
-                "circus_demo_cs",
-                "../examples/circus_demo_cs/bin/Release/net8.0",
-            ),
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../modules"),
-        ),
-    ))
+    StaticProjectBackend::Native {
+        init: project::init,
+    }
 }
 
 /// The renderer this binary links, or `None` for a headless build.
 pub fn static_renderer() -> Option<StaticRenderer> {
-    Some(StaticRenderer {
-        init: pill_master_renderer::register,
-        attach: pill_master_renderer::attach,
-    })
+    None
 }
 
 /// The `logging:` section of `project_settings.yaml`.
 #[rustfmt::skip]
-const LOGGING: StaticLogging = StaticLogging { level: None, timestamp: None, source_location: None, targets: &[("engine::rendering", "info")] };
+const LOGGING: StaticLogging = StaticLogging::NONE;
 
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
-        name: "Circus Demo (C#)",
+        name: "Bouncing Balls",
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),
-        asset_pack: Some(include_bytes!(concat!(env!("OUT_DIR"), "/assets.pillpack"))),
+        asset_pack: None,
         logging: LOGGING,
     }
 }

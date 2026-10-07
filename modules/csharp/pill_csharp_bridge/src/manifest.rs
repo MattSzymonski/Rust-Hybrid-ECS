@@ -41,7 +41,49 @@ use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 /// opaque parser error, rejects pathological manifests.
 const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
-/// Field types a descriptor component is allowed to contain.
+/// One accepted leaf type's whole meaning to the host.
+///
+/// The managed manifest vocabulary is read by four separate checks -
+/// blittability, natural alignment, the engine type tag and default-literal
+/// parsing - and each one used to carry its own copy of the type names. This
+/// table is the one copy: a type is accepted exactly when it has a row here,
+/// and every check reads its answer from that same row, so the four can no
+/// longer disagree about what a type means.
+struct BlittableLeaf {
+    /// Canonical managed type name as the manifest writes it.
+    type_name: &'static str,
+    /// Natural alignment the managed side places the field at.
+    alignment: usize,
+    /// Engine type tag, or `None` for a type the engine cannot decode: the
+    /// field keeps its bytes in storage but is left out of the registered
+    /// editor layout.
+    tag: Option<&'static str>,
+    /// How a `default:` literal for this type parses.
+    default_literal: DefaultLiteral,
+}
+
+/// How a leaf type's `default:` literal turns into native bytes.
+#[derive(Clone, Copy)]
+enum DefaultLiteral {
+    /// `true` or `false`.
+    Boolean,
+    /// An integer or float literal of this exact width.
+    Signed8,
+    Signed16,
+    Signed32,
+    Signed64,
+    Unsigned8,
+    Unsigned16,
+    Unsigned32,
+    Unsigned64,
+    Float32,
+    Float64,
+    /// No supported literal form. The pointer-width types land here, so a
+    /// manifest declaring such a default is refused by name.
+    Unsupported,
+}
+
+/// The managed blittable field vocabulary: one row per accepted leaf type.
 ///
 /// This is the enforcement behind `ComponentColumn`'s `unsafe impl Send`/`Sync`
 /// and its lack of drop glue. That storage is a raw byte buffer: rows are moved
@@ -49,55 +91,119 @@ const MAX_FIELD_NESTING_DEPTH: usize = 32;
 /// every field must be a blittable value with no ownership, no interior
 /// pointer, and nothing to release.
 ///
-/// Before this list existed the only check on a field's type was that its name
-/// was non-empty, so a manifest declaring a managed reference passed validation
-/// and the resulting column was shared across threads on a promise nothing
-/// verified.
+/// Before this vocabulary existed the only check on a field's type was that
+/// its name was non-empty, so a manifest declaring a managed reference passed
+/// validation and the resulting column was shared across threads on a promise
+/// nothing verified.
 ///
-/// `"struct"` denotes a nested value type; its own fields are validated
-/// recursively against this same list, so allowing it does not open a hole.
-const BLITTABLE_FIELD_TYPES: &[&str] = &[
-    "System.Byte",
-    "System.SByte",
-    "System.Int16",
-    "System.UInt16",
-    "System.Int32",
-    "System.UInt32",
-    "System.Int64",
-    "System.UInt64",
-    "System.IntPtr",
-    "System.UIntPtr",
-    "System.Single",
-    "System.Double",
-    "System.Boolean",
-    "System.Char",
-    "struct",
+/// A nested value type is a shape, not a leaf: it has no row here, and
+/// validation recurses into its own fields instead of looking it up.
+const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
+    BlittableLeaf {
+        type_name: "System.Byte",
+        alignment: 1,
+        tag: Some("u8"),
+        default_literal: DefaultLiteral::Unsigned8,
+    },
+    BlittableLeaf {
+        type_name: "System.SByte",
+        alignment: 1,
+        tag: Some("i8"),
+        default_literal: DefaultLiteral::Signed8,
+    },
+    BlittableLeaf {
+        type_name: "System.Int16",
+        alignment: 2,
+        tag: Some("i16"),
+        default_literal: DefaultLiteral::Signed16,
+    },
+    BlittableLeaf {
+        type_name: "System.UInt16",
+        alignment: 2,
+        tag: Some("u16"),
+        default_literal: DefaultLiteral::Unsigned16,
+    },
+    BlittableLeaf {
+        type_name: "System.Int32",
+        alignment: 4,
+        tag: Some("i32"),
+        default_literal: DefaultLiteral::Signed32,
+    },
+    BlittableLeaf {
+        type_name: "System.UInt32",
+        alignment: 4,
+        tag: Some("u32"),
+        default_literal: DefaultLiteral::Unsigned32,
+    },
+    BlittableLeaf {
+        type_name: "System.Int64",
+        alignment: 8,
+        tag: Some("i64"),
+        default_literal: DefaultLiteral::Signed64,
+    },
+    BlittableLeaf {
+        type_name: "System.UInt64",
+        alignment: 8,
+        tag: Some("u64"),
+        default_literal: DefaultLiteral::Unsigned64,
+    },
+    // Pointer-width on the host, which is what the managed side marshals them
+    // as; the engine only ever stores their bytes.
+    BlittableLeaf {
+        type_name: "System.IntPtr",
+        alignment: std::mem::size_of::<usize>(),
+        tag: None,
+        default_literal: DefaultLiteral::Unsupported,
+    },
+    BlittableLeaf {
+        type_name: "System.UIntPtr",
+        alignment: std::mem::size_of::<usize>(),
+        tag: None,
+        default_literal: DefaultLiteral::Unsupported,
+    },
+    BlittableLeaf {
+        type_name: "System.Single",
+        alignment: 4,
+        tag: Some("f32"),
+        default_literal: DefaultLiteral::Float32,
+    },
+    BlittableLeaf {
+        type_name: "System.Double",
+        alignment: 8,
+        tag: Some("f64"),
+        default_literal: DefaultLiteral::Float64,
+    },
+    BlittableLeaf {
+        type_name: "System.Boolean",
+        alignment: 1,
+        tag: Some("bool"),
+        default_literal: DefaultLiteral::Boolean,
+    },
+    // A blittable UTF-16 code unit with the same size as the engine's `u16`;
+    // exposing it that way keeps the field editable.
+    BlittableLeaf {
+        type_name: "System.Char",
+        alignment: 2,
+        tag: Some("u16"),
+        default_literal: DefaultLiteral::Unsigned16,
+    },
 ];
 
-/// Natural alignment of each blittable leaf type, for the offset check.
-///
-/// A managed struct laid out sequentially places every field at a multiple of
-/// its own alignment, so a manifest that does not is describing a packed or
-/// hand-written layout. The engine's own reflection decodes fields with
-/// `from_ne_bytes` over a byte slice and so tolerates any offset, but the
-/// managed side reads the same bytes as real typed fields - and a `double` at
-/// an odd offset is a fault on some targets and a silent tear on others.
-///
-/// `struct` is absent deliberately: a nested struct's alignment is whatever its
-/// widest leaf requires, and each of those leaves is checked in turn when the
-/// walk descends into it.
-fn natural_alignment(primitive_type: &str) -> Option<usize> {
-    let alignment = match primitive_type {
-        "System.Byte" | "System.SByte" | "System.Boolean" => 1,
-        "System.Int16" | "System.UInt16" | "System.Char" => 2,
-        "System.Int32" | "System.UInt32" | "System.Single" => 4,
-        "System.Int64" | "System.UInt64" | "System.Double" => 8,
-        // Pointer-width on the host, which is what the managed side marshals
-        // them as; the engine only ever stores their bytes.
-        "System.IntPtr" | "System.UIntPtr" => std::mem::size_of::<usize>(),
-        _ => return None,
-    };
-    Some(alignment)
+/// The nested-struct marker: a shape validation descends into, not a leaf.
+const STRUCT_TYPE: &str = "struct";
+
+/// The vocabulary row for one managed type, when it is an accepted leaf.
+fn blittable_leaf(primitive_type: &str) -> Option<&'static BlittableLeaf> {
+    BLITTABLE_LEAVES
+        .iter()
+        .find(|leaf| leaf.type_name == primitive_type)
+}
+
+/// Whether a manifest may declare a field of this type: an accepted leaf, or
+/// a nested value struct whose own fields are validated recursively against
+/// this same vocabulary.
+fn is_blittable(primitive_type: &str) -> bool {
+    primitive_type == STRUCT_TYPE || blittable_leaf(primitive_type).is_some()
 }
 
 /// Deserialized entry from the managed component manifest.
@@ -211,9 +317,9 @@ pub(super) fn validate_sibling_non_overlap(
 /// # Errors
 ///
 /// Returns an error when a field overflows its containing struct, names an
-/// empty field or type, declares a type outside [`BLITTABLE_FIELD_TYPES`],
-/// sits at an offset that is not a multiple of its natural alignment, or
-/// exceeds the maximum nesting depth.
+/// empty field or type, declares a type outside the [`BLITTABLE_LEAVES`]
+/// vocabulary, sits at an offset that is not a multiple of its natural
+/// alignment, or exceeds the maximum nesting depth.
 pub(super) fn validate_field_manifest(
     field: &ManagedFieldManifest,
     parent_size: usize,
@@ -234,7 +340,7 @@ pub(super) fn validate_field_manifest(
         // glue, so a field owning a resource would be duplicated on move and
         // leaked on free - and sharing such a column across threads, which the
         // engine does, would be unsound.
-        if !BLITTABLE_FIELD_TYPES.contains(&field.primitive_type.as_str()) {
+        if !is_blittable(&field.primitive_type) {
             return Err(format!(
                 "managed field {} has non-blittable type {}; descriptor components must contain only unmanaged value types",
                 field.name, field.primitive_type
@@ -251,11 +357,11 @@ pub(super) fn validate_field_manifest(
         // offset is checked against its parent by the same rule, so a field is
         // correctly aligned within the component exactly when every step of
         // that chain is.
-        if let Some(alignment) = natural_alignment(&field.primitive_type) {
-            if field.offset % alignment != 0 {
+        if let Some(leaf) = blittable_leaf(&field.primitive_type) {
+            if field.offset % leaf.alignment != 0 {
                 return Err(format!(
                     "managed field {} of type {} sits at offset {}, which is not a multiple of its {}-byte alignment",
-                    field.name, field.primitive_type, field.offset, alignment
+                    field.name, field.primitive_type, field.offset, leaf.alignment
                 ));
             }
         }
@@ -296,39 +402,18 @@ pub(super) fn validate_field_manifest(
     Ok(())
 }
 
-/// Map a managed primitive type onto the engine's field type-tag vocabulary.
-///
-/// Returns `None` for blittable types the engine cannot decode (the field is
-/// then omitted from the registered layout but keeps its bytes in storage).
-fn managed_primitive_tag(primitive_type: &str) -> Option<&'static str> {
-    match primitive_type {
-        "System.Byte" => Some("u8"),
-        "System.SByte" => Some("i8"),
-        "System.Int16" => Some("i16"),
-        "System.UInt16" => Some("u16"),
-        "System.Int32" => Some("i32"),
-        "System.UInt32" => Some("u32"),
-        "System.Int64" => Some("i64"),
-        "System.UInt64" => Some("u64"),
-        "System.Single" => Some("f32"),
-        "System.Double" => Some("f64"),
-        "System.Boolean" => Some("bool"),
-        // `System.Char` is a blittable UTF-16 code unit with the same size as
-        // the engine's `u16`; exposing it that way keeps the field editable.
-        "System.Char" => Some("u16"),
-        _ => None,
-    }
-}
-
 /// The engine-vocabulary tag one manifest field carries.
 ///
 /// Mirrors what [`managed_field_layout`] records for the same field, so a plan
-/// built from a manifest compares like with like.
+/// built from a manifest compares like with like. A leaf the engine cannot
+/// decode (the pointer-width types) carries no tag and reads `unsupported`.
 pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
-    if field.primitive_type == "struct" {
-        return "struct";
+    if field.primitive_type == STRUCT_TYPE {
+        return STRUCT_TYPE;
     }
-    managed_primitive_tag(&field.primitive_type).unwrap_or("unsupported")
+    blittable_leaf(&field.primitive_type)
+        .and_then(|leaf| leaf.tag)
+        .unwrap_or("unsupported")
 }
 
 /// Parse one field default literal into native-endian bytes.
@@ -342,53 +427,60 @@ pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
 pub(super) fn parse_default_bytes(primitive_type: &str, literal: &str) -> Result<Vec<u8>, String> {
     let trimmed = literal.trim();
     let invalid = || format!("field default `{literal}` is not a valid {primitive_type} literal");
-    match primitive_type {
-        "System.Byte" => trimmed
-            .parse::<u8>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.SByte" => trimmed
-            .parse::<i8>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Int16" => trimmed
-            .parse::<i16>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.UInt16" | "System.Char" => trimmed
-            .parse::<u16>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Int32" => trimmed
-            .parse::<i32>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.UInt32" => trimmed
-            .parse::<u32>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Int64" => trimmed
-            .parse::<i64>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.UInt64" => trimmed
-            .parse::<u64>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Single" => trimmed
-            .parse::<f32>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Double" => trimmed
-            .parse::<f64>()
-            .map(|value| value.to_ne_bytes().to_vec())
-            .map_err(|_| invalid()),
-        "System.Boolean" => match trimmed {
+    let Some(leaf) = blittable_leaf(primitive_type) else {
+        return Err(format!(
+            "field default `{literal}` names a type with no supported literal form ({primitive_type})"
+        ));
+    };
+    match leaf.default_literal {
+        DefaultLiteral::Boolean => match trimmed {
             "true" => Ok(vec![1]),
             "false" => Ok(vec![0]),
             _ => Err(invalid()),
         },
-        _ => Err(format!(
+        DefaultLiteral::Signed8 => trimmed
+            .parse::<i8>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Signed16 => trimmed
+            .parse::<i16>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Signed32 => trimmed
+            .parse::<i32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Signed64 => trimmed
+            .parse::<i64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        // UTF-16 code units parse as the engine's `u16` alongside the real
+        // unsigned 16-bit type.
+        DefaultLiteral::Unsigned8 => trimmed
+            .parse::<u8>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Unsigned16 => trimmed
+            .parse::<u16>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Unsigned32 => trimmed
+            .parse::<u32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Unsigned64 => trimmed
+            .parse::<u64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Float32 => trimmed
+            .parse::<f32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Float64 => trimmed
+            .parse::<f64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        DefaultLiteral::Unsupported => Err(format!(
             "field default `{literal}` names a type with no supported literal form ({primitive_type})"
         )),
     }
@@ -453,7 +545,7 @@ pub(super) fn managed_field_layout(
 ) -> Vec<ComponentFieldDescriptor> {
     let mut layout = Vec::new();
     for field in fields {
-        if field.primitive_type == "struct" {
+        if field.primitive_type == STRUCT_TYPE {
             layout.push(ComponentFieldDescriptor {
                 name: intern(&field.name),
                 type_tag: intern(&format!("struct:{component_name}::{}", field.name)),
@@ -464,7 +556,9 @@ pub(super) fn managed_field_layout(
             });
             continue;
         }
-        let Some(type_tag) = managed_primitive_tag(&field.primitive_type) else {
+        // A leaf the engine cannot decode keeps its bytes in storage but is
+        // omitted from the registered layout.
+        let Some(type_tag) = blittable_leaf(&field.primitive_type).and_then(|leaf| leaf.tag) else {
             continue;
         };
         layout.push(ComponentFieldDescriptor {

@@ -26,8 +26,10 @@
 use std::fmt;
 
 // External crates
-use colored::Colorize;
 use pill_core_macros::engine_error;
+
+// Current crate
+use crate::style::PillStyle;
 
 // =============================================================================
 // Semantic Rendering Protocol
@@ -202,12 +204,14 @@ impl<W: fmt::Write> MessageRenderer for TerminalMessageRenderer<'_, W> {
     }
 
     fn styled(&mut self, role: SemanticRole, value: &dyn fmt::Display) -> fmt::Result {
+        // The semantic roles map onto the crate's one styling vocabulary, so
+        // a color is defined once and the renderer owns no palette of its own.
         let value = value.to_string();
         let styled = match role {
-            SemanticRole::General => value.bright_cyan().to_string(),
-            SemanticRole::Specific => value.truecolor(95, 210, 90).to_string(),
-            SemanticRole::Module => value.truecolor(180, 25, 100).bold().to_string(),
-            SemanticRole::Name => format!("\"{value}\"").truecolor(190, 220, 160).to_string(),
+            SemanticRole::General => value.general_object_style(),
+            SemanticRole::Specific => value.specific_object_style(),
+            SemanticRole::Module => value.module_object_style(),
+            SemanticRole::Name => value.name_style(),
         };
         self.output.write_str(&styled)
     }
@@ -766,9 +770,7 @@ pub enum ModuleError {
         name_style(module),
         " does not export pill_module_abi_version"
     )]
-    #[diagnostic(help(
-        "an extension must export pill_module_abi_version, pill_module_init and, optionally, pill_module_update"
-    ))]
+    #[diagnostic(help("an extension must export pill_module_abi_version and pill_module_init"))]
     AbiVersionMissing { module: String },
 
     /// The module's registration entry point reported a failed generation.

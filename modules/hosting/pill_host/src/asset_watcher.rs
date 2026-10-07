@@ -34,12 +34,11 @@ use std::sync::mpsc::{channel, Receiver};
 
 // External crates
 use notify::event::{EventKind, ModifyKind, RenameMode};
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
-use pill_core::{error, info};
+use pill_core::info;
 
 // Current crate
-use crate::watcher::{debounce_duration, is_relevant_event};
+use crate::watcher::{is_relevant_event, spawn_settled_watcher};
 
 /// The extension of a metadata file, appended to its source's name.
 const METADATA_SUFFIX: &str = ".meta";
@@ -88,66 +87,32 @@ impl AssetWatcher {
             return Ok(None);
         }
 
-        // Step 1: Forward every relevant path to the worker. A rename arrives
-        // as a remove of the old name and a create of the new one, which is
-        // all this stage needs (Stage 9 handles renames as such).
-        let (path_sender, paths) = channel::<PathBuf>();
-        let mut watcher = RecommendedWatcher::new(
-            move |result: Result<Event, notify::Error>| match result {
-                Ok(event) if is_relevant_event(&event.kind) || is_rename(&event.kind) => {
-                    for path in event.paths {
-                        // Failure only means the worker has shut down.
-                        let _ = path_sender.send(path);
-                    }
-                }
-                Ok(_) => {}
-                // Never panic inside the callback, which some backends run on
-                // their own threads; report and continue.
-                Err(error) => {
-                    error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        error = %error,
-                        "asset watcher error"
-                    );
-                }
-            },
-            Config::default(),
-        )
-        .map_err(|source| WatcherError::CreationFailed { source })?;
-        watcher
-            .watch(&asset_directory, RecursiveMode::Recursive)
-            .map_err(|source| WatcherError::RegistrationFailed {
-                path: asset_directory.display().to_string(),
-                source,
-            })?;
+        // Step 1: Queue the receiver and spawn the shared watcher worker with
+        // the asset acceptance: every relevant event, rename sides included
+        // (a rename arrives as a remove of the old name and a create of the
+        // new one, which is all this stage needs).
+        let (change_sender, changes) = channel::<AssetChange>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             directory = %asset_directory.display(),
             "[assets] watching the project's assets for edits"
         );
-
-        // Step 2: The worker: settle, classify, queue.
-        let (change_sender, changes) = channel::<AssetChange>();
-        std::thread::Builder::new()
-            .name("pill asset watcher".to_owned())
-            .spawn(move || {
-                // Owned here so the watch lasts exactly as long as the worker.
-                let _watcher = watcher;
-                while let Ok(first_path) = paths.recv() {
-                    std::thread::sleep(debounce_duration());
-                    let mut touched = vec![first_path];
-                    touched.extend(paths.try_iter());
-                    for change in classify(&asset_directory, &touched) {
-                        if change_sender.send(change).is_err() {
-                            // The host dropped the watcher: stop.
-                            return;
-                        }
+        spawn_settled_watcher(
+            asset_directory,
+            "pill asset watcher",
+            "asset watcher error",
+            |kind: &EventKind| is_relevant_event(kind) || is_rename(kind),
+            |_path: &Path| true,
+            move |root, touched| {
+                for change in classify(root, &touched) {
+                    if change_sender.send(change).is_err() {
+                        // The host dropped the watcher: stop.
+                        return false;
                     }
                 }
-            })
-            .map_err(|source| WatcherError::CreationFailed {
-                source: notify::Error::io(source),
-            })?;
+                true
+            },
+        )?;
 
         Ok(Some(Self { changes }))
     }

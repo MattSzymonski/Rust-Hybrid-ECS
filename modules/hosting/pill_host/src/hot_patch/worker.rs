@@ -97,8 +97,6 @@ pub(crate) struct BuiltBody {
     pub(super) library: Library,
     /// Size on disk, for the analytics line.
     pub(super) artifact_bytes: u64,
-    /// Exports the image carries, for the analytics line.
-    pub(super) exports: usize,
     /// Milliseconds spent in `rustc`.
     pub(super) compile_ms: f64,
     /// Milliseconds spent mapping the image.
@@ -222,20 +220,16 @@ fn build_body(body: &PreparedBody) -> Result<BuiltBody, PatchRefusal> {
     })?;
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
 
-    // Measured before installing, so the analytics line carries the same two
-    // numbers a module reload does. Both are best-effort: a patch is still
-    // correct when its size or export table cannot be read.
+    // Measured before installing, so the analytics line carries the same
+    // artifact size a module reload does. Best-effort: a patch is still
+    // correct when its size cannot be read.
     let artifact_bytes = std::fs::metadata(artifact_path)
         .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let exports = crate::analytics::inspect_pe(artifact_path)
-        .map(|inspection| inspection.exports.len())
         .unwrap_or(0);
 
     Ok(BuiltBody {
         library,
         artifact_bytes,
-        exports,
         compile_ms,
         load_ms,
     })

@@ -21,6 +21,7 @@ use dioxus::prelude::*;
 use pill_core::platform::Instant;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Entity, FieldValue};
+use pill_host::AssetEntry;
 
 use crate::assets_tab::AssetInspector;
 use crate::editor_state::{EditorCommand, EditorSnapshot, RegisteredComponent};
@@ -678,28 +679,27 @@ fn ColorGroupEditor(group: ColorGroup, editor: Arc<EditorContext>) -> Element {
 pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
     let mut snapshot = use_signal(EditorSnapshot::default);
 
-    let poll_editor = Arc::clone(&editor);
-    use_future(move || {
-        let poll_editor = Arc::clone(&poll_editor);
-        async move {
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                snapshot.set(poll_editor.snapshot());
-            }
-        }
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        snapshot.set(editor.snapshot());
     });
 
     // Registered component picker, refetched on the poll cadence.
     let mut registered = use_signal(Vec::<RegisteredComponent>::new);
-    let register_editor = Arc::clone(&editor);
-    use_future(move || {
-        let register_editor = Arc::clone(&register_editor);
-        async move {
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                registered.set(register_editor.registered_components());
-            }
-        }
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        registered.set(editor.registered_components());
+    });
+
+    // The selected asset's entry, refreshed once per poll tick here, where the
+    // inspector is rendered from, so the inspector itself never walks the
+    // asset tree to find the record the parent already has.
+    let mut asset_entry = use_signal(|| None::<AssetEntry>);
+    crate::polling::use_poll_editor(&editor, POLL_INTERVAL, move |editor| {
+        asset_entry.set(editor.selected_asset().and_then(|path| {
+            editor
+                .asset_entries()
+                .into_iter()
+                .find(|entry| entry.path == path)
+        }));
     });
 
     let detail = snapshot.read().detail.clone();
@@ -708,7 +708,7 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
         // this panel, so a selection made in the Assets panel shows promptly.
         if let Some(path) = editor.selected_asset() {
             return rsx! {
-                AssetInspector { key: "{path}", editor: Arc::clone(&editor), path: path.clone() }
+                AssetInspector { key: "{path}", editor: Arc::clone(&editor), path: path.clone(), entry: asset_entry() }
             };
         }
         return rsx! {

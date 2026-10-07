@@ -47,7 +47,7 @@ use crate::engine::Engine;
 ///
 /// `engine_handle` is only valid while the host's [`Engine`](crate::Engine)
 /// lives and while the artifact is loaded. The artifact must not store it
-/// beyond the duration of the `pill_module_init` / `pill_module_update` call.
+/// beyond the duration of the `pill_module_init` call.
 ///
 /// # Examples
 ///

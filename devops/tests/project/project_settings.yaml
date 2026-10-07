@@ -3,12 +3,16 @@
 # The fixture project is selected by PROJECT_PATH; this file supplies the
 # required project `name` / `build_binary_name` and its extension list.
 #
-# The five `pill_dummy_*` modules are here, and deliberately not in the example
-# projects. Loading several modules at once is a path worth exercising, but it
-# is a test's job rather than every developer's: declared in an example it cost
-# every cold start and every reload cascade five crates to build, five DLLs to
-# load, five watchers and five graveyards, and it made the engine's own
-# benchmarks measure a configuration no real project has.
+# Four modules: `pill_spline` and `pill_dummy_color` carry the fixture's real
+# behavior (the reload suite edits the first, the C# bridge fixtures read the
+# second), and `pill_dummy_math` and `pill_dummy_random` are no-op modules that
+# only exercise loading several modules at once. Loading several at once is a
+# path worth exercising, but it is a test's job rather than every developer's:
+# declared in an example it cost every cold start and every reload cascade the
+# crates to build, the DLLs to load, the watchers and the graveyards, and it
+# made the engine's own benchmarks measure a configuration no real project has.
+# The surplus placeholders (`pill_dummy_text`, `pill_dummy_timer`) added two
+# more builds without adding a scenario, so they were removed.
 #
 # `test_hot_reload_migration.py` runs this file as committed - it sets
 # PROJECT_PATH here and writes no settings of its own - so the multi-module
@@ -26,7 +30,5 @@ renderer: "none"
 modules:
   - "pill_spline"
   - "pill_dummy_math"
-  - "pill_dummy_text"
   - "pill_dummy_color"
-  - "pill_dummy_timer"
   - "pill_dummy_random"

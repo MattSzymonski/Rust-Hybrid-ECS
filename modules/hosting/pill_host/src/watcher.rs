@@ -261,6 +261,93 @@ impl TriggerLog {
     }
 }
 
+/// Spawn the notify watcher + debounce worker skeleton shared by the source,
+/// asset and shader watchers.
+///
+/// The callback forwards every path `path_accepts` keeps out of every event
+/// `event_accepts` accepts; the worker settles a burst with the debounce
+/// window, collects the paths it produced and hands them to `settle`, which
+/// returns whether the worker should keep running. The watcher itself moves
+/// into the worker, so its OS handles stay registered exactly as long as the
+/// worker lives. `callback_error_message` is the message reported when the
+/// backend hands the callback an error; watching must never panic inside it,
+/// because some backends run it on their own threads.
+pub(crate) fn spawn_settled_watcher<F>(
+    root: PathBuf,
+    thread_name: &str,
+    callback_error_message: &'static str,
+    event_accepts: impl Fn(&EventKind) -> bool + Send + 'static,
+    path_accepts: impl Fn(&Path) -> bool + Send + 'static,
+    mut settle: F,
+) -> Result<(), WatcherError>
+where
+    F: FnMut(&Path, Vec<PathBuf>) -> bool + Send + 'static,
+{
+    let (path_sender, paths) = std::sync::mpsc::channel::<PathBuf>();
+    let mut watcher = RecommendedWatcher::new(
+        move |result: Result<Event, notify::Error>| match result {
+            Ok(event) => {
+                if event_accepts(&event.kind) {
+                    for path in event.paths {
+                        if path_accepts(&path) {
+                            // Failure only means the receiving thread has
+                            // shut down, so there is no recovery work for the
+                            // callback to perform.
+                            let _ = path_sender.send(path);
+                        }
+                    }
+                }
+            }
+            // Never panic inside the callback, which some backends run on
+            // their own threads; report and continue.
+            Err(error) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    error = %error,
+                    "{}",
+                    callback_error_message
+                );
+            }
+        },
+        Config::default(),
+    )
+    .map_err(|source| WatcherError::CreationFailed { source })?;
+
+    // Recursive watching covers nested trees without requiring every caller
+    // to enumerate its own directory structure.
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|source| WatcherError::RegistrationFailed {
+            path: root.display().to_string(),
+            source,
+        })?;
+
+    std::thread::Builder::new()
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            // RecommendedWatcher unregisters its OS handles when dropped.
+            // Move it into the worker even though the loop never calls it
+            // directly, keeping those handles alive for exactly as long as
+            // the worker lives.
+            let _watcher = watcher;
+            while let Ok(first_path) = paths.recv() {
+                // One save can produce several notifications for the same
+                // file; let the burst settle, then collect it.
+                std::thread::sleep(debounce_duration());
+                let mut touched = vec![first_path];
+                touched.extend(paths.try_iter());
+                if !settle(&root, touched) {
+                    // The host dropped the watcher: stop.
+                    return;
+                }
+            }
+        })
+        .map_err(|source| WatcherError::CreationFailed {
+            source: notify::Error::io(source),
+        })?;
+    Ok(())
+}
+
 /// Watch the configured source tree and signal reloads from a worker thread.
 ///
 /// # Errors
@@ -296,65 +383,22 @@ pub(crate) fn spawn_source_watcher(
         "watching for source changes"
     );
 
-    // Step 2: Create the watcher with a minimal callback that forwards
-    // relevant paths to a debounce channel.
-    let callback_root = watch_path.clone();
-    let (sender, receiver) = std::sync::mpsc::channel::<PathBuf>();
-    let mut watcher = RecommendedWatcher::new(
-        move |result: Result<Event, notify::Error>| match result {
-            Ok(event) => {
-                if is_relevant_event(&event.kind) {
-                    for path in event.paths {
-                        if is_relevant_path(&path, &callback_root) {
-                            // Failure only means the receiving thread has
-                            // shut down, so there is no recovery work for the
-                            // callback to perform.
-                            let _ = sender.send(path);
-                        }
-                    }
-                }
-            }
-            // Watching must never panic inside the callback, which some
-            // backends run on their own threads; report and continue.
-            Err(error) => {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    error = %error,
-                    "file watcher error"
-                );
-            }
-        },
-        Config::default(),
-    )
-    .map_err(|source| WatcherError::CreationFailed { source })?;
-
-    // Recursive watching covers nested source modules without requiring every
-    // language backend to enumerate its own directory structure.
-    watcher
-        .watch(&watch_path, RecursiveMode::Recursive)
-        .map_err(|source| WatcherError::RegistrationFailed {
-            path: watch_path.display().to_string(),
-            source,
-        })?;
-
-    // Step 3: Run the debounce worker that reports changes and signals the
-    // main loop in the host.
-    std::thread::spawn(move || {
-        // RecommendedWatcher unregisters its OS handles when dropped.
-        // Move it into the worker even though the loop never calls it directly,
-        // keeping those handles alive for exactly as long as the receiver remains live.
-        let _watcher = watcher;
-
-        // Block without consuming CPU until an event starts a debounce window.
-        while let Ok(first_path) = receiver.recv() {
-            // One source save can produce several notifications for the same file.
-            // Wait for the burst to settle, deduplicate all signals in a set,
-            // and report the trigger before signalling the main loop in the host.
-            let mut changed_paths = HashSet::from([first_path]);
-            std::thread::sleep(debounce_duration());
-            while let Ok(path) = receiver.try_recv() {
-                changed_paths.insert(path);
-            }
+    // Step 2: Spawn the shared watcher worker with the source-specific
+    // acceptance (canonicalized under the watch root, relevant relative
+    // paths) and the source-specific settling: report, log, bump the reload
+    // generation and record the trigger.
+    let accept_root = watch_path.clone();
+    let report_root = watch_path.clone();
+    spawn_settled_watcher(
+        watch_path,
+        "pill source watcher",
+        "file watcher error",
+        is_relevant_event,
+        move |path| is_relevant_path(path, &accept_root),
+        move |_root, touched| {
+            // One source save can produce several notifications for the same
+            // file, so the burst is deduplicated before it is reported.
+            let changed_paths: HashSet<PathBuf> = touched.into_iter().collect();
 
             // Prepare a short report of the changed paths for the console.
             // Paths are printed relative to the watch directory.
@@ -362,7 +406,7 @@ pub(crate) fn spawn_source_watcher(
                 .iter()
                 .take(REPORTED_PATH_LIMIT)
                 .map(|path| {
-                    path.strip_prefix(&watch_path)
+                    path.strip_prefix(&report_root)
                         .unwrap_or(path)
                         .display()
                         .to_string()
@@ -381,7 +425,7 @@ pub(crate) fn spawn_source_watcher(
             // rather than by the patch that follows it - and until now the only
             // way to know that was to time it from outside the process.
             //
-            // The debounce below is part of it by construction, so a healthy
+            // The debounce above is part of it by construction, so a healthy
             // reading is a little over DEBOUNCE_DURATION, not zero.
             let detection_delay_ms = changed_paths
                 .iter()
@@ -414,8 +458,9 @@ pub(crate) fn spawn_source_watcher(
                     detection_delay_ms,
                 });
             }
-        }
-    });
+            true
+        },
+    )?;
 
     Ok(())
 }

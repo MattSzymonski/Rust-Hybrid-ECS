@@ -6,4 +6,4 @@
 //!   instances and records their instanced draws inside the render pass.
 
 /// The mesh drawer: batches queued entities and records the instanced draws.
-pub mod mesh_drawer;
+pub(crate) mod mesh_drawer;

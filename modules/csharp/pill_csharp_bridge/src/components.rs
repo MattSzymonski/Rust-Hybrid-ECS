@@ -402,38 +402,13 @@ pub(super) fn register_component_manifest(
             )
             .into());
         }
-        // The editor layout is computed here, not at the top of the loop: it
-        // leaks every field name and struct tag, and entries that already had
-        // a binding - or a manifest just refused as shared - must not leak
-        // anything. Both reads happen before the name moves into
-        // `register_component_descriptor` below.
-        let component_name = component.full_name.clone();
-        let field_layout = managed_field_layout(&component.full_name, &component.fields);
-        let id = engine
-            .world_mut()
-            .register_component_descriptor(
-                stable_id.0,
-                component.full_name,
-                component.size,
-                component.alignment,
-                component.schema_hash,
-                // `parse_and_validate_manifest` ran `BLITTABLE_FIELD_TYPES`
-                // over every field before this point, so the witness is the
-                // record of a check rather than a restatement of the promise.
-                Blittability::from_manifest_fields(),
-            )
-            .map_err(|error| CSharpError::ManifestInvalid {
-                message: error.to_plain_message(),
-            })?;
-        bindings.insert(
-            stable_id,
-            ComponentBinding::Managed {
-                component_id: id,
-                size: component.size,
-                align: component.alignment,
-                schema_hash: component.schema_hash,
-            },
-        );
+        // Registration goes through the one helper every reload path uses, so
+        // startup and swap install managed storage the same way. The editor
+        // layout is computed inside it, after the checks above: it leaks every
+        // field name and struct tag, and an entry that already had a binding -
+        // or a manifest just refused as shared - must not leak anything.
+        let (id, field_layout) = register_managed_storage(engine, stable_id, &component)?;
+        bindings.insert(stable_id, managed_binding(id, &component));
         // The binding and the registered column are two records of one layout,
         // and two records can drift. Asserted where both are written, so a
         // future path that relayouts the column without the store fails in
@@ -445,21 +420,16 @@ pub(super) fn register_component_manifest(
             "the column just registered must match the binding just stored"
         );
 
-        // Slice G: give the editor the same field vocabulary `#[derive(PillComponent)]`
-        // produces, so a C# component shows named, editable fields instead of
-        // nothing. Re-registration on assembly swap replaces the layout.
+        // Slice G: give the editor the same field vocabulary
+        // `#[derive(PillComponent)]` produces, so a C# component shows named,
+        // editable fields instead of nothing. Re-registration on assembly
+        // swap replaces the layout.
         info!(
             target: telemetry_target::HOT_RELOAD,
-            component = %component_name,
+            component = %component.full_name,
             fields = %format_field_layout_line(&field_layout),
             "managed component field layout registered"
         );
-        engine
-            .world_mut()
-            .register_component_descriptor_with_layout(id, field_layout)
-            .map_err(|error| CSharpError::ManifestInvalid {
-                message: error.to_string(),
-            })?;
     }
     Ok(bindings)
 }
@@ -787,7 +757,7 @@ fn register_component_entry(
     stable_id: StableComponentId,
     component: &ManagedComponentManifest,
 ) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
-    let component_id = register_managed_storage(engine, stable_id, component)?;
+    let (component_id, _) = register_managed_storage(engine, stable_id, component)?;
     info!(
         target: telemetry_target::HOT_RELOAD,
         component = %component.full_name,
@@ -879,7 +849,7 @@ fn rename_component_entry(
     // below, in this order, so a failure in either leaves the undo's record
     // describing what was there.
     let plan = build_field_plan(engine, predecessor_id, &component.fields);
-    let successor_id = register_managed_storage(engine, stable_id, component)?;
+    let (successor_id, _) = register_managed_storage(engine, stable_id, component)?;
     let migrated_rows = engine
         .world_mut()
         .remap_descriptor_component(predecessor_id, successor_id, &plan)
@@ -1062,14 +1032,16 @@ fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
 
 /// Register one manifest entry as managed descriptor storage with its layout.
 ///
-/// Shared by the add and rename actions, which differ only in what happens to
-/// the rows afterwards.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+/// The one registration sequence: startup and every reload action (add,
+/// rename) go through it, so the descriptor, the binding entry and the
+/// editor-facing layout cannot be installed by one path and skipped by
+/// another. The installed layout is returned for the startup log line that
+/// reports it.
 fn register_managed_storage(
     engine: &mut Engine,
     stable_id: StableComponentId,
     component: &ManagedComponentManifest,
-) -> Result<ComponentId, CSharpError> {
+) -> Result<(ComponentId, Vec<ComponentFieldDescriptor>), CSharpError> {
     let field_layout = managed_field_layout(&component.full_name, &component.fields);
     let component_id = engine
         .world_mut()
@@ -1080,7 +1052,7 @@ fn register_managed_storage(
             component.alignment,
             component.schema_hash,
             // The entry was parsed by `parse_and_validate_manifest`, whose
-            // `BLITTABLE_FIELD_TYPES` check is what earns this witness.
+            // blittable-vocabulary check is what earns this witness.
             Blittability::from_manifest_fields(),
         )
         .map_err(|error| CSharpError::ManifestInvalid {
@@ -1088,11 +1060,11 @@ fn register_managed_storage(
         })?;
     engine
         .world_mut()
-        .register_component_descriptor_with_layout(component_id, field_layout)
+        .register_component_descriptor_with_layout(component_id, field_layout.clone())
         .map_err(|error| CSharpError::ManifestInvalid {
             message: error.to_string(),
         })?;
-    Ok(component_id)
+    Ok((component_id, field_layout))
 }
 
 /// The binding one arriving manifest entry describes.

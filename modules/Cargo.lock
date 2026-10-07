@@ -2600,14 +2600,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "host_module_pill_dummy_color"
-version = "0.1.0"
-dependencies = [
- "pill_dummy_color",
- "pill_engine",
-]
-
-[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -2624,19 +2616,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_module_pill_spline"
-version = "0.1.0"
-dependencies = [
- "pill_engine",
- "pill_spline",
-]
-
-[[package]]
 name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
  "glam",
- "pill_dummy_color",
+ "pill_assets",
  "pill_engine",
  "pill_master_renderer_data",
  "serde",
@@ -4698,8 +4682,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_asset_format"
+version = "0.1.0"
+
+[[package]]
 name = "pill_assets"
 version = "0.1.0"
+dependencies = [
+ "pill_asset_format",
+]
 
 [[package]]
 name = "pill_audio"
@@ -4803,22 +4794,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pill_dummy_text"
-version = "0.1.0"
-dependencies = [
- "pill_core",
- "pill_engine",
-]
-
-[[package]]
-name = "pill_dummy_timer"
-version = "0.1.0"
-dependencies = [
- "pill_core",
- "pill_engine",
-]
-
-[[package]]
 name = "pill_engine"
 version = "0.1.0"
 dependencies = [
@@ -4836,6 +4811,7 @@ dependencies = [
  "getrandom 0.3.4",
  "metrics",
  "miette",
+ "pill_asset_format",
  "pill_core",
  "pill_core_macros",
  "pill_engine",
@@ -4968,11 +4944,11 @@ dependencies = [
 name = "pill_shipping_bundle"
 version = "0.0.0"
 dependencies = [
- "pill_assets",
- "pill_csharp_bridge",
- "pill_master_renderer",
+ "pill_audio",
  "pill_master_renderer_data",
  "pill_runtime",
+ "pill_spline",
+ "project",
 ]
 
 [[package]]
@@ -5277,6 +5253,19 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "project"
+version = "0.1.0"
+dependencies = [
+ "pill_audio",
+ "pill_core",
+ "pill_engine",
+ "pill_master_renderer_data",
+ "pill_spline",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

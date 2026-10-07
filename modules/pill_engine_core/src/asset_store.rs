@@ -48,14 +48,13 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
+// External crates
+// The pack's magic and version come from the crate its writer also compiles
+// against, so the two sides cannot drift; see `pill_asset_format`.
+pub use pill_asset_format::{ASSET_PACK_MAGIC, ASSET_PACK_VERSION};
+
 // Current crate
 use crate::asset::{AssetLoadError, AssetLoadResult};
-
-/// The first bytes of every asset pack.
-pub const ASSET_PACK_MAGIC: &[u8; 8] = b"PILLPACK";
-
-/// The pack format version this engine reads.
-pub const ASSET_PACK_VERSION: u32 = 1;
 
 // =============================================================================
 // AssetPack
