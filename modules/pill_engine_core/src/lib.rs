@@ -62,9 +62,6 @@ pub mod archetype;
 /// `Res` / `ResMut` parameters.
 pub mod asset;
 
-/// The C ABI of importing an asset, shared by the C# bridge's import exports.
-pub mod asset_ffi;
-
 /// Importing assets by file extension, for code that does not know their type.
 pub mod asset_import_registry;
 
@@ -120,6 +117,10 @@ pub mod entity;
 
 /// Typed error system for the ECS engine.
 pub mod error;
+
+/// The C ABI mirrored Rust functions cross to reach C#: argument slots,
+/// result encodings and the error and string channels.
+pub mod mirror;
 
 /// Constants shared between the host and extensions.
 pub mod module_abi;
@@ -211,7 +212,8 @@ pub use tracing;
 // which owns the registries.
 pub use pill_engine_macros::{
     pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_fn, pill_mirror_impl, pill_mirror_method,
-    pill_module, pill_project, pill_value_type, PillComponent, PillLayout, PillMirror,
+    pill_mirror_object, pill_mirror_resource, pill_module, pill_project, pill_value_type,
+    PillComponent, PillLayout, PillMirror,
 };
 
 // World container and its entity-builder and error types.

@@ -22,7 +22,10 @@
 //! expecting a game to mutate renderer state mid frame.
 
 // External crates
-use pill_engine::{Asset, AssetLoadError, AssetLoadResult, ImportedAsset};
+use pill_engine::{
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
+    AssetLoadResult, ImportedAsset, PillMirror,
+};
 use serde::{Deserialize, Serialize};
 
 /// One vertex, in the layout the vertex buffer step reads it.
@@ -31,7 +34,7 @@ use serde::{Deserialize, Serialize};
 /// bytes, and the field order is the attribute layout the renderer declares
 /// to wgpu, so the two have to agree.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable, PillMirror)]
 pub struct MeshVertex {
     /// Object-space position.
     pub position: [f32; 3],
@@ -56,6 +59,7 @@ pub struct MeshVertex {
 /// version moves, so a game edits the mesh it holds and lets the renderer
 /// notice rather than touching buffers itself.
 #[derive(Clone, Debug)]
+#[pill_mirror_object(asset, import)]
 pub struct Mesh {
     /// Label used in logs, profiling, and error messages.
     pub name: String,
@@ -65,11 +69,13 @@ pub struct Mesh {
     pub indices: Vec<u32>,
 }
 
+#[pill_mirror_impl]
 impl Mesh {
     /// Builds a mesh from finished vertex and index buffers.
     ///
     /// The buffers are stored as given: nothing checks the indices against
     /// the vertex list, so the caller supplies a pair that already agrees.
+    #[pill_mirror_method]
     pub fn from_data(
         name: impl Into<String>,
         vertices: Vec<MeshVertex>,
@@ -88,6 +94,7 @@ impl Mesh {
     /// A project with no geometry of its own can register this and draw it
     /// through the same material and pipeline path as any loaded mesh, which
     /// keeps a fresh scene renderable before its assets exist.
+    #[pill_mirror_method]
     pub fn triangle() -> Self {
         let vertex = |position, texture_coordinates| MeshVertex {
             position,
@@ -122,6 +129,7 @@ impl Mesh {
     /// would otherwise upload empty comes back named instead. Both carry the
     /// mesh's name, so the failure points at the asset rather than at the
     /// bytes.
+    #[pill_mirror_method]
     pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
         Self::decode_obj(name.into(), bytes, &MeshImportSettings::default())
     }

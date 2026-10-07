@@ -24,7 +24,10 @@
 
 // External crates
 use indexmap::IndexMap;
-use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader};
+use pill_engine::{
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
+    AssetLoadResult, AssetLoader, PillMirror,
+};
 
 // Current crate
 use super::TextureType;
@@ -33,7 +36,8 @@ use super::TextureType;
 ///
 /// The renderer writes a slot's bytes by this kind rather than by the kind of
 /// value it was handed, so the two have to agree or the value packs as zero.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PillMirror)]
+#[repr(u8)]
 pub enum ShaderParameterType {
     /// A single float.
     Scalar,
@@ -49,6 +53,7 @@ pub enum ShaderParameterType {
 /// its parameters by name, and the shader's slots say which names it accepts
 /// and what the matching value packs as.
 #[derive(Debug, Clone)]
+#[pill_mirror_object]
 pub struct ShaderParameterSlot {
     /// The name the source binds the uniform under.
     pub name: String,
@@ -56,8 +61,10 @@ pub struct ShaderParameterSlot {
     pub parameter_type: ShaderParameterType,
 }
 
+#[pill_mirror_impl]
 impl ShaderParameterSlot {
     /// A slot for `name`, carrying `parameter_type`.
+    #[pill_mirror_method]
     pub fn new(name: impl Into<String>, parameter_type: ShaderParameterType) -> Self {
         Self {
             name: name.into(),
@@ -69,6 +76,7 @@ impl ShaderParameterSlot {
 /// One texture a shader declares, under the name its source gives it, with the
 /// bindings it declares it at.
 #[derive(Debug, Clone)]
+#[pill_mirror_object]
 pub struct ShaderTextureSlot {
     /// The name the source binds the texture under.
     pub name: String,
@@ -80,9 +88,11 @@ pub struct ShaderTextureSlot {
     pub sampler_binding: u32,
 }
 
+#[pill_mirror_impl]
 impl ShaderTextureSlot {
     /// A slot for `name`, of `texture_type`, at the texture and sampler
     /// bindings the shader declares it at.
+    #[pill_mirror_method]
     pub fn new(name: impl Into<String>, texture_type: TextureType, bindings: (u32, u32)) -> Self {
         Self {
             name: name.into(),
@@ -145,6 +155,7 @@ pub fn texture_slots_by_name(
 /// the sources go to the pipeline, and the slots say how the uniform buffer
 /// and the texture bindings have to be laid out for that pipeline.
 #[derive(Clone, Debug)]
+#[pill_mirror_object(asset)]
 pub struct Shader {
     /// Name used in logs and error messages.
     pub name: String,
@@ -162,6 +173,7 @@ pub struct Shader {
     pub pass_camera_parameters: bool,
 }
 
+#[pill_mirror_impl]
 impl Shader {
     /// Start a shader with its name, the way [`RenderPass::new`](crate::RenderPass::new)
     /// starts a pass: name first, then the parts, and [`ShaderBuilder::build`]
@@ -169,6 +181,7 @@ impl Shader {
     // `clippy::new_ret_no_self`: the chain returns the builder, not the shader,
     // because reading the sources is the one step that can fail.
     #[allow(clippy::new_ret_no_self)]
+    #[pill_mirror_method]
     pub fn new(name: impl Into<String>) -> ShaderBuilder {
         ShaderBuilder {
             name: name.into(),
@@ -187,6 +200,7 @@ impl Shader {
 /// The parts arrive in any order and [`Self::build`] reads the two sources, so
 /// a half-built shader is never alive.
 #[derive(Clone, Debug)]
+#[pill_mirror_object]
 pub struct ShaderBuilder {
     /// The name the finished shader will carry.
     name: String,
@@ -204,14 +218,17 @@ pub struct ShaderBuilder {
     pass_camera_parameters: bool,
 }
 
+#[pill_mirror_impl]
 impl ShaderBuilder {
     /// The WGSL vertex stage, read from this source when the shader is built.
+    #[pill_mirror_method]
     pub fn with_vertex_source(mut self, source: AssetLoader) -> Self {
         self.vertex_source = Some(source);
         self
     }
 
     /// The WGSL fragment stage, read from this source when the shader is built.
+    #[pill_mirror_method]
     pub fn with_fragment_source(mut self, source: AssetLoader) -> Self {
         self.fragment_source = Some(source);
         self
@@ -223,6 +240,7 @@ impl ShaderBuilder {
     /// and the host bridge has whatever a C# project handed it. Nothing is
     /// resolved or read, so [`Self::build`] has the stages already - where
     /// [`Self::with_vertex_source`] has a path that may turn out not to exist.
+    #[pill_mirror_method]
     pub fn with_wgsl(mut self, vertex: impl Into<String>, fragment: impl Into<String>) -> Self {
         self.vertex_source = Some(AssetLoader::Bytes(vertex.into().into_bytes().into()));
         self.fragment_source = Some(AssetLoader::Bytes(fragment.into().into_bytes().into()));
@@ -231,6 +249,7 @@ impl ShaderBuilder {
 
     /// The uniform slots the fragment stage declares, each carrying the name it
     /// binds under. Declaration order is the order their values pack in.
+    #[pill_mirror_method]
     pub fn with_parameter_slots(
         mut self,
         parameter_slots: impl IntoIterator<Item = ShaderParameterSlot>,
@@ -241,6 +260,7 @@ impl ShaderBuilder {
 
     /// The texture slots the fragment stage declares, each carrying the name it
     /// binds under and the bindings the shader declares it at.
+    #[pill_mirror_method]
     pub fn with_texture_slots(
         mut self,
         texture_slots: impl IntoIterator<Item = ShaderTextureSlot>,
@@ -250,12 +270,14 @@ impl ShaderBuilder {
     }
 
     /// Whether the shader reads the engine's parameters, at set 0.
+    #[pill_mirror_method]
     pub fn with_engine_parameters(mut self, pass_engine_parameters: bool) -> Self {
         self.pass_engine_parameters = pass_engine_parameters;
         self
     }
 
     /// Whether the shader reads the camera's parameters, at set 1.
+    #[pill_mirror_method]
     pub fn with_camera_parameters(mut self, pass_camera_parameters: bool) -> Self {
         self.pass_camera_parameters = pass_camera_parameters;
         self
@@ -268,6 +290,7 @@ impl ShaderBuilder {
     /// Fails when one of the sources was never set, or when reading one of
     /// them fails: a path that does not resolve, an I/O error, or bytes that
     /// are not UTF-8 text.
+    #[pill_mirror_method]
     pub fn build(self) -> AssetLoadResult<Shader> {
         // A source that was never set is a mistake in the chain, not a missing
         // file, and is refused rather than read from a default path.

@@ -135,6 +135,18 @@ pub fn register(_engine: &mut Engine) -> u32 {
 mod tests {
     use super::*;
 
+    /// Call `get_color_a` the way C# does: through its mirror trampoline,
+    /// reading the `f32` it writes to the return buffer.
+    fn managed_get_color_a() -> f32 {
+        let mut ret = [0u8; pill_engine::mirror::SLOT_SIZE];
+        // SAFETY: the function takes no arguments, so no slot is read, and the
+        // return buffer holds the four bytes an `f32` result writes.
+        let status =
+            unsafe { crate::pill_mirror_fn_get_color_a(std::ptr::null(), ret.as_mut_ptr()) };
+        assert_eq!(status, pill_engine::mirror::STATUS_OK);
+        f32::from_le_bytes([ret[0], ret[1], ret[2], ret[3]])
+    }
+
     /// The function must be discoverable by its qualified path, which is how a
     /// host addresses it across the ABI.
     #[test]
@@ -171,6 +183,7 @@ mod tests {
         assert_eq!(method.type_name, "pill_dummy_color::TestStruct");
         assert!(!method.is_free_function, "a method, not a free function");
         assert_eq!(method.return_tag, "u64");
+        assert_eq!(method.receiver, "ref", "`aaa` borrows its receiver");
 
         let declared: Vec<&str> = pill_engine::component_registry::value_type_descriptors()
             .iter()
@@ -222,7 +235,7 @@ mod tests {
         // time someone used it for what it is for.
         let original = get_color_a();
         assert_eq!(
-            crate::pill_mirror_fn_get_color_a(),
+            managed_get_color_a(),
             original,
             "the mirror trampoline forwards to the public name"
         );
@@ -241,7 +254,7 @@ mod tests {
         .expect("install with the recorded signature must be accepted");
         assert_eq!(get_color_a(), 999.0, "callers must see the replacement");
         assert_eq!(
-            crate::pill_mirror_fn_get_color_a(),
+            managed_get_color_a(),
             999.0,
             "and so must the managed call path - this is what a live patch reaches"
         );
@@ -254,7 +267,7 @@ mod tests {
             "a reset must return the function to its own body"
         );
         assert_eq!(
-            crate::pill_mirror_fn_get_color_a(),
+            managed_get_color_a(),
             original,
             "the managed call path returns to the compiled body"
         );

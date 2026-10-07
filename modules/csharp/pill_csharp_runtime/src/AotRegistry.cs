@@ -72,12 +72,25 @@ public readonly struct ResourceAccessRegistration
     /// <summary>Access mode: <c>0</c> read, <c>1</c> read-write.</summary>
     public byte Mode { get; }
 
-    /// <summary>Describe one declared resource access.</summary>
+    /// <summary>
+    /// What the identity names: a managed resource (<c>1</c>) or a Rust-owned
+    /// one reached by its shared name (<c>2</c>).
+    /// </summary>
+    public byte Kind { get; }
+
+    /// <summary>Describe one declared access to a managed resource.</summary>
     public ResourceAccessRegistration(ulong low, ulong high, byte mode)
+        : this(low, high, mode, ManagedAccess.ResourceKind)
+    {
+    }
+
+    /// <summary>Describe one declared resource access of either kind.</summary>
+    public ResourceAccessRegistration(ulong low, ulong high, byte mode, byte kind)
     {
         Low = low;
         High = high;
         Mode = mode;
+        Kind = kind;
     }
 
     /// <summary>
@@ -100,11 +113,16 @@ public readonly struct ResourceAccessRegistration
     public static ResourceAccessRegistration Of<T>(byte mode) where T : unmanaged
     {
         StableComponentId id = ResourceTypeMetadata<T>.StableId;
-        return new ResourceAccessRegistration(id.Low, id.High, mode);
+        return new ResourceAccessRegistration(id.Low, id.High, mode, ResourceNames.KindOf(typeof(T)));
     }
 }
 
 /// <summary>One compile-time registered startup method for the AOT posture.</summary>
+/// <remarks>
+/// A startup needs no declared access: it runs alone, before the scheduler
+/// starts, so its <c>Res&lt;T&gt;</c>/<c>ResMut&lt;T&gt;</c> parameters are
+/// passed as their stateless defaults and every resource is reachable.
+/// </remarks>
 public readonly struct AotStartupRegistration
 {
     /// <summary>Stable display name, matching the reflection path's format.</summary>

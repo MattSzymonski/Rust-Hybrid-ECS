@@ -19,12 +19,13 @@
 //! a pass was edited. What an installer put in the store is the store's
 //! business: `AssetManager::handle_by_name` is the index for it.
 
-use pill_engine::{Asset, Handle};
+use pill_engine::{pill_mirror_object, Asset, Handle};
 
 use crate::RenderPass;
 
 /// The passes a frame runs, in the order they were added.
 #[derive(Clone, Debug, Default)]
+#[pill_mirror_object(asset)]
 pub struct RenderingPipeline {
     /// Pass handles, in the order they run. A pass's own `order` key refines
     /// this when the renderer sorts the chain.

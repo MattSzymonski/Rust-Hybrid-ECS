@@ -113,8 +113,11 @@ public static unsafe class LoaderInterop
     /// table. Bumped to 15 by the standalone-material import and skybox slots,
     /// and the input and time query slots, appended to the API table.
     /// Bumped to 16 by the parallel-dispatch slot appended to the API table.
+    /// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
+    /// slots left the table, and the mirror text, native resource and asset
+    /// store slots were appended.
     /// </summary>
-    public const uint InteropContractVersion = 16;
+    public const uint InteropContractVersion = 17;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT

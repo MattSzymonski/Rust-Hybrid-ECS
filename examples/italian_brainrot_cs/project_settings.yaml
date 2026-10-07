@@ -10,9 +10,9 @@
 # or removing a module is a single edit here.
 #
 # This project loads its own mesh, texture and shaders at startup through the
-# managed asset-loading bridge (`Engine.LoadMeshObj` and friends in
-# `pill_csharp_runtime`), the same way the Rust project's `asset_loading::load`
-# does from Rust. It lists `pill_dummy_color` so the module is loaded AND its
+# renderer's mirrored asset types (`Mesh.FromObjBytes`, `Shader.New(...)`,
+# `assets.AddNamed(...)`, generated from `pill_master_renderer_data`), with the
+# same calls the Rust project's `asset_loading::load` makes. It lists `pill_dummy_color` so the module is loaded AND its
 # mirrored surface reaches C#: `RotationSystem` calls
 # `PillDummyColor.GetColorA()` - the module's mirrored `#[pill_hot_fn]` - and
 # editing that function's body under modules/extensions/pill_dummy_color

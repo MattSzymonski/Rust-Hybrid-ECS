@@ -23,6 +23,7 @@ use pill_engine::Engine;
 use pill_runtime::ProjectBackend;
 
 // Current crate
+use crate::mirror_calls::static_mirror_methods;
 use crate::{exposed_components_from_names, CSharpModuleConfig, CSharpRuntime};
 
 // =============================================================================
@@ -90,23 +91,33 @@ impl ProjectBackend for CSharpBackend {
     /// Start .NET (or load the AOT library) and register the project.
     ///
     /// Managed code is given byte-level bindings for every component the
-    /// extensions registered. Mirrored Rust methods are resolved from a loaded
-    /// module's exports; a linked build has no module handle, so the C# method
-    /// table stays empty (calling one throws at runtime).
+    /// extensions registered. The mirrored Rust functions are this binary's
+    /// own: every extension is linked in, so the descriptors they submitted
+    /// carry the trampolines' addresses with no module to load.
     fn start(
         &self,
         engine: &mut Engine,
         exposed_component_names: &[String],
     ) -> Result<Box<dyn Any>, HostError> {
         let exposed = exposed_components_from_names(engine.world(), exposed_component_names);
+        let mirror_methods = static_mirror_methods();
         let runtime = match self.posture {
             // Nothing to load beside a shipped project.
-            Posture::CoreClr => {
-                CSharpRuntime::start(engine, &self.root, &self.config, &exposed, &[], &mut |_| {})?
-            }
-            Posture::NativeAot => {
-                CSharpRuntime::start_aot(engine, &self.root, &self.config, &exposed, &[])?
-            }
+            Posture::CoreClr => CSharpRuntime::start(
+                engine,
+                &self.root,
+                &self.config,
+                &exposed,
+                &mirror_methods,
+                &mut |_| {},
+            )?,
+            Posture::NativeAot => CSharpRuntime::start_aot(
+                engine,
+                &self.root,
+                &self.config,
+                &exposed,
+                &mirror_methods,
+            )?,
         };
         Ok(Box::new(runtime))
     }

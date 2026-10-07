@@ -203,6 +203,7 @@ pub fn install(
 ///
 /// Returns an error when the chain does not install, or when the pass's name is
 /// taken by an asset of another type.
+#[pill_engine::pill_mirror_fn]
 pub fn set_skybox(
     assets: &mut AssetManager,
     material: Option<Handle<Material>>,

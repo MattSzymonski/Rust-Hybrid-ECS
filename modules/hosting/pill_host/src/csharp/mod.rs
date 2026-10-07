@@ -33,15 +33,18 @@ use crate::watcher::SourceTrigger;
 mod codegen;
 /// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
 mod fast_compile;
+/// The C# members, object classes, enums and resource markers generated from
+/// a module's mirror descriptors.
+mod mirror_codegen;
 
 // =============================================================================
 // Re-exports
 // =============================================================================
 
 pub(crate) use pill_csharp_bridge::{
-    accessor_operation_name, accessor_rows, exposed_components_from_names, publish_asset_exports,
-    publish_mirror_methods, CSharpRuntime, ModuleExposedComponent, ResolvedFieldAccessor,
-    ResolvedMirrorMethod, POLL_REJECTED, POLL_RELOADED,
+    accessor_operation_name, accessor_rows, exposed_components_from_names, publish_mirror_methods,
+    CSharpRuntime, ModuleExposedComponent, ResolvedFieldAccessor, ResolvedMirrorMethod,
+    POLL_REJECTED, POLL_RELOADED,
 };
 
 /// Generate the C# mirror file for extension components.

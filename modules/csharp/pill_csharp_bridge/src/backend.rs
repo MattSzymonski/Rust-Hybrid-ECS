@@ -113,12 +113,15 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// `CsEngineApi`. Bumped to 15 by the standalone-material import and skybox
 /// slots, and the input and time query slots, appended to `CsEngineApi`.
 /// Bumped to 16 by the parallel-dispatch slot appended to `CsEngineApi`.
+/// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
+/// slots left `CsEngineApi`, and the mirror text, native resource and asset
+/// store slots were appended.
 ///
 /// Collapsing the four length/copy export pairs into one pair keyed by a
 /// payload-kind number would save six exports here and six resolutions
 /// across the two export constructors. It was proposed and declined: see
 /// the design note in `LoaderInterop.cs` for why the named exports are kept.
-pub const INTEROP_CONTRACT_VERSION: u32 = 16;
+pub const INTEROP_CONTRACT_VERSION: u32 = 17;
 
 // =============================================================================
 // Types + Impls
@@ -918,7 +921,6 @@ impl CSharpRuntime {
         let startup_bindings = Arc::clone(&bindings);
         let mut startup_failed = None;
         engine.queue_deferred_commands(|world, queue| {
-            let no_accesses = [];
             // One read of the live table for the whole startup batch: every
             // method in it resolves components through the entries the manifest
             // has just registered.
@@ -927,13 +929,12 @@ impl CSharpRuntime {
                 // A rejected scope means a managed startup method re-entered
                 // the host. Running it without a scope would only produce
                 // failing FFI calls, so treat it as this startup's failure.
-                let Some(_guard) = ActiveSystemGuard::set_with_commands(
-                    world,
-                    queue,
-                    &no_accesses,
-                    &startup_bindings,
-                    true,
-                ) else {
+                // The scope is exclusive: startups run one at a time before the
+                // scheduler starts, so a startup's `Res<T>`/`ResMut<T>`
+                // parameters need no declared access.
+                let Some(_guard) =
+                    ActiveSystemGuard::set_exclusive(world, queue, &startup_bindings)
+                else {
                     startup_failed = Some(startup_index);
                     break;
                 };
@@ -1527,6 +1528,20 @@ pub(super) fn derive_system_access(
         // are both name hashes, so only the declared kind tells them apart, and
         // recording a resource as a component would let two writers of one
         // resource run in the same batch.
+        // A Rust-owned resource (`ResMut<AssetManager>`) is reached by its
+        // shared name, whose identity is the key itself; it has no managed
+        // binding to look up.
+        if access.kind == super::context::ACCESS_KIND_NATIVE_RESOURCE {
+            let resource = pill_engine::ResourceId::Shared(
+                StableComponentId::from_halves(access.component_key, access.component_key_high).0,
+            );
+            match access.mode {
+                0 => result.add_resource_read(resource),
+                1 => result.add_resource_write(resource),
+                mode => return Err(CSharpError::UnknownAccessMode { mode }),
+            }
+            continue;
+        }
         if access.kind == super::resources::RESOURCE_ACCESS_KIND {
             let resource = super::resources::resolve_resource_access(
                 access.component_key,

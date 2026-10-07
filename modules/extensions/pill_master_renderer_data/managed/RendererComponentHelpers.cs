@@ -2,8 +2,8 @@
 //
 // Responsibilities
 // - Give gameplay code readable accessors for the generated structs in
-//   `generated/pill_renderer_api_Components.g.cs`: vectors and quaternions
-//   instead of numbered array elements, asset handles instead of raw bytes.
+//   `generated/pill_master_renderer_data_Components.g.cs`: vectors and
+//   quaternions instead of numbered array elements.
 // - Keep the "no mesh, no material" and placement shorthands the gameplay
 //   projects rely on.
 //
@@ -12,8 +12,10 @@
 // layout can never drift from the native components. These are `partial`
 // halves of those same structs, and they declare no instance fields - only
 // properties and static members - so they cannot change a mirror's layout.
-// Everything here reads and writes the generated fields (or, for `Handle`, the
-// struct's `Raw` bytes), which is what the host binds.
+// Everything here reads and writes the generated fields, which is what the host
+// binds. The asset handles are already typed in the generated mirror
+// (`Handle<Mesh>`, `Handle<Material>`), because the renderer mirrors its asset
+// types with `#[pill_mirror_object]`.
 
 using System;
 using System.Numerics;
@@ -21,39 +23,6 @@ using System.Runtime.InteropServices;
 
 namespace pill_master_renderer.component
 {
-    /// <summary>
-    /// Conveniences over the generated <c>Handle</c> mirror of the engine's
-    /// <c>Handle&lt;T&gt;</c>: a u32 slot index and a u32 generation.
-    /// </summary>
-    public partial struct Handle
-    {
-        /// <summary>A handle that names no asset: both halves at their maximum.</summary>
-        public static Handle Invalid => From(uint.MaxValue, uint.MaxValue);
-
-        /// <summary>The asset's slot in its column.</summary>
-        public uint Index
-        {
-            readonly get => MemoryMarshal.Read<uint>(Raw);
-            set => MemoryMarshal.Write(Raw, in value);
-        }
-
-        /// <summary>The slot's generation; a handle to a reused slot is stale.</summary>
-        public uint Generation
-        {
-            readonly get => MemoryMarshal.Read<uint>(Raw[sizeof(uint)..]);
-            set => MemoryMarshal.Write(Raw[sizeof(uint)..], in value);
-        }
-
-        /// <summary>A handle from its two halves.</summary>
-        public static Handle From(uint index, uint generation)
-        {
-            var handle = default(Handle);
-            handle.Index = index;
-            handle.Generation = generation;
-            return handle;
-        }
-    }
-
     /// <summary>Conveniences over the generated <c>MeshRendererComponent</c> mirror.</summary>
     public partial struct MeshRendererComponent
     {
@@ -65,12 +34,19 @@ namespace pill_master_renderer.component
         /// </summary>
         public static MeshRendererComponent None => new()
         {
-            Mesh = Handle.Invalid,
-            Material = Handle.Invalid,
+            Mesh = global::TracyLive.Handle<global::pill_master_renderer_data.Mesh>.Invalid,
+            Material = global::TracyLive.Handle<global::pill_master_renderer_data.Material>.Invalid,
         };
 
         /// <summary>A renderer drawing <paramref name="mesh"/> with <paramref name="material"/>.</summary>
-        public static MeshRendererComponent From(Handle mesh, Handle material) => new()
+        /// <remarks>
+        /// The handles are the ones <c>assets.AddNamed(...)</c> returned for a
+        /// mesh and a material. The parameter types are spelled in full because
+        /// inside this struct <c>Mesh</c> and <c>Material</c> name its fields.
+        /// </remarks>
+        public static MeshRendererComponent From(
+            global::TracyLive.Handle<global::pill_master_renderer_data.Mesh> mesh,
+            global::TracyLive.Handle<global::pill_master_renderer_data.Material> material) => new()
         {
             Mesh = mesh,
             Material = material,

@@ -449,7 +449,7 @@ def verify_startup(
     # types (`Vector3f` declares its fields, so it lands as X/Y/Z at fixed
     # offsets rather than as an opaque blob).
     # Mirrored `#[pill_mirror_method]` Rust methods appear as typed C# instance
-    # methods that resolve the module's trampoline through MirrorMethods.
+    # methods that call the module's trampoline through MirrorCall.
     if not verify_generated_mirror(
         SPLINE_GENERATED_FILE,
         [
@@ -465,8 +465,8 @@ def verify_startup(
             "[FieldOffset(4)] public float Y;",
             "[FieldOffset(8)] public float Z;",
             "public ulong GetSum()",
-            "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);",
-            "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")",
+            "var __call = global::TracyLive.MirrorCall.Begin(\"pill_spline::OmoMO\", \"get_sum\");",
+            "__call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));",
             "public ulong GetA()",
             "MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1))",
         ],
@@ -489,7 +489,7 @@ def verify_startup(
             "public ulong Aaa()",
             "public static class PillDummyColor",
             "public static float GetColorA()",
-            "global::TracyLive.MirrorMethods.Resolve<PillDummyColorGetColorADelegate>(\"pill_dummy_color\", \"get_color_a\")",
+            "var __call = global::TracyLive.MirrorCall.Begin(\"pill_dummy_color\", \"get_color_a\");",
         ],
         should_exist=True,
         description="pill_dummy_color mirror",
@@ -1236,7 +1236,7 @@ def verify_codegen_rebuild() -> bool:
                 "[FieldOffset(196)] public float Elo;",
                 "[StructLayout(LayoutKind.Explicit, Size = 16)]\npublic partial struct OmoMO",
                 "public ulong GetSum()",
-                "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);",
+                "var __call = global::TracyLive.MirrorCall.Begin(\"pill_spline::OmoMO\", \"get_sum\");",
             ],
             should_exist=True,
             description="regenerated pill_spline mirror",

@@ -332,6 +332,30 @@ impl World {
         Some((bytes, ticks))
     }
 
+    /// The address of a Rust value stored under `id`, for a mirrored call that
+    /// takes the resource as `&T` or `&mut T`.
+    ///
+    /// The counterpart of [`Self::foreign_resource_bytes_mut`] for native
+    /// values: the caller does not get bytes to interpret, it gets the address
+    /// a generated trampoline casts back to the type it was compiled against.
+    /// A `write` borrow stamps the `changed` tick as it is handed out, for the
+    /// same reason the foreign view does.
+    ///
+    /// `None` when nothing is stored under `id`, or when the stored value is a
+    /// foreign payload - there is no Rust type there to cast to.
+    pub fn native_resource_pointer(&mut self, id: ResourceId, write: bool) -> Option<*mut u8> {
+        if self.resources.get(&id)?.is_foreign() {
+            return None;
+        }
+        if write {
+            let changed = Tick::new(self.change_tick);
+            if let Some(ticks) = self.resource_ticks.get_mut(&id) {
+                ticks.set_changed(changed);
+            }
+        }
+        Some(self.resources.get_mut(&id)?.bytes_mut().as_mut_ptr())
+    }
+
     /// The declared layout of a foreign resource: size, alignment, schema hash.
     ///
     /// What a host compares against the next generation's manifest before it

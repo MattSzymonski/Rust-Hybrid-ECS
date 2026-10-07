@@ -726,17 +726,20 @@ impl NativeLibrary {
         descriptors
     }
 
-    /// Fetch the artifact's `#[pill_mirror_method]` descriptors, each with the
-    /// exported address of its `#[no_mangle]` trampoline.
+    /// Fetch the artifact's mirror descriptors - its mirrored functions and
+    /// the rows describing its mirrored types - each with the address of its
+    /// trampoline.
     ///
-    /// Empty when the artifact predates the exports or declares no mirrored
-    /// methods. A descriptor whose trampoline symbol cannot be resolved is
-    /// skipped rather than surfaced, so a stale descriptor can never hand C#
-    /// a null callable.
+    /// The address comes from the descriptor itself, which the artifact
+    /// filled in with the trampoline it compiled, so nothing is resolved by
+    /// symbol. Empty when the artifact predates the exports or declares
+    /// nothing mirrored. A function row with no address is skipped, so a
+    /// broken descriptor can never hand C# a null callable; a type row with
+    /// none (an enum's, a resource's) is kept for the codegen.
     pub(crate) fn mirror_methods(&self) -> Vec<ResolvedMirrorMethod> {
-        let Some(library) = self.library.as_ref() else {
+        if self.library.is_none() {
             return Vec::new();
-        };
+        }
         let (Some(count), Some(copy)) = (self.mirror_method_count, self.copy_mirror_methods) else {
             return Vec::new();
         };
@@ -756,6 +759,9 @@ impl NativeLibrary {
                 return_tag: "",
                 arg_tags: &[],
                 arg_names: &[],
+                receiver: "",
+                owner_kind: "",
+                address: pill_engine::component_registry::ExportAddress(std::ptr::null()),
             };
             total
         ];
@@ -767,12 +773,12 @@ impl NativeLibrary {
 
         let mut resolved: Vec<ResolvedMirrorMethod> = Vec::new();
         for descriptor in descriptors {
-            // SAFETY: `library.get` maps the exported trampoline symbol; the
-            // module stays mapped for this `NativeLibrary`'s lifetime.
-            let address = match unsafe { library.get::<usize>(descriptor.symbol.as_bytes()) } {
-                Ok(symbol) => *symbol,
-                Err(_) => continue,
-            };
+            // The trampoline lives in this library, which stays mapped for the
+            // `NativeLibrary`'s lifetime.
+            let address = descriptor.address.0 as usize;
+            if address == 0 && descriptor.name != pill_engine::component_registry::MIRROR_TYPE_ROW {
+                continue;
+            }
             resolved.push(ResolvedMirrorMethod {
                 type_name: descriptor.type_name.to_string(),
                 method_name: descriptor.name.to_string(),
@@ -790,6 +796,8 @@ impl NativeLibrary {
                 address,
                 is_free_function: descriptor.is_free_function,
                 crate_name: descriptor.crate_name.to_string(),
+                receiver: descriptor.receiver.to_string(),
+                owner_kind: descriptor.owner_kind.to_string(),
             });
         }
         resolved
@@ -1128,6 +1136,7 @@ impl NativeLibrary {
     ///
     /// `T` must be the export's exact function-pointer type. The pointer is
     /// valid only while this library stays mapped.
+    #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
     pub(crate) unsafe fn resolve_export<T: Copy>(&self, name: &[u8]) -> Option<T> {
         let library = self.library.as_ref()?;
         // SAFETY: the caller states `T` is the export's type; the returned

@@ -391,11 +391,12 @@ mod slot {
         }
 
         /// The address of the current generation's export named `name`, if it
-        /// has one; how the C# bridge finds the functions a module offers by
-        /// name (the renderer data crate's asset functions).
+        /// has one; how the windowed host finds the renderer data crate's
+        /// shader reload function.
         ///
-        /// Valid while this generation stays current: callers republish after
-        /// every reload rather than keep an address across one.
+        /// Valid while this generation stays current: callers look it up again
+        /// after every reload rather than keep an address across one.
+        #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
         pub(crate) fn export_address(
             &self,
             name: &str,

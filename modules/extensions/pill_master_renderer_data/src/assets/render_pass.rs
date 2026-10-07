@@ -27,7 +27,10 @@
 
 use std::collections::BTreeMap;
 
-use pill_engine::{Asset, AssetLoadResult, AssetManager, AssetReference, Handle, StandaloneAsset};
+use pill_engine::{
+    pill_mirror_object, Asset, AssetLoadResult, AssetManager, AssetReference, Handle,
+    StandaloneAsset,
+};
 use serde::{Deserialize, Serialize};
 
 // The pass vocabulary is part of the frame contract, so it lives there.
@@ -42,6 +45,7 @@ use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget
 /// that built it is reloaded and its retired image eventually unmapped - and
 /// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
+#[pill_mirror_object(asset, standalone)]
 pub struct RenderPass {
     /// Label used in logs, profiling and error messages.
     pub name: String,

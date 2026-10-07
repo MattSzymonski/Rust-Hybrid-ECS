@@ -176,6 +176,10 @@ internal static unsafe class ResourceAccess
     /// </remarks>
     internal static ref T Borrow<T>(QueryAccess access) where T : unmanaged
     {
+        if (ResourceTypeMetadata<T>.IsNative)
+            throw new InvalidOperationException(
+                $"{typeof(T).Name} is a Rust resource ({ResourceTypeMetadata<T>.Name}); its value stays " +
+                "in Rust. Call its generated methods on the Res/ResMut parameter instead of .Value.");
         StableComponentId id = ResourceTypeMetadata<T>.StableId;
         NativeResourceView view;
         byte status = Engine.GetResourceView(id, (byte)access, &view);
@@ -237,6 +241,9 @@ internal static class ResourceTypeMetadata<T> where T : unmanaged
 
     /// <summary>Native size of the resource's layout, in bytes.</summary>
     internal static readonly int Size = TracyLive.Loader.NativeLayout.SizeOf(typeof(T));
+
+    /// <summary>Whether the type is a marker for a Rust-owned resource.</summary>
+    internal static readonly bool IsNative = ResourceNames.IsNative(typeof(T));
 }
 
 /// <summary>Resolves one resource type to its declared identity.</summary>
@@ -247,10 +254,27 @@ internal static class ResourceTypeMetadata<T> where T : unmanaged
 internal static class ResourceNames
 {
     /// <summary>The declared name of a resource type, or its full type name.</summary>
+    /// <remarks>
+    /// A marker for a Rust-owned resource (<see cref="NativeResourceAttribute"/>)
+    /// is named by the Rust type's shared name, which is what the engine keys
+    /// the resource by.
+    /// </remarks>
     internal static string Of(Type type)
     {
+        var native = (NativeResourceAttribute?)Attribute.GetCustomAttribute(
+            type, typeof(NativeResourceAttribute), inherit: false);
+        if (native is not null)
+            return native.SharedName;
         var declaration = (EcsResourceAttribute?)Attribute.GetCustomAttribute(
             type, typeof(EcsResourceAttribute), inherit: false);
         return declaration?.Name ?? type.FullName ?? type.Name;
     }
+
+    /// <summary>Whether a type is a marker for a Rust-owned resource.</summary>
+    internal static bool IsNative(Type type) =>
+        type.IsDefined(typeof(NativeResourceAttribute), inherit: false);
+
+    /// <summary>The access-list kind a resource parameter of this type declares.</summary>
+    internal static byte KindOf(Type type) =>
+        IsNative(type) ? Loader.ManagedAccess.NativeResourceKind : Loader.ManagedAccess.ResourceKind;
 }

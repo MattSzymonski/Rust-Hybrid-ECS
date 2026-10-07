@@ -35,7 +35,10 @@ use std::f32::consts::PI;
 
 // External crates
 use glam::Vec3;
-use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader, ImportedAsset};
+use pill_engine::{
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
+    AssetLoadResult, AssetLoader, ImportedAsset, PillMirror,
+};
 use serde::{Deserialize, Serialize};
 
 /// How a texture's texels are meant to be read.
@@ -48,7 +51,8 @@ use serde::{Deserialize, Serialize};
 /// Serialized by variant name (`"Color"`, `"Normal"`, `"Equirect"`,
 /// `"Cubemap"`) in a texture's metadata file, so renaming a variant changes the
 /// on-disk format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PillMirror)]
+#[repr(u8)]
 pub enum TextureType {
     /// A colour image: albedo, UI, or any texture sampled for its values.
     /// Uploaded as sRGB, so the hardware converts it to linear light before a
@@ -114,6 +118,7 @@ impl TextureType {
 /// texture, view and sampler, and re-uploads them when the asset's version
 /// moves, so a game edits the texture it holds instead of GPU state.
 #[derive(Clone, Debug)]
+#[pill_mirror_object(asset, import)]
 pub struct Texture {
     /// Label used in logs, profiling and error messages.
     pub name: String,
@@ -131,6 +136,7 @@ pub struct Texture {
     pub texture_type: TextureType,
 }
 
+#[pill_mirror_impl]
 impl Texture {
     /// Builds a texture by decoding an image file.
     ///
@@ -146,6 +152,7 @@ impl Texture {
     /// unreadable, [`AssetLoadError::Decode`] when the bytes are not a
     /// decodable image, and a decode error when the image's dimensions do not
     /// match its texels.
+    #[pill_mirror_method]
     pub fn new(
         name: impl Into<String>,
         texture_type: TextureType,
@@ -205,6 +212,7 @@ impl Texture {
     /// square. The GPU upload checks the length later, but it can only report a
     /// mismatch as an upload failure; catching it here names the texture while
     /// its own numbers are still at hand.
+    #[pill_mirror_method]
     pub fn from_rgba(
         name: impl Into<String>,
         texture_type: TextureType,
@@ -250,6 +258,7 @@ impl Texture {
     ///
     /// Returns [`AssetLoadError::Decode`] when `texture_type` is not an
     /// environment, or when `rgba` does not hold `width * height` texels.
+    #[pill_mirror_method]
     pub fn from_rgba_f32(
         name: impl Into<String>,
         texture_type: TextureType,
