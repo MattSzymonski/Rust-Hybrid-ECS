@@ -716,7 +716,12 @@ public static unsafe class Engine
     {
         const ulong prime = 0x100000001b3;
         ulong hash = offset;
-        foreach (byte value in Encoding.UTF8.GetBytes(name))
+        // Hashed through a stack buffer: a key is derived wherever a type or a
+        // resource name is resolved, and a type name always fits.
+        int length = Encoding.UTF8.GetByteCount(name);
+        Span<byte> bytes = length <= 512 ? stackalloc byte[length] : new byte[length];
+        Encoding.UTF8.GetBytes(name, bytes);
+        foreach (byte value in bytes)
         {
             hash ^= value;
             hash = unchecked(hash * prime);
@@ -1283,6 +1288,14 @@ internal struct QueryColumn
     internal uint ChangeTick;
 }
 
+/// <summary>The joined columns of one query enumeration, stored inline.</summary>
+/// <remarks>Eight slots: the widest query shape.</remarks>
+[InlineArray(8)]
+internal struct QueryColumns
+{
+    private QueryColumn _first;
+}
+
 /// <summary>Optional writable reference valid only for the current row.</summary>
 public readonly unsafe ref struct OptionalWriteRef<T> where T : unmanaged
 {
@@ -1445,9 +1458,12 @@ public readonly unsafe ref struct QueryRow
 public ref struct QueryEnumerator
 {
     private readonly QueryTermDescriptor[] _terms;
-    // The joined columns live in one array so a typed row can address every
-    // slot through a single reference to element zero.
-    private readonly QueryColumn[] _columns;
+    // The joined columns live in one contiguous buffer so a typed row can
+    // address every slot through a single reference to element zero. The
+    // buffer is inline in the enumerator, not a heap array: a query is
+    // enumerated every frame, and an array here cost every system one
+    // 536-byte allocation per query per frame.
+    private QueryColumns _columns;
     private readonly int _driver;
     private uint _nextDriverChunk;
     private int _row;
@@ -1456,7 +1472,7 @@ public ref struct QueryEnumerator
     internal QueryEnumerator(QueryDescriptor descriptor)
     {
         _terms = descriptor.TermArray;
-        _columns = new QueryColumn[8];
+        _columns = default;
         _driver = FindDriver(_terms);
         _nextDriverChunk = 0;
         _row = -1;
@@ -1578,7 +1594,8 @@ public ref struct QueryEnumerator
 
     /// <summary>Reference to one joined column, for the typed row wrappers.</summary>
     /// <remarks>
-    /// Ref-returning an array element needs the explicit [UnscopedRef] opt-in.
+    /// Ref-returning an element of this enumerator's own column buffer needs
+    /// the explicit [UnscopedRef] opt-in.
     /// The contract is narrow: only the typed enumerator calls this, and the
     /// row it feeds never outlives the enumerator that owns the columns.
     /// </remarks>
