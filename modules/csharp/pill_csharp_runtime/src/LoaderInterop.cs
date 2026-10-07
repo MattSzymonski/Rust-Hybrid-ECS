@@ -90,6 +90,28 @@ internal sealed class EcsFrameContext : SynchronizationContext
 }
 
 /// <summary>Stable native entry points used by the Rust scheduler bridge.</summary>
+/// <summary>
+/// Marks a <see cref="LoaderInterop"/> method a NativeAOT shipping build must
+/// export under <see cref="EntryPoint"/>.
+/// </summary>
+/// <remarks>
+/// NativeAOT exports <c>[UnmanagedCallersOnly]</c> methods only from the root
+/// assembly of a library publish - the game project - so the loader's own
+/// attributes are compiled out under <c>PILL_AOT</c> and the AOT registry
+/// generator emits a forwarder into the project for every method marked with
+/// this, in memory, at build time. The development-only reload exports carry
+/// no mark: a shipping build never reloads.
+/// </remarks>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class ShippedExportAttribute : Attribute
+{
+    /// <summary>Mark one method for export under <paramref name="entryPoint"/>.</summary>
+    public ShippedExportAttribute(string entryPoint) => EntryPoint = entryPoint;
+
+    /// <summary>The symbol the Rust host resolves.</summary>
+    public string EntryPoint { get; }
+}
+
 public static unsafe class LoaderInterop
 {
     /// <summary>
@@ -123,6 +145,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_interop_version")]
 #endif
+    [ShippedExport("pill_interop_version")]
     public static uint InteropVersion() => InteropContractVersion;
 
     /// <summary>Tell the loader a new project assembly is already on disk.</summary>
@@ -156,6 +179,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_init")]
 #endif
+    [ShippedExport("pill_init")]
     public static byte Init(IntPtr api)
     {
         try
@@ -248,18 +272,21 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_system_count")]
 #endif
+    [ShippedExport("pill_system_count")]
     public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
 
     /// <summary>Return the number of one-shot startup methods.</summary>
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_startup_count")]
 #endif
+    [ShippedExport("pill_startup_count")]
     public static uint StartupCount() => (uint)(_host?.StartupCount ?? 0);
 
     /// <summary>Return whether a system declared the Commands parameter.</summary>
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_system_uses_commands")]
 #endif
+    [ShippedExport("pill_system_uses_commands")]
     public static byte SystemUsesCommands(uint systemIndex)
     {
         try
@@ -277,6 +304,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_run_startup")]
 #endif
+    [ShippedExport("pill_run_startup")]
     public static byte RunStartup(uint startupIndex)
     {
         try
@@ -297,6 +325,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_component_manifest_length")]
 #endif
+    [ShippedExport("pill_component_manifest_length")]
     public static uint ComponentManifestLength() =>
         checked((uint)(_host?.ComponentManifest.Length ?? 0));
 
@@ -304,6 +333,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_copy_component_manifest")]
 #endif
+    [ShippedExport("pill_copy_component_manifest")]
     public static byte CopyComponentManifest(byte* output, uint capacity)
     {
         try
@@ -324,6 +354,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_system_access_count")]
 #endif
+    [ShippedExport("pill_system_access_count")]
     public static uint SystemAccessCount(uint systemIndex)
     {
         try
@@ -342,6 +373,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_get_system_access")]
 #endif
+    [ShippedExport("pill_get_system_access")]
     public static byte GetSystemAccess(uint systemIndex, uint accessIndex, NativeSystemAccess* output)
     {
         try
@@ -366,6 +398,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_system_name_length")]
 #endif
+    [ShippedExport("pill_system_name_length")]
     public static uint SystemNameLength(uint systemIndex)
     {
         try
@@ -384,6 +417,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_copy_system_name")]
 #endif
+    [ShippedExport("pill_copy_system_name")]
     public static byte CopySystemName(uint systemIndex, byte* output, uint capacity)
     {
         try
@@ -410,6 +444,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_run_system")]
 #endif
+    [ShippedExport("pill_run_system")]
     public static byte RunSystem(uint systemIndex)
     {
         int index = checked((int)systemIndex);
@@ -466,6 +501,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_system_error_message_length")]
 #endif
+    [ShippedExport("pill_system_error_message_length")]
     public static uint SystemErrorMessageLength(uint systemIndex)
     {
         try
@@ -485,6 +521,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_copy_system_error_message")]
 #endif
+    [ShippedExport("pill_copy_system_error_message")]
     public static byte CopySystemErrorMessage(uint systemIndex, byte* output, uint capacity)
     {
         try
@@ -586,6 +623,7 @@ public static unsafe class LoaderInterop
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_poll_reload")]
 #endif
+    [ShippedExport("pill_poll_reload")]
     public static byte PollReload()
     {
         try
