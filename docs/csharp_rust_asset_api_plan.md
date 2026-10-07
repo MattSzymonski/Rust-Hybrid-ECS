@@ -83,6 +83,52 @@ How the open questions were settled:
   whichever binary last published it; asset store operations go through the
   shared column either way.
 
+## Remaining issues
+
+### Gaps in the implementation
+
+- **Suites not run yet.** `test_hot_reload_suite`, `test_hot_reload_assets`,
+  `test_renderer_assets`, `test_shipping_smoke`, `test_web_smoke` and the WASM
+  build all touch changed code - in particular asset rehoming and the new
+  shared name on `AssetManager`.
+- **Audio not run end to end.** `Sound` is mirrored and compiles, but no
+  project has imported a sound through the generated path.
+- **Coarse stale-object check.** Any extension reload or C# assembly swap marks
+  every live `RustObject` as stale, not only objects of the module that
+  reloaded. This is safe (stale objects are leaked, never dropped by unloaded
+  code) but stricter than necessary.
+- **Finalizer drop only tested with a mock.** No test lets the garbage
+  collector drop a real Rust object on the finalizer thread.
+- **`.Value` on `Res<AssetManager>` fails only at runtime.** It throws a clear
+  error; an analyzer rule could catch it at compile time.
+- **Uncovered value shapes.** Tuples of enums are not supported, and optional
+  value-type results are generated but not exercised by any test.
+- **Leftover API.** `MirrorMethods.Resolve<TDelegate>` is no longer used by
+  generated code; it remains only for existing runtime tests and could be
+  removed or made internal.
+
+### Pre-existing problems
+
+- **`pill_spline` tests.** `get_location_at` computes
+  `local_t = ... + 4.0` (commit `8be6515f`), which fails 5 of the crate's
+  math tests.
+- **Heap-field accessors in shipping builds.** `Vec`/`String` field accessors
+  are still resolved by symbol in the development host only; mirrored
+  functions now work in shipping builds, these accessors do not.
+- **Locale-dependent bridge suite.** `test_csharp_bridge.py` expects `7.5` and
+  fails where the system locale prints `7,5`; run it with
+  `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1` on such machines.
+- **Coding-standards violations.** 16 remain, all in example files untouched
+  by this work.
+- **AOT generator warnings.** The generated AOT registry produces CS8669
+  nullable-annotation warnings.
+
+### Environment requirements
+
+- **NativeAOT publish** needs `vswhere.exe` on `PATH` (it lives in
+  `C:\Program Files (x86)\Microsoft Visual Studio\Installer`).
+- **`test_renderer_boundaries.py`** needs Python 3.11 or later (`tomllib`).
+
 ## Current state
 
 **The renderer's C# asset API is spread across four layers:**
