@@ -1131,12 +1131,20 @@ impl ProjectModuleConfig {
         let runtime_output_subdirectory = format!(
             "{CSHARP_RUNTIME_PROJECT_SUBDIRECTORY}/bin/{configuration}/{CSHARP_TARGET_FRAMEWORK}"
         );
+        // `PillEngineRoot` tells the project where the engine's shared C# build
+        // (`csharp/Pill.CSharp.props`) is, so a project's location below the
+        // repository is not baked into its `.csproj`.
+        let engine_root = engine_workspace_root()?;
         let build_command = vec![
             "dotnet".to_string(),
             "build".to_string(),
             format!("{project_path}/{project_assembly_name}.csproj"),
             "-c".to_string(),
             configuration.to_string(),
+            format!(
+                "-p:PillEngineRoot={}/",
+                engine_root.display().to_string().replace('\\', "/")
+            ),
             "--nologo".to_string(),
         ];
 
