@@ -20,8 +20,9 @@
 
          The NativeAOT shipping posture needs the keyword: the assembly is
          compiled into a static image that is never hot-reloaded, and the
-         `AotExports.cs` export forwarders it carries need raw pointers to
-         re-export the loader ABI from the AOT root. `unsafe` is therefore
+         loader export forwarders the AOT generator emits into it (in memory -
+         no file in this project) need raw pointers to re-export the loader ABI
+         from the AOT root. `unsafe` is therefore
          enabled only when that posture is active (EnablePillAot=true); the
          reloadable JIT build keeps it off. -->
 
