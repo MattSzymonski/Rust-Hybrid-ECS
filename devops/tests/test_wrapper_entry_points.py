@@ -73,10 +73,10 @@ EXPECTED_ENTRY_POINTS = frozenset({
     "pill_copy_value_type_descriptors",
     "pill_mirror_method_descriptor_count",
     "pill_copy_mirror_method_descriptors",
-    # The fixture's `#[pill_mirror_fn]` free function and the `#[pill_mirror_impl]`
-    # method trampoline: both are resolved by symbol and handed to the C# runtime.
-    "pill_mirror_fn_get_color_a",
-    "pill_mirror_TestStruct_aaa",
+    # No mirror trampoline is exported: each descriptor carries its
+    # trampoline's address, so the host reads it from the descriptor rather
+    # than resolving a symbol, and two crates mirroring same-named types
+    # cannot collide in a statically linked build.
     "pill_field_accessor_descriptor_count",
     "pill_copy_field_accessor_descriptors",
 })

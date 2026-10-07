@@ -21,16 +21,13 @@ public partial struct TestStruct
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 
-    /// Calls the Rust method `pill_dummy_color::TestStruct::aaa` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong TestStructAaaDelegate(global::TracyLive.RowPointer self);
-
+    /// <summary>Calls the Rust function <c>pill_dummy_color::TestStruct::aaa</c>.</summary>
     public ulong Aaa()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<TestStructAaaDelegate>("pill_dummy_color::TestStruct", "aaa");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
+        var __call = global::TracyLive.MirrorCall.Begin("pill_dummy_color::TestStruct", "aaa");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Invoke();
+        return __call.Result<ulong>();
     }
 }
 
@@ -57,19 +54,15 @@ public partial struct Tint
 namespace pill_dummy_color {
 
 /// Static mirror of the free functions the Rust module `pill_dummy_color` declares;
-/// each member calls its exported trampoline through `MirrorMethods`.
+/// each member calls its trampoline through `TracyLive.MirrorCall`.
 public static class PillDummyColor
 {
-
-    /// Calls the Rust function `pill_dummy_color::get_color_a` through its
-    /// generated C-ABI trampoline.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate float PillDummyColorGetColorADelegate();
-
+    /// <summary>Calls the Rust function <c>pill_dummy_color::get_color_a</c>.</summary>
     public static float GetColorA()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<PillDummyColorGetColorADelegate>("pill_dummy_color", "get_color_a");
-        return mirror();
+        var __call = global::TracyLive.MirrorCall.Begin("pill_dummy_color", "get_color_a");
+        __call.Invoke();
+        return __call.Result<float>();
     }
 }
 

@@ -31,6 +31,7 @@ use std::path::Path;
 // External crates
 use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDescriptor};
 
+use super::mirror_codegen;
 use pill_csharp_bridge::{
     is_opaque_container_tag, snake_to_pascal, split_array_tag, ModuleExposedComponent,
     ResolvedFieldAccessor, ResolvedMirrorMethod,
@@ -131,7 +132,10 @@ pub(crate) fn generate_components_csharp(
     // exposed cannot linger in the C# project (it would otherwise compile in a
     // struct or class whose binding no longer exists).
     let has_free_functions = methods.iter().any(|method| method.is_free_function);
-    if exposed.is_empty() && value_types.is_empty() && !has_free_functions {
+    let has_declared_types = methods
+        .iter()
+        .any(|method| method.method_name == pill_engine::component_registry::MIRROR_TYPE_ROW);
+    if exposed.is_empty() && value_types.is_empty() && !has_free_functions && !has_declared_types {
         if output_path.exists() {
             std::fs::remove_file(&output_path).map_err(|error| {
                 format!("cannot remove stale {}: {error}", output_path.display())
@@ -160,16 +164,18 @@ pub(crate) fn generate_components_csharp(
          using System.Runtime.InteropServices;\n\n",
     );
 
+    // The namespace every value type is emitted in, decided before anything is
+    // emitted so a generated signature can name a value type by its full name
+    // from any namespace (an object class taking a `MeshVertex` span, say).
+    let value_namespaces = value_type_namespaces(module_name, exposed, value_types);
+    let scope = mirror_codegen::MirrorScope::new(methods, value_types, &|type_name| {
+        value_namespaces.get(type_name).cloned()
+    })?;
+
     // Nested `#[derive(PillMirror)]` struct definitions, deduplicated by Rust
     // qualified path and pushed in dependency order, so concatenating them in
     // order always compiles. Emitted once per file, before the components.
     let mut nested_definitions: Vec<EmittedStruct> = Vec::new();
-    // The namespace each nested definition is emitted in, index for index: the
-    // namespace of the first component that referenced it. A file can span
-    // namespaces (the renderer data mirrors `pill_engine` and renderer types
-    // together), so "the first component's namespace" would strand a type
-    // away from the only component that uses it.
-    let mut nested_namespaces: Vec<String> = Vec::new();
     let mut component_blocks: Vec<(String, String)> = Vec::new();
 
     for component in exposed {
@@ -199,9 +205,9 @@ pub(crate) fn generate_components_csharp(
                 &rust_type_name,
                 accessors,
                 &rust_type_name,
+                &scope,
             )?
         };
-        nested_namespaces.resize(nested_definitions.len(), namespace.to_string());
         component_blocks.push((namespace.to_string(), body));
     }
 
@@ -237,6 +243,7 @@ pub(crate) fn generate_components_csharp(
             value_type.type_name,
             &[],
             "",
+            &scope,
         )?;
         nested_definitions.push(EmittedStruct {
             qualified: value_type.type_name.to_string(),
@@ -244,24 +251,20 @@ pub(crate) fn generate_components_csharp(
         });
     }
 
-    // Nested value types live in the namespace of the component that first
-    // referenced them, so C# refers to `pill_spline.Vector3f` etc. A value type
-    // no component references goes to the first component's namespace - or,
-    // when the module exposes no components at all, to the namespace of its own
-    // declaring crate, so `#[derive(PillMirror)]` alone exposes the type where
-    // a C# project would `using` it.
-    let default_namespace = component_blocks
-        .first()
-        .map(|(namespace, _)| namespace.clone())
-        .unwrap_or_else(|| format!("pill_{module_name}"));
-    if component_blocks.is_empty() {
-        for definition in nested_definitions.iter().skip(nested_namespaces.len()) {
-            let namespace =
-                path_namespace(&definition.qualified).unwrap_or_else(|| default_namespace.clone());
-            nested_namespaces.push(namespace);
-        }
-    }
-    nested_namespaces.resize(nested_definitions.len(), default_namespace);
+    // Each nested definition goes to the namespace the pre-pass chose for it;
+    // an opaque stand-in (a type no descriptor declares) goes beside the
+    // components, as before.
+    let default_namespace = default_value_namespace(module_name, exposed);
+    let nested_namespaces: Vec<String> = nested_definitions
+        .iter()
+        .map(|definition| {
+            value_namespaces
+                .get(&definition.qualified)
+                .cloned()
+                .or_else(|| opaque_namespaces(exposed, &definition.qualified))
+                .unwrap_or_else(|| default_namespace.clone())
+        })
+        .collect();
     for (nested, namespace) in nested_definitions.iter().zip(&nested_namespaces) {
         content.push_str(&format!(
             "namespace {namespace} {{\n\n{}\n\n}}\n\n",
@@ -289,6 +292,14 @@ pub(crate) fn generate_components_csharp(
         ));
     }
 
+    // The object classes, enums and resource markers the module's type rows
+    // declare, each in its crate's root namespace.
+    for declared in &scope.declared {
+        content.push_str(&mirror_codegen::emit_declared_type(
+            declared, methods, &scope,
+        )?);
+    }
+
     // `#[pill_mirror_fn]` free functions become one static class per declaring
     // module, after the struct mirrors. The methods are sorted by module path
     // then name upstream, so grouping is a single scan.
@@ -306,9 +317,10 @@ pub(crate) fn generate_components_csharp(
             {
                 group_end += 1;
             }
-            content.push_str(&emit_free_function_class(
+            content.push_str(&mirror_codegen::emit_free_function_class(
                 module_path,
                 &free_functions[group_start..group_end],
+                &scope,
             )?);
             group_start = group_end;
         }
@@ -392,6 +404,7 @@ fn emit_typed_struct(
     qualified: &str,
     accessors: &[ResolvedFieldAccessor],
     owner_type_name: &str,
+    scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
     if align > 8 {
         return Err(format!(
@@ -478,9 +491,24 @@ fn emit_typed_struct(
             ));
         }
         emitted_alignment = emitted_alignment.max(element_align);
+        let typed_handle = base_tag
+            .strip_prefix("struct:Handle<")
+            .and_then(|asset| asset.strip_suffix('>'))
+            .filter(|_| element_size == 8)
+            .and_then(|asset| scope.typed_handle(asset));
         let cs_type = if let Some((cs, _, _)) = cs_primitive(base_tag) {
             cs.to_string()
+        } else if let Some(typed_handle) = typed_handle {
+            // An asset handle whose asset this module mirrors is typed by it,
+            // so a C# field holds a `Handle<Mesh>` a mirrored call returned.
+            typed_handle
         } else if let Some(qualified) = base_tag.strip_prefix("struct:") {
+            // A handle to an asset nobody mirrors stays the opaque `Handle`.
+            let qualified = if qualified.starts_with("Handle<") {
+                "Handle"
+            } else {
+                qualified
+            };
             emit_nested_struct(
                 qualified,
                 element_size,
@@ -488,6 +516,7 @@ fn emit_typed_struct(
                 value_types,
                 emitted,
                 methods,
+                scope,
             )?
         } else {
             return Err(format!(
@@ -581,7 +610,7 @@ fn emit_typed_struct(
     // Mirrored methods (from `#[pill_mirror_impl]`) become typed C# instance
     // methods that call the Rust implementation through its C-ABI trampoline.
     if !qualified.is_empty() {
-        body.push_str(&emit_value_type_methods(name, qualified, methods)?);
+        body.push_str(&emit_value_type_methods(qualified, methods, scope)?);
     }
     // Heap-field accessors (components only): a value type never carries a
     // container field, so an empty owner type means nothing to emit.
@@ -594,6 +623,7 @@ fn emit_typed_struct(
             emitted,
             methods,
             accessors,
+            scope,
         )?);
     }
     body.push_str("}\n");
@@ -614,6 +644,7 @@ fn emit_nested_struct(
     value_types: &[PillValueTypeDescriptor],
     emitted: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
+    scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
     let cs_name = last_path_segment(qualified);
     if let Some(existing) = emitted.iter().find(|entry| entry.qualified == qualified) {
@@ -651,6 +682,7 @@ fn emit_nested_struct(
                 descriptor.type_name,
                 &[],
                 "",
+                scope,
             )?
         }
         None => emit_opaque_struct(&cs_name, size, align)?,
@@ -773,7 +805,7 @@ const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
 ///
 /// Prefers the Rust parameter name captured by the macro; falls back to a
 /// positional `argN` when the name is blank or is a C# reserved keyword.
-fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
+pub(super) fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
     if !rust_name.is_empty() && !CSHARP_RESERVED_KEYWORDS.contains(&rust_name) {
         rust_name.to_string()
     } else {
@@ -781,226 +813,134 @@ fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
     }
 }
 
-/// Emit the typed C# instance methods that mirror a value type's
-/// `#[pill_mirror_method]` Rust methods.
+/// Emit the C# members that mirror a value type's (or a component row's)
+/// `#[pill_mirror_impl]` functions.
 ///
-/// Each mirrored method becomes a `[UnmanagedFunctionPointer(Cdecl)]` delegate
-/// (nested inside the struct) and an instance method that resolves the
-/// module's exported trampoline through [`TracyLive.MirrorMethods`] and hands
-/// it the receiver's live address via `MirrorMethods.AddressOf`, so a call
-/// neither boxes nor pins the struct. The generated body still compiles
-/// without `AllowUnsafeBlocks`: the runtime helper owns the pointer work. The
-/// mirror contract stays `&self` (read-only), matching the trampoline's
-/// `*const` receiver pointer.
+/// `&self`/`&mut self` methods become instance members that hand the
+/// trampoline the receiver's live address - a component row's column slot, or
+/// the local the call was made on - so a `&mut self` method writes through to
+/// it; functions with no receiver become static members. Every member calls
+/// its trampoline through `TracyLive.MirrorCall`, which owns the pointer work,
+/// so the generated body compiles without `AllowUnsafeBlocks`.
 ///
-/// Returns an empty string when the value type has no mirrored methods.
+/// Returns an empty string when the value type has no mirrored functions.
 fn emit_value_type_methods(
-    cs_name: &str,
     qualified: &str,
     methods: &[ResolvedMirrorMethod],
+    scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
-    let matching: Vec<&ResolvedMirrorMethod> = methods
-        .iter()
-        .filter(|method| method.type_name == qualified)
-        .collect();
-    if matching.is_empty() {
-        return Ok(String::new());
-    }
-
     let mut output = String::new();
-    for method in matching {
-        let pascal = snake_to_pascal(&method.method_name);
-        let return_type = if method.return_tag.is_empty() {
-            "void".to_string()
-        } else {
-            cs_primitive(&method.return_tag)
-                .map(|(cs, _, _)| cs.to_string())
-                .ok_or_else(|| {
-                    format!(
-                        "mirrored method `{}.{}` has unsupported return tag `{}`",
-                        qualified, method.method_name, method.return_tag
-                    )
-                })?
-        };
-        let mut arg_types: Vec<String> = Vec::new();
-        let mut arg_names: Vec<String> = Vec::new();
-        for (index, tag) in method.arg_tags.iter().enumerate() {
-            let cs_type = cs_primitive(tag)
-                .map(|(cs, _, _)| cs.to_string())
-                .ok_or_else(|| {
-                    format!(
-                        "mirrored method `{}.{}` has unsupported argument tag `{}`",
-                        qualified, method.method_name, tag
-                    )
-                })?;
-            arg_types.push(cs_type);
-            // The Rust parameter name is preserved so the mirror reads like the
-            // original; a missing/blank name or a C# keyword (a Rust argument
-            // may legally be named `event`) falls back to a positional `argN`.
-            let rust_name = method.arg_names.get(index).map_or("", String::as_str);
-            arg_names.push(csharp_parameter_name(index, rust_name));
-        }
-
-        let delegate_name = format!("{cs_name}{pascal}Delegate");
-        let typed_arguments: Vec<String> = arg_types
-            .iter()
-            .zip(arg_names.iter())
-            .map(|(cs_type, arg_name)| format!("{cs_type} {arg_name}"))
-            .collect();
-        let delegate_args = if typed_arguments.is_empty() {
-            "global::TracyLive.RowPointer self".to_string()
-        } else {
-            format!(
-                "global::TracyLive.RowPointer self, {}",
-                typed_arguments.join(", ")
-            )
-        };
-        // The receiver crosses as its live address: `AddressOf` turns the
-        // `ref` into a pointer inside the runtime, so the call needs neither
-        // `unsafe` nor a boxed copy of the struct.
-        let receiver = "global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))";
-        let call_args = if arg_names.is_empty() {
-            receiver.to_string()
-        } else {
-            format!("{receiver}, {}", arg_names.join(", "))
-        };
-        let method_signature = if typed_arguments.is_empty() {
-            format!("public {return_type} {pascal}()")
-        } else {
-            format!(
-                "public {return_type} {pascal}({})",
-                typed_arguments.join(", ")
-            )
-        };
-        let invocation = if method.return_tag.is_empty() {
-            format!("mirror({call_args});")
-        } else {
-            format!("return mirror({call_args});")
-        };
-
-        output.push_str(&format!(
-            "\n\
-             \x20\x20\x20\x20/// Calls the Rust method `{qualified}::{method_name}` through its\n\
-             \x20\x20\x20\x20/// generated C-ABI trampoline, handing it the receiver's live\n\
-             \x20\x20\x20\x20/// address without boxing or pinning it.\n\
-             \x20\x20\x20\x20[UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n\
-             \x20\x20\x20\x20public delegate {return_type} {delegate_name}({delegate_args});\n\
-             \n\
-             \x20\x20\x20\x20{method_signature}\n\
-             \x20\x20\x20\x20{{\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20var mirror = global::TracyLive.MirrorMethods.Resolve<{delegate_name}>(\"{qualified}\", \"{method_name}\");\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20{invocation}\n\
-             \x20\x20\x20\x20}}\n",
-            qualified = qualified,
-            method_name = method.method_name,
-            return_type = return_type,
-            delegate_name = delegate_name,
-            delegate_args = delegate_args,
-            method_signature = method_signature,
-            invocation = invocation,
-        ));
+    if scope.declared_kind(qualified).is_some() {
+        // An object's, enum's or resource's functions are emitted on its own
+        // declaration, never on a struct mirror.
+        return Ok(output);
+    }
+    for method in mirror_codegen::members_of(methods, qualified) {
+        output.push_str(&mirror_codegen::emit_member(
+            method,
+            &mirror_codegen::MemberHost::ValueStruct,
+            scope,
+        )?);
     }
     Ok(output)
 }
 
-/// Emit the static class mirroring a module's `#[pill_mirror_fn]` free
-/// functions.
-///
-/// `module_path` is the Rust module declaring them (`pill_dummy_color` for a
-/// root-level function, `pill_dummy_color::utils` for a submodule): the class
-/// is named after its last segment, PascalCased, and declared in the namespace
-/// of the preceding segments, so `pill_dummy_color::get_color_a` reaches C# as
-/// `pill_dummy_color.PillDummyColor.GetColorA()`.
-///
-/// Each function becomes a `[UnmanagedFunctionPointer(Cdecl)]` delegate and a
-/// static method that resolves the module's exported trampoline through
-/// `TracyLive.MirrorMethods`. Free functions have no receiver, so a call
-/// passes no address and hands the runtime no data to pin.
-fn emit_free_function_class(
-    module_path: &str,
-    methods: &[&ResolvedMirrorMethod],
-) -> Result<String, String> {
-    // A one-segment path has no namespace to derive: the module's own name
-    // serves as the namespace and its PascalCase as the class
-    // (`namespace pill_dummy_color { public static class PillDummyColor }`).
-    let class_name = snake_to_pascal(&last_path_segment(module_path));
-    let namespace = path_namespace(module_path).unwrap_or_else(|| module_path.to_string());
+/// The namespace a value type no component references is emitted in: the
+/// first exposed component's, or - when the module exposes none - the type's
+/// own module path.
+fn default_value_namespace(module_name: &str, exposed: &[ModuleExposedComponent]) -> String {
+    exposed
+        .first()
+        .and_then(|component| split_csharp_name(&component.csharp_name))
+        .map(|(namespace, _)| namespace.to_string())
+        .unwrap_or_else(|| format!("pill_{module_name}"))
+}
 
-    let mut body = String::new();
-    for method in methods {
-        let pascal = snake_to_pascal(&method.method_name);
-        let return_type = if method.return_tag.is_empty() {
-            "void".to_string()
-        } else {
-            cs_primitive(&method.return_tag)
-                .map(|(cs, _, _)| cs.to_string())
-                .ok_or_else(|| {
-                    format!(
-                        "mirrored function `{}.{}` has unsupported return tag `{}`",
-                        module_path, method.method_name, method.return_tag
-                    )
-                })?
-        };
-        let mut typed_arguments: Vec<String> = Vec::new();
-        for (index, tag) in method.arg_tags.iter().enumerate() {
-            let cs_type = cs_primitive(tag)
-                .map(|(cs, _, _)| cs.to_string())
-                .ok_or_else(|| {
-                    format!(
-                        "mirrored function `{}.{}` has unsupported argument tag `{}`",
-                        module_path, method.method_name, tag
-                    )
-                })?;
-            let rust_name = method.arg_names.get(index).map_or("", String::as_str);
-            typed_arguments.push(format!(
-                "{cs_type} {}",
-                csharp_parameter_name(index, rust_name)
-            ));
+/// The namespace of the first component whose fields name `qualified` - used
+/// for an opaque stand-in no descriptor declares.
+fn opaque_namespaces(exposed: &[ModuleExposedComponent], qualified: &str) -> Option<String> {
+    exposed
+        .iter()
+        .find(|component| {
+            component.fields.iter().any(|field| {
+                split_array_tag(field.type_tag)
+                    .ok()
+                    .and_then(|(base, _)| base.strip_prefix("struct:"))
+                    .is_some_and(|path| {
+                        path == qualified || (qualified == "Handle" && path.starts_with("Handle<"))
+                    })
+            })
+        })
+        .and_then(|component| split_csharp_name(&component.csharp_name))
+        .map(|(namespace, _)| namespace.to_string())
+}
+
+/// Decide the namespace of every value type before anything is emitted.
+///
+/// A value type lives in the namespace of the first component that references
+/// it, directly or through another value type, so C# refers to
+/// `pill_spline.Vector3f` beside `pill_spline.Spline`. A value type no
+/// component references goes to the first component's namespace - or, when
+/// the module exposes no components at all, to the namespace of its own
+/// declaring module, so `#[derive(PillMirror)]` alone exposes the type where a
+/// C# project would `using` it.
+fn value_type_namespaces(
+    module_name: &str,
+    exposed: &[ModuleExposedComponent],
+    value_types: &[PillValueTypeDescriptor],
+) -> std::collections::HashMap<String, String> {
+    fn visit(
+        fields: &[ComponentFieldDescriptor],
+        namespace: &str,
+        value_types: &[PillValueTypeDescriptor],
+        assigned: &mut std::collections::HashMap<String, String>,
+    ) {
+        for field in fields {
+            let Ok((base, _)) = split_array_tag(field.type_tag) else {
+                continue;
+            };
+            let Some(path) = base.strip_prefix("struct:") else {
+                continue;
+            };
+            let Some(descriptor) = value_types
+                .iter()
+                .find(|descriptor| descriptor.type_name == path)
+            else {
+                continue;
+            };
+            if assigned.contains_key(descriptor.type_name) {
+                continue;
+            }
+            assigned.insert(descriptor.type_name.to_string(), namespace.to_string());
+            visit(descriptor.fields, namespace, value_types, assigned);
         }
-
-        let delegate_name = format!("{class_name}{pascal}Delegate");
-        let method_signature = if typed_arguments.is_empty() {
-            format!("public static {return_type} {pascal}()")
-        } else {
-            format!(
-                "public static {return_type} {pascal}({})",
-                typed_arguments.join(", ")
-            )
-        };
-        let invocation = if method.return_tag.is_empty() {
-            "mirror();".to_string()
-        } else {
-            "return mirror();".to_string()
-        };
-
-        body.push_str(&format!(
-            "\n\
-             \x20\x20\x20\x20/// Calls the Rust function `{module_path}::{method_name}` through its\n\
-             \x20\x20\x20\x20/// generated C-ABI trampoline.\n\
-             \x20\x20\x20\x20[UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n\
-             \x20\x20\x20\x20public delegate {return_type} {delegate_name}({delegate_arguments});\n\
-             \n\
-             \x20\x20\x20\x20{method_signature}\n\
-             \x20\x20\x20\x20{{\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20var mirror = global::TracyLive.MirrorMethods.Resolve<{delegate_name}>(\"{module_path}\", \"{method_name}\");\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20{invocation}\n\
-             \x20\x20\x20\x20}}\n",
-            module_path = module_path,
-            method_name = method.method_name,
-            return_type = return_type,
-            delegate_name = delegate_name,
-            delegate_arguments = typed_arguments.join(", "),
-            method_signature = method_signature,
-            invocation = invocation,
-        ));
     }
 
-    Ok(format!(
-        "\nnamespace {namespace} {{\n\n\
-         /// Static mirror of the free functions the Rust module `{module_path}` declares;\n\
-         /// each member calls its exported trampoline through `MirrorMethods`.\n\
-         public static class {class_name}\n{{\n{body}}}\n\n}}\n\n"
-    ))
+    let mut assigned = std::collections::HashMap::new();
+    for component in exposed {
+        if let Some((namespace, _)) = split_csharp_name(&component.csharp_name) {
+            visit(&component.fields, namespace, value_types, &mut assigned);
+        }
+    }
+    let default_namespace = default_value_namespace(module_name, exposed);
+    for value_type in value_types {
+        if assigned.contains_key(value_type.type_name) {
+            continue;
+        }
+        let namespace = if exposed.is_empty() {
+            path_namespace(value_type.type_name).unwrap_or_else(|| default_namespace.clone())
+        } else {
+            default_namespace.clone()
+        };
+        assigned.insert(value_type.type_name.to_string(), namespace);
+        visit(
+            value_type.fields,
+            &assigned[value_type.type_name].clone(),
+            value_types,
+            &mut assigned,
+        );
+    }
+    assigned
 }
 
 /// Emit the C# members that reach a component's heap-owning fields.
@@ -1039,6 +979,11 @@ fn emit_free_function_class(
 ///
 /// Every span is a lease, not ownership: resizing or replacing the container
 /// invalidates it, exactly as a `&mut Vec` would in Rust.
+///
+/// The parameters are the descriptor fields plus the recursion context, as
+/// for [`emit_typed_struct`]; clippy's threshold is below the (internal)
+/// signature's size.
+#[allow(clippy::too_many_arguments)]
 fn emit_heap_field_accessors(
     cs_name: &str,
     type_name: &str,
@@ -1047,6 +992,7 @@ fn emit_heap_field_accessors(
     emitted: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
     accessors: &[ResolvedFieldAccessor],
+    scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
     let mut containers: Vec<&ComponentFieldDescriptor> = fields
         .iter()
@@ -1242,6 +1188,7 @@ fn emit_heap_field_accessors(
                 value_types,
                 emitted,
                 methods,
+                scope,
             )?;
             let resize_operation =
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
@@ -1319,6 +1266,7 @@ fn emit_heap_field_accessors(
                 value_types,
                 emitted,
                 methods,
+                scope,
             )?;
             let resize_operation =
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
@@ -1526,6 +1474,7 @@ fn resolve_span_element_type(
     value_types: &[PillValueTypeDescriptor],
     emitted: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
+    scope: &mirror_codegen::MirrorScope,
 ) -> Result<String, String> {
     if let Some((cs_type, _, _)) = cs_primitive(element_tag) {
         return Ok(cs_type.to_string());
@@ -1547,6 +1496,7 @@ fn resolve_span_element_type(
             value_types,
             emitted,
             methods,
+            scope,
         );
     }
     Err(format!(
@@ -1658,6 +1608,8 @@ mod tests {
             address: 0x1234,
             is_free_function: false,
             crate_name: String::new(),
+            receiver: "ref".to_string(),
+            owner_kind: String::new(),
         }
     }
 
@@ -1672,6 +1624,8 @@ mod tests {
     ) -> ResolvedMirrorMethod {
         ResolvedMirrorMethod {
             is_free_function: true,
+            receiver: String::new(),
+            owner_kind: "module".to_string(),
             ..mirrored_method(module_path, method_name, return_tag, arg_tags, arg_names)
         }
     }
@@ -2406,16 +2360,16 @@ mod tests {
         let content = read_generated(&workspace, "pill_dummy_color");
         assert!(content.contains("namespace pill_dummy_color {"));
         assert!(content.contains("public static class PillDummyColor"));
-        assert!(content.contains("public delegate float PillDummyColorGetColorADelegate();"));
         assert!(content.contains("public static float GetColorA()"));
         assert!(content.contains(
-            "global::TracyLive.MirrorMethods.Resolve<PillDummyColorGetColorADelegate>(\"pill_dummy_color\", \"get_color_a\")"
+            "var __call = global::TracyLive.MirrorCall.Begin(\"pill_dummy_color\", \"get_color_a\");"
         ));
-        // Argument names survive; the delegate carries no receiver.
+        assert!(content.contains("return __call.Result<float>();"));
+        // Argument names survive, and every argument is pushed in order; no
+        // receiver is pushed for a free function.
         assert!(content.contains("public static float Blend(float alpha, float beta)"));
-        assert!(content.contains(
-            "public delegate float PillDummyColorBlendDelegate(float alpha, float beta);"
-        ));
+        assert!(content.contains("__call.Push(alpha);\n        __call.Push(beta);"));
+        assert!(!content.contains("PushAddress"));
     }
 
     /// A free function declared in a submodule gets its own class in the
@@ -2440,9 +2394,9 @@ mod tests {
         assert!(content.contains("public static byte Grade()"));
     }
 
-    /// Mirrored methods become typed C# instance methods that resolve the
-    /// module's trampoline through `MirrorMethods` and hand it the receiver's
-    /// live address. A value type without methods emits no method block.
+    /// Mirrored methods become typed C# instance methods that call the
+    /// module's trampoline through `MirrorCall` and hand it the receiver's live
+    /// address. A value type without methods emits no method block.
     #[test]
     fn mirrored_methods_are_emitted_on_value_types() {
         static FIELDS: &[ComponentFieldDescriptor] = &[
@@ -2493,23 +2447,18 @@ mod tests {
         .unwrap();
 
         let content = read_generated(&workspace, "pill_spline");
-        // Instance method + delegate, PascalCased, resolving by Rust names.
+        // Instance method, PascalCased, calling the trampoline by Rust names.
         assert!(content.contains("public ulong GetSum()"));
         assert!(content.contains(
-            "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);"
+            "var __call = global::TracyLive.MirrorCall.Begin(\"pill_spline::OmoMO\", \"get_sum\");"
         ));
-        assert!(content.contains(
-            "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")"
-        ));
-        // Argument-carrying method: the Rust parameter names survive into both
-        // the delegate and the instance method, which forwards them by value.
+        // Argument-carrying method: the Rust parameter names survive, the
+        // receiver goes first as its live address, then each argument.
         assert!(content.contains("public uint Add(uint amount, float scale)"));
         assert!(content.contains(
-            "public delegate uint OmoMOAddDelegate(global::TracyLive.RowPointer self, uint amount, float scale);"
+            "__call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));\n        __call.Push(amount);\n        __call.Push(scale);"
         ));
-        assert!(content.contains(
-            "return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), amount, scale);"
-        ));
+        assert!(content.contains("return __call.Result<uint>();"));
         // The receiver is addressed through the runtime helper and nothing is
         // boxed or pinned, so a mirrored call allocates nothing.
         assert!(!content.contains("boxed"));
@@ -2549,12 +2498,12 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("public float GetLocationX(float t)"));
         assert!(content.contains(
-            "return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);"
+            "__call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));\n        __call.Push(t);"
         ));
     }
 
-    /// A void-returning mirrored method emits a `void` delegate and a call
-    /// that does not return a value.
+    /// A void-returning mirrored method emits a `void` member whose call
+    /// reads no result.
     #[test]
     fn mirrored_method_void_return_is_emitted() {
         static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
@@ -2592,11 +2541,7 @@ mod tests {
 
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("public void Reset(ulong countdown)"));
-        assert!(content
-            .contains("public delegate void OmoMOResetDelegate(global::TracyLive.RowPointer self, ulong countdown);"));
-        assert!(content.contains(
-            "mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), countdown);"
-        ));
+        assert!(content.contains("__call.Push(countdown);\n        __call.Invoke();\n    }"));
     }
 
     /// A Rust parameter name that is a C# reserved keyword (or is absent) must

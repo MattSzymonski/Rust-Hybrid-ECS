@@ -337,8 +337,12 @@ namespace PillCSharpRuntimeMacros
             List<string> entries)
         {
             string runMethod = $"RunStartup_{index}";
+            // Every startup parameter - Commands, Res<T>, ResMut<T> - is
+            // stateless, so each is passed as its default, as the reflection
+            // path does.
+            string arguments = string.Join(", ", method.Parameters.Select(_ => "default"));
             source.AppendLine(
-                $"        private static void {runMethod}() => {receiver}.{method.Name}(default);");
+                $"        private static void {runMethod}() => {receiver}.{method.Name}({arguments});");
             string name = $"{method.ContainingType.ToDisplayString(FullyQualified)}.{method.Name}";
             entries.Add(
                 $"            new global::TracyLive.Loader.AotStartupRegistration(" +

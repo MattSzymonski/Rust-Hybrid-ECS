@@ -725,306 +725,52 @@ public static unsafe class Engine
     }
 
     // =========================================================================
-    // Asset loading
+    // Mirror ABI
     // =========================================================================
 
     /// <summary>
-    /// Decodes a Wavefront OBJ buffer into a mesh and inserts it into the
-    /// active invocation's <c>AssetManager</c>.
+    /// Take the last error (<paramref name="kind"/> 0) or the returned string
+    /// (1) the mirrored call that just ran on this thread left behind.
     /// </summary>
-    /// <remarks>
-    /// Only valid from inside an active invocation - ordinarily an
-    /// <see cref="EcsStartupAttribute"/> method, the managed equivalent of the
-    /// Rust project's own one-time asset loading.
-    /// </remarks>
-    public static AssetHandle LoadMeshObj(string name, ReadOnlySpan<byte> objBytes)
+    internal static string? TakeMirrorText(byte kind)
     {
-        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        uint index, generation;
-        byte status;
-        fixed (byte* namePointer = nameBytes)
-        fixed (byte* bytesPointer = objBytes)
-        {
-            status = _api.AssetLoadMeshObj(
-                namePointer, (uint)nameBytes.Length,
-                bytesPointer, (uint)objBytes.Length,
-                &index, &generation);
-        }
-        ValidateAssetStatus(status, $"load mesh \"{name}\"");
-        return new AssetHandle(index, generation);
+        if (_api.TakeMirrorText == null)
+            return null;
+        byte* data;
+        uint length;
+        if (_api.TakeMirrorText(kind, &data, &length) != 0)
+            return null;
+        return length == 0 ? string.Empty : Encoding.UTF8.GetString(data, checked((int)length));
     }
 
     /// <summary>
-    /// Decodes a PNG buffer into a color texture and inserts it into the
-    /// active invocation's <c>AssetManager</c>. Same invocation contract as
-    /// <see cref="LoadMeshObj"/>.
+    /// Ask the host for the address of a Rust-owned resource under the
+    /// running invocation's declared access.
     /// </summary>
-    public static AssetHandle LoadTexturePng(string name, ReadOnlySpan<byte> pngBytes)
+    /// <remarks>The status byte is turned into a message by <see cref="MirrorCall"/>, which can name the type.</remarks>
+    internal static byte GetNativeResource(StableComponentId id, byte mode, void** output)
     {
-        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        uint index, generation;
-        byte status;
-        fixed (byte* namePointer = nameBytes)
-        fixed (byte* bytesPointer = pngBytes)
-        {
-            status = _api.AssetLoadTexturePng(
-                namePointer, (uint)nameBytes.Length,
-                bytesPointer, (uint)pngBytes.Length,
-                &index, &generation);
-        }
-        ValidateAssetStatus(status, $"load texture \"{name}\"");
-        return new AssetHandle(index, generation);
+        if (_api.GetNativeResource == null)
+            return 3;
+        return _api.GetNativeResource(id.Low, id.High, mode, output);
     }
 
-    /// <summary>
-    /// Builds a shader from managed WGSL sources and slot declarations, and
-    /// inserts it into the active invocation's <c>AssetManager</c>. Same
-    /// invocation contract as <see cref="LoadMeshObj"/>.
-    /// </summary>
-    public static AssetHandle LoadShader(
-        string name,
-        string vertexWgsl,
-        string fragmentWgsl,
-        ReadOnlySpan<ShaderParameter> parameters,
-        ReadOnlySpan<ShaderTextureBinding> textures,
-        bool passEngineParameters,
-        bool passCameraParameters)
+    /// <summary>Read a file below <c>res</c> through the engine's mounted asset store.</summary>
+    /// <exception cref="EngineException">The file cannot be read.</exception>
+    internal static byte[] ReadAsset(string path)
     {
-        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        byte[] vertexBytes = Encoding.UTF8.GetBytes(vertexWgsl);
-        byte[] fragmentBytes = Encoding.UTF8.GetBytes(fragmentWgsl);
-
-        // Every nested name needs its own pinned buffer alive for the whole
-        // call, so they are collected up front rather than pinned one at a
-        // time inside the loop that fills the native slot arrays.
-        byte[][] parameterNameBytes = new byte[parameters.Length][];
-        for (int i = 0; i < parameters.Length; i++)
-            parameterNameBytes[i] = Encoding.UTF8.GetBytes(parameters[i].Name);
-        byte[][] textureNameBytes = new byte[textures.Length][];
-        for (int i = 0; i < textures.Length; i++)
-            textureNameBytes[i] = Encoding.UTF8.GetBytes(textures[i].Name);
-
-        Span<GCHandle> parameterNamePins = new GCHandle[parameters.Length];
-        Span<GCHandle> textureNamePins = new GCHandle[textures.Length];
-        uint index, generation;
-        byte status;
-        try
-        {
-            var nativeParameters = new NativeShaderParameterSlot[parameters.Length];
-            for (int i = 0; i < parameters.Length; i++)
-            {
-                parameterNamePins[i] = GCHandle.Alloc(parameterNameBytes[i], GCHandleType.Pinned);
-                nativeParameters[i] = new NativeShaderParameterSlot
-                {
-                    Name = (byte*)parameterNamePins[i].AddrOfPinnedObject(),
-                    NameLen = (uint)parameterNameBytes[i].Length,
-                    Kind = (byte)parameters[i].Kind,
-                };
-            }
-
-            var nativeTextures = new NativeShaderTextureSlot[textures.Length];
-            for (int i = 0; i < textures.Length; i++)
-            {
-                textureNamePins[i] = GCHandle.Alloc(textureNameBytes[i], GCHandleType.Pinned);
-                nativeTextures[i] = new NativeShaderTextureSlot
-                {
-                    Name = (byte*)textureNamePins[i].AddrOfPinnedObject(),
-                    NameLen = (uint)textureNameBytes[i].Length,
-                    TextureBinding = textures[i].TextureBinding,
-                    SamplerBinding = textures[i].SamplerBinding,
-                };
-            }
-
-            fixed (byte* namePointer = nameBytes)
-            fixed (byte* vertexPointer = vertexBytes)
-            fixed (byte* fragmentPointer = fragmentBytes)
-            fixed (NativeShaderParameterSlot* parametersPointer = nativeParameters)
-            fixed (NativeShaderTextureSlot* texturesPointer = nativeTextures)
-            {
-                status = _api.AssetLoadShader(
-                    namePointer, (uint)nameBytes.Length,
-                    vertexPointer, (uint)vertexBytes.Length,
-                    fragmentPointer, (uint)fragmentBytes.Length,
-                    parametersPointer, (uint)nativeParameters.Length,
-                    texturesPointer, (uint)nativeTextures.Length,
-                    passEngineParameters ? (byte)1 : (byte)0,
-                    passCameraParameters ? (byte)1 : (byte)0,
-                    &index, &generation);
-            }
-        }
-        finally
-        {
-            foreach (GCHandle pin in parameterNamePins)
-                if (pin.IsAllocated) pin.Free();
-            foreach (GCHandle pin in textureNamePins)
-                if (pin.IsAllocated) pin.Free();
-        }
-        ValidateAssetStatus(status, $"load shader \"{name}\"");
-        return new AssetHandle(index, generation);
-    }
-
-    /// <summary>
-    /// Builds a material from already-loaded handles and per-slot parameters,
-    /// and inserts it into the active invocation's <c>AssetManager</c>. Same
-    /// invocation contract as <see cref="LoadMeshObj"/>.
-    /// </summary>
-    /// <param name="shader">
-    /// The shader to render with, or <see cref="AssetHandle.None"/> to leave
-    /// the renderer's default shader in place.
-    /// </param>
-    public static AssetHandle CreateMaterial(
-        string name,
-        AssetHandle shader,
-        ReadOnlySpan<MaterialTextureBinding> textures,
-        ReadOnlySpan<MaterialScalarParameter> scalars,
-        ReadOnlySpan<MaterialColorParameter> colors,
-        byte renderingOrder = byte.MaxValue)
-    {
-        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-
-        byte[][] textureSlotBytes = new byte[textures.Length][];
-        for (int i = 0; i < textures.Length; i++)
-            textureSlotBytes[i] = Encoding.UTF8.GetBytes(textures[i].Slot);
-        byte[][] scalarNameBytes = new byte[scalars.Length][];
-        for (int i = 0; i < scalars.Length; i++)
-            scalarNameBytes[i] = Encoding.UTF8.GetBytes(scalars[i].Name);
-        byte[][] colorNameBytes = new byte[colors.Length][];
-        for (int i = 0; i < colors.Length; i++)
-            colorNameBytes[i] = Encoding.UTF8.GetBytes(colors[i].Name);
-
-        Span<GCHandle> texturePins = new GCHandle[textures.Length];
-        Span<GCHandle> scalarPins = new GCHandle[scalars.Length];
-        Span<GCHandle> colorPins = new GCHandle[colors.Length];
-        uint index, generation;
-        byte status;
-        try
-        {
-            var nativeTextures = new NativeMaterialTexture[textures.Length];
-            for (int i = 0; i < textures.Length; i++)
-            {
-                texturePins[i] = GCHandle.Alloc(textureSlotBytes[i], GCHandleType.Pinned);
-                nativeTextures[i] = new NativeMaterialTexture
-                {
-                    Slot = (byte*)texturePins[i].AddrOfPinnedObject(),
-                    SlotLen = (uint)textureSlotBytes[i].Length,
-                    TextureIndex = textures[i].Texture.Index,
-                    TextureGeneration = textures[i].Texture.Generation,
-                };
-            }
-
-            var nativeScalars = new NativeMaterialScalar[scalars.Length];
-            for (int i = 0; i < scalars.Length; i++)
-            {
-                scalarPins[i] = GCHandle.Alloc(scalarNameBytes[i], GCHandleType.Pinned);
-                nativeScalars[i] = new NativeMaterialScalar
-                {
-                    Name = (byte*)scalarPins[i].AddrOfPinnedObject(),
-                    NameLen = (uint)scalarNameBytes[i].Length,
-                    Value = scalars[i].Value,
-                };
-            }
-
-            var nativeColors = new NativeMaterialColor[colors.Length];
-            for (int i = 0; i < colors.Length; i++)
-            {
-                colorPins[i] = GCHandle.Alloc(colorNameBytes[i], GCHandleType.Pinned);
-                nativeColors[i] = new NativeMaterialColor
-                {
-                    Name = (byte*)colorPins[i].AddrOfPinnedObject(),
-                    NameLen = (uint)colorNameBytes[i].Length,
-                    R = colors[i].R,
-                    G = colors[i].G,
-                    B = colors[i].B,
-                };
-            }
-
-            fixed (byte* namePointer = nameBytes)
-            fixed (NativeMaterialTexture* texturesPointer = nativeTextures)
-            fixed (NativeMaterialScalar* scalarsPointer = nativeScalars)
-            fixed (NativeMaterialColor* colorsPointer = nativeColors)
-            {
-                status = _api.AssetCreateMaterial(
-                    namePointer, (uint)nameBytes.Length,
-                    shader.Index, shader.Generation,
-                    texturesPointer, (uint)nativeTextures.Length,
-                    scalarsPointer, (uint)nativeScalars.Length,
-                    colorsPointer, (uint)nativeColors.Length,
-                    renderingOrder,
-                    &index, &generation);
-            }
-        }
-        finally
-        {
-            foreach (GCHandle pin in texturePins)
-                if (pin.IsAllocated) pin.Free();
-            foreach (GCHandle pin in scalarPins)
-                if (pin.IsAllocated) pin.Free();
-            foreach (GCHandle pin in colorPins)
-                if (pin.IsAllocated) pin.Free();
-        }
-        ValidateAssetStatus(status, $"create material \"{name}\"");
-        return new AssetHandle(index, generation);
-    }
-
-    /// <summary>
-    /// Drops the pipeline the world's <c>RenderingManager</c> holds, returning
-    /// the renderer to its built-in chain: a single geometry pass that draws
-    /// every instance through its own material's shader.
-    /// </summary>
-    /// <remarks>
-    /// The renderer registers the PBR chain as the manager's default, and that
-    /// chain draws only materials built for its <c>pill_pbr</c> shader - a
-    /// project with its own shading styles clears the manager so the built-in
-    /// pass draws them. The managed equivalent of the Rust project fetching
-    /// the resource and calling <c>clear</c> on it. Same invocation contract
-    /// as <see cref="LoadMeshObj"/>.
-    /// </remarks>
-    public static void ClearRenderPipeline()
-    {
-        byte status = _api.AssetClearRenderPipeline();
-        ValidateAssetStatus(status, "clear the render pipeline");
-    }
-
-    /// <summary>
-    /// Imports the standalone material file at <paramref name="path"/>
-    /// (relative to <c>res</c>).
-    /// </summary>
-    /// <remarks>
-    /// A material file is the asset: no <c>.meta</c> file is involved, and the
-    /// guid in its header is what the loaded material is keyed by. Its shader
-    /// and maps resolve by guid from the shaders and textures already loaded,
-    /// so import those first. Same invocation contract as
-    /// <see cref="LoadMeshObj"/>.
-    /// </remarks>
-    public static AssetHandle ImportMaterial(string path)
-    {
+        if (_api.AssetLoaderRead == null)
+            throw new InvalidOperationException("The host offers no asset store to this runtime.");
         byte[] pathBytes = Encoding.UTF8.GetBytes(path);
-        uint index, generation;
+        byte* data;
+        uint length;
         byte status;
         fixed (byte* pathPointer = pathBytes)
-        {
-            status = _api.AssetImportMaterial(
-                pathPointer, (uint)pathBytes.Length, &index, &generation);
-        }
-        ValidateAssetStatus(status, $"import material \"{path}\"");
-        return new AssetHandle(index, generation);
-    }
-
-    /// <summary>
-    /// Draws <paramref name="material"/> as the sky behind the PBR chain's lit
-    /// surface, or turns the sky off when it is <c>null</c>.
-    /// </summary>
-    /// <remarks>
-    /// The material is a sky material: one of the chain's skybox shaders with
-    /// its <c>sky</c> slot bound. Imports nothing, so the material must already
-    /// be loaded. Same invocation contract as <see cref="LoadMeshObj"/>.
-    /// </remarks>
-    public static void SetSkybox(AssetHandle? material)
-    {
-        byte status = _api.AssetSetSkybox(
-            material?.Index ?? uint.MaxValue,
-            material?.Generation ?? uint.MaxValue);
-        ValidateAssetStatus(status, "set the sky material");
+            status = _api.AssetLoaderRead(pathPointer, (uint)pathBytes.Length, &data, &length);
+        if (status != 0)
+            throw new EngineException(
+                $"Could not read asset \"{path}\": {TakeMirrorText(0) ?? $"native status {status}"}");
+        return new ReadOnlySpan<byte>(data, checked((int)length)).ToArray();
     }
 
     /// <summary>
@@ -1071,69 +817,6 @@ public static unsafe class Engine
                 return (x, y);
             }
         }
-    }
-
-    /// <summary>
-    /// Imports the source at <paramref name="path"/> (relative to <c>res</c>)
-    /// through its <c>.meta</c> file with the import slot <paramref name="kind"/>
-    /// selects. <see cref="Assets.Import{T}"/> is the public face of this.
-    /// </summary>
-    internal static ImportedAsset ImportAsset(
-        ImportedAssetKind kind,
-        string path,
-        MetadataPolicy policy,
-        string? initialSettingsJson)
-    {
-        byte[] pathBytes = Encoding.UTF8.GetBytes(path);
-        byte[] settingsBytes = Encoding.UTF8.GetBytes(initialSettingsJson ?? string.Empty);
-        NativeImportedAsset output = default;
-        byte status;
-        fixed (byte* pathPointer = pathBytes)
-        fixed (byte* settingsPointer = settingsBytes)
-        {
-            var import = kind switch
-            {
-                ImportedAssetKind.Texture => _api.AssetImportTexture,
-                ImportedAssetKind.Mesh => _api.AssetImportMesh,
-                _ => _api.AssetImportSound,
-            };
-            status = import(
-                pathPointer, (uint)pathBytes.Length,
-                (byte)policy,
-                settingsPointer, (uint)settingsBytes.Length,
-                &output);
-        }
-        ValidateAssetStatus(status, $"import {kind.ToString().ToLowerInvariant()} \"{path}\"");
-        return new ImportedAsset(
-            new AssetHandle(output.Index, output.Generation),
-            $"{output.GuidHigh:x16}{output.GuidLow:x16}",
-            output.AlreadyLoaded != 0);
-    }
-
-    private static void ValidateAssetStatus(byte status, string operation)
-    {
-        if (status == 0)
-            return;
-        string reason = status switch
-        {
-            1 => "no managed invocation is active (asset loading needs an [EcsStartup] method)",
-            2 => "the engine's AssetManager resource is missing",
-            3 => "a supplied string was not valid UTF-8",
-            4 => "the source data failed to decode",
-            5 => "a required buffer was null",
-            6 => "no loaded module provides this asset function in this build",
-            7 => "an asset with that name is already loaded",
-            8 => "no source file exists at that path",
-            9 => "its .meta file cannot be read as this asset type's, or could not be written",
-            10 => "the path is already loaded under a different guid than its .meta file holds",
-            11 => "its .meta file's guid belongs to another loaded asset (a copied .meta?)",
-            12 => "the initial settings JSON does not fit this asset type",
-            13 => "the metadata policy is not a known one",
-            14 => "the engine's RenderingManager resource is missing",
-            15 => "the sky material could not be set (no such material, or the PBR chain will not install)",
-            _ => $"native status {status}",
-        };
-        throw new InvalidOperationException($"Could not {operation}: {reason}.");
     }
 }
 

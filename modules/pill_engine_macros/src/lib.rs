@@ -25,9 +25,10 @@
 //! - [`attribute(PillProject)`] does the same for the project ABI
 //!   (`pill_module_init`, `pill_module_abi_version`,
 //!   `project_schema_fingerprint`).
-//! - [`attribute(PillMirrorFn)`] mirrors a free function to C# as a static
-//!   method on a class named after its declaring module, the free-function
-//!   counterpart of `#[pill_mirror_impl]`'s instance methods.
+//! - The mirror attributes (`#[pill_mirror_impl]`, `#[pill_mirror_fn]`,
+//!   `#[pill_mirror_object]`, `#[pill_mirror_resource]`, and
+//!   `#[derive(PillMirror)]`) make Rust functions and types callable from C#
+//!   through one C-ABI trampoline shape; the lowering lives in `mirror`.
 //!
 //! # Design
 //!
@@ -43,6 +44,9 @@
 //! [`inventory`]: https://docs.rs/inventory
 
 extern crate proc_macro;
+
+/// The mirror attributes' lowering of Rust signatures and types to the C ABI.
+mod mirror;
 
 // External crates
 use proc_macro::TokenStream;
@@ -963,6 +967,30 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                 | "BTreeMap" | "BTreeSet" | "VecDeque" | "LinkedList" => {
                     Err(heap_owned_rejection(ty, &last))
                 }
+                // An asset handle keeps the asset it names, so the C# mirror
+                // can type the field as `Handle<Mesh>` rather than an opaque
+                // `Handle`. Still a `struct:` tag: every reader that folds or
+                // resolves struct tags treats it exactly as before.
+                "Handle" => {
+                    let asset = segment
+                        .and_then(|segment| match &segment.arguments {
+                            syn::PathArguments::AngleBracketed(arguments) => {
+                                arguments.args.iter().find_map(|argument| match argument {
+                                    syn::GenericArgument::Type(syn::Type::Path(asset)) => asset
+                                        .path
+                                        .segments
+                                        .last()
+                                        .map(|segment| segment.ident.to_string()),
+                                    _ => None,
+                                })
+                            }
+                            _ => None,
+                        });
+                    Ok(match asset {
+                        Some(asset) => format!("struct:Handle<{asset}>"),
+                        None => "struct:Handle".to_string(),
+                    })
+                }
                 _ => {
                     // A nested struct (or an enum, which the codegen treats as
                     // an un-resolvable struct and renders opaque). Tagged by
@@ -1066,18 +1094,29 @@ fn is_primitive_tag(tag: &str) -> bool {
 // #[derive(PillMirror)]
 // =============================================================================
 
-/// Turns a plain (non-component) value type into a typed C# mirror.
+/// Turns a plain (non-component) value type, or a fieldless enum, into a
+/// typed C# mirror.
 ///
-/// Generates a [`PillValueTypeDescriptor`] submitted into this artifact's
-/// compile-time inventory, so the host's C# codegen can resolve
-/// `struct:<path>` field tags to typed nested structs. Only named-field
-/// structs are supported; generic types are rejected.
+/// On a named-field struct, generates a [`PillValueTypeDescriptor`] submitted
+/// into this artifact's compile-time inventory, so the host's C# codegen can
+/// resolve `struct:<path>` field tags to typed nested structs, plus the
+/// encodings that let mirrored functions take and return the type by value.
+///
+/// On a fieldless enum with an integer `#[repr]`, generates a C# `enum` with
+/// the same values, which mirrored functions take and return as the
+/// discriminant. Generic types are rejected.
 ///
 /// [`PillValueTypeDescriptor`]: ::pill_engine::component_registry::PillValueTypeDescriptor
 #[proc_macro_derive(PillMirror)]
 pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let ident = &input.ident;
+
+    if let syn::Data::Enum(data) = &input.data {
+        return mirror::mirror_enum(&input, data)
+            .unwrap_or_else(syn::Error::into_compile_error)
+            .into();
+    }
 
     if !input.generics.params.is_empty() {
         return syn::Error::new_spanned(
@@ -1101,6 +1140,7 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
         ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
     };
 
+    let encodings = mirror::value_type_encodings(ident);
     let expanded = quote! {
         #declared_layout
 
@@ -1113,6 +1153,8 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
                 fields: #layout_reference,
             }
         }
+
+        #encodings
     };
 
     expanded.into()
@@ -1269,330 +1311,66 @@ impl syn::parse::Parse for ValueTypeDeclaration {
 // #[pill_mirror_impl] / #[pill_mirror_method]
 // =============================================================================
 
-/// Mirrors selected `&self` or `&mut self` methods of a mirrored type to C#.
+/// Mirrors selected functions of an `impl` block to C#.
 ///
-/// The type may be a `#[derive(PillMirror)]` value type or an exposed
-/// component row; both reach the generated C# struct the same way.
+/// Applied to an inherent `impl` block; the functions inside it marked with
+/// `#[pill_mirror_method]` become members of the type's C# mirror:
 ///
-/// Applied to an inherent `impl` block; methods inside it marked with
-/// `#[pill_mirror_method]` become typed C# instance methods on the generated
-/// mirror struct, implemented by calling the real Rust method through a
-/// generated `extern "C"` trampoline. The marker's path may be written fully
-/// qualified (`#[pill_engine::pill_mirror_method]`); only its last segment is
-/// matched. The derive and this attribute are
-/// separate because the derive only sees the struct definition, while the
-/// method signatures live in a later `impl` block.
+/// - `&self` / `&mut self` methods become instance members. On a
+///   `#[derive(PillMirror)]` value type or a component row the call reaches the
+///   live value through its address, so a `&mut self` method writes through to
+///   it; on a `#[pill_mirror_object]` it reaches the boxed object; on a
+///   `#[pill_mirror_resource]` it becomes an extension method on `Res<T>` /
+///   `ResMut<T>`.
+/// - `self` methods consume an object (a builder's `with_*` and `build`).
+/// - Functions with no receiver become static members (`Shader::new`).
+///
+/// The marker's path may be written fully qualified
+/// (`#[pill_engine::pill_mirror_method]`); only its last segment is matched.
+/// The `impl` block must live in the module that declares the type, so the
+/// qualified name the methods are filed under is the type's own.
 ///
 /// ```ignore
-/// #[derive(PillMirror)]
-/// pub struct OmoMO { pub x: u64, pub y: u64 }
+/// #[pill_mirror_object(asset)]
+/// pub struct Mesh { /* ... */ }
 ///
 /// #[pill_mirror_impl]
-/// impl OmoMO {
+/// impl Mesh {
 ///     #[pill_mirror_method]
-///     pub fn get_sum(&self) -> u64 { self.x + self.y }
+///     pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
+///         /* ... */
+///     }
 /// }
 /// ```
 ///
-/// For every marked method the macro emits, at module level next to the impl:
-/// - a `#[no_mangle] extern "C"` trampoline named
-///   `pill_mirror_{TypeName}_{method}` whose ABI is fixed regardless of the
-///   Rust method's calling convention, and
-/// - a [`PillMethodDescriptor`] submitted into this artifact's registry, so
-///   the host can resolve the trampoline's symbol and hand the address to the
-///   C# runtime.
-///
-/// v1 supports a deliberately narrow contract: a `&self` or `&mut self`
-/// receiver (the generated call hands the trampoline the receiver's live
-/// address, so a mirrored call allocates nothing and a `&mut self` method
-/// writes through to that address), primitive arguments and return values
-/// (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`, `usize`, `isize`), and a `()`
-/// return. Anything else is rejected here at compile time with a clear error.
+/// For every marked function the macro emits, next to the `impl` block, a
+/// C-ABI trampoline of the one shape `pill_engine::mirror` defines and a
+/// [`PillMethodDescriptor`] carrying its address and the type tags of its
+/// arguments and result, which is everything the host's C# codegen reads.
+/// Arguments and results may be primitives, strings, slices and `Vec`s,
+/// `impl Into<String>` and `impl IntoIterator`, `Handle<T>`, `AssetLoader`,
+/// `Option<T>`, tuples and arrays of primitives, and the mirrored types
+/// themselves - by value or by reference. A `Result<T, E>` with `E: Display`
+/// fails the managed call with `E`'s message. Anything else is a compile
+/// error naming the parameter.
 ///
 /// [`PillMethodDescriptor`]: ::pill_engine::component_registry::PillMethodDescriptor
 #[proc_macro_attribute]
 pub fn pill_mirror_impl(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let impl_block = parse_macro_input!(item as syn::ItemImpl);
-
-    if impl_block.trait_.is_some() {
-        return syn::Error::new_spanned(
-            &impl_block,
-            "`#[pill_mirror_impl]` requires an inherent impl block",
-        )
-        .to_compile_error()
-        .into();
-    }
-    if !impl_block.generics.params.is_empty() {
-        return syn::Error::new_spanned(
-            &impl_block.generics,
-            "`#[pill_mirror_impl]` does not support generic impl blocks",
-        )
-        .to_compile_error()
-        .into();
-    }
-    let type_ident = match &*impl_block.self_ty {
-        syn::Type::Path(type_path) => type_path
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident.clone()),
-        _ => None,
-    }
-    .ok_or_else(|| {
-        syn::Error::new_spanned(
-            &impl_block.self_ty,
-            "`#[pill_mirror_impl]` requires a named receiver type (e.g. `impl OmoMO`)",
-        )
-    });
-    let type_ident = match type_ident {
-        Ok(ident) => ident,
-        Err(error) => return error.to_compile_error().into(),
-    };
-    let type_name = quote! {
-        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#type_ident))
-    };
-
-    let mut mirror_items: Vec<proc_macro2::TokenStream> = Vec::new();
-    for item in &impl_block.items {
-        let syn::ImplItem::Fn(method) = item else {
-            continue;
-        };
-        // The marker may be written bare (`#[pill_mirror_method]`, the house
-        // style) or fully qualified (`#[pill_engine::pill_mirror_method]`):
-        // accept both by matching the attribute path's last segment, so a
-        // qualified spelling cannot silently skip a method.
-        let is_mirrored = method.attrs.iter().any(|attribute| {
-            attribute
-                .path()
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "pill_mirror_method")
-        });
-        if !is_mirrored {
-            continue;
-        }
-        match emit_mirrored_method_trampoline(method, &type_ident, &type_name) {
-            Ok(stream) => mirror_items.push(stream),
-            Err(error) => return error.to_compile_error().into(),
-        }
-    }
-
-    let mut expanded = quote! { #impl_block };
-    for mirror_item in mirror_items {
-        expanded.extend(mirror_item);
-    }
-    expanded.into()
+    mirror::mirror_impl(impl_block)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
-/// Marker attribute for methods inside a `#[pill_mirror_impl]` block.
+/// Marker attribute for functions inside a `#[pill_mirror_impl]` block.
 ///
 /// The impl-level macro reads it from the token stream; it is otherwise a
-/// no-op that leaves the method untouched, so a method compiles the same with
-/// or without the mirror machinery.
+/// no-op that leaves the function untouched, so a function compiles the same
+/// with or without the mirror machinery.
 #[proc_macro_attribute]
 pub fn pill_mirror_method(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     item
-}
-
-/// Build the `#[no_mangle] extern "C"` trampoline and descriptor submission
-/// for one `#[pill_mirror_method]` method.
-fn emit_mirrored_method_trampoline(
-    method: &syn::ImplItemFn,
-    type_ident: &syn::Ident,
-    type_name: &proc_macro2::TokenStream,
-) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let method_ident = &method.sig.ident;
-    if !method.sig.generics.params.is_empty() {
-        return Err(syn::Error::new_spanned(
-            &method.sig.generics,
-            format!(
-                "`{}` is generic; mirrored methods must have concrete signatures",
-                method_ident
-            ),
-        ));
-    }
-
-    // Receiver must be `&self` or `&mut self`: the trampoline receives the
-    // address of the value the method was invoked on, so a `&mut self` method
-    // writes through to the caller's storage - a component row, or the local
-    // copy the call was made on. `self` by value would copy the type across
-    // an ABI the mirror does not define.
-    let receiver_is_mutable = match &method.sig.inputs.first() {
-        Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_some() => {
-            receiver.mutability.is_some()
-        }
-        Some(other) => {
-            return Err(syn::Error::new_spanned(
-                other,
-                format!(
-                    "`{method_ident}` must take `&self` or `&mut self` to be mirrored; `self` by value is not supported"
-                ),
-            ));
-        }
-        None => {
-            return Err(syn::Error::new_spanned(
-                &method.sig,
-                format!("`{method_ident}` must take `&self` or `&mut self` to be mirrored"),
-            ));
-        }
-    };
-
-    // Every argument must be a supported primitive, tagged for the C# codegen.
-    // The trampoline's own parameters are positional (`arg1`, `arg2`, ...); the
-    // C#-facing fallback name is zero-based, matching the codegen's convention
-    // for a pattern that is not a plain identifier.
-    let mut arguments: Vec<MirroredArgument> = Vec::new();
-    for (index, argument) in method.sig.inputs.iter().enumerate().skip(1) {
-        let syn::FnArg::Typed(pat_type) = argument else {
-            unreachable!("receiver handled above; remaining inputs are typed")
-        };
-        arguments.push(capture_mirrored_argument(pat_type, index, index - 1)?);
-    }
-    let arg_idents: Vec<&syn::Ident> = arguments.iter().map(|argument| &argument.ident).collect();
-    let arg_types: Vec<&syn::Type> = arguments.iter().map(|argument| &argument.ty).collect();
-    let arg_tag_literals: Vec<&syn::LitStr> =
-        arguments.iter().map(|argument| &argument.tag).collect();
-    let arg_name_literals: Vec<&syn::LitStr> =
-        arguments.iter().map(|argument| &argument.name).collect();
-
-    // Return must be a supported primitive or `()`.
-    let (return_tag_literal, return_type) =
-        capture_mirrored_return(&method.sig.output, method.sig.ident.span())?;
-
-    // Deterministic exported symbol + descriptor string, both derived from the
-    // same names so they can never drift.
-    let method_name_literal = syn::LitStr::new(&method_ident.to_string(), method_ident.span());
-    let symbol_name = format!("pill_mirror_{type_ident}_{method_ident}");
-    let symbol_ident = syn::Ident::new(&symbol_name, method_ident.span());
-    let symbol_literal = syn::LitStr::new(&symbol_name, method_ident.span());
-    let self_pointer = format_ident!("self_pointer");
-    // A `&mut self` method receives a writable pointer so it can edit the
-    // value the managed call was made on; `&self` methods keep the read-only
-    // `*const` contract.
-    let self_pointer_type = if receiver_is_mutable {
-        quote! { *mut #type_ident }
-    } else {
-        quote! { *const #type_ident }
-    };
-
-    Ok(quote! {
-        /// C-ABI trampoline for the mirrored method
-        /// [`#type_ident::#method_ident`], generated by `#[pill_mirror_impl]`.
-        ///
-        /// # Safety
-        ///
-        /// `#self_pointer` must point at a live `#type_ident` value for the
-        /// duration of the call; the C# runtime passes the address of the
-        /// value the mirror method was invoked on, and a `&mut self` method
-        /// writes through it.
-        #[doc(hidden)]
-        #[no_mangle]
-        pub unsafe extern "C" fn #symbol_ident(
-            #self_pointer: #self_pointer_type
-            #(, #arg_idents: #arg_types)*
-        ) -> #return_type {
-            // SAFETY: the host-side runtime guarantees the pointer points at a
-            // live value of this type for the whole call.
-            unsafe { (*#self_pointer).#method_ident(#(#arg_idents),*) }
-        }
-
-        ::pill_engine::submit! {
-            ::pill_engine::component_registry::PillMethodDescriptor {
-                type_name: #type_name,
-                is_free_function: false,
-                crate_name: env!("CARGO_PKG_NAME"),
-                name: #method_name_literal,
-                symbol: #symbol_literal,
-                return_tag: #return_tag_literal,
-                arg_tags: &[#(#arg_tag_literals),*],
-                arg_names: &[#(#arg_name_literals),*],
-            }
-        }
-    })
-}
-
-/// One mirrored argument captured for a generated trampoline and descriptor.
-struct MirroredArgument {
-    /// Identifier the trampoline receives it under (`arg1`, `arg2`, ...).
-    ident: syn::Ident,
-    /// The declared type, copied into the trampoline's signature.
-    ty: syn::Type,
-    /// Type tag for the C# codegen; primitives only.
-    tag: syn::LitStr,
-    /// C#-facing parameter name: the Rust source name when the pattern is a
-    /// plain identifier, a positional `argN` otherwise.
-    name: syn::LitStr,
-}
-
-/// Validate one argument of a mirrored function against the primitive
-/// vocabulary and capture everything the trampoline and descriptor need.
-///
-/// `ident_index` numbers the trampoline's parameters (`arg1` for the first
-/// argument of a method, `arg0` for the first argument of a free function);
-/// `fallback_index` numbers the C#-facing fallback name, zero-based.
-fn capture_mirrored_argument(
-    pat_type: &syn::PatType,
-    ident_index: usize,
-    fallback_index: usize,
-) -> Result<MirroredArgument, syn::Error> {
-    let tag = mirror_method_type_tag(&pat_type.ty).map_err(|error| {
-        syn::Error::new_spanned(
-            &pat_type.ty,
-            format!("{}: {}", error, pat_type.ty.to_token_stream()),
-        )
-    })?;
-    let argument_name = match &*pat_type.pat {
-        syn::Pat::Ident(pat_ident) => pat_ident.ident.to_string(),
-        _ => format!("arg{fallback_index}"),
-    };
-    Ok(MirroredArgument {
-        ident: format_ident!("arg{ident_index}"),
-        ty: (*pat_type.ty).clone(),
-        tag: syn::LitStr::new(&tag, pat_type.ty.span()),
-        name: syn::LitStr::new(&argument_name, pat_type.ty.span()),
-    })
-}
-
-/// Validate a mirrored function's return against the primitive vocabulary;
-/// `()` maps to an empty tag and a `()` trampoline return.
-fn capture_mirrored_return(
-    output: &syn::ReturnType,
-    span: proc_macro2::Span,
-) -> Result<(syn::LitStr, proc_macro2::TokenStream), syn::Error> {
-    match output {
-        syn::ReturnType::Default => Ok((syn::LitStr::new("", span), quote! { () })),
-        syn::ReturnType::Type(_, return_ty) => {
-            let tag = mirror_method_type_tag(return_ty).map_err(|error| {
-                syn::Error::new_spanned(
-                    return_ty,
-                    format!("{}: {}", error, return_ty.to_token_stream()),
-                )
-            })?;
-            Ok((
-                syn::LitStr::new(&tag, return_ty.span()),
-                quote! { #return_ty },
-            ))
-        }
-    }
-}
-
-/// Tag a mirrored function's argument/return type from the closed vocabulary
-/// the C# codegen understands; everything else is rejected.
-fn mirror_method_type_tag(ty: &syn::Type) -> Result<String, String> {
-    let syn::Type::Path(type_path) = ty else {
-        return Err("unsupported mirrored-method type".to_string());
-    };
-    let Some(segment) = type_path.path.segments.last() else {
-        return Err("unsupported mirrored-method type".to_string());
-    };
-    let name = segment.ident.to_string();
-    match name.as_str() {
-        "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64"
-        | "bool" | "usize" | "isize" => Ok(name),
-        _ => Err(format!(
-            "unsupported mirrored-method type `{name}`; use a primitive (u8..u64, i8..i64, f32, f64, bool, usize, isize)"
-        )),
-    }
 }
 
 // =============================================================================
@@ -1602,27 +1380,13 @@ fn mirror_method_type_tag(ty: &syn::Type) -> Result<String, String> {
 /// Mirrors a free function to C#, as a static method on a static class named
 /// after the module declaring it.
 ///
-/// The free-function counterpart of [`pill_mirror_impl`]: while that attribute
-/// mirrors `&self` methods onto the C# struct emitted for their type, this one
-/// exposes a plain function on its own. `pill_dummy_color::get_color_a`
-/// becomes `pill_dummy_color.PillDummyColor.GetColorA()` - the class is the
-/// last path segment PascalCased, declared in the namespace of the preceding
-/// segments.
-///
-/// For the decorated function the macro emits, at module level next to it:
-/// - a `#[no_mangle] extern "C"` trampoline named `pill_mirror_fn_<name>`
-///   whose ABI is fixed regardless of the Rust function's calling convention,
-///   and
-/// - a [`PillMethodDescriptor`] submitted into this artifact's registry with
-///   `is_free_function: true` and the declaring module's path as `type_name`,
-///   so the host resolves the trampoline and the codegen emits the static
-///   class rather than a struct member.
-///
-/// v1 keeps the same deliberately narrow contract as mirrored methods:
-/// primitive arguments and return values (`u8..u64`, `i8..i64`, `f32`, `f64`,
-/// `bool`, `usize`, `isize`) and a `()` return. Everything else is rejected at
-/// compile time. The trampoline symbol derives from the function name alone,
-/// so one mirrored free function per name per artifact.
+/// The free-function counterpart of [`pill_mirror_impl`]:
+/// `pill_dummy_color::get_color_a` becomes
+/// `pill_dummy_color.PillDummyColor.GetColorA()` - the class is the last path
+/// segment PascalCased, declared in the namespace of the preceding segments.
+/// The argument and result vocabulary is [`pill_mirror_impl`]'s, so a free
+/// function may take a resource (`assets: &mut AssetManager` becomes a
+/// `ResMut<AssetManager>` parameter) as well as plain values.
 ///
 /// Combine it with [`pill_hot_fn`] by listing this attribute first: it then
 /// captures the original signature (the contract C# compiled against) while
@@ -1636,85 +1400,59 @@ fn mirror_method_type_tag(ty: &syn::Type) -> Result<String, String> {
 ///     1.0
 /// }
 /// ```
-///
-/// [`PillMethodDescriptor`]: ::pill_engine::component_registry::PillMethodDescriptor
 #[proc_macro_attribute]
 pub fn pill_mirror_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
-    let fn_ident = item_fn.sig.ident.clone();
+    mirror::mirror_fn(item_fn)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
-    if !item_fn.sig.generics.params.is_empty() {
-        return syn::Error::new_spanned(
-            &item_fn.sig.generics,
-            "`#[pill_mirror_fn]` cannot mirror a generic function: the trampoline needs one concrete signature",
-        )
-        .to_compile_error()
-        .into();
-    }
+// =============================================================================
+// #[pill_mirror_object] / #[pill_mirror_resource]
+// =============================================================================
 
-    // Every argument must be a supported primitive, tagged for the C# codegen.
-    // A free function has no receiver, so numbering starts at the first
-    // argument for both the trampoline's parameters and the fallback names.
-    let mut arguments: Vec<MirroredArgument> = Vec::new();
-    for (index, argument) in item_fn.sig.inputs.iter().enumerate() {
-        let syn::FnArg::Typed(pat_type) = argument else {
-            return syn::Error::new_spanned(
-                argument,
-                "`#[pill_mirror_fn]` mirrors free functions; a `self` receiver belongs to `#[pill_mirror_impl]`",
-            )
-            .to_compile_error()
-            .into();
-        };
-        match capture_mirrored_argument(pat_type, index, index) {
-            Ok(captured) => arguments.push(captured),
-            Err(error) => return error.to_compile_error().into(),
-        }
-    }
-    let arg_idents: Vec<&syn::Ident> = arguments.iter().map(|argument| &argument.ident).collect();
-    let arg_types: Vec<&syn::Type> = arguments.iter().map(|argument| &argument.ty).collect();
-    let arg_tag_literals: Vec<&syn::LitStr> =
-        arguments.iter().map(|argument| &argument.tag).collect();
-    let arg_name_literals: Vec<&syn::LitStr> =
-        arguments.iter().map(|argument| &argument.name).collect();
+/// Mirrors a Rust type C# holds by reference: a class wrapping a box the
+/// managed side owns.
+///
+/// Use it for a type that is not plain data - a mesh, a builder, a slot
+/// description with a `String` in it. Functions that return the type hand C# a
+/// new object; functions that take it by value move it out of the C# object,
+/// which is unusable afterwards; `&self`/`&mut self` methods borrow it.
+/// Disposing the C# object (or letting the garbage collector finalize it)
+/// drops the Rust value.
+///
+/// Flags:
+/// - `asset` - the type is an `Asset`: C# can add it to the world's
+///   `AssetManager`, remove it and look it up (`assets.AddNamed(name, mesh)`).
+/// - `import` - also an `ImportedAsset`: `assets.Import<Mesh>(path, ...)`.
+/// - `standalone` - also a `StandaloneAsset`: `assets.ImportStandalone<Material>(path)`.
+///
+/// The type must be `Send`, because the garbage collector may drop it from
+/// its finalizer thread.
+#[proc_macro_attribute]
+pub fn pill_mirror_object(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as syn::Item);
+    mirror::mirror_object(attribute.into(), item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
-    // Return must be a supported primitive or `()`.
-    let (return_tag_literal, return_type) =
-        match capture_mirrored_return(&item_fn.sig.output, item_fn.sig.ident.span()) {
-            Ok(captured) => captured,
-            Err(error) => return error.to_compile_error().into(),
-        };
-
-    let function_name_literal = syn::LitStr::new(&fn_ident.to_string(), fn_ident.span());
-    let symbol_name = format!("pill_mirror_fn_{fn_ident}");
-    let symbol_ident = syn::Ident::new(&symbol_name, fn_ident.span());
-    let symbol_literal = syn::LitStr::new(&symbol_name, fn_ident.span());
-
-    let expanded = quote! {
-        #item_fn
-
-        /// C-ABI trampoline for this module's mirrored free function,
-        /// generated by `#[pill_mirror_fn]`.
-        #[doc(hidden)]
-        #[no_mangle]
-        pub extern "C" fn #symbol_ident(#(#arg_idents: #arg_types),*) -> #return_type {
-            #fn_ident(#(#arg_idents),*)
-        }
-
-        ::pill_engine::submit! {
-            ::pill_engine::component_registry::PillMethodDescriptor {
-                type_name: ::core::module_path!(),
-                is_free_function: true,
-                crate_name: env!("CARGO_PKG_NAME"),
-                name: #function_name_literal,
-                symbol: #symbol_literal,
-                return_tag: #return_tag_literal,
-                arg_tags: &[#(#arg_tag_literals),*],
-                arg_names: &[#(#arg_name_literals),*],
-            }
-        }
-    };
-
-    expanded.into()
+/// Mirrors a world resource to C# under a shared name.
+///
+/// `#[pill_mirror_resource("my_crate::MyResource")]` implements `Resource`
+/// with that shared name and declares the type, so C# names it as a marker
+/// type: systems take `Res<T>` / `ResMut<T>` (the scheduler orders them
+/// against every Rust user of the resource), its `#[pill_mirror_impl]`
+/// methods become extension methods on those parameters, and mirrored
+/// functions can take it as `&T` / `&mut T`. The resource's bytes are never
+/// exposed to C#.
+#[proc_macro_attribute]
+pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as syn::Item);
+    mirror::mirror_resource(attribute.into(), item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
 // =============================================================================

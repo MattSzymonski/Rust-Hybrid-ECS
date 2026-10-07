@@ -9,21 +9,25 @@
 //! # Design
 //!
 //! Inserted by `pill_master_renderer::register`, so it exists before any project
-//! code runs and `set_pipeline` never has to check for it. The `shared_name` is
-//! what makes the host binary and a project module agree on the resource id,
-//! exactly as `RenderFrame` does; without it the renderer would read a resource
-//! the project never wrote.
+//! code runs and `set_pipeline` never has to check for it. The shared name,
+//! given by `#[pill_mirror_resource]`, is what makes the host binary and a
+//! project module agree on the resource id, exactly as `RenderFrame` does;
+//! without it the renderer would read a resource the project never wrote. The
+//! same name is what C# computes for its `RenderingManager` marker, so a
+//! managed system declares `ResMut<RenderingManager>` and calls `Clear()`.
 
-use pill_engine::{Handle, Resource};
+use pill_engine::{pill_mirror_impl, pill_mirror_method, pill_mirror_resource, Handle};
 
 use crate::RenderingPipeline;
 
 /// The pipeline the renderer runs, as the game declared it.
 #[derive(Clone, Debug, Default)]
+#[pill_mirror_resource("pill_master_renderer::resources::rendering_manager::RenderingManager")]
 pub struct RenderingManager {
     pipeline: Option<Handle<RenderingPipeline>>,
 }
 
+#[pill_mirror_impl]
 impl RenderingManager {
     /// A manager with no pipeline: the renderer keeps its built-in chain.
     pub fn new() -> Self {
@@ -36,30 +40,28 @@ impl RenderingManager {
     /// frame it resolves the passes, checks every offscreen target against the
     /// pass that produces it, and creates the pipelines it does not have yet.
     /// Until then the renderer keeps drawing with its built-in chain.
+    #[pill_mirror_method]
     pub fn set_pipeline(&mut self, pipeline: Handle<RenderingPipeline>) {
         self.pipeline = Some(pipeline);
     }
 
     /// The pipeline the renderer should run, if the game set one.
+    #[pill_mirror_method]
     pub fn pipeline(&self) -> Option<Handle<RenderingPipeline>> {
         self.pipeline
     }
 
     /// Drop the pipeline, returning the renderer to its built-in chain.
+    #[pill_mirror_method]
     pub fn clear(&mut self) {
         self.pipeline = None;
-    }
-}
-
-impl Resource for RenderingManager {
-    fn shared_name() -> Option<&'static str> {
-        Some("pill_master_renderer::resources::rendering_manager::RenderingManager")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_engine::Resource;
 
     #[test]
     fn a_new_manager_has_no_pipeline() {

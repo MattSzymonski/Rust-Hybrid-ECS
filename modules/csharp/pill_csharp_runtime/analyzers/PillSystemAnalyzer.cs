@@ -147,7 +147,8 @@ namespace PillScriptAnalyzers
                     method.Name));
             }
 
-            // Startup methods take no parameters; only systems have a budget.
+            // Only systems have a parameter budget the scheduler enforces; a
+            // startup's Commands and Res/ResMut parameters are checked at load.
             if (attributeName == EcsSystemAttribute &&
                 (method.Parameters.Length == 0 || method.Parameters.Length > MaxSystemParameters))
             {

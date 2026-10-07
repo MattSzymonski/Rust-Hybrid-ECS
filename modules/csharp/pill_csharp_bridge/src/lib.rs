@@ -29,9 +29,6 @@
 mod abi;
 /// NativeAOT library loader used by the C# project backend's AOT posture.
 mod aot_runtime;
-/// Managed asset loading, bridging `AssetManager` for projects with no
-/// direct Rust asset-construction code of their own.
-mod assets;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
 /// Native callbacks that translate C# lifecycle requests into deferred ECS commands.
@@ -52,6 +49,9 @@ mod managed_buffer;
 mod manifest;
 /// The one apply pipeline every manifest kind runs through.
 mod manifest_apply;
+/// The native calls the mirror ABI needs beside the trampolines: text
+/// channels, Rust-owned resources, and the asset store.
+mod mirror_calls;
 /// The rules that name a generated mirror's fields, for generation and binding checks.
 mod mirror_naming;
 /// Parallel dispatch of managed callbacks onto the shared Rayon pool.
@@ -108,7 +108,7 @@ pub struct ResolvedMirrorMethod {
     /// `beta`), so the generated C# mirror names its parameters identically.
     /// Parallel to `arg_tags`.
     pub arg_names: Vec<String>,
-    /// Address of the exported C-ABI trampoline.
+    /// Address of the C-ABI trampoline; zero for a type row with none.
     pub address: usize,
     /// Whether the declaration is a `#[pill_mirror_fn]` free function; the
     /// codegen then emits a static method on a static class named after the
@@ -119,6 +119,12 @@ pub struct ResolvedMirrorMethod {
     /// `crate_name` matches the module being generated or published, so one
     /// artifact linking another crate's code cannot claim its declarations.
     pub crate_name: String,
+    /// How the function takes its owner: `""`, `"ref"`, `"mut"` or `"value"`.
+    pub receiver: String,
+    /// What the owning type is, when the declaring attribute knew it:
+    /// `"object"`, `"enum"`, `"resource"`, `"module"`, or empty for a method
+    /// whose type the codegen resolves from the type rows.
+    pub owner_kind: String,
 }
 
 /// One heap-field accessor resolved to callable addresses, shared by the
@@ -181,6 +187,8 @@ pub fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorM
                     address,
                     is_free_function: false,
                     crate_name: String::new(),
+                    receiver: String::new(),
+                    owner_kind: String::new(),
                 });
             }
         };
@@ -197,9 +205,6 @@ pub fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorM
 /// Rebuild the mirror-method table the managed runtime reads, after an
 /// extension reload changes its trampoline addresses or method set.
 pub use abi::publish_mirror_methods;
-/// Publish the renderer data crate's asset functions from the loaded modules.
-#[cfg(feature = "hot_reload")]
-pub use assets::publish_asset_exports;
 
 // =============================================================================
 // Tests

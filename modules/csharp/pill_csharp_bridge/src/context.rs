@@ -37,6 +37,14 @@ pub(super) const ACCESS_KIND_COMPONENT: u8 = 0;
 /// Access-list discriminator for a resource key.
 pub(super) const ACCESS_KIND_RESOURCE: u8 = 1;
 
+/// Access-list discriminator for a Rust-owned resource reached by its shared
+/// name (`ResMut<AssetManager>`), whose bytes managed code never sees.
+///
+/// Separate from [`ACCESS_KIND_RESOURCE`] because the two resolve through
+/// different tables: a managed resource through the manifest's bindings, a
+/// native one straight to `ResourceId::Shared` of its name.
+pub(super) const ACCESS_KIND_NATIVE_RESOURCE: u8 = 2;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -80,6 +88,10 @@ struct ActiveScopeData {
     access: (*const NativeSystemAccess, usize),
     bindings: *const ComponentBindings,
     uses_commands: bool,
+    /// Whether the invocation holds the whole world, as a startup method
+    /// does: every resource access is authorized without a declaration,
+    /// because nothing else can be running.
+    exclusive: bool,
     /// Token stamped into every chunk issued during this invocation.
     scope_token: u32,
 }
@@ -103,7 +115,7 @@ impl ActiveSystemGuard {
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
     ) -> Option<Self> {
-        Self::set_inner(world, std::ptr::null_mut(), access, bindings, false)
+        Self::set_inner(world, std::ptr::null_mut(), access, bindings, false, false)
     }
 
     /// Publishes one scheduled system's world, command queue, bindings, and
@@ -115,7 +127,22 @@ impl ActiveSystemGuard {
         bindings: &ComponentBindings,
         uses_commands: bool,
     ) -> Option<Self> {
-        Self::set_inner(world, queue, access, bindings, uses_commands)
+        Self::set_inner(world, queue, access, bindings, uses_commands, false)
+    }
+
+    /// Publishes one startup method's scope: the whole world, a command queue
+    /// and the bindings, with every resource reachable.
+    ///
+    /// Startups run one at a time before the scheduler starts, so the scope
+    /// holds the world exclusively and needs no access list; that is what
+    /// lets a startup take `Res<T>` / `ResMut<T>` parameters it never
+    /// declared to a scheduler.
+    pub(super) fn set_exclusive(
+        world: &mut World,
+        queue: &mut CommandQueue,
+        bindings: &ComponentBindings,
+    ) -> Option<Self> {
+        Self::set_inner(world, queue, &[], bindings, true, true)
     }
 
     /// Installs the complete scope in one assignment after rejecting nested
@@ -135,6 +162,7 @@ impl ActiveSystemGuard {
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
         uses_commands: bool,
+        exclusive: bool,
     ) -> Option<Self> {
         // Step 1: Reject nested invocation before touching any thread-local.
         let already_active = ACTIVE_SCOPE.with(|slot| slot.get().is_some());
@@ -183,6 +211,7 @@ impl ActiveSystemGuard {
                 access: (access.as_ptr(), access.len()),
                 bindings: bindings as *const ComponentBindings,
                 uses_commands,
+                exclusive,
                 scope_token,
             }));
         });
@@ -397,10 +426,26 @@ pub(super) fn resource_access_is_authorized(
     declared_access(ACCESS_KIND_RESOURCE, key, requested_mode)
 }
 
+/// The counterpart of [`resource_access_is_authorized`] for a Rust-owned
+/// resource reached by its shared name.
+pub(super) fn native_resource_access_is_authorized(
+    key: StableComponentId,
+    requested_mode: u8,
+) -> Option<bool> {
+    declared_access(ACCESS_KIND_NATIVE_RESOURCE, key, requested_mode)
+}
+
 /// Scan the active system's reflected access list for one declaration.
+///
+/// An exclusive scope - a startup method - authorizes every resource access,
+/// and no component access: a startup has no queries to have declared one.
 fn declared_access(kind: u8, key: StableComponentId, requested_mode: u8) -> Option<bool> {
     ACTIVE_SCOPE.with(|slot| {
-        let (pointer, len) = slot.get()?.access;
+        let scope = slot.get()?;
+        if scope.exclusive && kind != ACCESS_KIND_COMPONENT {
+            return Some(true);
+        }
+        let (pointer, len) = scope.access;
         if pointer.is_null() {
             return None;
         }

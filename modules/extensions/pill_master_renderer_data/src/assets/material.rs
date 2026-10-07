@@ -22,7 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use pill_engine::{Asset, AssetLoadResult, AssetManager, AssetReference, Handle, StandaloneAsset};
+use pill_engine::{
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadResult, AssetManager,
+    AssetReference, Handle, StandaloneAsset,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{Shader, Texture};
@@ -54,6 +57,7 @@ pub struct MaterialTexture {
 /// that built it is reloaded and its retired image eventually unmapped - and
 /// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
+#[pill_mirror_object(asset, standalone)]
 pub struct Material {
     /// Label used in logs, profiling and error messages.
     pub name: String,
@@ -87,15 +91,18 @@ pub struct Material {
 /// A fresh builder starts on the renderer's built-in shader with no textures,
 /// no parameters, and the highest rendering order, so a material only mentions
 /// the fields the game wants to differ from those defaults.
+#[pill_mirror_object]
 pub struct MaterialBuilder {
     material: Material,
 }
 
+#[pill_mirror_impl]
 impl Material {
     /// Start building a material under the given name.
     ///
     /// The name labels the material in logs, profiling and error messages,
     /// which is why it is the one field the builder asks for up front.
+    #[pill_mirror_method]
     pub fn builder(name: impl Into<String>) -> MaterialBuilder {
         MaterialBuilder {
             material: Self {
@@ -109,9 +116,11 @@ impl Material {
     }
 }
 
+#[pill_mirror_impl]
 impl MaterialBuilder {
     /// Set the shader the material draws with. [`Handle::INVALID`] keeps the
     /// renderer's built-in shader.
+    #[pill_mirror_method]
     pub fn shader(mut self, shader: &Handle<Shader>) -> Self {
         self.material.shader = *shader;
         self
@@ -121,6 +130,7 @@ impl MaterialBuilder {
     ///
     /// Binding a slot twice replaces the earlier binding: the map keeps one
     /// texture per slot, and the last call is the one that was meant.
+    #[pill_mirror_method]
     pub fn texture(mut self, slot: impl Into<String>, texture: &Handle<Texture>) -> Self {
         self.material
             .textures
@@ -129,6 +139,7 @@ impl MaterialBuilder {
     }
 
     /// Set one scalar uniform parameter, under the slot the shader declares.
+    #[pill_mirror_method]
     pub fn scalar_parameter(mut self, slot: impl Into<String>, value: f32) -> Self {
         self.material
             .parameters
@@ -137,6 +148,7 @@ impl MaterialBuilder {
     }
 
     /// Set one boolean uniform parameter, packed as a `u32` of 0 or 1.
+    #[pill_mirror_method]
     pub fn bool_parameter(mut self, slot: impl Into<String>, value: bool) -> Self {
         self.material
             .parameters
@@ -145,6 +157,7 @@ impl MaterialBuilder {
     }
 
     /// Set one colour uniform parameter, packed as three `f32`s.
+    #[pill_mirror_method]
     pub fn color_parameter(mut self, slot: impl Into<String>, value: [f32; 3]) -> Self {
         self.material
             .parameters
@@ -155,12 +168,14 @@ impl MaterialBuilder {
     /// Choose when the material draws relative to the others in the same pass.
     ///
     /// See [`Material::rendering_order`]: a larger value is drawn earlier.
+    #[pill_mirror_method]
     pub fn rendering_order(mut self, value: u8) -> Self {
         self.material.rendering_order = value;
         self
     }
 
     /// Finish building and return the material.
+    #[pill_mirror_method]
     pub fn build(self) -> Material {
         self.material
     }

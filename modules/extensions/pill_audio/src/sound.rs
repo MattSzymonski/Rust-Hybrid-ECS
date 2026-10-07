@@ -64,6 +64,11 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// `Debug` prints the path and the byte count rather than the bytes: a sound
 /// is megabytes of samples, and a default derive would dump all of them into
 /// a log line.
+///
+/// Mirrored to C# as `pill_audio.Sound`: a managed project imports one with
+/// `assets.Import<Sound>(path, ...)` and builds one with `Sound.Load` or
+/// `Sound.FromBytes`, exactly as a Rust project would.
+#[pill_engine::pill_mirror_object(asset, import)]
 pub struct Sound {
     /// Path the bytes were read from, kept for diagnostics and reloading.
     path: std::path::PathBuf,
@@ -152,6 +157,7 @@ impl std::error::Error for SoundLoadError {
     }
 }
 
+#[pill_engine::pill_mirror_impl]
 impl Sound {
     /// Read an audio file into memory.
     ///
@@ -167,6 +173,7 @@ impl Sound {
     /// [`SoundLoadError::InvalidPath`] when the format is not supported or no
     /// mount has the path, and [`SoundLoadError::Unreadable`] when the file
     /// was found but cannot be read.
+    #[pill_engine::pill_mirror_method]
     pub fn load(path: &std::path::Path) -> Result<Self, SoundLoadError> {
         let path = path.to_path_buf();
         validate_format(&path).map_err(SoundLoadError::InvalidPath)?;
@@ -190,6 +197,7 @@ impl Sound {
     ///
     /// For an embedded asset (`include_bytes!`) or one produced by a cooking
     /// step, where there is no path to validate.
+    #[pill_engine::pill_mirror_method]
     pub fn from_bytes(path: &std::path::Path, bytes: Vec<u8>) -> Self {
         Self {
             path: path.to_path_buf(),

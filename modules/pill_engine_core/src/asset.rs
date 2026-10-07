@@ -568,7 +568,19 @@ pub struct AssetManager {
     revision: u64,
 }
 
-impl Resource for AssetManager {}
+/// The shared name C# reaches the store under, as
+/// `ResMut<TracyLive.AssetManager>`.
+///
+/// Shared rather than `TypeId`-keyed so the identity is a name both languages
+/// can compute: the managed marker type hashes the same string, and every
+/// artifact that links the engine agrees on it without comparing `TypeId`s.
+pub const ASSET_MANAGER_SHARED_NAME: &str = "pill_engine::asset::AssetManager";
+
+impl Resource for AssetManager {
+    fn shared_name() -> Option<&'static str> {
+        Some(ASSET_MANAGER_SHARED_NAME)
+    }
+}
 
 impl AssetManager {
     /// The storage key `T`'s column is kept under, or `None` when `T` is a

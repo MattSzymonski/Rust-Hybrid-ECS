@@ -96,37 +96,6 @@ public unsafe struct EngineApi
     /// </remarks>
     public delegate* unmanaged[Cdecl]<ulong, ulong, byte, NativeResourceView*, byte> GetResourceView;
 
-    /// <summary>
-    /// Decode a Wavefront OBJ buffer into a mesh, inserted into the active
-    /// invocation's <c>AssetManager</c>. Appended after <see cref="GetResourceView"/>
-    /// for the same reason every earlier addition was: a new slot goes at the
-    /// end, never between existing ones.
-    /// </summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, byte*, uint, uint*, uint*, byte> AssetLoadMeshObj;
-
-    /// <summary>Decode a PNG buffer into a color texture, inserted the same way.</summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, byte*, uint, uint*, uint*, byte> AssetLoadTexturePng;
-
-    /// <summary>Build a shader from managed WGSL sources and slot declarations.</summary>
-    public delegate* unmanaged[Cdecl]<
-        byte*, uint,
-        byte*, uint,
-        byte*, uint,
-        NativeShaderParameterSlot*, uint,
-        NativeShaderTextureSlot*, uint,
-        byte, byte,
-        uint*, uint*, byte> AssetLoadShader;
-
-    /// <summary>Build a material from already-loaded handles and per-slot parameters.</summary>
-    public delegate* unmanaged[Cdecl]<
-        byte*, uint,
-        uint, uint,
-        NativeMaterialTexture*, uint,
-        NativeMaterialScalar*, uint,
-        NativeMaterialColor*, uint,
-        byte,
-        uint*, uint*, byte> AssetCreateMaterial;
-
     /// <summary>Emit a managed event through the native tracing subscriber.</summary>
     public delegate* unmanaged[Cdecl]<byte, byte*, uint, byte*, uint, void> CSharpLog;
 
@@ -135,40 +104,6 @@ public unsafe struct EngineApi
 
     /// <summary>End a dynamic managed profiling zone.</summary>
     public delegate* unmanaged[Cdecl]<ulong, void> CSharpZoneEnd;
-
-    /// <summary>
-    /// Import a texture from <c>res</c> through its <c>.meta</c> file: path,
-    /// policy, initial settings as UTF-8 JSON, output. One named slot per
-    /// asset type, appended at the end like every earlier slot.
-    /// </summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportTexture;
-
-    /// <summary>Import a mesh, shaped like <see cref="AssetImportTexture"/>.</summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportMesh;
-
-    /// <summary>Import a sound, shaped like <see cref="AssetImportTexture"/>.</summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportSound;
-
-    /// <summary>
-    /// Drop the rendering pipeline the world's <c>RenderingManager</c> holds,
-    /// returning the renderer to its built-in chain. Takes no arguments;
-    /// returns the shared asset status byte. Appended at the end like every
-    /// earlier slot.
-    /// </summary>
-    public delegate* unmanaged[Cdecl]<byte> AssetClearRenderPipeline;
-
-    /// <summary>
-    /// Import a standalone material file. Takes the path bytes and writes the
-    /// handle through the two outputs; returns the shared asset status byte.
-    /// Appended at the end like every earlier slot.
-    /// </summary>
-    public delegate* unmanaged[Cdecl]<byte*, uint, uint*, uint*, byte> AssetImportMaterial;
-
-    /// <summary>
-    /// Draw a material as the sky behind the PBR chain, or turn the sky off
-    /// when both handle halves are <c>uint.MaxValue</c>. Appended at the end.
-    /// </summary>
-    public delegate* unmanaged[Cdecl]<uint, uint, byte> AssetSetSkybox;
 
     /// <summary>
     /// Whether a key, by its <see cref="KeyCode"/> value, is held this frame.
@@ -207,76 +142,30 @@ public unsafe struct EngineApi
     /// same reason every earlier addition was: a new slot goes at the end.
     /// </summary>
     public delegate* unmanaged[Cdecl]<delegate* unmanaged[Cdecl]<nint, uint, void>, nint, uint, byte> ParallelFor;
-}
 
-/// <summary>
-/// What an import writes: the mirror of <c>pill_engine::asset_ffi::NativeImportedAsset</c>,
-/// field for field.
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-public struct NativeImportedAsset
-{
-    public uint Index;
-    public uint Generation;
-    public ulong GuidLow;
-    public ulong GuidHigh;
-    /// <summary><c>1</c> when the path was already loaded.</summary>
-    public byte AlreadyLoaded;
-    /// <summary><c>0</c> read from a file, <c>1</c> a file was written, <c>2</c> in memory only.</summary>
-    public byte MetadataSource;
-}
+    /// <summary>
+    /// Take the last error (<c>0</c>) or the returned string (<c>1</c>) a
+    /// mirrored call left on this thread: writes a pointer and a length the
+    /// caller copies before its next call. Status <c>0</c> handed text out,
+    /// <c>1</c> the channel was empty.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte, byte**, uint*, byte> TakeMirrorText;
 
-/// <summary>One parameter slot a managed shader declaration supplies.</summary>
-[StructLayout(LayoutKind.Sequential)]
-public unsafe struct NativeShaderParameterSlot
-{
-    public byte* Name;
-    public uint NameLen;
-    /// <summary><c>0</c> scalar, <c>1</c> bool, <c>2</c> color.</summary>
-    public byte Kind;
-}
+    /// <summary>
+    /// Write the address of a Rust-owned resource, by its shared name's
+    /// identity halves, under the requested mode (<c>0</c> read, <c>1</c>
+    /// write). Status <c>0</c> wrote it, <c>1</c> the world holds no value,
+    /// <c>2</c> the access was not declared, <c>3</c> no invocation is
+    /// running.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<ulong, ulong, byte, void**, byte> GetNativeResource;
 
-/// <summary>
-/// One texture slot a managed shader declaration supplies. The bound texture
-/// is always color-typed.
-/// </summary>
-[StructLayout(LayoutKind.Sequential)]
-public unsafe struct NativeShaderTextureSlot
-{
-    public byte* Name;
-    public uint NameLen;
-    public uint TextureBinding;
-    public uint SamplerBinding;
-}
-
-/// <summary>One texture a managed material declaration binds to a shader slot.</summary>
-[StructLayout(LayoutKind.Sequential)]
-public unsafe struct NativeMaterialTexture
-{
-    public byte* Slot;
-    public uint SlotLen;
-    public uint TextureIndex;
-    public uint TextureGeneration;
-}
-
-/// <summary>One scalar parameter a managed material declaration sets.</summary>
-[StructLayout(LayoutKind.Sequential)]
-public unsafe struct NativeMaterialScalar
-{
-    public byte* Name;
-    public uint NameLen;
-    public float Value;
-}
-
-/// <summary>One color parameter a managed material declaration sets.</summary>
-[StructLayout(LayoutKind.Sequential)]
-public unsafe struct NativeMaterialColor
-{
-    public byte* Name;
-    public uint NameLen;
-    public float R;
-    public float G;
-    public float B;
+    /// <summary>
+    /// Read a file below <c>res</c> through the mounted asset store for
+    /// <see cref="AssetLoader.Load"/>; status <c>1</c> leaves the reason in
+    /// the last-error channel.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte**, uint*, byte> AssetLoaderRead;
 }
 
 /// <summary>

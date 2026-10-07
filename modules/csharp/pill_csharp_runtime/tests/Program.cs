@@ -330,7 +330,123 @@ internal static unsafe class MockNativeWorld
         MirrorEpoch = &MirrorEpoch,
         CurrentScopeToken = &CurrentScopeToken,
         ParallelFor = &ParallelFor,
+        TakeMirrorText = &TakeMirrorText,
+        GetNativeResource = &GetNativeResource,
     };
+
+    // ---- Mirror ABI ------------------------------------------------------
+
+    /// <summary>The message the mock host's last-error channel holds, if any.</summary>
+    internal static string? MirrorError;
+
+    /// <summary>The string the mock host's return channel holds, if any.</summary>
+    internal static string? MirrorReturnString;
+
+    /// <summary>Native copy of the last text handed out, kept until the next take.</summary>
+    private static IntPtr _heldText;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte TakeMirrorText(byte kind, byte** data, uint* length)
+    {
+        string? text = kind == 0 ? MirrorError : MirrorReturnString;
+        if (kind == 0)
+            MirrorError = null;
+        else
+            MirrorReturnString = null;
+        if (text is null)
+            return 1;
+        if (_heldText != IntPtr.Zero)
+            Marshal.FreeHGlobal(_heldText);
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
+        _heldText = Marshal.AllocHGlobal(Math.Max(bytes.Length, 1));
+        Marshal.Copy(bytes, 0, _heldText, bytes.Length);
+        *data = (byte*)_heldText;
+        *length = (uint)bytes.Length;
+        return 0;
+    }
+
+    /// <summary>What the mock host answers a native resource request with.</summary>
+    internal static byte NativeResourceStatus;
+
+    /// <summary>The address the mock host hands out for a native resource.</summary>
+    internal static IntPtr NativeResourceAddress = (IntPtr)0x5000;
+
+    /// <summary>The mode the last native resource request asked for.</summary>
+    internal static byte LastNativeResourceMode;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte GetNativeResource(ulong low, ulong high, byte mode, void** output)
+    {
+        LastNativeResourceMode = mode;
+        if (NativeResourceStatus != 0)
+            return NativeResourceStatus;
+        *output = (void*)NativeResourceAddress;
+        return 0;
+    }
+
+    /// <summary>The slots the last probe call received, copied out.</summary>
+    internal static byte[] ProbedSlots = [];
+
+    /// <summary>
+    /// A trampoline that records its slots and answers with the sum of the
+    /// first slot's <c>uint</c> and the string's length - enough to show the
+    /// arguments arrived and the result travels back.
+    /// </summary>
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorProbe(byte* args, byte* ret)
+    {
+        ProbedSlots = new ReadOnlySpan<byte>(args, 16 * 8).ToArray();
+        uint first = *(uint*)args;
+        uint stringLength = *(uint*)(args + 16 + 8);
+        *(uint*)ret = first + stringLength;
+        return 0;
+    }
+
+    /// <summary>A trampoline that adds its first slot to one, touching no managed memory.</summary>
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorIncrement(byte* args, byte* ret)
+    {
+        *(uint*)ret = *(uint*)args + 1;
+        return 0;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorFails(byte* args, byte* ret)
+    {
+        MirrorError = "the OBJ has no triangles";
+        return 1;
+    }
+
+    /// <summary>Boxes the mock trampolines handed out and dropped.</summary>
+    internal static int ObjectsCreated;
+    internal static int ObjectsDropped;
+    internal static IntPtr LastDropped;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorMakeObject(byte* args, byte* ret)
+    {
+        ObjectsCreated++;
+        *(IntPtr*)ret = (IntPtr)(0x9000 + ObjectsCreated);
+        return 0;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorDropObject(byte* args, byte* ret)
+    {
+        ObjectsDropped++;
+        LastDropped = *(IntPtr*)args;
+        return 0;
+    }
+
+    /// <summary>Records the box a by-value call consumed.</summary>
+    internal static IntPtr LastConsumed;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte MirrorConsumeObject(byte* args, byte* ret)
+    {
+        LastConsumed = *(IntPtr*)args;
+        return 0;
+    }
 
     /// <summary>
     /// The epoch the host would bump when it republishes its mirror-method
@@ -1912,6 +2028,190 @@ internal static class Program
                 Equal(written, (byte)0, "utf8 write status");
             });
 
+            Test("a mirrored call packs every slot the Rust side reads", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Probe", "probe",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorProbe);
+
+                var call = MirrorCall.Begin("Test.Probe", "probe");
+                call.Push(7u);
+                call.PushString("pill");
+                call.PushSpan<float>([1.5f, 2.5f]);
+                call.PushField(0, 3u);
+                call.PushField(4, 9u);
+                call.EndSlot();
+                call.PushOptional<uint>(42u);
+                call.PushOptional<uint>(null);
+                call.PushResource<AssetManager>(QueryAccess.Write);
+                call.PushLoader(AssetLoader.FromBytes([5, 6, 7]));
+                call.Invoke();
+                Equal(call.Result<uint>(), 11u, "the result travels back");
+
+                byte[] slots = MockNativeWorld.ProbedSlots;
+                Equal(BitConverter.ToUInt32(slots, 0), 7u, "a primitive at offset 0");
+                Equal(BitConverter.ToUInt32(slots, 16 + 8), 4u, "a string's byte length at 8");
+                Equal(BitConverter.ToUInt32(slots, 32 + 8), 2u, "a span's element count at 8");
+                Equal(BitConverter.ToUInt32(slots, 48), 3u, "a tuple's first field");
+                Equal(BitConverter.ToUInt32(slots, 48 + 4), 9u, "a tuple's second field at its offset");
+                Equal(BitConverter.ToUInt32(slots, 64), 42u, "a present option's value");
+                Equal(slots[64 + 15], (byte)1, "a present option's flag at 15");
+                Equal(slots[80 + 15], (byte)0, "an absent option's flag");
+                Equal((IntPtr)BitConverter.ToInt64(slots, 96), MockNativeWorld.NativeResourceAddress,
+                    "a resource slot carries the address the host handed out");
+                Equal(MockNativeWorld.LastNativeResourceMode, (byte)1, "a write was requested");
+                Equal(BitConverter.ToUInt32(slots, 112 + 8), 3u, "a bytes loader's length");
+                Equal(slots[112 + 12], (byte)1, "a bytes loader's kind at 12");
+            });
+
+            Test("a mirrored call of primitives allocates nothing", () =>
+            {
+                // Generated value-type methods run per row, per frame (the
+                // spline sampling in project_cs), so the call path must not
+                // touch the managed heap once the thread's frame exists.
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Probe", "increment",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorIncrement);
+                static uint CallOnce(uint value)
+                {
+                    var call = MirrorCall.Begin("Test.Probe", "increment");
+                    call.Push(value);
+                    call.Push(0.5f);
+                    call.Invoke();
+                    return call.Result<uint>();
+                }
+                CallOnce(1);
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                uint total = 0;
+                for (uint index = 0; index < 1000; index++)
+                    total += CallOnce(index);
+                long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                Assert(total > 0, "the calls ran");
+                Equal(allocated, 0L, "bytes allocated by 1000 mirrored calls");
+            });
+
+            Test("a failed mirrored call throws with the Rust error's message", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Probe", "fails",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorFails);
+                EngineException? caught = null;
+                try
+                {
+                    var call = MirrorCall.Begin("Test.Probe", "fails");
+                    call.Invoke();
+                }
+                catch (EngineException exception)
+                {
+                    caught = exception;
+                }
+                Assert(caught is not null, "the failure must surface as an EngineException");
+                Assert(caught!.Message.Contains("the OBJ has no triangles"), caught.Message);
+                Assert(caught.Message.Contains("Test.Probe::fails"), caught.Message);
+            });
+
+            Test("an undeclared native resource access is refused by name", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Probe", "probe",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorProbe);
+                MockNativeWorld.NativeResourceStatus = 2;
+                try
+                {
+                    Throws<InvalidOperationException>(() =>
+                    {
+                        var call = MirrorCall.Begin("Test.Probe", "probe");
+                        call.PushResource<AssetManager>(QueryAccess.Write);
+                    }, "an undeclared access must be refused");
+                }
+                finally
+                {
+                    MockNativeWorld.NativeResourceStatus = 0;
+                }
+            });
+
+            Test("an object is moved once and dropped once", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Object", "make",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorMakeObject);
+                MirrorMethods.Register("Test.Object", "__type",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorDropObject);
+                MirrorMethods.Register("Test.Object", "consume",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorConsumeObject);
+
+                ProbeObject Make()
+                {
+                    var call = MirrorCall.Begin("Test.Object", "make");
+                    call.Invoke();
+                    return new ProbeObject(call.ResultObject(0));
+                }
+
+                int droppedBefore = MockNativeWorld.ObjectsDropped;
+                ProbeObject moved = Make();
+                var consume = MirrorCall.Begin("Test.Object", "consume");
+                consume.PushMoved(moved);
+                consume.Invoke();
+                Assert(!moved.IsAlive, "a moved object owns nothing");
+                Assert(MockNativeWorld.LastConsumed != IntPtr.Zero, "the box reached the call");
+                Throws<ObjectDisposedException>(() =>
+                {
+                    var again = MirrorCall.Begin("Test.Object", "consume");
+                    again.PushMoved(moved);
+                }, "a moved object cannot be moved again");
+                moved.Dispose();
+                Equal(MockNativeWorld.ObjectsDropped, droppedBefore, "a moved object is not dropped by C#");
+
+                ProbeObject disposed = Make();
+                disposed.Dispose();
+                disposed.Dispose();
+                Equal(MockNativeWorld.ObjectsDropped, droppedBefore + 1, "dispose drops exactly once");
+            });
+
+            Test("an object that outlived a module reload is leaked, not dropped", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Object", "make",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorMakeObject);
+                var call = MirrorCall.Begin("Test.Object", "make");
+                call.Invoke();
+                var stale = new ProbeObject(call.ResultObject(0));
+
+                // A rebind is what an extension reload looks like to the runtime.
+                MirrorMethods.Reset();
+                MirrorMethods.Register("Test.Object", "__type",
+                    (IntPtr)(delegate* unmanaged[Cdecl]<byte*, byte*, byte>)&MockNativeWorld.MirrorDropObject);
+                int droppedBefore = MockNativeWorld.ObjectsDropped;
+                Throws<InvalidOperationException>(() =>
+                {
+                    var use = MirrorCall.Begin("Test.Object", "__type");
+                    use.PushBorrowed(stale);
+                }, "a stale object refuses to be used");
+                stale.Dispose();
+                Equal(MockNativeWorld.ObjectsDropped, droppedBefore, "a stale object's drop must not run");
+            });
+
+            Test("a native resource marker is refused as a byte resource", () =>
+            {
+                Throws<InvalidOperationException>(
+                    () => ResourceAccess.Borrow<AssetManager>(QueryAccess.Read),
+                    "a Rust resource has no C# value");
+                Equal(ResourceNames.Of(typeof(AssetManager)), "pill_engine::asset::AssetManager",
+                    "the marker is named by the Rust shared name");
+            });
+
             Console.WriteLine($"C# ECS runtime tests passed: {_passed}");
             return 0;
         }
@@ -2447,5 +2747,13 @@ internal static class Program
             $"checksum={callSink + walkSink + taxSink + _benchSink:F1}");
         NativeMemory.Free(elements);
         MockNativeWorld.AccessorElements = null;
+    }
+}
+
+/// <summary>A wrapped Rust value for the mirror-call tests.</summary>
+internal sealed class ProbeObject : RustObject
+{
+    internal ProbeObject(RustObjectHandle handle) : base(handle, "Test.Object")
+    {
     }
 }

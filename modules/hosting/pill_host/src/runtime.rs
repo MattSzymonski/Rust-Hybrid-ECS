@@ -1219,10 +1219,6 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         }
         extensions.push(slot);
     }
-    // The renderer data crate's asset functions, for the C# bridge: resolved
-    // from whichever loaded module offers them, before any managed code runs.
-    publish_asset_exports(&extensions);
-
     // Step 5: Build and load the project module, then start its source watcher.
     // Extensions load first, so the C# backend can be handed every
     // native component the modules exposed to managed code: each module's
@@ -1593,25 +1589,6 @@ where
         shader_watcher,
         unsupported_data_check_pending: true,
     })
-}
-
-/// Publish the C# asset functions the loaded extensions offer (the renderer
-/// data crate's), taking the last module that offers each name.
-///
-/// A project with no renderer data crate publishes none, and its C# asset
-/// calls report that no renderer data provides them.
-fn publish_asset_exports(extensions: &[ExtensionSlot]) {
-    let found = crate::csharp::publish_asset_exports(|name| {
-        extensions
-            .iter()
-            .rev()
-            .find_map(|slot| slot.export_address(name))
-    });
-    info!(
-        target: telemetry_target::HOT_RELOAD,
-        found,
-        "C# asset functions published from the loaded extensions"
-    );
 }
 
 /// Drop every recorded prologue address, because an image was just replaced.
@@ -2323,13 +2300,6 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         .iter()
         .map(|&index| extensions[index].name().to_owned())
         .collect();
-
-    // Step 3a: A reloaded module may be the one offering the C# asset
-    // functions; its previous generation's addresses must not be used again,
-    // and managed code (a queued C# reload re-runs startups) may call them next.
-    if any_module_reloaded {
-        publish_asset_exports(extensions);
-    }
 
     // Step 3b: A reloaded module may have changed the C# mirror surface
     // (component fields, value types, or mirrored methods), and even a

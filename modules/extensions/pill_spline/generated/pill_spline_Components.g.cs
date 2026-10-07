@@ -38,64 +38,51 @@ public partial struct OmoMO
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 
-    /// Calls the Rust method `pill_spline::OmoMO::get_a` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetADelegate(global::TracyLive.RowPointer self);
-
+    /// <summary>Calls the Rust function <c>pill_spline::OmoMO::get_a</c>.</summary>
     public ulong GetA()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetADelegate>("pill_spline::OmoMO", "get_a");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::OmoMO", "get_a");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Invoke();
+        return __call.Result<ulong>();
     }
 
-    /// Calls the Rust method `pill_spline::OmoMO::get_b` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetBDelegate(global::TracyLive.RowPointer self);
-
+    /// <summary>Calls the Rust function <c>pill_spline::OmoMO::get_b</c>.</summary>
     public ulong GetB()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetBDelegate>("pill_spline::OmoMO", "get_b");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::OmoMO", "get_b");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Invoke();
+        return __call.Result<ulong>();
     }
 
-    /// Calls the Rust method `pill_spline::OmoMO::get_c` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetCDelegate(global::TracyLive.RowPointer self);
-
+    /// <summary>Calls the Rust function <c>pill_spline::OmoMO::get_c</c>.</summary>
     public ulong GetC()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetCDelegate>("pill_spline::OmoMO", "get_c");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::OmoMO", "get_c");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Invoke();
+        return __call.Result<ulong>();
     }
 
-    /// Calls the Rust method `pill_spline::OmoMO::get_d` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate int OmoMOGetDDelegate(global::TracyLive.RowPointer self, int alpha, int beta);
-
+    /// <summary>Calls the Rust function <c>pill_spline::OmoMO::get_d</c>.</summary>
     public int GetD(int alpha, int beta)
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetDDelegate>("pill_spline::OmoMO", "get_d");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), alpha, beta);
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::OmoMO", "get_d");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Push(alpha);
+        __call.Push(beta);
+        __call.Invoke();
+        return __call.Result<int>();
     }
 
-    /// Calls the Rust method `pill_spline::OmoMO::get_sum` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);
-
+    /// <summary>Calls the Rust function <c>pill_spline::OmoMO::get_sum</c>.</summary>
     public ulong GetSum()
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>("pill_spline::OmoMO", "get_sum");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::OmoMO", "get_sum");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Invoke();
+        return __call.Result<ulong>();
     }
 }
 
@@ -129,40 +116,36 @@ public partial struct Spline
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 
-    /// Calls the Rust method `pill_spline::Spline::get_location_x` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate float SplineGetLocationXDelegate(global::TracyLive.RowPointer self, float t);
-
+    /// <summary>Calls the Rust function <c>pill_spline::Spline::get_location_x</c>.</summary>
     public float GetLocationX(float t)
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineGetLocationXDelegate>("pill_spline::Spline", "get_location_x");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::Spline", "get_location_x");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Push(t);
+        __call.Invoke();
+        return __call.Result<float>();
     }
 
-    /// Calls the Rust method `pill_spline::Spline::get_location_y` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate float SplineGetLocationYDelegate(global::TracyLive.RowPointer self, float t);
-
+    /// <summary>Calls the Rust function <c>pill_spline::Spline::get_location_y</c>.</summary>
     public float GetLocationY(float t)
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineGetLocationYDelegate>("pill_spline::Spline", "get_location_y");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::Spline", "get_location_y");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Push(t);
+        __call.Invoke();
+        return __call.Result<float>();
     }
 
-    /// Calls the Rust method `pill_spline::Spline::set_control_point_location` through its
-    /// generated C-ABI trampoline, handing it the receiver's live
-    /// address without boxing or pinning it.
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate byte SplineSetControlPointLocationDelegate(global::TracyLive.RowPointer self, uint index, float x, float y);
-
-    public byte SetControlPointLocation(uint index, float x, float y)
+    /// <summary>Calls the Rust function <c>pill_spline::Spline::set_control_point_location</c>.</summary>
+    public bool SetControlPointLocation(uint index, float x, float y)
     {
-        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineSetControlPointLocationDelegate>("pill_spline::Spline", "set_control_point_location");
-        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), index, x, y);
+        var __call = global::TracyLive.MirrorCall.Begin("pill_spline::Spline", "set_control_point_location");
+        __call.PushAddress(ref global::System.Runtime.CompilerServices.Unsafe.AsRef(in this));
+        __call.Push(index);
+        __call.Push(x);
+        __call.Push(y);
+        __call.Invoke();
+        return __call.Result<bool>();
     }
 }
 

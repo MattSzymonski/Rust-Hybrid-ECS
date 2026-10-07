@@ -247,76 +247,11 @@ pub(super) struct CsEngineApi {
     /// purpose: the managed mirror struct reproduces this field order, so a new
     /// slot goes at the end rather than between existing ones.
     get_resource_view: extern "C" fn(u64, u64, u8, *mut ResourceView) -> u8,
-    /// Decode a Wavefront OBJ buffer into a mesh, inserted into the active
-    /// invocation's `AssetManager`. Status `0` succeeded; see
-    /// `assets::ffi_asset_load_mesh_obj` for the rest.
-    asset_load_mesh_obj: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
-    /// Decode a PNG buffer into a color texture, inserted the same way.
-    asset_load_texture_png: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
-    /// Build a shader from managed WGSL sources and slot declarations. The slot
-    /// arrays cross as opaque pointers: their element layout is shared by the
-    /// managed side and the renderer data crate, which builds the asset
-    /// (`pill_master_renderer_data::csharp_assets`), not by the host.
-    asset_load_shader: extern "C" fn(
-        *const u8,
-        u32,
-        *const u8,
-        u32,
-        *const u8,
-        u32,
-        *const std::ffi::c_void,
-        u32,
-        *const std::ffi::c_void,
-        u32,
-        u8,
-        u8,
-        *mut u32,
-        *mut u32,
-    ) -> u8,
-    /// Build a material from already-loaded handles and per-slot parameters.
-    asset_create_material: extern "C" fn(
-        *const u8,
-        u32,
-        u32,
-        u32,
-        *const std::ffi::c_void,
-        u32,
-        *const std::ffi::c_void,
-        u32,
-        *const std::ffi::c_void,
-        u32,
-        u8,
-        *mut u32,
-        *mut u32,
-    ) -> u8,
     /// Emit a managed log event through the shared tracing subscriber.
     csharp_log: extern "C" fn(u8, *const u8, u32, *const u8, u32),
     /// Begin and end a dynamic managed Tracy zone.
     csharp_zone_begin: extern "C" fn(*const u8, u32) -> u64,
     csharp_zone_end: extern "C" fn(u64),
-    /// Import a texture, mesh or sound from `res` through its `.meta` file:
-    /// path, policy (`0` read if present, `1` create if missing), initial
-    /// settings as UTF-8 JSON, and the output (`pill_engine::asset_ffi::NativeImportedAsset`).
-    /// One named slot per type, appended at the end like every earlier slot.
-    asset_import_texture:
-        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
-    asset_import_mesh:
-        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
-    asset_import_sound:
-        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
-    /// Drop the active invocation's world rendering pipeline, returning the
-    /// renderer to its built-in pass. `0` succeeded; see
-    /// `pill_master_renderer_data::csharp_assets` for the rest. Appended at the
-    /// end like every earlier slot.
-    asset_clear_render_pipeline: extern "C" fn() -> u8,
-    /// Import a standalone material file, inserted into the active
-    /// invocation's `AssetManager`. `0` succeeded; see
-    /// `pill_master_renderer_data::csharp_assets` for the rest. Appended at
-    /// the end like every earlier slot.
-    asset_import_material: extern "C" fn(*const u8, u32, *mut u32, *mut u32) -> u8,
-    /// Draw a material as the sky behind the PBR chain, or turn the sky off
-    /// with the `u32::MAX` handle halves. Appended at the end.
-    asset_set_skybox: extern "C" fn(u32, u32) -> u8,
     /// Whether a key, by its [`KeyCode`](pill_engine::KeyCode) discriminant,
     /// is held this frame. Appended at the end.
     input_key_held: extern "C" fn(u8) -> u8,
@@ -337,6 +272,16 @@ pub(super) struct CsEngineApi {
     /// the end like every earlier slot.
     parallel_for:
         extern "C" fn(super::parallel::ParallelCallback, *mut std::ffi::c_void, u32) -> u8,
+    /// Take the last error (`0`) or the returned string (`1`) a mirrored call
+    /// left on this thread; see `mirror_calls::ffi_take_mirror_text`.
+    take_mirror_text: extern "C" fn(u8, *mut *const u8, *mut u32) -> u8,
+    /// Write the address of a Rust-owned resource, by its shared name's
+    /// identity, under the running invocation's declared access; see
+    /// `mirror_calls::ffi_get_native_resource`.
+    get_native_resource: extern "C" fn(u64, u64, u8, *mut *mut std::ffi::c_void) -> u8,
+    /// Read a file below `res` through the mounted asset store for
+    /// `AssetLoader.Load()`; see `mirror_calls::ffi_asset_loader_read`.
+    asset_loader_read: extern "C" fn(*const u8, u32, *mut *const u8, *mut u32) -> u8,
 }
 
 impl CsEngineApi {
@@ -368,25 +313,18 @@ impl CsEngineApi {
             current_scope_token: super::context::ffi_current_scope_token,
             mirror_epoch: ffi_mirror_epoch,
             get_resource_view: super::resources::ffi_get_resource_view,
-            asset_load_mesh_obj: super::assets::ffi_asset_load_mesh_obj,
-            asset_load_texture_png: super::assets::ffi_asset_load_texture_png,
-            asset_load_shader: super::assets::ffi_asset_load_shader,
-            asset_create_material: super::assets::ffi_asset_create_material,
             csharp_log: ffi_csharp_log,
             csharp_zone_begin: ffi_csharp_zone_begin,
             csharp_zone_end: ffi_csharp_zone_end,
-            asset_import_texture: super::assets::ffi_asset_import_texture,
-            asset_import_mesh: super::assets::ffi_asset_import_mesh,
-            asset_import_sound: super::assets::ffi_asset_import_sound,
-            asset_clear_render_pipeline: super::assets::ffi_asset_clear_render_pipeline,
-            asset_import_material: super::assets::ffi_asset_import_material,
-            asset_set_skybox: super::assets::ffi_asset_set_skybox,
             input_key_held: super::frame_state::ffi_input_key_held,
             input_mouse_button_held: super::frame_state::ffi_input_mouse_button_held,
             input_mouse_delta: super::frame_state::ffi_input_mouse_delta,
             time_delta_seconds: super::frame_state::ffi_time_delta_seconds,
             time_elapsed_seconds: super::frame_state::ffi_time_elapsed_seconds,
             parallel_for: super::parallel::ffi_parallel_for,
+            take_mirror_text: super::mirror_calls::ffi_take_mirror_text,
+            get_native_resource: super::mirror_calls::ffi_get_native_resource,
+            asset_loader_read: super::mirror_calls::ffi_asset_loader_read,
         }
     }
 }
@@ -404,7 +342,10 @@ pub fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
     // so the stored table stays `Send`.
     let mut names: Vec<std::ffi::CString> = Vec::new();
     let mut rows: Vec<MirrorMethodRow> = Vec::new();
-    for method in mirror_methods {
+    for method in mirror_methods
+        .iter()
+        .filter(|method| super::mirror_calls::is_callable(method))
+    {
         let Some(type_name) = std::ffi::CString::new(method.type_name.as_str()).ok() else {
             continue;
         };

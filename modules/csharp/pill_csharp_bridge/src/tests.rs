@@ -2726,79 +2726,197 @@ fn a_managed_resource_publishes_its_field_layout() {
 }
 
 // =============================================================================
-// Asset functions (renderer data crate, found by name)
+// Mirrored Rust functions (renderer data crate, reached by address)
 // =============================================================================
 
-/// The export names the C# asset entry points forward to.
-const ASSET_EXPORTS: [&str; 7] = [
-    "pill_render_data_load_mesh_obj",
-    "pill_render_data_load_texture_png",
-    "pill_render_data_load_shader",
-    "pill_render_data_create_material",
-    "pill_render_data_import_texture",
-    "pill_render_data_import_mesh",
-    "pill_render_data_clear_render_pipeline",
-];
+/// The qualified name `#[pill_mirror_object]` files the renderer's mesh under.
+const MESH_TYPE: &str = "pill_master_renderer_data::assets::mesh::Mesh";
 
-/// A binary that links the renderer data crate finds every asset function the
-/// C# bridge forwards to by its export name (the shipping path).
-#[test]
-fn the_renderer_data_asset_functions_are_found_by_name() {
-    for name in ASSET_EXPORTS {
-        assert!(
-            pill_engine::component_registry::find_export(name).is_some(),
-            "{name} is not offered by any linked crate"
-        );
+/// The qualified name of the renderer's pipeline resource.
+const RENDERING_MANAGER_TYPE: &str =
+    "pill_master_renderer_data::rendering_manager::RenderingManager";
+
+/// The address of one mirrored function in this binary's own table.
+fn mirrored(type_name: &str, method: &str) -> usize {
+    super::mirror_calls::static_mirror_methods()
+        .into_iter()
+        .find(|row| row.type_name == type_name && row.method_name == method)
+        .unwrap_or_else(|| panic!("{type_name}::{method} is not mirrored"))
+        .address
+}
+
+/// Call a mirrored trampoline with packed slots, returning its status and the
+/// return buffer.
+fn call_mirrored(address: usize, slots: &[[u8; 16]]) -> (u8, [u8; 64]) {
+    type Trampoline = unsafe extern "C" fn(*const u8, *mut u8) -> u8;
+    let mut ret = [0u8; 64];
+    // SAFETY: the address is a trampoline of the one mirror signature, from
+    // this binary's inventory; the slots and the return buffer outlive the call.
+    let status = unsafe {
+        let trampoline: Trampoline = std::mem::transmute(address);
+        trampoline(slots.as_ptr().cast(), ret.as_mut_ptr())
+    };
+    (status, ret)
+}
+
+/// One `str` slot over a borrowed string.
+fn str_slot(text: &str) -> [u8; 16] {
+    let mut slot = [0u8; 16];
+    slot[..8].copy_from_slice(&(text.as_ptr() as usize).to_le_bytes());
+    slot[8..12].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    slot
+}
+
+/// One slot holding an address.
+fn pointer_slot(pointer: usize) -> [u8; 16] {
+    let mut slot = [0u8; 16];
+    slot[..8].copy_from_slice(&pointer.to_le_bytes());
+    slot
+}
+
+/// The access a system declares for `ResMut<T>` over a Rust-owned resource.
+fn native_resource_write(shared_name: &str) -> NativeSystemAccess {
+    let identity = pill_engine::component::shared_component_identity(shared_name);
+    NativeSystemAccess {
+        component_key: identity as u64,
+        component_key_high: (identity >> 64) as u64,
+        mode: 1,
+        kind: super::context::ACCESS_KIND_NATIVE_RESOURCE,
     }
 }
 
-/// Outside a managed invocation the call reports "no active scope" (1), not
-/// "no asset functions" (6): the function was found, only the world is missing.
-#[test]
-fn an_asset_call_outside_an_invocation_reports_no_active_scope() {
-    // As the host does after loading the extensions (same full set as every
-    // other test publishes, so parallel tests cannot disturb each other).
-    #[cfg(feature = "hot_reload")]
-    crate::publish_asset_exports(pill_engine::component_registry::find_export);
-    let name = "outside";
-    let (mut index, mut generation) = (0u32, 0u32);
-    let status = super::assets::ffi_asset_load_mesh_obj(
-        name.as_ptr(),
-        name.len() as u32,
-        std::ptr::null(),
-        0,
-        &mut index,
-        &mut generation,
+/// Ask the bridge for a Rust-owned resource's address, as the managed side does.
+fn native_resource(shared_name: &str, mode: u8) -> (u8, usize) {
+    let identity = pill_engine::component::shared_component_identity(shared_name);
+    let mut pointer = std::ptr::null_mut();
+    let status = super::mirror_calls::ffi_get_native_resource(
+        identity as u64,
+        (identity >> 64) as u64,
+        mode,
+        &mut pointer,
     );
-    assert_eq!(status, 1);
+    (status, pointer as usize)
 }
 
-/// Inside an invocation, a mesh decoded from OBJ bytes by the renderer data
-/// crate lands in the world's asset store under its name.
+/// Take one of the mirror text channels, as the managed side does.
+fn take_text(kind: u8) -> Option<String> {
+    let (mut data, mut length) = (std::ptr::null(), 0u32);
+    let status = super::mirror_calls::ffi_take_mirror_text(kind, &mut data, &mut length);
+    (status == 0).then(|| {
+        // SAFETY: the bridge handed out `length` bytes it keeps until the next
+        // call on this thread.
+        let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+        String::from_utf8(bytes.to_vec()).expect("the channels carry UTF-8")
+    })
+}
+
+/// A binary that links the renderer data crate carries its mirrored functions
+/// and types in its own inventory, each callable one with its address - the
+/// table a shipping build hands the managed runtime.
 #[test]
-fn a_mesh_loads_through_the_forwarded_call() {
+fn the_renderer_data_mirrors_reach_the_static_table() {
+    let rows = super::mirror_calls::static_mirror_methods();
+    for (type_name, method) in [
+        (MESH_TYPE, "from_obj_bytes"),
+        (MESH_TYPE, "__type"),
+        (MESH_TYPE, "__asset_add_named"),
+        (MESH_TYPE, "__asset_import"),
+        (RENDERING_MANAGER_TYPE, "clear"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| row.type_name == type_name && row.method_name == method)
+            .unwrap_or_else(|| panic!("{type_name}::{method} is not in the table"));
+        assert_ne!(row.address, 0, "{type_name}::{method} has a trampoline");
+    }
+    let resource = rows
+        .iter()
+        .find(|row| row.type_name == RENDERING_MANAGER_TYPE && row.method_name == "__type")
+        .expect("the resource declares its type row");
+    assert_eq!(resource.owner_kind, "resource");
+    assert_eq!(
+        resource.address, 0,
+        "a resource's type row has no trampoline"
+    );
+}
+
+/// A Rust-owned resource is reached only inside an invocation, and only under
+/// the access the system declared - or in a startup, which holds the world.
+#[test]
+fn a_native_resource_needs_a_declared_access() {
     let mut engine = Engine::new();
     pill_master_renderer_data::register(&mut engine);
-    // What the host does after loading the extensions; this test binary links
-    // the data crate, so its own descriptors stand in for the loaded module.
-    #[cfg(feature = "hot_reload")]
-    crate::publish_asset_exports(pill_engine::component_registry::find_export);
+    let shared_name = pill_engine::asset::ASSET_MANAGER_SHARED_NAME;
+    assert_eq!(
+        native_resource(shared_name, 1).0,
+        3,
+        "no invocation is running"
+    );
+
     let bindings = ComponentBindings::default();
-    let name = "forwarded_triangle";
-    let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-    let (mut index, mut generation) = (u32::MAX, u32::MAX);
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
-        let status = super::assets::ffi_asset_load_mesh_obj(
-            name.as_ptr(),
-            name.len() as u32,
-            obj.as_ptr(),
-            obj.len() as u32,
-            &mut index,
-            &mut generation,
-        );
-        assert_eq!(status, 0, "the forwarded load succeeds");
+        assert_eq!(native_resource(shared_name, 1).0, 2, "nothing was declared");
     }
+    let declared = [native_resource_write(shared_name)];
+    let expected = engine
+        .world_mut()
+        .get_resource_mut::<pill_engine::AssetManager>()
+        .map(|assets| assets as *mut pill_engine::AssetManager as usize)
+        .expect("the renderer data registers asset types");
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
+        assert_eq!(
+            native_resource(shared_name, 1),
+            (0, expected),
+            "the declared write reaches the store itself"
+        );
+    }
+    let mut queue = pill_engine::commands::CommandQueue::default();
+    {
+        let _guard = ActiveSystemGuard::set_exclusive(engine.world_mut(), &mut queue, &bindings);
+        assert_eq!(
+            native_resource(shared_name, 1),
+            (0, expected),
+            "a startup holds the world"
+        );
+    }
+}
+
+/// A mesh built by its mirrored constructor and added through the mirrored
+/// asset store operation lands in the world's store, with no bridge code that
+/// names the renderer.
+#[test]
+fn a_mesh_loads_through_its_mirrored_trampolines() {
+    let mut engine = Engine::new();
+    pill_master_renderer_data::register(&mut engine);
+    let shared_name = pill_engine::asset::ASSET_MANAGER_SHARED_NAME;
+    let declared = [native_resource_write(shared_name)];
+    let bindings = ComponentBindings::default();
+    let name = "mirrored_triangle";
+    let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let (index, generation) = {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
+        let (status, ret) = call_mirrored(
+            mirrored(MESH_TYPE, "from_obj_bytes"),
+            &[str_slot(name), str_slot(obj)],
+        );
+        assert_eq!(status, 0, "the OBJ decodes: {:?}", take_text(0));
+        let mesh = usize::from_le_bytes(ret[..8].try_into().unwrap());
+        assert_ne!(mesh, 0, "the constructor returns a boxed mesh");
+
+        let (status, assets) = native_resource(shared_name, 1);
+        assert_eq!(status, 0);
+        let (status, ret) = call_mirrored(
+            mirrored(MESH_TYPE, "__asset_add_named"),
+            &[pointer_slot(assets), str_slot(name), pointer_slot(mesh)],
+        );
+        assert_eq!(status, 0, "the store takes the box: {:?}", take_text(0));
+        (
+            u32::from_le_bytes(ret[..4].try_into().unwrap()),
+            u32::from_le_bytes(ret[4..8].try_into().unwrap()),
+        )
+    };
 
     let assets = engine
         .world()
@@ -2810,16 +2928,32 @@ fn a_mesh_loads_through_the_forwarded_call() {
     assert_eq!((handle.index(), handle.generation()), (index, generation));
 }
 
-/// Inside an invocation, the forwarded clear drops the renderer's default PBR
-/// pipeline, returning the world to the built-in frame.
+/// A failed mirrored call reports status 1 and leaves its message - the Rust
+/// error's text - in the last-error channel for the managed exception.
 #[test]
-fn the_render_pipeline_clears_through_the_forwarded_call() {
+fn a_failed_mirrored_call_reports_its_message() {
+    let name = "not_a_mesh";
+    let obj = "this is not an OBJ file";
+    let (status, _) = call_mirrored(
+        mirrored(MESH_TYPE, "from_obj_bytes"),
+        &[str_slot(name), str_slot(obj)],
+    );
+    assert_eq!(status, 1, "an undecodable buffer fails the call");
+    let message = take_text(0).expect("the failure left its message");
+    assert!(
+        message.contains(name),
+        "the message names the asset: {message}"
+    );
+    assert_eq!(take_text(0), None, "taking the message clears it");
+}
+
+/// The resource's mirrored `clear` runs against the world's own manager,
+/// returning the renderer to its built-in frame.
+#[test]
+fn the_render_pipeline_clears_through_its_mirrored_method() {
     let mut engine = Engine::new();
     pill_master_renderer_data::register(&mut engine);
-    // As in the mesh test: the host publishes after loading the extensions,
-    // and this binary's own descriptors stand in for the loaded module.
-    #[cfg(feature = "hot_reload")]
-    crate::publish_asset_exports(pill_engine::component_registry::find_export);
+    let shared_name = "pill_master_renderer::resources::rendering_manager::RenderingManager";
     let manager = engine
         .world()
         .get_resource::<pill_master_renderer_data::RenderingManager>()
@@ -2828,11 +2962,17 @@ fn the_render_pipeline_clears_through_the_forwarded_call() {
         manager.pipeline().is_some(),
         "register installs the PBR chain as the default"
     );
+    let declared = [native_resource_write(shared_name)];
     let bindings = ComponentBindings::default();
     {
-        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
-        let status = super::assets::ffi_asset_clear_render_pipeline();
-        assert_eq!(status, 0, "the forwarded clear succeeds");
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &declared, &bindings);
+        let (status, manager) = native_resource(shared_name, 1);
+        assert_eq!(status, 0);
+        let (status, _) = call_mirrored(
+            mirrored(RENDERING_MANAGER_TYPE, "clear"),
+            &[pointer_slot(manager)],
+        );
+        assert_eq!(status, 0, "the mirrored clear succeeds");
     }
 
     let manager = engine

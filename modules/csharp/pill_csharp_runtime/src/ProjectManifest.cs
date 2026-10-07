@@ -98,8 +98,11 @@ internal static class ProjectManifestBuilder
     /// </summary>
     private static bool IsProjectComponentCandidate(Type type)
     {
+        // A generated marker for a Rust-owned resource is a struct with no
+        // fields, which would otherwise pass for an empty component.
         if (!type.IsValueType || type.IsEnum || type.IsPrimitive || type.IsGenericType ||
-            type.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false))
+            type.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false) ||
+            ResourceNames.IsNative(type))
             return false;
         try
         {

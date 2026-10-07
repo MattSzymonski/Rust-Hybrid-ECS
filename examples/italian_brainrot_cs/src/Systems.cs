@@ -14,11 +14,10 @@
 // unlike a Rust project's `#[pill_project] fn init`, a managed startup runs
 // exactly once for the life of the host rather than on every hot reload, so
 // neither needs the "already exists" guards the Rust project or an ordinary
-// per-frame `[EcsSystem]` would. The actual asset construction - decoding the
-// OBJ, the PNG, and building the shader/material records - happens on the
-// Rust side of `Engine.LoadMeshObj`/`LoadTexturePng`/`LoadShader`/`CreateMaterial`;
-// this file only supplies the bytes and the same parameter values
-// `asset_loading.rs` does.
+// per-frame `[EcsSystem]` would. The asset loading reads like the Rust
+// `asset_loading.rs` line for line: the renderer data crate mirrors its asset
+// types, builders and resource to C#, so the same calls build the same
+// meshes, textures, shaders and materials, in the renderer's own Rust code.
 
 using System.Numerics;
 // The module's mirrored free function and value type, generated from its Rust
@@ -26,6 +25,9 @@ using System.Numerics;
 using pill_dummy_color;
 // The renderer's components, generated from their Rust registration.
 using pill_master_renderer.component;
+// The renderer's assets, builders and pipeline resource, generated from their
+// Rust declarations.
+using pill_master_renderer_data;
 
 namespace TracyLive;
 
@@ -100,24 +102,11 @@ internal static class SimulationClock
 /// </remarks>
 public static class SceneStartup
 {
-    // Mirrors pill_engine::AssetLoader's own fallback resolution (see
-    // resolve_asset_path in pill_engine/src/asset.rs): `PROJECT_PATH` names
-    // this project's directory relative to the host's working directory,
-    // which is also this hosted process's working directory. Neither
-    // AppContext.BaseDirectory nor Assembly.Location works here - the
-    // managed runtime is hosted by the Rust process rather than launched as
-    // its own executable, and an assembly loaded into a collectible context
-    // reports an empty Location - so PROJECT_PATH is the one path component
-    // that is always right.
-    private static readonly string ResRoot = Path.Combine(
-        Environment.CurrentDirectory,
-        Environment.GetEnvironmentVariable("PROJECT_PATH") ?? string.Empty,
-        "res");
-
-    private static byte[] ReadRes(string relativePath) => File.ReadAllBytes(Path.Combine(ResRoot, relativePath));
-
     [EcsStartup]
-    public static void Start(Commands commands)
+    public static void Start(
+        Commands commands,
+        ResMut<AssetManager> assets,
+        ResMut<RenderingManager> rendering)
     {
         // The showcase is the three shading styles, one material each, so this
         // project runs the renderer's built-in frame: a single geometry pass
@@ -126,69 +115,75 @@ public static class SceneStartup
         // chain draws materials built for its `pill_pbr` shader alone - so
         // clearing the manager returns the renderer to the built-in pass the
         // styles need.
-        Engine.ClearRenderPipeline();
+        rendering.Clear();
 
-        AssetHandle mesh = Engine.LoadMeshObj(
-            "italian_brainrot.mesh", ReadRes(Path.Combine("models", "chimpanzini_bananini.obj")));
-        AssetHandle color = Engine.LoadTexturePng(
-            "italian_brainrot.color", ReadRes(Path.Combine("textures", "chimpanzini_bananini_color.png")));
-
-        string vertexWgsl = System.Text.Encoding.UTF8.GetString(
-            ReadRes(Path.Combine("shaders", "default_vertex.wgsl")));
-        ShaderTextureBinding[] colorTextureSlot = [new ShaderTextureBinding("color", 0, 1)];
-
-        AssetHandle unlitShader = Engine.LoadShader(
+        // The OBJ decode lives in the renderer; the loader supplies only the bytes.
+        byte[] obj = AssetLoader.Path("models/chimpanzini_bananini.obj").Load();
+        Handle<Mesh> mesh = assets.AddNamed(
+            "italian_brainrot.mesh",
+            Mesh.FromObjBytes("chimpanzini_bananini", obj));
+        Handle<Texture> color = assets.AddNamed(
+            "italian_brainrot.color",
+            Texture.New(
+                "chimpanzini_bananini",
+                TextureType.Color,
+                AssetLoader.Path("textures/chimpanzini_bananini_color.png")));
+        Handle<Shader> unlitShader = assets.AddNamed(
             "italian_brainrot.shader.unlit",
-            vertexWgsl,
-            System.Text.Encoding.UTF8.GetString(ReadRes(Path.Combine("shaders", "unlit_fragment.wgsl"))),
-            [new ShaderParameter("tint", ShaderParameterKind.Color)],
-            colorTextureSlot,
-            passEngineParameters: true,
-            passCameraParameters: true);
-        AssetHandle cartoonShader = Engine.LoadShader(
+            Shader.New("italian_brainrot_unlit")
+                .WithVertexSource(AssetLoader.Path("shaders/default_vertex.wgsl"))
+                .WithFragmentSource(AssetLoader.Path("shaders/unlit_fragment.wgsl"))
+                .WithParameterSlots([new ShaderParameterSlot("tint", ShaderParameterType.Color)])
+                .WithTextureSlots([new ShaderTextureSlot("color", TextureType.Color, (0, 1))])
+                .WithEngineParameters(true)
+                .WithCameraParameters(true)
+                .Build());
+        Handle<Shader> cartoonShader = assets.AddNamed(
             "italian_brainrot.shader.cartoon",
-            vertexWgsl,
-            System.Text.Encoding.UTF8.GetString(ReadRes(Path.Combine("shaders", "cartoon_fragment.wgsl"))),
-            [new ShaderParameter("posterize_level", ShaderParameterKind.Scalar)],
-            colorTextureSlot,
-            passEngineParameters: true,
-            passCameraParameters: true);
+            Shader.New("cartoon")
+                .WithVertexSource(AssetLoader.Path("shaders/default_vertex.wgsl"))
+                .WithFragmentSource(AssetLoader.Path("shaders/cartoon_fragment.wgsl"))
+                .WithParameterSlots([new ShaderParameterSlot("posterize_level", ShaderParameterType.Scalar)])
+                .WithTextureSlots([new ShaderTextureSlot("color", TextureType.Color, (0, 1))])
+                .WithEngineParameters(true)
+                .WithCameraParameters(true)
+                .Build());
 
-        // An invalid shader handle selects the renderer's built-in lit shader.
-        AssetHandle lit = Engine.CreateMaterial(
+        // A material with no shader set keeps the renderer's built-in lit shader.
+        Handle<Material> lit = assets.AddNamed(
             "italian_brainrot.material.lit",
-            AssetHandle.None,
-            [new MaterialTextureBinding("color", color)],
-            [new MaterialScalarParameter("specularity", 0.5f)],
-            [new MaterialColorParameter("tint", 1.0f, 1.0f, 1.0f)]);
-        AssetHandle unlit = Engine.CreateMaterial(
+            Material.Builder("chimpanzini_bananini_lit")
+                .Texture("color", color)
+                .ColorParameter("tint", Vector3.One)
+                .ScalarParameter("specularity", 0.5f)
+                .Build());
+        Handle<Material> unlit = assets.AddNamed(
             "italian_brainrot.material.unlit",
-            unlitShader,
-            [new MaterialTextureBinding("color", color)],
-            [],
-            [new MaterialColorParameter("tint", 1.0f, 1.0f, 1.0f)]);
-        AssetHandle cartoon = Engine.CreateMaterial(
+            Material.Builder("chimpanzini_bananini_unlit")
+                .Shader(unlitShader)
+                .Texture("color", color)
+                .ColorParameter("tint", Vector3.One)
+                .Build());
+        Handle<Material> cartoon = assets.AddNamed(
             "italian_brainrot.material.cartoon",
-            cartoonShader,
-            [new MaterialTextureBinding("color", color)],
-            [new MaterialScalarParameter("posterize_level", 3.0f)],
-            []);
+            Material.Builder("chimpanzini_bananini_cartoon")
+                .Shader(cartoonShader)
+                .Texture("color", color)
+                .ScalarParameter("posterize_level", 3.0f)
+                .Build());
 
         commands.CreateEntity()
             .With(CameraComponent.Perspective(60.0f, 0.1f, 1000.0f))
             .With(TransformComponent.At(0.0f, 0.0f, 5.0f, 1.0f))
             .Build();
 
-        AssetHandle[] materials = [lit, unlit, cartoon];
+        Handle<Material>[] materials = [lit, unlit, cartoon];
         for (int i = 0; i < ProjectConstants.ModelPositions.Length; i++)
         {
             var (x, y, z) = ProjectConstants.ModelPositions[i];
-            AssetHandle material = materials[i];
             commands.CreateEntity()
                 .With(TransformComponent.At(x, y, z, 1.0f))
-                .With(MeshRendererComponent.From(
-                    Handle.From(mesh.Index, mesh.Generation),
-                    Handle.From(material.Index, material.Generation)))
+                .With(MeshRendererComponent.From(mesh, materials[i]))
                 .With(new TagAlpha())
                 .Build();
         }

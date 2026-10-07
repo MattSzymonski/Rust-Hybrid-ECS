@@ -37,6 +37,12 @@ internal readonly record struct ManagedAccess(
 
     /// <summary>The key names a world resource.</summary>
     internal const byte ResourceKind = 1;
+
+    /// <summary>
+    /// The key names a Rust-owned resource by its shared name
+    /// (<c>ResMut&lt;AssetManager&gt;</c>), whose value managed code never sees.
+    /// </summary>
+    internal const byte NativeResourceKind = 2;
 }
 
 /// <summary>Compiled managed system plus its scheduler declaration.</summary>
@@ -261,8 +267,7 @@ internal sealed class ProjectHost
                 ManagedAccess[] accesses = MergeAccesses(queries)
                     .Concat((registration.ResourceAccesses ?? [])
                         .Select(resource => new ManagedAccess(
-                            resource.Low, resource.High, resource.Mode,
-                            ManagedAccess.ResourceKind)))
+                            resource.Low, resource.High, resource.Mode, resource.Kind)))
                     .ToArray();
                 return new ManagedSystem(
                     registration.Name,
@@ -844,7 +849,7 @@ internal sealed class ProjectHost
         // that meets a Rust module halfway is registered under the name both
         // sides write down, and the access has to name the same thing.
         StableComponentId id = Engine.StableIdOf(ResourceNames.Of(resource));
-        access = new ManagedAccess(id.Low, id.High, (byte)mode, ManagedAccess.ResourceKind);
+        access = new ManagedAccess(id.Low, id.High, (byte)mode, ResourceNames.KindOf(resource));
         return true;
     }
 
@@ -938,15 +943,45 @@ internal sealed class ProjectHost
         .Select(CreateStartup)
         .ToArray();
 
+    /// <summary>
+    /// Validate one startup method and compile a parameterless runner for it.
+    /// </summary>
+    /// <remarks>
+    /// A startup may take at most one <c>Commands</c> and any
+    /// <c>Res&lt;T&gt;</c>/<c>ResMut&lt;T&gt;</c> parameters - asset loading
+    /// takes <c>ResMut&lt;AssetManager&gt;</c>. Every one of them is stateless,
+    /// so each is passed as its default, and none needs a declared access: a
+    /// startup runs alone before the scheduler starts and holds the world.
+    /// </remarks>
     internal static ManagedStartup CreateStartup(MethodInfo method)
     {
-        if (method.ReturnType != typeof(void) ||
-            method.GetParameters() is not [var parameter] ||
-            parameter.ParameterType != typeof(Commands))
+        if (method.ReturnType != typeof(void))
+            throw new InvalidOperationException($"{method} must be static void.");
+        ParameterInfo[] parameters = method.GetParameters();
+        if (parameters.Length > MaxSystemParameters)
             throw new InvalidOperationException(
-                $"{method} must be static void and have exactly one Commands parameter.");
-        Action runner = Expression.Lambda<Action>(
-            Expression.Call(method, Expression.Default(typeof(Commands)))).Compile();
+                $"{method} declares {parameters.Length} parameters; a startup takes at most " +
+                $"{MaxSystemParameters}.");
+        bool usesCommands = false;
+        var arguments = new List<Expression>(parameters.Length);
+        foreach (ParameterInfo parameter in parameters)
+        {
+            Type parameterType = parameter.ParameterType;
+            if (parameterType == typeof(Commands))
+            {
+                if (usesCommands)
+                    throw new InvalidOperationException($"{method} declares Commands more than once.");
+                usesCommands = true;
+            }
+            else if (!TryDescribeResourceParameter(parameterType, out _))
+            {
+                throw new InvalidOperationException(
+                    $"{method} has an unsupported parameter {parameter.Name}. A startup takes " +
+                    "Commands, Res<T> and ResMut<T> parameters.");
+            }
+            arguments.Add(Expression.Default(parameterType));
+        }
+        Action runner = Expression.Lambda<Action>(Expression.Call(method, arguments)).Compile();
         return new ManagedStartup($"{method.DeclaringType?.FullName}.{method.Name}", runner);
     }
 

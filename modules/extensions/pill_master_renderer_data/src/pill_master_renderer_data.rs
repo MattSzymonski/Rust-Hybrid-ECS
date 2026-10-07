@@ -35,9 +35,6 @@ pub mod assets;
 /// The world-side draw components and [`register_components`].
 pub mod components;
 
-/// The C# bridge's asset functions, offered to the host by name.
-pub mod csharp_assets;
-
 /// Bind group indices, the instance batch size, and the pipelines the renderer ships.
 pub mod config;
 

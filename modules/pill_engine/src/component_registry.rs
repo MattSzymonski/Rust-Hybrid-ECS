@@ -136,25 +136,25 @@ pub struct PillFieldAccessorDescriptor {
     pub push_symbol: &'static str,
 }
 
-/// One mirrored method of a `#[derive(PillMirror)]` value type, submitted by
-/// the `#[pill_mirror_impl]` attribute macro on the type's `impl` block, or
-/// one mirrored free function, submitted by `#[pill_mirror_fn]` (see
-/// [`PillMethodDescriptor::is_free_function`] for how the codegen tells the
-/// two apart).
+/// One mirrored Rust function, or one mirrored type, submitted by the mirror
+/// attributes: `#[pill_mirror_impl]` for the methods of an `impl` block,
+/// `#[pill_mirror_fn]` for a free function, `#[pill_mirror_object]`,
+/// `#[pill_mirror_resource]` and `#[derive(PillMirror)]` for the types
+/// themselves.
 ///
-/// The macro generates a `#[no_mangle] extern "C"` trampoline for each marked
-/// function (so the C ABI is fixed regardless of the Rust function's calling
-/// convention) and records it here. The host resolves the trampoline's exported
-/// symbol address, hands the table to the C# runtime, and the mirror codegen
-/// emits a typed C# method that calls it - an instance method on the value
-/// type's struct mirror for a method, a static method on a static class named
-/// after the declaring module for a free function.
+/// Every function gets a `#[no_mangle] extern "C"` trampoline with the one
+/// signature `pill_engine::mirror` defines - `(args, ret) -> status` - and is
+/// recorded here with its address, so a statically linked host reaches it
+/// with no symbol table and a loaded module's host reads the same address out
+/// of the module's copy of this descriptor. The host hands the table to the
+/// C# runtime, and the mirror codegen emits a typed C# member that calls it.
 ///
-/// v1 supports a deliberately narrow contract: a `&self` receiver (read-only;
-/// writes cannot propagate through the C# pinned-box call) for methods and no
-/// receiver for free functions, primitive arguments and return values
-/// (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`, `usize`, `isize`), and a `()`
-/// return. Everything else is rejected at compile time by the macro.
+/// A row named [`MIRROR_TYPE_ROW`] describes a type rather than a function:
+/// what kind it is (`owner_kind`), its drop trampoline for an object, its
+/// variants for an enum (`arg_names`, with the discriminants in `arg_tags` and
+/// the representation in `return_tag`), or its shared name for a resource
+/// (`arg_names[0]`). Rows whose name starts with `__` are never emitted as C#
+/// members: the runtime reaches them by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillMethodDescriptor {
     /// Fully-qualified type name the method belongs to, as `std::any::type_name`
@@ -177,10 +177,10 @@ pub struct PillMethodDescriptor {
     /// Exported `#[no_mangle]` symbol of the generated C-ABI trampoline
     /// (`pill_mirror_OmoMO_get_sum`), which the host resolves at load time.
     pub symbol: &'static str,
-    /// Type tag of the method's return value from the same closed vocabulary
-    /// the field codegen uses (`u64`, `f32`, ...); empty for a `()` return.
+    /// Type tag of the return value (`u64`, `str`, `val:Mesh`,
+    /// `result:handle:Mesh`, ...; see `pill_engine::mirror`); empty for `()`.
     pub return_tag: &'static str,
-    /// Type tags of the method's arguments, in declaration order.
+    /// Type tags of the arguments after the receiver, in declaration order.
     pub arg_tags: &'static [&'static str],
     /// Argument names from the Rust source, in declaration order (`alpha`,
     /// `beta`), so the generated C# mirror names its parameters identically
@@ -188,7 +188,21 @@ pub struct PillMethodDescriptor {
     /// always emits one name per tag (a positional fallback when the pattern
     /// is not a plain identifier).
     pub arg_names: &'static [&'static str],
+    /// How the function takes its owner: `""` not at all (a free or
+    /// associated function), `"ref"` as `&self`, `"mut"` as `&mut self`, or
+    /// `"value"` as `self`.
+    pub receiver: &'static str,
+    /// What the owning type is: `"value"` for a `#[derive(PillMirror)]` value
+    /// type or a component row, `"object"` for a `#[pill_mirror_object]`,
+    /// `"enum"`, `"resource"`, or `"module"` for a free function.
+    pub owner_kind: &'static str,
+    /// The trampoline's address; null for a type row with no trampoline.
+    pub address: ExportAddress,
 }
+
+/// The name of a [`PillMethodDescriptor`] row that describes a type rather
+/// than a function.
+pub const MIRROR_TYPE_ROW: &str = "__type";
 
 /// A named C-ABI function an artifact offers to the host, found by name.
 ///
@@ -202,7 +216,7 @@ pub struct PillMethodDescriptor {
 /// own signature, which the host states where it calls it.
 #[derive(Clone, Copy, Debug)]
 pub struct PillExportDescriptor {
-    /// The function's export name, e.g. `pill_render_data_load_mesh_obj`.
+    /// The function's export name, e.g. `pill_render_data_shader_changed`.
     pub name: &'static str,
     /// The function's address.
     pub address: ExportAddress,
@@ -431,6 +445,9 @@ mod tests {
                 return_tag: "u64",
                 arg_tags: &[],
                 arg_names: &[],
+                receiver: "ref",
+                owner_kind: "value",
+                address: ExportAddress(std::ptr::null()),
             }
         }
         crate::submit! {
@@ -443,6 +460,9 @@ mod tests {
                 return_tag: "u32",
                 arg_tags: &["f32", "u8"],
                 arg_names: &["blend", "count"],
+                receiver: "ref",
+                owner_kind: "value",
+                address: ExportAddress(std::ptr::null()),
             }
         }
 

@@ -94,8 +94,6 @@ pub mod audio_manager;
 pub mod audio_source_component;
 /// The per-frame system driving playback.
 pub mod audio_system;
-/// The C# bridge's sound import export.
-pub mod csharp_assets;
 /// Where a listener's ears sit in the world.
 pub mod listener_geometry;
 /// The [`Sound`] asset.
