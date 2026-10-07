@@ -1758,6 +1758,39 @@ internal static class Program
                 Equal(sum, 3_000.0f, "typed row access loop was not executed");
             });
 
+            Test("enumerating a query allocates nothing", () =>
+            {
+                // A system enumerates its queries every frame, so starting an
+                // enumeration - joining the columns of each chunk - must stay
+                // off the managed heap, not only the per-row accessors.
+                TestVelocity* velocities = stackalloc TestVelocity[1];
+                Entity* entities = stackalloc Entity[1];
+                velocities[0].X = 3;
+                entities[0] = new Entity(601, 8);
+                MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 1;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                var query = new Query<Read<TestVelocity>>();
+                static float Walk(Query<Read<TestVelocity>> query)
+                {
+                    float total = 0;
+                    foreach (var row in query)
+                        total += row.Read<TestVelocity>().X;
+                    return total;
+                }
+                Walk(query); // Initialize generic metadata and JIT paths.
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                float sum = 0;
+                for (int frame = 0; frame < 1_000; frame++)
+                    sum += Walk(query);
+                long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                Equal(allocated, 0L, "enumerating a query allocated");
+                Equal(sum, 3_000.0f, "the query loop was not executed");
+            });
+
             Test("compiled runner supplies its query parameter", () =>
             {
                 TestSystems.WasRun = false;
