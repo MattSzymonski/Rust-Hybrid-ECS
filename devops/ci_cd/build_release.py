@@ -987,6 +987,10 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        # Where the project finds the engine's shared C# build
+        # (`modules/csharp/Pill.CSharp.props`), passed so a project need not
+        # sit at a fixed depth below the repository.
+        engine_root_property = f"-p:PillEngineRoot={(repository_root / 'modules').as_posix()}/"
         if shutil.which("dotnet") is None:
             print(
                 "error: a C# shipping build needs the .NET SDK (dotnet) on PATH",
@@ -1013,6 +1017,7 @@ def main() -> int:
                     "-r",
                     dotnet_rid(),
                     "-p:EnablePillAot=true",
+                    engine_root_property,
                     "--nologo",
                 ],
                 cwd=str(repository_root),
@@ -1026,6 +1031,7 @@ def main() -> int:
                     str(managed_manifests[0]),
                     "-c",
                     "Release",
+                    engine_root_property,
                     "--nologo",
                 ],
                 cwd=str(repository_root),

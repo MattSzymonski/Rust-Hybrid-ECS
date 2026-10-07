@@ -698,13 +698,13 @@ internal static class Program
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ProjectManifestBuilder.Build(systems, typeof(BallPhysicsSystem).Assembly));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                // The runtime mirrors (Position, Color, PhysicsState,
-                // SplineSample), the generated value types - the renderer's
-                // `Handle` and the spline extension's `Vector3f` - the modules'
-                // own structs, and the project's resources: 15 after the
-                // spline's `Vector3f` and the project's `[EcsResource]`
-                // `SimulationTime` joined the earlier 13.
-                Equal(components.Length, 15, "unexpected manifest component count: " +
+                // The project's own structs (PhysicsState, SplineSample) and
+                // resource (SimulationTime), plus the mirrors of the modules
+                // project_settings.yaml loads: the renderer data's components
+                // and its `MeshVertex` value type, and the spline extension's
+                // `Spline`, `Vector3f` and `OmoMO`. Only loaded modules are
+                // mirrored, so `pill_dummy_color`'s value types are absent.
+                Equal(components.Length, 13, "unexpected manifest component count: " +
                     string.Join(" | ", components.Select(component =>
                         component.GetProperty("full_name").GetString())));
                 var position = components.Single(component =>
