@@ -2624,6 +2624,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "host_module_pill_spline"
+version = "0.1.0"
+dependencies = [
+ "pill_engine",
+ "pill_spline",
+]
+
+[[package]]
 name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [

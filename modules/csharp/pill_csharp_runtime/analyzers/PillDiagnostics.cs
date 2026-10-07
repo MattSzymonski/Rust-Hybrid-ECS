@@ -85,6 +85,18 @@ namespace PillScriptAnalyzers
             "resume with no world and possibly a stale chunk pointer. For work that spans " +
             "frames, keep state in a component and advance it each frame.");
 
+        internal static readonly DiagnosticDescriptor NoEngineCallsInParallelBody = Rule(
+            "PILL0202",
+            "A parallel row body may not touch engine state",
+            "'{0}' is engine state referenced inside a ForEachParallel body; the body runs on worker threads where every engine API is refused",
+            ScopeCategory,
+            DiagnosticSeverity.Error,
+            "ForEachParallel runs the body on the host's shared pool, outside the scheduled " +
+            "scope: Commands and every engine API are refused on a worker (no managed " +
+            "invocation is active there), usually as a per-frame error storm. Touch only the " +
+            "references the body is handed - write the row components - and queue Commands " +
+            "before the pass or apply collected results after it returns.");
+
         // ------------------------------------------------------------------
         // 03xx - static state and reload unloadability
         // ------------------------------------------------------------------
@@ -119,7 +131,9 @@ namespace PillScriptAnalyzers
             StateCategory,
             DiagnosticSeverity.Error,
             "A thread with frames from the assembly prevents unload, and the ECS API is valid " +
-            "only on the thread the scheduler called you on, and only before you return.");
+            "only on the thread the scheduler called you on, and only before you return. For " +
+            "row-parallel work inside a system, use ForEachParallel: it dispatches onto the " +
+            "host's shared pool inside the scheduled scope and joins before the system returns.");
 
         internal static readonly DiagnosticDescriptor GcHandleBlocksUnload = Rule(
             "PILL0304",

@@ -69,6 +69,7 @@ EXPECTED_RULES = (
     "PILL0102",  # unsupported parameter list
     "PILL0103",  # must return void
     "PILL0201",  # may not be async
+    "PILL0202",  # engine state inside a parallel row body
     "PILL0301",  # mutable static state in a system-declaring type
     "PILL0302",  # static event blocks unload
     "PILL0303",  # background work blocks unload and runs outside any frame
@@ -145,11 +146,45 @@ internal class ProbeSystems
         GCHandle.Alloc(new object());                    // PILL0304
         Ticked?.Invoke();
     }
+
+    [EcsSystem]
+    internal static void ParallelBodyTouchesEngine(
+        Query<Write<Position>> query, Commands commands)
+    {
+        query.ForEachParallel((ref Position position) =>
+        {
+            _ = position;
+            _ = Engine.Time;                             // PILL0202
+            _ = commands;
+        });
+    }
 }
 
 internal sealed class OwnsAFinalizer                     // PILL0305
 {
     ~OwnsAFinalizer() { }
+}
+'''
+
+# A WELL-FORMED parallel body: it touches only the reference it was handed,
+# so the suite proves the PILL0202 rule does not fire on correct code.
+CLEAN_PARALLEL_PROBE_SOURCE = '''\
+// Written by devops/tests/test_csharp_analyzer.py; removed afterwards.
+using pill_engine.common_components;
+
+namespace TracyLive.AnalyzerCleanProbe;
+
+internal static class CleanParallelProbeSystem
+{
+    [EcsSystem]
+    internal static void ParallelBodyTouchesOnlyItsRows(
+        Query<Write<Position>> query)
+    {
+        query.ForEachParallel((ref Position position) =>
+        {
+            _ = position;
+        });
+    }
 }
 '''
 
@@ -216,6 +251,34 @@ def scenario_clean_project_is_diagnostic_free() -> bool:
     return True
 
 
+def scenario_correct_parallel_body_is_clean() -> bool:
+    """A well-formed ForEachParallel body must raise no diagnostic.
+
+    The negative half of PILL0202: a body that only reads and writes the
+    references it was handed is exactly what the feature is for, and the rule
+    must stay silent on it (a rule that fires on correct code is worse than
+    no rule).
+    """
+    print("\n  [TEST] A correct parallel row body builds with no analyzer diagnostic.")
+    ANALYZER_PROBE_CS.write_text(CLEAN_PARALLEL_PROBE_SOURCE, encoding="utf-8")
+    try:
+        output = build_project()
+    finally:
+        if ANALYZER_PROBE_CS.exists():
+            ANALYZER_PROBE_CS.unlink()
+
+    if "Build succeeded" not in output:
+        print("  [FAIL] The clean parallel probe does not build.")
+        print(output[-3000:])
+        return False
+    reported = rules_in(output)
+    if reported:
+        print(f"  [FAIL] The clean parallel probe reported {sorted(reported)}.")
+        return False
+    print("  [OK] A body that only touches its row references is diagnostic-free.")
+    return True
+
+
 def scenario_every_rule_fires() -> bool:
     """A probe violating every rule must produce every diagnostic."""
     print("\n  [TEST] Every analyzer rule fires on a probe that violates it.")
@@ -251,6 +314,7 @@ def scenario_every_rule_fires() -> bool:
 
 SCENARIOS = (
     scenario_clean_project_is_diagnostic_free,
+    scenario_correct_parallel_body_is_clean,
     scenario_every_rule_fires,
 )
 

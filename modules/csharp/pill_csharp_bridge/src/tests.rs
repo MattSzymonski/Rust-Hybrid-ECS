@@ -14,6 +14,12 @@
 //! while scheduler tests derive [`SystemAccess`] metadata from concise native
 //! access declarations.
 
+// Standard library
+use std::collections::HashSet;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Mutex;
+
 // External crates
 use pill_core::error::EngineMessage;
 use pill_engine::{
@@ -40,6 +46,9 @@ use super::components::{
     ComponentBindings, ModuleExposedComponent, StableComponentId,
 };
 use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
+use super::parallel::{
+    ffi_parallel_for, parallel_for, PARALLEL_NESTED, PARALLEL_NO_SCOPE, PARALLEL_OK,
+};
 // The shared-ABI fixtures: the engine's `Position` and the renderer data's
 // `MeshRendererComponent`, bound the way a managed project gets them.
 use super::context::ActiveSystemGuard;
@@ -1679,10 +1688,10 @@ fn a_reshaped_descriptor_component_is_migrated_on_apply() {
 /// the successor instead of being refused as a disappearance.
 #[test]
 fn a_renamed_component_carries_its_rows_through_the_alias() {
-    // The apply path reads the process-wide resource table too, so this test
-    // needs the same exclusivity the resource tests take or a leftover entry
-    // from one of them reads as a vanished resource.
-    let _table = resource_test_scope();
+    // The apply path reads the resource table too; clear whatever an earlier
+    // test left on this worker thread, or a leftover entry reads as a
+    // vanished resource.
+    resource_test_scope();
     let mut engine = Engine::new();
     let (store, _before) = store_with_component(
         &mut engine,
@@ -1757,7 +1766,7 @@ fn a_renamed_component_carries_its_rows_through_the_alias() {
 /// A field added with a default starts from that value, not zero.
 #[test]
 fn an_added_field_starts_from_its_declared_default() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let (store, _before) = store_with_component(
         &mut engine,
@@ -1804,7 +1813,7 @@ fn an_added_field_starts_from_its_declared_default() {
 /// carries keeps its value even when the default for it changed.
 #[test]
 fn a_changed_default_never_resets_a_carried_field() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let (store, _before) = store_with_component(
         &mut engine,
@@ -1909,7 +1918,7 @@ fn field_defaults_are_validated_against_their_field_type() {
 /// it instead of zero.
 #[test]
 fn a_resource_field_added_with_a_default_starts_from_it() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes("Tuned", 4, 4, 11, vec![manifest_field("speed", 0, 4)]);
     register_component_manifest(&mut engine, &before, ComponentBindings::new())
@@ -1954,7 +1963,7 @@ fn a_resource_field_added_with_a_default_starts_from_it() {
 /// clean instead of colliding with storage nothing tracks.
 #[test]
 fn a_vanished_component_is_retired_on_apply() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let (store, _manifest) = store_with_component(
         &mut engine,
@@ -2254,26 +2263,14 @@ fn the_apply_refuses_what_it_cannot_migrate() {
 // Managed resources
 // =============================================================================
 
-/// Serialises every test that touches the managed resource binding table.
+/// Start a resource test from an empty table.
 ///
-/// The table is one process-wide map, because a resource is one value per world
-/// rather than one per archetype. Cargo runs these tests on parallel threads in
-/// a single process, so without this they would register into each other's
-/// table and fail by interference rather than by defect.
-static RESOURCE_TABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Take the resource-table lock and start from an empty table.
-///
-/// The guard is returned so it lives for the body of the test. A poisoned lock
-/// is recovered rather than propagated: it means an earlier resource test
-/// panicked, which is already reported, and turning that into a cascade of
-/// secondary failures hides the one that matters.
-fn resource_test_scope() -> std::sync::MutexGuard<'static, ()> {
-    let guard = RESOURCE_TABLE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// The table is thread-local under `cargo test` (see `resources`), so tests on
+/// parallel threads cannot reach each other's entries; cargo reuses threads
+/// across tests, though, so the reset is what still gives each test a table of
+/// its own.
+fn resource_test_scope() {
     super::resources::reset_resource_bindings_for_test();
-    guard
 }
 
 /// Build the serialized manifest for one managed resource.
@@ -2346,7 +2343,7 @@ fn resource_id_of(name: &str) -> pill_engine::ResourceId {
 /// that follows.
 #[test]
 fn a_manifest_resource_is_registered_and_seeded() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let manifest = resource_manifest_bytes(
         "Tuning",
@@ -2375,7 +2372,7 @@ fn a_manifest_resource_is_registered_and_seeded() {
 /// A managed resource is snapshot-visible as soon as it is registered.
 #[test]
 fn a_manifest_resource_joins_the_snapshot() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let manifest = resource_manifest_bytes("Saved", 4, 4, 3, vec![manifest_field("count", 0, 4)]);
     register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
@@ -2397,7 +2394,7 @@ fn a_manifest_resource_joins_the_snapshot() {
 /// the successor instead of being refused as a disappearance.
 #[test]
 fn a_renamed_resource_carries_its_value_through_the_alias() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes(
         "OldSettings",
@@ -2457,7 +2454,7 @@ fn a_renamed_resource_carries_its_value_through_the_alias() {
 /// A resource entry marked shared is refused where it is declared.
 #[test]
 fn a_shared_resource_entry_is_refused() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let stable_id = stable_component_id("TracyLive.Confused");
     let manifest = serde_json::to_vec(&serde_json::json!([{
@@ -2488,7 +2485,7 @@ fn a_shared_resource_entry_is_refused() {
 /// A reshaped resource keeps its value and moves its bytes by field name.
 #[test]
 fn a_reshaped_resource_is_migrated_on_reload() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes(
         "Relaid",
@@ -2539,7 +2536,7 @@ fn a_reshaped_resource_is_migrated_on_reload() {
 /// declaration go, and an unclaimed id is dropped outright.
 #[test]
 fn a_resource_dropped_from_the_manifest_is_retired() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes("Vanishing", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
     let store = BindingStore::new(
@@ -2575,7 +2572,7 @@ fn a_resource_dropped_from_the_manifest_is_retired() {
 /// this subject's declaration: `drop_resources` releases only unclaimed ids.
 #[test]
 fn a_claimed_resource_survives_a_dropped_declaration() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes("Shared", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
     let store = BindingStore::new(
@@ -2609,7 +2606,7 @@ fn a_claimed_resource_survives_a_dropped_declaration() {
 /// resource would be free to run in the same batch.
 #[test]
 fn a_resource_access_is_derived_as_a_resource() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let manifest = resource_manifest_bytes("Scheduled", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
     register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
@@ -2650,7 +2647,7 @@ fn a_resource_access_is_derived_as_a_resource() {
 /// A resource access for a key no manifest registered is refused by name.
 #[test]
 fn an_unregistered_resource_access_is_refused() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let stable_id = stable_component_id("TracyLive.NeverDeclared");
 
     let error = derive_system_access(
@@ -2681,7 +2678,7 @@ fn an_unregistered_resource_access_is_refused() {
 /// described.
 #[test]
 fn a_managed_resource_publishes_its_field_layout() {
-    let _table = resource_test_scope();
+    resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes(
         "Inspectable",
@@ -2876,4 +2873,92 @@ fn a_component_registered_twice_is_exposed_once() {
         names.len() > exposed_count,
         "the log itself does repeat names"
     );
+}
+
+/// Every index of a parallel dispatch reaches the callback, and a large
+/// fan-out runs on more than one Rayon thread.
+#[test]
+fn parallel_dispatch_runs_every_index_across_threads() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+
+    let count = 4096u32;
+    let visited = AtomicU32::new(0);
+    let threads = Mutex::new(HashSet::new());
+    let status = parallel_for(count, |_index| {
+        visited.fetch_add(1, Ordering::Relaxed);
+        threads
+            .lock()
+            .expect("the thread set is not poisoned")
+            .insert(std::thread::current().id());
+    });
+
+    assert_eq!(status, PARALLEL_OK);
+    assert_eq!(visited.load(Ordering::Relaxed), count);
+    if pill_core::rayon::current_num_threads() > 1 {
+        let distinct = threads
+            .lock()
+            .expect("the thread set is not poisoned")
+            .len();
+        assert!(
+            distinct >= 2,
+            "expected more than one Rayon thread, saw {distinct}"
+        );
+    }
+}
+
+/// A dispatch without a managed scope is refused before any callback runs,
+/// and a dispatch started from inside a callback is refused as nested.
+#[test]
+fn parallel_dispatch_refuses_off_scope_and_nested_calls() {
+    // Step 1: no scope on this thread - the callback must not run at all.
+    extern "C" fn count_calls(state: *mut c_void, _index: u32) {
+        // SAFETY: the test passes a pointer to a live `AtomicU32` as state,
+        // and the dispatch keeps it alive for the call's duration.
+        let calls = unsafe { &*(state as *const AtomicU32) };
+        calls.fetch_add(1, Ordering::Relaxed);
+    }
+    let calls = AtomicU32::new(0);
+    assert_eq!(
+        ffi_parallel_for(count_calls, &calls as *const AtomicU32 as *mut c_void, 4,),
+        PARALLEL_NO_SCOPE
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+    // Step 2: with a scope, a callback that dispatches again records the
+    // nested refusal - on whichever thread runs it.
+    extern "C" fn inner_must_not_run(_state: *mut c_void, _index: u32) {}
+    extern "C" fn nested(state: *mut c_void, _index: u32) {
+        // SAFETY: the test passes a pointer to a live `AtomicU8` as state,
+        // and the dispatch keeps it alive until every callback finished.
+        let recorded = unsafe { &*(state as *const AtomicU8) };
+        let nested_status = ffi_parallel_for(inner_must_not_run, std::ptr::null_mut(), 1);
+        recorded.store(nested_status, Ordering::Relaxed);
+    }
+
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let nested_status = AtomicU8::new(255);
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+        let status = ffi_parallel_for(nested, &nested_status as *const AtomicU8 as *mut c_void, 8);
+        assert_eq!(status, PARALLEL_OK);
+    }
+    assert_eq!(nested_status.load(Ordering::Relaxed), PARALLEL_NESTED);
+}
+
+/// Zero work items is a valid no-op dispatch.
+#[test]
+fn parallel_dispatch_with_zero_items_runs_nothing() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &shared);
+
+    let visited = AtomicU32::new(0);
+    let status = parallel_for(0, |_index| {
+        visited.fetch_add(1, Ordering::Relaxed);
+    });
+    assert_eq!(status, PARALLEL_OK);
+    assert_eq!(visited.load(Ordering::Relaxed), 0);
 }

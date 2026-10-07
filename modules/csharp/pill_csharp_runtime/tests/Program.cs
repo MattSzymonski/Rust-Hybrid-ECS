@@ -197,6 +197,8 @@ internal static unsafe class MockNativeWorld
     internal static NativeComponentTicks* HealthTicks;
     internal static uint Length;
     internal static uint ChangeTick;
+    /// <summary>Dispatch calls the parallel path made through the mock slot.</summary>
+    internal static int ParallelDispatchCalls;
     internal static ulong NextEntityId;
     internal static int QueuedCreates;
     internal static int LastCreateComponentCount;
@@ -327,6 +329,7 @@ internal static unsafe class MockNativeWorld
         CopyMirrorMethods = &CopyMirrorMethods,
         MirrorEpoch = &MirrorEpoch,
         CurrentScopeToken = &CurrentScopeToken,
+        ParallelFor = &ParallelFor,
     };
 
     /// <summary>
@@ -347,6 +350,21 @@ internal static unsafe class MockNativeWorld
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     internal static uint CurrentScopeToken() => ScopeTokenValue;
+
+    /// <summary>
+    /// The host's parallel dispatch, run sequentially on the calling thread:
+    /// deterministic for tests, while the real host fans the same callbacks
+    /// out across its Rayon pool.
+    /// </summary>
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte ParallelFor(
+        delegate* unmanaged[Cdecl]<nint, uint, void> callback, nint state, uint count)
+    {
+        ParallelDispatchCalls++;
+        for (uint index = 0; index < count; index++)
+            callback(state, index);
+        return ParallelDispatch.Ok;
+    }
 
     /// <summary>The rows <see cref="CopyMirrorMethods"/> serves.</summary>
     internal static MirrorMethodEntry[] MirroredRows = [];
@@ -564,11 +582,15 @@ internal static class Program
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ProjectManifestBuilder.Build(systems, typeof(BallPhysicsSystem).Assembly));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                // Position, MeshRendererComponent, PhysicsState, SplineSample + the module Spline mirror.
-                // 13 rather than 12 since the renderer's mirrors are generated: the
-                // generated `Handle` value type is a blittable project struct too,
-                // described like the value types a module's generated mirror carries.
-                Equal(components.Length, 13, "unexpected manifest component count");
+                // The runtime mirrors (Position, Color, PhysicsState,
+                // SplineSample), the generated value types - the renderer's
+                // `Handle` and the spline extension's `Vector3f` - the modules'
+                // own structs, and the project's resources: 15 after the
+                // spline's `Vector3f` and the project's `[EcsResource]`
+                // `SimulationTime` joined the earlier 13.
+                Equal(components.Length, 15, "unexpected manifest component count: " +
+                    string.Join(" | ", components.Select(component =>
+                        component.GetProperty("full_name").GetString())));
                 var position = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "pill_engine.common_components.Position");
                 var renderable = components.Single(component =>
@@ -619,7 +641,7 @@ internal static class Program
                 var method = typeof(BallPhysicsSystem).GetMethod(nameof(BallPhysicsSystem.Run))
                     ?? throw new InvalidOperationException("BallPhysicsSystem.Run is missing");
                 var system = ProjectHost.CreateSystem(method);
-                var componentAccesses=system.Accesses.Where(access=>access.Kind==0).ToArray();
+                var componentAccesses = system.Accesses.Where(access => access.Kind == 0).ToArray();
 
                 Equal(system.Accesses.Count(access => access.Kind == 0), 3, "unexpected ball access count");
                 Assert(system.Accesses.All(access => access.Mode == 1),
@@ -1065,14 +1087,362 @@ internal static class Program
                 Equal(velocityTicks[1].Changed, 2u, "read-only row was marked changed");
             });
 
+            Test("parallel rows visit every row once and match a sequential pass", () =>
+            {
+                const uint rows = 1200;
+                TestPosition* positions =
+                    (TestPosition*)NativeMemory.Alloc(rows * (nuint)sizeof(TestPosition));
+                TestVelocity* velocities =
+                    (TestVelocity*)NativeMemory.Alloc(rows * (nuint)sizeof(TestVelocity));
+                NativeComponentTicks* positionTicks =
+                    (NativeComponentTicks*)NativeMemory.Alloc(rows * (nuint)sizeof(NativeComponentTicks));
+                for (var i = 0; i < rows; i++)
+                {
+                    positions[i] = new TestPosition { X = i, Y = 0 };
+                    velocities[i] = new TestVelocity { X = 1, Y = 0 };
+                    positionTicks[i] = default;
+                }
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.PositionTicks = positionTicks;
+                MockNativeWorld.Length = rows;
+                MockNativeWorld.ChangeTick = 21;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                try
+                {
+                    var query = new Query<Write<TestPosition>, Read<TestVelocity>>();
+                    var visited = 0;
+                    var dispatchesBefore = MockNativeWorld.ParallelDispatchCalls;
+                    ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                        (segment, start, count) =>
+                        {
+                            for (var row = start; row < start + count; row++)
+                            {
+                                ref TestPosition position = ref segment.Get<TestPosition>(0, row);
+                                ref readonly TestVelocity velocity =
+                                    ref segment.Get<TestVelocity>(1, row);
+                                position.X += velocity.X;
+                                segment.MarkChanged(0, row);
+                                Interlocked.Increment(ref visited);
+                            }
+                        }, 256);
+
+                    Equal(visited, (int)rows, "every row must be visited exactly once");
+                    Equal(MockNativeWorld.ParallelDispatchCalls, dispatchesBefore + 1,
+                        "a multi-slice pass must dispatch exactly once");
+                    for (var i = 0; i < rows; i++)
+                    {
+                        Equal(positions[i].X, i + 1.0f, "parallel row value");
+                        Equal(positionTicks[i].Changed, 21u, "written row was not marked changed");
+                    }
+
+                    // Sequential parity: the same body over Rows() (foreach)
+                    // reaches the same storage, so the passes must agree.
+                    foreach (var row in query)
+                    {
+                        ref TestPosition position = ref row.Write<TestPosition>();
+                        position.X += 1.0f;
+                    }
+                    for (var i = 0; i < rows; i++)
+                        Equal(positions[i].X, i + 2.0f, "sequential pass parity");
+                }
+                finally
+                {
+                    MockNativeWorld.Positions = null;
+                    MockNativeWorld.Velocities = null;
+                    MockNativeWorld.PositionTicks = null;
+                    MockNativeWorld.Length = 0;
+                    NativeMemory.Free(positions);
+                    NativeMemory.Free(velocities);
+                    NativeMemory.Free(positionTicks);
+                }
+            });
+
+            Test("parallel rows stamp required writes and skip absent optionals", () =>
+            {
+                const int rows = 600;
+                TestPosition* positions = stackalloc TestPosition[rows];
+                NativeComponentTicks* positionTicks = stackalloc NativeComponentTicks[rows];
+                for (var i = 0; i < rows; i++)
+                {
+                    positions[i] = default;
+                    positionTicks[i] = default;
+                }
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.PositionTicks = positionTicks;
+                MockNativeWorld.Healths = null;
+                MockNativeWorld.Length = rows;
+                MockNativeWorld.ChangeTick = 77;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                try
+                {
+                    var query = new Query<Write<TestPosition>, OptionalWrite<TestHealth>>();
+                    var anyPresent = false;
+                    var visited = 0;
+                    ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                        (segment, start, count) =>
+                        {
+                            for (var row = start; row < start + count; row++)
+                            {
+                                ref TestPosition position = ref segment.Get<TestPosition>(0, row);
+                                position.X += 1.0f;
+                                segment.MarkChanged(0, row);
+                                OptionalWriteRef<TestHealth> optional =
+                                    segment.GetOptionalWrite<TestHealth>(1, row);
+                                if (optional.HasValue)
+                                    anyPresent = true;
+                                Interlocked.Increment(ref visited);
+                            }
+                        }, 256);
+
+                    Equal(visited, rows, "every row must be visited exactly once");
+                    Assert(!anyPresent, "an absent optional reported a value");
+                    for (var i = 0; i < rows; i++)
+                        Equal(positionTicks[i].Changed, 77u, "written row was not marked changed");
+                    for (var i = 0; i < rows; i++)
+                        Equal(positions[i].X, 1.0f, "parallel row value");
+                }
+                finally
+                {
+                    MockNativeWorld.Positions = null;
+                    MockNativeWorld.PositionTicks = null;
+                    MockNativeWorld.Length = 0;
+                }
+            });
+
+            Test("parallel slice failure rethrows the first exception after other items run", () =>
+            {
+                const uint rows = 1200;
+                TestPosition* positions =
+                    (TestPosition*)NativeMemory.Alloc(rows * (nuint)sizeof(TestPosition));
+                NativeComponentTicks* positionTicks =
+                    (NativeComponentTicks*)NativeMemory.Alloc(rows * (nuint)sizeof(NativeComponentTicks));
+                for (var i = 0; i < rows; i++)
+                {
+                    positions[i] = default;
+                    positionTicks[i] = default;
+                }
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.PositionTicks = positionTicks;
+                MockNativeWorld.Length = rows;
+                MockNativeWorld.ChangeTick = 5;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                try
+                {
+                    var query = new Query<Write<TestPosition>>();
+                    var visited = 0;
+                    var thrown = false;
+                    try
+                    {
+                        ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                            (segment, start, count) =>
+                            {
+                                for (var row = start; row < start + count; row++)
+                                {
+                                    Interlocked.Increment(ref visited);
+                                    if (row == 700)
+                                        throw new InvalidOperationException("parallel body exploded");
+                                    ref TestPosition position = ref segment.Get<TestPosition>(0, row);
+                                    position.X += 1.0f;
+                                }
+                            }, 256);
+                    }
+                    catch (InvalidOperationException error)
+                    {
+                        thrown = true;
+                        Equal(error.Message, "parallel body exploded",
+                            "the original exception must surface unchanged");
+                    }
+                    Assert(thrown, "the failing pass must rethrow after the join");
+                    Assert(visited > 512 && visited < (int)rows,
+                        "later slices still ran; the failing slice stopped at its throwing row");
+                    Equal(positions[0].X, 1.0f, "the first slice ran");
+                    Equal(positions[(int)rows - 1].X, 1.0f, "slices after the failure still ran");
+
+                    // The process survives: a fresh pass over the same query
+                    // covers every row again.
+                    var recovery = 0;
+                    ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                        (segment, start, count) =>
+                        {
+                            for (var row = start; row < start + count; row++)
+                            {
+                                _ = segment.Get<TestPosition>(0, row).X;
+                                recovery++;
+                            }
+                        }, 256);
+                    Equal(recovery, (int)rows, "a pass after a failed one still covers every row");
+                }
+                finally
+                {
+                    MockNativeWorld.Positions = null;
+                    MockNativeWorld.PositionTicks = null;
+                    MockNativeWorld.Length = 0;
+                    NativeMemory.Free(positions);
+                    NativeMemory.Free(positionTicks);
+                }
+            });
+
+            Test("parallel rows refuse off-scope and nested passes, and inline single slices", () =>
+            {
+                TestPosition* positions = stackalloc TestPosition[2];
+                NativeComponentTicks* positionTicks = stackalloc NativeComponentTicks[2];
+                positions[0] = default;
+                positions[1] = default;
+                positionTicks[0] = default;
+                positionTicks[1] = default;
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.PositionTicks = positionTicks;
+                MockNativeWorld.Length = 2;
+                MockNativeWorld.ChangeTick = 3;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                try
+                {
+                    var query = new Query<Write<TestPosition>>();
+
+                    // A single work item runs inline: the host slot is never
+                    // called.
+                    var dispatchesBefore = MockNativeWorld.ParallelDispatchCalls;
+                    var visited = 0;
+                    ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                        (segment, start, count) =>
+                        {
+                            for (var row = start; row < start + count; row++)
+                            {
+                                segment.Get<TestPosition>(0, row).X += 1.0f;
+                                visited++;
+                            }
+                        }, 1_000_000);
+                    Equal(visited, 2, "the inline slice must cover every row");
+                    Equal(MockNativeWorld.ParallelDispatchCalls, dispatchesBefore,
+                        "a single slice must not dispatch through the host");
+                    Equal(positions[0].X, 1.0f, "the inline slice wrote the row");
+
+                    // Nesting is refused before any row of the inner pass runs.
+                    var nestedMessage = "";
+                    try
+                    {
+                        ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                            (segment, start, count) =>
+                                ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                                    (_, _, _) => { }));
+                    }
+                    catch (InvalidOperationException error)
+                    {
+                        nestedMessage = error.Message;
+                    }
+                    Assert(nestedMessage.Contains("cannot start another parallel pass"),
+                        "a nested pass must be refused with the nesting message");
+
+                    // Off-scope entry is refused before any row runs.
+                    var attemptedRows = 0;
+                    MockNativeWorld.ScopeTokenValue = 0;
+                    var scopeMessage = "";
+                    try
+                    {
+                        ((QueryBase)query).GetEnumerator().ForEachSliceParallel(
+                            (_, _, _) => attemptedRows++);
+                    }
+                    catch (InvalidOperationException error)
+                    {
+                        scopeMessage = error.Message;
+                    }
+                    MockNativeWorld.ScopeTokenValue = 1;
+                    Assert(scopeMessage.Contains("requires a scheduled [EcsSystem]"),
+                        "an off-scope pass must be refused with the scope message");
+                    Equal(attemptedRows, 0, "no row may run for a refused pass");
+                }
+                finally
+                {
+                    MockNativeWorld.Positions = null;
+                    MockNativeWorld.PositionTicks = null;
+                    MockNativeWorld.Length = 0;
+                }
+            });
+
+            Test("generated ForEachParallel binds named refs, optionals, and entities", () =>
+            {
+                const int rows = 300;
+                TestPosition* positions = stackalloc TestPosition[rows];
+                TestHealth* healths = stackalloc TestHealth[rows];
+                Entity* entities = stackalloc Entity[rows];
+                NativeComponentTicks* healthTicks = stackalloc NativeComponentTicks[rows];
+                for (var i = 0; i < rows; i++)
+                {
+                    positions[i] = new TestPosition { X = i, Y = 0 };
+                    healths[i] = new TestHealth { Value = 1 };
+                    entities[i] = new Entity((ulong)(100 + i), 0);
+                    healthTicks[i] = default;
+                }
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.Healths = healths;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.HealthTicks = healthTicks;
+                MockNativeWorld.Length = rows;
+                MockNativeWorld.ChangeTick = 42;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                try
+                {
+                    var query = new Query<EntityTerm, Read<TestPosition>, OptionalWrite<TestHealth>>();
+                    var visited = 0;
+                    var idSum = 0UL;
+                    var absent = false;
+                    query.ForEachParallel(64,
+                        (Entity entity, in TestPosition position, OptionalWriteRef<TestHealth> health) =>
+                        {
+                            if (!health.HasValue)
+                            {
+                                absent = true;
+                                return;
+                            }
+                            idSum += entity.Id;
+                            health.Value.Value += position.X;
+                            visited++;
+                        });
+                    Equal(visited, rows, "the generated pass must visit every row once");
+                    Assert(!absent, "every fixture row carries the optional component");
+                    Equal(idSum, 74850UL, "the entity term must deliver each row's entity");
+                    for (var i = 0; i < rows; i++)
+                    {
+                        Equal(healths[i].Value, 1.0f + i, "optional writes must reach the row");
+                        Equal(healthTicks[i].Changed, 42u, "optional writes must stamp the tick");
+                    }
+
+                    // The parameterless overload travels the same path with the
+                    // runtime's default slice size; 300 rows is one slice, so
+                    // this also covers the inline pass.
+                    var visitedDefault = 0;
+                    query.ForEachParallel(
+                        (Entity entity, in TestPosition position, OptionalWriteRef<TestHealth> health) =>
+                            visitedDefault++);
+                    Equal(visitedDefault, rows, "the default overload must visit every row once");
+                }
+                finally
+                {
+                    MockNativeWorld.Positions = null;
+                    MockNativeWorld.Healths = null;
+                    MockNativeWorld.Entities = null;
+                    MockNativeWorld.HealthTicks = null;
+                    MockNativeWorld.Length = 0;
+                }
+            });
+
             Test("typed rows alias native columns instead of copying them", () =>
             {
                 TestPosition* positions = stackalloc TestPosition[1];
                 TestVelocity* velocities = stackalloc TestVelocity[1];
+                NativeComponentTicks* positionTicks = stackalloc NativeComponentTicks[1];
                 positions[0].X = 5;
                 velocities[0].X = 7;
+                positionTicks[0] = default;
                 MockNativeWorld.Positions = positions;
                 MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.PositionTicks = positionTicks;
                 MockNativeWorld.Length = 1;
                 MockNativeWorld.ChangeTick = 3;
                 EngineApi api = MockNativeWorld.Api();
@@ -1093,16 +1463,20 @@ internal static class Program
                 Equal(positions[0].X, 12.0f, "aliased write did not reach native storage");
                 MockNativeWorld.Positions = null;
                 MockNativeWorld.Velocities = null;
+                MockNativeWorld.PositionTicks = null;
             });
 
             Test("typed rows reject access the query did not declare", () =>
             {
                 TestPosition* positions = stackalloc TestPosition[1];
                 TestHealth* health = stackalloc TestHealth[1];
+                NativeComponentTicks* positionTicks = stackalloc NativeComponentTicks[1];
                 positions[0].X = 1;
                 health[0].Value = 2;
+                positionTicks[0] = default;
                 MockNativeWorld.Positions = positions;
                 MockNativeWorld.Healths = health;
+                MockNativeWorld.PositionTicks = positionTicks;
                 MockNativeWorld.Length = 1;
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
@@ -1148,6 +1522,7 @@ internal static class Program
                 Equal(positions[0].X, 2.0f, "positive control did not write");
                 MockNativeWorld.Positions = null;
                 MockNativeWorld.Healths = null;
+                MockNativeWorld.PositionTicks = null;
             });
 
             Test("optional writes mark only rows whose value is requested", () =>

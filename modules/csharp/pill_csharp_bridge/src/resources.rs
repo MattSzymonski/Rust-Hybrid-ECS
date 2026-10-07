@@ -25,6 +25,11 @@
 //! next door is published the same way for the same reason. It also keeps the
 //! scope struct, and every installer that fills it, unchanged.
 //!
+//! Under `cargo test` the table is thread-local instead: cargo runs tests on
+//! parallel threads in one process, and since every manifest apply publishes
+//! the table whole, a component-only manifest in one test would otherwise
+//! wipe a resource test's bindings mid-flight. See `RESOURCE_BINDINGS`.
+//!
 //! A reload does not have its own apply loop either. The rename/retire/rollback
 //! protocol is the components' protocol, run from one place; what is
 //! resource-specific is that a resource owns no column, so its migration moves
@@ -33,7 +38,11 @@
 
 // Standard library
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock, RwLockReadGuard};
+
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(not(test))]
+use std::sync::{OnceLock, RwLock};
 
 // External crates
 use pill_core::error::{CSharpError, EngineMessage};
@@ -115,23 +124,66 @@ pub(super) struct ResourceFieldLayout {
 pub(super) type ResourceBindings = HashMap<StableComponentId, ResourceBinding>;
 
 /// The live resource table, shared by the registration path and the callback.
+///
+/// One table for the process in a host: there is one resource value per world,
+/// so registration, reload and the `Res<T>` callback must all see the same
+/// bindings.
+///
+/// Under `cargo test` it is thread-local instead. Every manifest apply
+/// publishes the table whole - an arriving generation's manifest is the
+/// complete list of what it declares - and cargo runs tests on parallel
+/// threads in one process, so a component-only manifest in one test would
+/// otherwise wipe a resource test's bindings mid-flight. A test registers,
+/// acts and asserts on one thread, so a per-thread table gives each test
+/// exactly what a host gives the process: a table nothing else writes.
+#[cfg(not(test))]
 static RESOURCE_BINDINGS: OnceLock<RwLock<ResourceBindings>> = OnceLock::new();
 
-/// Borrow the table, recovering a poisoned lock as the value it guarded.
+#[cfg(test)]
+thread_local! {
+    static RESOURCE_BINDINGS: RefCell<ResourceBindings> = RefCell::new(ResourceBindings::new());
+}
+
+/// Run `body` against the live table.
 ///
-/// A panic while the lock is held cannot leave the map wrong - it is plain data
+/// A panic while a lock is held cannot leave the map wrong - it is plain data
 /// and a writer completes or abandons one whole entry - so poisoning is
 /// reported as the map rather than becoming a new failure mode for every later
 /// resource access. The same rule `BindingStore` applies.
-fn table() -> &'static RwLock<ResourceBindings> {
-    RESOURCE_BINDINGS.get_or_init(|| RwLock::new(HashMap::new()))
+#[cfg(not(test))]
+fn with_bindings<R>(body: impl FnOnce(&ResourceBindings) -> R) -> R {
+    let table = RESOURCE_BINDINGS.get_or_init(|| RwLock::new(HashMap::new()));
+    let guard = table
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    body(&guard)
 }
 
-/// Read the resource table.
-fn read_table() -> RwLockReadGuard<'static, ResourceBindings> {
-    table()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Run `body` against this test's table; see `RESOURCE_BINDINGS`.
+#[cfg(test)]
+fn with_bindings<R>(body: impl FnOnce(&ResourceBindings) -> R) -> R {
+    RESOURCE_BINDINGS.with(|table| body(&table.borrow()))
+}
+
+/// Replace the live table with one generation's bindings.
+///
+/// Replaced rather than merged: a reload's manifest is the complete list of
+/// what the arriving generation declares, so a resource it dropped must stop
+/// resolving. The engine keeps the stored value either way - `drop_resources`
+/// is what releases a retired one - so this only closes the managed door.
+#[cfg(not(test))]
+fn publish_bindings(bindings: ResourceBindings) {
+    let table = RESOURCE_BINDINGS.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut live = table
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *live = bindings;
+}
+
+/// Replace this test's table; see `RESOURCE_BINDINGS`.
+#[cfg(test)]
+fn publish_bindings(bindings: ResourceBindings) {
+    RESOURCE_BINDINGS.with(|table| *table.borrow_mut() = bindings);
 }
 
 // =============================================================================
@@ -167,33 +219,18 @@ pub(super) fn register_resource_manifest(
             binding_for(resource_id, resource),
         );
     }
-    publish_resource_bindings(bindings);
+    publish_bindings(bindings);
     Ok(())
-}
-
-/// Replace the live resource table with one generation's bindings.
-///
-/// Replaced rather than merged: a reload's manifest is the complete list of
-/// what the arriving generation declares, so a resource it dropped must stop
-/// resolving. The engine keeps the stored value either way - `drop_resources`
-/// is what releases a retired one - so this only closes the managed door.
-fn publish_resource_bindings(bindings: ResourceBindings) {
-    let mut live = table()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *live = bindings;
 }
 
 /// Empty the live table, so one test's registrations cannot reach another's.
 ///
-/// The table is process-wide by design - there is one resource value per world,
-/// not one per archetype - which is right in a host and wrong under `cargo
-/// test`, where every test shares one process and cargo runs them on parallel
-/// threads. Tests that touch it take a shared lock and start by calling this;
-/// see `RESOURCE_TABLE_LOCK` in the test module.
+/// The table is thread-local under `cargo test` by design, but cargo reuses
+/// threads across tests, so each resource test still starts by resetting the
+/// table it is about to write; see `RESOURCE_BINDINGS`.
 #[cfg(test)]
 pub(super) fn reset_resource_bindings_for_test() {
-    publish_resource_bindings(ResourceBindings::new());
+    publish_bindings(ResourceBindings::new());
 }
 
 /// The engine id and byte width of one bound resource.
@@ -201,9 +238,11 @@ pub(super) fn reset_resource_bindings_for_test() {
 /// The hot path wants only these two, and cloning a binding to read them would
 /// copy the field layout on every `Res<T>` access.
 pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usize)> {
-    read_table()
-        .get(&key)
-        .map(|binding| (binding.resource_id, binding.size))
+    with_bindings(|table| {
+        table
+            .get(&key)
+            .map(|binding| (binding.resource_id, binding.size))
+    })
 }
 
 /// Apply a reloaded generation's resource declarations to the live world.
@@ -263,13 +302,13 @@ pub(super) fn apply_resource_manifest_on_reload(
     engine: &mut Engine,
     resources: &[ManagedResourceDeclaration],
 ) -> Result<ManifestOutcome, CSharpError> {
-    let previous = read_table().clone();
+    let previous = with_bindings(|table| table.clone());
     let (result, table) = apply_manifest(&RESOURCE_SUBJECT, engine, previous, resources);
     // The table is published on every exit, the failing one included. A reshape
     // that already ran cannot be undone - reversing it would invent the bytes
     // it dropped - so the pipeline leaves it applied, and publishing is what
     // keeps the table describing the layout the engine actually holds.
-    publish_resource_bindings(table);
+    publish_bindings(table);
     result
 }
 
