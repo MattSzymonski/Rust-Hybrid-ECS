@@ -1,6 +1,6 @@
 //! Creates the camera and the helmet.
 
-use crate::{asset_loading::SceneAssets, TagHelmet};
+use crate::{TagHelmet, asset_loading::SceneAssets};
 use pill_engine::{Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
