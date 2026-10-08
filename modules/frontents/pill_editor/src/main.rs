@@ -18,6 +18,12 @@
 //! panels around it. Input over the scene reaches the WebView rather than the
 //! window, so the Scene panel forwards its DOM events ([`scene_input`]); the
 //! gamepads are polled around every frame.
+//!
+//! On Linux the surface is not the window itself but a native surface of the
+//! engine's own placed at the Scene panel ([`scene_window`]), because there the
+//! WebView and the surface would otherwise share one native window and
+//! overwrite each other's pixels. On Wayland it sits below the transparent
+//! WebView, as on Windows; on X11 it has to sit above it.
 
 mod assets_tab;
 mod console_tab;
@@ -30,6 +36,8 @@ mod layout;
 mod polling;
 mod popout;
 mod scene_input;
+#[cfg(target_os = "linux")]
+mod scene_window;
 mod systems_tab;
 
 use std::cell::{Cell, RefCell};
@@ -62,6 +70,15 @@ use popout::PopoutManager;
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Frame interval while the scene is not on screen. The renderer skips such
+/// frames, so nothing else would pace the loop; this keeps the ECS ticking at
+/// roughly a display's rate instead of spinning a core.
+const HIDDEN_SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// How soon to look again when the compositor has not yet shown the engine's
+/// previous frame. Short against a frame, and a check costs next to nothing.
+const SCENE_FRAME_POLL: Duration = Duration::from_millis(2);
+
 /// Cap for the console ring buffer of failed editor commands.
 const COMMAND_ERROR_LIMIT: usize = 100;
 
@@ -85,14 +102,13 @@ fn main() {
     install_engine_report_handler();
     init_telemetry();
 
-    let config = Config::new()
+    let config = embedded_scene_config(Config::new())
         .with_disable_context_menu(true)
-        .with_window(
+        .with_window(scene_window_builder(
             dioxus::desktop::tao::window::WindowBuilder::new()
                 .with_title("ECS Editor")
-                .with_inner_size(LogicalSize::new(1280.0, 800.0))
-                .with_transparent(true),
-        )
+                .with_inner_size(LogicalSize::new(1280.0, 800.0)),
+        ))
         .with_on_window(|window, dom| {
             // Dioxus retains event-loop ownership. The cloned Arc is passed to
             // the engine only so wgpu can keep the native surface alive.
@@ -130,6 +146,51 @@ fn main() {
         .launch(app);
 }
 
+/// Whether a window that shows the scene has to be created transparent.
+///
+/// The engine presents underneath a transparent WebView everywhere except
+/// Linux under X11, where its child window has to sit above the WebView
+/// ([`scene_window`]) and a transparent GTK window would only give that child
+/// an alpha channel to get wrong.
+fn scene_needs_transparent_window() -> bool {
+    #[cfg(target_os = "linux")]
+    return scene_window::session_is_wayland();
+    #[cfg(not(target_os = "linux"))]
+    return true;
+}
+
+/// Configure a window that shows the scene through its WebView.
+///
+/// On Linux the GTK window's own background has to be transparent as well:
+/// GTK 3 declares a window whose theme background is opaque as opaque to the
+/// compositor (`wl_surface.set_opaque_region`), and the compositor then culls
+/// the scene's subsurface underneath it - no pixels and no frame callbacks.
+pub(crate) fn scene_window_builder(
+    builder: dioxus::desktop::tao::window::WindowBuilder,
+) -> dioxus::desktop::tao::window::WindowBuilder {
+    if !scene_needs_transparent_window() {
+        return builder;
+    }
+    let builder = builder.with_transparent(true);
+    #[cfg(target_os = "linux")]
+    let builder = builder.with_background_color((0, 0, 0, 0));
+    builder
+}
+
+/// Adjust the configuration of a window that embeds the scene.
+///
+/// On Linux dioxus-desktop puts its default menu bar in the same GTK box as
+/// the WebView, above it, so WebView (CSS) coordinates would no longer match
+/// the window's and the scene would land one menu bar too high. Windows draws
+/// its menu outside the client area and keeps the default.
+pub(crate) fn embedded_scene_config(config: Config) -> Config {
+    if cfg!(target_os = "linux") {
+        config.with_menu(None::<dioxus::desktop::muda::Menu>)
+    } else {
+        config
+    }
+}
+
 /// Live statistics displayed by the transparent Dioxus overlay.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Stats {
@@ -157,13 +218,18 @@ fn app() -> Element {
     // guarantees request_redraw runs in a later event-loop turn instead of
     // being coalesced into the RedrawRequested event currently in progress.
     // One completion produces one request, so this neither needs a timer nor
-    // floods the runtime with a permanently self-waking task.
+    // floods the runtime with a permanently self-waking task. A request can
+    // carry a delay, for a frame that has to wait for the compositor.
     let redraw_window = Arc::downgrade(&window().window);
-    let redraw_scheduler = use_coroutine(move |mut requests: UnboundedReceiver<()>| {
+    let redraw_scheduler = use_coroutine(move |mut requests: UnboundedReceiver<Duration>| {
         let redraw_window = redraw_window.clone();
         async move {
-            while requests.next().await.is_some() {
-                tokio::task::yield_now().await;
+            while let Some(delay) = requests.next().await {
+                if delay.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(delay).await;
+                }
                 let Some(window) = redraw_window.upgrade() else {
                     break;
                 };
@@ -174,7 +240,7 @@ fn app() -> Element {
 
     // Seed the first frame. Subsequent frames schedule themselves only after
     // their current engine update and presentation have completed.
-    use_effect(move || redraw_scheduler.send(()));
+    use_effect(move || redraw_scheduler.send(Duration::ZERO));
 
     // Layout geometry is the shared source of truth for DOM positioning and
     // native GPU clipping. No DOM measurement round trip is required.
@@ -189,6 +255,64 @@ fn app() -> Element {
         );
         viewport_editor.set_scene_rect(snapshot.scene_rect);
     });
+
+    // Linux without X11 cannot put the engine and the WebView in one window.
+    //
+    // dioxus-desktop builds the WebView as a child window only on Windows,
+    // macOS, iOS and Android (`build_as_child` in its `webview.rs`); everywhere
+    // else the WebView is a GTK widget in the same window the engine's
+    // swapchain presents to, and the two painters take turns replacing each
+    // other's pixels. Under Wayland and X11 the engine gets a native surface of
+    // its own and the Scene panel stays docked ([`scene_window`]). Where that
+    // surface cannot be created, the Scene panel starts detached, in the window
+    // where the engine is the only painter - which is what popping it out by
+    // hand does. Set `PILL_EDITOR_DOCK_SCENE` to keep it docked anyway.
+    //
+    // The saved layout is why this runs on every start rather than once: the
+    // Scene tab it removes is gone from the layout the next start loads, so the
+    // window has to be opened whether or not there was a tab to detach. For
+    // the same reason the docked path puts back a Scene tab an earlier detached
+    // start saved away.
+    #[cfg(target_os = "linux")]
+    {
+        let mut detach_layout = layout_model;
+        let detach_editor = Arc::clone(&editor);
+        let detach_popouts = Arc::clone(&popouts);
+        let detached = use_hook(|| Cell::new(false));
+        use_effect(move || {
+            if detached.replace(true) {
+                return;
+            }
+            if detach_editor.has_scene_window() {
+                restore_detached_panels(detach_layout, vec![PanelKind::Scene]);
+                return;
+            }
+            if std::env::var_os("PILL_EDITOR_DOCK_SCENE").is_some() {
+                return;
+            }
+            let scene_tab = detach_layout.peek().nodes.iter().find_map(|(id, node)| {
+                matches!(node, LayoutNode::Tab(tab) if tab.panel == PanelKind::Scene).then_some(*id)
+            });
+            if let Some(scene_tab) = scene_tab {
+                // The write lock is released before the save, which reads.
+                let detached = detach_layout
+                    .write()
+                    .apply(LayoutAction::DetachTab { tab: scene_tab });
+                match detached {
+                    Ok(_) => layout::save(&detach_layout.peek()),
+                    Err(error) => {
+                        eprintln!("[editor] Could not detach the Scene panel: {error}");
+                        return;
+                    }
+                }
+            }
+            popout::open_panel_window(
+                PanelKind::Scene,
+                Arc::clone(&detach_editor),
+                Arc::clone(&detach_popouts),
+            );
+        });
+    }
 
     let event_editor = Arc::clone(&editor);
     let event_popouts = Arc::clone(&popouts);
@@ -205,6 +329,19 @@ fn app() -> Element {
             }
             TaoEvent::RedrawRequested(_) => {
                 restore_detached_panels(layout_model, event_popouts.drain_redocks());
+                // GTK settles the WebView's size after the resize event that
+                // announced it; catch up with it here.
+                let size = event_editor.logical_size();
+                if *layout_size.peek() != size {
+                    layout_size.set(size);
+                }
+                if !event_editor.prepare_scene_frame() {
+                    // The compositor has not shown the previous frame yet;
+                    // look again shortly rather than block in the driver.
+                    redraw_scheduler.send(SCENE_FRAME_POLL);
+                    return;
+                }
+                let next_frame = event_editor.next_frame_delay();
                 if let Some(frame) = event_editor.render() {
                     if let Some(report) = frame.console_report {
                         pill_core::info!(
@@ -224,7 +361,7 @@ fn app() -> Element {
                         });
                     }
                 }
-                redraw_scheduler.send(());
+                redraw_scheduler.send(next_frame);
             }
             _ => {}
         }
@@ -312,6 +449,15 @@ pub(crate) struct EditorContext {
     last_stats_update: Cell<Instant>,
     main_scene_viewport: Cell<RenderViewport>,
     detached_scene_window: Cell<Option<WindowId>>,
+    /// The main window's native scene window, when the platform provides one.
+    #[cfg(target_os = "linux")]
+    main_scene_child: Option<Arc<scene_window::SceneChildWindow>>,
+    /// The detached Scene window's native scene window while it is open.
+    #[cfg(target_os = "linux")]
+    detached_scene_child: RefCell<Option<Arc<scene_window::SceneChildWindow>>>,
+    /// Renderer size last given to the detached scene window.
+    #[cfg(target_os = "linux")]
+    detached_scene_size: Cell<(u32, u32)>,
     /// Latest engine snapshot shared by every dock's VirtualDom.
     snapshot: RefCell<EditorSnapshot>,
     /// Structural and field commands queued by panels since the last frame.
@@ -355,13 +501,21 @@ impl EditorContext {
     /// the caller reports it once and exits.
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
-        let mut host = setup_rendering(
-            HostConfig::from_environment()
-                .map_err(|source| RenderingError::from(HostError::from(source)))?,
-            Arc::clone(&window),
-            size.width,
-            size.height,
-        )?;
+        let config = HostConfig::from_environment()
+            .map_err(|source| RenderingError::from(HostError::from(source)))?;
+        #[cfg(target_os = "linux")]
+        let main_scene_child = scene_window::SceneChildWindow::new(&window).map(Arc::new);
+        #[cfg(target_os = "linux")]
+        let mut host = match &main_scene_child {
+            Some(child) => {
+                let mut host = setup_rendering(config, Arc::clone(child), 1, 1)?;
+                host.resize(0, 0);
+                host
+            }
+            None => setup_rendering(config, Arc::clone(&window), size.width, size.height)?,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut host = setup_rendering(config, Arc::clone(&window), size.width, size.height)?;
         FrameDriver::set_render_viewport(&mut host, Some(RenderViewport::default()));
         // The editor keeps every source asset in `res` paired with a `.meta`
         // file, so each one has a guid from the moment it is in the project.
@@ -373,6 +527,12 @@ impl EditorContext {
             last_stats_update: Cell::new(Instant::now()),
             main_scene_viewport: Cell::new(RenderViewport::default()),
             detached_scene_window: Cell::new(None),
+            #[cfg(target_os = "linux")]
+            main_scene_child,
+            #[cfg(target_os = "linux")]
+            detached_scene_child: RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            detached_scene_size: Cell::new((0, 0)),
             snapshot: RefCell::new(EditorSnapshot::default()),
             pending_commands: RefCell::new(Vec::new()),
             last_command_errors: RefCell::new(Vec::new()),
@@ -383,15 +543,34 @@ impl EditorContext {
         })
     }
 
+    /// Whether the engine presents into a native window of its own rather
+    /// than into the editor window it shares with the WebView.
+    pub(crate) fn has_scene_window(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.main_scene_child.is_some();
+        #[cfg(not(target_os = "linux"))]
+        return false;
+    }
+
     /// Reconfigure the renderer only when it currently targets the main window.
+    ///
+    /// A native scene window is sized by [`Self::set_scene_rect`] instead,
+    /// which the layout calls after every main-window resize.
     fn resize_main_window(&self, width: u32, height: u32) {
-        if self.detached_scene_window.get().is_none() {
+        if self.detached_scene_window.get().is_none() && !self.has_scene_window() {
             FrameDriver::resize(&mut *self.host.borrow_mut(), width, height);
         }
     }
 
     /// Current WebView size in the logical coordinates used by CSS.
+    ///
+    /// On Linux this is measured on the WebView itself: tao's window size
+    /// includes GTK's client-side decorations under Wayland.
     fn logical_size(&self) -> EditorSize {
+        #[cfg(target_os = "linux")]
+        if let Some((width, height)) = scene_window::webview_logical_size(&self.window) {
+            return EditorSize { width, height };
+        }
         let size = self.window.inner_size();
         let scale = self.window.scale_factor();
         EditorSize {
@@ -406,6 +585,18 @@ impl EditorContext {
             .map(|rect| logical_rect_to_physical(rect, self.window.scale_factor()))
             .unwrap_or_default();
         self.main_scene_viewport.set(viewport);
+        #[cfg(target_os = "linux")]
+        if let Some(child) = &self.main_scene_child {
+            // The child covers the panel, so the renderer fills all of it.
+            // While detached the panel has no tab and the child stays hidden.
+            let (width, height) = child.place(viewport);
+            if self.detached_scene_window.get().is_none() {
+                let mut host = self.host.borrow_mut();
+                host.resize(width, height);
+                host.set_render_viewport(Some(RenderViewport::full(width, height)));
+            }
+            return;
+        }
         if self.detached_scene_window.get().is_none() {
             FrameDriver::set_render_viewport(&mut *self.host.borrow_mut(), Some(viewport));
         }
@@ -416,6 +607,24 @@ impl EditorContext {
         let size = window.inner_size();
         let window_id = window.id();
         let mut host = self.host.borrow_mut();
+        #[cfg(target_os = "linux")]
+        if self.has_scene_window() {
+            // The pop-out has a WebView too; give the engine a child window
+            // of it for the same reason the dock has one.
+            let child = scene_window::SceneChildWindow::new(&window)
+                .map(Arc::new)
+                .ok_or(EditorError::SceneWindow)?;
+            let (width, height) = child.webview_size();
+            let (width, height) = child.place(RenderViewport::full(width, height));
+            host.retarget_render_window(Arc::clone(&child), width.max(1), height.max(1))
+                .map_err(|source| EditorError::Retarget { source })?;
+            host.resize(width, height);
+            host.set_render_viewport(Some(RenderViewport::full(width, height)));
+            self.detached_scene_size.set((width, height));
+            *self.detached_scene_child.borrow_mut() = Some(child);
+            self.detached_scene_window.set(Some(window_id));
+            return Ok(());
+        }
         host.retarget_render_window(window, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
         FrameDriver::set_render_viewport(
@@ -429,6 +638,12 @@ impl EditorContext {
     /// Resize the detached renderer without accepting events from stale windows.
     pub(crate) fn resize_detached_scene(&self, window_id: WindowId, width: u32, height: u32) {
         if self.detached_scene_window.get() == Some(window_id) {
+            // The detached scene window follows its WebView every frame
+            // instead ([`Self::refresh_scene_window`]).
+            #[cfg(target_os = "linux")]
+            if self.detached_scene_child.borrow().is_some() {
+                return;
+            }
             let mut host = self.host.borrow_mut();
             FrameDriver::resize(&mut *host, width, height);
             FrameDriver::set_render_viewport(&mut *host, Some(RenderViewport::full(width, height)));
@@ -440,8 +655,23 @@ impl EditorContext {
         if self.detached_scene_window.get() != Some(detached_window) {
             return Ok(());
         }
-        let size = self.window.inner_size();
         let mut host = self.host.borrow_mut();
+        #[cfg(target_os = "linux")]
+        if let Some(child) = &self.main_scene_child {
+            let (width, height) = child.place(self.main_scene_viewport.get());
+            // The swapchain is built at least 1x1 and parked by the resize
+            // when the panel is not on screen yet; the redock re-places it.
+            host.retarget_render_window(Arc::clone(child), width.max(1), height.max(1))
+                .map_err(|source| EditorError::Retarget { source })?;
+            host.resize(width, height);
+            host.set_render_viewport(Some(RenderViewport::full(width, height)));
+            // The old renderer, and with it the last use of this window, has
+            // been dropped by the retarget.
+            self.detached_scene_child.borrow_mut().take();
+            self.detached_scene_window.set(None);
+            return Ok(());
+        }
+        let size = self.window.inner_size();
         host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
         FrameDriver::set_render_viewport(&mut *host, Some(self.main_scene_viewport.get()));
@@ -557,6 +787,7 @@ impl EditorContext {
     /// visible; scalar writes take effect for `Changed<T>` the next frame,
     /// one accepted frame of latency). The gamepads are polled just before the
     /// frame and play the rumble it requested just after.
+    /// Call only after [`Self::prepare_scene_frame`] allowed the frame.
     fn render(&self) -> Option<EditorFrame> {
         self.flush_pending_commands();
 
@@ -564,7 +795,12 @@ impl EditorContext {
             let mut host = self.host.borrow_mut();
             let mut gamepads = self.gamepads.borrow_mut();
             gamepads.poll(|input| FrameDriver::push_input(&mut *host, input));
-            match host.run_frame() {
+            let result = host.run_frame();
+            #[cfg(target_os = "linux")]
+            if let Some(child) = self.current_scene_child() {
+                child.end_frame(host.presented_last_frame());
+            }
+            match result {
                 Ok(console_report) => {
                     gamepads.play_rumble(FrameDriver::take_rumble_requests(&mut *host));
                     let now = Instant::now();
@@ -597,6 +833,56 @@ impl EditorContext {
         // the renderer.
         self.refresh_snapshot();
         frame
+    }
+
+    /// Per-frame upkeep of the engine's native scene window, and whether the
+    /// engine may run its next frame now.
+    ///
+    /// A detached Scene window fills its WebView, whose size GTK settles only
+    /// after the resize event that announced it, so it is measured here. The
+    /// answer is `false` while the compositor has not shown the previous frame
+    /// ([`scene_window::SceneChildWindow::begin_frame`]); the caller retries
+    /// shortly instead of blocking the event loop inside the driver.
+    fn prepare_scene_frame(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(child) = self.current_scene_child() {
+            if self.detached_scene_window.get().is_some() {
+                let (width, height) = child.webview_size();
+                let (width, height) = child.place(RenderViewport::full(width, height));
+                if self.detached_scene_size.replace((width, height)) != (width, height) {
+                    let mut host = self.host.borrow_mut();
+                    host.resize(width, height);
+                    host.set_render_viewport(Some(RenderViewport::full(width, height)));
+                }
+            }
+            child.refresh();
+            return child.begin_frame();
+        }
+        true
+    }
+
+    /// How long to wait before the next frame: nothing while the engine
+    /// presents (the compositor paces it), a display interval while the scene
+    /// is off screen and every frame would be skipped.
+    fn next_frame_delay(&self) -> Duration {
+        #[cfg(target_os = "linux")]
+        if self
+            .current_scene_child()
+            .is_some_and(|child| !child.is_shown())
+        {
+            return HIDDEN_SCENE_FRAME_INTERVAL;
+        }
+        Duration::ZERO
+    }
+
+    /// The native scene window the renderer currently presents into.
+    #[cfg(target_os = "linux")]
+    fn current_scene_child(&self) -> Option<Arc<scene_window::SceneChildWindow>> {
+        if self.detached_scene_window.get().is_some() {
+            self.detached_scene_child.borrow().clone()
+        } else {
+            self.main_scene_child.clone()
+        }
     }
 
     /// Apply the accumulated command batch right before systems run.

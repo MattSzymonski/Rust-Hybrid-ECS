@@ -21,7 +21,7 @@ pub(crate) fn rotation_system(
     let Some(time) = time.get() else {
         return Ok(());
     };
-    let step = glam::Quat::from_rotation_y(TURN_RADIANS_PER_SECOND * time.delta_seconds());
+    let step = glam::Quat::from_rotation_y(TURN_RADIANS_PER_SECOND * 4.0 * time.delta_seconds());
     for (mut transform, _) in helmets.iter_mut() {
         let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
             transform.rotation,

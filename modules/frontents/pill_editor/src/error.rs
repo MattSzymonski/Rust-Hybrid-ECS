@@ -47,6 +47,10 @@ pub enum EditorError {
         source: pill_host::RendererError,
     },
 
+    /// A detached Scene window could not be given its native scene window.
+    #[message("failed to create a native window for the detached scene")]
+    SceneWindow,
+
     /// One editor frame failed while presenting the rendered world.
     #[message("failed to present one editor frame")]
     Frame {

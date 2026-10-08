@@ -78,17 +78,22 @@ pub(crate) fn open_panel_window(
         popouts,
     };
     let dom = VirtualDom::new_with_props(DetachedPanelWindow, props);
-    let mut config = Config::new().with_disable_context_menu(true).with_window(
-        WindowBuilder::new()
-            .with_title(format!("{} - ECS Editor", panel.title()))
-            .with_inner_size(LogicalSize::new(720.0, 520.0))
-            .with_transparent(panel == PanelKind::Scene),
-    );
+    let builder = WindowBuilder::new()
+        .with_title(format!("{} - ECS Editor", panel.title()))
+        .with_inner_size(LogicalSize::new(720.0, 520.0));
+    let builder = if panel == PanelKind::Scene {
+        crate::scene_window_builder(builder)
+    } else {
+        builder
+    };
+    let mut config = Config::new()
+        .with_disable_context_menu(true)
+        .with_window(builder);
 
     if panel == PanelKind::Scene {
         // The renderer remains owned by the same host; only its native surface
         // is replaced. The ECS world and hot-loaded project are not recreated.
-        config = config
+        config = crate::embedded_scene_config(config)
             .with_on_window(move |window, _| {
                 if let Err(error) = editor.attach_detached_scene(window) {
                     pill_core::warn!(target: pill_core::telemetry::telemetry_target::ENGINE, "Could not attach detached Scene renderer: {error}");
