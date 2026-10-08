@@ -67,6 +67,19 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+/// What a frame leaves outside a viewport that does not cover the whole target.
+///
+/// Zero in every channel, which is transparent in both alpha conventions, so a
+/// frame that draws into only part of a window does not hide whatever else
+/// paints the rest of that window. The editor relies on this: it draws its
+/// panels over the same window the scene viewport lives in.
+const CLEAR_TRANSPARENT: wgpu::Color = wgpu::Color {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.0,
+};
+
 /// Format of every offscreen colour target a chain declares.
 ///
 /// Half-float rather than the surface's `Unorm`: the values a lit frame
@@ -544,14 +557,30 @@ impl State {
             }
 
             let clear = entry.clears();
-            let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = views
+            // `LoadOp::Clear` ignores the scissor, so an opaque colour here
+            // repaints the whole swapchain image whatever the viewport says.
+            // When the frame owns only part of the target, that would paint
+            // over everything else sharing the window - the editor's panels -
+            // once per frame. A transparent clear keeps those pixels, and is
+            // asked for only where the surface can actually carry alpha: in an
+            // `Opaque` mode the same clear would be opaque black instead.
+            let shared_target = !covers_target(viewport, width, height) && self.surface.composites();
+            let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = entry
+                .outputs()
                 .iter()
-                .map(|target| {
+                .zip(views.iter())
+                .map(|(output, target)| {
+                    let load = match output {
+                        PassOutput::Surface if shared_target => {
+                            wgpu::LoadOp::Clear(CLEAR_TRANSPARENT)
+                        }
+                        _ => color_load(clear),
+                    };
                     Some(wgpu::RenderPassColorAttachment {
                         view: target,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: color_load(clear),
+                            load,
                             store: wgpu::StoreOp::Store,
                         },
                     })
@@ -640,6 +669,30 @@ impl State {
                         occlusion_query_set: None,
                     });
                     render_pass.set_pipeline(&pass.pipeline);
+                    // A fullscreen pass covers its whole target unless it is
+                    // clipped, and the post-processing stages - the ones that
+                    // write the swapchain - would otherwise spread the scene
+                    // over the entire window instead of the rectangle the
+                    // geometry passes drew into.
+                    //
+                    // Only the scissor moves. The viewport has to stay the whole
+                    // target, because this pass derives its texture coordinates
+                    // from its own position in NDC: mapping NDC onto a
+                    // sub-rectangle would stretch the source into it rather than
+                    // clip the picture to it. The scissor is expressed in this
+                    // pass's own target, which the chain may have scaled down.
+                    let (target_width, target_height) = match entry.outputs().first() {
+                        Some(PassOutput::Offscreen(name)) => {
+                            self.offscreen.get(*name).map_or((width, height), |target| {
+                                let extent = target.texture.size();
+                                (extent.width, extent.height)
+                            })
+                        }
+                        _ => (width, height),
+                    };
+                    let scissor =
+                        viewport_in_target(viewport, width, height, target_width, target_height);
+                    render_pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
                     if pass.pass_engine_parameters {
                         render_pass.set_bind_group(
                             ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -774,5 +827,82 @@ fn color_load(clear: bool) -> wgpu::LoadOp<wgpu::Color> {
         wgpu::LoadOp::Clear(CLEAR_COLOR)
     } else {
         wgpu::LoadOp::Load
+    }
+}
+
+/// Whether a frame's viewport covers every pixel of a `width` by `height` target.
+///
+/// Only a frame that covers the target owns it. One that does not shares the
+/// window with another painter and has to leave the rest of it alone - which is
+/// why every pass is clipped to the frame's rectangle, and why the swapchain
+/// image is opened transparent rather than in [`CLEAR_COLOR`].
+fn covers_target(viewport: RenderViewport, width: u32, height: u32) -> bool {
+    viewport.x == 0 && viewport.y == 0 && viewport.width >= width && viewport.height >= height
+}
+
+/// The frame's viewport expressed in the pixels of one pass's target.
+///
+/// A pass may declare a target the chain scaled - the bloom prefilter writes
+/// half the surface - and wgpu rejects a scissor that leaves the attachment it
+/// is set on. Scaling the rectangle keeps the clip in the same place, because a
+/// scaled target holds the same picture at a different resolution rather than a
+/// different part of it.
+fn viewport_in_target(
+    viewport: RenderViewport,
+    surface_width: u32,
+    surface_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> RenderViewport {
+    if target_width == surface_width && target_height == surface_height {
+        return viewport;
+    }
+    let scale = |value: u32, surface: u32, target: u32| -> u32 {
+        ((u64::from(value) * u64::from(target)) / u64::from(surface.max(1))) as u32
+    };
+    let x = scale(viewport.x, surface_width, target_width).min(target_width.saturating_sub(1));
+    let y = scale(viewport.y, surface_height, target_height).min(target_height.saturating_sub(1));
+    let right = scale(viewport.x + viewport.width, surface_width, target_width);
+    let bottom = scale(viewport.y + viewport.height, surface_height, target_height);
+    // At least one pixel each way: an empty rectangle is not a valid scissor.
+    RenderViewport::new(
+        x,
+        y,
+        right.saturating_sub(x).max(1).min(target_width - x),
+        bottom.saturating_sub(y).max(1).min(target_height - y),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_viewport_in_a_scaled_target_is_scaled_with_it() {
+        // Half the surface, which is the bloom prefilter's target.
+        assert_eq!(
+            viewport_in_target(RenderViewport::new(200, 100, 400, 200), 1280, 800, 640, 400),
+            RenderViewport::new(100, 50, 200, 100)
+        );
+
+        // A rectangle that would leave the target is pulled back inside it: wgpu
+        // rejects a scissor that hangs over the edge, which is what made the
+        // first version of this clip panic instead of drawing.
+        let clipped =
+            viewport_in_target(RenderViewport::new(900, 600, 300, 200), 1280, 800, 640, 400);
+        assert!(clipped.x + clipped.width <= 640, "{clipped:?}");
+        assert!(clipped.y + clipped.height <= 400, "{clipped:?}");
+    }
+
+    #[test]
+    fn a_viewport_on_the_surface_is_left_alone() {
+        let viewport = RenderViewport::new(200, 100, 400, 200);
+        assert_eq!(viewport_in_target(viewport, 1280, 800, 1280, 800), viewport);
+    }
+
+    #[test]
+    fn only_a_frame_covering_the_target_owns_it() {
+        assert!(covers_target(RenderViewport::full(1280, 800), 1280, 800));
+        assert!(!covers_target(RenderViewport::new(0, 0, 700, 800), 1280, 800));
     }
 }

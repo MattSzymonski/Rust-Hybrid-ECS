@@ -236,10 +236,10 @@ const DX_RUSTC_WRAPPER_ENVIRONMENT: &str = "DX_RUSTC";
 /// the dx-built editor - whose engine dylibs carry dx's workspace-wrapper
 /// hash - from every other host. Also read by
 /// [`crate::build_runner::apply_cargo_host_overrides`], which keeps the cargo
-/// anchor for dx hosts only: the editor's own macro graph unions features
-/// onto the host (proc-macro) units of `proc-macro2`/`quote`/`syn` that cannot
-/// be enumerated in the engine manifests, so only selecting the editor
-/// package as the anchor reproduces them.
+/// anchor for editor hosts and dx-launched hosts: the editor's renderer graph
+/// must be present when project modules are built, and its macro graph under
+/// dx unions features onto proc-macro units that cannot be enumerated in the
+/// engine manifests.
 pub(crate) fn running_under_dioxus_cli() -> bool {
     env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
 }

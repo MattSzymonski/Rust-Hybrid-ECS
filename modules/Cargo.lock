@@ -1717,6 +1717,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "futures-util",
+ "gtk",
  "miette",
  "pill_core",
  "pill_core_macros",
@@ -1726,11 +1727,15 @@ dependencies = [
  "pill_input",
  "pill_master_renderer_data",
  "pill_runtime",
+ "raw-window-handle 0.6.2",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wayland-backend",
+ "wayland-client",
+ "x11-dl",
 ]
 
 [[package]]
@@ -2600,6 +2605,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "host_module_pill_dummy_color"
+version = "0.1.0"
+dependencies = [
+ "pill_dummy_color",
+ "pill_engine",
+]
+
+[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -2620,7 +2633,7 @@ name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
  "glam",
- "pill_assets",
+ "pill_dummy_color",
  "pill_engine",
  "pill_master_renderer_data",
  "serde",

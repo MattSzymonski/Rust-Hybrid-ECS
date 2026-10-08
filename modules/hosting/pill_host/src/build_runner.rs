@@ -408,8 +408,14 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         "CARGO_TARGET_DIR",
         workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
     );
-    if crate::config::running_under_dioxus_cli() {
-        // The dioxus editor keeps the cargo anchor. Its own macro graph
+    let anchor = host_anchor_package();
+    let editor_host = anchor.as_deref() == Some("editor");
+    if crate::config::running_under_dioxus_cli() || editor_host {
+        // The editor keeps the cargo anchor. Its dependency graph must be
+        // part of the module build too: its renderer dependencies affect the
+        // shared engine dylibs even though the project itself only depends on
+        // renderer data. Under the Dioxus CLI the same anchor also reproduces
+        // the editor's macro graph
         // (dioxus' procedural macros) unions features onto the HOST units of
         // `proc-macro2`/`quote`/`syn` - a resolution cargo keeps separate
         // from the target side - and those unions change the metadata of the
@@ -417,7 +423,7 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         // cascades into `pill_core`'s and `pill_engine_core`'s exported
         // symbol hashes. Only selecting the editor package reproduces the
         // exact graph; enumerating its unions is not possible.
-        if let Some(anchor) = host_anchor_package() {
+        if let Some(anchor) = anchor {
             command.arg("--package").arg(&anchor);
             // Select the anchor with the SAME features the running host was
             // built with, not merely the same package. The anchor's default
