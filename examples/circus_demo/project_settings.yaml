@@ -12,3 +12,8 @@ modules: []
 logging:
   targets:
     engine::rendering: info
+
+# Shipping and web builds start with debug drawing off; this demo shows its
+# overlay (the field's bounds, the axes, the tuning values) everywhere. F3
+# toggles it at runtime in any build.
+debug_draw: true

@@ -104,6 +104,8 @@ pub enum MaterialParameter {
 /// shader, material, and mesh into single instanced draws.
 #[derive(Clone, Debug)]
 pub struct RenderInstance {
+    /// The entity the instance belongs to: what outlining and picking address.
+    pub entity: pill_engine::Entity,
     /// World transform the instance is drawn at.
     pub transform: TransformComponent,
     /// Asset key of the mesh to draw.
@@ -228,6 +230,16 @@ pub struct RenderFrame {
     /// surface draws through `camera` above; a surface missing here is not
     /// drawn.
     pub surface_views: BTreeMap<u32, crate::SurfaceView>,
+    /// What systems debug-drew for this frame: lines, labels and gizmo
+    /// handles, empty while debug drawing is off.
+    pub debug: pill_engine::DebugFrame,
+    /// The entities to outline this frame, and the outline colour.
+    pub outlined: Vec<pill_engine::Entity>,
+    /// The colour of every outline.
+    pub outline_color: [f32; 4],
+    /// The picks asked for since the last frame; the renderer answers them
+    /// through [`crate::PillRenderer::take_pick_results`].
+    pub pick_requests: Vec<crate::PickRequest>,
     /// Number of this frame, counting from one; packed into the engine
     /// parameters beside the clocks.
     pub sequence: u64,
@@ -246,6 +258,10 @@ impl Default for RenderFrame {
             camera_transform: TransformComponent::default(),
             has_camera: false,
             surface_views: BTreeMap::new(),
+            debug: pill_engine::DebugFrame::default(),
+            outlined: Vec::new(),
+            outline_color: [1.0, 0.55, 0.1, 1.0],
+            pick_requests: Vec::new(),
             sequence: 0,
         }
     }

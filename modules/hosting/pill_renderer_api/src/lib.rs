@@ -14,6 +14,8 @@
 //! - Carry a window across to a renderer as plain data ([`RawWindowData`]).
 //! - Let one renderer draw into several surfaces, each through its own camera
 //!   ([`SurfaceId`], [`SurfaceCameras`]).
+//! - Carry debug drawing, selection outlines and picking between the world and
+//!   any renderer ([`SelectionOutlines`], [`PickRequests`], [`PickResults`]).
 //!
 //! # Design
 //!
@@ -46,6 +48,9 @@ pub mod raw_window;
 /// Several surfaces per renderer: identities, presentation, camera bindings.
 pub mod surface;
 
+/// Selection outlines and picking.
+pub mod picking;
+
 // Current crate
 pub use api::{
     AttachFuture, FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
@@ -54,6 +59,10 @@ pub use components::*;
 pub use error::RendererError;
 pub use frame::{
     CullMode, MaterialParameter, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
+};
+pub use picking::{
+    decode_pick_value, PickHit, PickRequest, PickRequests, PickResult, PickResults,
+    SelectionOutlines, PICK_HANDLE_BIT,
 };
 pub use raw_window::{RawWindowData, RawWindowKind};
 pub use surface::{

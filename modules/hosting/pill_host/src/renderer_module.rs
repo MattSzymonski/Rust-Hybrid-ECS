@@ -403,6 +403,10 @@ impl PillRenderer for ModuleRenderer {
     fn set_surface_ready(&mut self, id: pill_renderer_api::SurfaceId, ready: bool) {
         self.backend_mut().set_surface_ready(id, ready);
     }
+
+    fn take_pick_results(&mut self) -> Vec<pill_renderer_api::PickResult> {
+        self.backend_mut().take_pick_results()
+    }
 }
 
 impl Drop for ModuleRenderer {

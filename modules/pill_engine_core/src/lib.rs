@@ -95,6 +95,10 @@ pub mod component_field;
 /// Centralised configuration constants and hardware detection.
 pub mod config;
 
+/// Immediate debug drawing - lines, shapes, labels and gizmo handles - any
+/// system can draw and every renderer draws.
+pub mod debug_draw;
+
 /// Periodic ECS state report, registered by the engine and printed every N
 /// frames.
 pub mod diagnostics;
@@ -183,6 +187,10 @@ pub use commands::{CommandError, Commands};
 pub use common_components::{register_common_components, Color, Position, TransformComponent};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
+pub use debug_draw::{
+    DebugColor, DebugDraw, DebugFrame, DebugLabel, DebugLifetime, DebugLine, DebugStyle, GizmoLine,
+    GizmoTriangle, LabelAnchor,
+};
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};

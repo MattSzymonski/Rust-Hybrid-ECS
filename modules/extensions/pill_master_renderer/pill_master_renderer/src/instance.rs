@@ -256,11 +256,17 @@ mod tests {
         );
     }
 
+    /// Any live entity handle: the instance tests read only transforms.
+    fn test_entity() -> pill_engine::Entity {
+        pill_engine::World::new().reserve_entity()
+    }
+
     #[test]
     fn instances_split_across_tasks_keep_queue_order() {
         let count = INSTANCES_PER_TASK * 3 + 7;
         let frame_instances: Vec<RenderInstance> = (0..count)
             .map(|index| RenderInstance {
+                entity: test_entity(),
                 transform: TransformComponent {
                     translation: [index as f32, 0.0, 0.0],
                     rotation: Quat::IDENTITY.to_array(),
@@ -293,6 +299,7 @@ mod tests {
     fn built_instances_follow_queue_order() {
         let frame_instances: Vec<RenderInstance> = (0..3)
             .map(|index| RenderInstance {
+                entity: test_entity(),
                 transform: TransformComponent {
                     translation: [index as f32, 0.0, 0.0],
                     rotation: Quat::IDENTITY.to_array(),

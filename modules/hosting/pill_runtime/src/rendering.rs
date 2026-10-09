@@ -414,6 +414,21 @@ impl AttachedRenderer {
         }
         Ok(())
     }
+
+    /// Move the picks the renderer has answered since the last call into the
+    /// world's [`pill_renderer_api::PickResults`].
+    ///
+    /// Answers arrive frames after their request, whenever the GPU finishes;
+    /// a world without the resource drops them.
+    pub fn deliver_pick_results(&mut self, world: &mut World) {
+        let results = self.renderer.take_pick_results();
+        if results.is_empty() {
+            return;
+        }
+        if let Some(delivered) = world.get_resource_mut::<pill_renderer_api::PickResults>() {
+            delivered.results.extend(results);
+        }
+    }
 }
 
 // =============================================================================
@@ -471,6 +486,8 @@ impl RenderingRuntime {
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
         let report = self.runtime.run_frame();
         self.display.render(self.runtime.engine().world())?;
+        self.display
+            .deliver_pick_results(self.runtime.engine_mut().world_mut());
         Ok(report)
     }
 

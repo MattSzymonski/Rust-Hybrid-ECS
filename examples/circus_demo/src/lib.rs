@@ -6,7 +6,8 @@
 //! - Register the renderer's data, this project's components and its tuning
 //!   resource.
 //! - Load the level's meshes and materials (`resources`), build the scene
-//!   (`game`), and register the systems that move the pills and the camera.
+//!   (`game`), and register the systems that move the pills and the camera,
+//!   and the one that draws the debug overlay (`debug_overlay`).
 //!
 //! # Design
 //!
@@ -20,6 +21,7 @@ use pill_engine::{pill_project, Engine};
 
 mod camera;
 mod curl_noise_system;
+mod debug_overlay;
 mod game;
 mod resources;
 
@@ -46,6 +48,7 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.register_system("camera_fov", camera::camera_fov_changing_system);
     engine.register_system("curl_noise", curl_noise_system::curl_noise_system);
     engine.register_system("demo_control", game::demo_control_system);
+    engine.register_system("debug_overlay", debug_overlay::debug_overlay_system);
     0
 }
 

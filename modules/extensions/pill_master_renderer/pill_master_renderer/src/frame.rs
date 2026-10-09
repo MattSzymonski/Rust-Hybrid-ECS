@@ -196,6 +196,17 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
     .collect()
 }
 
+/// The resources [`rendering_system`] reads besides the frame, the assets and
+/// the rendering manager, grouped into one parameter because a system takes at
+/// most six.
+type RenderingExtras<'w> = (
+    Res<'w, pill_engine::Time>,
+    Res<'w, pill_renderer_api::SurfaceCameras>,
+    ResMut<'w, pill_engine::DebugDraw>,
+    Res<'w, pill_renderer_api::SelectionOutlines>,
+    ResMut<'w, pill_renderer_api::PickRequests>,
+);
+
 /// Fills the frame from the current world, once per update.
 ///
 /// Registered as the post-update `rendering` system, so gameplay has already
@@ -208,13 +219,9 @@ pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
-    // One parameter, because a system takes at most six.
-    (time, surface_cameras): (
-        Res<pill_engine::Time>,
-        Res<pill_renderer_api::SurfaceCameras>,
-    ),
+    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests): RenderingExtras<'_>,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
-    mut objects: Query<(&TransformComponent, &MeshRendererComponent)>,
+    mut objects: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
     let Some(mut frame) = frame.get_mut() else {
         return Ok(());
@@ -249,6 +256,25 @@ pub fn rendering_system(
         frame.delta_seconds = time.delta_seconds();
         frame.seconds += frame.delta_seconds;
     }
+    // What systems debug-drew, aged by this frame's step; nothing while debug
+    // drawing is off or the world has no drawing.
+    let delta_seconds = frame.delta_seconds;
+    frame.debug = debug_draw
+        .get_mut()
+        .map(|mut debug_draw| debug_draw.collect_frame(delta_seconds))
+        .unwrap_or_default();
+    match outlines.get() {
+        Some(outlines) => {
+            frame.outlined.clone_from(&outlines.entities);
+            frame.outline_color = outlines.color;
+        }
+        None => frame.outlined.clear(),
+    }
+    // Picks asked for since the last frame; the renderer answers them later.
+    frame.pick_requests = pick_requests
+        .get_mut()
+        .map(|mut requests| std::mem::take(&mut requests.pending))
+        .unwrap_or_default();
     frame.instances.clear();
     let world_cameras: Vec<(Entity, CameraComponent, TransformComponent)> = cameras
         .iter_mut()
@@ -301,7 +327,7 @@ pub fn rendering_system(
     // one pair skips almost every asset lookup; with 50,000 pills those
     // lookups were most of this system's time.
     let mut last_resolved: Option<(Handle<Mesh>, Handle<Material>, Option<u8>)> = None;
-    for (transform, renderer) in objects.iter_mut() {
+    for (entity, transform, renderer) in objects.iter_mut() {
         let rendering_order = match last_resolved {
             Some((mesh, material, rendering_order))
                 if mesh == renderer.mesh && material == renderer.material =>
@@ -327,6 +353,7 @@ pub fn rendering_system(
             continue;
         };
         frame.instances.push(RenderInstance {
+            entity,
             transform: *transform,
             mesh: asset_key(renderer.mesh),
             material: asset_key(renderer.material),

@@ -257,6 +257,21 @@ def load_logging(project_root: Path):
     return level, timestamp, source_location, targets
 
 
+def load_debug_draw(project_root: Path) -> bool:
+    """Loads the `debug_draw:` key: whether the build starts with debug
+    drawing on. Absent means off. Raises ValueError on anything but a bool.
+    """
+    settings_path = project_root / PROJECT_SETTINGS_FILE_NAME
+    with settings_path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    value = data.get("debug_draw", False)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{settings_path}: `debug_draw:` is `{value}`; use true or false")
+    return value
+
+
 def build_logging_literal(logging) -> str:
     """Renders the `StaticLogging` expression for the loaded `logging:` section."""
     level, timestamp, source_location, targets = logging
@@ -540,12 +555,14 @@ def build_library_source(
     renderer=None,
     packs_assets: bool = False,
     logging=(None, None, None, []),
+    debug_draw: bool = False,
 ) -> str:
     """Builds the generated bundle's src/lib.rs text.
 
     `renderer` is the GPU crate a windowed build links, or None.
     `packs_assets` embeds the asset pack the build script wrote.
     `logging` is the validated `logging:` section, from `load_logging`.
+    `debug_draw` is the `debug_draw:` key, from `load_debug_draw`.
     """
     lines = [
         "//! Generated shipping bundle - do not edit. Regenerated from",
@@ -662,6 +679,7 @@ def build_library_source(
             else "        asset_pack: None,"
         ),
         "        logging: LOGGING,",
+        f"        debug_draw: {'true' if debug_draw else 'false'},",
         "    }",
         "}",
     ]
@@ -917,6 +935,7 @@ def main() -> int:
         renderer=linked_renderer,
         packs_assets=packs_assets,
         logging=load_logging(project_root),
+        debug_draw=load_debug_draw(project_root),
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest

@@ -17,6 +17,8 @@
 //! - Draw into several surfaces from one device: the primary one the renderer
 //!   was built on, and every one attached since ([`ExtraTarget`]), each through
 //!   its own camera.
+//! - Draw the overlay - debug drawing, outlines, picking - over each surface
+//!   after its chain (`crate::overlay`).
 //!
 //! # Design
 //!
@@ -57,8 +59,10 @@ use crate::{
     drawers::mesh_drawer::MeshDrawer,
     error::{capturing_validation, RendererError, Result},
     frame::{PassTarget, RenderFrame, ResolvedPass},
+    overlay::{Overlay, OverlayFrame},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
     profiler::Profiler,
+    render_queue::RenderQueueItem,
     rendering_resources_manager::RenderingResourcesManager,
     resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
     surface::Surface,
@@ -225,7 +229,7 @@ impl Renderer {
         id: u32,
         frame: &RenderFrame,
         assets_manager: &AssetManager,
-        render_queue: &[crate::render_queue::RenderQueueItem],
+        render_queue: &[RenderQueueItem],
         view: (CameraComponent, TransformComponent),
     ) -> Result<()> {
         let Renderer {
@@ -251,12 +255,12 @@ impl Renderer {
             rendering_resources_manager.shader_handles(),
         );
         let outcome = state.render(
-            target.camera,
+            (id, target.camera),
             &plan,
             target.pipeline.passes(),
             frame,
             (&view.0, &view.1),
-            queued_instances,
+            (queued_instances, render_queue),
             target.viewport,
         );
         drop(plan);
@@ -361,7 +365,17 @@ impl PillRenderer for Renderer {
                     .map(|view| (*id, (view.camera, view.transform)))
             })
             .collect();
-        if !primary_drawn && extra_views.is_empty() {
+        // A pick on a surface not drawn this frame is answered at once: its
+        // pixel holds nothing this frame could read back.
+        let drawn_surfaces: Vec<u32> = primary_drawn
+            .then_some(SurfaceId::PRIMARY.0)
+            .into_iter()
+            .chain(extra_views.iter().map(|(id, _)| *id))
+            .collect();
+        self.state
+            .overlay
+            .answer_undrawn(&frame.pick_requests, &drawn_surfaces);
+        if drawn_surfaces.is_empty() {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
@@ -416,12 +430,12 @@ impl PillRenderer for Renderer {
         let submit_zone = pill_core::profile_scope!("renderer: submit");
         if primary_drawn {
             self.state.render(
-                self.camera,
+                (SurfaceId::PRIMARY.0, self.camera),
                 &plan,
                 self.pipeline.passes(),
                 frame,
                 (&frame.camera, &frame.camera_transform),
-                &self.queued_instances,
+                (&self.queued_instances, &render_queue),
                 self.viewport,
             )?;
         }
@@ -593,6 +607,10 @@ impl PillRenderer for Renderer {
             target.ready = ready;
         }
     }
+
+    fn take_pick_results(&mut self) -> Vec<pill_renderer_api::PickResult> {
+        self.state.overlay.take_results(&self.state.device)
+    }
 }
 
 /// The wgpu objects behind a [`Renderer`]: device, surface, and frame state.
@@ -635,6 +653,8 @@ pub struct State {
     pub(crate) instance: wgpu::Instance,
     /// The adapter the device runs on; an extra surface is checked against it.
     pub(crate) adapter: wgpu::Adapter,
+    /// Debug drawing, outlines and picking, drawn over every surface's chain.
+    pub(crate) overlay: Overlay,
 }
 
 impl State {
@@ -669,6 +689,13 @@ impl State {
         .map_err(|detail| RendererError::Other {
             detail: format!("camera bind group layout: {detail}"),
         })?;
+        let overlay = Overlay::new(
+            &device,
+            &queue,
+            surface.format(),
+            depth_format,
+            &camera_bind_group_layout,
+        )?;
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
         let gpu_profiler = create_gpu_profiler(&device, &queue, surface.backend());
@@ -686,6 +713,7 @@ impl State {
             camera_bind_group_layout,
             instance,
             adapter,
+            overlay,
         })
     }
 
@@ -756,12 +784,12 @@ impl State {
 
     fn render(
         &mut self,
-        camera_handle: RendererCameraHandle,
+        (surface_id, camera_handle): (u32, RendererCameraHandle),
         plan: &[PassPlan],
         passes: &[PassSlot],
         frame: &RenderFrame,
         (view_camera, view_transform): (&CameraComponent, &TransformComponent),
-        instances: &[Instance],
+        (instances, render_queue): (&[Instance], &[RenderQueueItem]),
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
         // Both borrows are of separate fields, so the surface can reconfigure
@@ -1028,6 +1056,27 @@ impl State {
                 write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, entry.label());
             }
         }
+        // Over the chain's picture: outlines, debug lines and labels, gizmos,
+        // and the pick buffer when this surface has picks waiting.
+        let overlay_zone = pill_core::profile_scope!("renderer: overlay");
+        self.overlay.record(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            OverlayFrame {
+                surface: surface_id,
+                color_view: &view,
+                depth_view: &self.depth_texture.texture_view,
+                size: (width, height),
+                viewport,
+                camera,
+                frame,
+                render_queue,
+                instance_buffer: self.mesh_drawer.instance_buffer(),
+                storage: &self.renderer_resource_storage,
+            },
+        );
+        drop(overlay_zone);
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);
             profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);
@@ -1044,6 +1093,7 @@ impl State {
             detail: format!("frame submission: {detail}"),
         })?;
         drop(queue_submit_zone);
+        self.overlay.after_submit();
         let present_zone = pill_core::profile_scope!("renderer: present");
         surface_frame.present();
         drop(present_zone);

@@ -10,6 +10,9 @@
 //! - In a development build, open a second window as a second renderer
 //!   surface on request (`PILL_SECOND_VIEW=1`), the multi-surface test
 //!   frontend ([`SecondView`]).
+//! - In a development build, pick the window's center and corner and outline
+//!   what the center hit on request (`PILL_PICK_TEST=1`), the picking test
+//!   frontend ([`PickTest`]).
 //!
 //! # Design
 //!
@@ -74,6 +77,9 @@ struct WindowedApplication {
     /// The second window, when `PILL_SECOND_VIEW=1` asked for one.
     #[cfg(feature = "dev")]
     second_view: Option<SecondView>,
+    /// The picking test, when `PILL_PICK_TEST=1` asked for it.
+    #[cfg(feature = "dev")]
+    pick_test: Option<PickTest>,
 }
 
 /// Environment variable that opens a second window drawn as surface 1.
@@ -100,6 +106,85 @@ struct SecondView {
 /// The second view's surface id.
 #[cfg(all(feature = "rendering", feature = "dev"))]
 const SECOND_VIEW_SURFACE: pill_runtime::SurfaceId = pill_runtime::SurfaceId(1);
+
+/// Environment variable that runs the picking test.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+const PICK_TEST_ENVIRONMENT_VARIABLE: &str = "PILL_PICK_TEST";
+
+/// Frames the picking test lets the scene settle before it picks.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+const PICK_TEST_SETTLE_FRAMES: u32 = 30;
+
+/// The picking test frontend: once the scene has settled, ask what is under
+/// the main window's center and its top-left corner, log both answers, and
+/// outline the entity the center hit.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+#[derive(Default)]
+struct PickTest {
+    /// Frames drawn since the test started.
+    frames: u32,
+    /// The center and corner request ids, once asked.
+    requests: Option<(u64, u64)>,
+    /// The answers that arrived, by request.
+    center: Option<pill_runtime::PickHit>,
+    corner: Option<pill_runtime::PickHit>,
+    /// Whether both answers were logged.
+    finished: bool,
+}
+
+#[cfg(all(feature = "rendering", feature = "dev"))]
+impl PickTest {
+    /// Advance the test by one drawn frame of a `width` by `height` window.
+    fn step(&mut self, host: &mut posture::Windowed, width: u32, height: u32) {
+        if self.finished {
+            return;
+        }
+        self.frames += 1;
+        let world = host.host_mut().engine_mut().world_mut();
+        let Some((center_id, corner_id)) = self.requests else {
+            if self.frames < PICK_TEST_SETTLE_FRAMES {
+                return;
+            }
+            let Some(requests) = world.get_resource_mut::<pill_runtime::PickRequests>() else {
+                error!(target: telemetry_target::ENGINE, "[pick test] the world has no PickRequests");
+                self.finished = true;
+                return;
+            };
+            let surface = pill_runtime::SurfaceId::PRIMARY;
+            let center = requests.request(surface, width / 2, height / 2);
+            let corner = requests.request(surface, 1, 1);
+            self.requests = Some((center, corner));
+            info!(
+                target: telemetry_target::ENGINE,
+                "[pick test] requested center ({}, {}) and corner (1, 1)",
+                width / 2,
+                height / 2
+            );
+            return;
+        };
+        if let Some(results) = world.get_resource_mut::<pill_runtime::PickResults>() {
+            for result in results.take() {
+                if result.request.id == center_id {
+                    self.center = Some(result.hit);
+                } else if result.request.id == corner_id {
+                    self.corner = Some(result.hit);
+                }
+            }
+        }
+        let (Some(center), Some(corner)) = (self.center, self.corner) else {
+            return;
+        };
+        self.finished = true;
+        info!(target: telemetry_target::ENGINE, "[pick test] center: {center:?}");
+        info!(target: telemetry_target::ENGINE, "[pick test] corner: {corner:?}");
+        if let pill_runtime::PickHit::Entity(entity) = center {
+            if let Some(outlines) = world.get_resource_mut::<pill_runtime::SelectionOutlines>() {
+                outlines.entities = vec![entity];
+                info!(target: telemetry_target::ENGINE, "[pick test] outlined {entity:?}");
+            }
+        }
+    }
+}
 
 #[cfg(feature = "rendering")]
 impl ApplicationHandler for WindowedApplication {
@@ -159,6 +244,10 @@ impl ApplicationHandler for WindowedApplication {
                 self.present_first_frame_and_reveal(event_loop);
                 #[cfg(feature = "dev")]
                 self.open_second_view_if_requested(event_loop);
+                #[cfg(feature = "dev")]
+                if std::env::var(PICK_TEST_ENVIRONMENT_VARIABLE).as_deref() == Ok("1") {
+                    self.pick_test = Some(PickTest::default());
+                }
             }
             Err(error) => {
                 report_failure("renderer attachment", &error);
@@ -382,6 +471,11 @@ impl WindowedApplication {
             Ok(report) => {
                 // Step 4: Play the rumble the frame's systems asked for.
                 self.gamepads.play_rumble(host.take_rumble_requests());
+                #[cfg(feature = "dev")]
+                if let Some(pick_test) = &mut self.pick_test {
+                    let size = window.inner_size();
+                    pick_test.step(host, size.width, size.height);
+                }
 
                 // Step 5: Defensive reveal in case a platform recreates the
                 // window after setup (setup already revealed it after the
@@ -507,6 +601,8 @@ pub fn run(project: posture::Project) -> Result<(), RunError> {
         gamepads: Gamepads::new(),
         #[cfg(feature = "dev")]
         second_view: None,
+        #[cfg(feature = "dev")]
+        pick_test: None,
     };
 
     // Step 4: Run the event loop until the window is closed.

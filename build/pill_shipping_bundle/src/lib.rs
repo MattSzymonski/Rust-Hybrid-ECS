@@ -54,5 +54,6 @@ pub fn static_project() -> StaticProject {
         renderer: static_renderer(),
         asset_pack: None,
         logging: LOGGING,
+        debug_draw: false,
     }
 }
