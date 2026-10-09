@@ -11,6 +11,8 @@ pill_host = { package = "pill_host", path = "../../hosting/pill_host", features 
     "rendering",
 ] }
 pill_engine = { path = "../../pill_engine" }
+# The layout model and the editor's engine view, shared with the native editor.
+pill_editor_core = { path = "../pill_editor_core" }
 pill_core = { path = "../../pill_core" }
 # The gamepads, shared with the standalone frontend. Keyboard and mouse come
 # from the Scene panel's DOM events instead (`scene_input`).

@@ -53,7 +53,9 @@ from pathlib import Path
 MODULES = Path(__file__).resolve().parents[2] / "modules"
 
 # The shared engine libraries whose subtrees must resolve identically.
-ENGINE_DYLIBS = ("pill_core", "pill_engine_core")
+# The shared dylibs whose resolved features must agree in every build: the
+# engine's, and the editor core every editor module and the editor share.
+ENGINE_DYLIBS = ("pill_core", "pill_engine_core", "pill_editor_core")
 
 # The host postures module and project builds run under: the host's own cargo
 # selection, and the engine features `build_runner::host_engine_features`

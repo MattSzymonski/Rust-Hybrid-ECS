@@ -25,14 +25,16 @@
 //! overwrite each other's pixels. On Wayland it sits below the transparent
 //! WebView, as on Windows; on X11 it has to sit above it.
 
+// The UI-independent core, imported at the crate root so `crate::layout` and
+// `crate::editor_state` paths keep resolving.
+use pill_editor_core::{editor_state, layout};
+
 mod assets_tab;
 mod console_tab;
 mod dock_view;
-mod editor_state;
 mod entities_tab;
 mod error;
 mod inspector;
-mod layout;
 mod polling;
 mod popout;
 mod scene_input;
@@ -416,7 +418,7 @@ fn restore_detached_panels(mut model: Signal<layout::LayoutModel>, panels: Vec<P
             continue;
         };
         match model.write().apply(LayoutAction::OpenTab {
-            panel,
+            panel: panel.clone(),
             target_tabset,
         }) {
             Ok(_) => changed = true,

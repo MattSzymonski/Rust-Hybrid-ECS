@@ -167,7 +167,8 @@ fn apply_in_place(model: &mut LayoutModel, action: LayoutAction) -> Result<bool,
             if model.tabset(target_tabset).is_none() {
                 return Err(LayoutError::WrongNodeKind(target_tabset));
             }
-            let tab = model.add_tab(panel, panel != PanelKind::Scene);
+            let closeable = panel != PanelKind::Scene;
+            let tab = model.add_tab(panel, closeable);
             let tabset = tabset_mut(model, target_tabset)?;
             tabset.tabs.push(tab);
             tabset.selected = Some(tab);

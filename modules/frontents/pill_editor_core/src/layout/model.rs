@@ -23,7 +23,12 @@ pub enum Axis {
 }
 
 /// Serializable editor panel identity used by the panel factory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// Open-ended: besides the built-in panels, a tab may hold a panel an editor
+/// crate registers, by its id. A saved layout keeps such a tab while its
+/// crate is not loaded, and the editor shows a placeholder in it until the
+/// crate returns.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelKind {
     Scene,
@@ -33,11 +38,14 @@ pub enum PanelKind {
     Statistics,
     Systems,
     Assets,
+    /// A panel registered by an editor crate, addressed by its panel id.
+    Module(String),
 }
 
 impl PanelKind {
-    /// Human-readable name shown in a tab's title bar.
-    pub const fn title(self) -> &'static str {
+    /// Human-readable name shown in a tab's title bar; a module panel shows its
+    /// id until its registration supplies a title.
+    pub fn title(&self) -> &str {
         match self {
             Self::Scene => "Scene",
             Self::Hierarchy => "Hierarchy",
@@ -46,6 +54,7 @@ impl PanelKind {
             Self::Statistics => "Statistics",
             Self::Systems => "Systems",
             Self::Assets => "Assets",
+            Self::Module(panel_id) => panel_id,
         }
     }
 }

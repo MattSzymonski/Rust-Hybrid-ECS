@@ -28,6 +28,12 @@ DESCRIPTION
                         loadable artifact; the generated `host_module_*`
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
+      4. shared UI    - each UI-independent shared dylib (`pill_editor_core`,
+                        and `pill_ui` once it exists) is built as a `dylib`
+                        (one copy per process) and links no UI framework,
+                        window system or GPU crate (`dioxus`, `tao`, `wry`,
+                        `winit`, `wgpu`), followed through every path
+                        dependency.
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -56,6 +62,15 @@ FACADE_CRATE = "pill_engine"
 # The registry crate the core must not use (rule 2).
 REGISTRY_CRATE = "inventory"
 REGISTRY_PATH_PREFIX = "inventory::"
+
+# The UI-independent shared dylibs, by crate name and directory under
+# `modules/`, and the crates they must never link (rule 4). A crate not yet
+# present is skipped, so a later stage adds its entry before the crate exists.
+SHARED_UI_INDEPENDENT_DYLIBS = (
+    ("pill_editor_core", "frontents/pill_editor_core"),
+    ("pill_ui", "pill_ui"),
+)
+UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
 # Dependency tables that are linked into the crate itself. Dev-dependencies
 # are left out: they build tests, never the library.
@@ -163,6 +178,35 @@ def module_abi_references(root):
     return found
 
 
+# Every break of rule 4: a UI-independent shared dylib that is not a `dylib`,
+# or that links a UI framework, window or GPU crate through any path dependency.
+def shared_dylib_failures(root):
+    found = []
+    for name, relative in SHARED_UI_INDEPENDENT_DYLIBS:
+        directory = root / "modules" / relative
+        if not (directory / "Cargo.toml").is_file():
+            continue
+        manifest = read_manifest(directory / "Cargo.toml")
+        crate_types = manifest.get("lib", {}).get("crate-type", [])
+        if "dylib" not in crate_types:
+            found.append(f"{name} is not built as a `dylib` (crate-type {crate_types})")
+        visited = set()
+        pending = [(directory.resolve(), [name])]
+        while pending:
+            current, chain = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for package, dependency_directory in linked_dependencies(
+                read_manifest(current / "Cargo.toml"), current
+            ):
+                if package in UI_FRAMEWORK_CRATES:
+                    found.append(f"{' -> '.join(chain + [package])}")
+                elif dependency_directory is not None:
+                    pending.append((dependency_directory, chain + [package]))
+    return found
+
+
 # Runs every rule against the repository at `root`; returns the failures.
 def check(root):
     core_directory = root / "modules" / CORE_CRATE
@@ -178,6 +222,10 @@ def check(root):
     failures.extend(
         f"no module-abi: {reference} (the wrappers replaced the feature)"
         for reference in module_abi_references(root)
+    )
+    failures.extend(
+        f"shared UI: {failure} (a UI-independent shared dylib)"
+        for failure in shared_dylib_failures(root)
     )
     return failures
 
@@ -261,6 +309,31 @@ def self_test():
     outcome = "PASS" if len(failures) == 1 else "FAIL"
     passed &= outcome == "PASS"
     print(f"  {outcome}  a manifest declaring the removed feature fails")
+
+    # Rule 4: a UI-independent shared dylib passes as a dylib with no UI crate,
+    # and fails when it links one or is not a dylib.
+    for description, crate_type, dependencies, expected_failures in (
+        ("a UI-independent shared dylib passes", '["rlib", "dylib"]', [], 0),
+        ("a shared dylib linking a UI framework fails", '["rlib", "dylib"]', ["winit"], 1),
+        ("a shared dylib that is not a dylib fails", '["rlib"]', [], 1),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_crate(root, "pill_engine_core", [])
+            directory = root / "modules" / "frontents" / "pill_editor_core"
+            (directory / "src").mkdir(parents=True, exist_ok=True)
+            lines = [
+                '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
+                f"[lib]\ncrate-type = {crate_type}\n",
+                "[dependencies]",
+            ]
+            lines.extend(f'{dependency} = "1"' for dependency in dependencies)
+            (directory / "Cargo.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            (directory / "src" / "lib.rs").write_text("", encoding="utf-8")
+            failures = check(root)
+        outcome = "PASS" if len(failures) == expected_failures else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -280,7 +353,10 @@ def main():
         print(f"  FAIL  {failure}")
     if failures:
         return 1
-    print("  PASS  engine layout: the core does not link the facade, reads no registry, and module-abi is gone")
+    print(
+        "  PASS  engine layout: the core does not link the facade, reads no registry, "
+        "module-abi is gone, and the shared UI dylibs are UI-independent dylibs"
+    )
     return 0
 
 
