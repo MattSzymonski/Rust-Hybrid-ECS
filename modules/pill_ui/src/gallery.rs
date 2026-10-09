@@ -199,9 +199,17 @@ mod tests {
     ) {
         state.input.begin_frame();
         let theme = Theme::default();
-        let (output, layout) = run_frame(state, text, &theme, Vector2f::new(420.0, 2600.0), |ui| {
-            ui_gallery(ui);
-        });
+        let mut sheet = crate::css::Stylesheet::empty();
+        let (output, layout) = run_frame(
+            state,
+            text,
+            &theme,
+            &mut sheet,
+            Vector2f::new(420.0, 2600.0),
+            |ui| {
+                ui_gallery(ui);
+            },
+        );
         let mut atlas = Atlas::new(2048, 2048);
         let mut list = DrawList::new();
         crate::paint::paint(

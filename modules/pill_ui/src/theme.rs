@@ -67,14 +67,16 @@ impl Default for Theme {
             spacing: 6.0,
             padding: 8.0,
             indent: 14.0,
-            background: Color::rgba(0.12, 0.13, 0.15, 1.0),
-            surface: Color::rgba(0.19, 0.20, 0.23, 1.0),
-            inset: Color::rgba(0.08, 0.09, 0.10, 1.0),
-            text: Color::rgba(0.87, 0.88, 0.90, 1.0),
-            text_disabled: Color::rgba(0.45, 0.46, 0.50, 1.0),
-            accent: Color::rgba(0.26, 0.52, 0.85, 1.0),
-            accent_muted: Color::rgba(0.20, 0.36, 0.58, 1.0),
-            border: Color::rgba(0.32, 0.34, 0.38, 1.0),
+            // The same values `assets/default.css` states, exactly; the two
+            // are the built-in look in code and in the subset (D7).
+            background: Color::rgba(31.0 / 255.0, 33.0 / 255.0, 38.0 / 255.0, 1.0),
+            surface: Color::rgba(48.0 / 255.0, 51.0 / 255.0, 59.0 / 255.0, 1.0),
+            inset: Color::rgba(20.0 / 255.0, 23.0 / 255.0, 26.0 / 255.0, 1.0),
+            text: Color::rgba(222.0 / 255.0, 224.0 / 255.0, 230.0 / 255.0, 1.0),
+            text_disabled: Color::rgba(115.0 / 255.0, 117.0 / 255.0, 128.0 / 255.0, 1.0),
+            accent: Color::rgba(66.0 / 255.0, 133.0 / 255.0, 217.0 / 255.0, 1.0),
+            accent_muted: Color::rgba(51.0 / 255.0, 92.0 / 255.0, 148.0 / 255.0, 1.0),
+            border: Color::rgba(82.0 / 255.0, 87.0 / 255.0, 97.0 / 255.0, 1.0),
             border_width: 1.0,
         }
     }

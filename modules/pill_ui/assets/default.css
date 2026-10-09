@@ -1,0 +1,74 @@
+/* The built-in theme, as a stylesheet (plan decision D7).
+ *
+ * This is the shell's default sheet: `Theme::default()`'s values, expressed
+ * in the CSS subset for everything painting currently honours - container
+ * and button fills, text colour and metrics, separators, borders, outlines
+ * and opacity. Load it with
+ * `Stylesheet::parse(include_str!("../assets/default.css"))`; a UI with no
+ * sheet at all falls back to the same values in code, and a project's
+ * editor sheet loads after this one to override it.
+ *
+ * The widget internals that keep their built-in look for now (checkbox
+ * marks, slider knobs and tracks, combo-box arrows, table row highlight,
+ * drag-field boxes) are not restated here; they restyle in Stage 10's
+ * design pass, which reworks those widgets anyway.
+ */
+
+:root {
+    --font-size: 14px;
+    --heading-size: 18px;
+    --line-height: 18px;
+    --spacing: 6px;
+    --background: rgb(31, 33, 38);
+    --surface: rgb(48, 51, 59);
+    --inset: rgb(20, 23, 26);
+    --text: rgb(222, 224, 230);
+    --text-disabled: rgb(115, 117, 128);
+    --accent: rgb(66, 133, 217);
+    --accent-muted: rgb(51, 92, 148);
+    --border: rgb(82, 87, 97);
+}
+
+row,
+column,
+scroll-area {
+    gap: var(--spacing);
+}
+
+label {
+    color: var(--text);
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+}
+
+heading {
+    color: var(--text);
+    font-size: var(--heading-size);
+}
+
+button {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+}
+
+button:hover {
+    background: var(--accent-muted);
+}
+
+button:active {
+    background: var(--accent);
+}
+
+button:focus-visible {
+    border-color: var(--accent);
+}
+
+button:disabled {
+    background: var(--inset);
+    color: var(--text-disabled);
+}
+
+separator {
+    background: var(--border);
+}
