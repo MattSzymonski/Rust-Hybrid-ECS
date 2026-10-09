@@ -87,17 +87,21 @@ Paint (honoured today):
   metrics, measured and painted identically; inherited. `font-weight` is
   parsed and stored; the bundled font has one instance until Stage 10.
 - `text-align` (`left`, `center`, `right`), `white-space` (`normal`,
-  `nowrap`), `text-overflow` (`clip`, `ellipsis`; ellipsis cuts like clip
-  until the shader pass).
+  `nowrap`), `text-overflow` (`clip`, `ellipsis`; ellipsis cuts a `nowrap`
+  line to the longest prefix that fits with `…` appended).
 - `border*` - per-side strokes; `outline` + `outline-offset` - the
   `:focus-visible` ring; `opacity` - multiplied down the subtree.
+- `border-radius` - rounded fills; the shader carries the radius, controls
+  round by the theme's token by default; per-corner radii are not in the
+  subset.
+- `box-shadow` - a non-inset shadow paints behind the node (the blur's half
+  extent approximates the gaussian spread); `inset` shadows are kept and
+  not drawn.
 - `pointer-events` - `none` removes the node (and, being inherited, its
   subtree) from hit-testing, same as `display: none` removing it entirely.
 
 Parsed and stored, visible once their layer lands:
 
-- `border-radius`, `box-shadow` - need the rounded/shadow shader
-  (Stage 11); flat rendering until then.
 - `z-index` - needs the overlay layer (Stages 13+); everything draws in
   tree order.
 - `cursor` - needs the platform cursor; `user-select` - text fields are the

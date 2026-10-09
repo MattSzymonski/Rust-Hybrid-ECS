@@ -5186,6 +5186,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_ui_wgpu"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "pill_core",
+ "pill_ui",
+ "png 0.17.16",
+ "wgpu",
+]
+
+[[package]]
 name = "pill_web"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,26 @@
+[package]
+name = "pill_ui_wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+# `rlib` only: this crate is compiled into each of its users (the editor
+# shell, a renderer's UI pass, tests and the golden harness), which each own
+# their device and target - no wgpu object ever crosses a DLL boundary
+# (plan decision D8). Nothing loads this crate as a module.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+pill_core = { path = "../pill_core" }
+pill_ui = { path = "../pill_ui" }
+# The same wgpu the renderer uses; a second version in one process would bring
+# a second graphics stack into the build.
+wgpu = "25.0.0"
+bytemuck = { version = "1.4", features = ["derive"] }
+
+# `png` encodes and decodes the golden images the `golden` example compares.
+[dev-dependencies]
+png = "0.17"

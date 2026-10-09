@@ -69,3 +69,9 @@ pub use state::UiState;
 pub use text::{ShapedGlyph, ShapedText, TextStyle, TextSystem};
 pub use theme::Theme;
 pub use widget::WidgetId;
+
+/// The built-in default stylesheet: the Stage 10 design (W-0004 v4) as
+/// source text, parsed with [`Stylesheet::parse`] - what the golden images
+/// are rendered with, and what a UI falls back to without a project
+/// stylesheet.
+pub const DEFAULT_SHEET: &str = include_str!("../assets/default.css");

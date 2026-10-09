@@ -12,7 +12,9 @@ DESCRIPTION
     `pill_renderer_api`. This check reads the workspace members' manifests
     (and the example projects') and enforces:
 
-      1. wgpu          - only a GPU module depends on `wgpu`, and at least one
+      1. wgpu          - only a GPU module depends on `wgpu` (or one of the
+                         named exceptions, `pill_ui_wgpu` and
+                         `pill_editor_native`), and at least one GPU module
                          does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
                          crates: pill_core, pill_core_macros, pill_engine,
@@ -74,6 +76,12 @@ GRAPH_ONLY_SUFFIX = "_dependency_graph"
 
 # The graphics crate only a GPU module may link (rule 1).
 GRAPHICS_CRATE = "wgpu"
+
+# Crates outside the renderer split that link the graphics crate by design:
+# `pill_ui_wgpu` is the shared UI draw-list backend (an `rlib` compiled into
+# its users, never a module) and `pill_editor_native` the editor shell, which
+# owns the window and its swap chain (plan decisions D8, D19).
+WGPU_EXCEPTION_CRATES = {"pill_ui_wgpu", "pill_editor_native"}
 
 
 class Crate:
@@ -141,12 +149,14 @@ def check(repository: Path):
     renderer_crates = data_crates | gpu_modules
     problems = []
 
-    # Rule 1: wgpu only in GPU modules, and in at least one.
+    # Rule 1: wgpu only in GPU modules (or a named exception), and in at
+    # least one GPU module.
     linking_graphics = sorted(crate.name for crate in members
                               if any(package == GRAPHICS_CRATE for _, package, _ in crate.dependencies()))
     for name in linking_graphics:
-        if name not in gpu_modules:
-            problems.append((1, f"{name} depends on {GRAPHICS_CRATE}; only a GPU module may"))
+        if name not in gpu_modules and name not in WGPU_EXCEPTION_CRATES:
+            problems.append((1, f"{name} depends on {GRAPHICS_CRATE}; only a GPU module "
+                                f"or a named exception may"))
     if not any(name in gpu_modules for name in linking_graphics):
         problems.append((1, f"no GPU module depends on {GRAPHICS_CRATE}"))
 
@@ -227,7 +237,7 @@ def report(repository: Path) -> int:
 # A minimal repository that satisfies every rule: a renderer `r` with its data
 # crate, the contract crate, a host with graph-only dependencies, a project.
 VALID_TREE = {
-    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", '
+    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", "pill_ui_wgpu", '
                           '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
@@ -238,6 +248,7 @@ VALID_TREE = {
     "modules/pill_host/src/lib.rs": "//! Host.\n",
     "modules/pill_host/src/tests.rs": "use renderer_data_dependency_graph as r_data;\n",
     "modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\npill_host = { path = "x" }\n',
+    "modules/pill_ui_wgpu/Cargo.toml": '[package]\nname = "pill_ui_wgpu"\n[dependencies]\nwgpu = "25"\n',
     "modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
     "modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\npill_renderer_api = { path = "x" }\n',
     "modules/extensions/r/generated/host_module_r/Cargo.toml": '[package]\nname = "host_module_r"\n[dependencies]\nr = { path = "x" }\n',
@@ -249,6 +260,7 @@ VALID_TREE = {
 BROKEN_VARIANTS = [
     (1, {"modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nwgpu = "25"\n'}),
     (1, {"modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nr_data = { path = "x" }\n'}),
+    (1, {"modules/pill_ui_wgpu/Cargo.toml": '[package]\nname = "pill_not_ui_wgpu"\n[dependencies]\nwgpu = "25"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nglam = "0.33"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[build-dependencies]\npill_assets = "1"\n'}),
     (3, {"modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\nr_data = { path = "x" }\n'}),

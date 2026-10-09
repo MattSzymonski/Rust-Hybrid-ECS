@@ -42,7 +42,7 @@ pub mod value;
 pub use parse::{
     AlignKind, BorderSide, BoxSizingKind, Declaration, DisplayKind, Entry, FlexDirectionKind,
     FontSpec, JustifyKind, LineHeight, OverflowKind, PositionKind, RawRule, Report, ReportKind,
-    TextAlign, TextOverflow, WhiteSpace,
+    Shadow, TextAlign, TextOverflow, WhiteSpace,
 };
 pub use selector::{NodeFacts, PseudoClass, Selector, Specificity};
 pub use style::ComputedStyle;

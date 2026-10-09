@@ -129,6 +129,57 @@ impl<'a> Look<'a> {
         self.fade(self.css.background.unwrap_or(base))
     }
 
+    /// The node's corner radius: the computed one when the sheet set it,
+    /// else the widget's built-in `default`.
+    fn radius(&self, default: f32) -> f32 {
+        self.css.border_radius.unwrap_or(default)
+    }
+
+    /// The border a fill-and-border widget draws: the sheet's uniform border
+    /// when all four sides agree, else the theme's ring in `default`.
+    fn uniform_border(&self, theme: &Theme, default: Color) -> (f32, Color) {
+        let sides = [
+            self.css.border.top,
+            self.css.border.right,
+            self.css.border.bottom,
+            self.css.border.left,
+        ];
+        let widths = sides.map(|side| side.width.unwrap_or(0.0));
+        if widths[0] > 0.0 && widths.iter().all(|width| *width == widths[0]) {
+            let color = sides
+                .iter()
+                .find_map(|side| side.color)
+                .unwrap_or(theme.border);
+            return (widths[0], color);
+        }
+        (theme.border_width, default)
+    }
+
+    /// A widget's fill with its border: the border as an outer rounded fill,
+    /// the fill inside it. A zero radius draws square - the old
+    /// fill-then-stroke pair, pixel for pixel.
+    fn fill_rounded(
+        &self,
+        list: &mut DrawList,
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        border: Color,
+        fill: Color,
+    ) {
+        let radius = radius.max(0.0);
+        if width <= 0.0 {
+            list.push_rounded_fill(rect, fill, radius);
+            return;
+        }
+        list.push_rounded_fill(rect, border, radius);
+        let inner = Rect::new(
+            rect.min + Vector2f::new(width, width),
+            rect.max - Vector2f::new(width, width),
+        );
+        list.push_rounded_fill(inner, fill, (radius - width).max(0.0));
+    }
+
     /// The text metrics the node paints with.
     fn style(&self, theme: &Theme, node: &PanelNode) -> TextStyle {
         text_style(node, theme, self.css)
@@ -147,50 +198,6 @@ impl<'a> Look<'a> {
             line_height: line_height.max(font_size),
             family: self.css.font_family.clone(),
         }
-    }
-
-    /// Stroke the node's border: the computed widths and colours when the
-    /// sheet wrote any, the theme's uniform ring otherwise.
-    fn stroke(&self, list: &mut DrawList, rect: Rect, theme: &Theme, default: Color) {
-        let border = self.css.border;
-        let sides = [border.top, border.right, border.bottom, border.left];
-        if sides.iter().all(|side| side.width.is_none()) {
-            stroke(list, rect, theme.border_width, self.fade(default));
-            return;
-        }
-        let edge = |list: &mut DrawList, rect: Rect, side: crate::css::BorderSide| {
-            let width = side.width.unwrap_or(0.0);
-            if width > 0.0 {
-                list.push_fill(rect, self.fade(side.color.unwrap_or(theme.border)));
-            }
-        };
-        let top = sides[0].width.unwrap_or(0.0);
-        let right = sides[1].width.unwrap_or(0.0);
-        let bottom = sides[2].width.unwrap_or(0.0);
-        let left = sides[3].width.unwrap_or(0.0);
-        edge(
-            list,
-            Rect::new(rect.min, Vector2f::new(rect.max.x, rect.min.y + top)),
-            sides[0],
-        );
-        edge(
-            list,
-            Rect::new(
-                Vector2f::new(rect.max.x - right, rect.min.y),
-                Vector2f::new(rect.max.x, rect.max.y),
-            ),
-            sides[1],
-        );
-        edge(
-            list,
-            Rect::new(Vector2f::new(rect.min.x, rect.max.y - bottom), rect.max),
-            sides[2],
-        );
-        edge(
-            list,
-            Rect::new(rect.min, Vector2f::new(rect.min.x + left, rect.max.y)),
-            sides[3],
-        );
     }
 }
 
@@ -242,12 +249,36 @@ fn draw_node(
 ) {
     let interaction = widget_state(node, rect, state);
     let look = Look::of(css);
+
+    // A `box-shadow` paints behind the node's own drawing; an inset shadow
+    // is kept for later layers (the dock layout's left rules draw their own
+    // rectangles). The blur's half extent approximates CSS's gaussian
+    // spread: solid under the node, fading outward over `blur / 2` pixels.
+    if let Some(shadow) = css.box_shadow {
+        if !shadow.inset && shadow.color.a > 0.0 {
+            let expansion = (shadow.blur * 0.5).max(0.0);
+            let offset = Vector2f::new(shadow.offset_x, shadow.offset_y);
+            let grow = Vector2f::new(expansion, expansion);
+            let shadow_rect = Rect::new(rect.min + offset - grow, rect.max + offset + grow);
+            let radius = css.border_radius.unwrap_or(0.0);
+            list.push_soft_fill(
+                shadow_rect,
+                look.fade(shadow.color),
+                radius + expansion,
+                expansion,
+            );
+        }
+    }
     match node {
         PanelNode::Row { .. } | PanelNode::Column { .. } | PanelNode::ScrollArea { .. } => {
             // Containers have no built-in fill; a stylesheet may give them
             // one, which is how panel backgrounds are drawn.
             if let Some(background) = css.background {
-                list.push_fill(rect, look.fade(background));
+                list.push_rounded_fill(
+                    rect,
+                    look.fade(background),
+                    css.border_radius.unwrap_or(0.0),
+                );
             }
         }
         PanelNode::VectorField { .. } => {}
@@ -264,6 +295,7 @@ fn draw_node(
                 look.text(theme.text),
                 css.text_align,
                 css.white_space == Some(crate::css::WhiteSpace::Nowrap),
+                css.text_overflow == Some(crate::css::TextOverflow::Ellipsis),
             );
         }
         PanelNode::Heading { text: label } => {
@@ -279,6 +311,7 @@ fn draw_node(
                 look.text(theme.text),
                 css.text_align,
                 css.white_space == Some(crate::css::WhiteSpace::Nowrap),
+                css.text_overflow == Some(crate::css::TextOverflow::Ellipsis),
             );
         }
         PanelNode::Separator => {
@@ -413,7 +446,8 @@ fn draw_node(
 }
 
 /// Draw a label or heading with the computed alignment; `nowrap` clips
-/// instead of wrapping.
+/// instead of wrapping, and `ellipsis` cuts a too-wide single line to the
+/// longest prefix that fits once an ellipsis is appended.
 #[allow(clippy::too_many_arguments)]
 fn draw_aligned(
     list: &mut DrawList,
@@ -426,6 +460,7 @@ fn draw_aligned(
     color: Color,
     align: Option<crate::css::TextAlign>,
     nowrap: bool,
+    ellipsis: bool,
 ) {
     let measured = text.measure(contents, style, None);
     let free = (rect.width() - measured.x).max(0.0);
@@ -437,8 +472,13 @@ fn draw_aligned(
         };
     let origin = Vector2f::new(x, rect.min.y);
     if nowrap {
+        let drawn = if ellipsis {
+            ellipsized(text, contents, style, rect.width())
+        } else {
+            contents.to_string()
+        };
         list.push_clip(rect);
-        draw_text(list, atlas, text, contents, origin, style, None, color);
+        draw_text(list, atlas, text, &drawn, origin, style, None, color);
         list.pop_clip();
     } else {
         draw_text(
@@ -452,6 +492,35 @@ fn draw_aligned(
             color,
         );
     }
+}
+
+/// The longest prefix of `contents` that fits `width` once an ellipsis is
+/// appended; `contents` unchanged when it already fits.
+fn ellipsized(text: &mut TextSystem, contents: &str, style: &TextStyle, width: f32) -> String {
+    /// The character the cut is marked with.
+    const ELLIPSIS: &str = "…";
+
+    if text.measure(contents, style, None).x <= width {
+        return contents.to_string();
+    }
+    let budget = width - text.measure(ELLIPSIS, style, None).x;
+    if budget <= 0.0 {
+        return String::new();
+    }
+    let characters: Vec<char> = contents.chars().collect();
+    let (mut low, mut high) = (0usize, characters.len());
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let candidate: String = characters[..middle].iter().collect();
+        if text.measure(&candidate, style, None).x <= budget {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let mut fitted: String = characters[..low].iter().collect();
+    fitted.push_str(ELLIPSIS);
+    fitted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -474,13 +543,14 @@ fn draw_button(
     } else {
         look.fill(theme.button)
     };
-    list.push_fill(rect, background);
     let border = if interaction.focused {
         theme.highlight
     } else {
         theme.border_strong
     };
-    look.stroke(list, rect, theme, border);
+    let radius = look.radius(theme.radius_small);
+    let (width, border) = look.uniform_border(theme, border);
+    look.fill_rounded(list, rect, radius, width, border, background);
     let color = if interaction.enabled {
         look.text(theme.text)
     } else {
@@ -529,7 +599,16 @@ fn draw_checkbox(
     } else {
         theme.text_disabled
     };
-    list.push_fill(checkbox, look.fill(theme.inset));
+    let radius = look.radius(theme.radius_tiny);
+    let (width, border) = look.uniform_border(theme, border);
+    look.fill_rounded(
+        list,
+        checkbox,
+        radius,
+        width,
+        border,
+        look.fill(theme.inset),
+    );
     if checked {
         let mark = 6.0;
         let inset = (box_size - mark) * 0.5;
@@ -545,7 +624,6 @@ fn draw_checkbox(
             },
         );
     }
-    look.stroke(list, checkbox, theme, border);
 
     let color = if interaction.enabled {
         theme.text
@@ -601,7 +679,7 @@ fn draw_slider(
         Vector2f::new(track_x0, mid - 2.0),
         Vector2f::new(track_x1, mid + 2.0),
     );
-    list.push_fill(track, theme.track);
+    list.push_rounded_fill(track, theme.track, theme.radius_tiny);
     let fraction = if max > min {
         ((value - min) / (max - min)).clamp(0.0, 1.0)
     } else {
@@ -611,7 +689,7 @@ fn draw_slider(
         track.min,
         Vector2f::new(track_x0 + track.width() * fraction, track.max.y),
     );
-    list.push_fill(filled, theme.track_fill);
+    list.push_rounded_fill(filled, theme.track_fill, theme.radius_tiny);
 
     let knob_x = track_x0 + track.width() * fraction;
     let knob = Rect::new(
@@ -623,12 +701,21 @@ fn draw_slider(
     } else {
         theme.text_disabled
     };
-    list.push_fill(knob, knob_color);
-    if interaction.focused {
-        stroke(list, knob, theme.border_width, theme.highlight);
+    let knob_border = if interaction.focused {
+        theme.highlight
     } else {
-        stroke(list, knob, theme.border_width, theme.track_fill);
-    }
+        theme.track_fill
+    };
+    list.push_rounded_fill(knob, knob_border, theme.radius_tiny);
+    let inner = Rect::new(
+        knob.min + Vector2f::new(theme.border_width, theme.border_width),
+        knob.max - Vector2f::new(theme.border_width, theme.border_width),
+    );
+    list.push_rounded_fill(
+        inner,
+        knob_color,
+        (theme.radius_tiny - theme.border_width).max(0.0),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -684,7 +771,9 @@ fn draw_drag_value(
     } else {
         theme.border_strong
     };
-    look.stroke(list, value_box, theme, border);
+    let radius = look.radius(theme.radius_small);
+    let (width, border) = look.uniform_border(theme, border);
+    look.fill_rounded(list, value_box, radius, width, border, background);
 
     let shown = format_value(value, step);
     let width = text.measure(&shown, &style, None).x;
@@ -719,13 +808,14 @@ fn draw_text_field(
     interaction: State,
     look: &Look<'_>,
 ) {
-    list.push_fill(rect, look.fill(theme.inset));
     let border = if interaction.focused {
         theme.highlight
     } else {
         theme.border_strong
     };
-    look.stroke(list, rect, theme, border);
+    let radius = look.radius(theme.radius_small);
+    let (width, border) = look.uniform_border(theme, border);
+    look.fill_rounded(list, rect, radius, width, border, look.fill(theme.inset));
 
     let style = label_style(theme);
     let origin = Vector2f::new(
@@ -796,13 +886,14 @@ fn draw_combo_box(
     } else {
         look.fill(theme.inset)
     };
-    list.push_fill(rect, background);
     let border = if interaction.focused {
         theme.highlight
     } else {
         theme.border_strong
     };
-    look.stroke(list, rect, theme, border);
+    let radius = look.radius(theme.radius_small);
+    let (width, border) = look.uniform_border(theme, border);
+    look.fill_rounded(list, rect, radius, width, border, background);
 
     let style = label_style(theme);
     let color = if interaction.enabled {
@@ -945,9 +1036,9 @@ fn draw_table(
             .map(|pointer| row_rect.contains(pointer))
             .unwrap_or(false);
         if selected == Some(index) {
-            list.push_fill(row_rect, theme.highlight_wash);
+            list.push_rounded_fill(row_rect, theme.highlight_wash, theme.radius_small);
         } else if hovered {
-            list.push_fill(row_rect, theme.hover);
+            list.push_rounded_fill(row_rect, theme.hover, theme.radius_small);
         }
         for (column, cell_text) in row.iter().enumerate() {
             let cell = cell_rect(row_rect, column, column_width);
@@ -990,11 +1081,11 @@ fn draw_tree_row(
     interaction: State,
 ) {
     if selected {
-        list.push_fill(rect, theme.highlight_wash);
+        list.push_rounded_fill(rect, theme.highlight_wash, theme.radius_small);
         let rule = Rect::new(rect.min, Vector2f::new(rect.min.x + 2.0, rect.max.y));
         list.push_fill(rule, theme.highlight);
     } else if interaction.hovered {
-        list.push_fill(rect, theme.hover);
+        list.push_rounded_fill(rect, theme.hover, theme.radius_small);
     }
     let style = label_style(theme);
     let mut text_x = rect.min.x + 2.0;
@@ -1175,6 +1266,60 @@ mod tests {
                 "root",
                 vec![TreeNode::new("child")],
             )],
+        );
+    }
+
+    #[test]
+    fn a_narrow_nowrap_label_cuts_to_an_ellipsis() {
+        let mut text = TextSystem::new();
+        let style = TextStyle::default();
+        let long = "a very long label that cannot possibly fit here";
+        let fitted = ellipsized(&mut text, long, &style, 80.0);
+        assert!(fitted.ends_with('…'), "the cut is marked: {fitted:?}");
+        assert!(
+            text.measure(&fitted, &style, None).x <= 80.0,
+            "the fitted line stays inside the width: {fitted:?}"
+        );
+        assert!(fitted.len() < long.len());
+        assert_eq!(ellipsized(&mut text, "small", &style, 300.0), "small");
+    }
+
+    #[test]
+    fn a_sheet_radius_rounds_the_button_fill() {
+        let mut state = UiState::new();
+        let mut text = TextSystem::new();
+        let mut sheet = crate::css::Stylesheet::parse("button { border-radius: 4px; }");
+        assert!(sheet.reports().is_empty());
+        state.input.begin_frame();
+        let theme = Theme::default();
+        let (output, layout) = run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            Vector2f::new(200.0, 80.0),
+            |ui| {
+                ui.button("rounded");
+            },
+        );
+        let mut atlas = Atlas::new(64, 64);
+        let mut list = DrawList::new();
+        paint(
+            &output.tree,
+            &layout,
+            &theme,
+            &state,
+            &mut text,
+            &mut atlas,
+            &mut list,
+        );
+        assert!(
+            list.vertices.iter().any(|vertex| vertex.shape[2] == 4.0),
+            "the border fill carries the sheet's radius"
+        );
+        assert!(
+            list.vertices.iter().any(|vertex| vertex.shape[2] == 3.0),
+            "the inner fill carries the radius minus the border width"
         );
     }
 

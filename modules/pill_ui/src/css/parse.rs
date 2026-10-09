@@ -278,7 +278,7 @@ pub enum Declaration {
     /// `border-radius`, kept for the rounded shader (not rendered yet).
     BorderRadius(f32),
     /// `box-shadow`, kept as written (not rendered yet).
-    BoxShadow(String),
+    BoxShadow(Shadow),
     /// `outline`: the focus ring, width and colour.
     Outline {
         /// Stroke width in pixels; zero draws nothing.
@@ -936,6 +936,22 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "z-index",
 ];
 
+/// One `box-shadow`: offsets and blur in pixels, and the colour. An inset
+/// shadow is kept but not drawn yet - the dock layout's left rules use it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    /// The `inset` keyword: the shadow paints inside the box.
+    pub inset: bool,
+    /// Horizontal offset in pixels.
+    pub offset_x: f32,
+    /// Vertical offset in pixels.
+    pub offset_y: f32,
+    /// Blur radius in pixels; `0` is a hard shadow.
+    pub blur: f32,
+    /// The shadow's colour.
+    pub color: Color,
+}
+
 /// Type one declaration's value into one or more typed declarations; the
 /// error names what was refused.
 fn type_declarations(name: &str, raw: &str) -> Result<Vec<Declaration>, String> {
@@ -1188,7 +1204,33 @@ fn type_declarations(name: &str, raw: &str) -> Result<Vec<Declaration>, String> 
             Declaration::Border(sides)
         }
         "border-radius" => Declaration::BorderRadius(length(single(&words)?)?),
-        "box-shadow" => Declaration::BoxShadow(raw.to_string()),
+        "box-shadow" => {
+            let mut inset = false;
+            let mut lengths = Vec::new();
+            let mut color = None;
+            for word in &words {
+                if word.text.eq_ignore_ascii_case("inset") {
+                    inset = true;
+                } else if let Some(parsed) = parse_color(&word.text) {
+                    color = Some(parsed);
+                } else {
+                    lengths.push(length(&word.text)?);
+                }
+            }
+            if lengths.len() > 3 {
+                return Err(format!(
+                    "`{raw}` has a spread radius; only offsets, blur and colour are supported"
+                ));
+            }
+            let color = color.ok_or_else(|| format!("`{raw}` names no shadow colour"))?;
+            Declaration::BoxShadow(Shadow {
+                inset,
+                offset_x: lengths.first().copied().unwrap_or(0.0),
+                offset_y: lengths.get(1).copied().unwrap_or(0.0),
+                blur: lengths.get(2).copied().unwrap_or(0.0),
+                color,
+            })
+        }
         "outline" => parse_outline(&words)?,
         "outline-offset" => Declaration::OutlineOffset(length(single(&words)?)?),
         "box-sizing" => Declaration::BoxSizing(match single(&words)? {

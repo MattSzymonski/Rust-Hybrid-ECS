@@ -15,8 +15,8 @@
  * - `z-index`, `cursor` and `user-select` are kept; they parse and are
  *   reported by nothing, but only take effect when the shell's overlay and
  *   platform layers arrive (Stages 13+).
- * - `border-radius` and `box-shadow` are kept; they parse and wait for the
- *   rounded shader (Stage 11).
+ * - `border-radius` and `box-shadow` render through the rounded shader;
+ *   inset shadows are kept and not drawn.
  * - Selectors the subset would report (`::before`, `:not(...)`, attribute
  *   selectors, `@media`) are rewritten or dropped; there are none left.
  */
