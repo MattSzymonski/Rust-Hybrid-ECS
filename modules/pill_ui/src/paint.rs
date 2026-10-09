@@ -24,9 +24,10 @@ use pill_core::math::{Vector2f, Vector3f};
 
 // Current crate
 use crate::atlas::Atlas;
+use crate::css::ComputedStyle;
 use crate::draw::{Color, DrawList, Rect};
-use crate::layout::PanelLayout;
-use crate::panel::{PanelNode, PanelTree};
+use crate::layout::{text_style, PanelLayout};
+use crate::panel::{node_enabled, PanelNode, PanelTree};
 use crate::state::UiState;
 use crate::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -71,7 +72,12 @@ pub fn paint(
             }
             active_clip = node_clip;
         }
-        draw_node(node, rect, theme, state, text, atlas, list);
+        let css = &layout.styles[index];
+        if css.hidden {
+            // `display: none`: neither the node nor its subtree draws.
+            continue;
+        }
+        draw_node(node, rect, theme, state, text, atlas, list, css);
     }
     if active_clip.is_some() {
         list.pop_clip();
@@ -83,6 +89,108 @@ fn collect<'a>(node: &'a PanelNode, out: &mut Vec<&'a PanelNode>) {
     out.push(node);
     for child in node.children() {
         collect(child, out);
+    }
+}
+
+/// What the computed style asks painting to change: fills, text colours,
+/// fonts, borders, outlines and the effective opacity.
+#[derive(Copy, Clone, Debug)]
+struct Look<'a> {
+    /// The node's computed style.
+    css: &'a ComputedStyle,
+    /// The opacity after ancestors multiplied in.
+    fade: f32,
+}
+
+impl<'a> Look<'a> {
+    /// A look over one node's computed style.
+    fn of(css: &'a ComputedStyle) -> Look<'a> {
+        Look {
+            css,
+            fade: css.opacity_effective,
+        }
+    }
+
+    /// A colour with the look's opacity folded into its alpha.
+    fn fade(&self, color: Color) -> Color {
+        if self.fade >= 1.0 {
+            return color;
+        }
+        Color::rgba(color.r, color.g, color.b, color.a * self.fade)
+    }
+
+    /// The text colour: the computed one if set, else `base`.
+    fn text(&self, base: Color) -> Color {
+        self.fade(self.css.color.unwrap_or(base))
+    }
+
+    /// A default fill, overridden by `background` when the sheet set one.
+    fn fill(&self, base: Color) -> Color {
+        self.fade(self.css.background.unwrap_or(base))
+    }
+
+    /// The text metrics the node paints with.
+    fn style(&self, theme: &Theme, node: &PanelNode) -> TextStyle {
+        text_style(node, theme, self.css)
+    }
+
+    /// The text metrics a widget's own labels paint with.
+    fn label_style(&self, theme: &Theme) -> TextStyle {
+        let font_size = self.css.font_size.unwrap_or(theme.font_size);
+        let line_height = match self.css.line_height {
+            Some(crate::css::LineHeight::Px(px)) => px,
+            Some(crate::css::LineHeight::Factor(factor)) => factor * font_size,
+            None => theme.line_height,
+        };
+        TextStyle {
+            font_size,
+            line_height: line_height.max(font_size),
+            family: self.css.font_family.clone(),
+        }
+    }
+
+    /// Stroke the node's border: the computed widths and colours when the
+    /// sheet wrote any, the theme's uniform ring otherwise.
+    fn stroke(&self, list: &mut DrawList, rect: Rect, theme: &Theme, default: Color) {
+        let border = self.css.border;
+        let sides = [border.top, border.right, border.bottom, border.left];
+        if sides.iter().all(|side| side.width.is_none()) {
+            stroke(list, rect, theme.border_width, self.fade(default));
+            return;
+        }
+        let edge = |list: &mut DrawList, rect: Rect, side: crate::css::BorderSide| {
+            let width = side.width.unwrap_or(0.0);
+            if width > 0.0 {
+                list.push_fill(rect, self.fade(side.color.unwrap_or(theme.border)));
+            }
+        };
+        let top = sides[0].width.unwrap_or(0.0);
+        let right = sides[1].width.unwrap_or(0.0);
+        let bottom = sides[2].width.unwrap_or(0.0);
+        let left = sides[3].width.unwrap_or(0.0);
+        edge(
+            list,
+            Rect::new(rect.min, Vector2f::new(rect.max.x, rect.min.y + top)),
+            sides[0],
+        );
+        edge(
+            list,
+            Rect::new(
+                Vector2f::new(rect.max.x - right, rect.min.y),
+                Vector2f::new(rect.max.x, rect.max.y),
+            ),
+            sides[1],
+        );
+        edge(
+            list,
+            Rect::new(Vector2f::new(rect.min.x, rect.max.y - bottom), rect.max),
+            sides[2],
+        );
+        edge(
+            list,
+            Rect::new(rect.min, Vector2f::new(rect.min.x + left, rect.max.y)),
+            sides[3],
+        );
     }
 }
 
@@ -117,22 +225,6 @@ fn widget_state(node: &PanelNode, rect: Rect, state: &UiState) -> State {
     }
 }
 
-/// Whether the node's widget reacts to input; nodes without an `enabled`
-/// field always do.
-fn node_enabled(node: &PanelNode) -> bool {
-    match node {
-        PanelNode::Button { enabled, .. }
-        | PanelNode::Checkbox { enabled, .. }
-        | PanelNode::Slider { enabled, .. }
-        | PanelNode::DragValue { enabled, .. }
-        | PanelNode::TextField { enabled, .. }
-        | PanelNode::ComboBox { enabled, .. }
-        | PanelNode::ColorField { enabled, .. }
-        | PanelNode::VectorField { enabled, .. } => *enabled,
-        _ => true,
-    }
-}
-
 // =============================================================================
 // Per-widget drawing
 // =============================================================================
@@ -146,39 +238,51 @@ fn draw_node(
     text: &mut TextSystem,
     atlas: &mut Atlas,
     list: &mut DrawList,
+    css: &ComputedStyle,
 ) {
     let interaction = widget_state(node, rect, state);
+    let look = Look::of(css);
     match node {
-        PanelNode::Row { .. }
-        | PanelNode::Column { .. }
-        | PanelNode::ScrollArea { .. }
-        | PanelNode::VectorField { .. } => {}
+        PanelNode::Row { .. } | PanelNode::Column { .. } | PanelNode::ScrollArea { .. } => {
+            // Containers have no built-in fill; a stylesheet may give them
+            // one, which is how panel backgrounds are drawn.
+            if let Some(background) = css.background {
+                list.push_fill(rect, look.fade(background));
+            }
+        }
+        PanelNode::VectorField { .. } => {}
         PanelNode::Label { text: label } => {
-            draw_text(
+            let style = look.style(theme, node);
+            draw_aligned(
                 list,
                 atlas,
                 text,
                 label,
-                rect.min,
-                &label_style(theme),
-                None,
-                theme.text,
+                rect,
+                theme,
+                &style,
+                look.text(theme.text),
+                css.text_align,
+                css.white_space == Some(crate::css::WhiteSpace::Nowrap),
             );
         }
         PanelNode::Heading { text: label } => {
-            draw_text(
+            let style = look.style(theme, node);
+            draw_aligned(
                 list,
                 atlas,
                 text,
                 label,
-                rect.min,
-                &heading_style(theme),
-                None,
-                theme.text,
+                rect,
+                theme,
+                &style,
+                look.text(theme.text),
+                css.text_align,
+                css.white_space == Some(crate::css::WhiteSpace::Nowrap),
             );
         }
         PanelNode::Separator => {
-            list.push_fill(rect, theme.border);
+            list.push_fill(rect, look.fade(theme.border));
         }
         PanelNode::Image {
             texture,
@@ -187,10 +291,10 @@ fn draw_node(
             color,
             ..
         } => {
-            list.push_quad(*texture, rect, *uv_min, *uv_max, *color);
+            list.push_quad(*texture, rect, *uv_min, *uv_max, look.fade(*color));
         }
         PanelNode::Button { label, .. } => {
-            draw_button(list, atlas, text, rect, theme, label, interaction)
+            draw_button(list, atlas, text, rect, theme, label, interaction, &look)
         }
         PanelNode::Checkbox { label, checked, .. } => {
             draw_checkbox(list, atlas, text, rect, theme, label, *checked, interaction)
@@ -283,6 +387,61 @@ fn draw_node(
             interaction,
         ),
     }
+
+    // A stylesheet's `outline` draws over the node: the dock layout's
+    // `:focus-visible` ring is exactly this.
+    if let Some((width, color)) = css.outline {
+        if width > 0.0 {
+            let offset = css.outline_offset.unwrap_or(0.0);
+            let outline_rect = Rect::new(
+                Vector2f::new(rect.min.x - offset, rect.min.y - offset),
+                Vector2f::new(rect.max.x + offset, rect.max.y + offset),
+            );
+            stroke(list, outline_rect, width, look.fade(color));
+        }
+    }
+}
+
+/// Draw a label or heading with the computed alignment; `nowrap` clips
+/// instead of wrapping.
+#[allow(clippy::too_many_arguments)]
+fn draw_aligned(
+    list: &mut DrawList,
+    atlas: &mut Atlas,
+    text: &mut TextSystem,
+    contents: &str,
+    rect: Rect,
+    _theme: &Theme,
+    style: &TextStyle,
+    color: Color,
+    align: Option<crate::css::TextAlign>,
+    nowrap: bool,
+) {
+    let measured = text.measure(contents, style, None);
+    let free = (rect.width() - measured.x).max(0.0);
+    let x = rect.min.x
+        + match align {
+            Some(crate::css::TextAlign::Center) => free * 0.5,
+            Some(crate::css::TextAlign::Right) => free,
+            _ => 0.0,
+        };
+    let origin = Vector2f::new(x, rect.min.y);
+    if nowrap {
+        list.push_clip(rect);
+        draw_text(list, atlas, text, contents, origin, style, None, color);
+        list.pop_clip();
+    } else {
+        draw_text(
+            list,
+            atlas,
+            text,
+            contents,
+            origin,
+            style,
+            Some(rect.width()),
+            color,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -294,28 +453,30 @@ fn draw_button(
     theme: &Theme,
     label: &str,
     interaction: State,
+    look: &Look<'_>,
 ) {
     let background = if !interaction.enabled {
-        theme.inset
+        look.fill(theme.inset)
     } else if interaction.active {
-        theme.accent
+        look.fill(theme.accent)
     } else if interaction.hovered {
-        theme.accent_muted
+        look.fill(theme.accent_muted)
     } else {
-        theme.surface
+        look.fill(theme.surface)
     };
     list.push_fill(rect, background);
-    if interaction.focused {
-        stroke(list, rect, theme.border_width, theme.accent);
+    let border = if interaction.focused {
+        theme.accent
     } else {
-        stroke(list, rect, theme.border_width, theme.border);
-    }
-    let color = if interaction.enabled {
-        theme.text
-    } else {
-        theme.text_disabled
+        theme.border
     };
-    let style = label_style(theme);
+    look.stroke(list, rect, theme, border);
+    let color = if interaction.enabled {
+        look.text(theme.text)
+    } else {
+        look.text(theme.text_disabled)
+    };
+    let style = look.label_style(theme);
     let size = text.measure(label, &style, None);
     let origin = Vector2f::new(
         rect.min.x + (rect.width() - size.x) * 0.5,
@@ -872,14 +1033,6 @@ fn label_style(theme: &Theme) -> TextStyle {
     }
 }
 
-fn heading_style(theme: &Theme) -> TextStyle {
-    TextStyle {
-        font_size: theme.heading_size,
-        line_height: theme.heading_size * 1.3,
-        family: None,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     list: &mut DrawList,
@@ -938,7 +1091,15 @@ mod tests {
         }
         state.input.begin_frame();
         let theme = Theme::default();
-        let (output, layout) = run_frame(state, text, &theme, Vector2f::new(400.0, 300.0), panel);
+        let mut sheet = crate::css::Stylesheet::empty();
+        let (output, layout) = run_frame(
+            state,
+            text,
+            &theme,
+            &mut sheet,
+            Vector2f::new(400.0, 300.0),
+            panel,
+        );
         let mut atlas = Atlas::new(512, 512);
         let mut list = DrawList::new();
         paint(
@@ -1168,5 +1329,101 @@ mod tests {
             .chunks_exact(4)
             .any(|quad: &[UiVertex]| quad[0].color == surface);
         assert!(highlighted, "the hovered row is highlighted");
+    }
+
+    #[test]
+    fn a_stylesheet_restyles_the_ui() {
+        let mut state = UiState::new();
+        let mut text = TextSystem::new();
+        let mut sheet = crate::css::Stylesheet::parse(
+            "
+            .quiet label { color: rgb(255, 0, 0); }
+            .primary button { background: rgb(0, 255, 0); }
+            ",
+        );
+        assert!(sheet.reports().is_empty(), "{:?}", sheet.reports());
+
+        state.input.begin_frame();
+        let theme = Theme::default();
+        let (output, layout) = crate::layout::run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            Vector2f::new(400.0, 300.0),
+            |ui| {
+                ui.class("quiet");
+                ui.column(|ui| {
+                    ui.label("styled label");
+                });
+                ui.class("primary");
+                ui.column(|ui| {
+                    ui.button("styled button");
+                });
+            },
+        );
+        let mut atlas = Atlas::new(2048, 2048);
+        let mut list = DrawList::new();
+        paint(
+            &output.tree,
+            &layout,
+            &theme,
+            &state,
+            &mut text,
+            &mut atlas,
+            &mut list,
+        );
+
+        let red = Color::rgba(1.0, 0.0, 0.0, 1.0);
+        let green = Color::rgba(0.0, 1.0, 0.0, 1.0);
+        assert!(
+            list.vertices.iter().any(|vertex| vertex.color == red),
+            "the label's text colour came from the stylesheet"
+        );
+        assert!(
+            list.vertices
+                .chunks_exact(4)
+                .any(|quad| quad[0].color == green),
+            "the button's fill came from the stylesheet"
+        );
+    }
+
+    #[test]
+    fn display_none_paints_nothing_of_its_subtree() {
+        let mut state = UiState::new();
+        let mut text = TextSystem::new();
+        let mut sheet = crate::css::Stylesheet::parse(".gone { display: none; }");
+        state.input.begin_frame();
+        let theme = Theme::default();
+        let (output, layout) = crate::layout::run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            Vector2f::new(400.0, 300.0),
+            |ui| {
+                ui.class("gone");
+                ui.column(|ui| {
+                    ui.label("never drawn");
+                    ui.button("ghost");
+                });
+            },
+        );
+        assert!(
+            layout.interactive.is_empty(),
+            "hidden widgets take no input"
+        );
+        let mut atlas = Atlas::new(256, 256);
+        let mut list = DrawList::new();
+        paint(
+            &output.tree,
+            &layout,
+            &theme,
+            &state,
+            &mut text,
+            &mut atlas,
+            &mut list,
+        );
+        assert!(list.vertices.is_empty(), "a hidden subtree paints nothing");
     }
 }

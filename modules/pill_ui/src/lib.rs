@@ -24,8 +24,12 @@
 //! [`IconCache`], which are shared per process and never keep a module's
 //! pointers.
 
+/// The `.css` asset type: a stylesheet as a project file.
+pub mod asset;
 /// The shared texture atlas holding rasterized glyphs and icons.
 pub mod atlas;
+/// The CSS subset: stylesheets, selectors, values and computed styles.
+pub mod css;
 /// The draw list a backend consumes, and the value types it carries.
 pub mod draw;
 /// The UI Gallery: every widget, every state, every theme token.
@@ -49,7 +53,9 @@ pub mod theme;
 /// Widget identity and per-widget memory.
 pub mod widget;
 
+pub use asset::StylesheetAsset;
 pub use atlas::{Atlas, Region};
+pub use css::{ComputedStyle, NodeFacts, Stylesheet};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 pub use gallery::ui_gallery;
 pub use icons::{IconCache, IconId};

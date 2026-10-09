@@ -5174,12 +5174,15 @@ dependencies = [
  "arrayvec",
  "bitflags 2.13.1",
  "cosmic-text",
+ "cssparser",
  "fontdb",
  "pill_core",
  "pill_engine",
  "resvg",
+ "serde",
  "sys-locale",
  "taffy",
+ "trait_type_map",
 ]
 
 [[package]]

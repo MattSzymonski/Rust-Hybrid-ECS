@@ -349,6 +349,23 @@ impl TreeNode {
     }
 }
 
+/// One node's styling metadata: its type name, classes and id name, the
+/// facts selectors match against.
+///
+/// [`PanelTree::meta`] holds these in the tree's preorder, parallel to the
+/// nodes themselves, so styling never has to grow the node enum.
+#[derive(Clone, Debug, Default)]
+pub struct NodeMeta {
+    /// The node's type name, e.g. `button`.
+    pub type_name: &'static str,
+    /// The classes the builder attached, in written order.
+    pub classes: Vec<String>,
+    /// The name the node's id derives from, matched by `#id`.
+    pub name: Option<String>,
+    /// The direct children's metadata, preorder.
+    children: Vec<NodeMeta>,
+}
+
 /// One frame's widget tree.
 #[derive(Clone, Debug)]
 pub struct PanelTree {
@@ -358,6 +375,8 @@ pub struct PanelTree {
     /// Every focusable widget's id, in build order: the Tab order, and the
     /// order painting walks to draw focus rings.
     pub focus_order: Vec<WidgetId>,
+    /// Every node's styling metadata, in the tree's preorder.
+    pub meta: Vec<NodeMeta>,
 }
 
 // =============================================================================
@@ -398,8 +417,12 @@ pub struct PanelBuilder<'a> {
     path: Vec<String>,
     /// How many auto-named widgets of each kind the current group holds.
     level_counters: HashMap<String, u32>,
-    /// Containers under construction; the last is the open group.
-    stack: Vec<PanelNode>,
+    /// The groups under construction; the last is the open one.
+    stack: Vec<OpenNode>,
+    /// The name the last `id_of` call used, waiting for the node it names.
+    last_name: Option<String>,
+    /// Classes the next widget or group will carry.
+    pending_classes: Vec<String>,
     /// Focusable ids, in build order.
     focusable: Vec<WidgetId>,
     /// Activations and changes, in order.
@@ -426,9 +449,16 @@ impl<'a> PanelBuilder<'a> {
             theme,
             path: Vec::new(),
             level_counters: HashMap::new(),
-            stack: vec![PanelNode::Column {
-                children: Vec::new(),
-            }],
+            stack: vec![OpenNode::new(
+                PanelNode::Column {
+                    children: Vec::new(),
+                },
+                "column",
+                Vec::new(),
+                None,
+            )],
+            last_name: None,
+            pending_classes: Vec::new(),
             focusable: Vec::new(),
             inputs: Vec::new(),
             clipboard: Vec::new(),
@@ -465,10 +495,13 @@ impl<'a> PanelBuilder<'a> {
             .stack
             .pop()
             .expect("the root column is always open until finish");
+        let mut meta = Vec::new();
+        flatten_meta(&root.meta, &mut meta);
         PanelOutput {
             tree: PanelTree {
-                root,
+                root: root.node,
                 focus_order: std::mem::take(&mut self.focusable),
+                meta,
             },
             inputs: self.inputs,
             clipboard: self.clipboard,
@@ -478,6 +511,14 @@ impl<'a> PanelBuilder<'a> {
     // =========================================================================
     // Structure
     // =========================================================================
+
+    /// Attach `class` to the next widget or group built.
+    ///
+    /// Classes are what stylesheets select; they accumulate until the next
+    /// node consumes them.
+    pub fn class(&mut self, class: &str) {
+        self.pending_classes.push(class.to_string());
+    }
 
     /// Run `add` inside a named id scope: everything built inside derives
     /// its id from `name`, which keeps state stable when a group moves.
@@ -867,6 +908,7 @@ impl<'a> PanelBuilder<'a> {
         let mut changed = false;
 
         let mut children = Vec::new();
+        let mut children_meta = Vec::new();
         let components = [
             ("r", color.r * 255.0, 1.0),
             ("g", color.g * 255.0, 1.0),
@@ -892,16 +934,25 @@ impl<'a> PanelBuilder<'a> {
                 step: *step,
                 enabled,
             });
+            children_meta.push(NodeMeta {
+                type_name: "drag-value",
+                classes: Vec::new(),
+                name: Some(label.to_string()),
+                children: Vec::new(),
+            });
         }
         if changed {
             self.inputs.push(PanelInput::Changed(id));
         }
-        self.add(PanelNode::ColorField {
-            id,
-            color,
-            enabled,
-            children,
-        });
+        self.add_with_children(
+            PanelNode::ColorField {
+                id,
+                color,
+                enabled,
+                children,
+            },
+            children_meta,
+        );
         color
     }
 
@@ -918,6 +969,7 @@ impl<'a> PanelBuilder<'a> {
         let mut value = value;
         let step = 0.1;
         let mut children = Vec::new();
+        let mut children_meta = Vec::new();
         let mut changed = false;
         for (label, component) in [("x", value.x), ("y", value.y), ("z", value.z)] {
             let component_id = WidgetId::named(id, label);
@@ -937,16 +989,25 @@ impl<'a> PanelBuilder<'a> {
                 step,
                 enabled,
             });
+            children_meta.push(NodeMeta {
+                type_name: "drag-value",
+                classes: Vec::new(),
+                name: Some(label.to_string()),
+                children: Vec::new(),
+            });
         }
         if changed {
             self.inputs.push(PanelInput::Changed(id));
         }
-        self.add(PanelNode::VectorField {
-            id,
-            value,
-            enabled,
-            children,
-        });
+        self.add_with_children(
+            PanelNode::VectorField {
+                id,
+                value,
+                enabled,
+                children,
+            },
+            children_meta,
+        );
         value
     }
 
@@ -1163,7 +1224,11 @@ impl<'a> PanelBuilder<'a> {
     // =========================================================================
 
     /// The id of the widget called `name` in the group being built.
-    fn id_of(&self, name: &str) -> WidgetId {
+    ///
+    /// Also remembers `name` for the metadata of the node the call is about
+    /// to add.
+    fn id_of(&mut self, name: &str) -> WidgetId {
+        self.last_name = Some(name.to_string());
         let mut parent = WidgetId::ROOT;
         for segment in &self.path {
             parent = WidgetId::named(parent, segment);
@@ -1179,13 +1244,33 @@ impl<'a> PanelBuilder<'a> {
         name
     }
 
-    /// Append a finished node to the open group.
+    /// Append a finished node to the open group, with its metadata.
     fn add(&mut self, node: PanelNode) {
+        self.add_with_children(node, Vec::new());
+    }
+
+    /// Append a finished node whose children were built by hand (the colour
+    /// and vector component fields), with their metadata.
+    fn add_with_children(&mut self, node: PanelNode, children_meta: Vec<NodeMeta>) {
+        let name = self.last_name.take();
+        let classes = std::mem::take(&mut self.pending_classes);
+        let meta = NodeMeta {
+            type_name: node_type(&node),
+            classes,
+            name,
+            children: children_meta,
+        };
+        self.push_child(node, meta);
+    }
+
+    /// Append a node and its metadata to the open group.
+    fn push_child(&mut self, node: PanelNode, meta: NodeMeta) {
         let parent = self
             .stack
             .last_mut()
             .expect("a group is always open while building");
-        match parent {
+        parent.meta.children.push(meta);
+        match &mut parent.node {
             PanelNode::Row { children }
             | PanelNode::Column { children }
             | PanelNode::ColorField { children, .. }
@@ -1199,14 +1284,18 @@ impl<'a> PanelBuilder<'a> {
     /// Build a group: push `node` as the open group under the path segment
     /// `segment`, run `add`, pop it back into its parent.
     fn push_group(&mut self, segment: String, node: PanelNode, add: impl FnOnce(&mut Self)) {
-        self.path.push(segment);
-        self.stack.push(node);
+        self.last_name = None;
+        let classes = std::mem::take(&mut self.pending_classes);
+        let type_name = node_type(&node);
+        self.path.push(segment.clone());
+        self.stack
+            .push(OpenNode::new(node, type_name, classes, Some(segment)));
         let saved_counters = std::mem::take(&mut self.level_counters);
         add(self);
         self.level_counters = saved_counters;
-        let node = self.stack.pop().expect("the pushed group is open");
+        let open = self.stack.pop().expect("the pushed group is open");
         self.path.pop();
-        self.add(node);
+        self.push_child(open.node, open.meta);
     }
 
     /// Decide what this frame's input did with `id`, advancing the drag and
@@ -1342,6 +1431,82 @@ struct TreeRowInfo {
     open: bool,
     /// Whether the row has children.
     has_children: bool,
+}
+
+/// A group under construction: its node, its metadata and its children's.
+struct OpenNode {
+    /// The node being built.
+    node: PanelNode,
+    /// The node's metadata; children accumulate in `meta.children`.
+    meta: NodeMeta,
+}
+
+impl OpenNode {
+    /// An open group with the given identity; children follow.
+    fn new(
+        node: PanelNode,
+        type_name: &'static str,
+        classes: Vec<String>,
+        name: Option<String>,
+    ) -> OpenNode {
+        OpenNode {
+            node,
+            meta: NodeMeta {
+                type_name,
+                classes,
+                name,
+                children: Vec::new(),
+            },
+        }
+    }
+}
+
+/// Whether the node's widget reacts to input; nodes without an `enabled`
+/// field always do.
+pub(crate) fn node_enabled(node: &PanelNode) -> bool {
+    match node {
+        PanelNode::Button { enabled, .. }
+        | PanelNode::Checkbox { enabled, .. }
+        | PanelNode::Slider { enabled, .. }
+        | PanelNode::DragValue { enabled, .. }
+        | PanelNode::TextField { enabled, .. }
+        | PanelNode::ComboBox { enabled, .. }
+        | PanelNode::ColorField { enabled, .. }
+        | PanelNode::VectorField { enabled, .. } => *enabled,
+        _ => true,
+    }
+}
+
+/// The type name selectors match a node by.
+fn node_type(node: &PanelNode) -> &'static str {
+    match node {
+        PanelNode::Row { .. } => "row",
+        PanelNode::Column { .. } => "column",
+        PanelNode::Label { .. } => "label",
+        PanelNode::Heading { .. } => "heading",
+        PanelNode::Separator => "separator",
+        PanelNode::Image { .. } => "image",
+        PanelNode::Button { .. } => "button",
+        PanelNode::Checkbox { .. } => "checkbox",
+        PanelNode::Slider { .. } => "slider",
+        PanelNode::DragValue { .. } => "drag-value",
+        PanelNode::TextField { .. } => "text-field",
+        PanelNode::ComboBox { .. } => "combo-box",
+        PanelNode::ColorField { .. } => "color-field",
+        PanelNode::VectorField { .. } => "vector-field",
+        PanelNode::Collapsing { .. } => "collapsing",
+        PanelNode::ScrollArea { .. } => "scroll-area",
+        PanelNode::Table { .. } => "table",
+        PanelNode::TreeRow { .. } => "tree-row",
+    }
+}
+
+/// Append `meta` and its descendants to `out`, preorder - the tree's order.
+fn flatten_meta(meta: &NodeMeta, out: &mut Vec<NodeMeta>) {
+    out.push(meta.clone());
+    for child in &meta.children {
+        flatten_meta(child, out);
+    }
 }
 
 /// The horizontal arrow step this frame, in `step` units (left is -1).

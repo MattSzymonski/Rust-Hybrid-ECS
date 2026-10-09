@@ -27,14 +27,19 @@ use std::collections::BTreeMap;
 use pill_core::math::Vector2f;
 use taffy::compute::compute_leaf_layout;
 use taffy::prelude::{
-    AvailableSpace, Dimension, Display, FlexDirection, LengthPercentage, LengthPercentageAuto,
-    NodeId, Size as TaffySize, Style, TaffyTree,
+    AvailableSpace, Dimension, Display, FlexDirection, JustifyContent, LengthPercentage,
+    LengthPercentageAuto, NodeId, Size as TaffySize, Style, TaffyTree,
 };
-use taffy::{AlignItems, Overflow, Point};
+use taffy::{AlignItems, BoxSizing, Overflow, Point, Position, Rect as TaffyRect};
 
 // Current crate
+use crate::css::parse::{
+    AlignKind, DisplayKind, FlexDirectionKind, JustifyKind, OverflowKind, PositionKind,
+};
+use crate::css::value::Length;
+use crate::css::{ComputedStyle, NodeFacts, Stylesheet};
 use crate::draw::Rect;
-use crate::panel::{PanelBuilder, PanelNode, PanelOutput, PanelTree};
+use crate::panel::{node_enabled, PanelBuilder, PanelNode, PanelOutput, PanelTree};
 use crate::state::UiState;
 use crate::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -47,7 +52,8 @@ const COLOR_SWATCH_WIDTH: f32 = 24.0;
 // PanelLayout
 // =============================================================================
 
-/// One frame's geometry: where every node ended up.
+/// One frame's geometry and styling: where every node ended up and what it
+/// computed to.
 #[derive(Clone, Debug, Default)]
 pub struct PanelLayout {
     /// The root's size.
@@ -59,6 +65,9 @@ pub struct PanelLayout {
     /// The interactive id of each node, parallel to `rects`, for
     /// introspection and tests.
     pub ids: Vec<Option<WidgetId>>,
+    /// Each node's computed style, parallel to `rects`, with
+    /// `opacity_effective` and `hidden` filled in while walking.
+    pub styles: Vec<ComputedStyle>,
     /// Where each interactive widget can be hit, already clipped away from
     /// scrolled-out positions.
     pub interactive: BTreeMap<WidgetId, Rect>,
@@ -81,11 +90,12 @@ impl PanelLayout {
 ///
 /// The caller has queued this frame's input events and called
 /// [`UiInput::begin_frame`](crate::input::UiInput::begin_frame); what comes
-/// back is the tree, its geometry, and the widgets' events.
+/// back is the tree, its geometry and styles, and the widgets' events.
 pub fn run_frame(
     state: &mut UiState,
     text: &mut TextSystem,
     theme: &Theme,
+    sheet: &mut Stylesheet,
     available: Vector2f,
     panel: impl FnOnce(&mut PanelBuilder<'_>),
 ) -> (PanelOutput, PanelLayout) {
@@ -94,7 +104,7 @@ pub fn run_frame(
         panel(&mut builder);
         builder.finish()
     };
-    let layout = compute(&output.tree, text, theme, available, state);
+    let layout = compute(&output.tree, text, theme, sheet, available, state);
     layout.store_interaction(state);
     (output, layout)
 }
@@ -103,7 +113,8 @@ pub fn run_frame(
 // compute
 // =============================================================================
 
-/// Lay `tree` out into at most `available` logical pixels.
+/// Lay `tree` out into at most `available` logical pixels, styled by
+/// `sheet` (an empty stylesheet means the built-in theme's look).
 ///
 /// Reads the stored scroll offsets from `state` (clamping them to the
 /// content's real height) but does not write anything to it; call
@@ -113,12 +124,24 @@ pub fn compute(
     tree: &PanelTree,
     text: &mut TextSystem,
     theme: &Theme,
+    sheet: &mut Stylesheet,
     available: Vector2f,
     state: &UiState,
 ) -> PanelLayout {
+    let styles = resolve_styles(tree, sheet, state);
     let mut taffy: TaffyTree<TextMeasure> = TaffyTree::new();
     let mut order = Vec::new();
-    let root = build_node(&mut taffy, &tree.root, theme, 0.0, true, &mut order);
+    let mut cursor = 0usize;
+    let root = build_node(
+        &mut taffy,
+        &tree.root,
+        theme,
+        &styles,
+        &mut cursor,
+        0.0,
+        true,
+        &mut order,
+    );
 
     taffy
         .compute_layout_with_measure(
@@ -141,10 +164,14 @@ pub fn compute(
                                 height: 0.0,
                             };
                         };
-                        let wrap = known_dimensions.width.or(match space.width {
-                            AvailableSpace::Definite(width) => Some(width),
-                            _ => None,
-                        });
+                        let wrap = if context.wrap {
+                            known_dimensions.width.or(match space.width {
+                                AvailableSpace::Definite(width) => Some(width),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
                         let measured = text.measure(&context.text, &context.style, wrap);
                         TaffySize {
                             width: measured.x,
@@ -156,7 +183,10 @@ pub fn compute(
         )
         .expect("panel trees always lay out");
 
-    let mut layout = PanelLayout::default();
+    let mut layout = PanelLayout {
+        styles,
+        ..PanelLayout::default()
+    };
     let mut cursor = 0usize;
     let root_rect = walk(
         &taffy,
@@ -189,6 +219,15 @@ fn walk(
 ) -> Rect {
     let node_id = order[*cursor];
     *cursor += 1;
+    let index = *cursor - 1;
+    let (hidden, takes_pointer, clips_children) = {
+        let css = &layout.styles[index];
+        (
+            css.hidden,
+            css.pointer_events != Some(false),
+            clips_overflow(css),
+        )
+    };
     let geometry = taffy.layout(node_id).expect("laid out above");
     let local = Vector2f::new(geometry.location.x, geometry.location.y);
     let rect = Rect::from_min_size(
@@ -203,22 +242,37 @@ fn walk(
             Some(clip) => rect.intersection(&clip),
             None => Some(rect),
         };
-        if let Some(hit) = hit {
-            layout.interactive.insert(id, hit);
+        if (!hidden && takes_pointer).then_some(()).is_some() {
+            if let Some(hit) = hit {
+                layout.interactive.insert(id, hit);
+            }
         }
     }
 
-    // Children: a scroll area shifts and clips its contents by the stored
-    // offset; everything else only accumulates its own position.
+    // Children: CSS `overflow` clips a subtree to the node's rectangle; a
+    // scroll area also shifts its contents by the stored offset.
+    let own_clip = if clips_children {
+        match clip {
+            Some(clip) => rect.intersection(&clip),
+            None => Some(rect),
+        }
+    } else {
+        clip
+    };
     match node {
         PanelNode::ScrollArea { id, .. } => {
-            // Children first, at their natural positions; the content's real
-            // height is what tells the offset how far it may go.
-            let start = layout.rects.len();
-            let child_clip = match clip {
-                Some(clip) => rect.intersection(&clip),
-                None => Some(rect),
+            // A scroll area always clips its contents, whether or not the
+            // stylesheet says so; children first, at their natural
+            // positions, so the content's real height tells the offset how
+            // far it may go.
+            let scroll_clip = match own_clip {
+                Some(clip) => Some(clip),
+                None => match clip {
+                    Some(clip) => rect.intersection(&clip),
+                    None => Some(rect),
+                },
             };
+            let start = layout.rects.len();
             for child in node.children() {
                 walk(
                     taffy,
@@ -227,7 +281,7 @@ fn walk(
                     cursor,
                     parent_origin + local,
                     shift,
-                    child_clip,
+                    scroll_clip,
                     state,
                     layout,
                 );
@@ -272,7 +326,7 @@ fn walk(
                     cursor,
                     parent_origin + local,
                     shift,
-                    clip,
+                    own_clip,
                     state,
                     layout,
                 );
@@ -282,23 +336,109 @@ fn walk(
     rect
 }
 
+/// Whether a node's CSS clips its children.
+fn clips_overflow(css: &ComputedStyle) -> bool {
+    match css.overflow {
+        Some((x, y)) => x != OverflowKind::Visible || y != OverflowKind::Visible,
+        None => false,
+    }
+}
+
+/// Resolve every node's computed style, preorder, with inheritance and the
+/// effective opacity and hidden flags filled in.
+fn resolve_styles(tree: &PanelTree, sheet: &mut Stylesheet, state: &UiState) -> Vec<ComputedStyle> {
+    let mut out = Vec::with_capacity(tree.meta.len());
+    let mut chain: Vec<NodeFacts<'_>> = Vec::new();
+    let mut parents: Vec<ComputedStyle> = Vec::new();
+    let mut cursor = 0usize;
+    resolve_walk(
+        &tree.root,
+        &tree.meta,
+        &mut cursor,
+        &mut chain,
+        &mut parents,
+        sheet,
+        state,
+        &mut out,
+    );
+    out
+}
+
+/// One step of [`resolve_styles`].
+#[allow(clippy::too_many_arguments)]
+fn resolve_walk<'t>(
+    node: &PanelNode,
+    meta: &'t [crate::panel::NodeMeta],
+    cursor: &mut usize,
+    chain: &mut Vec<NodeFacts<'t>>,
+    parents: &mut Vec<ComputedStyle>,
+    sheet: &mut Stylesheet,
+    state: &UiState,
+    out: &mut Vec<ComputedStyle>,
+) {
+    let facts_meta = &meta[*cursor];
+    *cursor += 1;
+    let id = node.id();
+    let enabled = node_enabled(node);
+    let hovered = enabled
+        && id
+            .zip(state.input.pointer())
+            .map(|(id, pointer)| {
+                state
+                    .hit_rects
+                    .get(&id)
+                    .map(|rect| rect.contains(pointer))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+    let facts = NodeFacts {
+        type_name: facts_meta.type_name,
+        classes: &facts_meta.classes,
+        id_name: facts_meta.name.as_deref(),
+        hovered,
+        active: id.is_some() && state.interaction.active == id,
+        focused: id.is_some() && state.interaction.focus == id,
+        disabled: !enabled,
+    };
+    chain.push(facts);
+    let key = crate::css::key_for(chain);
+    let parent = parents.last().cloned().unwrap_or_default();
+    let mut style = sheet.resolve(chain, key, &parent);
+    style.opacity_effective = parent.opacity_effective * style.opacity.unwrap_or(1.0);
+    style.hidden = parent.hidden || style.display == Some(DisplayKind::None);
+    out.push(style.clone());
+    parents.push(style);
+    for child in node.children() {
+        resolve_walk(child, meta, cursor, chain, parents, sheet, state, out);
+    }
+    parents.pop();
+    chain.pop();
+}
+
 /// Build the `taffy` node for `node`, recording node ids in preorder in
-/// `order`.
+/// `order`; `styles` and `cursor` follow the same preorder for the
+/// computed styles.
+#[allow(clippy::too_many_arguments)]
 fn build_node(
     taffy: &mut TaffyTree<TextMeasure>,
     node: &PanelNode,
     theme: &Theme,
+    styles: &[ComputedStyle],
+    cursor: &mut usize,
     extra_indent: f32,
     is_root: bool,
     order: &mut Vec<NodeId>,
 ) -> NodeId {
-    let style = node_style(node, theme, extra_indent, is_root);
+    let css = &styles[*cursor];
+    *cursor += 1;
+    let style = node_style(node, theme, extra_indent, is_root, css);
 
     match node {
         PanelNode::Label { text } | PanelNode::Heading { text } => {
             let context = TextMeasure {
                 text: text.clone(),
-                style: text_style(node, theme),
+                style: text_style(node, theme, css),
+                wrap: css.white_space != Some(crate::css::WhiteSpace::Nowrap),
             };
             let id = taffy
                 .new_leaf_with_context(style, context)
@@ -314,7 +454,16 @@ fn build_node(
                 _ => 0.0,
             };
             for child in node.children() {
-                let child_id = build_node(taffy, child, theme, child_indent, false, order);
+                let child_id = build_node(
+                    taffy,
+                    child,
+                    theme,
+                    styles,
+                    cursor,
+                    child_indent,
+                    false,
+                    order,
+                );
                 taffy.add_child(id, child_id).expect("child insertion");
             }
             id
@@ -322,25 +471,41 @@ fn build_node(
     }
 }
 
-/// The text style a text node measures with.
-fn text_style(node: &PanelNode, theme: &Theme) -> TextStyle {
-    match node {
-        PanelNode::Heading { .. } => TextStyle {
-            font_size: theme.heading_size,
-            line_height: theme.heading_size * 1.3,
-            family: None,
-        },
-        _ => TextStyle {
-            font_size: theme.font_size,
-            line_height: theme.line_height,
-            family: None,
-        },
+/// The text style a text node measures with: the theme's metrics, overridden
+/// by the node's computed style. Painting reuses it, so text paints exactly
+/// as it measured.
+pub(crate) fn text_style(node: &PanelNode, theme: &Theme, css: &ComputedStyle) -> TextStyle {
+    let base_size = match node {
+        PanelNode::Heading { .. } => theme.heading_size,
+        _ => theme.font_size,
+    };
+    let base_line = match node {
+        PanelNode::Heading { .. } => theme.heading_size * 1.3,
+        _ => theme.line_height,
+    };
+    let font_size = css.font_size.unwrap_or(base_size);
+    let line_height = match css.line_height {
+        Some(crate::css::LineHeight::Px(px)) => px,
+        Some(crate::css::LineHeight::Factor(factor)) => factor * font_size,
+        None => base_line,
+    };
+    TextStyle {
+        font_size,
+        line_height: line_height.max(font_size),
+        family: css.font_family.clone(),
     }
 }
 
 /// The `taffy` style of one node: fixed heights for widgets, `auto` for
-/// text, flex for containers.
-fn node_style(node: &PanelNode, theme: &Theme, extra_indent: f32, is_root: bool) -> Style {
+/// text, flex for containers - the built-in look, with the node's computed
+/// style over it.
+fn node_style(
+    node: &PanelNode,
+    theme: &Theme,
+    extra_indent: f32,
+    is_root: bool,
+    css: &ComputedStyle,
+) -> Style {
     let mut style = Style {
         // Widgets keep their sizes: content overflows a scroll area rather
         // than shrinking to fit it.
@@ -443,7 +608,161 @@ fn node_style(node: &PanelNode, theme: &Theme, extra_indent: f32, is_root: bool)
                 LengthPercentageAuto::length(*depth as f32 * theme.indent + extra_indent);
         }
     }
+
+    // The computed style's overrides; anything it does not set keeps the
+    // built-in value above.
+    if let Some(display) = css.display {
+        style.display = match display {
+            DisplayKind::Flex => Display::Flex,
+            DisplayKind::Block => Display::Block,
+            DisplayKind::None => Display::None,
+        };
+    }
+    if let Some(direction) = css.flex_direction {
+        style.flex_direction = match direction {
+            FlexDirectionKind::Row => FlexDirection::Row,
+            FlexDirectionKind::RowReverse => FlexDirection::RowReverse,
+            FlexDirectionKind::Column => FlexDirection::Column,
+            FlexDirectionKind::ColumnReverse => FlexDirection::ColumnReverse,
+        };
+    }
+    if let Some(grow) = css.flex_grow {
+        style.flex_grow = grow;
+    }
+    if let Some(shrink) = css.flex_shrink {
+        style.flex_shrink = shrink;
+    }
+    if let Some(basis) = css.flex_basis {
+        style.flex_basis = dimension_of(basis);
+    }
+    if let Some(align) = css.align_items {
+        style.align_items = Some(match align {
+            AlignKind::Stretch => AlignItems::STRETCH,
+            AlignKind::Center => AlignItems::CENTER,
+            AlignKind::FlexStart => AlignItems::FLEX_START,
+            AlignKind::FlexEnd => AlignItems::FLEX_END,
+        });
+    }
+    if let Some(justify) = css.justify_content {
+        style.justify_content = Some(match justify {
+            JustifyKind::Start => JustifyContent::START,
+            JustifyKind::End => JustifyContent::END,
+            JustifyKind::Center => JustifyContent::CENTER,
+            JustifyKind::SpaceBetween => JustifyContent::SPACE_BETWEEN,
+        });
+    }
+    if let Some((row, column)) = css.gap {
+        style.gap = TaffySize {
+            width: LengthPercentage::length(column),
+            height: LengthPercentage::length(row),
+        };
+    }
+    if let Some(width) = css.width {
+        style.size.width = dimension_of(width);
+    }
+    if let Some(height) = css.height {
+        style.size.height = dimension_of(height);
+    }
+    if let Some(min_width) = css.min_width {
+        style.min_size.width = min_max_of(min_width);
+    }
+    if let Some(min_height) = css.min_height {
+        style.min_size.height = min_max_of(min_height);
+    }
+    if let Some(max_width) = css.max_width {
+        style.max_size.width = min_max_of(max_width);
+    }
+    if let Some(max_height) = css.max_height {
+        style.max_size.height = min_max_of(max_height);
+    }
+    if let Some(padding) = css.padding {
+        style.padding = TaffyRect {
+            left: LengthPercentage::length(padding.left),
+            right: LengthPercentage::length(padding.right),
+            top: LengthPercentage::length(padding.top),
+            bottom: LengthPercentage::length(padding.bottom),
+        };
+    }
+    if let Some(margin) = css.margin {
+        style.margin = TaffyRect {
+            left: auto_length_of(margin.left),
+            right: auto_length_of(margin.right),
+            top: auto_length_of(margin.top),
+            bottom: auto_length_of(margin.bottom),
+        };
+    }
+    let border = css.border;
+    for (side, target) in [
+        (border.top, &mut style.border.top),
+        (border.right, &mut style.border.right),
+        (border.bottom, &mut style.border.bottom),
+        (border.left, &mut style.border.left),
+    ] {
+        if let Some(width) = side.width {
+            *target = LengthPercentage::length(width);
+        }
+    }
+    if let Some(sizing) = css.box_sizing {
+        style.box_sizing = match sizing {
+            crate::css::BoxSizingKind::BorderBox => BoxSizing::BorderBox,
+            crate::css::BoxSizingKind::ContentBox => BoxSizing::ContentBox,
+        };
+    }
+    if let Some(position) = css.position {
+        style.position = match position {
+            PositionKind::Relative => Position::Relative,
+            PositionKind::Absolute | PositionKind::Fixed => Position::Absolute,
+        };
+    }
+    let inset = css.inset;
+    style.inset = TaffyRect {
+        left: auto_length_of(inset.left.unwrap_or(Length::Auto)),
+        right: auto_length_of(inset.right.unwrap_or(Length::Auto)),
+        top: auto_length_of(inset.top.unwrap_or(Length::Auto)),
+        bottom: auto_length_of(inset.bottom.unwrap_or(Length::Auto)),
+    };
+    if let Some((x, y)) = css.overflow {
+        let convert = |kind: OverflowKind| match kind {
+            OverflowKind::Visible => Overflow::Visible,
+            OverflowKind::Hidden => Overflow::Hidden,
+            OverflowKind::Auto | OverflowKind::Scroll => Overflow::Scroll,
+            OverflowKind::Clip => Overflow::Clip,
+        };
+        style.overflow = Point {
+            x: convert(x),
+            y: convert(y),
+        };
+    }
     style
+}
+
+/// A CSS size as a `taffy` dimension.
+fn dimension_of(size: crate::css::Size) -> Dimension {
+    match size {
+        crate::css::Size::Length(Length::Px(value)) => Dimension::length(value),
+        crate::css::Size::Length(Length::Percent(value)) => Dimension::percent(value / 100.0),
+        crate::css::Size::Length(Length::Auto) => Dimension::auto(),
+        crate::css::Size::MaxContent => Dimension::max_content(),
+        crate::css::Size::MinContent => Dimension::min_content(),
+    }
+}
+
+/// A CSS length as a `taffy` length that may be `auto`.
+fn auto_length_of(length: Length) -> LengthPercentageAuto {
+    match length {
+        Length::Px(value) => LengthPercentageAuto::length(value),
+        Length::Percent(value) => LengthPercentageAuto::percent(value / 100.0),
+        Length::Auto => LengthPercentageAuto::auto(),
+    }
+}
+
+/// A CSS min/max size as a `taffy` length; content keywords become `auto`,
+/// which keeps the built-in behaviour.
+fn min_max_of(size: crate::css::Size) -> LengthPercentageAuto {
+    match size {
+        crate::css::Size::Length(length) => auto_length_of(length),
+        crate::css::Size::MaxContent | crate::css::Size::MinContent => LengthPercentageAuto::auto(),
+    }
 }
 
 /// What the measure function needs to size a text leaf.
@@ -452,6 +771,8 @@ struct TextMeasure {
     text: String,
     /// The style to measure it with.
     style: TextStyle,
+    /// Whether the text wraps at the available width.
+    wrap: bool,
 }
 
 // =============================================================================
@@ -461,6 +782,7 @@ struct TextMeasure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::css::Stylesheet;
     use crate::draw::TextureId;
     use crate::panel::TreeNode;
     use crate::widget::WidgetId;
@@ -500,7 +822,8 @@ mod tests {
         }
         state.input.begin_frame();
         let theme = Theme::default();
-        run_frame(state, text, &theme, ctrl(400.0, 300.0), panel)
+        let mut sheet = Stylesheet::empty();
+        run_frame(state, text, &theme, &mut sheet, ctrl(400.0, 300.0), panel)
     }
 
     #[test]

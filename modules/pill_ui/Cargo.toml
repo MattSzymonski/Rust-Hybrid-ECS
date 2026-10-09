@@ -44,6 +44,20 @@ resvg = { version = "0.48", default-features = false }
 # The process locale for font matching, the same crate `cosmic-text`'s `std`
 # feature resolves; read once in `TextSystem::new`.
 sys-locale = "0.3"
+# The CSS subset's tokenizer (plan decision D6, Stage 9). Version-matched to
+# the one the editor's desktop graph resolves (0.29.6 through `kuchikiki`),
+# so one copy serves everything; the parser above it is ours (selectors,
+# values, cascade), which is why this stays the small `cssparser` and not
+# the `selectors` engine. Its default feature set is empty in 0.29, so no
+# posture can union features onto it.
+cssparser = "0.29"
+# The import settings' (de)serialization, the same crate and derive feature
+# every asset type in the workspace uses.
+serde = { version = "1", features = ["derive"] }
+# The shared component/asset trait dispatch, the same git revision the
+# engine and extensions use (a git dependency, so a second revision would
+# be a second `ahash` and a second trait map).
+trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
 # Flex and grid layout (plan decision D6). Defaults kept - flexbox, grid,
 # block/float, calc and content sizing; nothing else in the graph uses taffy,
 # so there is no union to pin.
