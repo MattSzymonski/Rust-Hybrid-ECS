@@ -223,6 +223,11 @@ pub struct RenderFrame {
     /// Whether an enabled camera was found; the renderer skips a frame
     /// without one.
     pub has_camera: bool,
+    /// The camera of every other surface that has one this frame, by surface
+    /// id, resolved from the [`crate::SurfaceCameras`] bindings. The primary
+    /// surface draws through `camera` above; a surface missing here is not
+    /// drawn.
+    pub surface_views: BTreeMap<u32, crate::SurfaceView>,
     /// Number of this frame, counting from one; packed into the engine
     /// parameters beside the clocks.
     pub sequence: u64,
@@ -240,6 +245,7 @@ impl Default for RenderFrame {
             camera: CameraComponent::default(),
             camera_transform: TransformComponent::default(),
             has_camera: false,
+            surface_views: BTreeMap::new(),
             sequence: 0,
         }
     }

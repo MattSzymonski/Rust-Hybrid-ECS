@@ -29,7 +29,7 @@ use std::pin::Pin;
 use pill_engine::AssetManager;
 
 // Current crate
-use crate::{RenderFrame, RenderViewport, RendererError};
+use crate::{RawWindowData, RenderFrame, RenderViewport, RendererError, SurfaceId, SurfaceOptions};
 
 /// What one [`PillRenderer::render`] call did with the frame it was given.
 ///
@@ -106,6 +106,11 @@ pub type AttachFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PillRenderer>
 ///
 /// Boxing it as `Box<dyn PillRenderer>` is what lets a frontend swap the wgpu
 /// backend for [`HeadlessRenderer`] without touching its frame loop.
+///
+/// A wrapper that implements this trait by delegating to another renderer -
+/// the host's module renderer does - must forward every method, the defaulted
+/// ones included: one it leaves out silently runs the default instead of the
+/// renderer it wraps.
 pub trait PillRenderer {
     /// Reports the limits of the device the renderer draws on.
     ///
@@ -165,6 +170,60 @@ pub trait PillRenderer {
     /// versions; this clears that bookkeeping for callers that know the asset
     /// set was replaced wholesale and the diff can no longer be trusted.
     fn invalidate_assets(&mut self);
+
+    /// Starts drawing into another surface: a second window or canvas, sized
+    /// `width` by `height` physical pixels.
+    ///
+    /// Every surface shares the renderer's device and caches; each draws
+    /// through the camera the frame resolved for it
+    /// ([`RenderFrame::surface_views`]) and is drawn by [`Self::render`] after
+    /// the primary one. Attaching an id already attached replaces it.
+    ///
+    /// The default refuses: a renderer that draws one surface only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::UnsupportedSurface`] when the renderer draws a
+    /// single surface or `id` is [`SurfaceId::PRIMARY`], and the creation
+    /// errors of the surface otherwise.
+    ///
+    /// # Safety
+    ///
+    /// `window` must name a live window that outlives the surface: the caller
+    /// keeps it alive until [`Self::detach_surface`] or until the renderer is
+    /// dropped, whichever comes first.
+    unsafe fn attach_surface(
+        &mut self,
+        id: SurfaceId,
+        window: RawWindowData,
+        width: u32,
+        height: u32,
+        options: SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        let _ = (window, width, height, options);
+        Err(RendererError::UnsupportedSurface {
+            detail: format!("surface {} (this renderer draws one surface)", id.0),
+        })
+    }
+
+    /// Stops drawing into a surface attached with [`Self::attach_surface`] and
+    /// releases it; an unknown id does nothing.
+    fn detach_surface(&mut self, _id: SurfaceId) {}
+
+    /// [`Self::resize`] for an attached surface; an unknown id does nothing.
+    fn resize_surface(&mut self, _id: SurfaceId, _width: u32, _height: u32) {}
+
+    /// [`Self::set_viewport`] for an attached surface; an unknown id does
+    /// nothing.
+    fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
+
+    /// Whether a surface may present on the next [`Self::render`].
+    ///
+    /// The frontend paces surfaces the window system paces itself - a Wayland
+    /// subsurface, by its frame callbacks - and a surface that may not present
+    /// is skipped rather than waited on. Every surface starts ready; this
+    /// applies to the primary surface too.
+    fn set_surface_ready(&mut self, _id: SurfaceId, _ready: bool) {}
 }
 
 /// Stub renderer for frontends that run without a GPU surface.

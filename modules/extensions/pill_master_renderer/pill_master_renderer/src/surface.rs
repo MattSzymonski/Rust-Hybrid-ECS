@@ -68,6 +68,24 @@ fn requested_present_mode(available: &[wgpu::PresentMode]) -> Option<wgpu::Prese
     Some(present_mode)
 }
 
+/// The present mode a surface asking for `present` gets: that mode where the
+/// surface lists it, vsync otherwise.
+fn preferred_present_mode(
+    present: pill_renderer_api::PresentPreference,
+    available: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    let preferred = match present {
+        pill_renderer_api::PresentPreference::Vsync => wgpu::PresentMode::Fifo,
+        pill_renderer_api::PresentPreference::LowLatency => wgpu::PresentMode::Mailbox,
+        pill_renderer_api::PresentPreference::Immediate => wgpu::PresentMode::Immediate,
+    };
+    if available.contains(&preferred) {
+        preferred
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
 /// The colour format every pipeline rendering to this surface declares.
 ///
 /// Preference order taken from the reference: an sRGB target where the surface
@@ -156,7 +174,13 @@ impl Surface {
         window: RawWindowData,
         width: u32,
         height: u32,
-    ) -> Result<(Self, wgpu::Device, wgpu::Queue)> {
+    ) -> Result<(
+        Self,
+        wgpu::Device,
+        wgpu::Queue,
+        wgpu::Instance,
+        wgpu::Adapter,
+    )> {
         // A zero-sized window still needs a surface it can configure; the first
         // resize replaces these.
         let width = width.max(1);
@@ -279,7 +303,105 @@ impl Surface {
             },
             device,
             queue,
+            instance,
+            adapter,
         ))
+    }
+
+    /// Builds a surface for another window on the device the first surface
+    /// created, drawing in that surface's format.
+    ///
+    /// The format has to match: every pass pipeline declares the first
+    /// surface's format, and one surface's pipelines cannot draw into another
+    /// format. A window whose surface cannot offer it is refused. The present
+    /// mode follows `present`, falling back to `Fifo` where the surface does
+    /// not list the preferred mode or the driver refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::SurfaceCreation`] when the window's surface
+    /// cannot be created or the adapter cannot present to it,
+    /// [`RendererError::UnsupportedSurface`] when it cannot draw in
+    /// `render_format`, and the configuration errors of [`configure`].
+    ///
+    /// # Safety
+    ///
+    /// `window` must name a live window that outlives the returned surface.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn create_additional(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        window: RawWindowData,
+        width: u32,
+        height: u32,
+        render_format: wgpu::TextureFormat,
+        present: pill_renderer_api::PresentPreference,
+    ) -> Result<Self> {
+        let (raw_window_handle, raw_display_handle) = window.to_raw()?;
+        // SAFETY: the handles name a live window that outlives the surface,
+        // which is this function's own contract with its caller.
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle,
+                raw_window_handle,
+            })
+        }
+        .map_err(|error| RendererError::SurfaceCreation {
+            detail: error.to_string(),
+        })?;
+        if !adapter.is_surface_supported(&surface) {
+            return Err(RendererError::SurfaceCreation {
+                detail: "the renderer's GPU cannot present to this window".to_string(),
+            });
+        }
+        let capabilities = surface.get_capabilities(adapter);
+        // A configured format whose sRGB view is the render format: the same
+        // format, or its plain variant on a surface without sRGB formats.
+        let color_format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|format| format.add_srgb_suffix() == render_format)
+            .ok_or_else(|| RendererError::UnsupportedSurface {
+                detail: format!(
+                    "the window offers no format drawable as {render_format:?} ({:?})",
+                    capabilities.formats
+                ),
+            })?;
+        let alpha_mode =
+            pick_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
+        let present_mode = preferred_present_mode(present, &capabilities.present_modes);
+        let mut configuration = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: color_format,
+            width: width.max(1),
+            height: height.max(1),
+            desired_maximum_frame_latency: 2,
+            present_mode,
+            alpha_mode,
+            view_formats: vec![render_format],
+        };
+        // As for the first surface: a preferred mode the driver refuses falls
+        // back to vsync rather than failing the surface.
+        if let Err(error) = configure(&surface, device, &mut configuration) {
+            if configuration.present_mode == wgpu::PresentMode::Fifo {
+                return Err(error);
+            }
+            warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "present mode {:?} was refused for an additional surface ({error}); falling back to Fifo",
+                configuration.present_mode
+            );
+            configuration.present_mode = wgpu::PresentMode::Fifo;
+            configure(&surface, device, &mut configuration)?;
+        }
+        Ok(Self {
+            surface,
+            configuration,
+            format: render_format,
+            backend: adapter.get_info().backend,
+        })
     }
 
     /// The graphics API the device behind this surface runs on.
@@ -485,6 +607,30 @@ fn attempt_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A preferred present mode is used where the surface lists it, and vsync
+    /// otherwise.
+    #[test]
+    fn a_present_preference_falls_back_to_vsync() {
+        use pill_renderer_api::PresentPreference;
+        let all = [
+            wgpu::PresentMode::Fifo,
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Immediate,
+        ];
+        assert_eq!(
+            preferred_present_mode(PresentPreference::LowLatency, &all),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            preferred_present_mode(PresentPreference::Immediate, &[wgpu::PresentMode::Fifo]),
+            wgpu::PresentMode::Fifo
+        );
+        assert_eq!(
+            preferred_present_mode(PresentPreference::Vsync, &all),
+            wgpu::PresentMode::Fifo
+        );
+    }
 
     #[test]
     fn an_srgb_format_is_preferred_where_the_surface_offers_one() {

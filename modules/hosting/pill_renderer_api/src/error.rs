@@ -57,6 +57,10 @@ pub enum RendererError {
         value(detail)
     )]
     SurfaceConfigurationRefused { detail: String },
+    /// The renderer cannot draw into another surface, or not into this one.
+    #[message("the renderer cannot draw into this surface: ", value(detail))]
+    UnsupportedSurface { detail: String },
+
     /// A resource the call referenced - a camera, a shader - is not in
     /// storage.
     #[message("renderer resource was not found")]

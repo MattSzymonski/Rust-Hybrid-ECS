@@ -938,6 +938,48 @@ impl FrameDriver for RenderingHost {
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
         self.host.engine_mut().take_rumble_requests()
     }
+
+    fn attach_surface<W: RendererWindow>(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        window: W,
+        width: u32,
+        height: u32,
+        options: pill_renderer_api::SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        // Kept by the display, which re-attaches it after every renderer
+        // reload (`AttachedRenderer::replace_backend`).
+        self.display
+            .attach_surface(id, window, width, height, options)
+    }
+
+    fn detach_surface(&mut self, id: pill_renderer_api::SurfaceId) {
+        self.display.detach_surface(id);
+    }
+
+    fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
+        self.display.resize_surface(id, width, height);
+    }
+
+    fn set_surface_viewport(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        viewport: Option<RenderViewport>,
+    ) {
+        self.display.set_surface_viewport(id, viewport);
+    }
+
+    fn set_surface_ready(&mut self, id: pill_renderer_api::SurfaceId, ready: bool) {
+        self.display.set_surface_ready(id, ready);
+    }
+
+    fn set_surface_camera(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        binding: Option<pill_renderer_api::CameraBinding>,
+    ) {
+        pill_runtime::set_surface_camera(self.host.engine_mut().world_mut(), id, binding);
+    }
 }
 
 // =============================================================================
