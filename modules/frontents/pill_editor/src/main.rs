@@ -72,7 +72,9 @@ const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Frame interval while the scene is not on screen. The renderer skips such
 /// frames, so nothing else would pace the loop; this keeps the ECS ticking at
-/// roughly a display's rate instead of spinning a core.
+/// roughly a display's rate instead of spinning a core. Only Linux has a scene
+/// child window that can be hidden.
+#[cfg(target_os = "linux")]
 const HIDDEN_SCENE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// How soon to look again when the compositor has not yet shown the engine's

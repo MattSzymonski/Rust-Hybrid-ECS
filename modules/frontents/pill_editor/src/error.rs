@@ -47,7 +47,9 @@ pub enum EditorError {
         source: pill_host::RendererError,
     },
 
-    /// A detached Scene window could not be given its native scene window.
+    /// A detached Scene window could not be given its native scene window
+    /// (Linux only: elsewhere the scene shares the WebView's window).
+    #[cfg(target_os = "linux")]
     #[message("failed to create a native window for the detached scene")]
     SceneWindow,
 

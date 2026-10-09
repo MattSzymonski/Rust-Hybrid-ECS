@@ -150,15 +150,23 @@ def discover_crates() -> List[Crate]:
     project_root = NATIVE_PROJECT_ROOT
     crates.append(Crate(project_root.name, project_root / "src", "project"))
 
-    # `modules:` is a YAML list of quoted crate directory names under
-    # `extensions/`, ending at the next top-level key or end of file.
+    # `modules:` is a YAML list of quoted crate names, each in an extension
+    # folder under `extensions/`, ending at the next top-level key or end of file.
     config_text = read_source(project_settings_yaml(NATIVE_PROJECT_ROOT))
     modules_block = re.search(
         r"^modules:\s*$(.*?)(?=^\S|\Z)", config_text, re.MULTILINE | re.DOTALL
     )
     if modules_block:
         for name in re.findall(r'^\s*-\s*"([^"]+)"', modules_block.group(1), re.MULTILINE):
-            crates.append(Crate(name, MODULES_ROOT / "extensions" / name / "src", "module"))
+            crate_directory = next(
+                (
+                    folder / name
+                    for folder in sorted((MODULES_ROOT / "extensions").iterdir())
+                    if (folder / name / "Cargo.toml").is_file()
+                ),
+                MODULES_ROOT / "extensions" / name / name,
+            )
+            crates.append(Crate(name, crate_directory / "src", "module"))
     return crates
 
 

@@ -93,6 +93,8 @@ BUNDLE_DIRECTORY = Path("build") / BUNDLE_CRATE_NAME
 PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
 EXTENSION_DIRECTORY = Path("modules") / "extensions"
+# Extension crates live one level down, one folder per extension:
+# `modules/extensions/<extension>/<crate>/`.
 # The crates a bundle names: the runtime always (the static-link types), and the
 # C# bridge for a managed project (its external project backend). Never the
 # development host - a shipping build does not compile it at all.
@@ -132,6 +134,25 @@ CSHARP_TARGET_FRAMEWORK = "net8.0"
 # The engine workspace root, against which the managed config's output
 # subdirectories are resolved (the workspace manifest globs `modules/*`).
 WORKSPACE_DIRECTORY = Path("modules")
+
+
+# Finds the directory of an extension crate: `modules/extensions/<folder>/<crate>`
+# for the folder that holds it, the folder of its own name first (as the host's
+# `locate_extension_folder` does). Falls back to that conventional path when no
+# folder holds the crate, so a missing crate is reported as missing.
+def extension_crate_directory(root: Path, crate_name: str) -> Path:
+    extensions_root = root / EXTENSION_DIRECTORY
+    own_folder = extensions_root / crate_name / crate_name
+    if (own_folder / PROJECT_MANIFEST_FILE_NAME).is_file():
+        return own_folder
+    if extensions_root.is_dir():
+        for folder in sorted(extensions_root.iterdir()):
+            if folder.name.startswith("_") or not folder.is_dir():
+                continue
+            candidate = folder / crate_name
+            if (candidate / PROJECT_MANIFEST_FILE_NAME).is_file():
+                return candidate
+    return own_folder
 
 
 def repository_root() -> Path:
@@ -449,7 +470,7 @@ def build_cargo_manifest(
             + " }",
         )
     for module in modules:
-        module_directory = root / EXTENSION_DIRECTORY / module
+        module_directory = extension_crate_directory(root, module)
         relative_path = manifest_relative_path(bundle_directory, module_directory)
         lines.append(
             f'{module} = {{ path = "{relative_path}", default-features = false }}'
@@ -459,7 +480,7 @@ def build_cargo_manifest(
         # depends on it for real, and hands the host its two entry points.
         # Nothing loads this binary as a module, so it carries no wrapper.
         renderer_path = manifest_relative_path(
-            bundle_directory, root / EXTENSION_DIRECTORY / renderer
+            bundle_directory, extension_crate_directory(root, renderer)
         )
         lines.append(
             f'{renderer} = {{ path = "{renderer_path}", default-features = false }}'
@@ -815,7 +836,8 @@ def main() -> int:
         )
         return 1
 
-    # Step 2: validate every selected module exists under modules/extensions/,
+    # Step 2: validate every selected module exists in an extension folder under
+    # modules/extensions/,
     # the renderer's data crate included, and the GPU crate a windowed build
     # links.
     linked_renderer = (
@@ -824,7 +846,7 @@ def main() -> int:
     missing_modules = [
         name
         for name in modules + ([linked_renderer] if linked_renderer else [])
-        if not (root / EXTENSION_DIRECTORY / name).is_dir()
+        if not (extension_crate_directory(root, name) / PROJECT_MANIFEST_FILE_NAME).is_file()
     ]
     if missing_modules:
         print(

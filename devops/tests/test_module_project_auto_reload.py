@@ -49,7 +49,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "pill_spline.rs"
+MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
 
 # The host has no environment-variable override for the extension list,
 # so this test drives it the same way a person would: by writing the project's

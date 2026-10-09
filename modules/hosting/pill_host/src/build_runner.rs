@@ -542,10 +542,13 @@ pub(crate) fn declared_features(workspace_root: &Path, package: &str) -> Option<
         .clone()
 }
 
-/// Uncached [`declared_features`]: scans `*/Cargo.toml` and `*/*/Cargo.toml`
+/// Uncached [`declared_features`]: reads the extension crate's manifest
+/// (`extensions/<folder>/<package>/Cargo.toml`) when an extension folder
+/// holds the package, otherwise scans `*/Cargo.toml` and `*/*/Cargo.toml`
 /// under `workspace_root` for the package named `package`.
 fn read_declared_features(workspace_root: &Path, package: &str) -> Option<Vec<String>> {
-    let mut manifests = Vec::new();
+    let mut manifests =
+        vec![crate::config::extension_crate_directory(workspace_root, package).join("Cargo.toml")];
     for first in std::fs::read_dir(workspace_root).ok()?.flatten() {
         let directory = first.path();
         manifests.push(directory.join("Cargo.toml"));
@@ -1904,9 +1907,10 @@ pub(crate) fn build_extension_batch(
         ProjectModuleBackend::CSharp(_) => None,
     });
     // The renderer's wrapper is built exactly like an extension's.
-    // Constructed from the name alone, which is all `RendererModule` needs to
-    // load it.
-    let renderer_config = renderer.map(ExtensionConfig::workspace_member);
+    // Constructed from the name and the folder holding it, which is all
+    // `RendererModule` needs to load it.
+    let renderer_config =
+        renderer.map(|name| ExtensionConfig::located_workspace_member(workspace_root, name));
     let total = configs.len()
         + usize::from(project_package.is_some())
         + usize::from(renderer_config.is_some());

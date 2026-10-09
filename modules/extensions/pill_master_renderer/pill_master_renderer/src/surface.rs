@@ -233,11 +233,8 @@ impl Surface {
         // the sRGB variant allowed as a view format; drawing into the plain
         // format directly would put linear values on screen, far too dark.
         let render_format = color_format.add_srgb_suffix();
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
-            .ok_or(RendererError::NoAlphaModes)?;
+        let alpha_mode =
+            pick_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
         // `Fifo` is the one present mode a surface is required to support, and
         // a mode listed by `Surface::get_capabilities` is not thereby
         // creatable: the NVIDIA Vulkan driver on Windows advertises `Mailbox`

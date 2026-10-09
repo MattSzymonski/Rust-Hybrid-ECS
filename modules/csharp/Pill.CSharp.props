@@ -173,8 +173,8 @@
     <_PillModules>$([MSBuild]::Unescape($([System.Text.RegularExpressions.Regex]::Replace('$(_PillRendererData);$(_PillModules)', ';+', ';').Trim(';'))))</_PillModules>
 
     <_PillExtensions>$(PillEngineRoot)extensions/</_PillExtensions>
-    <_PillMirrorGlobs Condition="'$(_PillModules)' != ''">$([MSBuild]::Unescape('$(_PillExtensions)$(_PillModules.Replace(';', '/generated/*.g.cs;$(_PillExtensions)'))/generated/*.g.cs'))</_PillMirrorGlobs>
-    <_PillManagedGlobs Condition="'$(_PillModules)' != ''">$([MSBuild]::Unescape('$(_PillExtensions)$(_PillModules.Replace(';', '/managed/*.cs;$(_PillExtensions)'))/managed/*.cs'))</_PillManagedGlobs>
+    <_PillMirrorGlobs Condition="'$(_PillModules)' != ''">$([MSBuild]::Unescape('$(_PillExtensions)*/$(_PillModules.Replace(';', '/generated/*.g.cs;$(_PillExtensions)*/'))/generated/*.g.cs'))</_PillMirrorGlobs>
+    <_PillManagedGlobs Condition="'$(_PillModules)' != ''">$([MSBuild]::Unescape('$(_PillExtensions)*/$(_PillModules.Replace(';', '/managed/*.cs;$(_PillExtensions)*/'))/managed/*.cs'))</_PillManagedGlobs>
   </PropertyGroup>
 
   <!-- The mirrors are derived from each module's real registered layout by the

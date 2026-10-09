@@ -29,8 +29,8 @@ DESCRIPTION
     `--no-default-features` and the host's `hot_patch`/`rendering`) so the
     editor's host-side macro-graph unions are reproduced exactly.
 
-    Extensions are found by convention (every `extensions/*` crate that is not
-    a host-generated member), and generated projects are the `host_project_*`
+    Extensions are found by convention (every `extensions/<folder>/<crate>` crate;
+    their wrappers sit in the folder's `generated/`), and generated projects are the `host_project_*`
     crates present at the time.
 
 USAGE
@@ -113,23 +113,36 @@ def dylib_tree(dylib, selection):
     return packages
 
 
-# Every extension built as a loadable module: a crate under `extensions/`
-# that is not a host-generated member. (`extensions/rendering` holds the old
-# renderers, excluded from the workspace.)
-def module_names():
-    names = []
-    for manifest in sorted(MODULES.glob("extensions/*/Cargo.toml")):
+# Every extension crate built as a loadable module: a crate in an extension
+# folder, `extensions/<folder>/<crate>/` (`extensions/rendering` holds the old
+# renderers, excluded from the workspace; `_`-folders are bookkeeping). Mapped
+# to the folder that holds it.
+def module_folders():
+    folders = {}
+    for manifest in sorted(MODULES.glob("extensions/*/*/Cargo.toml")):
+        folder = manifest.parent.parent.name
         name = manifest.parent.name
-        if name.startswith(("host_project_", "host_module_")) or name == "rendering":
+        if folder == "rendering" or folder.startswith("_") or name == "generated":
             continue
-        names.append(name)
-    return names
+        folders[name] = folder
+    return folders
+
+
+# The names of every extension crate, in name order.
+def module_names():
+    return sorted(module_folders())
+
+
+# The generated wrapper directory of extension crate `name`.
+def wrapper_directory(name):
+    return MODULES / "extensions" / module_folders()[name] / "generated" / f"host_module_{name}"
 
 
 # The feature names an extension declares, minus the `default` key: the set a
 # generated wrapper enables on its dependency edge.
 def wrapper_features(name):
-    text = (MODULES / "extensions" / name / "Cargo.toml").read_text(encoding="utf-8")
+    manifest = MODULES / "extensions" / module_folders()[name] / name / "Cargo.toml"
+    text = manifest.read_text(encoding="utf-8")
     section = re.search(r"^\[features\]\s*$(.*?)(^\[|\Z)", text, re.MULTILINE | re.DOTALL)
     if not section:
         return []
@@ -139,7 +152,7 @@ def wrapper_features(name):
 
 # Every generated project crate currently present.
 def project_names():
-    return [path.parent.name for path in sorted(MODULES.glob("extensions/host_project_*/Cargo.toml"))]
+    return [path.parent.name for path in sorted(MODULES.glob("projects_generated/host_project_*/Cargo.toml"))]
 
 
 # The builds a host running `frontend` spawns, as {label: cargo selection}.
@@ -153,7 +166,7 @@ def spawned_builds(frontend):
     builds = {}
     for module in module_names():
         wrapper = f"host_module_{module}"
-        if (MODULES / "extensions" / wrapper).is_dir():
+        if wrapper_directory(module).is_dir():
             selection = ["--package", wrapper]
             features = list(engine_features)
         else:
@@ -177,7 +190,7 @@ def spawned_builds(frontend):
     batch_packages = [
         f"host_module_{module}"
         for module in module_names()
-        if (MODULES / "extensions" / f"host_module_{module}").is_dir()
+        if wrapper_directory(module).is_dir()
     ]
     batch_packages += project_names()
     if len(batch_packages) > 1:

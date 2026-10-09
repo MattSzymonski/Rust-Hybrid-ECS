@@ -15,7 +15,7 @@
 # same calls the Rust project's `asset_loading::load` makes. It lists `pill_dummy_color` so the module is loaded AND its
 # mirrored surface reaches C#: `RotationSystem` calls
 # `PillDummyColor.GetColorA()` - the module's mirrored `#[pill_hot_fn]` - and
-# editing that function's body under modules/extensions/pill_dummy_color
+# editing that function's body under modules/extensions/pill_dummy_color/pill_dummy_color
 # hot-patches the value the system prints, with no restart or reload.
 
 name: "Italian Brainrot (C#)"

@@ -142,7 +142,7 @@ How the open questions were settled:
 
 **What already exists to build on:**
 - **Extension-owned C#:** every C# project compiles
-  `modules/extensions/*/generated/*.g.cs` and `*/managed/*.cs`.
+  `modules/extensions/*/*/generated/*.g.cs` and `*/*/managed/*.cs`.
 - **Mirror macros:** `#[pill_mirror_impl]`, `#[pill_mirror_method]` and
   `#[pill_mirror_fn]` (`pill_engine_macros`) emit C-ABI trampolines and
   `PillMethodDescriptor` entries.

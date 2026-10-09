@@ -22,7 +22,7 @@
             // The host resolves `extensions/` relative to the process working
             // directory and expects to be launched from the engine workspace
             // root, which is `modules/`. Launching from anywhere else fails
-            // with "extension <name> has no directory under extensions/".
+            // with "extension <name> is in no extension folder under extensions/".
             "cwd": "${workspaceFolder}/modules",
             "environment": [
                 {
