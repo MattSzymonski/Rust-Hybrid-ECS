@@ -1,0 +1,71 @@
+# Fast per-commit checks: every feature posture compiles, the unit tests run,
+# the comment/layout lint passes, and rustdoc's intra-doc links resolve.
+#
+# The heavy end-to-end lanes (hot reload, benchmarks) run on a schedule in
+# nightly.yml instead: they drive real host processes and real builds.
+#
+# Every command lives in devops/ci_cd/verify.py, the one list CI and
+# AGENTS.md share; each step below runs one of its steps by name, so the
+# Actions UI keeps a line per check. `python devops/ci_cd/verify.py --list`
+# prints them all, and a local run of the script executes the same commands.
+name: CI
+
+on:
+  # Automatic triggers are disabled for now; uncomment them to re-enable CI.
+  # The workflow still runs manually from the Actions tab.
+  # push:
+  # pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fast:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: modules
+      - name: Formatting
+        run: python devops/ci_cd/verify.py --only fmt
+      - name: Clippy
+        run: python devops/ci_cd/verify.py --only clippy
+      - name: Check (default posture)
+        run: python devops/ci_cd/verify.py --only check
+      - name: Check (hot_patch posture)
+        run: python devops/ci_cd/verify.py --only check-hot-patch
+      - name: Check (shipping posture)
+        run: python devops/ci_cd/verify.py --only check-shipping
+      - name: Check (rendering posture)
+        run: python devops/ci_cd/verify.py --only check-rendering
+      - name: Unit tests
+        run: python devops/ci_cd/verify.py --only test
+      - name: Unit tests (hot_patch lane)
+        run: python devops/ci_cd/verify.py --only test-hot-patch
+      - name: Coding standards lint
+        run: python devops/ci_cd/verify.py --only coding-standards
+      - name: Renderer boundaries
+        run: python devops/ci_cd/verify.py --only renderer-boundaries
+      - name: Engine layout
+        run: python devops/ci_cd/verify.py --only engine-layout
+      - name: Asset metadata
+        run: python devops/ci_cd/verify.py --only asset-metadata
+      - name: Engine dylib export counts
+        run: python devops/ci_cd/verify.py --only engine-exports
+      - name: Engine dylib feature drift
+        # `cargo tree --offline`: the build steps above fetched every crate.
+        run: python devops/ci_cd/verify.py --only engine-feature-drift
+      - name: Documentation
+        # The `-D rustdoc::broken_intra_doc_links` deny lands once the
+        # workspace's pre-existing unresolved links are fixed (see
+        # local/docs/simplification_backlog.md).
+        run: python devops/ci_cd/verify.py --only doc
+      - name: Web target clippy
+        # What a browser build compiles must stay wasm-clean.
+        run: python devops/ci_cd/verify.py --only wasm-clippy
