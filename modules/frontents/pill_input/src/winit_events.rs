@@ -4,8 +4,9 @@
 //!
 //! - Translate the input-carrying [`WindowEvent`]s and [`DeviceEvent`]s into
 //!   [`InputEvent`]s ([`translate_window_event`], [`translate_device_event`]).
-//! - Map winit's key codes and mouse buttons onto the engine's ([`key_code`],
-//!   [`mouse_button`]).
+//! - Map winit's key codes, mouse buttons, modifier state and IME events onto
+//!   the engine's ([`key_code`], [`mouse_button`], [`modifier_state`],
+//!   [`ime_event`]).
 //!
 //! # Design
 //!
@@ -13,53 +14,128 @@
 //! mapping is one list of names; a name the engine lacks fails to compile, and
 //! a count check catches a key left out. Positions and deltas stay in physical
 //! pixels, as winit reports them; the window is the game's whole area in both
-//! winit frontends.
+//! winit frontends. One window event can carry two engine events - a pressed
+//! key reports both its key change and its committed text - so the translation
+//! yields a small sequence rather than one optional event.
 
 // External crates
 use pill_core::math::Vector2f;
-use pill_engine::{ButtonState, InputEvent, KeyCode, MouseButton, ScrollDelta};
-use winit::event::{DeviceEvent, ElementState, MouseScrollDelta, WindowEvent};
-use winit::keyboard::PhysicalKey;
+use pill_engine::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
+use winit::event::{DeviceEvent, ElementState, Ime, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{ModifiersState, PhysicalKey};
 
 // =============================================================================
 // Free Functions
 // =============================================================================
 
-/// The input event a window event carries, or `None` for any other event.
+/// The input events a window event carries, in the order to apply them.
 ///
-/// Key repeats are dropped: the engine does not count them as presses.
-pub fn translate_window_event(event: &WindowEvent) -> Option<InputEvent> {
-    match event {
+/// Zero events for an event that carries no input, one for most carriers,
+/// two for a key that was both pressed or repeated and typed something: the
+/// key change first, its committed text second.
+pub fn translate_window_event(event: &WindowEvent) -> impl Iterator<Item = InputEvent> {
+    let events = match event {
         WindowEvent::KeyboardInput { event, .. } => {
-            if event.repeat {
-                return None;
-            }
             let PhysicalKey::Code(code) = event.physical_key else {
-                return None;
+                return [None, None].into_iter().flatten();
             };
-            Some(InputEvent::Key {
-                key: key_code(code)?,
-                state: button_state(event.state),
-            })
+            key_code(code)
+                .map(|key| key_events(key, event.state, event.repeat, event.text.as_deref()))
+                .unwrap_or([None, None])
         }
-        WindowEvent::MouseInput { state, button, .. } => Some(InputEvent::MouseButton {
-            button: mouse_button(*button)?,
-            state: button_state(*state),
+        WindowEvent::ModifiersChanged(modifiers) => [
+            Some(InputEvent::ModifiersChanged {
+                modifiers: modifier_state(modifiers.state()),
+            }),
+            None,
+        ],
+        WindowEvent::Ime(ime) => [ime_event(ime), None],
+        WindowEvent::MouseInput { state, button, .. } => [
+            mouse_button(*button).map(|button| InputEvent::MouseButton {
+                button,
+                state: button_state(*state),
+            }),
+            None,
+        ],
+        WindowEvent::CursorMoved { position, .. } => [
+            Some(InputEvent::CursorMoved {
+                position: Vector2f::new(position.x as f32, position.y as f32),
+            }),
+            None,
+        ],
+        WindowEvent::CursorLeft { .. } => [Some(InputEvent::CursorLeft), None],
+        WindowEvent::MouseWheel { delta, .. } => [
+            Some(InputEvent::MouseWheel {
+                delta: match *delta {
+                    MouseScrollDelta::LineDelta(x, y) => ScrollDelta::Lines(Vector2f::new(x, y)),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        ScrollDelta::Pixels(Vector2f::new(position.x as f32, position.y as f32))
+                    }
+                },
+            }),
+            None,
+        ],
+        WindowEvent::Focused(false) => [Some(InputEvent::FocusLost), None],
+        _ => [None, None],
+    };
+    events.into_iter().flatten()
+}
+
+/// The events one keyboard input carries: the key change, and the text the
+/// key committed when it typed something printable.
+///
+/// Repeat keeps its own kind - a repeat is not a new press - and types again,
+/// which is what a held key in a text field does. Control-only text (Enter is
+/// `"\r"`, Tab is `"\t"`) belongs to the key event: those keys act, they do
+/// not type. Split out of [`translate_window_event`] because winit's key event
+/// cannot be constructed outside winit, so this is the part tests drive
+/// directly.
+fn key_events(
+    key: KeyCode,
+    state: ElementState,
+    repeat: bool,
+    text: Option<&str>,
+) -> [Option<InputEvent>; 2] {
+    let mut events = [None, None];
+    events[0] = Some(if repeat {
+        InputEvent::KeyRepeat { key }
+    } else {
+        InputEvent::Key {
+            key,
+            state: button_state(state),
+        }
+    });
+    if state == ElementState::Pressed {
+        if let Some(text) = text {
+            if text.chars().any(|character| !character.is_control()) {
+                events[1] = Some(InputEvent::TextInput {
+                    text: text.to_string(),
+                });
+            }
+        }
+    }
+    events
+}
+
+/// The engine's modifier state for winit's.
+fn modifier_state(state: ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: state.shift_key(),
+        control: state.control_key(),
+        alt: state.alt_key(),
+        super_key: state.super_key(),
+    }
+}
+
+/// The input event an IME event carries, or `None` while the IME toggles.
+fn ime_event(ime: &Ime) -> Option<InputEvent> {
+    match ime {
+        Ime::Preedit(text, cursor) => Some(InputEvent::ImePreedit {
+            text: text.clone(),
+            cursor: *cursor,
         }),
-        WindowEvent::CursorMoved { position, .. } => Some(InputEvent::CursorMoved {
-            position: Vector2f::new(position.x as f32, position.y as f32),
-        }),
-        WindowEvent::CursorLeft { .. } => Some(InputEvent::CursorLeft),
-        WindowEvent::MouseWheel { delta, .. } => Some(InputEvent::MouseWheel {
-            delta: match *delta {
-                MouseScrollDelta::LineDelta(x, y) => ScrollDelta::Lines(Vector2f::new(x, y)),
-                MouseScrollDelta::PixelDelta(position) => {
-                    ScrollDelta::Pixels(Vector2f::new(position.x as f32, position.y as f32))
-                }
-            },
-        }),
-        WindowEvent::Focused(false) => Some(InputEvent::FocusLost),
-        _ => None,
+        Ime::Commit(text) => Some(InputEvent::ImeCommit { text: text.clone() }),
+        Ime::Enabled | Ime::Disabled => None,
     }
 }
 
@@ -169,15 +245,116 @@ mod tests {
     #[test]
     fn focus_loss_and_raw_motion_translate() {
         assert_eq!(
-            translate_window_event(&WindowEvent::Focused(false)),
-            Some(InputEvent::FocusLost)
+            translate_window_event(&WindowEvent::Focused(false)).collect::<Vec<_>>(),
+            [InputEvent::FocusLost]
         );
-        assert_eq!(translate_window_event(&WindowEvent::Focused(true)), None);
+        assert!(translate_window_event(&WindowEvent::Focused(true))
+            .next()
+            .is_none());
         assert_eq!(
             translate_device_event(&DeviceEvent::MouseMotion { delta: (3.0, -4.0) }),
             Some(InputEvent::MouseMotion {
                 delta: Vector2f::new(3.0, -4.0),
             })
         );
+    }
+
+    #[test]
+    fn a_typed_key_yields_its_key_change_and_its_text() {
+        assert_eq!(
+            key_events(KeyCode::KeyA, ElementState::Pressed, false, Some("a")),
+            [
+                Some(InputEvent::Key {
+                    key: KeyCode::KeyA,
+                    state: ButtonState::Pressed,
+                }),
+                Some(InputEvent::TextInput {
+                    text: "a".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repeat_is_its_own_kind_and_types_again() {
+        assert_eq!(
+            key_events(KeyCode::KeyA, ElementState::Pressed, true, Some("a")),
+            [
+                Some(InputEvent::KeyRepeat { key: KeyCode::KeyA }),
+                Some(InputEvent::TextInput {
+                    text: "a".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn control_only_text_stays_with_the_key_event() {
+        assert_eq!(
+            key_events(KeyCode::Enter, ElementState::Pressed, false, Some("\r")),
+            [
+                Some(InputEvent::Key {
+                    key: KeyCode::Enter,
+                    state: ButtonState::Pressed,
+                }),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_released_key_never_types() {
+        assert_eq!(
+            key_events(KeyCode::KeyA, ElementState::Released, false, Some("a")),
+            [
+                Some(InputEvent::Key {
+                    key: KeyCode::KeyA,
+                    state: ButtonState::Released,
+                }),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_modifier_state_translates() {
+        let change = WindowEvent::ModifiersChanged(winit::event::Modifiers::from(
+            ModifiersState::SHIFT | ModifiersState::CONTROL,
+        ));
+        assert_eq!(
+            translate_window_event(&change).collect::<Vec<_>>(),
+            [InputEvent::ModifiersChanged {
+                modifiers: Modifiers {
+                    shift: true,
+                    control: true,
+                    ..Modifiers::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn ime_events_translate() {
+        assert_eq!(
+            translate_window_event(&WindowEvent::Ime(Ime::Preedit(
+                "ka".to_string(),
+                Some((0, 2)),
+            )))
+            .collect::<Vec<_>>(),
+            [InputEvent::ImePreedit {
+                text: "ka".to_string(),
+                cursor: Some((0, 2)),
+            }]
+        );
+        assert_eq!(
+            translate_window_event(&WindowEvent::Ime(Ime::Commit("ka".to_string())))
+                .collect::<Vec<_>>(),
+            [InputEvent::ImeCommit {
+                text: "ka".to_string(),
+            }]
+        );
+        assert!(translate_window_event(&WindowEvent::Ime(Ime::Enabled))
+            .next()
+            .is_none());
     }
 }

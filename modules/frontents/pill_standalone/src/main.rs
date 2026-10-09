@@ -33,6 +33,9 @@ mod frontend;
 mod posture;
 /// The headless and windowed run loops.
 mod runner;
+/// The dev-only probe that loads `pill_ui` for the shared-dylib check.
+#[cfg(feature = "dev")]
+mod ui_probe;
 
 // Exactly one posture: without one there is nothing to run, and with both the
 // development host would sit beside a linked project it never uses. Feature
@@ -129,7 +132,14 @@ fn main() -> miette::Result<()> {
     install_engine_report_handler();
     // Step 2: bring up the shared telemetry stack (best-effort).
     init_telemetry();
-    // Step 3: run the project and convert the error once.
+    // Step 3: the UI probe, when a test run asked for it. It runs before the
+    // project is resolved - no host, no project, no window (see `ui_probe`).
+    #[cfg(feature = "dev")]
+    if ui_probe::requested() {
+        ui_probe::run();
+        return Ok(());
+    }
+    // Step 4: run the project and convert the error once.
     let outcome: Result<(), RunError> = runner::run(project()?);
 
     outcome.map_err(|error| {

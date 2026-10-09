@@ -5,7 +5,7 @@
 //!
 //! - Defines [`Input`], the engine-owned input resource, and the plain-data
 //!   vocabulary it is fed with: [`InputEvent`], [`KeyCode`], [`MouseButton`],
-//!   [`GamepadButton`], [`GamepadAxis`], [`PlayerId`].
+//!   [`Modifiers`], [`GamepadButton`], [`GamepadAxis`], [`PlayerId`].
 //! - Tracks, per frame, what is held and what was pressed or released since the
 //!   previous frame, plus the cursor, mouse motion and scroll accumulated over
 //!   it.
@@ -26,7 +26,9 @@
 //! Key codes name physical keys (the W3C `KeyboardEvent.code` vocabulary, as
 //! winit does), not the characters a layout produces: `KeyW` is the key left of
 //! `KeyE` on every layout, which is what movement bindings want. Text entry is
-//! not covered.
+//! covered separately: [`InputEvent::TextInput`] and [`InputEvent::ImeCommit`]
+//! carry committed characters, and [`InputEvent::ImePreedit`] carries the
+//! composition in progress.
 //!
 //! The resource is defined in `pill_engine`, which every artifact compiles
 //! identically, so a project DLL reads the host's instance through `Res<Input>`
@@ -38,7 +40,8 @@
 //!   a release inside one frame report both, so a short tap is never lost.
 //!   Operating-system key repeat does not produce new presses.
 //! - Mouse motion and scroll add up over the frame; the cursor position is the
-//!   latest one.
+//!   latest one. Committed text adds up in the same way; the modifier state
+//!   and the IME composition are the latest reported ones.
 
 // Standard library
 use std::time::Duration;
@@ -364,11 +367,30 @@ pub enum ScrollDelta {
     Pixels(Vector2f),
 }
 
+/// The modifier keys' state, as the platform reports it.
+///
+/// Separate from the physical modifier keys ([`KeyCode::ShiftLeft`] and
+/// friends): a platform folds both shifts, both controls and AltGr into this
+/// one state, which is what shortcut matching wants.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    /// Whether a shift key is down.
+    pub shift: bool,
+    /// Whether a control key is down.
+    pub control: bool,
+    /// Whether an alt key is down.
+    pub alt: bool,
+    /// Whether a Windows/Command key is down.
+    pub super_key: bool,
+}
+
 /// One input change, as a frontend reports it.
 ///
 /// Positions and deltas are in physical pixels; positions are relative to the
-/// top-left corner of the area the game is drawn in.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// top-left corner of the area the game is drawn in. Committed text and IME
+/// pre-edit carry owned strings, so this is not `Copy`; each event is still
+/// plain data, safe to hand across a module boundary.
+#[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
     /// A key went down or came up.
     Key {
@@ -376,6 +398,42 @@ pub enum InputEvent {
         key: KeyCode,
         /// Down or up.
         state: ButtonState,
+    },
+    /// A held key repeated, as the operating system reports it.
+    ///
+    /// A repeat is not a new press: [`Input`] tracks a held key exactly as it
+    /// did without this event. Frontends deliver it so text fields and
+    /// navigation can respond to a held key; a game that ignores it sees no
+    /// change.
+    KeyRepeat {
+        /// Which key.
+        key: KeyCode,
+    },
+    /// The modifier keys' state changed.
+    ModifiersChanged {
+        /// The new state, as the platform reports it.
+        modifiers: Modifiers,
+    },
+    /// Text was committed by typing: one character, or a short run for a key
+    /// that produces several.
+    TextInput {
+        /// The committed text.
+        text: String,
+    },
+    /// The IME's composition text changed.
+    ///
+    /// An empty `text` means no composition is active.
+    ImePreedit {
+        /// The composition text.
+        text: String,
+        /// The platform's composing cursor range within `text`, as byte
+        /// offsets, when it reports one.
+        cursor: Option<(usize, usize)>,
+    },
+    /// The IME committed its composition as text.
+    ImeCommit {
+        /// The committed text.
+        text: String,
     },
     /// A mouse button went down or came up.
     MouseButton {
@@ -544,6 +602,16 @@ pub struct Input {
     /// The latest cursor position over the game, or `None` when it is not
     /// over it.
     cursor_position: Option<Vector2f>,
+    /// The modifier keys' state, as last reported.
+    modifiers: Modifiers,
+    /// Text committed since the previous frame: typed characters and IME
+    /// commits, in order.
+    text_entered: String,
+    /// The IME's active composition text, while one is composing.
+    ime_preedit: Option<String>,
+    /// The composing cursor range within [`Self::ime_preedit`], as byte
+    /// offsets, when the platform reports one.
+    ime_cursor: Option<(usize, usize)>,
     /// Mouse motion accumulated since the previous frame.
     mouse_delta: Vector2f,
     /// Line scrolling accumulated since the previous frame.
@@ -593,6 +661,32 @@ impl Input {
     /// Every key that went down since the previous frame.
     pub fn keys_pressed(&self) -> impl Iterator<Item = KeyCode> + '_ {
         self.keys_pressed.iter()
+    }
+
+    // -------------------------------------------------------------------------
+    // Modifiers and text
+    // -------------------------------------------------------------------------
+
+    /// The modifier keys' state.
+    pub fn modifiers(&self) -> Modifiers {
+        self.modifiers
+    }
+
+    /// Text committed since the previous frame: typed characters and IME
+    /// commits, in order.
+    pub fn text_entered(&self) -> &str {
+        &self.text_entered
+    }
+
+    /// The IME's active composition text, or `None` while not composing.
+    pub fn ime_preedit(&self) -> Option<&str> {
+        self.ime_preedit.as_deref()
+    }
+
+    /// The composing cursor range within [`Self::ime_preedit`], as byte
+    /// offsets, when the platform reports one.
+    pub fn ime_cursor(&self) -> Option<(usize, usize)> {
+        self.ime_cursor
     }
 
     // -------------------------------------------------------------------------
@@ -719,6 +813,7 @@ impl Input {
         self.mouse_delta = Vector2f::ZERO;
         self.scroll_lines = Vector2f::ZERO;
         self.scroll_pixels = Vector2f::ZERO;
+        self.text_entered.clear();
         for gamepad in &mut self.gamepads {
             gamepad.pressed = 0;
             gamepad.released = 0;
@@ -736,6 +831,24 @@ impl Input {
     fn apply(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { key, state } => self.apply_key(key, state),
+            // A repeat is not a new press: the held state is what it was.
+            InputEvent::KeyRepeat { .. } => {}
+            InputEvent::ModifiersChanged { modifiers } => self.modifiers = modifiers,
+            InputEvent::TextInput { text } => self.text_entered.push_str(&text),
+            InputEvent::ImePreedit { text, cursor } => {
+                if text.is_empty() {
+                    self.ime_preedit = None;
+                    self.ime_cursor = None;
+                } else {
+                    self.ime_preedit = Some(text);
+                    self.ime_cursor = cursor;
+                }
+            }
+            InputEvent::ImeCommit { text } => {
+                self.text_entered.push_str(&text);
+                self.ime_preedit = None;
+                self.ime_cursor = None;
+            }
             InputEvent::MouseButton { button, state } => self.apply_mouse_button(button, state),
             InputEvent::CursorMoved { position } => self.cursor_position = Some(position),
             InputEvent::CursorLeft => self.cursor_position = None,
@@ -746,7 +859,15 @@ impl Input {
             InputEvent::MouseWheel {
                 delta: ScrollDelta::Pixels(delta),
             } => self.scroll_pixels += delta,
-            InputEvent::FocusLost => self.release_keyboard_and_mouse(),
+            InputEvent::FocusLost => {
+                // A composition cannot survive the focus that owned it, and
+                // the platform stops reporting a modifier state it no longer
+                // feeds; the next report re-establishes both.
+                self.modifiers = Modifiers::default();
+                self.ime_preedit = None;
+                self.ime_cursor = None;
+                self.release_keyboard_and_mouse();
+            }
             InputEvent::GamepadConnected { player } => {
                 self.gamepads[player.index()] = GamepadState {
                     connected: true,
@@ -849,7 +970,7 @@ mod tests {
     /// Queue `events` and start a frame.
     fn frame(input: &mut Input, events: &[InputEvent]) {
         for event in events {
-            input.push_event(*event);
+            input.push_event(event.clone());
         }
         input.begin_frame();
     }
@@ -1104,5 +1225,129 @@ mod tests {
             input.keys_pressed().collect::<Vec<_>>(),
             [KeyCode::KeyA, KeyCode::KeyD]
         );
+    }
+
+    #[test]
+    fn a_repeat_event_leaves_the_held_state_alone() {
+        let mut input = Input::new();
+        frame(&mut input, &[key(KeyCode::KeyA, ButtonState::Pressed)]);
+        frame(&mut input, &[InputEvent::KeyRepeat { key: KeyCode::KeyA }]);
+        assert!(input.key_held(KeyCode::KeyA));
+        assert!(!input.key_pressed(KeyCode::KeyA));
+        assert!(!input.key_released(KeyCode::KeyA));
+    }
+
+    #[test]
+    fn committed_text_adds_up_over_the_frame_in_order() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[
+                InputEvent::TextInput {
+                    text: "he".to_string(),
+                },
+                InputEvent::ImeCommit {
+                    text: "llo".to_string(),
+                },
+            ],
+        );
+        assert_eq!(input.text_entered(), "hello");
+        frame(&mut input, &[]);
+        assert_eq!(input.text_entered(), "");
+    }
+
+    #[test]
+    fn the_modifier_state_is_the_latest_reported_one() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[
+                InputEvent::ModifiersChanged {
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    },
+                },
+                InputEvent::ModifiersChanged {
+                    modifiers: Modifiers {
+                        control: true,
+                        ..Modifiers::default()
+                    },
+                },
+            ],
+        );
+        assert_eq!(
+            input.modifiers(),
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_preedit_lives_until_committed_and_a_commit_clears_it() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[InputEvent::ImePreedit {
+                text: "ni".to_string(),
+                cursor: Some((0, 2)),
+            }],
+        );
+        assert_eq!(input.ime_preedit(), Some("ni"));
+        assert_eq!(input.ime_cursor(), Some((0, 2)));
+        frame(
+            &mut input,
+            &[InputEvent::ImeCommit {
+                text: "nihon".to_string(),
+            }],
+        );
+        assert_eq!(input.ime_preedit(), None);
+        assert_eq!(input.ime_cursor(), None);
+        assert_eq!(input.text_entered(), "nihon");
+    }
+
+    #[test]
+    fn an_empty_preedit_cancels_the_composition() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[InputEvent::ImePreedit {
+                text: "kai".to_string(),
+                cursor: None,
+            }],
+        );
+        frame(
+            &mut input,
+            &[InputEvent::ImePreedit {
+                text: String::new(),
+                cursor: None,
+            }],
+        );
+        assert_eq!(input.ime_preedit(), None);
+    }
+
+    #[test]
+    fn focus_loss_clears_the_modifier_state_and_the_composition() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[
+                InputEvent::ModifiersChanged {
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    },
+                },
+                InputEvent::ImePreedit {
+                    text: "ka".to_string(),
+                    cursor: None,
+                },
+            ],
+        );
+        frame(&mut input, &[InputEvent::FocusLost]);
+        assert_eq!(input.modifiers(), Modifiers::default());
+        assert_eq!(input.ime_preedit(), None);
     }
 }

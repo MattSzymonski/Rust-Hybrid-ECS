@@ -196,8 +196,8 @@ pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};
 pub use hot_patch::{HotPatchError, HotPatchRegistry, HotSlot, PlainSlot};
 pub use input::{
-    ButtonState, GamepadAxis, GamepadButton, Input, InputEvent, KeyCode, MouseButton, PlayerId,
-    RumbleRequest, ScrollDelta,
+    ButtonState, GamepadAxis, GamepadButton, Input, InputEvent, KeyCode, Modifiers, MouseButton,
+    PlayerId, RumbleRequest, ScrollDelta,
 };
 pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
 pub use pill_core::DynamicBuffer;

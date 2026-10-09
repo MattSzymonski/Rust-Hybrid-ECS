@@ -96,9 +96,12 @@ static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
 /// The engine's shared libraries, by file stem: every module, project and
-/// patch imports both, and each exists once per process unless a module needs
-/// the isolated copies (see [`engine_dylib_needs_isolation`]).
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 2] = ["pill_core", "pill_engine_core"];
+/// patch imports them, and each exists once per process unless a module needs
+/// the isolated copies (see [`engine_dylib_needs_isolation`]). `pill_ui`
+/// joined them with the UI library (plan decision D17): the editor shell
+/// module and editor crates import it, and a module-world copy differing
+/// from the host's needs the same co-located treatment as the engine's own.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 3] = ["pill_core", "pill_engine_core", "pill_ui"];
 
 /// Whether a module build produced engine dylibs different from the ones the
 /// host has mapped, which means the module must load against its own copies.

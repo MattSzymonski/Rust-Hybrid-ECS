@@ -275,8 +275,10 @@ impl ApplicationHandler for WindowedApplication {
         }
         #[cfg(not(feature = "dev"))]
         let _ = window_id;
-        if let (Some(input), Some(host)) = (translate_window_event(&event), &mut self.host) {
-            host.push_input(input);
+        for input in translate_window_event(&event) {
+            if let Some(host) = &mut self.host {
+                host.push_input(input);
+            }
         }
         match event {
             WindowEvent::CloseRequested => {
