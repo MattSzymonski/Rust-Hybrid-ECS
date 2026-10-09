@@ -1,0 +1,24 @@
+[package]
+name = "pill_spline_editor"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+# Named after the crate rather than `lib.rs`, like every extension crate (see
+# `pill_spline`'s manifest for why).
+path = "src/pill_spline_editor.rs"
+# `rlib` only: the artifact an editor host loads is built by the generated
+# `host_module_pill_spline_editor` wrapper in this folder's `generated/`.
+crate-type = ["rlib"]
+
+# The spline extension's editor part: only an editor host loads it, after
+# `pill_spline`, and reloads it whenever `pill_spline` reloads. No game build -
+# standalone, shipping or web - ever builds it.
+[dependencies]
+pill_core = { path = "../../../pill_core" }
+pill_engine = { path = "../../../pill_engine" }
+pill_spline = { path = "../pill_spline", default-features = false }
+serde = { version = "1", features = ["derive"] }

@@ -4977,6 +4977,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_spline_editor"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_engine",
+ "pill_spline",
+ "serde",
+]
+
+[[package]]
 name = "pill_standalone"
 version = "0.1.0"
 dependencies = [

@@ -52,6 +52,15 @@ compile_error!(
 // Project
 // =============================================================================
 
+/// Environment variable that runs the development host in the editor posture,
+/// loading extension editor crates (`<extension>_editor`).
+///
+/// A development and test switch, standing in for an editor frontend until one
+/// sets the posture itself; unset, this binary never builds or loads an editor
+/// crate.
+#[cfg(feature = "dev")]
+const EDITOR_POSTURE_ENVIRONMENT_VARIABLE: &str = "PILL_EDITOR_POSTURE";
+
 /// The project to run: resolved from `PROJECT_PATH` and its settings.
 ///
 /// # Errors
@@ -59,6 +68,11 @@ compile_error!(
 /// Returns the configuration error when the project cannot be resolved.
 #[cfg(feature = "dev")]
 fn project() -> miette::Result<pill_host::HostConfig> {
+    // The editor posture only on an explicit `1`, so a stray value never
+    // loads editor code into an ordinary run.
+    if std::env::var(EDITOR_POSTURE_ENVIRONMENT_VARIABLE).as_deref() == Ok("1") {
+        return Ok(pill_host::HostConfig::from_environment_for_editor()?);
+    }
     Ok(pill_host::HostConfig::from_environment()?)
 }
 

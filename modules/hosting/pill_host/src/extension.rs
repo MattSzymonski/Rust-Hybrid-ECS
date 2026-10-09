@@ -90,6 +90,11 @@ mod slot {
         source_edit_generation: Arc<AtomicU64>,
         /// Last source-edit generation the frame loop acted on.
         last_processed_source_edit: u64,
+        /// A rebuild the reload pipeline queued rather than the watcher: an
+        /// editor crate's, after a runtime crate of its folder reloaded. Kept
+        /// apart from the watcher's counter so a fast-path patch of a source
+        /// edit can never swallow it.
+        queued_cascade_reload: bool,
         /// Persistable component type names the last `init` registered, used to
         /// detect types the next generation forgets to re-register.
         registered_type_names: Vec<String>,
@@ -253,6 +258,7 @@ mod slot {
                 old_libraries: Vec::new(),
                 source_edit_generation,
                 last_processed_source_edit: 0,
+                queued_cascade_reload: false,
                 registered_type_names: init.registered_type_names,
                 registered_schemas: init.registered_schemas,
                 registered_resource_ids: init.registered_resource_ids,
@@ -305,9 +311,10 @@ mod slot {
             before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
-            if generation == self.last_processed_source_edit {
+            if generation == self.last_processed_source_edit && !self.queued_cascade_reload {
                 return ReloadOutcome::Unchanged;
             }
+            self.queued_cascade_reload = false;
 
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -339,6 +346,23 @@ mod slot {
         /// Name of this module, used for reporting.
         pub(crate) fn name(&self) -> &str {
             &self.config.name
+        }
+
+        /// The extension folder holding this module's crate.
+        pub(crate) fn folder(&self) -> &str {
+            &self.config.folder
+        }
+
+        /// Whether this module is its folder's editor crate.
+        pub(crate) fn is_editor_crate(&self) -> bool {
+            self.config.is_editor_crate
+        }
+
+        /// Rebuild and reload this module on the next reload pass, though its
+        /// own sources did not change: an editor crate links its folder's
+        /// runtime crates, so it is stale once one of them reloads.
+        pub(crate) fn queue_cascade_reload(&mut self) {
+            self.queued_cascade_reload = true;
         }
 
         /// The module's crate directory, relative to the workspace root: the

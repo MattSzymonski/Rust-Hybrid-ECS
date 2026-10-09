@@ -2158,8 +2158,28 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // Which ones, not just whether any: each carries its own patch session, and
     // only the sessions whose sources were rebuilt need a new baseline.
     let mut reloaded_modules: Vec<usize> = Vec::new();
-    for (index, slot) in extensions.iter_mut().enumerate() {
-        match slot.reload_if_changed(engine, engine_api, workspace_root) {
+    for index in 0..extensions.len() {
+        let outcome = extensions[index].reload_if_changed(engine, engine_api, workspace_root);
+        // A runtime crate that reloads leaves its folder's editor crate running
+        // an old embedded copy of it, so queue that crate's rebuild. Editor
+        // crates load after every runtime crate, so this pass reaches it later.
+        if matches!(outcome, ReloadOutcome::Reloaded { .. }) && !extensions[index].is_editor_crate()
+        {
+            let folder = extensions[index].folder().to_string();
+            for editor_slot in extensions[index + 1..]
+                .iter_mut()
+                .filter(|other| other.is_editor_crate() && other.folder() == folder)
+            {
+                info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    module = editor_slot.name(),
+                    "a runtime crate of the folder reloaded; queuing the editor crate's reload"
+                );
+                editor_slot.queue_cascade_reload();
+            }
+        }
+        let slot = &mut extensions[index];
+        match outcome {
             ReloadOutcome::Reloaded { generation } => {
                 reloaded_modules.push(index);
                 // The reloaded image is unpatched and every recorded prologue

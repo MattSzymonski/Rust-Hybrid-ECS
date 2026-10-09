@@ -95,6 +95,8 @@ PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
 EXTENSION_DIRECTORY = Path("modules") / "extensions"
 # Extension crates live one level down, one folder per extension:
 # `modules/extensions/<extension>/<crate>/`.
+# Suffix of an extension's editor crate, which no shipped build ever links.
+EDITOR_CRATE_SUFFIX = "_editor"
 # The crates a bundle names: the runtime always (the static-link types), and the
 # C# bridge for a managed project (its external project backend). Never the
 # development host - a shipping build does not compile it at all.
@@ -836,10 +838,21 @@ def main() -> int:
         )
         return 1
 
+    # Step 1b: refuse an editor crate. Editor crates (`<extension>_editor`) load
+    # only in an editor host, with their extension; a shipped game never links
+    # one, and the dev host refuses them in `modules:` for the same reason.
+    editor_crates = [name for name in modules if name.endswith(EDITOR_CRATE_SUFFIX)]
+    if editor_crates:
+        print(
+            "error: editor crates cannot ship; remove them from `modules:`: "
+            f"{', '.join(editor_crates)}",
+            file=sys.stderr,
+        )
+        return 1
+
     # Step 2: validate every selected module exists in an extension folder under
-    # modules/extensions/,
-    # the renderer's data crate included, and the GPU crate a windowed build
-    # links.
+    # modules/extensions/, the renderer's data crate included, and the GPU
+    # crate a windowed build links.
     linked_renderer = (
         renderer_name if renderer_name and RENDERING_FEATURE in requested_features else None
     )
