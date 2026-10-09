@@ -51,8 +51,8 @@ Common flags on the end-to-end suites:
 - `--skip-build` assumes `pill_standalone` is already built. Not every suite
   has it; those that don't always build what they need.
 
-When an agent runs a suite, it goes through `.agents/tools/agent_run.py`
-(see `AGENTS.md`), which records the output under `local/workbench/runs/`.
+When an agent runs a suite, it goes through `.agents/site/agent_run.py`
+(see `AGENTS.md`), which records the output under `.construction_site/runs/`.
 
 ### Where they run in CI
 
