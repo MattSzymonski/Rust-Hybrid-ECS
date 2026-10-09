@@ -205,6 +205,7 @@ type RenderingExtras<'w> = (
     ResMut<'w, pill_engine::DebugDraw>,
     Res<'w, pill_renderer_api::SelectionOutlines>,
     ResMut<'w, pill_renderer_api::PickRequests>,
+    ResMut<'w, pill_ui::UiContext>,
 );
 
 /// Fills the frame from the current world, once per update.
@@ -219,7 +220,9 @@ pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
-    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests): RenderingExtras<'_>,
+    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests, mut ui): RenderingExtras<
+        '_,
+    >,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
     mut objects: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
@@ -319,6 +322,14 @@ pub fn rendering_system(
                 frame.surface_views.insert(*surface, view);
             }
         }
+    }
+
+    // The game's UI, when the project has a context: drain what its systems
+    // built this update - the draw lists and the glyph-atlas changes. Without
+    // a context the frame carries no UI (Stage 12).
+    match ui.get_mut() {
+        Some(mut ui) => frame.ui = ui.take_frame(),
+        None => frame.ui.clear(),
     }
 
     // The last mesh and material pair resolved, with the draw order it gave

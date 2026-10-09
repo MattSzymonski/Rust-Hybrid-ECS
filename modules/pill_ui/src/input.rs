@@ -13,7 +13,7 @@
 //!
 //! `pill_ui` never reads a platform library; a frontend translates winit (or
 //! the browser) into [`InputEvent`]s and hands each one to both the engine's
-//! [`Input`](pill_engine::Input) resource and this type. What UI adds over
+//! [`Input`](pill_engine_core::Input) resource and this type. What UI adds over
 //! the engine resource is ordering (which keys were pressed, in which order),
 //! repeats as a first-class list for held-key navigation, and text entry
 //! (committed characters and the IME composition). Gamepad input is not part
@@ -21,7 +21,7 @@
 
 // External crates
 use pill_core::math::Vector2f;
-use pill_engine::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
+use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
 
 // =============================================================================
 // UiInput
@@ -82,7 +82,7 @@ impl UiInput {
     ///
     /// Called by the frontend between frames, in arrival order. The events
     /// are applied by [`Self::begin_frame`], so a UI pass sees the same
-    /// edges the engine's [`Input`](pill_engine::Input) resource reports.
+    /// edges the engine's [`Input`](pill_engine_core::Input) resource reports.
     pub fn apply(&mut self, event: &InputEvent) {
         self.pending.push(event.clone());
     }

@@ -46,6 +46,7 @@ use pill_core::{info, PillStyle};
 use pill_engine::common_components::TransformComponent;
 use pill_engine::AssetManager;
 use pill_renderer_api::{CameraComponent, RawWindowData, SurfaceId, SurfaceOptions};
+use pill_ui_wgpu::UiRenderer;
 
 // Current crate
 use crate::{
@@ -655,6 +656,12 @@ pub struct State {
     pub(crate) adapter: wgpu::Adapter,
     /// Debug drawing, outlines and picking, drawn over every surface's chain.
     pub(crate) overlay: Overlay,
+    /// The shared UI backend, built the first time a frame carries UI; its
+    /// pipelines are tied to this surface's colour format (Stage 12).
+    pub(crate) ui_renderer: Option<UiRenderer>,
+    /// UI frames since the UI pass last logged what it drew, so the log
+    /// stays readable while the end-to-end suites still see the token.
+    frames_since_ui_report: u32,
 }
 
 impl State {
@@ -714,6 +721,8 @@ impl State {
             instance,
             adapter,
             overlay,
+            ui_renderer: None,
+            frames_since_ui_report: 0,
         })
     }
 
@@ -731,6 +740,80 @@ impl State {
             "depth_texture",
         )?;
         Ok(())
+    }
+
+    /// Draw the frame's UI for `surface_id`, uploading atlas changes first.
+    ///
+    /// The backend is built lazily, the first time any frame carries UI, so a
+    /// project without a UI context never pays for it. Only the lists naming
+    /// `surface_id` draw here; every surface records through this same path,
+    /// each with its own id.
+    fn record_ui(
+        &mut self,
+        surface_id: u32,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        size: (u32, u32),
+        frame: &RenderFrame,
+    ) {
+        if frame.ui.is_empty() {
+            return;
+        }
+        if self.ui_renderer.is_none() {
+            let atlas_size = frame
+                .ui
+                .atlas
+                .as_ref()
+                .map(|update| (update.width, update.height))
+                .unwrap_or((
+                    pill_ui::atlas::DEFAULT_LENGTH,
+                    pill_ui::atlas::DEFAULT_LENGTH,
+                ));
+            self.ui_renderer = Some(UiRenderer::new(
+                &self.device,
+                &self.queue,
+                self.surface.format(),
+                atlas_size,
+            ));
+        }
+        let ui_renderer = self.ui_renderer.as_mut().expect("built above");
+        if let Some(update) = &frame.ui.atlas {
+            ui_renderer.apply_atlas_update(&self.queue, update);
+        }
+        let mut vertices = 0usize;
+        let mut draws = 0usize;
+        for draw in frame
+            .ui
+            .draws
+            .iter()
+            .filter(|draw| draw.surface == surface_id)
+        {
+            vertices += draw.list.vertices.len();
+            draws += 1;
+            ui_renderer.render(
+                &self.device,
+                &self.queue,
+                encoder,
+                view,
+                size,
+                draw.scale_factor,
+                &draw.list,
+                None,
+            );
+        }
+        // Observable proof for the runtime suites, sampled like the GPU
+        // profiler's report so the log stays readable.
+        self.frames_since_ui_report += 1;
+        if self.frames_since_ui_report >= GPU_REPORT_INTERVAL {
+            self.frames_since_ui_report = 0;
+            info!(
+                target: pill_core::telemetry::telemetry_target::UI,
+                "[ui] surface={} draws={} vertices={}",
+                surface_id,
+                draws,
+                vertices
+            );
+        }
     }
 
     /// Create a target for every offscreen output the chain declares.
@@ -1077,6 +1160,9 @@ impl State {
             },
         );
         drop(overlay_zone);
+        // The game's UI, over the chain's picture (Stage 12): the frame's
+        // lists for this surface, through the shared `pill_ui_wgpu` backend.
+        self.record_ui(surface_id, &mut encoder, &view, (width, height), frame);
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);
             profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);

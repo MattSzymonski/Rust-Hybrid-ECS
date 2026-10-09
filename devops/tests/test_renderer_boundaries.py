@@ -18,8 +18,8 @@ DESCRIPTION
                          does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
                          crates: pill_core, pill_core_macros, pill_engine,
-                         serde, thiserror, miette, raw-window-handle; and has no
-                         build dependencies.
+                         pill_ui, serde, thiserror, miette, raw-window-handle;
+                         and has no build dependencies.
       3. host          - `pill_runtime`, `pill_csharp_bridge`, `pill_host` and
                          `pill_standalone` name no data crate
                          or GPU module in code. A dependency on one is allowed
@@ -61,6 +61,8 @@ API_ALLOWED_DEPENDENCIES = {
     "pill_core",
     "pill_core_macros",
     "pill_engine",
+    # The UI draw lists the frame carries (Stage 12).
+    "pill_ui",
     "serde",
     "thiserror",
     "miette",
@@ -241,7 +243,7 @@ VALID_TREE = {
                           '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
-                                           'pill_engine = { path = "x" }\nserde = "1"\n',
+                                           'pill_engine = { path = "x" }\npill_ui = { path = "x" }\nserde = "1"\n',
     "modules/pill_host/Cargo.toml": '[package]\nname = "pill_host"\n[dependencies]\n'
                                    'renderer_data_dependency_graph = { package = "r_data", path = "x" }\n'
                                    'renderer_dependency_graph = { package = "r", path = "x" }\n',
@@ -262,6 +264,7 @@ BROKEN_VARIANTS = [
     (1, {"modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nr_data = { path = "x" }\n'}),
     (1, {"modules/pill_ui_wgpu/Cargo.toml": '[package]\nname = "pill_not_ui_wgpu"\n[dependencies]\nwgpu = "25"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nglam = "0.33"\n'}),
+    (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nrand = "0.8"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[build-dependencies]\npill_assets = "1"\n'}),
     (3, {"modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\nr_data = { path = "x" }\n'}),
     (3, {"modules/pill_host/src/lib.rs": "//! Host.\nuse renderer_data_dependency_graph::Mesh;\n"}),

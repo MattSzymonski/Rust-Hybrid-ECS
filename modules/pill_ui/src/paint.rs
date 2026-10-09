@@ -869,6 +869,7 @@ fn clamp_to_boundary(text: &str, byte: usize) -> usize {
     byte
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_combo_box(
     list: &mut DrawList,
     atlas: &mut Atlas,
@@ -1188,7 +1189,7 @@ mod tests {
     use crate::layout::run_frame;
     use crate::panel::{PanelBuilder, TreeNode};
     use crate::widget::WidgetId;
-    use pill_engine::{ButtonState, InputEvent, MouseButton};
+    use pill_engine_core::{ButtonState, InputEvent, MouseButton};
 
     fn pointer_event(x: f32, y: f32) -> InputEvent {
         InputEvent::CursorMoved {

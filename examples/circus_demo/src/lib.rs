@@ -7,7 +7,8 @@
 //!   resource.
 //! - Load the level's meshes and materials (`resources`), build the scene
 //!   (`game`), and register the systems that move the pills and the camera,
-//!   and the one that draws the debug overlay (`debug_overlay`).
+//!   the one that draws the debug overlay (`debug_overlay`), and the tuning
+//!   overlay (`ui`).
 //!
 //! # Design
 //!
@@ -15,6 +16,12 @@
 //! takes is idempotent: imports hand back the assets already loaded, the scene
 //! is only built into a world that does not hold it yet, and the tuning
 //! resource is only inserted when no earlier generation left one behind.
+
+// The crate's own name, so hot-patchable files (they cannot use `crate::`
+// paths: a generated patch replays their imports into a synthetic crate that
+// links this rlib) can name its types as `circus_demo::...`. The engine core
+// uses the same self-alias for its derive expansions.
+extern crate self as circus_demo;
 
 // External crates
 use pill_engine::{pill_project, Engine};
@@ -24,6 +31,11 @@ mod curl_noise_system;
 mod debug_overlay;
 mod game;
 mod resources;
+mod ui;
+
+// The items the hot-patchable overlay names; reachable in a generated patch
+// through its `use circus_demo::*`.
+pub use game::{DemoState, PILL_COUNT};
 
 /// Registers everything the demo uses, loads its assets and builds the scene.
 #[pill_project]
@@ -44,11 +56,29 @@ pub fn init(engine: &mut Engine) -> u32 {
         return 1;
     }
 
+    // The tuning overlay's stylesheet is a `.css` asset like the editor's:
+    // register the type once per live generation, and claim the UI context
+    // every generation too - the reload releases exactly the resources the
+    // new generation does not re-register - while the value is inserted only
+    // when no earlier generation left one behind (the shape `DemoState`
+    // uses). Claiming without re-inserting is what keeps the same context,
+    // and the scroll and values inside it, across a project reload.
+    engine
+        .world_mut()
+        .register_imported_asset::<pill_ui::StylesheetAsset>();
+    engine.world_mut().register_resource::<pill_ui::UiContext>();
+    if !engine.world_mut().has_resource::<pill_ui::UiContext>() {
+        engine
+            .world_mut()
+            .insert_resource(pill_ui::UiContext::new());
+    }
+
     engine.register_system("fps_camera", camera::fps_camera_system);
     engine.register_system("camera_fov", camera::camera_fov_changing_system);
     engine.register_system("curl_noise", curl_noise_system::curl_noise_system);
     engine.register_system("demo_control", game::demo_control_system);
     engine.register_system("debug_overlay", debug_overlay::debug_overlay_system);
+    engine.register_system("tuning_overlay", ui::tuning_overlay_system);
     0
 }
 

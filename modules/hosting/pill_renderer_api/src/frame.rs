@@ -243,6 +243,10 @@ pub struct RenderFrame {
     /// Number of this frame, counting from one; packed into the engine
     /// parameters beside the clocks.
     pub sequence: u64,
+    /// The UI to draw over the frame: the draw lists a game's or tool's
+    /// [`pill_ui`] context built this update, per surface, and the glyph
+    /// atlas changes they need. Empty means no UI (Stage 12).
+    pub ui: pill_ui::UiFrame,
 }
 
 impl Default for RenderFrame {
@@ -263,6 +267,7 @@ impl Default for RenderFrame {
             outline_color: [1.0, 0.55, 0.1, 1.0],
             pick_requests: Vec::new(),
             sequence: 0,
+            ui: pill_ui::UiFrame::default(),
         }
     }
 }

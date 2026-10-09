@@ -786,7 +786,7 @@ mod tests {
     use crate::draw::TextureId;
     use crate::panel::TreeNode;
     use crate::widget::WidgetId;
-    use pill_engine::{ButtonState, InputEvent, MouseButton};
+    use pill_engine_core::{ButtonState, InputEvent, MouseButton};
 
     fn text_system() -> TextSystem {
         TextSystem::new()
