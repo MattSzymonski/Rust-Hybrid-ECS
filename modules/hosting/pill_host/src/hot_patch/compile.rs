@@ -684,6 +684,7 @@ fn compiler_token_index(tokens: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build_runner::is_shared_slot_rlib;
 
     /// A trimmed but structurally faithful copy of a real cargo -v line.
     fn sample() -> &'static str {
