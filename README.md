@@ -97,7 +97,8 @@ restore it with `git checkout -- build/pill_shipping_bundle`.
 
 ## Extensions
 
-Engine extensions are crates inside `modules/extensions/`, built as `cdylib`
+Engine extensions are crates inside `modules/extensions/`, one folder per
+extension (`modules/extensions/<extension>/<crate>/`), built into a `cdylib`
 and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
@@ -111,17 +112,17 @@ to load, in order. An absent or empty list loads none.
 
 ### Adding a module
 
-The workspace manifest globs `extensions/*`, so a module is discovered by
-existing; nothing lists it by name.
+The workspace manifest globs `extensions/*/pill_*`, so a module is discovered
+by existing; nothing lists it by name.
 
-1. Create `modules/extensions/<name>/` with a `Cargo.toml` declaring
+1. Create `modules/extensions/<name>/<name>/` with a `Cargo.toml` declaring
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
 2. Export `pill_module_abi_version` and `pill_module_init`.
 3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from
 the directory name, so the host needs no changes. See
-`modules/extensions/pill_test` for the reference implementation and
+`modules/extensions/pill_test/pill_test` for the reference implementation and
 `local/documents/modularity_implementation_plan.md` for the design and its
 constraints.
 

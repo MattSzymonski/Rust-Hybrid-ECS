@@ -6,9 +6,9 @@ read from the Cargo manifests.
 REQUIREMENTS: Python 3.11+ (standard library only: `tomllib`).
 
 DESCRIPTION
-    Each renderer comes as two crates: a GPU module (`extensions/<renderer>`)
-    and its data crate (`extensions/<renderer>_data`). Both are found by that
-    naming convention, never listed here. The shared contract crate is
+    Each renderer comes as two crates: a GPU module (`<renderer>`) and its
+    data crate (`<renderer>_data`), both in an extension folder under
+    `extensions/`. Both are found by that naming convention, never listed here. The shared contract crate is
     `pill_renderer_api`. This check reads the workspace members' manifests
     (and the example projects') and enforces:
 
@@ -26,7 +26,7 @@ DESCRIPTION
                          graph equal to a module's), and no non-test source of
                          the crate may mention that key.
       4. projects      - no example project, and no generated project crate
-                         (`extensions/host_project_*`), depends on a GPU
+                         (`projects_generated/host_project_*`), depends on a GPU
                          module.
       5. data crates   - no data crate depends on a GPU module.
 
@@ -103,19 +103,25 @@ class Crate:
         return found
 
 
-# The workspace members under `modules/`, expanding `dir/*` globs and skipping
-# `exclude`d paths.
+# The workspace members under `modules/`, expanding glob members as cargo does
+# and skipping paths under an `exclude`d one.
 def workspace_members(modules: Path):
     with (modules / "Cargo.toml").open("rb") as manifest_file:
         workspace = tomllib.load(manifest_file)["workspace"]
-    excluded = {(modules / path).resolve() for path in workspace.get("exclude", [])}
+    excluded = [(modules / path).resolve() for path in workspace.get("exclude", [])]
     members = []
+    seen = set()
     for member in workspace.get("members", []):
-        directories = sorted((modules / member[:-2]).iterdir()) if member.endswith("/*") else [modules / member]
+        is_glob = any(character in member for character in "*?[")
+        directories = sorted(modules.glob(member)) if is_glob else [modules / member]
         for directory in directories:
             manifest = directory / "Cargo.toml"
-            if directory.resolve() in excluded or not manifest.is_file():
+            resolved = directory.resolve()
+            if any(resolved == path or path in resolved.parents for path in excluded):
                 continue
+            if not manifest.is_file() or resolved in seen:
+                continue
+            seen.add(resolved)
             members.append(Crate(manifest))
     return members
 
@@ -221,7 +227,8 @@ def report(repository: Path) -> int:
 # A minimal repository that satisfies every rule: a renderer `r` with its data
 # crate, the contract crate, a host with graph-only dependencies, a project.
 VALID_TREE = {
-    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", "extensions/*"]\n'
+    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", '
+                          '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
                                            'pill_engine = { path = "x" }\nserde = "1"\n',
@@ -231,24 +238,24 @@ VALID_TREE = {
     "modules/pill_host/src/lib.rs": "//! Host.\n",
     "modules/pill_host/src/tests.rs": "use renderer_data_dependency_graph as r_data;\n",
     "modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\npill_host = { path = "x" }\n',
-    "modules/extensions/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
-    "modules/extensions/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\npill_renderer_api = { path = "x" }\n',
-    "modules/extensions/host_module_r/Cargo.toml": '[package]\nname = "host_module_r"\n[dependencies]\nr = { path = "x" }\n',
+    "modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
+    "modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\npill_renderer_api = { path = "x" }\n',
+    "modules/extensions/r/generated/host_module_r/Cargo.toml": '[package]\nname = "host_module_r"\n[dependencies]\nr = { path = "x" }\n',
     "modules/extensions/rendering/old/Cargo.toml": '[package]\nname = "old"\n[dependencies]\nwgpu = "26"\n',
     "examples/p/Cargo.toml": '[package]\nname = "p"\n[dependencies]\nr_data = { path = "x" }\n',
 }
 
 # One broken variant per rule: the files to overwrite, and the rule it breaks.
 BROKEN_VARIANTS = [
-    (1, {"modules/extensions/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nwgpu = "25"\n'}),
-    (1, {"modules/extensions/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nr_data = { path = "x" }\n'}),
+    (1, {"modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nwgpu = "25"\n'}),
+    (1, {"modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nr_data = { path = "x" }\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nglam = "0.33"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[build-dependencies]\npill_assets = "1"\n'}),
     (3, {"modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\nr_data = { path = "x" }\n'}),
     (3, {"modules/pill_host/src/lib.rs": "//! Host.\nuse renderer_data_dependency_graph::Mesh;\n"}),
     (4, {"examples/p/Cargo.toml": '[package]\nname = "p"\n[dependencies]\nr = { path = "x" }\n'}),
-    (4, {"modules/extensions/host_module_o/Cargo.toml": '[package]\nname = "host_module_o"\n[dependencies]\nr = { path = "x" }\n'}),
-    (5, {"modules/extensions/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nr = { path = "x" }\n'}),
+    (4, {"modules/extensions/o/generated/host_module_o/Cargo.toml": '[package]\nname = "host_module_o"\n[dependencies]\nr = { path = "x" }\n'}),
+    (5, {"modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nr = { path = "x" }\n'}),
 ]
 
 

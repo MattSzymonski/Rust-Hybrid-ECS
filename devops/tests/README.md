@@ -130,7 +130,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 
 | Suite | Files it changes | How it restores them |
 | --- | --- | --- |
-| `test_hot_reload_suite.py` | `devops/tests/project/src/lib.rs`, `modules/extensions/pill_spline/src/pill_spline.rs`, and `project_settings.yaml` of both `devops/tests/project` and `examples/project_rs` | `BACKUP`, original bytes and timestamp. The two settings files are then written once more with a fresh timestamp. |
+| `test_hot_reload_suite.py` | `devops/tests/project/src/lib.rs`, `modules/extensions/pill_spline/pill_spline/src/pill_spline.rs`, and `project_settings.yaml` of both `devops/tests/project` and `examples/project_rs` | `BACKUP`, original bytes and timestamp. The two settings files are then written once more with a fresh timestamp. |
 | `test_hot_reload_migration.py` | `devops/tests/project/src/lib.rs` | Its own text copy, fresh timestamp |
 | `test_module_project_auto_reload.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
 | `test_editor_revision.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
@@ -141,7 +141,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_hot_reload_assets.py` | In `examples/master_renderer_test/res/`: `textures/helmet_emissive.jpg` (overwritten with junk bytes), its `.meta`, `materials/helmet.material`; moves the image pair into `textures/moved_by_suite/` and back. Also `pill_master_renderer_data.rs` (a comment appended to force a rebuild) | `BackupRegistry`, fresh timestamp; the move is undone in its own `finally` |
 | `test_hot_patch_coverage.py` | One function body in every crate listed in `examples/project_rs/project_settings.yaml`, plus the project | `BackupRegistry`, original bytes and timestamp |
 | `test_patch_bookkeeping.py` | A system in `examples/project_rs/src/` (a body edit, then a broken tail); creates `modules/target/hot/rollback.request` | `BackupRegistry`, fresh timestamp; the request file is deleted |
-| `test_wrapper_entry_points.py` | Writes `modules/extensions/host_module_wrapper_probe/` (a generated-namespace crate) | Deleted at the end unless `--keep-probe`; a host run prunes it as a stale wrapper too |
+| `test_wrapper_entry_points.py` | Writes `modules/extensions/pill_dummy_color/generated/host_module_wrapper_probe/` (a generated-namespace crate) | Deleted at the end unless `--keep-probe`; a host run prunes it as a stale wrapper too |
 | `test_web_smoke.py` | Regenerates `build/pill_shipping_bundle/`; writes `examples/master_renderer_test/build/web/` | The bundle is snapshotted and restored |
 | `test_shipping_smoke.py` | Regenerates `build/pill_shipping_bundle/` (gitignored) | Not restored |
 
@@ -265,7 +265,7 @@ the same commit that changes it.
 
 ## Generated C# mirrors
 
-`modules/extensions/<module>/generated/<module>_Components.g.cs` files are
+`modules/extensions/<extension>/<module>/generated/<module>_Components.g.cs` files are
 **committed**. They are build inputs, not artifacts: `examples/project_cs`
 compiles against them, so the C# side must build without a host run. The host
 regenerates each mirror on start and reload but writes only when the content

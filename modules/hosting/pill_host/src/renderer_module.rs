@@ -131,7 +131,7 @@ impl RendererModule {
                 owner,
             });
         };
-        let config = ExtensionConfig::workspace_member(name);
+        let config = ExtensionConfig::located_workspace_member(workspace_root, name);
         config.validate()?;
         // The watcher first: it is what retries a first load that fails below.
         let source_edit_generation = Arc::new(AtomicU64::new(0));

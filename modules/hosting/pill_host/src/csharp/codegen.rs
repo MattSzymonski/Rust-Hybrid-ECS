@@ -96,7 +96,7 @@ pub(crate) fn generate_module_components_csharp(
     accessors: &[ResolvedFieldAccessor],
 ) -> Result<bool, String> {
     generate_components_csharp(
-        &workspace_root.join("extensions").join(module_name),
+        &crate::config::extension_crate_directory(workspace_root, module_name),
         module_name,
         exposed,
         value_types,
@@ -110,7 +110,7 @@ pub(crate) fn generate_module_components_csharp(
 /// The engine of [`generate_module_components_csharp`], for a crate that is not
 /// an extension: the host's own renderer data (`pill_renderer_api`) exposes its
 /// components exactly as an extension does, but lives beside `pill_engine`
-/// rather than under `extensions/`.
+/// rather than in an extension folder under `extensions/`.
 ///
 /// # Errors
 ///
@@ -1568,7 +1568,7 @@ fn last_path_segment(qualified: &str) -> String {
 /// Regression tests for the host-side C# mirror generation.
 ///
 /// Each test drives [`generate_module_components_csharp`] against a fresh temp
-/// workspace shaped like the real repo (`<root>/extensions/<module>/generated/`),
+/// workspace shaped like the real repo (`<root>/extensions/<module>/<module>/generated/`),
 /// covering: generated content, the alignment-pad matrix, namespace splitting,
 /// the up-to-date / missing / stale rewrite conditions, per-module file
 /// isolation, stale-file removal when a module stops exposing components,
@@ -1635,7 +1635,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("pill_codegen_{}_{}", test_name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("extensions").join(module_name))
+        std::fs::create_dir_all(root.join("extensions").join(module_name).join(module_name))
             .expect("create temp module dir");
         root
     }
@@ -1708,6 +1708,7 @@ mod tests {
         workspace
             .join("extensions")
             .join(module_name)
+            .join(module_name)
             .join("generated")
             .join(format!("{module_name}_Components.g.cs"))
     }
@@ -1750,8 +1751,12 @@ mod tests {
         )
         .unwrap();
         assert!(generated_path(&workspace, "pill_spline").exists());
-        assert!(generated_path(&workspace, "pill_spline")
-            .starts_with(workspace.join("extensions").join("pill_spline")));
+        assert!(generated_path(&workspace, "pill_spline").starts_with(
+            workspace
+                .join("extensions")
+                .join("pill_spline")
+                .join("pill_spline")
+        ));
     }
 
     /// A single component produces a struct with the right namespace, name,
@@ -2213,7 +2218,13 @@ mod tests {
     #[test]
     fn writes_separate_files_per_module() {
         let workspace = temp_workspace("per_module", "pill_spline");
-        std::fs::create_dir_all(workspace.join("extensions").join("other_module")).unwrap();
+        std::fs::create_dir_all(
+            workspace
+                .join("extensions")
+                .join("other_module")
+                .join("other_module"),
+        )
+        .unwrap();
         call_codegen(
             &workspace,
             "pill_spline",

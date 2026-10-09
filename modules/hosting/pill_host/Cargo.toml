@@ -30,7 +30,7 @@ pill_runtime = { path = "../pill_runtime" }
 # names: without this entry a headless host would resolve a different
 # `pill_core.dll` than the data module and could not load it. Nothing
 # references it, so nothing of it is linked into the host.
-renderer_data_dependency_graph = { package = "pill_master_renderer_data", path = "../../extensions/pill_master_renderer_data" }
+renderer_data_dependency_graph = { package = "pill_master_renderer_data", path = "../../extensions/pill_master_renderer/pill_master_renderer_data" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running
 # host (see `build_runner::apply_cargo_host_overrides`), and cargo folds each
@@ -39,7 +39,7 @@ renderer_data_dependency_graph = { package = "pill_master_renderer_data", path =
 # different `pill_core.dll`s and the renderer module could not load. Declaring
 # the renderer here puts wgpu's graph into the host's resolution without
 # linking any of it: rlibs link as archives, and nothing references this one.
-renderer_dependency_graph = { package = "pill_master_renderer", path = "../../extensions/pill_master_renderer", optional = true }
+renderer_dependency_graph = { package = "pill_master_renderer", path = "../../extensions/pill_master_renderer/pill_master_renderer", optional = true }
 libloading = "0.8"
 # Development only (`hot_reload`): the source and shader watchers, and the
 # cooker the shader watcher runs - the one the renderer data crate's build

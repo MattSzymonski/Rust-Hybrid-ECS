@@ -15,7 +15,7 @@ DESCRIPTION
     whole set, because the host resolves them by symbol exactly as it did
     before the wrapper existed.
 
-    The script writes `modules/extensions/host_module_wrapper_probe` (a
+    The script writes `modules/extensions/pill_dummy_color/generated/host_module_wrapper_probe` (a
     throwaway workspace member wrapping `pill_dummy_color`), builds it, reads
     the DLL's export directory and compares the `pill_*` names against the
     expected set. The probe is deleted again afterwards, unless `--keep-probe`
@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_engine_exports import PortableExecutableError, parse_headers, rva_to_offset  # noqa: E402
 
 MODULES = Path(__file__).resolve().parents[2] / "modules"
-PROBE_DIRECTORY = MODULES / "extensions" / "host_module_wrapper_probe"
+PROBE_DIRECTORY = MODULES / "extensions" / "pill_dummy_color" / "generated" / "host_module_wrapper_probe"
 
 # The extension both builds compile; it carries no extra features, so the
 # check isolates what the macro emits.
@@ -97,8 +97,8 @@ name = "host_module_wrapper_probe"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pill_engine = { path = "../../pill_engine", features = ["hot_patch"] }
-pill_dummy_color = { path = "../pill_dummy_color", default-features = false }
+pill_engine = { path = "../../../../pill_engine", features = ["hot_patch"] }
+pill_dummy_color = { path = "../../pill_dummy_color", default-features = false }
 """
 
 PROBE_SOURCE = """//! Loadable-artifact wrapper for the `pill_dummy_color` extension.
@@ -155,7 +155,7 @@ def run_cargo(arguments, description):
 
 
 # Writes the probe member so `cargo build -p host_module_wrapper_probe` finds
-# it; the workspace's `extensions/*` glob picks it up.
+# it; the workspace's `extensions/*/generated/*` glob picks it up.
 def write_probe():
     (PROBE_DIRECTORY / "src").mkdir(parents=True, exist_ok=True)
     (PROBE_DIRECTORY / "Cargo.toml").write_text(PROBE_MANIFEST, encoding="utf-8")
@@ -205,6 +205,11 @@ def main():
     finally:
         if not arguments.keep_probe:
             shutil.rmtree(PROBE_DIRECTORY, ignore_errors=True)
+            # The probe's `generated/` folder too, when the probe was all it held.
+            try:
+                PROBE_DIRECTORY.parent.rmdir()
+            except OSError:
+                pass
 
     missing = sorted(EXPECTED_ENTRY_POINTS - wrapper_names)
     unexpected = sorted(wrapper_names - EXPECTED_ENTRY_POINTS)

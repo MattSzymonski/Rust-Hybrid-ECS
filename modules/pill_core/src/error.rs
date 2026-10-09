@@ -547,8 +547,12 @@ pub enum ConfigError {
     #[message("project settings file lists extension ", value(name), " twice")]
     DuplicateExtensionName { name: String },
 
-    /// A configured extension has no sibling directory to build from.
-    #[message("extension ", value(name), " has no directory under extensions/")]
+    /// No extension folder holds the configured extension crate.
+    #[message(
+        "extension ",
+        value(name),
+        " is in no extension folder under extensions/"
+    )]
     ExtensionDirectoryMissing { name: String },
 
     /// The asset pack a shipping build embeds could not be read.

@@ -104,27 +104,40 @@ pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
 #[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 
-/// Workspace-relative directory holding every extension crate.
+/// Workspace-relative directory holding one folder per extension.
 ///
-/// The workspace manifest globs this directory, so a module is discovered by
-/// existing rather than by being listed anywhere.
+/// Each folder, `extensions/<extension>/`, holds that extension's crates
+/// (`extensions/<extension>/<crate>/`). The workspace manifest globs the
+/// folders, so a module is discovered by existing rather than by being listed
+/// anywhere.
 const EXTENSION_DIRECTORY: &str = "extensions";
+
+/// Folder, inside an extension's folder, holding the host-generated wrapper
+/// crates of that extension's crates.
+const GENERATED_DIRECTORY: &str = "generated";
+
+/// Workspace-relative directory holding the generated project member.
+///
+/// Projects live outside the workspace, so the member that builds one as part
+/// of it is generated here; the `projects_generated/*` workspace glob discovers
+/// it without any entry in the workspace manifest.
+const PROJECT_MEMBER_DIRECTORY: &str = "projects_generated";
 
 /// Name prefix of the generated workspace member that builds a native project.
 ///
-/// The member lives under [`EXTENSION_DIRECTORY`], so the existing
-/// `extensions/*` workspace glob discovers it without any entry in the workspace
-/// manifest; only the package name differs per project.
+/// The member lives under [`PROJECT_MEMBER_DIRECTORY`]; only the package name
+/// differs per project.
 pub(crate) const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
 
 /// Name prefix of the generated workspace member that builds one extension's
 /// loadable artifact.
 ///
-/// One wrapper is materialized per loaded extension under
-/// [`EXTENSION_DIRECTORY`], so the same `extensions/*` glob discovers it. The
-/// wrapper is the `cdylib`; the extension itself stays a plain library inside
-/// it, which is what lets the module build and every project build compile
-/// one identical copy of the extension.
+/// One wrapper is materialized per loaded extension crate, in the
+/// [`GENERATED_DIRECTORY`] of the extension folder holding that crate, so the
+/// `extensions/*/generated/*` glob discovers it. The wrapper is the `cdylib`;
+/// the extension itself stays a plain library inside it, which is what lets
+/// the module build and every project build compile one identical copy of the
+/// extension.
 pub(crate) const HOST_MODULE_MEMBER_PREFIX: &str = "host_module_";
 
 /// Cargo profile directory this host was compiled into, recorded by `build.rs`.
@@ -490,6 +503,10 @@ pub struct ExtensionConfig {
     /// Crate directory name, also the log field and temporary-copy prefix.
     pub name: String,
 
+    /// The extension folder under `extensions/` that holds the crate; the
+    /// crate itself is `extensions/<folder>/<name>/`.
+    pub folder: String,
+
     /// Library name of the artifact the host loads, which is the extension's
     /// own name: the wrapper's DLL is staged under it, and the host addresses
     /// the module by it in logs, analytics and the reload graveyard.
@@ -515,20 +532,22 @@ pub struct ExtensionConfig {
 }
 
 impl ExtensionConfig {
-    /// Derive the configuration of an extension from its directory name.
+    /// Derive the configuration of an extension crate from its name and the
+    /// extension folder holding it.
     ///
-    /// Extensions live under [`EXTENSION_DIRECTORY`] inside the engine
-    /// workspace, which a glob in the workspace manifest picks up
-    /// automatically, so a new module needs no manifest edit. The directory
-    /// name determines everything else: sources in `<directory>/<name>/src`,
-    /// the generated `host_module_<name>` wrapper that carries the loadable
-    /// artifact, and the private `target/hot` directory it is staged into.
+    /// Extension crates live in folders under [`EXTENSION_DIRECTORY`] inside
+    /// the engine workspace, which a glob in the workspace manifest picks up
+    /// automatically, so a new module needs no manifest edit. The folder and
+    /// crate name determine everything else: sources in
+    /// `extensions/<folder>/<name>/src`, the generated `host_module_<name>`
+    /// wrapper that carries the loadable artifact, and the private `target/hot`
+    /// directory it is staged into.
     ///
     /// Building inside the workspace is required rather than convenient. It
     /// makes the module resolve the identical dependency graph as the host,
     /// which is what keeps component type identities and the mangled symbol
     /// names of the shared `pill_core` library in agreement.
-    pub fn workspace_member(name: &str) -> Self {
+    pub fn workspace_member(name: &str, folder: &str) -> Self {
         let wrapper_library_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
         // The wrapper's manifest enables the extension's own features on its
         // dependency edge (`materialize_host_module_wrapper`); the command
@@ -538,12 +557,22 @@ impl ExtensionConfig {
 
         Self {
             name: name.to_string(),
+            folder: folder.to_string(),
             library_name: name.to_string(),
             wrapper_library_name,
-            watch_directory: format!("{EXTENSION_DIRECTORY}/{name}/src"),
+            watch_directory: format!("{EXTENSION_DIRECTORY}/{folder}/{name}/src"),
             build_command,
             output_subdirectory: "target/hot".to_string(),
         }
+    }
+
+    /// [`Self::workspace_member`] for the crate `name`, in whichever extension
+    /// folder under `workspace_root` holds it (the folder of its own name when
+    /// none does yet, so a missing crate fails at its watch path, as before).
+    pub fn located_workspace_member(workspace_root: &Path, name: &str) -> Self {
+        let folder = locate_extension_folder(&workspace_root.join(EXTENSION_DIRECTORY), name)
+            .unwrap_or_else(|| name.to_string());
+        Self::workspace_member(name, &folder)
     }
 
     /// Verify that the configuration is internally consistent.
@@ -747,10 +776,10 @@ impl HostConfig {
 
         // Step 4: Resolve the extensions, validating every name before
         // it is interpolated into a watch path and a cargo selector. A
-        // traversal or duplicate entry, or one with no directory under
-        // `extensions/`, is a configuration error here rather than a watch on
-        // an arbitrary directory, a malformed `--package`, or a second copy
-        // of a module already loading.
+        // traversal or duplicate entry, or a crate no extension folder under
+        // `extensions/` holds, is a configuration error here rather than a
+        // watch on an arbitrary directory, a malformed `--package`, or a second
+        // copy of a module already loading.
         let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
         let renderer =
             Self::resolve_renderer(project_settings.renderer.as_deref(), &extensions_root)?;
@@ -758,19 +787,30 @@ impl HostConfig {
             Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
         let extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
 
-        // Step 5: Write every loaded extension's wrapper crate before the
-        // first build, and clear wrappers for extensions this project no
-        // longer loads. The renderer module gets one too, with its renderer
-        // ABI entry points added to the generated source.
-        for name in &module_names {
-            materialize_host_module_wrapper(&workspace_root, name, false)?;
+        // Step 5: Write every loaded extension crate's wrapper into its
+        // extension folder's `generated/` before the first build, and clear
+        // wrappers for crates this project no longer loads. The renderer
+        // module gets one too, with its renderer ABI entry points added to the
+        // generated source.
+        let mut kept_wrappers: Vec<(String, String)> = Vec::new();
+        for extension in &extensions {
+            materialize_host_module_wrapper(
+                &workspace_root,
+                &extension.name,
+                &extension.folder,
+                false,
+            )?;
+            kept_wrappers.push((extension.folder.clone(), extension.name.clone()));
         }
         if let Some(renderer_name) = renderer.as_deref() {
-            materialize_host_module_wrapper(&workspace_root, renderer_name, true)?;
-        }
-        let mut kept_wrappers = module_names.clone();
-        if let Some(renderer_name) = renderer.as_deref() {
-            kept_wrappers.push(renderer_name.to_string());
+            let folder =
+                locate_extension_folder(&extensions_root, renderer_name).ok_or_else(|| {
+                    ConfigError::ExtensionDirectoryMissing {
+                        name: renderer_name.to_string(),
+                    }
+                })?;
+            materialize_host_module_wrapper(&workspace_root, renderer_name, &folder, true)?;
+            kept_wrappers.push((folder, renderer_name.to_string()));
         }
         prune_stale_host_module_wrappers(&workspace_root, &kept_wrappers);
 
@@ -790,9 +830,10 @@ impl HostConfig {
     /// Resolve the settings' `renderer:` value to a renderer name.
     ///
     /// Absent means [`DEFAULT_RENDERER`]; [`NO_RENDERER`] means none. A named
-    /// renderer must have both of its crates under `extensions/`: the GPU
-    /// module `<renderer>` and the data crate `<renderer>_data`. A missing one
-    /// is a configuration error here rather than a failed build later.
+    /// renderer must have both of its crates in an extension folder under
+    /// `extensions/`: the GPU module `<renderer>` and the data crate
+    /// `<renderer>_data`. A missing one is a configuration error here rather
+    /// than a failed build later.
     fn resolve_renderer(
         setting: Option<&str>,
         extensions_root: &Path,
@@ -807,10 +848,10 @@ impl HostConfig {
             });
         }
         let data = format!("{name}{RENDERER_DATA_SUFFIX}");
-        for directory in [name, data.as_str()] {
-            if !extensions_root.join(directory).is_dir() {
+        for crate_name in [name, data.as_str()] {
+            if locate_extension_folder(extensions_root, crate_name).is_none() {
                 return Err(ConfigError::ExtensionDirectoryMissing {
-                    name: directory.to_string(),
+                    name: crate_name.to_string(),
                 });
             }
         }
@@ -832,8 +873,8 @@ impl HostConfig {
             .collect()
     }
 
-    /// Resolve the settings file's module names against the `extensions/`
-    /// directory.
+    /// Resolve the settings file's module names against the extension folders
+    /// under `extensions/`.
     ///
     /// Split from [`Self::from_environment`] so the validation is testable
     /// without moving the process's working directory, which no test in this
@@ -841,8 +882,8 @@ impl HostConfig {
     /// of the checks is the order the errors matter in: a name that is not a
     /// crate directory is refused before anything is derived from it, a
     /// repeat is refused before a second copy of the module could load, and
-    /// the sibling directory is required before the module is configured at
-    /// all.
+    /// a folder holding the crate is required before the module is configured
+    /// at all.
     fn resolve_extensions(
         names: &[String],
         extensions_root: &Path,
@@ -861,12 +902,12 @@ impl HostConfig {
                     name: name.to_string(),
                 });
             }
-            if !extensions_root.join(name).is_dir() {
+            let Some(folder) = locate_extension_folder(extensions_root, name) else {
                 return Err(ConfigError::ExtensionDirectoryMissing {
                     name: name.to_string(),
                 });
-            }
-            let module = ExtensionConfig::workspace_member(name);
+            };
+            let module = ExtensionConfig::workspace_member(name, &folder);
             module.validate()?;
             modules.push(module);
         }
@@ -995,8 +1036,9 @@ impl ProjectModuleConfig {
         // against the engine workspace (one Cargo.lock, one target directory,
         // one crate-metadata set). This is what keeps `pill_spline::Spline` the
         // same type in the project DLL and in the extension DLLs. The
-        // member is generated under `extensions/` and discovered by the existing
-        // `extensions/*` glob, so the workspace manifest never names the project.
+        // member is generated under `projects_generated/` and discovered by the
+        // `projects_generated/*` glob, so the workspace manifest never names the
+        // project.
         materialize_host_project_member(workspace_root, project_path, &package_name)?;
 
         // Step 3: Derive the source watch directory and build output location.
@@ -1403,6 +1445,47 @@ fn is_valid_module_directory_name(value: &str) -> bool {
         && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The extension folder under `extensions_root` that holds the crate
+/// `crate_name`, as `extensions/<folder>/<crate_name>/Cargo.toml`.
+///
+/// The folder named like the crate is checked first, since most extensions
+/// hold one crate of their own name; otherwise every folder is scanned in
+/// name order, because a folder may hold several crates (the master
+/// renderer's folder holds its data crate too). Folders starting with `_` are
+/// workspace bookkeeping, never extensions. `None` when no folder holds it.
+pub(crate) fn locate_extension_folder(extensions_root: &Path, crate_name: &str) -> Option<String> {
+    let holds_crate = |folder: &str| {
+        extensions_root
+            .join(folder)
+            .join(crate_name)
+            .join("Cargo.toml")
+            .is_file()
+    };
+    if holds_crate(crate_name) {
+        return Some(crate_name.to_string());
+    }
+    let mut folders: Vec<String> = std::fs::read_dir(extensions_root)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|folder| !folder.starts_with('_'))
+        .collect();
+    folders.sort();
+    folders.into_iter().find(|folder| holds_crate(folder))
+}
+
+/// The directory of the extension crate `crate_name`:
+/// `extensions/<folder>/<crate_name>` for the folder that holds it, or the
+/// conventional `extensions/<crate_name>/<crate_name>` when no folder does
+/// yet.
+pub(crate) fn extension_crate_directory(workspace_root: &Path, crate_name: &str) -> PathBuf {
+    let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
+    let folder = locate_extension_folder(&extensions_root, crate_name)
+        .unwrap_or_else(|| crate_name.to_string());
+    extensions_root.join(folder).join(crate_name)
+}
+
 /// Read the project's own settings file from the project root.
 ///
 /// Returns `Ok(None)` when no file exists; the caller decides whether that is
@@ -1441,8 +1524,9 @@ fn read_project_settings_file(
 /// Cross-DLL type identity requires the project to compile as a member of the
 /// engine workspace: one Cargo.lock, one target directory, one crate-metadata
 /// set. The project source lives outside the workspace, so this writes a
-/// generated crate under `extensions/` — which the existing `extensions/*` glob
-/// discovers automatically, so no workspace-manifest entry is ever needed.
+/// generated crate under `projects_generated/` - which the
+/// `projects_generated/*` glob discovers automatically, so no
+/// workspace-manifest entry is ever needed.
 ///
 /// The generated `Cargo.toml` is the project's own manifest with every `path`
 /// dependency resolved to an absolute location and the `[lib]` `path` pointed
@@ -1518,7 +1602,7 @@ fn materialize_host_project_member(
     });
 
     // Step 3a: Refuse to write a member Cargo cannot load. The generated member
-    // is picked up by the `extensions/*` glob, so a single unresolvable path in
+    // is picked up by the `projects_generated/*` glob, so a single unresolvable path in
     // it stops Cargo loading the workspace at all - which breaks every build,
     // test and lint in the repository, including the build that would replace
     // the member. Report the offending path instead, and clear any member an
@@ -1528,7 +1612,7 @@ fn materialize_host_project_member(
         .find(|(_, absolute)| !Path::new(absolute).exists())
     {
         let member_directory = workspace_root
-            .join(EXTENSION_DIRECTORY)
+            .join(PROJECT_MEMBER_DIRECTORY)
             .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
         let _ = std::fs::remove_dir_all(&member_directory);
         return Err(ConfigError::ProjectDependencyPathMissing {
@@ -1580,7 +1664,7 @@ fn materialize_host_project_member(
     // would rebuild nothing, but skipping it also keeps the file's
     // modification time stable for anything else watching the tree.
     let member_directory = workspace_root
-        .join(EXTENSION_DIRECTORY)
+        .join(PROJECT_MEMBER_DIRECTORY)
         .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
     std::fs::create_dir_all(&member_directory).map_err(|source| {
         ConfigError::HostProjectMemberCreationFailed {
@@ -1680,46 +1764,51 @@ fn for_each_dependency_table_mut(root: &mut Table, visit: &mut impl FnMut(&mut T
 
 /// Removes host-generated workspace members left behind by earlier runs.
 ///
-/// Every directory under `extensions/` whose name carries
+/// Every directory under `projects_generated/` whose name carries
 /// [`HOST_PROJECT_MEMBER_PREFIX`] was written by this function, so any one that
 /// is not the member being materialized now belongs to a project the host is no
-/// longer pointed at. Leaving it in place is not harmless: the `extensions/*`
-/// glob still picks it up as a workspace member, and its dependency paths point
-/// into the previous project's directory. Once that directory moves or is
-/// deleted, Cargo fails to load the workspace at all, so every build, test and
-/// lint in the repository stops working with an error naming a crate nobody
-/// asked for.
+/// longer pointed at. Leaving it in place is not harmless: the
+/// `projects_generated/*` glob still picks it up as a workspace member, and its
+/// dependency paths point into the previous project's directory. Once that
+/// directory moves or is deleted, Cargo fails to load the workspace at all, so
+/// every build, test and lint in the repository stops working with an error
+/// naming a crate nobody asked for.
+///
+/// Members an older host wrote straight into `extensions/` are removed too:
+/// nothing globs that location any more, so they only confuse a reader.
 ///
 /// Failures are ignored rather than propagated. A stale member the host cannot
 /// remove (a file lock, a permission problem) is a housekeeping problem, not a
 /// reason to refuse to start; the build that follows either succeeds or reports
 /// the real error itself.
 fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
-    let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
-    let Ok(entries) = std::fs::read_dir(&extensions_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == keep || !path.is_dir() {
+    for directory in [PROJECT_MEMBER_DIRECTORY, EXTENSION_DIRECTORY] {
+        let Ok(entries) = std::fs::read_dir(workspace_root.join(directory)) else {
             continue;
-        }
-        let is_generated = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(HOST_PROJECT_MEMBER_PREFIX));
-        if is_generated {
-            let _ = std::fs::remove_dir_all(&path);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == keep || !path.is_dir() {
+                continue;
+            }
+            let is_generated = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(HOST_PROJECT_MEMBER_PREFIX));
+            if is_generated {
+                let _ = std::fs::remove_dir_all(&path);
+            }
         }
     }
 }
 
-/// Materialize the wrapper workspace member that builds one extension's
+/// Materialize the wrapper workspace member that builds one extension crate's
 /// loadable artifact.
 ///
-/// The wrapper is a generated crate under `extensions/` - discovered by the
-/// same workspace glob as everything else - whose `cdylib` is the artifact the
-/// host loads, staged and addressed under the extension's own name. The
+/// The wrapper is a generated crate in the `generated/` folder of the
+/// extension folder holding the crate - discovered by the
+/// `extensions/*/generated/*` workspace glob - whose `cdylib` is the artifact
+/// the host loads, staged and addressed under the extension's own name. The
 /// extension stays a plain library inside it, so its sources compile once per
 /// configuration: the module build and every project build share one rlib.
 ///
@@ -1740,11 +1829,15 @@ fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
 fn materialize_host_module_wrapper(
     workspace_root: &Path,
     name: &str,
+    folder: &str,
     is_renderer: bool,
 ) -> Result<(), ConfigError> {
     let member_name = format!("{HOST_MODULE_MEMBER_PREFIX}{name}");
-    let member_directory = workspace_root.join(EXTENSION_DIRECTORY).join(&member_name);
-    let extension_directory = workspace_root.join(EXTENSION_DIRECTORY).join(name);
+    let folder_directory = workspace_root.join(EXTENSION_DIRECTORY).join(folder);
+    let member_directory = folder_directory
+        .join(GENERATED_DIRECTORY)
+        .join(&member_name);
+    let extension_directory = folder_directory.join(name);
     let engine_directory = workspace_root.join("pill_engine");
 
     // Everything the extension declares except the `default` key. A wrapper
@@ -1848,39 +1941,61 @@ fn materialize_host_module_wrapper(
 
 /// Removes generated extension wrappers left behind by earlier runs.
 ///
-/// Every directory under `extensions/` whose name carries
+/// Every directory in an extension folder's `generated/` whose name carries
 /// [`HOST_MODULE_MEMBER_PREFIX`] was written by
-/// [`materialize_host_module_wrapper`], so any one whose extension is not in
-/// `keep` belongs to a project the host is no longer running. Leaving it in
-/// place is not harmless: the `extensions/*` glob still picks it up as a
-/// workspace member whose dependency paths may not resolve, and Cargo then
-/// fails to load the workspace at all. This is the module-side twin of
+/// [`materialize_host_module_wrapper`], so any one whose `(folder, crate)` is
+/// not in `keep` belongs to a project the host is no longer running, or to a
+/// crate that moved to another folder. Leaving it in place is not harmless:
+/// the `extensions/*/generated/*` glob still picks it up as a workspace member
+/// whose dependency paths may not resolve, and Cargo then fails to load the
+/// workspace at all. This is the module-side twin of
 /// [`prune_stale_host_project_members`].
+///
+/// Wrappers an older host wrote straight into `extensions/` are removed too.
 ///
 /// Failures are ignored rather than propagated, for the same reason they are
 /// there: a stale member the host cannot remove is a housekeeping problem,
 /// not a reason to refuse to start.
-fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[String]) {
+fn prune_stale_host_module_wrappers(workspace_root: &Path, keep: &[(String, String)]) {
     let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
-    let Ok(entries) = std::fs::read_dir(&extensions_root) else {
+    let Ok(folders) = std::fs::read_dir(&extensions_root) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+    // The wrapper's crate name, when `path` is a generated wrapper directory.
+    let wrapped_crate = |path: &Path| -> Option<String> {
+        path.file_name()?
+            .to_str()?
+            .strip_prefix(HOST_MODULE_MEMBER_PREFIX)
+            .map(str::to_string)
+    };
+    for folder_entry in folders.flatten() {
+        let folder_path = folder_entry.path();
+        if !folder_path.is_dir() {
             continue;
         }
-        let Some(extension) = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix(HOST_MODULE_MEMBER_PREFIX))
-        else {
+        // A wrapper left flat in `extensions/` by an older host.
+        if wrapped_crate(&folder_path).is_some() {
+            let _ = std::fs::remove_dir_all(&folder_path);
+            continue;
+        }
+        let Some(folder) = folder_entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if keep.iter().any(|name| name == extension) {
+        let Ok(wrappers) = std::fs::read_dir(folder_path.join(GENERATED_DIRECTORY)) else {
             continue;
+        };
+        for wrapper_entry in wrappers.flatten() {
+            let wrapper_path = wrapper_entry.path();
+            let Some(crate_name) = wrapped_crate(&wrapper_path) else {
+                continue;
+            };
+            let kept = keep.iter().any(|(kept_folder, kept_crate)| {
+                *kept_folder == folder && *kept_crate == crate_name
+            });
+            if wrapper_path.is_dir() && !kept {
+                let _ = std::fs::remove_dir_all(&wrapper_path);
+            }
         }
-        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -2101,14 +2216,68 @@ serde = { version = "1", features = ["derive"] }
         assert!(read_project_settings_file(&directory).unwrap().is_none());
     }
 
-    /// An `extensions/` directory holding the named crate directories.
+    /// An `extensions/` directory holding the named crates, each in a folder
+    /// of its own name (`<root>/<crate>/<crate>/Cargo.toml`).
     fn extensions_root_with(name: &str, crates: &[&str]) -> PathBuf {
         let root = temp_root().join(name);
         let _ = std::fs::remove_dir_all(&root);
         for crate_name in crates {
-            std::fs::create_dir_all(root.join(crate_name)).unwrap();
+            seed_extension_crate(&root, crate_name, crate_name);
         }
         root
+    }
+
+    /// Creates `<extensions_root>/<folder>/<crate_name>/Cargo.toml`.
+    fn seed_extension_crate(extensions_root: &Path, folder: &str, crate_name: &str) {
+        let directory = extensions_root.join(folder).join(crate_name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("Cargo.toml"),
+            format!("[package]\nname = \"{crate_name}\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// A crate is found in the folder of its own name first, and otherwise in
+    /// whichever folder holds it - the master renderer's folder holds its data
+    /// crate too. Bookkeeping folders (`_...`) are never searched.
+    #[test]
+    fn locates_crates_in_their_extension_folders() {
+        let root = temp_root().join("locate_extension_folder");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_extension_crate(&root, "pill_master_renderer", "pill_master_renderer");
+        seed_extension_crate(&root, "pill_master_renderer", "pill_master_renderer_data");
+        seed_extension_crate(&root, "_workspace_anchor", "pill_hidden");
+
+        assert_eq!(
+            locate_extension_folder(&root, "pill_master_renderer").as_deref(),
+            Some("pill_master_renderer")
+        );
+        assert_eq!(
+            locate_extension_folder(&root, "pill_master_renderer_data").as_deref(),
+            Some("pill_master_renderer"),
+            "a second crate in a folder is found by scanning the folders"
+        );
+        assert_eq!(locate_extension_folder(&root, "pill_hidden"), None);
+        assert_eq!(locate_extension_folder(&root, "pill_absent"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The renderer's data crate may share the GPU module's folder.
+    #[test]
+    fn a_renderer_with_both_crates_in_one_folder_resolves() {
+        let root = temp_root().join("renderer_one_folder");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_extension_crate(&root, "pill_master_renderer", "pill_master_renderer");
+        seed_extension_crate(&root, "pill_master_renderer", "pill_master_renderer_data");
+        assert_eq!(
+            HostConfig::resolve_renderer(None, &root)
+                .unwrap()
+                .as_deref(),
+            Some("pill_master_renderer")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// No `renderer:` key selects the master renderer, whose two crates must
@@ -2201,8 +2370,8 @@ serde = { version = "1", features = ["derive"] }
     fn rejects_traversal_and_duplicate_module_names() {
         let root = temp_root().join("extension_names");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("extensions").join("pill_spline")).unwrap();
         let extensions_root = root.join("extensions");
+        seed_extension_crate(&extensions_root, "pill_spline", "pill_spline");
 
         let traversal =
             HostConfig::resolve_extensions(&[String::from("../pill_spline")], &extensions_root);
@@ -2232,8 +2401,9 @@ serde = { version = "1", features = ["derive"] }
                 .expect("a real sibling directory resolves");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "pill_spline");
+        assert_eq!(resolved[0].folder, "pill_spline");
         assert_eq!(
-            resolved[0].watch_directory, "extensions/pill_spline/src",
+            resolved[0].watch_directory, "extensions/pill_spline/pill_spline/src",
             "the validated name still derives the documented watch path"
         );
 
@@ -2561,7 +2731,10 @@ mod profile_tests {
 
 #[cfg(test)]
 mod host_project_member_validation_tests {
-    use super::{materialize_host_project_member, EXTENSION_DIRECTORY, HOST_PROJECT_MEMBER_PREFIX};
+    use super::{
+        materialize_host_project_member, EXTENSION_DIRECTORY, HOST_PROJECT_MEMBER_PREFIX,
+        PROJECT_MEMBER_DIRECTORY,
+    };
     use pill_core::error::ConfigError;
 
     /// A project manifest whose one path dependency is filled in per test, so
@@ -2592,7 +2765,7 @@ mod host_project_member_validation_tests {
 
     /// Path of the member `materialize_host_project_member` would generate.
     fn member_directory(root: &std::path::Path) -> std::path::PathBuf {
-        root.join(EXTENSION_DIRECTORY)
+        root.join(PROJECT_MEMBER_DIRECTORY)
             .join(format!("{HOST_PROJECT_MEMBER_PREFIX}project"))
     }
 
@@ -2698,12 +2871,12 @@ mod host_project_member_validation_tests {
 
 #[cfg(test)]
 mod host_project_member_pruning_tests {
-    use super::{prune_stale_host_project_members, EXTENSION_DIRECTORY};
+    use super::{prune_stale_host_project_members, EXTENSION_DIRECTORY, PROJECT_MEMBER_DIRECTORY};
 
-    /// Creates `extensions/<name>/Cargo.toml` under `root` and returns its
+    /// Creates `<directory>/<name>/Cargo.toml` under `root` and returns its
     /// directory, so a test can assert on the directory rather than the file.
-    fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let directory = root.join(EXTENSION_DIRECTORY).join(name);
+    fn seed_member_in(root: &std::path::Path, directory: &str, name: &str) -> std::path::PathBuf {
+        let directory = root.join(directory).join(name);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("Cargo.toml"),
@@ -2715,11 +2888,16 @@ name = \"x\"
         directory
     }
 
+    /// A generated project member under `projects_generated/`.
+    fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        seed_member_in(root, PROJECT_MEMBER_DIRECTORY, name)
+    }
+
     /// Builds an empty temporary workspace root, removing any previous run's.
     fn workspace(test_name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("pill_prune_{test_name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(root.join(PROJECT_MEMBER_DIRECTORY)).unwrap();
         root
     }
 
@@ -2727,6 +2905,7 @@ name = \"x\"
     fn removes_a_member_left_by_a_previous_project() {
         let root = workspace("previous");
         let stale = seed_member(&root, "host_project_old");
+        let legacy = seed_member_in(&root, EXTENSION_DIRECTORY, "host_project_flat");
         let keep = seed_member(&root, "host_project_current");
 
         prune_stale_host_project_members(&root, &keep);
@@ -2735,13 +2914,17 @@ name = \"x\"
             !stale.exists(),
             "the previous project's member must be gone"
         );
+        assert!(
+            !legacy.exists(),
+            "a member an older host left flat in extensions/ must be gone"
+        );
         assert!(keep.exists(), "the member being materialized must survive");
     }
 
     #[test]
     fn leaves_real_extensions_alone() {
         let root = workspace("real_modules");
-        let module = seed_member(&root, "pill_spline");
+        let module = seed_member_in(&root, EXTENSION_DIRECTORY, "pill_spline");
         let keep = seed_member(&root, "host_project_current");
 
         prune_stale_host_project_members(&root, &keep);
@@ -2766,7 +2949,9 @@ name = \"x\"
 
 #[cfg(all(test, feature = "hot_patch"))]
 mod hot_patch_manifest_tests {
-    use super::{materialize_host_project_member, EXTENSION_DIRECTORY, HOST_PROJECT_MEMBER_PREFIX};
+    use super::{
+        materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX, PROJECT_MEMBER_DIRECTORY,
+    };
 
     /// A hot-patching host needs the generated member to build an `rlib` too,
     /// or a patch has nothing to link the project's types from.
@@ -2774,7 +2959,6 @@ mod hot_patch_manifest_tests {
     fn generated_member_builds_an_rlib_for_hot_patching() {
         let root = std::env::temp_dir().join("pill_member_hot_patch_rlib");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
         std::fs::create_dir_all(root.join("project").join("src")).unwrap();
         std::fs::write(
             root.join("project").join("Cargo.toml"),
@@ -2786,7 +2970,7 @@ mod hot_patch_manifest_tests {
         materialize_host_project_member(&root, "project", "project").unwrap();
 
         let generated = std::fs::read_to_string(
-            root.join(EXTENSION_DIRECTORY)
+            root.join(PROJECT_MEMBER_DIRECTORY)
                 .join(format!("{HOST_PROJECT_MEMBER_PREFIX}project"))
                 .join("Cargo.toml"),
         )
@@ -2796,5 +2980,64 @@ mod hot_patch_manifest_tests {
             generated.contains("rlib"),
             "the member must build an rlib when hot patching: {generated}"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_module_wrapper_pruning_tests {
+    use super::{prune_stale_host_module_wrappers, EXTENSION_DIRECTORY, GENERATED_DIRECTORY};
+
+    /// Creates `extensions/<folder>/generated/<wrapper>/Cargo.toml` under
+    /// `root` and returns the wrapper's directory.
+    fn seed_wrapper(root: &std::path::Path, folder: &str, wrapper: &str) -> std::path::PathBuf {
+        let directory = root
+            .join(EXTENSION_DIRECTORY)
+            .join(folder)
+            .join(GENERATED_DIRECTORY)
+            .join(wrapper);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        directory
+    }
+
+    /// A kept wrapper survives; a wrapper of a crate no longer loaded, one in
+    /// a folder the crate no longer lives in, and one an older host left flat
+    /// in `extensions/` are removed; real crates are never touched.
+    #[test]
+    fn keeps_only_the_wrappers_of_loaded_crates() {
+        let root = std::env::temp_dir().join("pill_prune_wrappers");
+        let _ = std::fs::remove_dir_all(&root);
+        let kept = seed_wrapper(&root, "pill_spline", "host_module_pill_spline");
+        let unloaded = seed_wrapper(&root, "pill_audio", "host_module_pill_audio");
+        let moved = seed_wrapper(&root, "pill_old_folder", "host_module_pill_spline");
+        let flat = root.join(EXTENSION_DIRECTORY).join("host_module_pill_test");
+        std::fs::create_dir_all(&flat).unwrap();
+        let real_crate = root
+            .join(EXTENSION_DIRECTORY)
+            .join("pill_spline")
+            .join("pill_spline");
+        std::fs::create_dir_all(&real_crate).unwrap();
+
+        prune_stale_host_module_wrappers(
+            &root,
+            &[("pill_spline".to_string(), "pill_spline".to_string())],
+        );
+
+        assert!(kept.exists(), "the loaded crate's wrapper must survive");
+        assert!(
+            !unloaded.exists(),
+            "a wrapper of an unloaded crate must be gone"
+        );
+        assert!(
+            !moved.exists(),
+            "a wrapper in the wrong folder must be gone"
+        );
+        assert!(
+            !flat.exists(),
+            "a flat wrapper from an older host must be gone"
+        );
+        assert!(real_crate.exists(), "a real crate must never be removed");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

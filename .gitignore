@@ -37,9 +37,13 @@ modules/pill_standalone_temp/
 # A capture worth keeping goes under `local/`, which is ignored below.
 *.log
 
-# Host-generated project workspace member (created at runtime)
-modules/extensions/host_project_*/
-modules/extensions/host_module_*/
+# Host-generated workspace members (created at runtime): each extension's
+# `host_module_*` wrappers in its own `generated/` folder, and the project's
+# `host_project_*` member. The READMEs anchoring the member globs stay tracked.
+modules/extensions/*/generated/
+!modules/extensions/_workspace_anchor/generated/
+modules/projects_generated/*
+!modules/projects_generated/README.md
 
 # Generated build scratch (shipping bundle contents, build metadata).
 #
