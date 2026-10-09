@@ -73,7 +73,7 @@ pub(crate) fn open_panel_window(
     popouts: Arc<PopoutManager>,
 ) {
     let props = DetachedPanelProps {
-        panel,
+        panel: panel.clone(),
         editor: Arc::clone(&editor),
         popouts,
     };
@@ -133,18 +133,19 @@ fn DetachedPanelWindow(props: DetachedPanelProps) -> Element {
     let event_editor = Arc::clone(&editor);
     let event_popouts = Arc::clone(&popouts);
     let event_finalized = Arc::clone(&finalized);
+    let event_panel = panel.clone();
     use_wry_event_handler(move |event, _| match event {
         TaoEvent::WindowEvent {
             event: WindowEvent::Resized(size),
             ..
-        } if panel == PanelKind::Scene => {
+        } if event_panel == PanelKind::Scene => {
             event_editor.resize_detached_scene(window_id, size.width, size.height);
         }
         TaoEvent::WindowEvent {
             event: WindowEvent::CloseRequested,
             ..
         } => finalize_popout(
-            panel,
+            event_panel.clone(),
             window_id,
             &event_editor,
             &event_popouts,
@@ -157,8 +158,15 @@ fn DetachedPanelWindow(props: DetachedPanelProps) -> Element {
     // first, then ask the main runtime to put the tab back into its dock tree.
     let close_editor = Arc::clone(&editor);
     let close_finalized = Arc::clone(&finalized);
+    let close_panel = panel.clone();
     use_drop(move || {
-        finalize_popout(panel, window_id, &close_editor, &popouts, &close_finalized);
+        finalize_popout(
+            close_panel.clone(),
+            window_id,
+            &close_editor,
+            &popouts,
+            &close_finalized,
+        );
     });
 
     let root_class = if panel == PanelKind::Scene {

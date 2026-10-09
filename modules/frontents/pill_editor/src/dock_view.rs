@@ -22,6 +22,19 @@ use crate::scene_input::SceneViewport;
 use crate::systems_tab::SystemsTab;
 use crate::{EditorContext, Stats, StatsWidget};
 
+/// DOM element ids for layout nodes: the one DOM-specific use of a [`NodeId`],
+/// kept here rather than in the UI-independent layout model.
+trait NodeDomId {
+    /// Return a DOM-safe stable identifier.
+    fn dom_id(self, prefix: &str) -> String;
+}
+
+impl NodeDomId for NodeId {
+    fn dom_id(self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.0)
+    }
+}
+
 /// Compiled-in fallback stylesheet, injected into every dock root.
 pub(crate) const DOCK_CSS: &str = include_str!("../assets/dock_layout.css");
 
@@ -301,7 +314,7 @@ pub fn DockView(
                                 aria_labelledby: tab_id.dom_id("dock-tab"),
                                 style: panel_style(rect, visible),
                                 PanelContent {
-                                    panel: tab.panel,
+                                    panel: tab.panel.clone(),
                                     stats,
                                     editor: Arc::clone(&editor),
                                 }
@@ -388,7 +401,7 @@ pub fn DockView(
                                                     span { "{tab.title}" }
                                                     {
                                                         let detach_tab = *tab_id;
-                                                        let detach_panel = tab.panel;
+                                                        let detach_panel = tab.panel.clone();
                                                         rsx! {
                                                             span {
                                                                 class: "dock-undock",
@@ -405,7 +418,7 @@ pub fn DockView(
                                                                         LayoutAction::DetachTab { tab: detach_tab },
                                                                         false,
                                                                     ) {
-                                                                        on_undock.call(detach_panel);
+                                                                        on_undock.call(detach_panel.clone());
                                                                     }
                                                                 },
                                                                 "↗"
@@ -542,7 +555,7 @@ pub fn DockView(
                                 apply_layout_action(
                                     model,
                                     LayoutAction::OpenTab {
-                                        panel,
+                                        panel: panel.clone(),
                                         target_tabset,
                                     },
                                     true,
@@ -600,6 +613,11 @@ pub(crate) fn PanelContent(
         PanelKind::Systems => rsx! { SystemsTab { editor } },
         PanelKind::Console => rsx! { ConsoleTab { editor } },
         PanelKind::Assets => rsx! { AssetsTab { editor } },
+        // A panel an editor crate registers: this editor hosts none, so a saved
+        // layout's module tab keeps its place with a note instead.
+        PanelKind::Module(panel_id) => rsx! {
+            div { class: "dock-panel-placeholder", "Module panel `{panel_id}` is not loaded." }
+        },
     }
 }
 

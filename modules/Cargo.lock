@@ -1721,6 +1721,7 @@ dependencies = [
  "miette",
  "pill_core",
  "pill_core_macros",
+ "pill_editor_core",
  "pill_engine",
  "pill_host",
  "pill_hot_scan",
@@ -2603,6 +2604,14 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
+
+[[package]]
+name = "host_module_pill_audio"
+version = "0.1.0"
+dependencies = [
+ "pill_audio",
+ "pill_engine",
+]
 
 [[package]]
 name = "host_module_pill_master_renderer"
@@ -4808,6 +4817,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_editor_core"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "pill_core",
+ "pill_core_macros",
+ "pill_engine",
+ "pill_master_renderer_data",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pill_engine"
 version = "0.1.0"
 dependencies = [
@@ -4857,6 +4880,7 @@ dependencies = [
  "pill_assets",
  "pill_core",
  "pill_csharp_bridge",
+ "pill_editor_core",
  "pill_engine",
  "pill_hot_scan",
  "pill_master_renderer",

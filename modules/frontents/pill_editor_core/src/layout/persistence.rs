@@ -128,12 +128,34 @@ fn save_to_path(model: &LayoutModel, path: PathBuf) -> Result<(), LayoutPersiste
     Ok(())
 }
 
+/// Where the editor keeps its layout: the platform's per-user state directory,
+/// so it survives temp-directory cleanup.
 fn layout_path() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    editor_state_directory()
         .join(APPLICATION_DIRECTORY)
         .join(LAYOUT_FILE)
+}
+
+/// The per-user directory editor state belongs in.
+///
+/// Windows: `%LOCALAPPDATA%`. Elsewhere: `$XDG_STATE_HOME`, or
+/// `~/.local/state` when it is unset, as the XDG base directory spec says.
+/// The temp directory is the last resort for an environment with neither.
+pub fn editor_state_directory() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data);
+        }
+    } else {
+        if let Some(state_home) = std::env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty())
+        {
+            return PathBuf::from(state_home);
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|path| !path.is_empty()) {
+            return PathBuf::from(home).join(".local").join("state");
+        }
+    }
+    std::env::temp_dir()
 }
 
 #[cfg(test)]
@@ -156,6 +178,54 @@ mod tests {
         save_to_path(&model, path.clone()).unwrap();
         let restored: LayoutModel = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(restored, model);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A layout saved before module panels existed still reads: built-in
+    /// panels keep their plain snake-case names on disk.
+    #[test]
+    fn old_layout_panel_names_still_load() {
+        use crate::layout::PanelKind;
+        assert_eq!(
+            serde_json::from_str::<PanelKind>("\"hierarchy\"").unwrap(),
+            PanelKind::Hierarchy
+        );
+        let saved = serde_json::to_string(&LayoutModel::default_editor()).unwrap();
+        assert!(saved.contains("\"scene\""), "{saved}");
+        let restored: LayoutModel = serde_json::from_str(&saved).unwrap();
+        assert!(restored.validate().is_ok());
+    }
+
+    /// A tab holding a module panel survives a save and a load, so a layout
+    /// keeps the tab while its editor crate is not loaded.
+    #[test]
+    fn module_panel_tab_round_trips_through_a_file() {
+        use crate::layout::{LayoutAction, PanelKind};
+        let directory = std::env::temp_dir().join(format!(
+            "ecs-layout-module-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("layout.json");
+        let mut model = LayoutModel::default_editor();
+        let target_tabset = model.resolved_active_tabset().unwrap();
+        model
+            .apply(LayoutAction::OpenTab {
+                panel: PanelKind::Module("x".to_string()),
+                target_tabset,
+            })
+            .unwrap();
+        save_to_path(&model, path.clone()).unwrap();
+        let restored: LayoutModel = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, model);
+        assert!(restored.validate().is_ok());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"module\": \"x\""));
         let _ = std::fs::remove_dir_all(directory);
     }
 
