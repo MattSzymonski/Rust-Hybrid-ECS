@@ -282,7 +282,7 @@ fn draw_node(
             );
         }
         PanelNode::Separator => {
-            list.push_fill(rect, look.fade(theme.border));
+            list.push_fill(rect, look.fill(theme.border));
         }
         PanelNode::Image {
             texture,
@@ -296,9 +296,17 @@ fn draw_node(
         PanelNode::Button { label, .. } => {
             draw_button(list, atlas, text, rect, theme, label, interaction, &look)
         }
-        PanelNode::Checkbox { label, checked, .. } => {
-            draw_checkbox(list, atlas, text, rect, theme, label, *checked, interaction)
-        }
+        PanelNode::Checkbox { label, checked, .. } => draw_checkbox(
+            list,
+            atlas,
+            text,
+            rect,
+            theme,
+            label,
+            *checked,
+            interaction,
+            &look,
+        ),
         PanelNode::Slider {
             label,
             value,
@@ -329,6 +337,7 @@ fn draw_node(
             *value,
             *step,
             interaction,
+            &look,
         ),
         PanelNode::TextField {
             id, text: contents, ..
@@ -342,12 +351,13 @@ fn draw_node(
             *id,
             contents,
             interaction,
+            &look,
         ),
         PanelNode::ComboBox {
             selected, options, ..
         } => {
             let shown = options.get(*selected).map(String::as_str).unwrap_or("");
-            draw_combo_box(list, atlas, text, rect, theme, shown, interaction);
+            draw_combo_box(list, atlas, text, rect, theme, shown, interaction, &look);
         }
         PanelNode::ColorField { color, .. } => {
             let swatch = Rect::new(
@@ -355,7 +365,7 @@ fn draw_node(
                 Vector2f::new(rect.min.x + 16.0, rect.max.y - 4.0),
             );
             list.push_fill(swatch, *color);
-            stroke(list, swatch, theme.border_width, theme.border);
+            stroke(list, swatch, theme.border_width, theme.border_strong);
         }
         PanelNode::Collapsing { title, open, .. } => {
             draw_collapsing(list, atlas, text, rect, theme, title, *open, interaction)
@@ -458,17 +468,17 @@ fn draw_button(
     let background = if !interaction.enabled {
         look.fill(theme.inset)
     } else if interaction.active {
-        look.fill(theme.accent)
+        look.fill(theme.button_active)
     } else if interaction.hovered {
-        look.fill(theme.accent_muted)
+        look.fill(theme.button_hover)
     } else {
-        look.fill(theme.surface)
+        look.fill(theme.button)
     };
     list.push_fill(rect, background);
     let border = if interaction.focused {
-        theme.accent
+        theme.highlight
     } else {
-        theme.border
+        theme.border_strong
     };
     look.stroke(list, rect, theme, border);
     let color = if interaction.enabled {
@@ -504,6 +514,7 @@ fn draw_checkbox(
     label: &str,
     checked: bool,
     interaction: State,
+    look: &Look<'_>,
 ) {
     let box_size = 14.0;
     let top = rect.min.y + (rect.height() - box_size) * 0.5;
@@ -512,11 +523,13 @@ fn draw_checkbox(
         Vector2f::new(box_size, box_size),
     );
     let border = if interaction.focused {
-        theme.accent
+        theme.highlight
+    } else if checked {
+        theme.check
     } else {
-        theme.border
+        theme.text_disabled
     };
-    list.push_fill(checkbox, theme.inset);
+    list.push_fill(checkbox, look.fill(theme.inset));
     if checked {
         let mark = 6.0;
         let inset = (box_size - mark) * 0.5;
@@ -526,13 +539,13 @@ fn draw_checkbox(
                 Vector2f::new(mark, mark),
             ),
             if interaction.enabled {
-                theme.accent
+                look.fade(theme.window)
             } else {
                 theme.text_disabled
             },
         );
     }
-    stroke(list, checkbox, theme.border_width, border);
+    look.stroke(list, checkbox, theme, border);
 
     let color = if interaction.enabled {
         theme.text
@@ -561,7 +574,7 @@ fn draw_slider(
     interaction: State,
 ) {
     let color = if interaction.enabled {
-        theme.text
+        theme.text_secondary
     } else {
         theme.text_disabled
     };
@@ -588,7 +601,7 @@ fn draw_slider(
         Vector2f::new(track_x0, mid - 2.0),
         Vector2f::new(track_x1, mid + 2.0),
     );
-    list.push_fill(track, theme.inset);
+    list.push_fill(track, theme.track);
     let fraction = if max > min {
         ((value - min) / (max - min)).clamp(0.0, 1.0)
     } else {
@@ -598,25 +611,23 @@ fn draw_slider(
         track.min,
         Vector2f::new(track_x0 + track.width() * fraction, track.max.y),
     );
-    list.push_fill(filled, theme.accent_muted);
+    list.push_fill(filled, theme.track_fill);
 
     let knob_x = track_x0 + track.width() * fraction;
     let knob = Rect::new(
         Vector2f::new(knob_x - 3.0, mid - 8.0),
         Vector2f::new(knob_x + 3.0, mid + 8.0),
     );
-    let knob_color = if !interaction.enabled {
-        theme.text_disabled
-    } else if interaction.active || interaction.hovered {
-        theme.accent
+    let knob_color = if interaction.enabled {
+        theme.knob
     } else {
-        theme.surface
+        theme.text_disabled
     };
     list.push_fill(knob, knob_color);
     if interaction.focused {
-        stroke(list, knob, theme.border_width, theme.accent);
+        stroke(list, knob, theme.border_width, theme.highlight);
     } else {
-        stroke(list, knob, theme.border_width, theme.border);
+        stroke(list, knob, theme.border_width, theme.track_fill);
     }
 }
 
@@ -631,9 +642,15 @@ fn draw_drag_value(
     value: f32,
     step: f32,
     interaction: State,
+    look: &Look<'_>,
 ) {
     let color = if interaction.enabled {
         theme.text
+    } else {
+        theme.text_disabled
+    };
+    let label_color = if interaction.enabled {
+        theme.text_secondary
     } else {
         theme.text_disabled
     };
@@ -649,25 +666,25 @@ fn draw_drag_value(
         ),
         &style,
         None,
-        color,
+        label_color,
     );
 
     let box_x = (rect.max.x - VALUE_BOX_WIDTH).max(rect.min.x);
     let value_box = Rect::new(Vector2f::new(box_x, rect.min.y), rect.max);
     let background = if interaction.active {
-        theme.accent_muted
+        theme.active
     } else if interaction.hovered {
-        theme.surface
+        theme.raised
     } else {
         theme.inset
     };
     list.push_fill(value_box, background);
     let border = if interaction.focused {
-        theme.accent
+        theme.highlight
     } else {
-        theme.border
+        theme.border_strong
     };
-    stroke(list, value_box, theme.border_width, border);
+    look.stroke(list, value_box, theme, border);
 
     let shown = format_value(value, step);
     let width = text.measure(&shown, &style, None).x;
@@ -700,14 +717,15 @@ fn draw_text_field(
     id: crate::widget::WidgetId,
     contents: &str,
     interaction: State,
+    look: &Look<'_>,
 ) {
-    list.push_fill(rect, theme.inset);
+    list.push_fill(rect, look.fill(theme.inset));
     let border = if interaction.focused {
-        theme.accent
+        theme.highlight
     } else {
-        theme.border
+        theme.border_strong
     };
-    stroke(list, rect, theme.border_width, border);
+    look.stroke(list, rect, theme, border);
 
     let style = label_style(theme);
     let origin = Vector2f::new(
@@ -739,7 +757,7 @@ fn draw_text_field(
                     Vector2f::new(origin.x + prefix(start), rect.min.y + 2.0),
                     Vector2f::new(origin.x + prefix(end), rect.max.y - 2.0),
                 );
-                list.push_fill(selection, theme.accent_muted);
+                list.push_fill(selection, theme.highlight_wash);
             }
             let caret_x = origin.x + prefix(clamp_to_boundary(contents, edit.cursor));
             let caret = Rect::new(
@@ -769,21 +787,22 @@ fn draw_combo_box(
     theme: &Theme,
     shown: &str,
     interaction: State,
+    look: &Look<'_>,
 ) {
     let background = if interaction.active {
-        theme.accent_muted
+        theme.active
     } else if interaction.hovered {
-        theme.surface
+        theme.raised
     } else {
-        theme.inset
+        look.fill(theme.inset)
     };
     list.push_fill(rect, background);
     let border = if interaction.focused {
-        theme.accent
+        theme.highlight
     } else {
-        theme.border
+        theme.border_strong
     };
-    stroke(list, rect, theme.border_width, border);
+    look.stroke(list, rect, theme, border);
 
     let style = label_style(theme);
     let color = if interaction.enabled {
@@ -801,6 +820,11 @@ fn draw_combo_box(
 
     // A stepped marker stands in for the arrow glyph until the icon set
     // carries one.
+    let marker_color = if interaction.enabled {
+        theme.text_muted
+    } else {
+        theme.text_disabled
+    };
     let mid = rect.min.y + rect.height() * 0.5;
     let x = rect.max.x - 12.0;
     for (index, width) in [8.0f32, 6.0, 4.0].iter().enumerate() {
@@ -810,7 +834,7 @@ fn draw_combo_box(
                 Vector2f::new(x + (8.0 - width) * 0.5, y),
                 Vector2f::new(x + (8.0 + width) * 0.5, y + 2.0),
             ),
-            color,
+            marker_color,
         );
     }
 }
@@ -830,8 +854,10 @@ fn draw_collapsing(
         rect.min,
         Vector2f::new(rect.max.x, rect.min.y + theme.item_height),
     );
-    if interaction.hovered || interaction.active {
-        list.push_fill(header, theme.surface);
+    if interaction.active {
+        list.push_fill(header, theme.active);
+    } else if interaction.hovered {
+        list.push_fill(header, theme.hover);
     }
     let marker = Rect::from_min_size(
         Vector2f::new(
@@ -846,9 +872,9 @@ fn draw_collapsing(
         marker,
         theme.border_width,
         if interaction.focused {
-            theme.accent
+            theme.highlight
         } else {
-            theme.border
+            theme.border_strong
         },
     );
     let inner = if open {
@@ -862,7 +888,7 @@ fn draw_collapsing(
             Vector2f::new(6.0, 2.0),
         )
     };
-    list.push_fill(inner, theme.text);
+    list.push_fill(inner, theme.text_muted);
 
     let style = label_style(theme);
     let origin = Vector2f::new(
@@ -890,7 +916,7 @@ fn draw_table(
     let column_width = rect.width() / columns as f32;
 
     let header = Rect::new(rect.min, Vector2f::new(rect.max.x, rect.min.y + row_height));
-    list.push_fill(header, theme.surface);
+    list.push_fill(header, theme.raised);
     for (column, title) in headers.iter().enumerate() {
         let cell = cell_rect(header, column, column_width);
         list.push_clip(cell);
@@ -902,7 +928,7 @@ fn draw_table(
             Vector2f::new(cell.min.x + 4.0, cell.min.y + 3.0),
             &style,
             None,
-            theme.text,
+            theme.text_muted,
         );
         list.pop_clip();
     }
@@ -919,9 +945,9 @@ fn draw_table(
             .map(|pointer| row_rect.contains(pointer))
             .unwrap_or(false);
         if selected == Some(index) {
-            list.push_fill(row_rect, theme.accent_muted);
+            list.push_fill(row_rect, theme.highlight_wash);
         } else if hovered {
-            list.push_fill(row_rect, theme.surface);
+            list.push_fill(row_rect, theme.hover);
         }
         for (column, cell_text) in row.iter().enumerate() {
             let cell = cell_rect(row_rect, column, column_width);
@@ -934,7 +960,7 @@ fn draw_table(
                 Vector2f::new(cell.min.x + 4.0, cell.min.y + 3.0),
                 &style,
                 None,
-                theme.text,
+                theme.text_secondary,
             );
             list.pop_clip();
         }
@@ -964,9 +990,11 @@ fn draw_tree_row(
     interaction: State,
 ) {
     if selected {
-        list.push_fill(rect, theme.accent_muted);
+        list.push_fill(rect, theme.highlight_wash);
+        let rule = Rect::new(rect.min, Vector2f::new(rect.min.x + 2.0, rect.max.y));
+        list.push_fill(rule, theme.highlight);
     } else if interaction.hovered {
-        list.push_fill(rect, theme.surface);
+        list.push_fill(rect, theme.hover);
     }
     let style = label_style(theme);
     let mut text_x = rect.min.x + 2.0;
@@ -987,9 +1015,14 @@ fn draw_tree_row(
                 Vector2f::new(2.0, 5.0),
             )
         };
-        list.push_fill(inner, theme.text);
+        list.push_fill(inner, theme.text_muted);
         text_x += 12.0;
     }
+    let label_color = if selected {
+        theme.text
+    } else {
+        theme.text_secondary
+    };
     list.push_clip(rect);
     draw_text(
         list,
@@ -1002,7 +1035,7 @@ fn draw_tree_row(
         ),
         &style,
         None,
-        theme.text,
+        label_color,
     );
     list.pop_clip();
 }
@@ -1287,12 +1320,15 @@ mod tests {
                 ui.button("Bake");
             },
         );
-        let accent = Theme::default().accent;
+        let held = Theme::default().button_active;
         let pressed_fill = list
             .vertices
             .chunks_exact(4)
-            .any(|quad| quad[0].color == accent);
-        assert!(pressed_fill, "the held button is filled with the accent");
+            .any(|quad| quad[0].color == held);
+        assert!(
+            pressed_fill,
+            "the held button is filled with the pressed fill"
+        );
     }
 
     #[test]
@@ -1323,11 +1359,11 @@ mod tests {
                 ui.table("table", &["a"], &[&["1"], &["2"]]);
             },
         );
-        let surface = Theme::default().surface;
+        let hover = Theme::default().hover;
         let highlighted = list
             .vertices
             .chunks_exact(4)
-            .any(|quad: &[UiVertex]| quad[0].color == surface);
+            .any(|quad: &[UiVertex]| quad[0].color == hover);
         assert!(highlighted, "the hovered row is highlighted");
     }
 

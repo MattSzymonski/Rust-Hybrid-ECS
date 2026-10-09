@@ -1,32 +1,48 @@
 /* The built-in theme, as a stylesheet (plan decision D7).
  *
- * This is the shell's default sheet: `Theme::default()`'s values, expressed
- * in the CSS subset for everything painting currently honours - container
- * and button fills, text colour and metrics, separators, borders, outlines
- * and opacity. Load it with
- * `Stylesheet::parse(include_str!("../assets/default.css"))`; a UI with no
- * sheet at all falls back to the same values in code, and a project's
- * editor sheet loads after this one to override it.
+ * The shell's default sheet: it implements the approved Stage 10 design
+ * (W-0004 v4) - a dark neutral-grey scale with one red item highlight - for
+ * everything painting takes from computed styles: container gaps, text,
+ * buttons, separators, and the boxes of checkboxes, text fields and combo
+ * boxes, including their hover, focus and disabled states.
  *
- * The widget internals that keep their built-in look for now (checkbox
- * marks, slider knobs and tracks, combo-box arrows, table row highlight,
- * drag-field boxes) are not restated here; they restyle in Stage 10's
- * design pass, which reworks those widgets anyway.
+ * Load it with `Stylesheet::parse(include_str!("../assets/default.css"))`;
+ * a UI with no sheet falls back to `Theme::default()`, which mirrors these
+ * values, and a project's editor sheet loads after this one to override it.
+ *
+ * The widget internals painting draws itself - checkbox marks, slider
+ * tracks and knobs, combo arrows, table and tree highlights - take the same
+ * values through `Theme`; they are not addressable sub-parts of the subset.
  */
 
 :root {
-    --font-size: 14px;
-    --heading-size: 18px;
+    /* surfaces */
+    --bg-window: rgb(20, 20, 20);
+    --bg-panel: rgb(25, 25, 25);
+    --bg-raised: rgb(31, 31, 31);
+    --bg-hover: rgb(40, 40, 40);
+    --bg-active: rgb(50, 50, 50);
+    --bg-inset: rgb(14, 14, 14);
+    /* borders */
+    --border-subtle: rgb(38, 38, 38);
+    --border-strong: rgb(56, 56, 56);
+    /* text */
+    --text: rgb(230, 230, 230);
+    --text-secondary: rgb(158, 158, 158);
+    --text-muted: rgb(116, 116, 116);
+    --text-disabled: rgb(78, 78, 78);
+    /* highlight */
+    --highlight: rgb(240, 68, 68);
+    --highlight-wash: rgba(240, 68, 68, 0.16);
+    /* buttons */
+    --button: rgb(42, 42, 42);
+    --button-hover: rgb(51, 51, 51);
+    --button-active: rgb(61, 61, 61);
+    /* type and rhythm */
+    --font-size: 13px;
+    --heading-size: 15px;
     --line-height: 18px;
     --spacing: 6px;
-    --background: rgb(31, 33, 38);
-    --surface: rgb(48, 51, 59);
-    --inset: rgb(20, 23, 26);
-    --text: rgb(222, 224, 230);
-    --text-disabled: rgb(115, 117, 128);
-    --accent: rgb(66, 133, 217);
-    --accent-muted: rgb(51, 92, 148);
-    --border: rgb(82, 87, 97);
 }
 
 row,
@@ -47,28 +63,65 @@ heading {
 }
 
 button {
-    background: var(--surface);
+    background: var(--button);
     color: var(--text);
-    border: 1px solid var(--border);
+    border: 1px solid var(--border-strong);
 }
 
 button:hover {
-    background: var(--accent-muted);
+    background: var(--button-hover);
 }
 
 button:active {
-    background: var(--accent);
+    background: var(--button-active);
 }
 
 button:focus-visible {
-    border-color: var(--accent);
+    border-color: var(--highlight);
 }
 
 button:disabled {
-    background: var(--inset);
+    background: var(--bg-inset);
     color: var(--text-disabled);
 }
 
 separator {
-    background: var(--border);
+    background: var(--border-subtle);
+}
+
+checkbox {
+    background: var(--bg-inset);
+    border: 1px solid var(--border-strong);
+}
+
+checkbox:focus-visible {
+    border-color: var(--highlight);
+}
+
+text-field {
+    background: var(--bg-inset);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+}
+
+text-field:focus-visible {
+    border-color: var(--highlight);
+}
+
+drag-value {
+    border: 1px solid var(--border-strong);
+}
+
+drag-value:focus-visible {
+    border-color: var(--highlight);
+}
+
+combo-box {
+    background: var(--bg-inset);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+}
+
+combo-box:focus-visible {
+    border-color: var(--highlight);
 }
