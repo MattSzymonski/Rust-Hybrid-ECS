@@ -22,12 +22,16 @@
 #   5. The offline cargo registry cache, so `cargo build --offline` never waits
 #      on the registry during a reload.
 #
+#   Before any step runs, the script prints this plan with everything it may
+#   install and asks once whether to include the VS Code debugging setup, so
+#   the rest of the run needs no input.
+#
 #   Every step is idempotent: already-installed tools are detected and skipped,
 #   so the script can be rerun after fixing whatever failed.
 
 # USAGE: powershell -ExecutionPolicy Bypass -File devops\setup\setup_windows_environment.ps1
-#          (no arguments)   Run every step; prompts once about the optional
-#                           VS Code debugging setup.
+#          (no arguments)   Run every step; prompts once, at the start, about
+#                           the optional VS Code debugging setup.
 
 # EXAMPLE USAGE:
 #   cd devops\setup
@@ -310,9 +314,38 @@ function Read-YesNo {
     return $answer.Trim().ToLowerInvariant() -in @('y', 'yes')
 }
 
+# Prints what each step does and what it may install, so the user knows the
+# whole plan before the one question and before anything changes.
+function Show-SetupOverview {
+    Write-Host ''
+    Write-Host 'Pill workspace environment setup (Windows)' -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'This script prepares this machine to build and run the engine. It will:'
+    Write-Host ''
+    Write-Host '  1. Rust toolchain     Install rustup and the stable MSVC toolchain'
+    Write-Host '                        (through winget, or rustup-init.exe when winget is blocked).'
+    Write-Host '  2. C++ Build Tools    Install the Visual Studio Build Tools C++ workload and the'
+    Write-Host '                        Windows 11 SDK, which the linker needs. Asks for elevation (UAC).'
+    Write-Host '  3. Smart App Control  Check that it is off. Nothing is installed: it can only be'
+    Write-Host '                        turned off by hand in Windows Security, and the script says how.'
+    Write-Host '  4. VS Code debugging  Optional. Install VS Code, the .NET 8 SDK, the dotnet-trace'
+    Write-Host '                        tool and these extensions: rust-analyzer, C/C++, C#, C# Dev Kit,'
+    Write-Host '                        Hex Editor, Even Better TOML and CodeLLDB.'
+    Write-Host '  5. Cargo cache        Download every crate dependency once (cargo fetch), so offline'
+    Write-Host '                        builds during hot reload never wait on the network.'
+    Write-Host ''
+    Write-Host 'Anything already installed is detected and skipped.'
+    Write-Host ''
+}
+
 try {
+    # --- Overview and the one question ---------------------------------------
+    # Asked before any step runs, so the rest of the setup is unattended.
+    Show-SetupOverview
+    $installVsCodeDebugging = Read-YesNo -Prompt 'Include the optional VS Code debugging setup (step 4)?' -Default $true
+    Write-Host ''
+
     # --- Preflight ---------------------------------------------------------
-    Write-Host 'Pill workspace environment setup (Windows)'
     $repoRoot = Find-RepositoryRoot
     Write-Info "repository root: $repoRoot"
 
@@ -418,9 +451,8 @@ try {
 
     # --- 4. Optional VS Code debugging setup --------------------------------
     Write-Step 'VS Code debugging setup (optional)'
-    $installVsCodeDebugging = Read-YesNo -Prompt 'Install the VS Code debugging setup and required tools?' -Default $true
     if (-not $installVsCodeDebugging) {
-        Write-Detail 'Skipping the VS Code debugging setup.'
+        Write-Detail 'Skipping the VS Code debugging setup, as chosen at the start.'
     }
     else {
         # VS Code's cppvsdbg provider is required by the native launch profiles;

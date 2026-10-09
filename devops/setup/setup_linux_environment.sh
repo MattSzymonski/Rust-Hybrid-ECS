@@ -13,7 +13,7 @@
 #       cargo run --package pill_standalone --features rendering
 #
 #   It is the Linux counterpart of setup_windows_environment.ps1 and performs
-#   the same four jobs, mapped onto this platform:
+#   the same jobs, mapped onto this platform:
 #
 #   1. System libraries. The windowed host dlopens the windowing and GPU stack
 #      at runtime and links the toolchain's shared `libstd` at load time, so a
@@ -35,20 +35,33 @@
 #      needed) and DOTNET_ROOT/PATH are exported and appended to ~/.bashrc so
 #      later shells inherit them.
 #
-#   4. Offline cargo registry. The host builds every extension and the project
+#   4. An optional VS Code debugging setup: the editor (Microsoft's .deb, on
+#      apt systems), the extensions the launch profiles and editing depend on,
+#      and the dotnet-trace global tool.
+#
+#   5. Offline cargo registry. The host builds every extension and the project
 #      with `cargo build --offline`, so a reload never waits on the registry
 #      index. That only works once every dependency - including the pinned
 #      `trait_type_map` git dependency - is already cached, so the script runs
 #      `cargo fetch` in modules/ once while it still has the network.
 #
+#   Before any step runs, the script prints this plan with everything it may
+#   install and asks once whether to include the VS Code debugging setup, so
+#   the rest of the run needs no input. Without a terminal to ask on, the
+#   optional step is skipped unless a flag selects it.
+#
 #   Like the Windows script, this one is idempotent: every step detects what is
 #   already present and does nothing.
 
-# USAGE: devops/setup/setup_linux_environment.sh [--no-fetch]
-#          (no arguments)   Prepare system packages, Rust, the .NET 8 SDK and
-#                           the offline cargo cache
-#          --no-fetch       Skip the one-time online `cargo fetch` (useful when
-#                           the cache is already warm or the network is down)
+# USAGE: devops/setup/setup_linux_environment.sh [--no-fetch] [--vscode-debugging | --no-vscode-debugging]
+#          (no arguments)          Prepare system packages, Rust, the .NET 8 SDK
+#                                  and the offline cargo cache; ask whether to
+#                                  add the VS Code debugging setup
+#          --no-fetch              Skip the one-time online `cargo fetch` (useful
+#                                  when the cache is already warm or the network
+#                                  is down)
+#          --vscode-debugging      Include the VS Code debugging setup without asking
+#          --no-vscode-debugging   Skip the VS Code debugging setup without asking
 
 # EXAMPLE USAGE:
 #   bash devops/setup/setup_linux_environment.sh
@@ -247,7 +260,87 @@ persist_dotnet_environment() {
     info "added DOTNET_ROOT/PATH to $rc_file"
 }
 
-# --- 4. Offline cargo registry ----------------------------------------------
+# --- 4. Optional VS Code debugging setup -------------------------------------
+
+# Extensions the launch profiles and day-to-day editing rely on: CodeLLDB and
+# C/C++ (gdb) debug the native host, the C# extensions attach coreclr to the
+# managed runtime. Same list as the Windows script.
+VSCODE_EXTENSIONS=(
+    rust-lang.rust-analyzer
+    ms-vscode.cpptools
+    ms-dotnettools.csharp
+    ms-dotnettools.csdevkit
+    ms-vscode.hexeditor
+    tamasfe.even-better-toml
+    vadimcn.vscode-lldb
+)
+
+# Install VS Code from Microsoft's .deb when the `code` command is missing.
+# Returns non-zero, after a warning, when it cannot be installed here, so the
+# caller skips the extensions instead of failing the whole setup.
+install_vscode() {
+    if command -v code > /dev/null 2>&1; then
+        info "VS Code already installed"
+        return 0
+    fi
+    if ! command -v apt-get > /dev/null 2>&1; then
+        warn "VS Code is not installed and apt-get is not available; install it from https://code.visualstudio.com, then re-run"
+        return 1
+    fi
+    info "installing VS Code (Microsoft's .deb package)..."
+    local package_file
+    package_file="$(mktemp --suffix=.deb)"
+    if ! curl -sSL 'https://update.code.visualstudio.com/latest/linux-deb-x64/stable' -o "$package_file" \
+        || ! as_root apt-get install -y "$package_file"; then
+        rm -f "$package_file"
+        warn "VS Code installation failed; install it from https://code.visualstudio.com, then re-run"
+        return 1
+    fi
+    rm -f "$package_file"
+    hash -r
+    info "VS Code installed"
+}
+
+# Install VS Code, its extensions and the dotnet-trace global tool, then put
+# the .NET global tools folder on PATH for later shells.
+install_vscode_debugging() {
+    if install_vscode; then
+        # Query the installed extensions once; each `code` call takes a second.
+        local installed_extensions
+        installed_extensions="$(code --list-extensions 2> /dev/null || true)"
+        local extension
+        for extension in "${VSCODE_EXTENSIONS[@]}"; do
+            if grep -qixF "$extension" <<< "$installed_extensions"; then
+                info "VS Code extension $extension already installed"
+            else
+                info "installing VS Code extension $extension..."
+                code --install-extension "$extension" > /dev/null \
+                    || warn "could not install VS Code extension $extension"
+            fi
+        done
+    fi
+
+    # `dotnet tool install` fails when the tool already exists, so check first.
+    if dotnet tool list --global 2> /dev/null | grep -q 'dotnet-trace'; then
+        info "dotnet-trace already installed"
+    else
+        info "installing dotnet-trace..."
+        dotnet tool install --global dotnet-trace
+    fi
+
+    # Global tools land in ~/.dotnet/tools, which dotnet does not put on PATH.
+    local rc_file="$HOME/.bashrc"
+    local marker="# .NET global tools, added by devops/setup/setup_linux_environment.sh"
+    if [[ ! -f "$rc_file" ]] || ! grep -qF "$marker" "$rc_file"; then
+        {
+            printf '\n%s\n' "$marker"
+            printf 'export PATH="$PATH:$HOME/.dotnet/tools"\n'
+        } >> "$rc_file"
+        info "added ~/.dotnet/tools to PATH in $rc_file"
+    fi
+}
+
+# --- 5. Offline cargo registry ----------------------------------------------
 
 fetch_cargo_dependencies() {
     info "fetching cargo dependencies (online, one-time)..."
@@ -259,8 +352,54 @@ fetch_cargo_dependencies() {
 
 FETCH=1
 
+# 1 or 0 when a flag decided the VS Code debugging setup, empty to ask.
+VSCODE_DEBUGGING=""
+
 usage() {
     sed -n 's/^# USAGE:/  /p; s/^# EXAMPLE USAGE:/  /p' "$0"
+    printf '\n'
+}
+
+# Print what each step does and what it may install, so the user knows the
+# whole plan before the one question and before anything changes.
+show_setup_overview() {
+    printf '\n%sPill workspace environment setup (Linux)%s\n\n' "$GREEN" "$NC"
+    cat << 'EOF'
+This script prepares this machine to build and run the engine. It will:
+
+  1. System packages    Install the missing build tools and runtime libraries with apt
+                        (C toolchain, pkg-config, git, Vulkan/GL, X11/Wayland, ICU,
+                        OpenSSL). Uses sudo; on other distributions it only lists them.
+  2. Rust toolchain     Install rustup and the stable toolchain into ~/.cargo.
+  3. .NET 8 SDK         Install it into ~/.dotnet and add DOTNET_ROOT and PATH to ~/.bashrc.
+  4. VS Code debugging  Optional. Install VS Code (with sudo), the dotnet-trace tool and
+                        these extensions: rust-analyzer, C/C++, C#, C# Dev Kit, Hex Editor,
+                        Even Better TOML and CodeLLDB.
+  5. Cargo cache        Download every crate dependency once (cargo fetch), so offline
+                        builds during hot reload never wait on the network.
+
+Anything already installed is detected and skipped.
+
+EOF
+}
+
+# Settle the VS Code question before any step runs: a flag wins, otherwise ask
+# on the terminal (default yes), and with no terminal to ask on, skip it.
+choose_vscode_debugging() {
+    if [[ -n "$VSCODE_DEBUGGING" ]]; then
+        return
+    fi
+    if [[ ! -t 0 ]]; then
+        VSCODE_DEBUGGING=0
+        info "no terminal to ask on; skipping the VS Code debugging setup (pass --vscode-debugging to include it)"
+        return
+    fi
+    local answer
+    read -r -p "Include the optional VS Code debugging setup (step 4)? [Y/n] " answer
+    case "${answer,,}" in
+        "" | y | yes) VSCODE_DEBUGGING=1 ;;
+        *) VSCODE_DEBUGGING=0 ;;
+    esac
     printf '\n'
 }
 
@@ -269,6 +408,8 @@ main() {
     for argument in "$@"; do
         case "$argument" in
             --no-fetch) FETCH=0 ;;
+            --vscode-debugging) VSCODE_DEBUGGING=1 ;;
+            --no-vscode-debugging) VSCODE_DEBUGGING=0 ;;
             -h | --help)
                 usage
                 exit 0
@@ -277,11 +418,19 @@ main() {
         esac
     done
 
+    show_setup_overview
+    choose_vscode_debugging
+
     info "repository root: $REPO_ROOT"
     install_system_packages
     install_rust
     install_dotnet
     persist_dotnet_environment
+    if [[ "$VSCODE_DEBUGGING" == "1" ]]; then
+        install_vscode_debugging
+    else
+        info "skipping the VS Code debugging setup"
+    fi
     if [[ "$FETCH" == "1" ]]; then
         fetch_cargo_dependencies
     fi
