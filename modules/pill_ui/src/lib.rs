@@ -28,18 +28,38 @@
 pub mod atlas;
 /// The draw list a backend consumes, and the value types it carries.
 pub mod draw;
+/// The UI Gallery: every widget, every state, every theme token.
+pub mod gallery;
 /// SVG icons, rasterized on the CPU into the atlas.
 pub mod icons;
 /// The engine's input events, kept the way UI reads them.
 pub mod input;
+/// Panel layout: `taffy` styles in, rectangles out.
+pub mod layout;
+/// Painting a laid-out panel tree into a draw list.
+pub mod paint;
+/// Immediate-mode widget building: the panel tree and the events it reports.
+pub mod panel;
 /// The UI's persistent state, as plain data.
 pub mod state;
 /// Fonts, shaping, line breaking and glyph rasterization.
 pub mod text;
+/// The built-in default theme: the tokens widgets are painted with.
+pub mod theme;
+/// Widget identity and per-widget memory.
+pub mod widget;
 
 pub use atlas::{Atlas, Region};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
+pub use gallery::ui_gallery;
 pub use icons::{IconCache, IconId};
 pub use input::UiInput;
+pub use layout::{compute, run_frame, PanelLayout};
+pub use paint::paint;
+pub use panel::{
+    ClipboardRequest, PanelBuilder, PanelInput, PanelNode, PanelOutput, PanelTree, TreeNode,
+};
 pub use state::UiState;
 pub use text::{ShapedGlyph, ShapedText, TextStyle, TextSystem};
+pub use theme::Theme;
+pub use widget::WidgetId;

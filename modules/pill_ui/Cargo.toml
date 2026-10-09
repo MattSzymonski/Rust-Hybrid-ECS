@@ -44,6 +44,10 @@ resvg = { version = "0.48", default-features = false }
 # The process locale for font matching, the same crate `cosmic-text`'s `std`
 # feature resolves; read once in `TextSystem::new`.
 sys-locale = "0.3"
+# Flex and grid layout (plan decision D6). Defaults kept - flexbox, grid,
+# block/float, calc and content sizing; nothing else in the graph uses taffy,
+# so there is no union to pin.
+taffy = "0.14"
 
 # Feature pins, in the style of `pill_core`'s pin block (plan decision D17).
 # pill_ui is a `dylib`, and its exported symbol names hash the features of
