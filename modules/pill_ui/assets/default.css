@@ -43,6 +43,9 @@
     --heading-size: 15px;
     --line-height: 18px;
     --spacing: 6px;
+    /* radii */
+    --r-tiny: 2px;
+    --r-sm: 3px;
 }
 
 row,
@@ -66,6 +69,7 @@ button {
     background: var(--button);
     color: var(--text);
     border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
 }
 
 button:hover {
@@ -92,6 +96,7 @@ separator {
 checkbox {
     background: var(--bg-inset);
     border: 1px solid var(--border-strong);
+    border-radius: var(--r-tiny);
 }
 
 checkbox:focus-visible {
@@ -102,6 +107,7 @@ text-field {
     background: var(--bg-inset);
     color: var(--text);
     border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
 }
 
 text-field:focus-visible {
@@ -110,6 +116,7 @@ text-field:focus-visible {
 
 drag-value {
     border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
 }
 
 drag-value:focus-visible {
@@ -120,6 +127,7 @@ combo-box {
     background: var(--bg-inset);
     color: var(--text);
     border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
 }
 
 combo-box:focus-visible {

@@ -4,7 +4,7 @@
 //!
 //! - [`ComputedStyle`]: what styling decided for one node - paint properties
 //!   (colours, fonts, outlines), layout properties (sizes, padding, flex)
-//!   and the accepted-but-not-yet-rendered ones (radius, shadow, z-index).
+//!   and the shape and overlay ones (radius, shadow, z-index).
 //!   `None` means "not set by CSS; the built-in theme applies".
 //! - [`apply`]: applies one matched declaration to a computed style;
 //!   [`apply_inherit`]: the `inherit` keyword; [`inherit`]: copies the
@@ -22,7 +22,7 @@ use crate::draw::Color;
 
 use super::parse::{
     AlignKind, BorderSide, BoxSizingKind, Declaration, DisplayKind, FlexDirectionKind, JustifyKind,
-    LineHeight, OverflowKind, PositionKind, TextAlign, TextOverflow, WhiteSpace,
+    LineHeight, OverflowKind, PositionKind, Shadow, TextAlign, TextOverflow, WhiteSpace,
 };
 use super::value::{Length, Sides, Size};
 
@@ -57,8 +57,9 @@ pub struct ComputedStyle {
     pub border: Sides<BorderSide>,
     /// Corner radius, kept for the rounded shader.
     pub border_radius: Option<f32>,
-    /// The shadow as written, kept; not rendered yet.
-    pub box_shadow: Option<String>,
+    /// The shadow to paint behind the node; an inset shadow is kept for the
+    /// dock layout's left rules and not drawn yet.
+    pub box_shadow: Option<Shadow>,
     /// The outline stroke: width and colour.
     pub outline: Option<(f32, Color)>,
     /// The outline's offset; negative pulls the stroke inside.
@@ -194,7 +195,7 @@ pub fn apply(style: &mut ComputedStyle, declaration: &Declaration) {
         Declaration::Margin(sides) => merge_margin(style, sides),
         Declaration::Border(sides) => merge_border(style, sides),
         Declaration::BorderRadius(radius) => style.border_radius = Some(*radius),
-        Declaration::BoxShadow(shadow) => style.box_shadow = Some(shadow.clone()),
+        Declaration::BoxShadow(shadow) => style.box_shadow = Some(*shadow),
         Declaration::Outline { width, color } => style.outline = Some((*width, *color)),
         Declaration::OutlineOffset(offset) => style.outline_offset = Some(*offset),
         Declaration::BoxSizing(sizing) => style.box_sizing = Some(*sizing),

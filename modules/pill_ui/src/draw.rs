@@ -142,7 +142,8 @@ pub enum TextureId {
 }
 
 /// One vertex: a position in logical pixels, a texture coordinate in
-/// `0.0..=1.0`, and a colour multiplied into the sampled texel.
+/// `0.0..=1.0`, a colour multiplied into the sampled texel, and the shape
+/// data the rounded-corner shader needs.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct UiVertex {
     /// Position in logical pixels, y down.
@@ -151,6 +152,12 @@ pub struct UiVertex {
     pub uv: Vector2f,
     /// The vertex colour.
     pub color: Color,
+    /// Position within the quad, `(0, 0)` at its top-left corner: the space
+    /// a backend evaluates rounded corners and soft edges in.
+    pub local: Vector2f,
+    /// The quad's shape: `[half_width, half_height, corner_radius,
+    /// edge_softness]`. Zero radius and softness is a plain rectangle.
+    pub shape: [f32; 4],
 }
 
 /// One ordered draw operation.
@@ -230,13 +237,47 @@ impl DrawList {
 
     /// A solid-coloured rectangle.
     pub fn push_fill(&mut self, rect: Rect, color: Color) {
-        self.push_quad(
+        self.push_rounded_fill(rect, color, 0.0);
+    }
+
+    /// A solid-coloured rectangle with rounded corners.
+    ///
+    /// The rounding is shape data, not extra geometry: a backend with the
+    /// rounded shader draws it directly. The radius is clamped to the
+    /// rectangle's half extent, beyond which it is a capsule.
+    pub fn push_rounded_fill(&mut self, rect: Rect, color: Color, corner_radius: f32) {
+        let shape = self.shape(rect, corner_radius, 0.0);
+        self.push_shaped_quad(
             TextureId::Solid,
             rect,
             Vector2f::ZERO,
             Vector2f::ZERO,
             color,
+            shape,
         );
+    }
+
+    /// A solid rectangle whose edge fades over `softness` pixels: full
+    /// colour `softness` inside the boundary, nothing at and beyond it - the
+    /// primitive behind `box-shadow`. `rect` is the visible outer extent.
+    pub fn push_soft_fill(&mut self, rect: Rect, color: Color, corner_radius: f32, softness: f32) {
+        let shape = self.shape(rect, corner_radius, softness);
+        self.push_shaped_quad(
+            TextureId::Solid,
+            rect,
+            Vector2f::ZERO,
+            Vector2f::ZERO,
+            color,
+            shape,
+        );
+    }
+
+    /// The shape array for a quad: half extents, clamped radius, softness.
+    fn shape(&self, rect: Rect, corner_radius: f32, softness: f32) -> [f32; 4] {
+        let half_width = rect.width() * 0.5;
+        let half_height = rect.height() * 0.5;
+        let radius = corner_radius.clamp(0.0, half_width.min(half_height));
+        [half_width, half_height, radius, softness.max(0.0)]
     }
 
     /// A rectangle textured from `rect`'s corner-to-corner UV range.
@@ -252,26 +293,52 @@ impl DrawList {
         uv_max: Vector2f,
         color: Color,
     ) {
+        let shape = self.shape(rect, 0.0, 0.0);
+        self.push_shaped_quad(texture, rect, uv_min, uv_max, color, shape);
+    }
+
+    /// The one vertex writer: appends the quad's four vertices (top-left,
+    /// top-right, bottom-right, bottom-left), its indices and the draw
+    /// command.
+    fn push_shaped_quad(
+        &mut self,
+        texture: TextureId,
+        rect: Rect,
+        uv_min: Vector2f,
+        uv_max: Vector2f,
+        color: Color,
+        shape: [f32; 4],
+    ) {
+        let width = rect.width();
+        let height = rect.height();
         let base = self.vertices.len() as u32;
         self.vertices.push(UiVertex {
             position: Vector2f::new(rect.min.x, rect.min.y),
             uv: Vector2f::new(uv_min.x, uv_min.y),
             color,
+            local: Vector2f::new(0.0, 0.0),
+            shape,
         });
         self.vertices.push(UiVertex {
             position: Vector2f::new(rect.max.x, rect.min.y),
             uv: Vector2f::new(uv_max.x, uv_min.y),
             color,
+            local: Vector2f::new(width, 0.0),
+            shape,
         });
         self.vertices.push(UiVertex {
             position: Vector2f::new(rect.max.x, rect.max.y),
             uv: Vector2f::new(uv_max.x, uv_max.y),
             color,
+            local: Vector2f::new(width, height),
+            shape,
         });
         self.vertices.push(UiVertex {
             position: Vector2f::new(rect.min.x, rect.max.y),
             uv: Vector2f::new(uv_min.x, uv_max.y),
             color,
+            local: Vector2f::new(0.0, height),
+            shape,
         });
 
         let first_index = self.indices.len() as u32;

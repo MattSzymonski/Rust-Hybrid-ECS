@@ -82,6 +82,18 @@ pub struct Theme {
     pub knob: Color,
     /// Border width for focused and outlined widgets.
     pub border_width: f32,
+
+    /// Corner radius for small parts: checkbox boxes, slider tracks.
+    pub radius_tiny: f32,
+
+    /// Corner radius for controls: buttons, input wells, combo boxes.
+    pub radius_small: f32,
+
+    /// Corner radius for panels and containers.
+    pub radius_medium: f32,
+
+    /// Corner radius for popups and menus.
+    pub radius_large: f32,
 }
 
 impl Default for Theme {
@@ -120,6 +132,10 @@ impl Default for Theme {
             track_fill: Color::rgba(143.0 / 255.0, 143.0 / 255.0, 143.0 / 255.0, 1.0),
             knob: Color::rgba(196.0 / 255.0, 196.0 / 255.0, 196.0 / 255.0, 1.0),
             border_width: 1.0,
+            radius_tiny: 2.0,
+            radius_small: 3.0,
+            radius_medium: 5.0,
+            radius_large: 6.0,
         }
     }
 }
