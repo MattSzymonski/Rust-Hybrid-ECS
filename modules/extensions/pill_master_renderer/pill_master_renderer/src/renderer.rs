@@ -14,6 +14,9 @@
 //!   passes.
 //! - Submit the frame through [`State`]: one command encoder, one wgpu render
 //!   pass per planned pass, then the present.
+//! - Draw into several surfaces from one device: the primary one the renderer
+//!   was built on, and every one attached since ([`ExtraTarget`]), each through
+//!   its own camera.
 //!
 //! # Design
 //!
@@ -23,17 +26,24 @@
 //! two comparisons and no rebuilds. Creation failures are reported and skipped
 //! rather than fatal: a shader, texture, or target that would not build is
 //! named in the log while the rest of the revision still reaches the GPU.
+//!
+//! An extra surface owns what is sized to it - its swapchain, depth buffer,
+//! offscreen targets and the pass objects bound to those targets - and its
+//! camera's uniform buffer. Rendering it swaps those into [`State`], records
+//! the frame with the same code the primary surface uses, and swaps them back;
+//! the device, the asset caches and the frame's queue are shared.
 
 #![allow(clippy::too_many_arguments)]
 
 // Standard library
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // External crates
 use pill_core::platform::Instant;
 use pill_core::{info, PillStyle};
+use pill_engine::common_components::TransformComponent;
 use pill_engine::AssetManager;
-use pill_renderer_api::RawWindowData;
+use pill_renderer_api::{CameraComponent, RawWindowData, SurfaceId, SurfaceOptions};
 
 // Current crate
 use crate::{
@@ -109,6 +119,37 @@ pub struct Renderer {
     /// The frame's instances in queue order, as uploaded. Kept between frames
     /// so its allocation is reused.
     queued_instances: Vec<Instance>,
+    /// Whether the primary surface may present this frame (the frontend's
+    /// pacing; see [`PillRenderer::set_surface_ready`]).
+    primary_ready: bool,
+    /// Every surface attached after the primary one, by surface id.
+    extra_targets: BTreeMap<u32, ExtraTarget>,
+}
+
+/// One surface attached after the primary one, and everything sized to it.
+///
+/// Swapped into [`State`] while it renders: `surface`, `depth_texture` and
+/// `offscreen` trade places with the state's own, so the chain is built and
+/// recorded by exactly the code the primary surface uses.
+struct ExtraTarget {
+    /// The surface's swapchain.
+    surface: Surface,
+    /// Its depth buffer, sized to it.
+    depth_texture: RendererTexture,
+    /// Its offscreen targets, sized to it.
+    offscreen: HashMap<String, RendererTexture>,
+    /// The chain's pass objects bound to this surface's targets.
+    pipeline: ScriptableRenderingPipeline,
+    /// The uniform buffer its camera is uploaded to.
+    camera: RendererCameraHandle,
+    /// The region drawn to, or `None` for the whole surface.
+    viewport: Option<RenderViewport>,
+    /// Whether the surface is zero-sized.
+    minimized: bool,
+    /// Whether the surface may present this frame.
+    ready: bool,
+    /// Whether a frame has been presented to it, for the one-time line.
+    presented: bool,
 }
 
 impl Renderer {
@@ -168,8 +209,77 @@ impl Renderer {
             pipeline: ScriptableRenderingPipeline::new(),
             metrics: RenderMetrics::default(),
             queued_instances: Vec::new(),
+            primary_ready: true,
+            extra_targets: BTreeMap::new(),
         })
     }
+
+    /// Render one extra surface through `view`, with the queue and instances
+    /// the primary surface already prepared for this frame.
+    ///
+    /// Swaps the target's surface-sized objects into [`State`] for the length
+    /// of the call and swaps them back whatever the outcome, so the state is
+    /// the primary surface's again when this returns.
+    fn render_extra_target(
+        &mut self,
+        id: u32,
+        frame: &RenderFrame,
+        assets_manager: &AssetManager,
+        render_queue: &[crate::render_queue::RenderQueueItem],
+        view: (CameraComponent, TransformComponent),
+    ) -> Result<()> {
+        let Renderer {
+            state,
+            rendering_resources_manager,
+            extra_targets,
+            queued_instances,
+            ..
+        } = self;
+        let Some(target) = extra_targets.get_mut(&id) else {
+            return Ok(());
+        };
+        swap_target_into_state(state, target);
+        target.pipeline.ensure(
+            &frame.passes,
+            assets_manager,
+            frame.chain_generation,
+            rendering_resources_manager.chain_context(state),
+        );
+        let plan = target.pipeline.plan(
+            &frame.passes,
+            render_queue,
+            rendering_resources_manager.shader_handles(),
+        );
+        let outcome = state.render(
+            target.camera,
+            &plan,
+            target.pipeline.passes(),
+            frame,
+            (&view.0, &view.1),
+            queued_instances,
+            target.viewport,
+        );
+        drop(plan);
+        swap_target_into_state(state, target);
+        if outcome.is_ok() && !target.presented {
+            target.presented = true;
+            info!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "[render] surface {id} first frame presented"
+            );
+        }
+        outcome
+    }
+}
+
+/// Trade an extra target's surface-sized objects with the state's own.
+///
+/// Called twice per extra surface per frame: once to make the state draw into
+/// the target, once to restore it.
+fn swap_target_into_state(state: &mut State, target: &mut ExtraTarget) {
+    std::mem::swap(&mut state.surface, &mut target.surface);
+    std::mem::swap(&mut state.depth_texture, &mut target.depth_texture);
+    std::mem::swap(&mut state.offscreen, &mut target.offscreen);
 }
 
 impl Drop for Renderer {
@@ -235,7 +345,23 @@ impl PillRenderer for Renderer {
         frame: &RenderFrame,
         assets_manager: &AssetManager,
     ) -> Result<FrameOutcome> {
-        if self.minimized || !frame.has_camera {
+        // Every surface that draws this frame: the primary one through the
+        // frame's chosen camera, each extra one through the camera resolved for
+        // it. A surface that is minimized, has no camera, or may not present
+        // yet is left out.
+        let primary_drawn = !self.minimized && frame.has_camera && self.primary_ready;
+        let extra_views: Vec<(u32, (CameraComponent, TransformComponent))> = self
+            .extra_targets
+            .iter()
+            .filter(|(_, target)| !target.minimized && target.ready)
+            .filter_map(|(id, _)| {
+                frame
+                    .surface_views
+                    .get(id)
+                    .map(|view| (*id, (view.camera, view.transform)))
+            })
+            .collect();
+        if !primary_drawn && extra_views.is_empty() {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
@@ -287,15 +413,34 @@ impl PillRenderer for Renderer {
         drop(plan_zone);
 
         let submitted = Instant::now();
-        let _submit_zone = pill_core::profile_scope!("renderer: submit");
-        self.state.render(
-            self.camera,
-            &plan,
-            self.pipeline.passes(),
-            frame,
-            &self.queued_instances,
-            self.viewport,
-        )?;
+        let submit_zone = pill_core::profile_scope!("renderer: submit");
+        if primary_drawn {
+            self.state.render(
+                self.camera,
+                &plan,
+                self.pipeline.passes(),
+                frame,
+                (&frame.camera, &frame.camera_transform),
+                &self.queued_instances,
+                self.viewport,
+            )?;
+        }
+        drop(plan);
+        drop(submit_zone);
+        // The extra surfaces, each with the queue and instances built above.
+        for (id, view) in extra_views {
+            let _extra_zone = pill_core::profile_scope!("renderer: extra surface");
+            if let Err(error) =
+                self.render_extra_target(id, frame, assets_manager, &render_queue, view)
+            {
+                // One surface failing - a lost swapchain on a window that is
+                // closing - never stops the others from drawing.
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "surface {id} was not drawn: {error}"
+                );
+            }
+        }
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
         Ok(FrameOutcome::Presented)
     }
@@ -306,6 +451,147 @@ impl PillRenderer for Renderer {
         // reaches the bind groups that reference the old ones.
         self.rendering_resources_manager.invalidate();
         self.pipeline.invalidate();
+        for target in self.extra_targets.values_mut() {
+            target.pipeline.invalidate();
+        }
+    }
+
+    unsafe fn attach_surface(
+        &mut self,
+        id: SurfaceId,
+        window: RawWindowData,
+        width: u32,
+        height: u32,
+        options: SurfaceOptions,
+    ) -> Result<()> {
+        if id == SurfaceId::PRIMARY {
+            return Err(RendererError::UnsupportedSurface {
+                detail: "surface 0 is the window the renderer was built on".to_string(),
+            });
+        }
+        // SAFETY: the window outlives the surface, which is this function's
+        // own contract with its caller.
+        let surface = unsafe {
+            Surface::create_additional(
+                &self.state.instance,
+                &self.state.adapter,
+                &self.state.device,
+                window,
+                width,
+                height,
+                self.state.surface.format(),
+                options.present,
+            )
+        }?;
+        let depth_texture = RendererTexture::new_depth_texture(
+            &self.state.device,
+            surface.configuration(),
+            "depth_texture",
+        )?;
+        let camera = self
+            .state
+            .renderer_resource_storage
+            .cameras
+            .insert(RendererCamera::new(
+                &self.state.device,
+                self.state.camera_bind_group_layout.clone(),
+            )?);
+        let target = ExtraTarget {
+            surface,
+            depth_texture,
+            offscreen: HashMap::new(),
+            pipeline: ScriptableRenderingPipeline::new(),
+            camera,
+            viewport: None,
+            minimized: width == 0 || height == 0,
+            ready: true,
+            presented: false,
+        };
+        if let Some(replaced) = self.extra_targets.insert(id.0, target) {
+            self.state
+                .renderer_resource_storage
+                .cameras
+                .remove(replaced.camera);
+        }
+        info!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "surface {} attached ({width}x{height})", id.0
+        );
+        Ok(())
+    }
+
+    fn detach_surface(&mut self, id: SurfaceId) {
+        let Some(target) = self.extra_targets.remove(&id.0) else {
+            return;
+        };
+        // Wait for the GPU before the swapchain goes: a frame still in flight
+        // may be presenting into it.
+        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait) {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "the GPU did not go idle before surface {} was released: {error}", id.0
+            );
+        }
+        self.state
+            .renderer_resource_storage
+            .cameras
+            .remove(target.camera);
+        drop(target);
+        info!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "surface {} detached", id.0
+        );
+    }
+
+    fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
+        if id == SurfaceId::PRIMARY {
+            self.resize(width, height);
+            return;
+        }
+        let Some(target) = self.extra_targets.get_mut(&id.0) else {
+            return;
+        };
+        target.minimized = width == 0 || height == 0;
+        if target.minimized {
+            return;
+        }
+        let resized = target
+            .surface
+            .resize(&self.state.device, width, height)
+            .and_then(|()| {
+                RendererTexture::new_depth_texture(
+                    &self.state.device,
+                    target.surface.configuration(),
+                    "depth_texture",
+                )
+            });
+        match resized {
+            Ok(depth_texture) => {
+                target.depth_texture = depth_texture;
+                target.offscreen.clear();
+                target.pipeline.invalidate_targets();
+            }
+            Err(error) => pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "surface {} resize to {width}x{height} failed: {error}", id.0
+            ),
+        }
+    }
+
+    fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
+        if id == SurfaceId::PRIMARY {
+            self.viewport = viewport;
+        } else if let Some(target) = self.extra_targets.get_mut(&id.0) {
+            target.viewport = viewport;
+        }
+    }
+
+    fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
+        if id == SurfaceId::PRIMARY {
+            self.primary_ready = ready;
+        } else if let Some(target) = self.extra_targets.get_mut(&id.0) {
+            target.ready = ready;
+        }
     }
 }
 
@@ -345,6 +631,10 @@ pub struct State {
     frames_since_gpu_report: u32,
     /// Layout every camera bind group is built from.
     pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
+    /// The instance the surfaces were created from; an extra surface needs it.
+    pub(crate) instance: wgpu::Instance,
+    /// The adapter the device runs on; an extra surface is checked against it.
+    pub(crate) adapter: wgpu::Adapter,
 }
 
 impl State {
@@ -353,7 +643,8 @@ impl State {
     /// As [`Surface::create`]: `window` must outlive the state.
     async unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
         // SAFETY: forwarded from this function's own contract.
-        let (surface, device, queue) = unsafe { Surface::create(window, width, height) }.await?;
+        let (surface, device, queue, instance, adapter) =
+            unsafe { Surface::create(window, width, height) }.await?;
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let depth_texture =
             RendererTexture::new_depth_texture(&device, surface.configuration(), "depth_texture")?;
@@ -393,6 +684,8 @@ impl State {
             gpu_profiler,
             frames_since_gpu_report: 0,
             camera_bind_group_layout,
+            instance,
+            adapter,
         })
     }
 
@@ -467,6 +760,7 @@ impl State {
         plan: &[PassPlan],
         passes: &[PassSlot],
         frame: &RenderFrame,
+        (view_camera, view_transform): (&CameraComponent, &TransformComponent),
         instances: &[Instance],
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
@@ -506,8 +800,8 @@ impl State {
             .unwrap_or_else(|| RenderViewport::full(width, height));
         camera.update(
             &self.queue,
-            &frame.camera,
-            &frame.camera_transform,
+            view_camera,
+            view_transform,
             viewport.width as f32 / viewport.height as f32,
         );
         let camera = self

@@ -12,6 +12,8 @@
 //!   the viewport a frontend points a renderer at - and register them through
 //!   [`register_contract_components`].
 //! - Carry a window across to a renderer as plain data ([`RawWindowData`]).
+//! - Let one renderer draw into several surfaces, each through its own camera
+//!   ([`SurfaceId`], [`SurfaceCameras`]).
 //!
 //! # Design
 //!
@@ -41,6 +43,9 @@ pub mod frame;
 /// A window's platform handles as plain data, for attaching a renderer to it.
 pub mod raw_window;
 
+/// Several surfaces per renderer: identities, presentation, camera bindings.
+pub mod surface;
+
 // Current crate
 pub use api::{
     AttachFuture, FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
@@ -51,3 +56,7 @@ pub use frame::{
     CullMode, MaterialParameter, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
 };
 pub use raw_window::{RawWindowData, RawWindowKind};
+pub use surface::{
+    resolve_camera_binding, CameraBinding, PresentPreference, SurfaceCameras, SurfaceId,
+    SurfaceOptions, SurfaceView,
+};

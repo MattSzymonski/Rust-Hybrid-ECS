@@ -17,6 +17,7 @@
 //! drawn with.
 
 // Standard library
+use std::collections::BTreeMap;
 use std::future::Future;
 
 // External crates
@@ -24,7 +25,8 @@ use pill_core::info;
 use pill_core::telemetry::telemetry_target;
 use pill_engine::{Engine, InputEvent, RumbleRequest, World};
 use pill_renderer_api::{
-    AttachFuture, PillRenderer, RawWindowData, RenderFrame, RenderViewport, RendererError,
+    AttachFuture, CameraBinding, PillRenderer, RawWindowData, RenderFrame, RenderViewport,
+    RendererError, SurfaceId, SurfaceOptions,
 };
 
 // Current crate
@@ -55,6 +57,27 @@ pub struct AttachedRenderer {
     /// Whether a frame with draw calls has been presented, for the one-time
     /// first-frame line.
     presented_scene: bool,
+    /// Every surface attached after the primary window, by surface id: the
+    /// window kept alive for it, and what re-attaching it to a new backend
+    /// takes. Declared after `renderer`, so the backend drops first.
+    extra_surfaces: BTreeMap<u32, ExtraSurface>,
+}
+
+/// One surface attached after the primary window.
+struct ExtraSurface {
+    /// The frontend window the surface draws on, held only to keep it alive
+    /// while the backend draws on it; never read.
+    _window: AttachedWindow,
+    /// The window's handles as data, for re-attaching to another backend.
+    window_data: RawWindowData,
+    /// The surface size last handed to the backend.
+    size: (u32, u32),
+    /// The region drawn to, or `None` for the whole surface.
+    viewport: Option<RenderViewport>,
+    /// How the surface presents.
+    options: SurfaceOptions,
+    /// Whether the surface may present (the frontend's pacing).
+    ready: bool,
 }
 
 impl AttachedRenderer {
@@ -78,6 +101,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
+            extra_surfaces: BTreeMap::new(),
         })
     }
 
@@ -106,6 +130,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
+            extra_surfaces: BTreeMap::new(),
         })
     }
 
@@ -167,12 +192,149 @@ impl AttachedRenderer {
         self.window_data = window_data;
         self.surface_size = (width, height);
         self.renderer.set_viewport(self.viewport);
+        self.reattach_extra_surfaces();
     }
 
-    /// Replace the backend on the same window, keeping the viewport.
+    /// Replace the backend on the same window, keeping the viewport and every
+    /// extra surface.
     pub fn replace_backend(&mut self, renderer: Box<dyn PillRenderer>) {
         self.renderer = renderer;
         self.renderer.set_viewport(self.viewport);
+        self.reattach_extra_surfaces();
+    }
+
+    /// Attach every extra surface to the current backend again, with its size,
+    /// viewport and pacing - after the backend was replaced (a renderer reload)
+    /// or retargeted.
+    ///
+    /// A surface the new backend refuses is kept and reported: its window is
+    /// still open, and the next replacement tries again.
+    fn reattach_extra_surfaces(&mut self) {
+        for (id, surface) in &self.extra_surfaces {
+            // SAFETY: the surface's window is kept alive in `extra_surfaces`
+            // until the surface is detached or this renderer is dropped, and
+            // the backend - declared first - drops before it either way.
+            let attached = unsafe {
+                self.renderer.attach_surface(
+                    SurfaceId(*id),
+                    surface.window_data,
+                    surface.size.0,
+                    surface.size.1,
+                    surface.options,
+                )
+            };
+            match attached {
+                Ok(()) => {
+                    self.renderer
+                        .set_surface_viewport(SurfaceId(*id), surface.viewport);
+                    self.renderer
+                        .set_surface_ready(SurfaceId(*id), surface.ready);
+                    info!(
+                        target: telemetry_target::RENDERING,
+                        "surface {id} reattached to the new renderer"
+                    );
+                }
+                Err(error) => pill_core::warn!(
+                    target: telemetry_target::RENDERING,
+                    "surface {id} could not be reattached to the new renderer: {error}"
+                ),
+            }
+        }
+    }
+
+    /// Draw into another window as surface `id`, sized `width` by `height`
+    /// physical pixels; the window is kept alive until [`Self::detach_surface`].
+    ///
+    /// Which camera draws into it comes from the world's
+    /// [`pill_renderer_api::SurfaceCameras`]; a surface with no binding stays
+    /// empty.
+    ///
+    /// A backend that draws one surface only - the placeholder a development
+    /// host holds while its renderer module builds or reloads - leaves the
+    /// surface pending rather than refused: it is kept, and attached to the
+    /// next backend that replaces this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RendererError`] when the window cannot give its handles or
+    /// the backend refuses the surface for another reason.
+    pub fn attach_surface<W: RendererWindow>(
+        &mut self,
+        id: SurfaceId,
+        window: W,
+        width: u32,
+        height: u32,
+        options: SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        let window_data = RawWindowData::from_window(&window)?;
+        // SAFETY: the window is stored in `extra_surfaces` below and kept until
+        // the surface is detached or this renderer is dropped; the backend,
+        // declared first, drops before it.
+        let attached = unsafe {
+            self.renderer
+                .attach_surface(id, window_data, width, height, options)
+        };
+        match attached {
+            Ok(()) => {}
+            Err(RendererError::UnsupportedSurface { detail }) => info!(
+                target: telemetry_target::RENDERING,
+                "surface {} waits for a renderer that draws more surfaces ({detail})", id.0
+            ),
+            Err(error) => return Err(error),
+        }
+        self.extra_surfaces.insert(
+            id.0,
+            ExtraSurface {
+                _window: Box::new(window),
+                window_data,
+                size: (width, height),
+                viewport: None,
+                options,
+                ready: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// Stop drawing into surface `id`, then release its window.
+    pub fn detach_surface(&mut self, id: SurfaceId) {
+        // The backend's surface first, then the window it was built on.
+        self.renderer.detach_surface(id);
+        self.extra_surfaces.remove(&id.0);
+    }
+
+    /// Forward a physical resize of surface `id`.
+    pub fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
+        if let Some(surface) = self.extra_surfaces.get_mut(&id.0) {
+            surface.size = (width, height);
+            self.renderer.resize_surface(id, width, height);
+            self.renderer.set_surface_viewport(id, surface.viewport);
+        }
+    }
+
+    /// Restrict drawing to a region of surface `id`; `None` draws all of it.
+    pub fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
+        if let Some(surface) = self.extra_surfaces.get_mut(&id.0) {
+            surface.viewport = viewport;
+            self.renderer.set_surface_viewport(id, viewport);
+        }
+    }
+
+    /// Whether surface `id` may present on the next frame; see
+    /// [`PillRenderer::set_surface_ready`]. Applies to the primary surface too.
+    pub fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
+        if let Some(surface) = self.extra_surfaces.get_mut(&id.0) {
+            surface.ready = ready;
+        }
+        self.renderer.set_surface_ready(id, ready);
+    }
+
+    /// The ids of the surfaces attached after the primary window.
+    pub fn extra_surface_ids(&self) -> Vec<SurfaceId> {
+        self.extra_surfaces
+            .keys()
+            .map(|id| SurfaceId(*id))
+            .collect()
     }
 
     /// Drop the backend and draw nothing until another one replaces it.
@@ -349,6 +511,38 @@ impl FrameDriver for RenderingRuntime {
 
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest> {
         self.engine_mut().take_rumble_requests()
+    }
+
+    fn attach_surface<W: RendererWindow>(
+        &mut self,
+        id: SurfaceId,
+        window: W,
+        width: u32,
+        height: u32,
+        options: SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        self.display
+            .attach_surface(id, window, width, height, options)
+    }
+
+    fn detach_surface(&mut self, id: SurfaceId) {
+        self.display.detach_surface(id);
+    }
+
+    fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
+        self.display.resize_surface(id, width, height);
+    }
+
+    fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
+        self.display.set_surface_viewport(id, viewport);
+    }
+
+    fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
+        self.display.set_surface_ready(id, ready);
+    }
+
+    fn set_surface_camera(&mut self, id: SurfaceId, binding: Option<CameraBinding>) {
+        crate::runtime::set_surface_camera(self.engine_mut().world_mut(), id, binding);
     }
 }
 

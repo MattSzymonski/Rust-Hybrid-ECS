@@ -49,8 +49,12 @@ mod telemetry;
 
 /// The renderer contract's types that appear in this crate's API
 /// ([`FrameDriver`], the windowed runtime), re-exported for frontends.
-pub use pill_renderer_api::{RenderViewport, RendererError};
-pub use runtime::{run_one_frame, setup, FrameDriver, FrameReport, Runtime};
+pub use pill_engine::common_components::TransformComponent;
+pub use pill_renderer_api::{
+    CameraBinding, CameraComponent, PresentPreference, RenderViewport, RendererError, SurfaceId,
+    SurfaceOptions,
+};
+pub use runtime::{run_one_frame, set_surface_camera, setup, FrameDriver, FrameReport, Runtime};
 pub use static_project::{
     ProjectBackend, StaticLogging, StaticModule, StaticProject, StaticProjectBackend,
     StaticRenderer, StaticRendererAttachFn,

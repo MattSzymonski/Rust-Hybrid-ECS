@@ -208,7 +208,11 @@ pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
-    time: Res<pill_engine::Time>,
+    // One parameter, because a system takes at most six.
+    (time, surface_cameras): (
+        Res<pill_engine::Time>,
+        Res<pill_renderer_api::SurfaceCameras>,
+    ),
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
     mut objects: Query<(&TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
@@ -246,17 +250,49 @@ pub fn rendering_system(
         frame.seconds += frame.delta_seconds;
     }
     frame.instances.clear();
+    let world_cameras: Vec<(Entity, CameraComponent, TransformComponent)> = cameras
+        .iter_mut()
+        .map(|(entity, transform, camera)| (entity, *camera, *transform))
+        .collect();
     // The camera is picked out of every enabled one; see [`pick_camera`] for
-    // what happens when several are enabled at once.
-    let selected = pick_camera(
-        cameras
-            .iter_mut()
-            .map(|(entity, transform, camera)| (entity.id(), *camera, *transform)),
-    );
+    // what happens when several are enabled at once. A binding for the primary
+    // surface overrides that choice.
+    let bindings = surface_cameras.get();
+    let primary_binding = bindings.and_then(|bindings| {
+        bindings
+            .bindings
+            .get(&pill_renderer_api::SurfaceId::PRIMARY.0)
+    });
+    let selected = match primary_binding {
+        Some(binding) => {
+            pill_renderer_api::resolve_camera_binding(binding, world_cameras.iter().copied())
+                .map(|view| (view.camera, view.transform))
+        }
+        None => pick_camera(
+            world_cameras
+                .iter()
+                .map(|(entity, camera, transform)| (entity.id(), *camera, *transform)),
+        ),
+    };
     frame.has_camera = selected.is_some();
     if let Some((camera, transform)) = selected {
         frame.camera = camera;
         frame.camera_transform = transform;
+    }
+    // Every other surface's camera, resolved from its binding; a surface whose
+    // binding resolves to nothing is left out, and draws nothing.
+    frame.surface_views.clear();
+    if let Some(bindings) = bindings {
+        for (surface, binding) in &bindings.bindings {
+            if *surface == pill_renderer_api::SurfaceId::PRIMARY.0 {
+                continue;
+            }
+            if let Some(view) =
+                pill_renderer_api::resolve_camera_binding(binding, world_cameras.iter().copied())
+            {
+                frame.surface_views.insert(*surface, view);
+            }
+        }
     }
 
     // The last mesh and material pair resolved, with the draw order it gave

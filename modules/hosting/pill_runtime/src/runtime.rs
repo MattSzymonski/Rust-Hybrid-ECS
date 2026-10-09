@@ -25,8 +25,10 @@ use pill_core::error::{ConfigError, EngineMessage, HostError};
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info};
-use pill_engine::{Engine, InputEvent, RumbleRequest};
-use pill_renderer_api::RenderViewport;
+use pill_engine::{Engine, InputEvent, RumbleRequest, World};
+use pill_renderer_api::{CameraBinding, RenderViewport, SurfaceCameras, SurfaceId};
+#[cfg(feature = "rendering")]
+use pill_renderer_api::{RendererError, SurfaceOptions};
 
 // Current crate
 use crate::StaticProject;
@@ -86,6 +88,60 @@ pub trait FrameDriver {
     /// Take the rumble requests the last frame's systems queued, for the
     /// frontend that owns the gamepads to play.
     fn take_rumble_requests(&mut self) -> Vec<RumbleRequest>;
+
+    #[cfg(feature = "rendering")]
+    /// Draw into another window as surface `id`; see
+    /// [`crate::AttachedRenderer::attach_surface`]. A driver without a
+    /// renderer refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RendererError`] when the driver draws no window, the window
+    /// cannot give its handles, or the renderer refuses the surface.
+    fn attach_surface<W: crate::RendererWindow>(
+        &mut self,
+        id: SurfaceId,
+        window: W,
+        width: u32,
+        height: u32,
+        options: SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        let _ = (window, width, height, options);
+        Err(RendererError::UnsupportedSurface {
+            detail: format!("surface {} (this driver draws no window)", id.0),
+        })
+    }
+
+    /// Stop drawing into surface `id`; nothing to do without a renderer.
+    fn detach_surface(&mut self, _id: SurfaceId) {}
+
+    /// Forward a physical resize of surface `id`; nothing to do without one.
+    fn resize_surface(&mut self, _id: SurfaceId, _width: u32, _height: u32) {}
+
+    /// Restrict drawing to a region of surface `id`; nothing to do without one.
+    fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
+
+    /// Whether surface `id` may present on the next frame (the frontend's
+    /// pacing); nothing to do without a renderer.
+    fn set_surface_ready(&mut self, _id: SurfaceId, _ready: bool) {}
+
+    /// Bind the camera surface `id` draws through, or remove its binding with
+    /// `None`; see [`pill_renderer_api::SurfaceCameras`].
+    fn set_surface_camera(&mut self, _id: SurfaceId, _binding: Option<CameraBinding>) {}
+}
+
+/// Write `binding` for surface `id` into the world's
+/// [`pill_renderer_api::SurfaceCameras`], creating the resource on first use.
+///
+/// Shared by every driver with a renderer, so the binding lives where the
+/// rendering system reads it.
+pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<CameraBinding>) {
+    if world.get_resource::<SurfaceCameras>().is_none() {
+        world.insert_resource(SurfaceCameras::default());
+    }
+    if let Some(cameras) = world.get_resource_mut::<SurfaceCameras>() {
+        cameras.set(id, binding);
+    }
 }
 
 /// The engine and the frame state every build needs.

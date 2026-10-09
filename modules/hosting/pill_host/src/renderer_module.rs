@@ -364,6 +364,45 @@ impl PillRenderer for ModuleRenderer {
     fn invalidate_assets(&mut self) {
         self.backend_mut().invalidate_assets();
     }
+
+    // Every method of the contract is forwarded, defaulted ones included: a
+    // method left out here would silently run the trait's default instead of
+    // the module's renderer.
+
+    unsafe fn attach_surface(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        window: pill_renderer_api::RawWindowData,
+        width: u32,
+        height: u32,
+        options: pill_renderer_api::SurfaceOptions,
+    ) -> Result<(), RendererError> {
+        // SAFETY: forwarded from this method's own contract.
+        unsafe {
+            self.backend_mut()
+                .attach_surface(id, window, width, height, options)
+        }
+    }
+
+    fn detach_surface(&mut self, id: pill_renderer_api::SurfaceId) {
+        self.backend_mut().detach_surface(id);
+    }
+
+    fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
+        self.backend_mut().resize_surface(id, width, height);
+    }
+
+    fn set_surface_viewport(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        viewport: Option<RenderViewport>,
+    ) {
+        self.backend_mut().set_surface_viewport(id, viewport);
+    }
+
+    fn set_surface_ready(&mut self, id: pill_renderer_api::SurfaceId, ready: bool) {
+        self.backend_mut().set_surface_ready(id, ready);
+    }
 }
 
 impl Drop for ModuleRenderer {

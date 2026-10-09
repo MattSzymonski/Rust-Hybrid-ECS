@@ -7,6 +7,9 @@
 //!   the window, attach the renderer, forward resize and redraw events.
 //! - Feed a windowed run's input to the engine: keyboard and mouse from winit,
 //!   gamepads polled before each frame, and rumble played after it.
+//! - In a development build, open a second window as a second renderer
+//!   surface on request (`PILL_SECOND_VIEW=1`), the multi-surface test
+//!   frontend ([`SecondView`]).
 //!
 //! # Design
 //!
@@ -68,7 +71,35 @@ struct WindowedApplication {
     setup_error: Option<RunError>,
     /// The gamepads, polled before every frame.
     gamepads: Gamepads,
+    /// The second window, when `PILL_SECOND_VIEW=1` asked for one.
+    #[cfg(feature = "dev")]
+    second_view: Option<SecondView>,
 }
+
+/// Environment variable that opens a second window drawn as surface 1.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+const SECOND_VIEW_ENVIRONMENT_VARIABLE: &str = "PILL_SECOND_VIEW";
+
+/// Environment variable that closes the second window after that many seconds.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+const SECOND_VIEW_SECONDS_ENVIRONMENT_VARIABLE: &str = "PILL_SECOND_VIEW_SECONDS";
+
+/// The second renderer surface: a test and development frontend for drawing
+/// one scene through two cameras in two windows.
+///
+/// Its camera is plain data - the scene seen from higher up and further back -
+/// so it needs nothing in the project's world.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+struct SecondView {
+    /// The second window, kept alive while surface 1 draws on it.
+    window: Arc<Window>,
+    /// When to close it, if `PILL_SECOND_VIEW_SECONDS` asked.
+    close_at: Option<pill_core::platform::Instant>,
+}
+
+/// The second view's surface id.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+const SECOND_VIEW_SURFACE: pill_runtime::SurfaceId = pill_runtime::SurfaceId(1);
 
 #[cfg(feature = "rendering")]
 impl ApplicationHandler for WindowedApplication {
@@ -126,6 +157,8 @@ impl ApplicationHandler for WindowedApplication {
                 self.host = Some(host);
                 self.window = Some(window);
                 self.present_first_frame_and_reveal(event_loop);
+                #[cfg(feature = "dev")]
+                self.open_second_view_if_requested(event_loop);
             }
             Err(error) => {
                 report_failure("renderer attachment", &error);
@@ -139,9 +172,20 @@ impl ApplicationHandler for WindowedApplication {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(feature = "dev")]
+        if self
+            .second_view
+            .as_ref()
+            .is_some_and(|view| view.window.id() == window_id)
+        {
+            self.second_view_event(event);
+            return;
+        }
+        #[cfg(not(feature = "dev"))]
+        let _ = window_id;
         if let (Some(input), Some(host)) = (translate_window_event(&event), &mut self.host) {
             host.push_input(input);
         }
@@ -176,6 +220,103 @@ impl ApplicationHandler for WindowedApplication {
             host.push_input(input);
         }
     }
+}
+
+#[cfg(all(feature = "rendering", feature = "dev"))]
+impl WindowedApplication {
+    /// Open the second window as surface 1 when `PILL_SECOND_VIEW=1`, with a
+    /// camera of its own; a failure is reported and the run goes on without it.
+    fn open_second_view_if_requested(&mut self, event_loop: &ActiveEventLoop) {
+        if std::env::var(SECOND_VIEW_ENVIRONMENT_VARIABLE).as_deref() != Ok("1") {
+            return;
+        }
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        let attributes = Window::default_attributes()
+            .with_title(format!("{} - second view", self.project.name))
+            .with_inner_size(winit::dpi::LogicalSize::new(640.0, 400.0));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(source) => {
+                report_failure("second view window creation", &source);
+                return;
+            }
+        };
+        let size = window.inner_size();
+        if let Err(error) = host.attach_surface(
+            SECOND_VIEW_SURFACE,
+            Arc::clone(&window),
+            size.width,
+            size.height,
+            pill_runtime::SurfaceOptions::default(),
+        ) {
+            report_failure("second view surface", &error);
+            return;
+        }
+        // The same scene from higher up and further back.
+        host.set_surface_camera(
+            SECOND_VIEW_SURFACE,
+            Some(pill_runtime::CameraBinding::View {
+                camera: pill_runtime::CameraComponent::default(),
+                transform: pill_runtime::TransformComponent {
+                    translation: [0.0, 3.0, 16.0],
+                    ..Default::default()
+                },
+            }),
+        );
+        let close_at = std::env::var(SECOND_VIEW_SECONDS_ENVIRONMENT_VARIABLE)
+            .ok()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .map(|seconds| {
+                pill_core::platform::Instant::now() + std::time::Duration::from_secs_f64(seconds)
+            });
+        info!(
+            target: telemetry_target::ENGINE,
+            "[second view] opened as surface {} ({}x{})",
+            SECOND_VIEW_SURFACE.0,
+            size.width,
+            size.height
+        );
+        self.second_view = Some(SecondView { window, close_at });
+    }
+
+    /// Route one event of the second window: close and resize; its redraws
+    /// ride the main window's frames.
+    fn second_view_event(&mut self, event: WindowEvent) {
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        match event {
+            WindowEvent::CloseRequested => {
+                close_second_view_of(host, &mut self.second_view, "its window was closed");
+            }
+            WindowEvent::Resized(size) => {
+                host.resize_surface(SECOND_VIEW_SURFACE, size.width, size.height);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Detach surface 1 and close its window; the main window keeps drawing.
+#[cfg(all(feature = "rendering", feature = "dev"))]
+fn close_second_view_of(
+    host: &mut posture::Windowed,
+    second_view: &mut Option<SecondView>,
+    reason: &str,
+) {
+    if second_view.is_none() {
+        return;
+    }
+    // The surface first, then the window it draws on.
+    host.detach_surface(SECOND_VIEW_SURFACE);
+    host.set_surface_camera(SECOND_VIEW_SURFACE, None);
+    *second_view = None;
+    info!(
+        target: telemetry_target::ENGINE,
+        "[second view] closed: {reason}"
+    );
 }
 
 #[cfg(feature = "rendering")]
@@ -226,6 +367,15 @@ impl WindowedApplication {
         // Step 2: Queue what the gamepads did since the last frame; keyboard
         // and mouse arrived as window events already.
         self.gamepads.poll(|input| host.push_input(input));
+        #[cfg(feature = "dev")]
+        let close_second_view = self.second_view.as_ref().is_some_and(|view| {
+            view.close_at
+                .is_some_and(|close_at| pill_core::platform::Instant::now() >= close_at)
+        });
+        #[cfg(feature = "dev")]
+        if close_second_view {
+            close_second_view_of(host, &mut self.second_view, "its time is up");
+        }
 
         // Step 3: Advance simulation and rendering by a single frame.
         match host.run_frame() {
@@ -355,6 +505,8 @@ pub fn run(project: posture::Project) -> Result<(), RunError> {
         window_shown: false,
         setup_error: None,
         gamepads: Gamepads::new(),
+        #[cfg(feature = "dev")]
+        second_view: None,
     };
 
     // Step 4: Run the event loop until the window is closed.
