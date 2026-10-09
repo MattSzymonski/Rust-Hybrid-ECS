@@ -38,6 +38,31 @@ pub struct Region {
 }
 
 // =============================================================================
+// AtlasUpdate
+// =============================================================================
+
+/// One dirty atlas region with its pixels, ready for a backend to upload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtlasRegionUpdate {
+    /// Where the pixels belong.
+    pub region: Region,
+    /// Tightly packed RGBA8 rows, `region.width * region.height * 4` bytes.
+    pub pixels: Vec<u8>,
+}
+
+/// What changed in an atlas since the last take: owned plain data a backend
+/// applies to its texture, per region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtlasUpdate {
+    /// Image width in texels.
+    pub width: u32,
+    /// Image height in texels.
+    pub height: u32,
+    /// The changed regions with their pixels, in the order they were written.
+    pub regions: Vec<AtlasRegionUpdate>,
+}
+
+// =============================================================================
 // Atlas
 // =============================================================================
 
@@ -155,6 +180,37 @@ impl Atlas {
     /// The regions written since the previous call; drains the record.
     pub fn take_updated_regions(&mut self) -> Vec<Region> {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Everything written since the previous call, pixels included, as owned
+    /// data; `None` when nothing changed.
+    ///
+    /// The same work [`Self::take_updated_regions`] describes, with the pixels
+    /// attached so the value can cross an artifact boundary - the draw lists a
+    /// game's UI builds travel to the renderer without the atlas itself.
+    pub fn take_update(&mut self) -> Option<AtlasUpdate> {
+        let regions = self.take_updated_regions();
+        if regions.is_empty() {
+            return None;
+        }
+        let stride = self.width as usize * 4;
+        let updates = regions
+            .into_iter()
+            .map(|region| {
+                let row_bytes = region.width as usize * 4;
+                let mut pixels = Vec::with_capacity(row_bytes * region.height as usize);
+                for row in 0..region.height as usize {
+                    let start = (region.y as usize + row) * stride + region.x as usize * 4;
+                    pixels.extend_from_slice(&self.pixels[start..start + row_bytes]);
+                }
+                AtlasRegionUpdate { region, pixels }
+            })
+            .collect();
+        Some(AtlasUpdate {
+            width: self.width,
+            height: self.height,
+            regions: updates,
+        })
     }
 
     /// The corner-to-corner texture coordinates of `region`, normalized to

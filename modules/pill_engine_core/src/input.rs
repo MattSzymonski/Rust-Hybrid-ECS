@@ -663,6 +663,11 @@ impl Input {
         self.keys_pressed.iter()
     }
 
+    /// Every key that came up since the previous frame.
+    pub fn keys_released(&self) -> impl Iterator<Item = KeyCode> + '_ {
+        self.keys_released.iter()
+    }
+
     // -------------------------------------------------------------------------
     // Modifiers and text
     // -------------------------------------------------------------------------

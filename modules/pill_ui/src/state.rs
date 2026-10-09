@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 // External crates
-use pill_engine::Resource;
+use pill_engine_core::Resource;
 
 // Current crate
 use crate::draw::Rect;

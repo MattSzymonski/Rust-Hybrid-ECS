@@ -28,7 +28,9 @@ use std::collections::HashMap;
 // External crates
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
-use pill_ui::{Atlas, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiVertex};
+use pill_ui::{
+    Atlas, AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiVertex,
+};
 use wgpu::util::DeviceExt;
 
 // =============================================================================
@@ -89,13 +91,19 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var coverage = 1.0;
     let radius = in.shape.z;
     let softness = in.shape.w;
+    // The signed distance to the rounded rectangle's edge, from the
+    // interpolated quad-local position and the shape's half extents. Both
+    // this and the derivative below are evaluated in uniform control flow:
+    // WGSL requires `fwidth` to stay outside of non-uniform branches (the
+    // WebGL2 backend rejects the shader otherwise), while native backends
+    // happen to tolerate it.
+    let half = in.shape.xy;
+    let point = in.local - half;
+    let offset = abs(point) - half + vec2<f32>(radius);
+    let distance =
+        length(max(offset, vec2<f32>(0.0))) + min(max(offset.x, offset.y), 0.0) - radius;
+    let edge_width = max(fwidth(distance), 0.0001);
     if (radius > 0.0 || softness > 0.0) {
-        // The signed distance to the rounded rectangle's edge, from the
-        // interpolated quad-local position and the shape's half extents.
-        let half = in.shape.xy;
-        let point = in.local - half;
-        let offset = abs(point) - half + vec2<f32>(radius);
-        let distance = length(max(offset, vec2<f32>(0.0))) + min(max(offset.x, offset.y), 0.0) - radius;
         if (softness > 0.0) {
             // A soft shape (a shadow): full `softness` pixels inside the
             // edge, nothing at and beyond it.
@@ -103,8 +111,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             coverage = falloff * falloff * (3.0 - 2.0 * falloff);
         } else {
             // A rounded fill: antialias the one-pixel boundary.
-            let aa = max(fwidth(distance), 0.0001);
-            coverage = 1.0 - smoothstep(0.0, aa, distance);
+            coverage = 1.0 - smoothstep(0.0, edge_width, distance);
         }
     }
     // Both the sampled texel and the vertex colour are linear light already;
@@ -428,6 +435,25 @@ impl UiRenderer {
         }
     }
 
+    /// Upload the regions of an [`AtlasUpdate`] - the same texture
+    /// [`Self::upload_atlas`] feeds, for a caller that received the atlas's
+    /// changes as owned data across an artifact boundary.
+    pub fn apply_atlas_update(&mut self, queue: &wgpu::Queue, update: &AtlasUpdate) {
+        assert_eq!(
+            (update.width, update.height),
+            self.atlas_size,
+            "the atlas update is {}x{} but this renderer was built for {}x{}",
+            update.width,
+            update.height,
+            self.atlas_size.0,
+            self.atlas_size.1
+        );
+        self.atlas_uploaded = true;
+        for entry in &update.regions {
+            upload_region_pixels(queue, &self.atlas_texture, entry.region, &entry.pixels);
+        }
+    }
+
     /// Register (or replace) the external texture `id` samples.
     ///
     /// `rgba` is `size.0 * size.1 * 4` bytes of sRGB-encoded RGBA8, the same
@@ -495,6 +521,7 @@ impl UiRenderer {
     /// target first (the colour is converted from sRGB to linear the way a
     /// clear value must be); `None` loads whatever is already there, for a UI
     /// pass drawn over a scene.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -652,6 +679,11 @@ fn upload_atlas_region(
         let start = (region.y as usize + row) * atlas_stride + region.x as usize * 4;
         rows.extend_from_slice(&atlas.pixels()[start..start + row_bytes]);
     }
+    upload_region_pixels(queue, texture, region, &rows);
+}
+
+/// Upload one region's tightly packed RGBA8 rows to the atlas texture.
+fn upload_region_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, region: Region, rows: &[u8]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -663,7 +695,7 @@ fn upload_atlas_region(
             },
             aspect: wgpu::TextureAspect::All,
         },
-        &rows,
+        rows,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(region.width * 4),

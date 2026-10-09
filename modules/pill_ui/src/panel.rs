@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 
 // External crates
 use pill_core::math::{Vector2f, Vector3f};
-use pill_engine::{KeyCode, MouseButton};
+use pill_engine_core::{KeyCode, MouseButton};
 
 // Current crate
 use crate::draw::{Color, Rect, TextureId};
@@ -57,7 +57,7 @@ const SCROLL_LINE_HEIGHT: f32 = 24.0;
 ///
 /// `pill_ui` never calls a platform API (plan decision D28): the shell
 /// fulfils these after the frame, and pasted text re-enters through
-/// [`InputEvent::TextInput`](pill_engine::InputEvent) in a later frame,
+/// [`InputEvent::TextInput`](pill_engine_core::InputEvent) in a later frame,
 /// where the focused text field consumes it like typed text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardRequest {
@@ -1542,7 +1542,7 @@ mod tests {
     use super::*;
     use crate::draw::Rect;
     use crate::widget::WidgetId;
-    use pill_engine::{ButtonState, InputEvent};
+    use pill_engine_core::{ButtonState, InputEvent};
 
     /// A test rectangle at the origin, big enough to click.
     fn rect_at(y: f32) -> Rect {
@@ -1734,7 +1734,7 @@ mod tests {
                 key(KeyCode::Tab, ButtonState::Pressed),
                 key(KeyCode::Tab, ButtonState::Released),
                 InputEvent::ModifiersChanged {
-                    modifiers: pill_engine::Modifiers {
+                    modifiers: pill_engine_core::Modifiers {
                         shift: true,
                         ..Default::default()
                     },
@@ -1792,7 +1792,7 @@ mod tests {
         state.hit_rects.insert(id, rect_at(0.0));
         state.set_focus(id);
 
-        let ctrl = pill_engine::Modifiers {
+        let ctrl = pill_engine_core::Modifiers {
             control: true,
             ..Default::default()
         };

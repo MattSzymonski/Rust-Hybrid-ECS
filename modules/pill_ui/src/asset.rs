@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 // External crates
-use pill_engine::{Asset, AssetLoadError, AssetLoadResult, ImportedAsset};
+use pill_engine_core::{Asset, AssetLoadError, AssetLoadResult, ImportedAsset};
 use serde::{Deserialize, Serialize};
 
 /// The bytes of one stylesheet file.
@@ -141,12 +141,12 @@ mod tests {
 
     #[test]
     fn the_world_registers_the_css_extension() {
-        use pill_engine::world::World;
+        use pill_engine_core::world::World;
 
         let mut world = World::new();
         world.register_imported_asset::<StylesheetAsset>();
         let registry = world
-            .get_resource::<pill_engine::asset_import_registry::ImportRegistry>()
+            .get_resource::<pill_engine_core::asset_import_registry::ImportRegistry>()
             .expect("the registry is a world resource");
         assert_eq!(
             registry.type_for_extension("css"),

@@ -28,10 +28,15 @@
 pub mod asset;
 /// The shared texture atlas holding rasterized glyphs and icons.
 pub mod atlas;
+/// The game's UI context: the resource projects build immediate-mode UI
+/// through, with input routing and the per-frame output.
+pub mod context;
 /// The CSS subset: stylesheets, selectors, values and computed styles.
 pub mod css;
 /// The draw list a backend consumes, and the value types it carries.
 pub mod draw;
+/// A frame of UI output: draw lists per surface and the atlas changes.
+pub mod frame;
 /// The UI Gallery: every widget, every state, every theme token.
 pub mod gallery;
 /// SVG icons, rasterized on the CPU into the atlas.
@@ -54,9 +59,11 @@ pub mod theme;
 pub mod widget;
 
 pub use asset::StylesheetAsset;
-pub use atlas::{Atlas, Region};
+pub use atlas::{Atlas, AtlasRegionUpdate, AtlasUpdate, Region};
+pub use context::UiContext;
 pub use css::{ComputedStyle, NodeFacts, Stylesheet};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
+pub use frame::{UiDraw, UiFrame};
 pub use gallery::ui_gallery;
 pub use icons::{bundled_svg, IconCache, IconId, EDITOR_ICONS};
 pub use input::UiInput;

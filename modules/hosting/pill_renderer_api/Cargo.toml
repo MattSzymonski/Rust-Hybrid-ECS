@@ -21,6 +21,11 @@ pill_core = { path = "../../pill_core" }
 # `#[engine_error]`, which expands to the `thiserror` and `miette` derives below.
 pill_core_macros = { path = "../../pill_core_macros" }
 pill_engine = { path = "../../pill_engine" }
+# The UI draw lists the frame carries (plan decision: the frame carries UI
+# draw lists per surface, Stage 12). A shared `dylib`, like `pill_core`, so
+# the lists are one type identity across every artifact that builds or draws
+# them.
+pill_ui = { path = "../../pill_ui" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

@@ -23,7 +23,16 @@ crate-type = ["rlib", "dylib"]
 
 [dependencies]
 pill_core = { path = "../pill_core" }
-pill_engine = { path = "../pill_engine" }
+# The engine's core, not the `pill_engine` facade: the core is a shared
+# `dylib` (like `pill_core`), while the facade is an `rlib` compiled into
+# every artifact. Embedding the facade in this DLL made every binary that
+# links `pill_ui.dll` *and* the facade rlib (frontends, projects) fail
+# rustc's dependency-format check - "cannot satisfy dependencies so
+# `pill_engine` only shows up once" - because the one valid double-reliance
+# is a dylib relied on by two users, not a statically embedded copy. Every
+# type used here (`Input`, `InputEvent`, `Asset`, `World`, ...) is the
+# core's, re-exported by the facade under the same paths.
+pill_engine_core = { path = "../pill_engine_core" }
 # Text shaping, line breaking and rasterization (plan decision D6). Defaults
 # off: the crate's `fontconfig`/`sys-locale` defaults serve its own automatic
 # FontSystem setup, which `pill_ui` replaces with its own font database (the
