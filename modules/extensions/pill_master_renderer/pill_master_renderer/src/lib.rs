@@ -51,6 +51,9 @@ pub mod instance;
 /// The frame's chain as GPU objects: a pass pipeline each, and the plan a frame is recorded from.
 mod pipeline;
 
+/// Debug drawing, selection outlines and picking, drawn over each surface.
+mod overlay;
+
 /// The query sets and readbacks behind GPU profiling measurements.
 pub mod profiler;
 

@@ -144,6 +144,27 @@ pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<Came
     }
 }
 
+/// Insert the debug-drawing and picking resources into `world`, each only
+/// where it is missing.
+///
+/// Every build has them (D14): debug drawing on in the development host, and
+/// in a shipping or web build as its project settings say. A system toggles
+/// it at runtime through [`pill_engine::DebugDraw::set_enabled`].
+pub fn insert_debug_resources(world: &mut World, debug_draw_enabled: bool) {
+    if !world.has_resource::<pill_engine::DebugDraw>() {
+        world.insert_resource(pill_engine::DebugDraw::new(debug_draw_enabled));
+    }
+    if !world.has_resource::<pill_renderer_api::SelectionOutlines>() {
+        world.insert_resource(pill_renderer_api::SelectionOutlines::default());
+    }
+    if !world.has_resource::<pill_renderer_api::PickRequests>() {
+        world.insert_resource(pill_renderer_api::PickRequests::default());
+    }
+    if !world.has_resource::<pill_renderer_api::PickResults>() {
+        world.insert_resource(pill_renderer_api::PickResults::default());
+    }
+}
+
 /// The engine and the frame state every build needs.
 pub struct Runtime {
     /// Boxed so its address stays stable when the runtime moves: the
@@ -371,6 +392,7 @@ impl FrameDriver for Runtime {
 /// path, so the first failure is fatal.
 pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
     let mut runtime = Runtime::new();
+    insert_debug_resources(runtime.engine_mut().world_mut(), project.debug_draw);
 
     // The project's log levels, baked into the bundle from its settings file,
     // before anything is logged on its behalf.
@@ -467,6 +489,7 @@ mod tests {
             renderer: None,
             asset_pack: None,
             logging: crate::StaticLogging::NONE,
+            debug_draw: false,
         })
         .expect("it starts");
         assert!(run_one_frame(&mut runtime).is_none());

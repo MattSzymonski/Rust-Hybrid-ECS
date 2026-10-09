@@ -51,10 +51,13 @@ mod telemetry;
 /// ([`FrameDriver`], the windowed runtime), re-exported for frontends.
 pub use pill_engine::common_components::TransformComponent;
 pub use pill_renderer_api::{
-    CameraBinding, CameraComponent, PresentPreference, RenderViewport, RendererError, SurfaceId,
-    SurfaceOptions,
+    CameraBinding, CameraComponent, PickHit, PickRequests, PickResults, PresentPreference,
+    RenderViewport, RendererError, SelectionOutlines, SurfaceId, SurfaceOptions,
 };
-pub use runtime::{run_one_frame, set_surface_camera, setup, FrameDriver, FrameReport, Runtime};
+pub use runtime::{
+    insert_debug_resources, run_one_frame, set_surface_camera, setup, FrameDriver, FrameReport,
+    Runtime,
+};
 pub use static_project::{
     ProjectBackend, StaticLogging, StaticModule, StaticProject, StaticProjectBackend,
     StaticRenderer, StaticRendererAttachFn,

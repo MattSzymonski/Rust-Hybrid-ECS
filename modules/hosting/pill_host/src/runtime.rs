@@ -893,6 +893,8 @@ impl RenderingHost {
             self.report_unsupported_render_data(data_extension.as_deref());
         }
         self.display.render(self.host.runtime.engine().world())?;
+        self.display
+            .deliver_pick_results(self.host.runtime.engine_mut().world_mut());
         Ok(report)
     }
 
@@ -1109,6 +1111,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // address does not change when the runtime moves.
     let mut runtime = Runtime::new();
     runtime.engine_mut().set_parallel_execution(true);
+    // Debug drawing is always on in the development host (D14); the
+    // settings' `debug_draw:` key is what a shipping build starts with.
+    pill_runtime::insert_debug_resources(runtime.engine_mut().world_mut(), true);
     let engine_api = EngineApi::new(runtime.engine_mut());
 
     // Step 3b: Announce every module this start builds, in build order: the

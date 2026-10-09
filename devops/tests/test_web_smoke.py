@@ -32,12 +32,18 @@ DESCRIPTION
     The shipping bundle the build regenerates is restored afterwards, so the
     tree is left as it was found.
 
+    `--project` builds another project instead; its input is not checked,
+    because the logged reactions are the default project's. `--save-capture`
+    keeps the last canvas capture as a PNG, for a look at what was drawn.
+
 USAGE
   python devops/tests/test_web_smoke.py [--timeout-scale N] [--seconds N]
+      [--project PATH] [--save-capture FILE]
 
 EXAMPLE USAGE
   python devops/tests/test_web_smoke.py
   python devops/tests/test_web_smoke.py --timeout-scale 2 --seconds 20
+  python devops/tests/test_web_smoke.py --project examples/circus_demo --save-capture local/temp/web.png
 
 --- SCRIPT ---
 """
@@ -71,9 +77,9 @@ from core.suite_common import run_suite_with_timing  # noqa: E402
 # Constants
 # =============================================================================
 
-# The project built for the browser, and where its web build lands.
+# The project built for the browser by default; its web build lands in the
+# project's `build/web`.
 PROJECT = "examples/master_renderer_test"
-WEB_BUILD_DIRECTORY = REPOSITORY_ROOT / PROJECT / "build" / "web"
 BUILD_SCRIPT = REPOSITORY_ROOT / "devops" / "tools" / "build_web.py"
 BUNDLE_DIRECTORY = REPOSITORY_ROOT / "build" / "pill_shipping_bundle"
 
@@ -268,8 +274,12 @@ def scene_variation(png_bytes: bytes):
     return ImageStat.Stat(image).stddev[0]
 
 
-def observe_page(browser: str, url: str, seconds: float) -> tuple:
-    """Open `url` and collect console text, problems and capture variations."""
+def observe_page(browser: str, url: str, seconds: float, send_input: bool, captures: list) -> tuple:
+    """Open `url` and collect console text, problems and capture variations.
+
+    Sends the default project's input when `send_input`; every capture's PNG
+    bytes are appended to `captures`.
+    """
     console_lines = []
     problems = []
     variations = []
@@ -326,7 +336,9 @@ def observe_page(browser: str, url: str, seconds: float) -> tuple:
                 except (socket.timeout, TimeoutError):
                     continue
                 if message.get("id") in capture_requests and "result" in message:
-                    variation = scene_variation(base64.b64decode(message["result"]["data"]))
+                    png_bytes = base64.b64decode(message["result"]["data"])
+                    captures.append(png_bytes)
+                    variation = scene_variation(png_bytes)
                     if variation is not None:
                         variations.append(variation)
                 method = message.get("method")
@@ -337,7 +349,7 @@ def observe_page(browser: str, url: str, seconds: float) -> tuple:
                         for argument in message["params"]["args"]
                     )
                     console_lines.append(text)
-                    if input_due is None and FIRST_FRAME_TOKEN in text:
+                    if send_input and input_due is None and FIRST_FRAME_TOKEN in text:
                         input_due = time.monotonic() + INPUT_DELAY_SECONDS
                     if level == "error":
                         problems.append(f"console error: {text[:300]}")
@@ -351,8 +363,11 @@ def observe_page(browser: str, url: str, seconds: float) -> tuple:
     return console_lines, problems, variations
 
 
-def run_smoke_test(timeout_scale: float, seconds: float) -> int:
-    """Build, serve and open the web build, then check what it did."""
+def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capture) -> int:
+    """Build, serve and open the web build of `project`, then check what it
+    did; the last capture goes to `save_capture` when given."""
+    web_build_directory = REPOSITORY_ROOT / project / "build" / "web"
+    checks_input = project == PROJECT
     print("=" * 70)
     print("  Web Build Smoke Test")
     print("=" * 70)
@@ -363,11 +378,11 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
         return 1
 
     # Step 1: build, restoring the shipping bundle the build regenerates.
-    print(f"\n  [BUILD] build_web.py --dev {PROJECT}")
+    print(f"\n  [BUILD] build_web.py --dev {project}")
     snapshot = snapshot_bundle()
     try:
         result = subprocess.run(
-            [sys.executable, str(BUILD_SCRIPT), "--dev", PROJECT],
+            [sys.executable, str(BUILD_SCRIPT), "--dev", project],
             cwd=str(REPOSITORY_ROOT),
             capture_output=True,
             text=True,
@@ -381,16 +396,22 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
         print("  [FAIL] the web build failed:")
         print((result.stdout + result.stderr)[-3000:])
         return 1
-    print("  [OK] built " + str(WEB_BUILD_DIRECTORY))
+    print("  [OK] built " + str(web_build_directory))
 
     # Step 2: serve it and watch it run.
     print(f"\n  [RUN] {Path(browser).name}, headless with WebGPU, for {seconds:.0f} s")
-    server = serve(WEB_BUILD_DIRECTORY)
+    server = serve(web_build_directory)
+    captures = []
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}/"
-        console_lines, problems, variations = observe_page(browser, url, seconds * timeout_scale)
+        console_lines, problems, variations = observe_page(
+            browser, url, seconds * timeout_scale, checks_input, captures
+        )
     finally:
         server.shutdown()
+    if save_capture and captures:
+        Path(save_capture).write_bytes(captures[-1])
+        print(f"  [SAVED] the last capture: {save_capture}")
 
     # Step 3: judge.
     console = "\n".join(console_lines)
@@ -399,7 +420,7 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
         (PACK_TOKEN, "the embedded asset pack was not mounted"),
         (FIRST_FRAME_TOKEN, "no first frame was presented with a camera"),
         (FRAME_TOKEN, "frames did not keep running"),
-        *INPUT_TOKENS,
+        *(INPUT_TOKENS if checks_input else ()),
     ):
         if token not in console:
             failures.append(meaning)
@@ -415,7 +436,10 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
     print("  [OK] the embedded asset pack was mounted")
     print("  [OK] the first frame was presented with a camera")
     print(f"  [OK] frames kept running ({console.count(FRAME_TOKEN)} statistics report(s))")
-    print("  [OK] keyboard, wheel and mouse button input reached the game")
+    if checks_input:
+        print("  [OK] keyboard, wheel and mouse button input reached the game")
+    else:
+        print("  [SKIP] input check: it reads the default project's logs")
     print("  [OK] no engine error, WebGPU error or page exception")
     if variations:
         print(f"  [OK] a lit scene was drawn (largest variation {max(variations):.1f})")
@@ -445,8 +469,22 @@ def main() -> None:
         default=15.0,
         help="how long to watch the running page (default 15)",
     )
+    parser.add_argument(
+        "--project",
+        default=PROJECT,
+        help=f"the project to build, relative to the repository root (default {PROJECT})",
+    )
+    parser.add_argument(
+        "--save-capture",
+        default=None,
+        help="write the last canvas capture to this PNG file",
+    )
     arguments = parser.parse_args()
-    sys.exit(run_smoke_test(arguments.timeout_scale, arguments.seconds))
+    sys.exit(
+        run_smoke_test(
+            arguments.timeout_scale, arguments.seconds, arguments.project, arguments.save_capture
+        )
+    )
 
 
 if __name__ == "__main__":

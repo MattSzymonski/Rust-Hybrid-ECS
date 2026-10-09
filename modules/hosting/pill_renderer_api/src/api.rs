@@ -224,6 +224,16 @@ pub trait PillRenderer {
     /// is skipped rather than waited on. Every surface starts ready; this
     /// applies to the primary surface too.
     fn set_surface_ready(&mut self, _id: SurfaceId, _ready: bool) {}
+
+    /// Take the answers to every pick the GPU has finished since the last call.
+    ///
+    /// A pick is answered frames after it was asked, never by stalling the
+    /// frame that asked; the frontend writes what this returns into the
+    /// world's [`crate::PickResults`]. The default answers nothing: a renderer
+    /// without a pick buffer.
+    fn take_pick_results(&mut self) -> Vec<crate::PickResult> {
+        Vec::new()
+    }
 }
 
 /// Stub renderer for frontends that run without a GPU surface.

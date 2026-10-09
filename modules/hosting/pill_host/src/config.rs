@@ -654,6 +654,11 @@ pub struct HostConfig {
     /// frontend applies over the engine's defaults once the project is read.
     pub logging: pill_runtime::LoggingSettings,
 
+    /// The settings' `debug_draw:` key: whether a shipping or web build of
+    /// the project starts with debug drawing on (`false` when absent). The
+    /// development host always draws.
+    pub shipping_debug_draw: bool,
+
     /// The project's `res` directory, which asset paths are relative to;
     /// `None` when the configuration was not read from a project directory.
     pub asset_directory: Option<PathBuf>,
@@ -877,6 +882,7 @@ impl HostConfig {
             renderer,
             assets: project_settings.assets,
             logging,
+            shipping_debug_draw: project_settings.debug_draw.unwrap_or(false),
             asset_directory: Some(project_root.join(PROJECT_ASSET_DIRECTORY)),
         })
     }
@@ -1053,6 +1059,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             renderer: None,
             assets: ProjectAssetSettings::default(),
             logging: pill_runtime::LoggingSettings::default(),
+            shipping_debug_draw: false,
             asset_directory: None,
         }
     }
@@ -1546,6 +1553,9 @@ struct ProjectSettingsFile {
     assets: ProjectAssetSettings,
     /// Log levels over the engine's defaults.
     logging: ProjectLoggingSettings,
+    /// Whether a shipping or web build starts with debug drawing on; the
+    /// development host always draws.
+    debug_draw: Option<bool>,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.

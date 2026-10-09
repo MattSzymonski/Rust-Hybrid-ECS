@@ -256,6 +256,11 @@ impl MeshDrawer {
         }
     }
 
+    /// The buffer the frame's instances were uploaded into, in queue order.
+    pub fn instance_buffer(&self) -> &wgpu::Buffer {
+        &self.instance_buffer
+    }
+
     fn allocate(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),

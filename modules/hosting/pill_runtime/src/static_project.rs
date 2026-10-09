@@ -170,6 +170,9 @@ pub struct StaticProject {
     /// The `logging:` section of the project's settings, as the bundle
     /// generator validated it; [`StaticLogging::NONE`] for none.
     pub logging: StaticLogging,
+    /// Whether debug drawing starts on: the settings' `debug_draw:` key,
+    /// `false` when absent. A system can still switch it at runtime.
+    pub debug_draw: bool,
 }
 
 /// A project's logging settings, compiled into the binary as text.
@@ -408,6 +411,7 @@ mod tests {
             renderer: None,
             asset_pack: None,
             logging: StaticLogging::NONE,
+            debug_draw: false,
         };
         project.initialize(&mut engine).expect("both succeed");
 
@@ -437,6 +441,7 @@ mod tests {
             renderer: None,
             asset_pack: None,
             logging: StaticLogging::NONE,
+            debug_draw: false,
         };
         let Err(error) = project.initialize(&mut engine) else {
             panic!("a non-zero module status must be reported");
@@ -460,6 +465,7 @@ mod tests {
             renderer: None,
             asset_pack: None,
             logging: StaticLogging::NONE,
+            debug_draw: false,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
         assert!(guard.is_none());
@@ -489,6 +495,7 @@ mod tests {
             renderer: None,
             asset_pack: None,
             logging: StaticLogging::NONE,
+            debug_draw: false,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
 

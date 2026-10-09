@@ -3,3 +3,7 @@
 # Project shaders elsewhere in the repository are their own to manage, which is
 # why this rule is scoped to this crate instead of being a top-level `*.wgsl`.
 src/shaders/*.wgsl
+
+# Hand-written WGSL the overlay pass embeds with `include_str!`; nothing cooks
+# these, so they are tracked.
+!src/overlay/*.wgsl
