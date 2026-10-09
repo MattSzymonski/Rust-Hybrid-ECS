@@ -21,10 +21,10 @@ through `layout::compute`/`run_frame`; `sheet.clear_cache()` after a reload
 
 The two sheets shipped today:
 
-- `assets/default.css` - the built-in theme restated in the subset (plan
-  decision D7): same values as `Theme::default()`, exactly. A UI with no
-  sheet falls back to the code's values; a project sheet loads after this
-  one and overrides it.
+- `assets/default.css` - the built-in theme in the subset (plan decision
+  D7): the approved Stage 10 design (W-0004 v4), the same values as
+  `Theme::default()`, exactly. A UI with no sheet falls back to the code's
+  values; a project sheet loads after this one and overrides it.
 - `assets/editor_dock.css` - the native port of the old web editor's
   `dock_layout.css` (`modules/frontents/pill_editor/assets`). It parses with
   zero reports.
