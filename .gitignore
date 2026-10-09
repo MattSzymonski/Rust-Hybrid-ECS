@@ -96,6 +96,9 @@ performance_benchmarks/cache/artifacts/
 # Local developer notes
 local/
 
+# The construction site's data (its own local-only git repository)
+.construction_site/
+
 # Copilot instructions (generated)
 .github/copilot-instructions.md
 
