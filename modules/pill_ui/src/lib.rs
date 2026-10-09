@@ -58,7 +58,7 @@ pub use atlas::{Atlas, Region};
 pub use css::{ComputedStyle, NodeFacts, Stylesheet};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 pub use gallery::ui_gallery;
-pub use icons::{IconCache, IconId};
+pub use icons::{bundled_svg, IconCache, IconId, EDITOR_ICONS};
 pub use input::UiInput;
 pub use layout::{compute, run_frame, PanelLayout};
 pub use paint::paint;

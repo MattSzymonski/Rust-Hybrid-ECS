@@ -5,6 +5,9 @@
 //! - [`IconCache`]: rasterizes SVG icon sources through resvg into the shared
 //!   [`Atlas`], one region per (icon, revision, pixel length), and
 //!   re-rasterizes when the caller's revision moves - the asset reloaded.
+//! - [`EDITOR_ICONS`] / [`bundled_svg`]: the bundled editor icon set, the
+//!   curated Phosphor subset (MIT; see `THIRD_PARTY_NOTICES.md`), white so a
+//!   draw's vertex colour tints it.
 //! - A parsing or rasterization failure is logged and draws nothing; it never
 //!   panics.
 //!
@@ -146,6 +149,139 @@ impl IconCache {
 }
 
 // =============================================================================
+// The bundled editor icon set
+// =============================================================================
+
+/// The bundled editor icons: the curated Phosphor subset (regular weight,
+/// MIT), white so a draw tints them with its vertex colour. Names are stable;
+/// consumers choose their own [`IconId`] for caching.
+pub static EDITOR_ICONS: &[(&str, &[u8])] = &[
+    (
+        "arrow-counter-clockwise",
+        include_bytes!("../assets/icons/arrow-counter-clockwise.svg"),
+    ),
+    (
+        "arrows-clockwise",
+        include_bytes!("../assets/icons/arrows-clockwise.svg"),
+    ),
+    (
+        "arrows-out",
+        include_bytes!("../assets/icons/arrows-out.svg"),
+    ),
+    (
+        "arrows-out-cardinal",
+        include_bytes!("../assets/icons/arrows-out-cardinal.svg"),
+    ),
+    ("bug", include_bytes!("../assets/icons/bug.svg")),
+    (
+        "caret-down",
+        include_bytes!("../assets/icons/caret-down.svg"),
+    ),
+    (
+        "caret-left",
+        include_bytes!("../assets/icons/caret-left.svg"),
+    ),
+    (
+        "caret-right",
+        include_bytes!("../assets/icons/caret-right.svg"),
+    ),
+    ("caret-up", include_bytes!("../assets/icons/caret-up.svg")),
+    ("check", include_bytes!("../assets/icons/check.svg")),
+    (
+        "check-circle",
+        include_bytes!("../assets/icons/check-circle.svg"),
+    ),
+    ("copy", include_bytes!("../assets/icons/copy.svg")),
+    ("cube", include_bytes!("../assets/icons/cube.svg")),
+    ("cursor", include_bytes!("../assets/icons/cursor.svg")),
+    (
+        "dots-three",
+        include_bytes!("../assets/icons/dots-three.svg"),
+    ),
+    (
+        "dots-three-outline",
+        include_bytes!("../assets/icons/dots-three-outline.svg"),
+    ),
+    (
+        "download-simple",
+        include_bytes!("../assets/icons/download-simple.svg"),
+    ),
+    ("export", include_bytes!("../assets/icons/export.svg")),
+    ("eye", include_bytes!("../assets/icons/eye.svg")),
+    ("eye-slash", include_bytes!("../assets/icons/eye-slash.svg")),
+    ("file", include_bytes!("../assets/icons/file.svg")),
+    ("file-code", include_bytes!("../assets/icons/file-code.svg")),
+    ("file-text", include_bytes!("../assets/icons/file-text.svg")),
+    (
+        "floppy-disk",
+        include_bytes!("../assets/icons/floppy-disk.svg"),
+    ),
+    ("folder", include_bytes!("../assets/icons/folder.svg")),
+    (
+        "folder-open",
+        include_bytes!("../assets/icons/folder-open.svg"),
+    ),
+    ("gear", include_bytes!("../assets/icons/gear.svg")),
+    ("grid-four", include_bytes!("../assets/icons/grid-four.svg")),
+    ("image", include_bytes!("../assets/icons/image.svg")),
+    ("info", include_bytes!("../assets/icons/info.svg")),
+    ("lightbulb", include_bytes!("../assets/icons/lightbulb.svg")),
+    ("list", include_bytes!("../assets/icons/list.svg")),
+    ("lock", include_bytes!("../assets/icons/lock.svg")),
+    ("lock-open", include_bytes!("../assets/icons/lock-open.svg")),
+    ("magnet", include_bytes!("../assets/icons/magnet.svg")),
+    (
+        "magnifying-glass",
+        include_bytes!("../assets/icons/magnifying-glass.svg"),
+    ),
+    ("minus", include_bytes!("../assets/icons/minus.svg")),
+    (
+        "paint-brush",
+        include_bytes!("../assets/icons/paint-brush.svg"),
+    ),
+    ("palette", include_bytes!("../assets/icons/palette.svg")),
+    ("pause", include_bytes!("../assets/icons/pause.svg")),
+    ("play", include_bytes!("../assets/icons/play.svg")),
+    ("plus", include_bytes!("../assets/icons/plus.svg")),
+    ("question", include_bytes!("../assets/icons/question.svg")),
+    (
+        "sliders-horizontal",
+        include_bytes!("../assets/icons/sliders-horizontal.svg"),
+    ),
+    ("sparkle", include_bytes!("../assets/icons/sparkle.svg")),
+    ("stop", include_bytes!("../assets/icons/stop.svg")),
+    ("sun", include_bytes!("../assets/icons/sun.svg")),
+    (
+        "terminal-window",
+        include_bytes!("../assets/icons/terminal-window.svg"),
+    ),
+    ("trash", include_bytes!("../assets/icons/trash.svg")),
+    (
+        "tree-structure",
+        include_bytes!("../assets/icons/tree-structure.svg"),
+    ),
+    (
+        "upload-simple",
+        include_bytes!("../assets/icons/upload-simple.svg"),
+    ),
+    ("warning", include_bytes!("../assets/icons/warning.svg")),
+    (
+        "warning-circle",
+        include_bytes!("../assets/icons/warning-circle.svg"),
+    ),
+    ("x", include_bytes!("../assets/icons/x.svg")),
+    ("x-circle", include_bytes!("../assets/icons/x-circle.svg")),
+];
+
+/// The SVG source of a bundled icon, by name.
+pub fn bundled_svg(name: &str) -> Option<&'static [u8]> {
+    EDITOR_ICONS
+        .iter()
+        .find(|(bundled_name, _)| *bundled_name == name)
+        .map(|(_, source)| *source)
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -255,5 +391,48 @@ mod tests {
             None
         );
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn every_bundled_icon_is_named_once_and_not_empty() {
+        let mut names: Vec<&str> = EDITOR_ICONS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), EDITOR_ICONS.len(), "icon names are unique");
+        assert!(EDITOR_ICONS.len() >= 40, "the editor set stays curated");
+        for (name, svg) in EDITOR_ICONS {
+            assert!(!name.is_empty());
+            assert!(!svg.is_empty(), "{name} has bytes");
+        }
+        assert!(bundled_svg("caret-down").is_some());
+        assert!(bundled_svg("not-an-icon").is_none());
+    }
+
+    #[test]
+    fn every_bundled_icon_rasterizes_its_own_texels_at_every_scale() {
+        // 100/125/150/200% monitor scales rasterize the 16 px icon to
+        // exactly 16/20/24/32 physical pixels: each scale gets its own crisp
+        // texels rather than an upscaled bitmap (the mixed-DPI contract).
+        let mut atlas = Atlas::new(1024, 1024);
+        let mut cache = IconCache::new();
+        for (index, (name, svg)) in EDITOR_ICONS.iter().enumerate() {
+            for scale in [1.0f32, 1.25, 1.5, 2.0] {
+                let expected = (16.0 * scale).round() as u32;
+                let region = cache
+                    .icon(&mut atlas, IconId(index as u64), 0, svg, 16.0, scale)
+                    .unwrap_or_else(|| panic!("{name} must rasterize at {scale}"));
+                assert_eq!(region.width, expected, "{name} at {scale}");
+                assert_eq!(region.height, expected, "{name} at {scale}");
+                let mut has_ink = false;
+                for y in 0..region.height {
+                    let row = (region.y as usize + y as usize) * atlas.width() as usize;
+                    for x in 0..region.width {
+                        let alpha = atlas.pixels()[(row + region.x as usize + x as usize) * 4 + 3];
+                        has_ink |= alpha > 0;
+                    }
+                }
+                assert!(has_ink, "{name} at {scale} draws something");
+            }
+        }
     }
 }
