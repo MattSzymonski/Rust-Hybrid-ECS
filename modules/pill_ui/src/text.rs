@@ -10,7 +10,7 @@
 //!
 //! # Design
 //!
-//! Font resolution starts from the bundled Open Sans (SIL OFL 1.1; the
+//! Font resolution starts from the bundled Geist (SIL OFL 1.1; the
 //! licence ships beside it and in `THIRD_PARTY_NOTICES.md`), loaded from the
 //! binary, so a machine without system fonts - a container, the web - still
 //! draws text; system fonts are added on top for a caller asking for a
@@ -40,10 +40,10 @@ use crate::draw::{Color, DrawList, Rect, TextureId};
 // =============================================================================
 
 /// The bundled default font, embedded so every build draws text without one.
-const BUNDLED_FONT: &[u8] = include_bytes!("../assets/OpenSans-Variable.ttf");
+const BUNDLED_FONT: &[u8] = include_bytes!("../assets/Geist-Variable.ttf");
 
 /// Family name used when the bundled font reports no usable one.
-const FALLBACK_FAMILY: &str = "Open Sans";
+const FALLBACK_FAMILY: &str = "Geist";
 
 // =============================================================================
 // Style and shaped output
