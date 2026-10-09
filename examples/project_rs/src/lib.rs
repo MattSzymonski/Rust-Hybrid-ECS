@@ -196,8 +196,8 @@ pub fn init(engine: &mut Engine) -> u32 {
             return 1;
         }
     }
-    if !has_camera {
-        if engine
+    if !has_camera
+        && engine
             .world_mut()
             .create_entity()
             .with(CameraComponent::default())
@@ -207,9 +207,8 @@ pub fn init(engine: &mut Engine) -> u32 {
             })
             .build()
             .is_err()
-        {
-            return 1;
-        }
+    {
+        return 1;
     }
 
     if let Err(message) = audio_scene::initialize(engine) {
@@ -279,7 +278,7 @@ pub fn init(engine: &mut Engine) -> u32 {
         let mut query = Query::<&PhysicsState>::new(engine.world_mut());
         query.iter_mut().count()
     };
-    for index in existing_balls..BALL_COUNT {
+    for (index, ball_material) in ball_materials.iter().enumerate().skip(existing_balls) {
         let physics = ball_spawn_state(index);
         let entity = engine
             .world_mut()
@@ -301,7 +300,7 @@ pub fn init(engine: &mut Engine) -> u32 {
             .with(
                 MeshRendererComponent::builder()
                     .mesh(&mesh)
-                    .material(&ball_materials[index])
+                    .material(ball_material)
                     .build(),
             );
 

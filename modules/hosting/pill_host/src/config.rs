@@ -116,6 +116,11 @@ const EXTENSION_DIRECTORY: &str = "extensions";
 /// crates of that extension's crates.
 const GENERATED_DIRECTORY: &str = "generated";
 
+/// Suffix of an extension folder's editor crate: folder `<extension>` holds its
+/// editor part in `<extension>/<extension>_editor/`, which only an editor host
+/// loads (after the folder's runtime crates) and no other build ever sees.
+pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
+
 /// Workspace-relative directory holding the generated project member.
 ///
 /// Projects live outside the workspace, so the member that builds one as part
@@ -507,6 +512,11 @@ pub struct ExtensionConfig {
     /// crate itself is `extensions/<folder>/<name>/`.
     pub folder: String,
 
+    /// Whether this is the folder's editor crate (`<folder>_editor`), which an
+    /// editor host loads after the folder's runtime crates and reloads whenever
+    /// one of them reloads.
+    pub is_editor_crate: bool,
+
     /// Library name of the artifact the host loads, which is the extension's
     /// own name: the wrapper's DLL is staged under it, and the host addresses
     /// the module by it in logs, analytics and the reload graveyard.
@@ -558,6 +568,7 @@ impl ExtensionConfig {
         Self {
             name: name.to_string(),
             folder: folder.to_string(),
+            is_editor_crate: name == format!("{folder}{EDITOR_CRATE_SUFFIX}"),
             library_name: name.to_string(),
             wrapper_library_name,
             watch_directory: format!("{EXTENSION_DIRECTORY}/{folder}/{name}/src"),
@@ -617,6 +628,15 @@ pub struct HostConfig {
     /// loaded before the project. When a renderer is selected, its data crate
     /// (`<renderer>_data`) comes first, whatever the settings list.
     pub extensions: Vec<ExtensionConfig>,
+
+    /// Whether this host loads extension editor crates: the editor posture.
+    ///
+    /// Only editor frontends set it, through
+    /// [`Self::from_environment_for_editor`]; every other build never builds or
+    /// loads an editor crate. When set, [`Self::extensions`] ends with the
+    /// editor crates of the loaded extensions' folders and of every
+    /// editor-only folder.
+    pub load_editor_crates: bool,
 
     /// The renderer's GPU module, from the settings' `renderer:` key
     /// (`pill_master_renderer` when absent); `None` for `renderer: none`.
@@ -732,6 +752,22 @@ impl HostConfig {
     /// configuration cannot be derived, the project settings file is missing
     /// or cannot be read/parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
+        Self::from_environment_in_posture(false)
+    }
+
+    /// [`Self::from_environment`] for an editor host: the extensions'
+    /// editor crates load too (see [`Self::load_editor_crates`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_environment`].
+    pub fn from_environment_for_editor() -> Result<Self, ConfigError> {
+        Self::from_environment_in_posture(true)
+    }
+
+    /// The configuration of either posture; `load_editor_crates` selects the
+    /// editor one.
+    fn from_environment_in_posture(load_editor_crates: bool) -> Result<Self, ConfigError> {
         // Step 1: Resolve the project from the PROJECT_PATH environment
         // variable; there is no other source for it.
         let project_path = required_environment(PROJECT_PATH_ENVIRONMENT_VARIABLE)?;
@@ -785,7 +821,24 @@ impl HostConfig {
             Self::resolve_renderer(project_settings.renderer.as_deref(), &extensions_root)?;
         let module_names =
             Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
-        let extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
+        let mut extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
+        // An editor host also loads the editor crates, after every runtime
+        // crate, so each finds its extension already registered.
+        if load_editor_crates {
+            let mut runtime_folders: Vec<String> = extensions
+                .iter()
+                .map(|extension| extension.folder.clone())
+                .collect();
+            if let Some(renderer_name) = renderer.as_deref() {
+                if let Some(folder) = locate_extension_folder(&extensions_root, renderer_name) {
+                    runtime_folders.push(folder);
+                }
+            }
+            extensions.extend(Self::resolve_editor_crates(
+                &runtime_folders,
+                &extensions_root,
+            ));
+        }
 
         // Step 5: Write every loaded extension crate's wrapper into its
         // extension folder's `generated/` before the first build, and clear
@@ -820,6 +873,7 @@ impl HostConfig {
             build_binary_name,
             project,
             extensions,
+            load_editor_crates,
             renderer,
             assets: project_settings.assets,
             logging,
@@ -897,6 +951,11 @@ impl HostConfig {
                     name: name.to_string(),
                 });
             }
+            if name.ends_with(EDITOR_CRATE_SUFFIX) {
+                return Err(ConfigError::EditorCrateListed {
+                    name: name.to_string(),
+                });
+            }
             if !seen_names.insert(name) {
                 return Err(ConfigError::DuplicateExtensionName {
                     name: name.to_string(),
@@ -913,6 +972,71 @@ impl HostConfig {
         }
         Ok(modules)
     }
+
+    /// The editor crates an editor host loads, in load order.
+    ///
+    /// First the editor crate of each folder in `runtime_folders` that has one,
+    /// in that order (a folder loads its editor crate once, after its runtime
+    /// crates); then every editor-only folder - a folder whose only crate is its
+    /// editor crate - in name order, loaded unconditionally. A folder without an
+    /// editor crate contributes nothing, silently. Bookkeeping folders (`_...`)
+    /// and the old renderers (`rendering`) are never searched.
+    fn resolve_editor_crates(
+        runtime_folders: &[String],
+        extensions_root: &Path,
+    ) -> Vec<ExtensionConfig> {
+        let editor_crate_of = |folder: &str| format!("{folder}{EDITOR_CRATE_SUFFIX}");
+        let has_editor_crate = |folder: &str| {
+            extensions_root
+                .join(folder)
+                .join(editor_crate_of(folder))
+                .join("Cargo.toml")
+                .is_file()
+        };
+        let mut folders: Vec<String> = Vec::new();
+        for folder in runtime_folders {
+            if !folders.contains(folder) && has_editor_crate(folder) {
+                folders.push(folder.clone());
+            }
+        }
+        // Editor-only folders: the editor crate is the folder's only crate.
+        let mut all_folders: Vec<String> = std::fs::read_dir(extensions_root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        all_folders.sort();
+        for folder in all_folders {
+            if folder.starts_with('_') || folder == "rendering" || folders.contains(&folder) {
+                continue;
+            }
+            if !has_editor_crate(&folder) {
+                continue;
+            }
+            let editor_crate = editor_crate_of(&folder);
+            let holds_runtime_crate = std::fs::read_dir(extensions_root.join(&folder))
+                .map(|entries| {
+                    entries.flatten().any(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        name != editor_crate
+                            && name != GENERATED_DIRECTORY
+                            && entry.path().join("Cargo.toml").is_file()
+                    })
+                })
+                .unwrap_or(false);
+            if !holds_runtime_crate {
+                folders.push(folder);
+            }
+        }
+        folders
+            .iter()
+            .map(|folder| ExtensionConfig::workspace_member(&editor_crate_of(folder), folder))
+            .collect()
+    }
 }
 
 impl From<ProjectModuleConfig> for HostConfig {
@@ -925,6 +1049,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             build_binary_name: project.name.clone(),
             project,
             extensions: Vec::new(),
+            load_editor_crates: false,
             renderer: None,
             assets: ProjectAssetSettings::default(),
             logging: pill_runtime::LoggingSettings::default(),
@@ -2262,6 +2387,77 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(locate_extension_folder(&root, "pill_absent"), None);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The editor posture's crates: a loaded folder's editor crate, after the
+    /// runtime crates and in their folder order; editor-only folders always;
+    /// a folder without one contributes nothing; and an unloaded folder's
+    /// editor crate stays out.
+    #[test]
+    fn resolves_editor_crates_by_convention() {
+        let root = temp_root().join("editor_crates");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_extension_crate(&root, "pill_spline", "pill_spline");
+        seed_extension_crate(&root, "pill_spline", "pill_spline_editor");
+        seed_extension_crate(&root, "pill_audio", "pill_audio");
+        seed_extension_crate(&root, "pill_test", "pill_test");
+        seed_extension_crate(&root, "pill_test", "pill_test_editor");
+        seed_extension_crate(&root, "pill_editor_shell", "pill_editor_shell_editor");
+        seed_extension_crate(&root, "_workspace_anchor", "_workspace_anchor_editor");
+
+        let resolved = HostConfig::resolve_editor_crates(
+            &["pill_audio".to_string(), "pill_spline".to_string()],
+            &root,
+        );
+        let names: Vec<&str> = resolved
+            .iter()
+            .map(|crate_config| crate_config.name.as_str())
+            .collect();
+        assert_eq!(names, ["pill_spline_editor", "pill_editor_shell_editor"]);
+        assert!(resolved
+            .iter()
+            .all(|crate_config| crate_config.is_editor_crate));
+        assert_eq!(
+            resolved[0].watch_directory,
+            "extensions/pill_spline/pill_spline_editor/src"
+        );
+
+        let none = HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root);
+        assert_eq!(
+            none.iter()
+                .map(|crate_config| crate_config.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pill_editor_shell_editor"],
+            "only the editor-only folder loads when no loaded folder has an editor crate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An editor crate named in `modules:` is refused: it loads with its
+    /// extension in an editor host, never on its own.
+    #[test]
+    fn refuses_editor_crates_in_the_module_list() {
+        let root = temp_root().join("editor_crate_listed");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_extension_crate(&root, "pill_spline", "pill_spline_editor");
+        let refused = HostConfig::resolve_extensions(&[String::from("pill_spline_editor")], &root);
+        assert!(
+            matches!(&refused, Err(ConfigError::EditorCrateListed { name }) if name == "pill_spline_editor"),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A runtime crate is never mistaken for an editor crate.
+    #[test]
+    fn only_the_folders_editor_crate_is_flagged() {
+        assert!(
+            ExtensionConfig::workspace_member("pill_spline_editor", "pill_spline").is_editor_crate
+        );
+        assert!(!ExtensionConfig::workspace_member("pill_spline", "pill_spline").is_editor_crate);
+        assert!(
+            !ExtensionConfig::workspace_member("pill_other_editor", "pill_spline").is_editor_crate
+        );
     }
 
     /// The renderer's data crate may share the GPU module's folder.

@@ -547,6 +547,15 @@ pub enum ConfigError {
     #[message("project settings file lists extension ", value(name), " twice")]
     DuplicateExtensionName { name: String },
 
+    /// The settings file lists an editor crate, which only loads with its
+    /// extension in an editor host.
+    #[message(
+        "extension ",
+        value(name),
+        " is an editor crate: it loads with its extension in an editor host, never from `modules:`"
+    )]
+    EditorCrateListed { name: String },
+
     /// No extension folder holds the configured extension crate.
     #[message(
         "extension ",
