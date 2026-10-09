@@ -24,7 +24,7 @@
 //!
 //! The host still links this crate directly under its `rendering` feature;
 //! making it a reloadable module is the remaining work of
-//! `local/docs/plans/renderer_hot_reload.md`.
+//! `local/workbench/plans/renderer_hot_reload.md`.
 
 // The contract lives in `pill_renderer_api` and this renderer's data in
 // `pill_master_renderer_data`; neither carries wgpu. Their modules are

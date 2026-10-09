@@ -564,7 +564,8 @@ impl State {
             // once per frame. A transparent clear keeps those pixels, and is
             // asked for only where the surface can actually carry alpha: in an
             // `Opaque` mode the same clear would be opaque black instead.
-            let shared_target = !covers_target(viewport, width, height) && self.surface.composites();
+            let shared_target =
+                !covers_target(viewport, width, height) && self.surface.composites();
             let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = entry
                 .outputs()
                 .iter()
@@ -692,7 +693,12 @@ impl State {
                     };
                     let scissor =
                         viewport_in_target(viewport, width, height, target_width, target_height);
-                    render_pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+                    render_pass.set_scissor_rect(
+                        scissor.x,
+                        scissor.y,
+                        scissor.width,
+                        scissor.height,
+                    );
                     if pass.pass_engine_parameters {
                         render_pass.set_bind_group(
                             ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -903,6 +909,10 @@ mod tests {
     #[test]
     fn only_a_frame_covering_the_target_owns_it() {
         assert!(covers_target(RenderViewport::full(1280, 800), 1280, 800));
-        assert!(!covers_target(RenderViewport::new(0, 0, 700, 800), 1280, 800));
+        assert!(!covers_target(
+            RenderViewport::new(0, 0, 700, 800),
+            1280,
+            800
+        ));
     }
 }

@@ -52,7 +52,7 @@ Common flags on the end-to-end suites:
   has it; those that don't always build what they need.
 
 When an agent runs a suite, it goes through `.agents/tools/agent_run.py`
-(see `AGENTS.md`), which records the output under `local/agent_runs/`.
+(see `AGENTS.md`), which records the output under `local/workbench/runs/`.
 
 ### Where they run in CI
 
