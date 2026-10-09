@@ -7,6 +7,9 @@ members = [
     "pill_engine_macros",
     "pill_core",
     "pill_core_macros",
+    # The UI library: one shared dylib for the editor, module tools and
+    # immediate-mode in-game/debug UI (plan decision D17).
+    "pill_ui",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild

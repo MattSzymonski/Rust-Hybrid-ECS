@@ -92,7 +92,10 @@ memchr = "2"
 num-traits = { version = "0.2", features = ["i128", "libm", "std"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 serde_core = { version = "1", features = ["alloc"] }
-smallvec = { version = "1", features = ["const_generics", "union"] }
+# `const_new` joined in W-0004 Stage 7: `pill_ui`'s icon tree reaches it
+# through `kurbo`, and the host posture includes `pill_ui` while a module
+# build does not.
+smallvec = { version = "1", features = ["const_generics", "const_new", "union"] }
 syn = { version = "3", features = ["full", "visit-mut"] }
 time = { version = "0.3", features = ["macros"] }
 

@@ -76,6 +76,8 @@ pub mod telemetry_target {
     pub const SYSTEM: &str = "engine::system";
     /// Renderer activity.
     pub const RENDERING: &str = "engine::rendering";
+    /// The UI library: fonts, text, icons and the draw list.
+    pub const UI: &str = "engine::ui";
     /// Resource loading and storage.
     pub const RESOURCES: &str = "engine::resources";
 

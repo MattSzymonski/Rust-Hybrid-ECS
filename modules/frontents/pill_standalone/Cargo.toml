@@ -23,6 +23,10 @@ pill_runtime = { path = "../../hosting/pill_runtime" }
 pill_host = { package = "pill_host", path = "../../hosting/pill_host", default-features = false, optional = true }
 # The window and event loop of a windowed run. Only the frontend links winit.
 winit = { version = "0.30", optional = true }
+# The UI library, linked only by `dev`: the probe in `ui_probe.rs` is its
+# dev-host consumer, proving the shared dylib loads once per process (W-0004
+# Stage 7). A shipping build does not compile it.
+pill_ui = { path = "../../pill_ui", optional = true }
 # A windowed run's input: winit's keyboard and mouse events as engine input
 # events, and the gamepads.
 pill_input = { path = "../pill_input", features = ["winit", "gamepad"], optional = true }
@@ -67,7 +71,7 @@ pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
 default = ["dev", "hot_patch"]
 # The development posture: the development host builds, loads, watches and
 # reloads the project and every extension.
-dev = ["dep:pill_host", "pill_host/hot_reload"]
+dev = ["dep:pill_host", "pill_host/hot_reload", "dep:pill_ui"]
 # The shipping posture: the runtime runs the project and extensions the
 # generated bundle links in. Nothing is watched, built or loaded at runtime, and
 # `pill_host` is not compiled. Build it with `--package pill_standalone`, not

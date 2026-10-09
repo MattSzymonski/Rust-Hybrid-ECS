@@ -169,7 +169,7 @@ impl ApplicationHandler for WebApplication {
     /// Input that arrives before the renderer is attached has no game to go to
     /// and is dropped.
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        if let Some(input) = translate_window_event(&event) {
+        for input in translate_window_event(&event) {
             if let Some(driver) = self.driver.borrow_mut().as_mut() {
                 driver.push_input(input);
             }
