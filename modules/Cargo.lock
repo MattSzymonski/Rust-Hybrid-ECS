@@ -2713,6 +2713,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "host_module_pill_editor_shell_editor"
+version = "0.1.0"
+dependencies = [
+ "pill_editor_shell_editor",
+ "pill_engine",
+]
+
+[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -2734,6 +2742,14 @@ version = "0.1.0"
 dependencies = [
  "pill_engine",
  "pill_spline",
+]
+
+[[package]]
+name = "host_module_pill_spline_editor"
+version = "0.1.0"
+dependencies = [
+ "pill_engine",
+ "pill_spline_editor",
 ]
 
 [[package]]
@@ -5180,6 +5196,7 @@ name = "pill_spline_editor"
 version = "0.1.0"
 dependencies = [
  "pill_core",
+ "pill_editor_core",
  "pill_engine",
  "pill_spline",
  "serde",

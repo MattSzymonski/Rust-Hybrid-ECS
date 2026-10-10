@@ -29,13 +29,17 @@ extern crate self as pill_editor_shell_editor;
 
 // External crates
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
+use pill_editor_core::commands::{
+    ensure_command_resources, CommandInbox, CommandRegistry, PendingEditorCommands,
+};
 use pill_editor_core::layout::{compute_layout, LayoutMetrics, Rect as LayoutRect};
 use pill_engine::{pill_hot, pill_module, Engine, ResMut};
 
 // Current crate
 use pill_editor_shell_editor::shell::{
-    collect_panel_placements, paint_dock_chrome, paint_panels, select_tab_by_title,
-    EditorShellState,
+    collect_panel_placements, execute_command, handle_command_shortcuts, handle_menu_pointer,
+    paint_dock_chrome, paint_menu, paint_palette, paint_panels, select_tab_by_title,
+    sync_command_files, EditorShellState, MENU_BAR_HEIGHT,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -71,8 +75,15 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EditorShellFrame>().is_none() {
         world.insert_resource(EditorShellFrame::default());
     }
-    // Step 3: the per-frame system that builds the editor UI.
-    engine.register_system("editor_shell", editor_shell_update);
+    // Step 3: the command layer's resources: the registry (with the
+    // built-in commands), the inbox module owners drain and the queue of
+    // engine mutations the executable applies.
+    ensure_command_resources(world);
+    // Step 4: the per-frame system that builds the editor UI. Post-update,
+    // like the renderer's frame build: it keeps running while the engine is
+    // paused - which is what lets the pause command be its own undo, and
+    // keeps the menus live over a frozen scene.
+    engine.register_post_update_system("editor_shell", editor_shell_update);
     // NOTE: asserted on by the editor's end-to-end suite.
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ECS,
@@ -95,29 +106,101 @@ pub fn editor_shell_update(
     mut state: ResMut<EditorShellState>,
     mut input: ResMut<EditorShellInput>,
     mut frame: ResMut<EditorShellFrame>,
+    mut registry: ResMut<CommandRegistry>,
+    mut inbox: ResMut<CommandInbox>,
+    mut pending: ResMut<PendingEditorCommands>,
 ) {
     // The resources are this crate's own registrations; a world without
     // them is not an editor's, and there is nothing to do.
-    let (Some(mut state), Some(mut input), Some(mut frame)) =
-        (state.get_mut(), input.get_mut(), frame.get_mut())
+    let (
+        Some(mut state),
+        Some(mut input),
+        Some(mut frame),
+        Some(mut registry),
+        Some(mut inbox),
+        Some(mut pending),
+    ) = (
+        state.get_mut(),
+        input.get_mut(),
+        frame.get_mut(),
+        registry.get_mut(),
+        inbox.get_mut(),
+        pending.get_mut(),
+    )
     else {
         return;
     };
-    // Step 1: this frame's input, then the UI frame begins: press edges and
-    // queued text apply once, here.
+    // Step 1: this frame's input. The menu layer gets first refusal on
+    // pointer events - a dropdown click must not also press a widget under
+    // it - and key presses are collected with the modifiers current at
+    // their moment, for the shortcut pass once the files are current.
+    state.paused = input.systems_paused;
+    let mut pressed: Vec<(pill_engine::KeyCode, pill_engine::Modifiers)> = Vec::new();
     for event in input.events.drain(..) {
-        state.ui.input.apply(&event);
+        match &event {
+            pill_engine::InputEvent::ModifiersChanged { modifiers } => {
+                state.modifiers = *modifiers;
+            }
+            pill_engine::InputEvent::CursorMoved { position } => {
+                state.cursor = *position;
+            }
+            _ => {}
+        }
+        if let pill_engine::InputEvent::Key {
+            key,
+            state: pill_engine::ButtonState::Pressed,
+        } = &event
+        {
+            pressed.push((*key, state.modifiers));
+        }
+        if !handle_menu_pointer(&mut state, &registry, &mut inbox, &mut pending, &event) {
+            state.ui.input.apply(&event);
+        }
     }
     if let Some(title) = input.requested_tab.take() {
         select_tab_by_title(&mut state.layout, &title);
     }
+    // Step 1b: the keybindings and preferences files, then the dispatch:
+    // commands the scripted channel requested run through the same path a
+    // binding does.
+    sync_command_files(&mut state, &mut registry);
+    for id in input.requested_commands.drain(..) {
+        execute_command(&mut state, &registry, &mut inbox, &mut pending, &id);
+    }
+    handle_command_shortcuts(&mut state, &registry, &mut inbox, &mut pending, &pressed);
     state.ui.input.begin_frame();
     state.frame_index += 1;
-    // Step 2: docking geometry for the client area.
+    // Step 1c: the registry's shape, logged whenever it changes, so a
+    // module's later registration shows up without a restart.
+    let command_count = registry.commands().count();
+    let menus = pill_editor_core::commands::menu_tree(&registry);
+    if (command_count, menus.len()) != state.registry_signature {
+        state.registry_signature = (command_count, menus.len());
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            commands = command_count,
+            menus = menus.len(),
+            "[editor] command registry ready"
+        );
+        for (top, specs) in &menus {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                path = %top,
+                items = specs.len(),
+                "[editor] menu registered"
+            );
+        }
+    }
+    // Step 2: docking geometry for the client area under the menu bar.
     let available = input.logical_size;
     let snapshot = compute_layout(
         &state.layout,
-        LayoutRect::new(0.0, 0.0, available.x as f64, available.y as f64),
+        LayoutRect::new(
+            0.0,
+            MENU_BAR_HEIGHT,
+            available.x as f64,
+            (available.y as f64 - MENU_BAR_HEIGHT).max(0.0),
+        ),
         LayoutMetrics::default(),
     );
     // Step 3: rebuild the frame. The scene rectangle goes to the executable
@@ -157,7 +240,7 @@ pub fn editor_shell_update(
         );
     }
     // Step 5: chrome first (it sits under the panels' content), then the
-    // panel contents themselves.
+    // panel contents themselves, then the menu layer over everything.
     paint_dock_chrome(&mut state, &snapshot, &mut frame, &previous_hits);
     paint_panels(
         &mut state,
@@ -166,6 +249,8 @@ pub fn editor_shell_update(
         editor_frames_per_second,
         &previous_hits,
     );
+    paint_menu(&mut state, &registry, &mut frame, available);
+    paint_palette(&mut state, &registry, &mut frame, available);
     // Step 6: this frame's atlas additions, for the executable to upload.
     frame.atlas = state.atlas.take_update();
 }

@@ -16,6 +16,8 @@
 //! shared `dylib` (see its manifest) because its values cross between the
 //! editor executable and the reloadable editor shell module.
 
+/// The command registry: named actions, menus and rebindable shortcuts.
+pub mod commands;
 /// The editor's snapshots of the engine and the commands it applies to it.
 pub mod editor_state;
 /// Layout persistence failures.
