@@ -4966,6 +4966,7 @@ name = "pill_editor_api"
 version = "0.1.0"
 dependencies = [
  "pill_core",
+ "pill_editor_core",
  "pill_engine_core",
  "pill_ui",
 ]
@@ -5196,9 +5197,11 @@ name = "pill_spline_editor"
 version = "0.1.0"
 dependencies = [
  "pill_core",
+ "pill_editor_api",
  "pill_editor_core",
  "pill_engine",
  "pill_spline",
+ "pill_ui",
  "serde",
 ]
 

@@ -258,6 +258,9 @@ struct EditorWindow {
     /// A tab the scripted suite asked to select, by title; delivered to the
     /// shell with the next frame's input.
     requested_tab: Option<String>,
+    /// A module panel the scripted suite asked to focus or open, by id;
+    /// delivered to the shell with the next frame's input.
+    requested_panel: Option<String>,
     /// Command ids the scripted suite asked to execute; delivered to the
     /// shell's dispatch with the next frame's input.
     requested_commands: Vec<String>,
@@ -400,6 +403,19 @@ impl EditorWindow {
         // cameras.
         let camera = EditorCamera::default();
         host.set_surface_camera(SCENE_SURFACE, Some(camera.binding()));
+        // The scripted suite's panel fixtures: a panel that panics, so the
+        // shell's containment can be exercised end to end (Stage 16).
+        // Registered only while the scripted channel is active; its name
+        // avoids the word the native suite's no-crash assertion scans for.
+        if std::env::var_os("PILL_EDITOR_TEST_COMMANDS").is_some() {
+            pill_editor_api::panels::register_editor_panel(
+                host.host_mut().engine_mut(),
+                "editor_test",
+                "containment_test",
+                "Containment Test",
+                containment_test_panel,
+            );
+        }
         info!(
             target: telemetry_target::ENGINE,
             width, height, "[editor] window created"
@@ -426,6 +442,7 @@ impl EditorWindow {
             last_scene_rect: None,
             last_game_rect: None,
             requested_tab: None,
+            requested_panel: None,
             requested_commands: Vec::new(),
             test_channel: TestChannel::from_environment(),
             test_started: Some(Instant::now()),
@@ -545,6 +562,14 @@ impl EditorWindow {
                             "[editor] test channel: tab request"
                         );
                         self.requested_tab = Some(title);
+                    }
+                    TestCommand::Panel { id } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            id = %id,
+                            "[editor] test channel: panel request"
+                        );
+                        self.requested_panel = Some(id);
                     }
                     TestCommand::Command { id } => {
                         info!(
@@ -1115,13 +1140,29 @@ impl EditorWindow {
         );
         {
             let systems_paused = self.host.host_mut().engine_mut().systems_paused();
-            let world = self.host.host_mut().engine_mut().world_mut();
+            let engine = self.host.host_mut().engine_mut();
+            // The editor snapshot the shell's panels draw from (Stage 16):
+            // the cheap tiers rebuild each frame, the detail tier waits for
+            // the selection the panels own (Stage 17), and the revision
+            // counter is the host's when one is exposed here.
+            let snapshot = pill_editor_core::editor_state::EditorSnapshot::capture_list(
+                engine,
+                0,
+                &[],
+                Vec::new(),
+            );
+            let world = engine.world_mut();
+            match world.get_resource_mut::<pill_editor_core::editor_state::EditorSnapshot>() {
+                Some(current) => *current = snapshot,
+                None => world.insert_resource(snapshot),
+            }
             if let Some(input) = world.get_resource_mut::<EditorShellInput>() {
                 input.events.append(&mut self.pending_ui_events);
                 input.logical_size = available;
                 input.scale_factor = scale_factor;
                 input.editor_frames_per_second = self.frames_per_second;
                 input.requested_tab = self.requested_tab.take();
+                input.requested_panel = self.requested_panel.take();
                 input
                     .requested_commands
                     .append(&mut self.requested_commands);
@@ -1766,8 +1807,17 @@ fn short_component_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
 
-/// Parse a scripted field value: `true`/`false`, a float (one with a `.`),
-/// or a plain integer.
+/// The suite's containment fixture panel: it always panics, so the shell's
+/// containment path is exercised end to end.
+fn containment_test_panel(
+    _builder: &mut pill_ui::PanelBuilder<'_>,
+    _context: &mut pill_editor_api::panels::PanelContext<'_>,
+) {
+    panic!("containment test panel");
+}
+
+/// Parse a scripted field value: `true`/`false`, a float (one with a `.`
+/// or an `f` suffix), or an integer (`u` suffix for an unsigned one).
 fn parse_field_value(token: &str) -> Result<pill_engine_core::FieldValue, String> {
     use pill_engine_core::FieldValue;
     match token {
@@ -1775,8 +1825,14 @@ fn parse_field_value(token: &str) -> Result<pill_engine_core::FieldValue, String
         "false" => return Ok(FieldValue::Bool(false)),
         _ => {}
     }
-    if token.contains('.') {
-        if let Ok(value) = token.parse::<f32>() {
+    if let Some(digits) = token.strip_suffix('u') {
+        if let Ok(value) = digits.parse::<u32>() {
+            return Ok(FieldValue::U32(value));
+        }
+    }
+    if token.contains('.') || token.ends_with('f') {
+        let digits = token.strip_suffix('f').unwrap_or(token);
+        if let Ok(value) = digits.parse::<f32>() {
             return Ok(FieldValue::F32(value));
         }
     }

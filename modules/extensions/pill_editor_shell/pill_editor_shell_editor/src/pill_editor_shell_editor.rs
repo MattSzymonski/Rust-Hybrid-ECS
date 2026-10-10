@@ -28,19 +28,22 @@
 extern crate self as pill_editor_shell_editor;
 
 // External crates
+use pill_editor_api::panels::EditorPanelRegistry;
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::commands::{
     ensure_command_resources, CommandInbox, CommandRegistry, PendingEditorCommands,
 };
+use pill_editor_core::editor_state::EditorSnapshot;
 use pill_editor_core::history::CommandHistory;
 use pill_editor_core::layout::{compute_layout, LayoutMetrics, Rect as LayoutRect};
-use pill_engine::{pill_hot, pill_module, Engine, ResMut};
+use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // Current crate
 use pill_editor_shell_editor::shell::{
-    collect_panel_placements, execute_command, handle_command_shortcuts, handle_menu_pointer,
-    paint_dock_chrome, paint_menu, paint_palette, paint_panels, select_tab_by_title,
-    sync_command_files, EditorShellState, MENU_BAR_HEIGHT,
+    collect_panel_placements, execute_command, focus_module_panel, handle_command_shortcuts,
+    handle_menu_pointer, paint_dock_chrome, paint_menu, paint_palette, paint_panels,
+    select_tab_by_title, sync_command_files, sync_panel_commands, EditorShellState,
+    MENU_BAR_HEIGHT,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -110,34 +113,40 @@ pub fn editor_shell_update(
         ResMut<EditorShellState>,
         ResMut<EditorShellInput>,
         ResMut<EditorShellFrame>,
+        Res<EditorSnapshot>,
     ),
     commands: (
         ResMut<CommandRegistry>,
         ResMut<CommandInbox>,
         ResMut<PendingEditorCommands>,
         ResMut<CommandHistory>,
+        ResMut<EditorPanelRegistry>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without
     // them is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame) = view;
-    let (mut registry, mut inbox, mut pending, mut history) = commands;
+    let (mut state, mut input, mut frame, editor_snapshot) = view;
+    let (mut registry, mut inbox, mut pending, mut history, mut panels) = commands;
     let (
         Some(mut state),
         Some(mut input),
         Some(mut frame),
+        Some(editor_snapshot),
         Some(mut registry),
         Some(mut inbox),
         Some(mut pending),
         Some(mut history),
+        Some(panels),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
+        editor_snapshot.get(),
         registry.get_mut(),
         inbox.get_mut(),
         pending.get_mut(),
         history.get_mut(),
+        panels.get_mut(),
     )
     else {
         return;
@@ -179,10 +188,14 @@ pub fn editor_shell_update(
     if let Some(title) = input.requested_tab.take() {
         select_tab_by_title(&mut state.layout, &title);
     }
+    if let Some(panel_id) = input.requested_panel.take() {
+        focus_module_panel(&mut state, &panel_id);
+    }
     // Step 1b: the keybindings and preferences files, then the dispatch:
     // commands the scripted channel requested run through the same path a
     // binding does.
     sync_command_files(&mut state, &mut registry, &mut history);
+    sync_panel_commands(&mut state, &panels, &mut registry);
     for id in input.requested_commands.drain(..) {
         execute_command(
             &mut state,
@@ -273,15 +286,25 @@ pub fn editor_shell_update(
         );
     }
     // Step 5: chrome first (it sits under the panels' content), then the
-    // panel contents themselves, then the menu layer over everything.
+    // panel contents themselves, then the menu layer over everything. The
+    // panels hand back queued edits and command ids the shell drains into
+    // its own queues (Stage 16).
     paint_dock_chrome(&mut state, &snapshot, &mut frame, &previous_hits);
-    paint_panels(
+    let work = paint_panels(
         &mut state,
         &placements,
         &mut frame,
+        &editor_snapshot,
+        &panels,
         editor_frames_per_second,
         &previous_hits,
     );
+    for batch in work.batches {
+        pending.batches.push(batch);
+    }
+    for command in work.commands {
+        inbox.executed.push(command);
+    }
     paint_menu(&mut state, &registry, &mut frame, available);
     paint_palette(&mut state, &registry, &mut frame, available);
     // Step 6: this frame's atlas additions, for the executable to upload.

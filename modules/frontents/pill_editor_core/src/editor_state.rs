@@ -99,6 +99,8 @@ pub struct EditorSnapshot {
     pub errors: Vec<String>,
 }
 
+impl pill_engine::Resource for EditorSnapshot {}
+
 impl EditorSnapshot {
     /// Rebuild the cheap tiers (entities, systems, pause state) from a live
     /// engine. Never mutates the world.

@@ -19,7 +19,9 @@ crate-type = ["rlib"]
 # standalone, shipping or web - ever builds it.
 [dependencies]
 pill_core = { path = "../../../pill_core" }
+pill_editor_api = { path = "../../../hosting/pill_editor_api" }
 pill_editor_core = { path = "../../../frontents/pill_editor_core" }
 pill_engine = { path = "../../../pill_engine" }
 pill_spline = { path = "../pill_spline", default-features = false }
+pill_ui = { path = "../../../pill_ui" }
 serde = { version = "1", features = ["derive"] }

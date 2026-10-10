@@ -27,15 +27,17 @@ use std::collections::BTreeMap;
 
 // External crates
 use pill_core::math::Vector2f;
+use pill_core::platform::Instant;
+use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
 use pill_editor_api::EditorShellFrame;
 use pill_editor_core::commands::{
-    menu_tree, CommandInbox, CommandRegistry, EditorPreferences, KeybindingsFile,
+    menu_tree, CommandInbox, CommandRegistry, CommandSpec, EditorPreferences, KeybindingsFile,
     PendingEditorCommands,
 };
-use pill_editor_core::editor_state::EditorCommand;
+use pill_editor_core::editor_state::{EditorCommand, EditorSnapshot};
 use pill_editor_core::history::{CommandHistory, HistoryEntryKind};
 use pill_editor_core::layout::{
-    LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
+    LayoutAction, LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
 };
 use pill_engine::Resource;
 use pill_ui::panel::ClipboardRequest;
@@ -136,6 +138,17 @@ pub struct EditorShellState {
     pub palette_rect: Option<LayoutRect>,
     /// The palette's command rows, from the last paint.
     pub palette_item_hits: Vec<(String, LayoutRect)>,
+    /// Build time of every module panel last frame, in milliseconds (Stage
+    /// 16's budget: measured, shown in Statistics, never throttled).
+    pub panel_millis: std::collections::BTreeMap<String, f32>,
+    /// Consecutive over-budget frames per module panel, for the warning.
+    pub panel_over_frames: std::collections::BTreeMap<String, u32>,
+    /// Module panels currently over budget; their tabs carry the badge.
+    pub panel_over: std::collections::BTreeSet<String>,
+    /// The live panel set last synced into the command registry.
+    pub panel_registry_signature: Vec<(String, String, String)>,
+    /// Log-once keys for the panel layer (registered, built, missing).
+    pub panel_reported: std::collections::BTreeSet<String>,
 }
 
 impl EditorShellState {
@@ -165,6 +178,11 @@ impl EditorShellState {
             menu_dropdown_item_hits: Vec::new(),
             palette_rect: None,
             palette_item_hits: Vec::new(),
+            panel_millis: std::collections::BTreeMap::new(),
+            panel_over_frames: std::collections::BTreeMap::new(),
+            panel_over: std::collections::BTreeSet::new(),
+            panel_registry_signature: Vec::new(),
+            panel_reported: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -440,6 +458,7 @@ pub fn paint_dock_chrome(
         theme,
         sheet,
         atlas,
+        panel_over,
         ..
     } = state;
     // Step 1: the tab strips. The fill goes into the frame first so it sits
@@ -472,7 +491,16 @@ pub fn paint_dock_chrome(
                 builder.row(|row| {
                     for tab_id in &tabset.tabs {
                         if let Some(tab) = layout.tab(*tab_id) {
-                            row.label(&tab.title);
+                            // An over-budget module panel's tab carries the
+                            // warning badge (Stage 16).
+                            match &tab.panel {
+                                PanelKind::Module(id) if panel_over.contains(id) => {
+                                    row.label(&format!("{}{}", tab.title, PANEL_BADGE));
+                                }
+                                _ => {
+                                    row.label(&tab.title);
+                                }
+                            }
                         }
                     }
                 });
@@ -493,22 +521,35 @@ pub fn paint_dock_chrome(
 
 /// The visible panels' contents, merged into `frame` with their hit
 /// rectangles restored around each build.
+///
+/// Module panels are built through the registry (Stage 16): a missing
+/// registration paints the placeholder, a panicking one is contained, and
+/// every build's duration feeds the budget badge. The returned [`PanelWork`]
+/// is what the panels handed back; the caller drains it into the command
+/// queues.
 pub fn paint_panels(
     state: &mut EditorShellState,
     placements: &[PanelPlacement],
     frame: &mut EditorShellFrame,
+    snapshot: &EditorSnapshot,
+    panels: &EditorPanelRegistry,
     editor_frames_per_second: f32,
     previous_hits: &BTreeMap<WidgetId, Rect>,
-) {
+) -> PanelWork {
     let EditorShellState {
         ui,
         text,
         theme,
         sheet,
         atlas,
+        panel_millis,
+        panel_over_frames,
+        panel_over,
+        panel_reported,
         ..
     } = state;
     let mut merged: BTreeMap<WidgetId, Rect> = BTreeMap::new();
+    let mut collected = PanelWork::default();
     for placement in placements {
         // The scene and game tabs' rectangles belong to their surfaces; the
         // shell draws nothing there.
@@ -518,26 +559,118 @@ pub fn paint_panels(
         // Restore the previous frame's map so this panel's widgets test
         // against it, then capture this panel's fresh rectangles.
         ui.set_hit_rects(previous_hits.clone());
-        let (list, clipboard) = subframe(
-            ui,
-            text,
-            theme,
-            sheet,
-            atlas,
-            Vector2f::new(placement.rect.x as f32, placement.rect.y as f32),
-            Vector2f::new(placement.rect.width as f32, placement.rect.height as f32),
-            |builder| build_panel(builder, &placement.kind, editor_frames_per_second),
-        );
+        let mut work = PanelWork::default();
+        let origin = Vector2f::new(placement.rect.x as f32, placement.rect.y as f32);
+        let size = Vector2f::new(placement.rect.width as f32, placement.rect.height as f32);
+        // A module panel may panic; the shell contains it and keeps going
+        // (the plan's rule: the panel shows its error, everything else
+        // survives). Build time is measured for the Statistics panel and
+        // the over-budget badge, and nothing is ever throttled.
+        let started = Instant::now();
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            subframe(ui, text, theme, sheet, atlas, origin, size, |builder| {
+                build_panel(
+                    builder,
+                    &placement.kind,
+                    editor_frames_per_second,
+                    snapshot,
+                    panels,
+                    panel_millis,
+                    &placement.rect,
+                    &mut work,
+                )
+            })
+        }));
+        let millis = started.elapsed().as_secs_f32() * 1000.0;
+        let (list, clipboard) = match built {
+            Ok(built) => built,
+            Err(payload) => {
+                let message = panic_message(&payload);
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = placement.kind.title(),
+                    message = message.as_str(),
+                    "[editor] module panel panicked"
+                );
+                subframe(ui, text, theme, sheet, atlas, origin, size, |builder| {
+                    builder.heading(placement.kind.title());
+                    builder.separator();
+                    builder.label("This panel panicked; see the log.");
+                })
+            }
+        };
+        // The budget tracking and the log-once lines, for module panels.
+        if let PanelKind::Module(id) = &placement.kind {
+            panel_millis.insert(id.clone(), millis);
+            if millis > PANEL_BUDGET_MILLIS {
+                let over_frames = panel_over_frames.entry(id.clone()).or_insert(0);
+                *over_frames += 1;
+                if *over_frames == PANEL_OVER_FRAMES && !panel_over.contains(id) {
+                    panel_over.insert(id.clone());
+                    pill_core::warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        id = id.as_str(),
+                        millis,
+                        "[editor] panel over budget"
+                    );
+                }
+            } else {
+                panel_over_frames.insert(id.clone(), 0);
+                panel_over.remove(id);
+            }
+            let built_key = format!("built:{id}");
+            if !panel_reported.contains(&built_key) && panels.panel(id).is_some() {
+                panel_reported.insert(built_key);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = id.as_str(),
+                    millis,
+                    "[editor] module panel built"
+                );
+            }
+            let missing_key = format!("missing:{id}");
+            if panels.panel(id).is_none() && !panel_reported.contains(&missing_key) {
+                panel_reported.insert(missing_key);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = id.as_str(),
+                    "[editor] module panel missing"
+                );
+            }
+        }
         merged.extend(ui.hit_rects().iter().map(|(id, rect)| (*id, *rect)));
         frame.panels.append(list);
         frame.clipboard.extend(clipboard);
+        collected.batches.extend(work.batches);
+        collected.commands.extend(work.commands);
     }
     ui.set_hit_rects(merged);
+    collected
 }
 
-/// One panel's content by kind. Placeholders stand until the stage that
-/// fills them; the gallery is real, proving the widget vocabulary.
-fn build_panel(builder: &mut PanelBuilder<'_>, kind: &PanelKind, editor_frames_per_second: f32) {
+/// A module panel build lasting longer than this (milliseconds) counts
+/// against the budget; nothing is throttled, the badge just warns.
+const PANEL_BUDGET_MILLIS: f32 = 4.0;
+
+/// Consecutive over-budget frames before the warning badge and the log.
+const PANEL_OVER_FRAMES: u32 = 120;
+
+/// The badge a tab title carries while its panel is over budget.
+const PANEL_BADGE: &str = " [!]";
+
+/// One panel's content by kind. Built-in placeholders stand until the stage
+/// that fills them; module panels are built through their registration
+/// (Stage 16); the gallery is real, proving the widget vocabulary.
+fn build_panel(
+    builder: &mut PanelBuilder<'_>,
+    kind: &PanelKind,
+    editor_frames_per_second: f32,
+    snapshot: &EditorSnapshot,
+    panels: &EditorPanelRegistry,
+    panel_millis: &std::collections::BTreeMap<String, f32>,
+    rect: &LayoutRect,
+    work: &mut PanelWork,
+) {
     match kind {
         PanelKind::Scene => {
             builder.label("The scene draws into its own surface.");
@@ -545,8 +678,34 @@ fn build_panel(builder: &mut PanelBuilder<'_>, kind: &PanelKind, editor_frames_p
         PanelKind::Game => {
             builder.label("The game view draws into its own surface.");
         }
-        PanelKind::Statistics => statistics_panel(builder, editor_frames_per_second),
+        PanelKind::Statistics => statistics_panel(
+            builder,
+            editor_frames_per_second,
+            snapshot,
+            panels,
+            panel_millis,
+        ),
         PanelKind::Gallery => pill_ui::ui_gallery(builder),
+        PanelKind::Module(id) => match panels.panel(id) {
+            Some(build) => {
+                let mut context = PanelContext {
+                    snapshot,
+                    rect: pill_editor_api::EditorRect::new(
+                        rect.x as f32,
+                        rect.y as f32,
+                        rect.width as f32,
+                        rect.height as f32,
+                    ),
+                    work,
+                };
+                build(builder, &mut context);
+            }
+            None => {
+                builder.heading(id);
+                builder.separator();
+                builder.label("module not loaded");
+            }
+        },
         other => {
             builder.heading(other.title());
             builder.separator();
@@ -555,16 +714,41 @@ fn build_panel(builder: &mut PanelBuilder<'_>, kind: &PanelKind, editor_frames_p
     }
 }
 
-/// The Statistics panel: the editor's frame rate and a first action row.
-fn statistics_panel(builder: &mut PanelBuilder<'_>, editor_frames_per_second: f32) {
+/// The Statistics panel: the editor's frame rate, the module panels' build
+/// times, and a first action row.
+fn statistics_panel(
+    builder: &mut PanelBuilder<'_>,
+    editor_frames_per_second: f32,
+    snapshot: &EditorSnapshot,
+    panels: &EditorPanelRegistry,
+    panel_millis: &std::collections::BTreeMap<String, f32>,
+) {
     builder.heading("Statistics");
     builder.separator();
     builder.label(&format!("{editor_frames_per_second:.1} FPS"));
+    builder.label(&format!("entities={}", snapshot.entities.len()));
     builder.separator();
+    for info in panels.list() {
+        let millis = panel_millis.get(&info.id).copied().unwrap_or(0.0);
+        builder.row(|row| {
+            row.label(&format!("panel {} {millis:.1}ms", info.title));
+        });
+    }
     builder.row(|row| {
         row.button_enabled("Reset Layout", true);
         row.button_enabled("Detach Scene", false);
     });
+}
+
+/// The panic payload as text, for the log line that contains it.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>() {
+        return text.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 // =============================================================================
@@ -668,6 +852,126 @@ fn report_once(state: &mut EditorShellState, message: &str) {
     }
 }
 
+// =============================================================================
+// Module panels (Stage 16)
+// =============================================================================
+
+/// Syncs the Window menu and the dock tabs with the live panel registry.
+///
+/// Runs when the registry's signature moves - a module registered, reloaded
+/// or unloaded - and replaces the "panels" owner's command specs with one
+/// entry per panel, so the Window menu lists exactly what is loaded. A
+/// `Module(id)` tab carrying a registered title is retitled in place.
+pub fn sync_panel_commands(
+    state: &mut EditorShellState,
+    panels: &EditorPanelRegistry,
+    registry: &mut CommandRegistry,
+) {
+    let signature = panels.signature();
+    if signature == state.panel_registry_signature {
+        return;
+    }
+    state.panel_registry_signature = signature.clone();
+    // A new generation's panels log their first build (or miss) again.
+    state.panel_reported.clear();
+    let specs = signature
+        .iter()
+        .map(|(id, title, _owner)| {
+            let command_id = format!("editor.panel.{id}");
+            CommandSpec::new(&command_id, title.as_str())
+                .menu(&["Window", title])
+                .global()
+        })
+        .collect::<Vec<_>>();
+    registry.register("panels", specs);
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        panels = signature.len(),
+        "[editor] panel registry ready"
+    );
+    for (id, title, owner) in &signature {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = id.as_str(),
+            title = title.as_str(),
+            owner = owner.as_str(),
+            "[editor] panel registered"
+        );
+    }
+    // A module panel's tab shows its registered title once one exists.
+    for (_, node) in state.layout.nodes.iter_mut() {
+        let LayoutNode::Tab(tab) = node else {
+            continue;
+        };
+        let PanelKind::Module(id) = &tab.panel else {
+            continue;
+        };
+        let Some((_, title, _)) = signature.iter().find(|(registered, _, _)| registered == id)
+        else {
+            continue;
+        };
+        if &tab.title != title {
+            tab.title = title.clone();
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                id = id.as_str(),
+                title = title.as_str(),
+                "[editor] panel tab retitled"
+            );
+        }
+    }
+}
+
+/// Focuses the tab of module panel `panel_id`, opening one in the active
+/// tabset when the panel is not docked yet. A panel whose module is not
+/// loaded still opens: the placeholder is what a restored layout shows.
+pub fn focus_module_panel(state: &mut EditorShellState, panel_id: &str) {
+    let existing = state.layout.nodes.iter().find_map(|(id, node)| match node {
+        LayoutNode::Tab(tab) => match &tab.panel {
+            PanelKind::Module(registered) if registered == panel_id => Some(*id),
+            _ => None,
+        },
+        _ => None,
+    });
+    let outcome = match existing {
+        Some(tab) => state
+            .layout
+            .apply(LayoutAction::SelectTab { tab })
+            .map(|_| true),
+        None => match state.layout.resolved_active_tabset() {
+            Some(target) => state
+                .layout
+                .apply(LayoutAction::OpenTab {
+                    panel: PanelKind::Module(panel_id.to_string()),
+                    target_tabset: target,
+                })
+                .map(|_| false),
+            None => {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = panel_id,
+                    "[editor] panel focus has no tabset to open into"
+                );
+                return;
+            }
+        },
+    };
+    match outcome {
+        Ok(existing) => pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = panel_id,
+            existing,
+            "[editor] panel focused"
+        ),
+        Err(error) => pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = panel_id,
+            error = %error,
+            "[editor] panel focus failed"
+        ),
+    }
+}
+
 /// Executes a registered command by id: logs it, hands it to every module
 /// owner through the inbox, and runs the built-ins of this crate.
 ///
@@ -696,6 +1000,12 @@ pub fn execute_command(
         "[editor] command executed"
     );
     inbox.executed.push(id.to_string());
+    // A module panel's Window entry names its panel; focusing opens the
+    // tab when the panel is not docked yet.
+    if let Some(panel_id) = id.strip_prefix("editor.panel.") {
+        focus_module_panel(state, panel_id);
+        return true;
+    }
     match id {
         "editor.pause_toggle" => {
             pending.push(vec![EditorCommand::SetPaused {
