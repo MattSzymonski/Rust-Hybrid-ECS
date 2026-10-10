@@ -548,6 +548,8 @@ mod tests {
             PanelKind::Inspector,
             PanelKind::Systems,
             PanelKind::Console,
+            // Problems shares the Console's tab set; both have to go.
+            PanelKind::Problems,
             PanelKind::Statistics,
             PanelKind::Preferences,
             PanelKind::Gallery,

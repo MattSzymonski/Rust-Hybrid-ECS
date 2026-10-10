@@ -71,8 +71,9 @@ const CLASSIC_LAYOUT_FILE: &str = "editor_layout.json";
 const KEYBINDINGS_FILE: &str = "keybindings.json";
 
 /// The preferences file (D31).
-/// The preferences file's name, next to the layout file (D31).
-pub const PREFERENCES_FILE: &str = "preferences.json";
+/// The preferences file's name, next to the layout file (D31); the shared
+/// constant lives in `pill_editor_core` because the executable writes it too.
+pub const PREFERENCES_FILE: &str = pill_editor_core::commands::PREFERENCES_FILE;
 
 /// The menu bar's height, in logical pixels; the dock layout gets what is
 /// left below it.
@@ -206,6 +207,11 @@ pub struct EditorShellState {
     pub toasts: std::collections::VecDeque<Toast>,
     /// The problems revision last handled, so the shell logs a change once.
     pub notices_revision_seen: u64,
+    /// The gizmo tool choices (Stage 20) the shell last saw in the
+    /// preferences file: what a toggle command negates. The executable
+    /// owns the per-project entry and writes it back; the file returning
+    /// through `sync_command_files` is what keeps this mirror honest.
+    pub gizmo: pill_editor_core::commands::GizmoProjectPreferences,
 }
 
 /// One toast: a short-lived line about something the host did (Stage 19).
@@ -344,6 +350,7 @@ impl EditorShellState {
             panel_text: std::collections::BTreeMap::new(),
             toasts: std::collections::VecDeque::new(),
             notices_revision_seen: 0,
+            gizmo: pill_editor_core::commands::GizmoProjectPreferences::default(),
         }
     }
 }
@@ -1281,14 +1288,18 @@ fn preferences_panel(
 ) {
     builder.heading("Preferences");
     builder.label("Preferences file (live-reloaded; blank keeps the default).");
-    builder.separator();
+    // The file's current document, parsed once: it seeds the fields, and it
+    // is the base the save writes back into, so keys this panel does not own
+    // (the theme, the executable's per-project gizmo entry) survive a save.
+    let mut document: serde_json::Map<String, serde_json::Value> = extras
+        .preferences_text
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
     // Seed the buffers once from the file, so the fields start where the
     // file is; later edits live in the buffers until saved.
     if !extras.text.contains_key("preferences_seeded") {
-        let current: serde_json::Value = extras
-            .preferences_text
-            .and_then(|text| serde_json::from_str(text).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
+        let current = serde_json::Value::Object(document.clone());
         let seed =
             |key: &str, source: &str, buffer: &mut std::collections::BTreeMap<String, String>| {
                 let value = current
@@ -1305,15 +1316,40 @@ fn preferences_panel(
         seed("autosave", "autosave_interval_seconds", extras.text);
         seed("step_cap", "history_step_cap", extras.text);
         seed("memory_mb", "history_memory_budget_mb", extras.text);
+        // The snapping steps (Stage 20) are nested; seed each from its own
+        // key with the default the gizmo uses when the file has none.
+        let steps = current.get("snapping_steps");
+        let mut seed_step = |key: &str, source: &str, fallback: &str| {
+            let value = steps
+                .and_then(|steps| steps.get(source))
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| fallback.to_string());
+            extras
+                .text
+                .entry(format!("snapping_{key}"))
+                .or_insert(value);
+        };
+        seed_step("translation", "translation", "0.5");
+        seed_step("rotation", "rotation_degrees", "15");
+        seed_step("scale", "scale", "0.1");
         extras
             .text
             .insert("preferences_seeded".to_string(), "1".to_string());
     }
+    // The tools row: the same commands the shortcuts and the menu fire. It
+    // closes the panel rather than opening it, so the form's first row
+    // stays the first thing a short dock shows.
+    builder.separator();
     let mut save = false;
     for (key, label) in [
         ("preset", "keymap preset"),
         ("code_editor", "code editor command"),
         ("autosave", "autosave seconds"),
+        // The snapping steps sit above the history limits: together with the
+        // Save button they fit the dock without scrolling past each other.
+        ("snapping_translation", "snap translate step"),
+        ("snapping_rotation", "snap rotate degrees"),
+        ("snapping_scale", "snap scale step"),
         ("step_cap", "undo step cap"),
         ("memory_mb", "undo memory MB"),
     ] {
@@ -1326,8 +1362,23 @@ fn preferences_panel(
     builder.row(|row| {
         save = row.button("Save preferences");
     });
+    // The gizmo tool row (Stage 20): the same commands the shortcuts and the
+    // menu fire, for a user who would rather click the mode than chord it.
+    builder.label("Gizmo tool");
+    builder.row(|row| {
+        for (label, id) in [
+            ("Translate", "editor.tool_translate"),
+            ("Rotate", "editor.tool_rotate"),
+            ("Scale", "editor.tool_scale"),
+            ("Snap", "editor.tool_snap_toggle"),
+            ("Local/World", "editor.tool_space_toggle"),
+        ] {
+            if row.button(label) {
+                work.command(id);
+            }
+        }
+    });
     if save {
-        let mut document = serde_json::Map::new();
         let take =
             |key: &str, source: &str, target: &mut serde_json::Map<String, serde_json::Value>| {
                 let text = extras
@@ -1351,6 +1402,22 @@ fn preferences_panel(
         take("autosave", "autosave_interval_seconds", &mut document);
         take("step_cap", "history_step_cap", &mut document);
         take("memory_mb", "history_memory_budget_mb", &mut document);
+        // The snapping steps belong together, as the gizmo reads them.
+        let number = |key: &str, fallback: f64| -> f64 {
+            extras
+                .text
+                .get(&format!("preferences_{key}"))
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .unwrap_or(fallback)
+        };
+        document.insert(
+            "snapping_steps".to_string(),
+            serde_json::json!({
+                "translation": number("snapping_translation", 0.5),
+                "rotation_degrees": number("snapping_rotation", 15.0),
+                "scale": number("snapping_scale", 0.1),
+            }),
+        );
         work.preferences = Some(serde_json::Value::Object(document).to_string());
     }
 }
@@ -1634,6 +1701,20 @@ pub fn sync_command_files(
                             "[editor] history trimmed"
                         );
                     }
+                    // The gizmo tool choices (Stage 20): the file returning
+                    // after the executable writes it back is what keeps the
+                    // shell's mirror in step, so toggling reads from here.
+                    state.gizmo = preferences
+                        .gizmo
+                        .as_ref()
+                        .map(
+                            |gizmo| pill_editor_core::commands::GizmoProjectPreferences {
+                                mode: gizmo.mode,
+                                space: gizmo.space,
+                                snap: gizmo.snap,
+                            },
+                        )
+                        .unwrap_or_default();
                 }
                 Err(error) => {
                     report_once(state, &format!("preferences: could not parse: {error}"));
@@ -1641,6 +1722,38 @@ pub fn sync_command_files(
             }
         }
     }
+}
+
+/// Queue one gizmo tool change, remembering it in the shell's mirror.
+///
+/// The mirror is what a later toggle negates before the file comes back
+/// around; the executable applies the batch and persists the choice under
+/// the current project's name, which it alone knows.
+fn gizmo_command(
+    state: &mut EditorShellState,
+    pending: &mut PendingEditorCommands,
+    mode: Option<pill_editor_core::gizmo::GizmoMode>,
+    space: Option<pill_editor_core::gizmo::GizmoSpace>,
+    snap: Option<bool>,
+) {
+    if let Some(mode) = mode {
+        state.gizmo.mode = Some(mode);
+    }
+    if let Some(space) = space {
+        state.gizmo.space = Some(space);
+    }
+    if let Some(snap) = snap {
+        state.gizmo.snap = Some(snap);
+    }
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        mode = ?state.gizmo.mode,
+        space = ?state.gizmo.space,
+        snap = ?state.gizmo.snap,
+        "[editor] gizmo tool"
+    );
+    pending.push(vec![EditorCommand::SetGizmoTool { mode, space, snap }]);
 }
 
 /// Reports one problem the first time; repeats are dropped.
@@ -1896,6 +2009,42 @@ pub fn execute_command(
             }]);
         }
         "editor.step" => pending.push(vec![EditorCommand::StepOnce]),
+        // The transform tools (Stage 20). The shell flips its mirror, the
+        // executable applies the change to the gizmo state and writes the
+        // per-project preference.
+        "editor.tool_translate" => gizmo_command(
+            state,
+            pending,
+            Some(pill_editor_core::gizmo::GizmoMode::Translate),
+            None,
+            None,
+        ),
+        "editor.tool_rotate" => gizmo_command(
+            state,
+            pending,
+            Some(pill_editor_core::gizmo::GizmoMode::Rotate),
+            None,
+            None,
+        ),
+        "editor.tool_scale" => gizmo_command(
+            state,
+            pending,
+            Some(pill_editor_core::gizmo::GizmoMode::Scale),
+            None,
+            None,
+        ),
+        "editor.tool_snap_toggle" => {
+            let snap = !state.gizmo.snap.unwrap_or(false);
+            gizmo_command(state, pending, None, None, Some(snap));
+        }
+        "editor.tool_space_toggle" => {
+            use pill_editor_core::gizmo::GizmoSpace;
+            let space = match state.gizmo.space.unwrap_or(GizmoSpace::World) {
+                GizmoSpace::World => GizmoSpace::Local,
+                GizmoSpace::Local => GizmoSpace::World,
+            };
+            gizmo_command(state, pending, None, Some(space), None);
+        }
         // The clipboard commands queue their intent; the hot root runs it
         // where the frame and the snapshot are in scope (Stage 18, D28).
         "editor.copy" => state.clipboard_action = Some(ClipboardAction::Copy),

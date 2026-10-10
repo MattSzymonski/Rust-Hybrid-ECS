@@ -40,6 +40,7 @@ use pill_editor_api::{
 };
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::editor_state::EditorCommand;
+use pill_editor_core::gizmo::{self, GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
 use pill_editor_core::history::{CommandHistory, HistoryEntry};
 use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
 use pill_host::{HostConfig, HostNotice, RenderingHost};
@@ -95,6 +96,119 @@ const SCENE_SURFACE: SurfaceId = SurfaceId(1);
 /// How many toast events the shell's input may hold while nobody drains
 /// them (the fallback UI, or a shell module that failed to load).
 const TOAST_QUEUE_MAX: usize = 64;
+
+/// How much of the camera distance the gizmo handles span, so they keep a
+/// constant screen size (Stage 20).
+const GIZMO_SCREEN_FRACTION: f32 = 0.18;
+
+/// Where along a handle a scripted drag presses: inside the head, which the
+/// pick buffer has a triangle for.
+const GIZMO_PRESS_FRACTION: f32 = 0.92;
+
+/// Frames between gizmo anchor heartbeats.
+const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
+
+#[cfg(test)]
+mod gizmo_tests {
+    use super::*;
+
+    /// A live entity handle: the commands the drag builds name one, and the
+    /// world is the only place a handle comes from.
+    fn entity() -> pill_engine_core::Entity {
+        let mut world = pill_engine_core::World::new();
+        world
+            .create_entity()
+            .build()
+            .expect("an entity with no components")
+    }
+
+    /// The drag commands are the whole drop target of a gizmo move, so they
+    /// are driven here the way a stub renderer's pick answer would drive
+    /// them - no window, no GPU.
+    #[test]
+    fn a_translate_drag_writes_the_snapped_axis_value() {
+        let original = TransformComponent {
+            translation: [1.0, 2.0, 3.0],
+            ..Default::default()
+        };
+        let mut settings = GizmoSettings::default();
+        let (commands, value) = gizmo_drag_commands(
+            GizmoMode::Translate,
+            0,
+            entity(),
+            &original,
+            1.5,
+            &settings,
+            2.0,
+        );
+        assert_eq!(commands.len(), 1);
+        let EditorCommand::SetArrayElement {
+            field,
+            index,
+            value: written,
+            ..
+        } = &commands[0]
+        else {
+            panic!("a translate drag writes one array element");
+        };
+        assert_eq!(field, "translation");
+        assert_eq!(*index, 0);
+        assert_eq!(value[0], 2.5);
+        assert!(matches!(written, pill_engine_core::FieldValue::F32(v) if *v == 2.5));
+
+        // Snapped, the same drag lands on the step.
+        settings.snap = true;
+        settings.translate_step = 0.5;
+        let (_, value) = gizmo_drag_commands(
+            GizmoMode::Translate,
+            0,
+            entity(),
+            &original,
+            1.7,
+            &settings,
+            2.0,
+        );
+        assert_eq!(value[0], 2.5, "1.0 + snap(1.7, 0.5) = 1.0 + 1.5");
+    }
+
+    /// A rotation drag writes all four quaternion elements, a scale drag its
+    /// own single element, snapped to the step.
+    #[test]
+    fn rotation_and_scale_write_their_fields() {
+        let original = TransformComponent::default();
+        let mut settings = GizmoSettings::default();
+        settings.snap = true;
+        settings.rotate_step_degrees = 15.0;
+        settings.scale_step = 0.5;
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let (commands, value) = gizmo_drag_commands(
+            GizmoMode::Rotate,
+            1,
+            entity(),
+            &original,
+            quarter,
+            &settings,
+            2.0,
+        );
+        assert_eq!(commands.len(), 4, "a rotation writes the whole quaternion");
+        let expected = gizmo::axis_angle_quaternion(gizmo::AXES[1], std::f32::consts::FRAC_PI_2);
+        for index in 0..4 {
+            assert!(
+                (value[index] - expected[index]).abs() < 1e-4,
+                "element {index}: {} vs {}",
+                value[index],
+                expected[index]
+            );
+        }
+        let scaled = TransformComponent {
+            scale: [1.0, 1.0, 1.0],
+            ..Default::default()
+        };
+        let (_, value) =
+            gizmo_drag_commands(GizmoMode::Scale, 2, entity(), &scaled, 0.6, &settings, 2.0);
+        assert_eq!(value[0], 1.5, "1.0 * (1 + 0.6/2) snapped to 0.5");
+    }
+}
 
 // =============================================================================
 // run
@@ -380,6 +494,30 @@ struct EditorWindow {
     /// The entity the outlines currently name, so the world resource is
     /// rewritten only on a change.
     outlined_entity: Option<pill_engine_core::Entity>,
+    /// The gizmo drag in flight, if any (Stage 20).
+    gizmo_drag: Option<GizmoDrag>,
+    /// The project this editor opened, by directory name: the key the gizmo
+    /// preferences are remembered under.
+    gizmo_project: Option<String>,
+    /// The gizmo settings last written to the preferences file, so the write
+    /// happens on a change instead of every frame.
+    gizmo_persisted: Option<GizmoSettings>,
+    /// The gizmo header (mode, space, anchor) last logged, so it logs on a
+    /// change rather than every frame.
+    gizmo_logged: Option<(GizmoMode, GizmoSpace, i32, i32)>,
+    /// A scripted gizmo drag waiting to start (test channel, Stage 20): the
+    /// axis to grab and the pixel delta to drag by.
+    synthetic_gizmo_drag: Option<(usize, f32, f32)>,
+    /// The pixel delta of the scripted drag whose pick is in flight; `None`
+    /// for a press the real mouse issued.
+    synthetic_gizmo_pending: Option<(f32, f32)>,
+    /// The scripted press's pixel neighbourhood: the request ids still in
+    /// flight, so the first pixel that names a handle starts the drag and a
+    /// full miss refuses it.
+    synthetic_press_ids: Vec<u64>,
+    /// Counter naming each drag's coalesce key, so one drag is one undo step
+    /// and the next drag is a new one.
+    gizmo_drag_seq: u64,
 }
 
 impl EditorWindow {
@@ -475,6 +613,28 @@ impl EditorWindow {
             .host()
             .asset_directory()
             .map(|path| path.to_string_lossy().into_owned());
+        // The gizmo tool's starting state (Stage 20): the project's own
+        // remembered choice, the file's last-used values, or the defaults.
+        // The project's directory name keys the per-project entry, and the
+        // executable is the one place that knows it.
+        let gizmo_project = std::env::var("PROJECT_PATH").ok().and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let gizmo_settings = match &gizmo_project {
+            Some(project) => pill_editor_core::commands::read_gizmo_settings(
+                &pill_editor_core::layout::layout_directory(),
+                project,
+            ),
+            None => GizmoSettings::default(),
+        };
+        host.host_mut()
+            .engine_mut()
+            .world_mut()
+            .insert_resource(GizmoState {
+                settings: gizmo_settings,
+            });
         // The console's capture ring, for the shell's Console panel (Stage
         // 17); present even when telemetry setup failed, so the panel
         // always has a reader.
@@ -595,6 +755,14 @@ impl EditorWindow {
             pending_pick: None,
             scene_press: None,
             outlined_entity: None,
+            gizmo_drag: None,
+            gizmo_project,
+            gizmo_persisted: Some(gizmo_settings),
+            gizmo_logged: None,
+            synthetic_gizmo_drag: None,
+            synthetic_gizmo_pending: None,
+            synthetic_press_ids: Vec::new(),
+            gizmo_drag_seq: 0,
         })
     }
 
@@ -781,6 +949,16 @@ impl EditorWindow {
                             "[editor] test channel: drag-out request"
                         );
                         self.start_drag_out(&path);
+                    }
+                    TestCommand::GizmoDrag { axis, dx, dy } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            axis,
+                            dx,
+                            dy,
+                            "[editor] test channel: gizmo drag request"
+                        );
+                        self.synthetic_gizmo_drag = Some((axis, dx, dy));
                     }
                     TestCommand::Edit(edit) => self.apply_edit(edit),
                     TestCommand::Dump(query) => self.dump_world(query),
@@ -1280,8 +1458,12 @@ impl EditorWindow {
     /// the plan wants (keys reach the game only with the game view focused,
     /// D29).
     fn game_view_event(&mut self, event: &WindowEvent) {
-        if matches!(event, WindowEvent::Resized(_)) {
+        if let WindowEvent::Resized(size) = event {
+            // The game surface is the renderer's primary one; its window
+            // resize must reach the swapchain, like any frontend forwards
+            // its window's (Stage 20 found the gap through scene picking).
             self.game.placed = None;
+            self.host.resize(size.width.max(1), size.height.max(1));
         }
         for event in translate_window_event(event) {
             self.host.push_input(event);
@@ -1292,8 +1474,15 @@ impl EditorWindow {
     /// view never forwards input to the game. Orbit on right drag, pan on
     /// middle drag, dolly on the wheel, and WASD moves the focus point.
     fn scene_view_event(&mut self, event: &WindowEvent) {
-        if matches!(event, WindowEvent::Resized(_)) {
+        if let WindowEvent::Resized(size) = event {
+            // The scene surface reconfigures with its window: the render
+            // target is what pick pixels are counted in, and a stale target
+            // sends every pick to the wrong texel (Stage 20).
             self.scene.placed = None;
+            if self.scene_attached {
+                self.host
+                    .resize_surface(SCENE_SURFACE, size.width.max(1), size.height.max(1));
+            }
         }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
@@ -1307,6 +1496,11 @@ impl EditorWindow {
                     }
                 }
                 self.scene.last_cursor = Some((position.x as f32, position.y as f32));
+                // A gizmo drag follows the cursor (Stage 20); the move is a
+                // re-read of the ray, not an accumulation of deltas.
+                if self.gizmo_drag.is_some() {
+                    self.update_gizmo_drag(position.x as f32, position.y as f32);
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => match button {
                 winit::event::MouseButton::Right => {
@@ -1325,7 +1519,11 @@ impl EditorWindow {
                         self.scene_press = self.scene.last_cursor;
                     }
                     winit::event::ElementState::Released => {
-                        if let Some((x, y)) = self.scene_press.take() {
+                        // A release while a gizmo drag runs ends the drag; the
+                        // press that started it already asked its pick.
+                        if self.gizmo_drag.is_some() {
+                            self.end_gizmo_drag();
+                        } else if let Some((x, y)) = self.scene_press.take() {
                             self.request_scene_pick(x as u32, y as u32);
                         }
                     }
@@ -1540,15 +1738,18 @@ impl EditorWindow {
     /// resource into the next render, and [`Self::drain_scene_picks`] applies
     /// whatever comes back, matched by request id.
     fn request_scene_pick(&mut self, physical_x: u32, physical_y: u32) {
+        self.pending_pick = self.queue_scene_pick(physical_x, physical_y);
+    }
+
+    /// Queue one scene pick and return its id, leaving the answer to
+    /// [`Self::drain_scene_picks`].
+    fn queue_scene_pick(&mut self, physical_x: u32, physical_y: u32) -> Option<u64> {
         let world = self.host.host_mut().engine_mut().world_mut();
         if world.get_resource::<PickRequests>().is_none() {
             world.insert_resource(PickRequests::default());
         }
-        let Some(requests) = world.get_resource_mut::<PickRequests>() else {
-            return;
-        };
+        let requests = world.get_resource_mut::<PickRequests>()?;
         let id = requests.request(SCENE_SURFACE, physical_x, physical_y);
-        self.pending_pick = Some(id);
         info!(
             target: telemetry_target::ENGINE,
             x = physical_x,
@@ -1556,6 +1757,7 @@ impl EditorWindow {
             id,
             "[editor] pick requested"
         );
+        Some(id)
     }
 
     /// Publish the selection as the renderer's outline set (Stage 20).
@@ -1602,7 +1804,51 @@ impl EditorWindow {
             Some(results) => results.take(),
             None => return,
         };
+        // A handle press starts a drag through methods that borrow all of
+        // `self`, while the world borrow below is still alive; the press is
+        // collected here and acted on once that borrow ends.
+        let mut handle_press: Option<(u32, f32, f32, Option<(f32, f32)>)> = None;
         for result in results {
+            // A scripted press answers on any pixel of its neighbourhood:
+            // the first that names a handle starts the drag, and only a full
+            // miss refuses it. An entity under one of those pixels is not a
+            // selection - the press was aimed at a handle.
+            if let Some(index) = self
+                .synthetic_press_ids
+                .iter()
+                .position(|id| *id == result.request.id)
+            {
+                self.synthetic_press_ids.remove(index);
+                match result.hit {
+                    PickHit::Handle(handle) => {
+                        if let Some(delta) = self.synthetic_gizmo_pending.take() {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                handle,
+                                "[editor] scene pick handle"
+                            );
+                            handle_press = Some((
+                                handle,
+                                result.request.x as f32,
+                                result.request.y as f32,
+                                Some(delta),
+                            ));
+                        }
+                    }
+                    _ => {
+                        if self.synthetic_press_ids.is_empty()
+                            && self.synthetic_gizmo_pending.is_some()
+                        {
+                            self.synthetic_gizmo_pending = None;
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                "[editor] gizmo drag refused: the press point hit no handle"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             if Some(result.request.id) != self.pending_pick {
                 continue;
             }
@@ -1651,8 +1897,496 @@ impl EditorWindow {
                         handle,
                         "[editor] scene pick handle"
                     );
+                    let scripted = self.synthetic_gizmo_pending.take();
+                    handle_press = Some((
+                        handle,
+                        result.request.x as f32,
+                        result.request.y as f32,
+                        scripted,
+                    ));
                 }
             }
+        }
+        if let Some((handle, press_x, press_y, scripted)) = handle_press {
+            self.begin_gizmo_drag(handle, press_x, press_y);
+            if let Some((delta_x, delta_y)) = scripted {
+                if self.gizmo_drag.is_some() {
+                    // One frame's press, move and release, through the same
+                    // projections a real drag uses.
+                    self.update_gizmo_drag(press_x + delta_x, press_y + delta_y);
+                    self.end_gizmo_drag();
+                } else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] gizmo drag refused the scripted press"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Draw the gizmo handles for the selection (Stage 20).
+    ///
+    /// The contract's own primitives, handle ids set: the same frame the
+    /// renderer draws is the frame it picks, so a handle a drag grabs is
+    /// always the handle that was on screen. Handles keep a constant screen
+    /// size (their world length follows the camera distance), and the frame
+    /// they are drawn into is one frame's worth - nothing to clear here.
+    fn publish_gizmo_geometry(&mut self) {
+        // Read the frame's inputs first: the world borrow must end before
+        // the camera helpers (which borrow `self`) run.
+        let (settings, entity, transform) = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let settings = world
+                .get_resource::<GizmoState>()
+                .map(|state| state.settings)
+                .unwrap_or_default();
+            let selected = world
+                .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+                .and_then(|selection| selection.entity);
+            let transform = selected.and_then(|entity| {
+                read_transform(world, entity).map(|transform| (entity, transform))
+            });
+            match transform {
+                Some((entity, transform)) => (settings, entity, transform),
+                None => return,
+            }
+        };
+        let origin = transform.translation;
+        let basis = self.gizmo_basis(settings.space, &transform);
+        let length = self.gizmo_length(origin);
+        let geometry = gizmo::build_geometry(settings.mode, origin, basis, length);
+        let anchor = self.project_to_screen(origin);
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if world
+            .get_resource::<pill_engine_core::debug_draw::DebugDraw>()
+            .is_none()
+        {
+            world.insert_resource(pill_engine_core::debug_draw::DebugDraw::new(true));
+        }
+        if let Some(debug) = world.get_resource_mut::<pill_engine_core::debug_draw::DebugDraw>() {
+            for (start, end, color, handle) in &geometry.lines {
+                debug.gizmo_line(*start, *end, *color, *handle);
+            }
+            for (corners, color, handle) in &geometry.triangles {
+                debug.gizmo_triangle(*corners, *color, *handle);
+            }
+        }
+        // The anchor line, on a change or on the periodic cadence: what the
+        // suite (and a developer) reads to know where the handles are.
+        if let Some((x, y)) = anchor {
+            let header = (settings.mode, settings.space, x as i32, y as i32);
+            if self.gizmo_logged != Some(header)
+                || self.frame_count.is_multiple_of(GIZMO_HEARTBEAT_FRAMES)
+            {
+                self.gizmo_logged = Some(header);
+                info!(
+                    target: telemetry_target::ENGINE,
+                    entity = %entity,
+                    mode = gizmo_mode_name(settings.mode),
+                    space = gizmo_space_name(settings.space),
+                    x,
+                    y,
+                    handles = geometry.lines.len() + geometry.triangles.len(),
+                    snapped = settings.snap,
+                    "[editor] gizmo anchor"
+                );
+            }
+        }
+    }
+
+    /// Write a changed gizmo choice to the project's preferences entry.
+    ///
+    /// The executable owns this write because it is the side that knows the
+    /// project; the shell's commands only queue the change. The file coming
+    /// back through the shell's live reader is what keeps the shell's mirror
+    /// honest.
+    fn persist_gizmo_settings(&mut self) {
+        let settings = self
+            .host
+            .host_mut()
+            .engine_mut()
+            .world()
+            .get_resource::<GizmoState>()
+            .map(|state| state.settings);
+        let Some(settings) = settings else {
+            return;
+        };
+        if self.gizmo_persisted == Some(settings) {
+            return;
+        }
+        self.gizmo_persisted = Some(settings);
+        let Some(project) = self.gizmo_project.clone() else {
+            return;
+        };
+        let directory = pill_editor_core::layout::layout_directory();
+        match pill_editor_core::commands::write_gizmo_preferences(&directory, &project, &settings) {
+            Ok(()) => info!(
+                target: telemetry_target::ENGINE,
+                project = project.as_str(),
+                mode = gizmo_mode_name(settings.mode),
+                snap = settings.snap,
+                "[editor] gizmo preferences written"
+            ),
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                error = error.as_str(),
+                "[editor] gizmo preferences write failed"
+            ),
+        }
+    }
+
+    /// The frame the gizmo's axes are measured in.
+    fn gizmo_basis(&self, space: GizmoSpace, transform: &TransformComponent) -> [[f32; 3]; 3] {
+        if space == GizmoSpace::World {
+            return gizmo::AXES;
+        }
+        [
+            gizmo::rotate_vector(transform.rotation, gizmo::AXES[0]),
+            gizmo::rotate_vector(transform.rotation, gizmo::AXES[1]),
+            gizmo::rotate_vector(transform.rotation, gizmo::AXES[2]),
+        ]
+    }
+
+    /// How long the handles are, in world units, at `origin`: a constant
+    /// fraction of the camera distance, so the gizmo neither shrinks away
+    /// nor swallows the scene.
+    fn gizmo_length(&self, origin: [f32; 3]) -> f32 {
+        (gizmo::distance(self.camera.eye(), origin) * GIZMO_SCREEN_FRACTION).clamp(0.05, 50.0)
+    }
+
+    /// The scene surface's size in physical pixels: the live window size,
+    /// which the surface was attached and resized with. The last placed
+    /// rectangle is only a fallback for a window that reports none yet.
+    fn scene_pixel_size(&self) -> Option<(f32, f32)> {
+        let size = self.scene.window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            return Some((size.width as f32, size.height as f32));
+        }
+        let (_, _, width, height) = self.scene.placed?;
+        Some((width as f32, height as f32))
+    }
+
+    /// The cursor ray through one physical pixel of the scene surface.
+    ///
+    /// Built from the editor camera's basis and the contract camera's
+    /// vertical field of view - the same numbers the renderer projects with,
+    /// so a pick and a drag agree about what a pixel looks at. `None` when
+    /// the surface has no usable size yet.
+    fn scene_ray(&self, x: f32, y: f32) -> Option<([f32; 3], [f32; 3])> {
+        let (width, height) = self.scene_pixel_size()?;
+        let (tan, aspect) = self.projection_terms(width, height);
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let up = gizmo::cross(right, forward);
+        let ndc_x = x / width * 2.0 - 1.0;
+        let ndc_y = 1.0 - y / height * 2.0;
+        let direction = gizmo::add(
+            forward,
+            gizmo::add(
+                gizmo::scale(right, ndc_x * tan * aspect),
+                gizmo::scale(up, ndc_y * tan),
+            ),
+        );
+        gizmo::normalize(direction).map(|direction| (self.camera.eye(), direction))
+    }
+
+    /// Where a world point lands on the scene surface, in physical pixels.
+    fn project_to_screen(&self, point: [f32; 3]) -> Option<(f32, f32)> {
+        let (width, height) = self.scene_pixel_size()?;
+        let (tan, aspect) = self.projection_terms(width, height);
+        let eye = self.camera.eye();
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let up = gizmo::cross(right, forward);
+        let relative = gizmo::sub(point, eye);
+        let depth = gizmo::dot(relative, forward);
+        if depth <= 1e-4 {
+            return None;
+        }
+        let ndc_x = gizmo::dot(relative, right) / (depth * tan * aspect);
+        let ndc_y = gizmo::dot(relative, up) / (depth * tan);
+        Some(((ndc_x + 1.0) * 0.5 * width, (1.0 - ndc_y) * 0.5 * height))
+    }
+
+    /// The tangent of half the vertical field of view, and the aspect ratio.
+    fn projection_terms(&self, width: f32, height: f32) -> (f32, f32) {
+        let fov = CameraComponent::default().vertical_fov.clamp(1.0, 179.0);
+        let tan = (fov.to_radians() * 0.5).tan();
+        (tan, (width / height).max(1e-3))
+    }
+
+    /// Press on one axis handle of the active tool (the test channel, Stage
+    /// 20): the press pixel is the handle tip's own, so the pick that answers
+    /// it is proving the same geometry the renderer draws.
+    fn start_synthetic_gizmo_drag(&mut self, axis: usize, delta_x: f32, delta_y: f32) {
+        if self.gizmo_drag.is_some() {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo drag refused: one is already in flight"
+            );
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let settings = world
+            .get_resource::<GizmoState>()
+            .map(|state| state.settings)
+            .unwrap_or_default();
+        let selected = world
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.entity);
+        let Some(entity) = selected else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo drag refused: nothing is selected"
+            );
+            return;
+        };
+        let Some(transform) = read_transform(world, entity) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                entity = %entity,
+                "[editor] gizmo drag refused: the entity has no transform"
+            );
+            return;
+        };
+        let basis = self.gizmo_basis(settings.space, &transform);
+        let length = self.gizmo_length(transform.translation);
+        // A rotation ring is a circle of `length` radius, so its grab point
+        // sits on that radius - at the diagonal of the two axes the ring
+        // turns around, where no other ring passes a pixel away. The
+        // straight handles are grabbed just short of their tip instead,
+        // along their own axis.
+        let grab_direction = match settings.mode {
+            GizmoMode::Rotate => {
+                gizmo::normalize(gizmo::add(basis[(axis + 1) % 3], basis[(axis + 2) % 3]))
+                    .unwrap_or(basis[axis])
+            }
+            _ => basis[axis],
+        };
+        let grab_distance = match settings.mode {
+            GizmoMode::Rotate => length,
+            _ => length * GIZMO_PRESS_FRACTION,
+        };
+        let tip = gizmo::add(
+            transform.translation,
+            gizmo::scale(grab_direction, grab_distance),
+        );
+        let Some((x, y)) = self.project_to_screen(tip) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo drag refused: the handle is behind the camera"
+            );
+            return;
+        };
+        self.synthetic_gizmo_pending = Some((delta_x, delta_y));
+        info!(
+            target: telemetry_target::ENGINE,
+            axis = gizmo_axis_name(axis),
+            x,
+            y,
+            "[editor] gizmo drag press"
+        );
+        // The press pixel projects onto the handle's own geometry, but a
+        // one-pixel line straddles pixel rows and a truncated coordinate
+        // can land on the row next to it: the press asks the exact pixel
+        // and its four neighbours, and the first that names a handle wins.
+        let (centre_x, centre_y) = (x.round() as i64, y.round() as i64);
+        self.synthetic_press_ids.clear();
+        for (pixel_x, pixel_y) in [
+            (centre_x, centre_y),
+            (centre_x - 1, centre_y),
+            (centre_x + 1, centre_y),
+            (centre_x, centre_y - 1),
+            (centre_x, centre_y + 1),
+        ] {
+            if let Some(id) = self.queue_scene_pick(pixel_x.max(0) as u32, pixel_y.max(0) as u32) {
+                self.synthetic_press_ids.push(id);
+            }
+        }
+    }
+
+    /// Begin a drag from a handle pick: the press pixel's ray records the
+    /// parameter or angle every later move is measured against.
+    fn begin_gizmo_drag(&mut self, handle: u32, press_x: f32, press_y: f32) {
+        let Some((mode, axis)) = gizmo::handle_axis(handle) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                handle,
+                "[editor] gizmo drag refused: unknown handle"
+            );
+            return;
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let settings = world
+            .get_resource::<GizmoState>()
+            .map(|state| state.settings)
+            .unwrap_or_default();
+        let selected = world
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.entity);
+        let Some(entity) = selected else {
+            return;
+        };
+        let Some(original) = read_transform(world, entity) else {
+            return;
+        };
+        let Some((ray_origin, ray_direction)) = self.scene_ray(press_x, press_y) else {
+            return;
+        };
+        let basis = self.gizmo_basis(settings.space, &original);
+        let origin = original.translation;
+        let start_value = match mode {
+            GizmoMode::Rotate => {
+                let Some(point) =
+                    gizmo::ray_plane_point(origin, basis[axis], ray_origin, ray_direction)
+                else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] gizmo drag refused: the ray is parallel to the ring"
+                    );
+                    return;
+                };
+                gizmo::plane_angle(origin, basis[axis], point)
+            }
+            _ => {
+                let Some(value) =
+                    gizmo::closest_axis_point(origin, basis[axis], ray_origin, ray_direction)
+                else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] gizmo drag refused: the ray is parallel to the axis"
+                    );
+                    return;
+                };
+                value
+            }
+        };
+        self.gizmo_drag_seq += 1;
+        let reference = self.gizmo_length(origin);
+        self.gizmo_drag = Some(GizmoDrag {
+            mode,
+            axis,
+            entity,
+            original,
+            start_value,
+            reference,
+            coalesce_key: format!("gizmo.drag.{}", self.gizmo_drag_seq),
+            last_value: None,
+        });
+        info!(
+            target: telemetry_target::ENGINE,
+            mode = gizmo_mode_name(mode),
+            axis = gizmo_axis_name(axis),
+            entity = %entity,
+            handle,
+            "[editor] gizmo drag started"
+        );
+    }
+
+    /// Apply one move of the drag in flight: re-read the ray, take the delta
+    /// against the press, snap it when the tool snaps, and queue the recorded
+    /// batch every frame of the drag coalesces into.
+    fn update_gizmo_drag(&mut self, cursor_x: f32, cursor_y: f32) {
+        let Some(drag) = self.gizmo_drag.as_ref() else {
+            return;
+        };
+        let (mode, axis) = (drag.mode, drag.axis);
+        let entity = drag.entity;
+        let reference = drag.reference;
+        let start_value = drag.start_value;
+        let original = drag.original;
+        let coalesce_key = drag.coalesce_key.clone();
+        let Some((ray_origin, ray_direction)) = self.scene_ray(cursor_x, cursor_y) else {
+            return;
+        };
+        // The settings and the basis come first: both borrow `self`, and the
+        // world borrow below must not overlap them.
+        let settings = self
+            .host
+            .host_mut()
+            .engine_mut()
+            .world()
+            .get_resource::<GizmoState>()
+            .map(|state| state.settings)
+            .unwrap_or_default();
+        let basis = self.gizmo_basis(settings.space, &original);
+        let origin = original.translation;
+        let delta = match mode {
+            GizmoMode::Rotate => {
+                let Some(point) =
+                    gizmo::ray_plane_point(origin, basis[axis], ray_origin, ray_direction)
+                else {
+                    return;
+                };
+                gizmo::wrap_angle(gizmo::plane_angle(origin, basis[axis], point) - start_value)
+            }
+            _ => {
+                let Some(value) =
+                    gizmo::closest_axis_point(origin, basis[axis], ray_origin, ray_direction)
+                else {
+                    return;
+                };
+                value - start_value
+            }
+        };
+        let (commands, value) =
+            gizmo_drag_commands(mode, axis, entity, &original, delta, &settings, reference);
+        if commands.is_empty() {
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if world
+            .get_resource::<pill_editor_core::commands::PendingEditorCommands>()
+            .is_none()
+        {
+            world.insert_resource(pill_editor_core::commands::PendingEditorCommands::default());
+        }
+        if let Some(pending) =
+            world.get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
+        {
+            pending.push_recorded(
+                commands,
+                format!("gizmo {}", gizmo_mode_name(mode)),
+                Some(coalesce_key),
+            );
+        }
+        if let Some(drag) = self.gizmo_drag.as_mut() {
+            drag.last_value = Some(value);
+        }
+    }
+
+    /// End the drag in flight, reporting what it did; the coalesced batch it
+    /// queued is the single undo step.
+    fn end_gizmo_drag(&mut self) {
+        let Some(drag) = self.gizmo_drag.take() else {
+            return;
+        };
+        let settings = self
+            .host
+            .host_mut()
+            .engine_mut()
+            .world()
+            .get_resource::<GizmoState>()
+            .map(|state| state.settings)
+            .unwrap_or_default();
+        match drag.last_value {
+            Some(value) => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(drag.mode),
+                axis = gizmo_axis_name(drag.axis),
+                entity = %drag.entity,
+                value = ?value,
+                snapped = settings.snap,
+                "[editor] gizmo drag ended"
+            ),
+            None => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(drag.mode),
+                axis = gizmo_axis_name(drag.axis),
+                entity = %drag.entity,
+                "[editor] gizmo drag ended without a move"
+            ),
         }
     }
 
@@ -1811,6 +2545,14 @@ impl EditorWindow {
         // Step 2d: the selection's outline, published before the frame
         // renders through it (Stage 20); one resource write per change.
         self.publish_selection_outline();
+        // Step 2e: the gizmo handles, rebuilt every frame so they follow the
+        // entity, the camera and the tool.
+        self.publish_gizmo_geometry();
+        // Step 2f: a scripted gizmo drag (the test channel): press on the
+        // named handle through the real pick, drag, release.
+        if let Some((axis, dx, dy)) = self.synthetic_gizmo_drag.take() {
+            self.start_synthetic_gizmo_drag(axis, dx, dy);
+        }
         // Step 3: this frame's size, and the input queued since the last
         // frame, delivered to the shell module's input resource; the
         // executable's own state keeps its copy for the fallback.
@@ -2225,6 +2967,10 @@ impl EditorWindow {
         // Step 4d: answers to scene picks (Stage 20) arrived during the
         // frame's render; the selection they name is applied here.
         self.drain_scene_picks();
+        // Step 4e: a gizmo choice the shell's commands changed is written to
+        // the project's preferences entry, once, from the side that knows
+        // the project.
+        self.persist_gizmo_settings();
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
         let frame = match self.surface.get_current_texture() {
@@ -2395,6 +3141,172 @@ fn problems_from_build_output(module: &str, output: &str) -> Vec<EditorProblem> 
             column: problem.column,
         })
         .collect()
+}
+
+// =============================================================================
+// Gizmo drag (Stage 20)
+// =============================================================================
+
+/// The wire name of a tool mode, for logs and suite tokens.
+fn gizmo_mode_name(mode: GizmoMode) -> &'static str {
+    match mode {
+        GizmoMode::Translate => "translate",
+        GizmoMode::Rotate => "rotate",
+        GizmoMode::Scale => "scale",
+    }
+}
+
+/// The wire name of a gizmo space.
+fn gizmo_space_name(space: GizmoSpace) -> &'static str {
+    match space {
+        GizmoSpace::World => "world",
+        GizmoSpace::Local => "local",
+    }
+}
+
+/// The wire name of one axis, for logs and suite tokens.
+fn gizmo_axis_name(axis: usize) -> &'static str {
+    match axis {
+        0 => "x",
+        1 => "y",
+        _ => "z",
+    }
+}
+
+/// Read one entity's transform as plain arrays; `None` when the entity is
+/// not alive, carries no transform, or a field does not read back as floats.
+fn read_transform(
+    world: &pill_engine_core::World,
+    entity: pill_engine_core::Entity,
+) -> Option<TransformComponent> {
+    use pill_engine_core::FieldValue;
+    let name = pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
+    let read = |field: &str| -> Option<Vec<f32>> {
+        let value = world.read_component_field(entity, name, field).ok()?;
+        let FieldValue::Array(elements) = value else {
+            return None;
+        };
+        elements
+            .iter()
+            .map(|element| match element {
+                FieldValue::F32(value) => Some(*value),
+                _ => None,
+            })
+            .collect()
+    };
+    let translation: [f32; 3] = read("translation")?.try_into().ok()?;
+    let rotation: [f32; 4] = read("rotation")?.try_into().ok()?;
+    let scale: [f32; 3] = read("scale")?.try_into().ok()?;
+    Some(TransformComponent {
+        translation,
+        rotation,
+        scale,
+    })
+}
+
+/// The commands one gizmo drag move produces, and the values it writes (for
+/// the log).
+///
+/// Pure and renderer-free, so the drop target of the drag path - a batch of
+/// the same recorded commands a panel edit issues - is testable headlessly:
+/// the unit test drives this as a stub renderer's pick answer would, the
+/// suite drives the real one. `reference` is the handles' world length at
+/// the press, which is what a scale drag's delta is measured against.
+fn gizmo_drag_commands(
+    mode: GizmoMode,
+    axis: usize,
+    entity: pill_engine_core::Entity,
+    original: &TransformComponent,
+    delta: f32,
+    settings: &GizmoSettings,
+    reference: f32,
+) -> (Vec<EditorCommand>, [f32; 4]) {
+    use pill_engine_core::FieldValue;
+    let component = pill_engine_core::common_components::TRANSFORM_SHARED_NAME.to_string();
+    match mode {
+        GizmoMode::Translate => {
+            let delta = if settings.snap {
+                gizmo::snap_value(delta, settings.translate_step)
+            } else {
+                delta
+            };
+            let value = original.translation[axis] + delta;
+            let batch = vec![EditorCommand::SetArrayElement {
+                entity,
+                component,
+                field: "translation".to_string(),
+                index: axis,
+                value: FieldValue::F32(value),
+            }];
+            (batch, [value, 0.0, 0.0, 0.0])
+        }
+        GizmoMode::Rotate => {
+            let degrees = delta.to_degrees();
+            let degrees = if settings.snap {
+                gizmo::snap_value(degrees, settings.rotate_step_degrees)
+            } else {
+                degrees
+            };
+            let turn = gizmo::axis_angle_quaternion(gizmo::AXES[axis], degrees.to_radians());
+            let combined = quaternion_product(turn, original.rotation);
+            let batch = (0..4)
+                .map(|index| EditorCommand::SetArrayElement {
+                    entity,
+                    component: component.clone(),
+                    field: "rotation".to_string(),
+                    index,
+                    value: FieldValue::F32(combined[index]),
+                })
+                .collect();
+            (batch, combined)
+        }
+        GizmoMode::Scale => {
+            let factor = 1.0 + delta / reference.max(1e-4);
+            let mut value = original.scale[axis] * factor;
+            if settings.snap {
+                value = gizmo::snap_value(value, settings.scale_step);
+            }
+            // A zero or negative scale is a degenerate mesh; the drag stops
+            // at the smallest positive value instead.
+            let value = value.max(0.01);
+            let batch = vec![EditorCommand::SetArrayElement {
+                entity,
+                component,
+                field: "scale".to_string(),
+                index: axis,
+                value: FieldValue::F32(value),
+            }];
+            (batch, [value, 0.0, 0.0, 0.0])
+        }
+    }
+}
+
+/// One gizmo drag in flight.
+///
+/// The press records where the drag started - the axis parameter or ring
+/// angle the cursor ray named, plus the transform it started from - so every
+/// move applies a delta against it and nothing jumps on the first pixel.
+struct GizmoDrag {
+    /// The tool mode the grabbed handle belongs to.
+    mode: GizmoMode,
+    /// The axis index the handle belongs to.
+    axis: usize,
+    /// The entity being dragged.
+    entity: pill_engine_core::Entity,
+    /// The transform at the press; every move is computed from it, so a
+    /// snapped drag cannot accumulate rounding.
+    original: TransformComponent,
+    /// The axis parameter (translate, scale) or ring angle (rotate) at the
+    /// press.
+    start_value: f32,
+    /// How long the handles were at the press, in world units: the scale
+    /// drag's reference.
+    reference: f32,
+    /// The coalesce key this drag's edits share, so the whole drag is one
+    /// undo step (the same rule a slider drag follows).
+    coalesce_key: String,
+    /// The value written on the previous move, for the end log.
+    last_value: Option<[f32; 4]>,
 }
 
 /// Show and place a view surface at its layout rectangle, in logical pixels,

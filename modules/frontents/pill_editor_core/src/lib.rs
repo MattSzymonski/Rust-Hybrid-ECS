@@ -9,6 +9,8 @@
 //!   the frame boundary ([`editor_state`]).
 //! - Own the clipboard payload documents the copy and paste commands share
 //!   ([`clipboard`]).
+//! - Own the transform gizmos' geometry, drag math and snapping
+//!   ([`gizmo`]).
 //! - Declare the layout persistence failures ([`error`]).
 //!
 //! # Design
@@ -26,6 +28,8 @@ pub mod commands;
 pub mod editor_state;
 /// Layout persistence failures.
 pub mod error;
+/// Transform gizmos: handle geometry, drag math and snapping.
+pub mod gizmo;
 /// The undo and redo history of editor edits.
 pub mod history;
 /// Serializable dock model, validated mutations, and deterministic geometry.

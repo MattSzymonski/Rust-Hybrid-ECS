@@ -15,11 +15,14 @@
 #   2. MSVC build tools and the Windows SDK. The workspace links with rust-lld,
 #      but rust-lld still needs the MSVC and Windows SDK import libraries; only
 #      link.exe is replaced.
-#   3. Smart App Control, which blocks LoadLibrary of the DLLs the host
+#   3. The Slang shader compiler. The renderer-data crate's build script and
+#      the dev host's shader watcher both shell out to `slangc`; without it
+#      every build of the renderer fails.
+#   4. Smart App Control, which blocks LoadLibrary of the DLLs the host
 #      compiles at runtime for hot reload (os error 4551).
-#   4. An optional VS Code debugging setup: the editor, the .NET 8 SDK and the
+#   5. An optional VS Code debugging setup: the editor, the .NET 8 SDK and the
 #      extensions the launch profiles depend on.
-#   5. The offline cargo registry cache, so `cargo build --offline` never waits
+#   6. The offline cargo registry cache, so `cargo build --offline` never waits
 #      on the registry during a reload.
 #
 #   Before any step runs, the script prints this plan with everything it may
@@ -45,10 +48,10 @@ $ErrorActionPreference = "Stop"
 # large downloads several times slower, so turn it off.
 $ProgressPreference = "SilentlyContinue"
 
-# Shared state for the [n/5] step marker printed by Write-Step and for the
+# Shared state for the [n/6] step marker printed by Write-Step and for the
 # failure report in the top-level catch block.
 $script:StepNumber = 0
-$script:TotalSteps = 5
+$script:TotalSteps = 6
 $script:CurrentStepTitle = 'startup'
 $script:CodeExtensionCache = $null
 
@@ -59,7 +62,7 @@ function Write-Info {
     Write-Host "==> $Message" -ForegroundColor Green
 }
 
-# Prints an empty line and the "==> [n/5] Title" step marker, and remembers the
+# Prints an empty line and the "==> [n/6] Title" step marker, and remembers the
 # step title so a later failure can be reported against it.
 function Write-Step {
     param([Parameter(Mandatory = $true)][string] $Title)
@@ -250,6 +253,42 @@ function Install-VisualStudioCppBuildTools {
     }
 }
 
+# The renderer-data crate cooks every .hlsl through `slangc` at build time,
+# and the dev host's shader watcher re-cooks edits the same way. The release
+# installed below matches the version the CI image pins
+# (devops/ci_cd/Dockerfile), from the official release zip.
+$script:SlangVersion = '2025.21.2'
+
+function Test-SlangCompiler {
+    return [bool](Get-Command slangc.exe -ErrorAction SilentlyContinue)
+}
+
+function Install-SlangCompiler {
+    $installDirectory = Join-Path $env:LOCALAPPDATA "Programs\slang\$($script:SlangVersion)"
+    $slangcPath = Join-Path $installDirectory 'bin\slangc.exe'
+    if (Test-Path -LiteralPath $slangcPath) {
+        Add-UserPathEntry -Directory (Join-Path $installDirectory 'bin')
+        Write-Success "Slang shader compiler $($script:SlangVersion) is already installed."
+        return
+    }
+
+    $archive = Join-Path ([IO.Path]::GetTempPath()) "slang-$($script:SlangVersion).zip"
+    Write-Detail "Downloading the Slang shader compiler $($script:SlangVersion)..."
+    Invoke-WebRequest -Uri "https://github.com/shader-slang/slang/releases/download/v$($script:SlangVersion)/slang-$($script:SlangVersion)-windows-x86_64.zip" -OutFile $archive
+    try {
+        New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
+        Expand-Archive -LiteralPath $archive -DestinationPath $installDirectory -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $slangcPath)) {
+        throw "The Slang archive did not contain bin\slangc.exe at the expected path '$slangcPath'."
+    }
+    Add-UserPathEntry -Directory (Join-Path $installDirectory 'bin')
+    Write-Success "Slang shader compiler $($script:SlangVersion) installed."
+}
+
 function Test-DotNet8Sdk {
     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
         return $false
@@ -326,12 +365,14 @@ function Show-SetupOverview {
     Write-Host '                        (through winget, or rustup-init.exe when winget is blocked).'
     Write-Host '  2. C++ Build Tools    Install the Visual Studio Build Tools C++ workload and the'
     Write-Host '                        Windows 11 SDK, which the linker needs. Asks for elevation (UAC).'
-    Write-Host '  3. Smart App Control  Check that it is off. Nothing is installed: it can only be'
+    Write-Host '  3. Slang compiler     Install the Slang shader compiler, which cooks every .hlsl'
+    Write-Host '                        the renderer builds.'
+    Write-Host '  4. Smart App Control  Check that it is off. Nothing is installed: it can only be'
     Write-Host '                        turned off by hand in Windows Security, and the script says how.'
-    Write-Host '  4. VS Code debugging  Optional. Install VS Code, the .NET 8 SDK, the dotnet-trace'
+    Write-Host '  5. VS Code debugging  Optional. Install VS Code, the .NET 8 SDK, the dotnet-trace'
     Write-Host '                        tool and these extensions: rust-analyzer, C/C++, C#, C# Dev Kit,'
     Write-Host '                        Hex Editor, Even Better TOML and CodeLLDB.'
-    Write-Host '  5. Cargo cache        Download every crate dependency once (cargo fetch), so offline'
+    Write-Host '  6. Cargo cache        Download every crate dependency once (cargo fetch), so offline'
     Write-Host '                        builds during hot reload never wait on the network.'
     Write-Host ''
     Write-Host 'Anything already installed is detected and skipped.'
@@ -342,7 +383,7 @@ try {
     # --- Overview and the one question ---------------------------------------
     # Asked before any step runs, so the rest of the setup is unattended.
     Show-SetupOverview
-    $installVsCodeDebugging = Read-YesNo -Prompt 'Include the optional VS Code debugging setup (step 4)?' -Default $true
+    $installVsCodeDebugging = Read-YesNo -Prompt 'Include the optional VS Code debugging setup (step 5)?' -Default $true
     Write-Host ''
 
     # --- Preflight ---------------------------------------------------------
@@ -431,7 +472,19 @@ try {
         Write-Caution 'cdb.exe is not installed. Download the Windows SDK from https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/ and select only Debugging Tools for Windows. This is required for stack_sample.ps1.'
     }
 
-    # --- 3. Smart App Control -----------------------------------------------
+    # --- 3. Slang shader compiler -------------------------------------------
+    # The renderer-data crate's build script cooks every .hlsl through
+    # `slangc`; without it on PATH every renderer build fails, and the host's
+    # shader watcher cannot re-cook edited shaders at runtime either.
+    Write-Step 'Slang shader compiler'
+    if (Test-SlangCompiler) {
+        Write-Success 'Slang shader compiler is already installed.'
+    }
+    else {
+        Install-SlangCompiler
+    }
+
+    # --- 4. Smart App Control -----------------------------------------------
     # SAC blocks LoadLibrary of the DLLs this workspace compiles on the fly for
     # hot-reloaded modules and projects ("An Application Control policy has
     # blocked this file", os error 4551). It can only be turned off through the
@@ -449,7 +502,7 @@ try {
         Write-Success 'Smart App Control is off.'
     }
 
-    # --- 4. Optional VS Code debugging setup --------------------------------
+    # --- 5. Optional VS Code debugging setup --------------------------------
     Write-Step 'VS Code debugging setup (optional)'
     if (-not $installVsCodeDebugging) {
         Write-Detail 'Skipping the VS Code debugging setup, as chosen at the start.'
@@ -512,7 +565,7 @@ try {
         Add-UserPathEntry -Directory $dotnetToolsDirectory
     }
 
-    # --- 5. Offline cargo registry -------------------------------------------
+    # --- 6. Offline cargo registry -------------------------------------------
     # The --offline run needs every dependency downloaded once; this also
     # fetches the pinned `trait_type_map` git dependency.
     Write-Step 'Cargo dependency cache'
