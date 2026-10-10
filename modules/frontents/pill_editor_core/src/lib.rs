@@ -30,3 +30,5 @@ pub mod error;
 pub mod history;
 /// Serializable dock model, validated mutations, and deterministic geometry.
 pub mod layout;
+/// Build diagnostics: the problems the Problems panel shows.
+pub mod problems;

@@ -92,6 +92,9 @@ pub struct PanelWork {
     /// (Stage 18): the executable turns a drag that leaves the window into
     /// an OS drag of that file. Set only while the row is held.
     pub drag_candidate: Option<String>,
+    /// A file the panel asked to open in the developer's editor, from a
+    /// Problems row (Stage 19).
+    pub open_file: Option<crate::EditorOpenRequest>,
 }
 
 impl PanelWork {
@@ -150,6 +153,11 @@ impl PanelWork {
     /// Offer an asset row to an OS drag while it is held.
     pub fn drag_candidate(&mut self, source: impl Into<String>) {
         self.drag_candidate = Some(source.into());
+    }
+
+    /// Ask for a file to be opened in the developer's editor.
+    pub fn open_file(&mut self, request: crate::EditorOpenRequest) {
+        self.open_file = Some(request);
     }
 }
 

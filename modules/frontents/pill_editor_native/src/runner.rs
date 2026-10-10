@@ -35,11 +35,14 @@ use pill_core::platform::futures::block_on;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
+use pill_editor_api::{
+    EditorNoticeEvent, EditorNotices, EditorOpenRequest, EditorProblem, EditorProblemLevel,
+};
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::editor_state::EditorCommand;
 use pill_editor_core::history::{CommandHistory, HistoryEntry};
 use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
-use pill_host::{HostConfig, RenderingHost};
+use pill_host::{HostConfig, HostNotice, RenderingHost};
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::FrameDriver;
 use pill_runtime::{CameraBinding, CameraComponent, SurfaceId, SurfaceOptions, TransformComponent};
@@ -85,6 +88,10 @@ const FPS_SMOOTHING: f32 = 0.1;
 /// The scene view's surface id; the game view is the primary surface the
 /// renderer is attached with.
 const SCENE_SURFACE: SurfaceId = SurfaceId(1);
+
+/// How many toast events the shell's input may hold while nobody drains
+/// them (the fallback UI, or a shell module that failed to load).
+const TOAST_QUEUE_MAX: usize = 64;
 
 // =============================================================================
 // run
@@ -356,6 +363,10 @@ struct EditorWindow {
     /// The Assets panel's rectangle, from the shell's last frame; a
     /// scripted drop aims its pointer at it.
     last_assets_rect: Option<EditorRect>,
+    /// The problems and toast events the editor shows (Stage 19), folded
+    /// from the host's notices; the shell's input carries what it draws
+    /// from and drains.
+    notices: EditorNotices,
 }
 
 impl EditorWindow {
@@ -567,6 +578,7 @@ impl EditorWindow {
             drag_candidate: None,
             drag_request: None,
             mouse_left_held: false,
+            notices: EditorNotices::default(),
         })
     }
 
@@ -1356,6 +1368,175 @@ impl EditorWindow {
         self.dropped_files.push(file);
     }
 
+    /// Turn the host's queued notices into the shell's notice resource
+    /// (Stage 19).
+    ///
+    /// Every notice becomes one toast event; a failed reload or patch also
+    /// becomes Problems rows, parsed from the captured build text where the
+    /// notice carries one. A module's rows are replaced by its next
+    /// successful reload - that is what clears the panel once the error is
+    /// fixed - and by nothing else, so a module that keeps failing keeps its
+    /// list.
+    fn publish_host_notices(&mut self) {
+        let notices = pill_host::take_notices();
+        if notices.is_empty() {
+            return;
+        }
+        for notice in notices {
+            let (level, text) = notice_toast(&notice);
+            info!(
+                target: telemetry_target::ENGINE,
+                level = notice_level_name(level),
+                text = text.as_str(),
+                "[editor] toast"
+            );
+            let seq = self.notices.next_event_seq;
+            self.notices.next_event_seq = seq + 1;
+            self.notices
+                .events
+                .push(EditorNoticeEvent { seq, level, text });
+            match &notice {
+                HostNotice::ModuleFailed { module, output } => {
+                    self.notices
+                        .problems
+                        .retain(|problem| problem.module != *module);
+                    let rows = problems_from_build_output(module, output);
+                    let count = rows.len();
+                    // One line per parsed problem (bounded), so the log tells
+                    // the suite - and anyone debugging - what the panel holds
+                    // and where each row would jump to. The field is `text`,
+                    // not `message`: tracing reserves `message` for the event
+                    // line itself.
+                    for row in rows.iter().take(10) {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            module = module.as_str(),
+                            level = notice_level_name(row.level),
+                            file = row.file.as_deref().unwrap_or(""),
+                            line = row.line.unwrap_or(0),
+                            text = row.message.as_str(),
+                            "[editor] problem"
+                        );
+                    }
+                    self.notices.problems.extend(rows);
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        module = module.as_str(),
+                        count,
+                        "[editor] problems updated"
+                    );
+                }
+                HostNotice::Reloaded { module, .. } => {
+                    let before = self.notices.problems.len();
+                    self.notices
+                        .problems
+                        .retain(|problem| problem.module != *module);
+                    if self.notices.problems.len() != before {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            module = module.as_str(),
+                            count = 0,
+                            "[editor] problems updated"
+                        );
+                    }
+                }
+                HostNotice::PatchFailed { function, detail } => {
+                    self.notices
+                        .problems
+                        .retain(|problem| problem.module != *function);
+                    self.notices.problems.push(EditorProblem {
+                        module: function.clone(),
+                        level: EditorProblemLevel::Error,
+                        message: detail.clone(),
+                        file: None,
+                        line: None,
+                        column: None,
+                    });
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        module = function.as_str(),
+                        count = 1,
+                        "[editor] problems updated"
+                    );
+                }
+                HostNotice::RolledBack {
+                    function,
+                    to_generation,
+                    automatic,
+                } => {
+                    // A rollback is worth a Problems row too (Stage 19): the
+                    // running implementation no longer matches the sources
+                    // until the next good edit.
+                    self.notices
+                        .problems
+                        .retain(|problem| problem.module != *function);
+                    let message = if *automatic {
+                        format!("rolled back to generation {to_generation} after repeated panics")
+                    } else {
+                        format!("rolled back to generation {to_generation}")
+                    };
+                    self.notices.problems.push(EditorProblem {
+                        module: function.clone(),
+                        level: EditorProblemLevel::Warning,
+                        message,
+                        file: None,
+                        line: None,
+                        column: None,
+                    });
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        module = function.as_str(),
+                        count = 1,
+                        "[editor] problems updated"
+                    );
+                }
+                HostNotice::PatchApplied { .. } => {}
+            }
+            self.notices.revision = self.notices.revision.wrapping_add(1);
+        }
+    }
+
+    /// Open a reported file in the developer's editor (Stage 19).
+    ///
+    /// `code -g <file>:<line>` is the default; `PILL_EDITOR_OPEN_COMMAND`
+    /// replaces the program (its extra words become leading arguments),
+    /// which the suite points at a recorder to see what a row asked for. The
+    /// path is made absolute against the workspace root, the way the compiler
+    /// that reported it resolved it.
+    fn open_file_in_editor(&self, request: &EditorOpenRequest) {
+        let path = std::path::Path::new(&request.file);
+        let file = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.host.host().workspace_root().join(path)
+        };
+        let file = file.to_string_lossy().into_owned();
+        info!(
+            target: telemetry_target::ENGINE,
+            file = file.as_str(),
+            line = request.line,
+            "[editor] open file"
+        );
+        let configured =
+            std::env::var("PILL_EDITOR_OPEN_COMMAND").unwrap_or_else(|_| "code".to_string());
+        let mut words = configured.split_whitespace();
+        let program = words.next().unwrap_or("code").to_string();
+        let spawned = std::process::Command::new(&program)
+            .args(words)
+            .arg("-g")
+            .arg(format!("{file}:{line}", line = request.line))
+            .spawn();
+        if let Err(error) = spawned {
+            let message = error.to_string();
+            warn!(
+                target: telemetry_target::ENGINE,
+                program = program.as_str(),
+                error = message.as_str(),
+                "[editor] open file failed"
+            );
+        }
+    }
+
     /// A held asset row dragged past the window edge asks for an OS drag
     /// (Stage 18); inside the window the move is just UI input. The drag
     /// itself starts at the next frame boundary, not here (see
@@ -1463,6 +1644,10 @@ impl EditorWindow {
         if let Some(source) = self.drag_request.take() {
             self.start_drag_out(&source);
         }
+        // Step 2c: the host's reload, patch and failure notices become the
+        // shell's Problems rows and toasts (Stage 19). Published before the
+        // frame so the shell sees them the moment the host produced them.
+        self.publish_host_notices();
         // Step 3: this frame's size, and the input queued since the last
         // frame, delivered to the shell module's input resource; the
         // executable's own state keeps its copy for the fallback.
@@ -1578,6 +1763,18 @@ impl EditorWindow {
                 input.dropped_files = std::mem::take(&mut self.dropped_files);
                 input.asset_root = self.asset_root.clone();
                 input.systems_paused = systems_paused;
+                // Stage 19: the problem list the panel draws, and the toasts
+                // queued since the shell's last drain. The events are moved,
+                // not copied; the problems are replaced (they only change on
+                // a notice, which is rare).
+                input.notices.problems.clone_from(&self.notices.problems);
+                input.notices.revision = self.notices.revision;
+                input.notices.next_event_seq = self.notices.next_event_seq;
+                input.notices.events.append(&mut self.notices.events);
+                // A shell that never drains (the fallback UI, or a module
+                // that failed to load) must not accumulate forever.
+                let excess = input.notices.events.len().saturating_sub(TOAST_QUEUE_MAX);
+                input.notices.events.drain(..excess);
             } else {
                 // No shell module: the fallback already consumed the events.
                 self.pending_ui_events.clear();
@@ -1615,6 +1812,7 @@ impl EditorWindow {
                     clipboard_read: frame.requested_clipboard.take(),
                     assets_rect: frame.assets_rect,
                     drag_candidate: frame.drag_candidate.take(),
+                    requested_open: frame.requested_open.take(),
                     scene_rect: frame.scene_rect,
                     game_rect: frame.game_rect,
                 })
@@ -1631,6 +1829,7 @@ impl EditorWindow {
                     clipboard_read: None,
                     assets_rect: self.last_assets_rect,
                     drag_candidate: None,
+                    requested_open: None,
                     scene_rect: self.last_scene_rect,
                     game_rect: self.last_game_rect,
                 }
@@ -1855,6 +2054,11 @@ impl EditorWindow {
                 None => world.insert_resource(answer),
             }
         }
+        // A Problems row asked for a file (Stage 19): hand it to the
+        // developer's editor, out of band.
+        if let Some(request) = output.requested_open {
+            self.open_file_in_editor(&request);
+        }
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
         let frame = match self.surface.get_current_texture() {
@@ -1922,10 +2126,109 @@ struct ShellOutput {
     /// An asset row held down, for an OS drag when the pointer leaves the
     /// window (Stage 18).
     drag_candidate: Option<String>,
+    /// A file the shell asked the executable to open, from a Problems row
+    /// (Stage 19).
+    requested_open: Option<EditorOpenRequest>,
     /// Where the scene surface goes, in logical pixels.
     scene_rect: Option<EditorRect>,
     /// Where the game surface goes, in logical pixels.
     game_rect: Option<EditorRect>,
+}
+
+// =============================================================================
+// Host notices to editor notices (Stage 19)
+// =============================================================================
+
+/// The toast a host notice becomes: its severity and its one line.
+fn notice_toast(notice: &HostNotice) -> (EditorProblemLevel, String) {
+    match notice {
+        HostNotice::ModuleFailed { module, .. } => (
+            EditorProblemLevel::Error,
+            format!("{module}: reload failed; the previous generation still runs"),
+        ),
+        HostNotice::Reloaded { module, build_ms } => {
+            let text = if *build_ms == 0 {
+                format!("{module} reloaded")
+            } else {
+                format!("{module} reloaded in {build_ms} ms")
+            };
+            (EditorProblemLevel::Note, text)
+        }
+        HostNotice::PatchApplied {
+            function,
+            milliseconds,
+        } => (
+            EditorProblemLevel::Note,
+            format!("{function} patched live in {milliseconds:.0} ms"),
+        ),
+        HostNotice::PatchFailed { function, detail } => (
+            EditorProblemLevel::Error,
+            format!("{function} patch failed: {detail}"),
+        ),
+        HostNotice::RolledBack {
+            function,
+            to_generation,
+            automatic,
+        } => {
+            let text = if *automatic {
+                format!(
+                    "{function} rolled back to generation {to_generation} after repeated panics"
+                )
+            } else {
+                format!("{function} rolled back to generation {to_generation}")
+            };
+            (EditorProblemLevel::Warning, text)
+        }
+    }
+}
+
+/// The wire name of a toast level, for the log line the suites match.
+fn notice_level_name(level: EditorProblemLevel) -> &'static str {
+    match level {
+        EditorProblemLevel::Error => "error",
+        EditorProblemLevel::Warning => "warning",
+        EditorProblemLevel::Note => "info",
+    }
+}
+
+/// The Problems rows a module's failed output becomes.
+///
+/// The build text is parsed for compiler diagnostics; when none is
+/// recognisable - a linker error, a foreign toolchain's wording - the first
+/// non-empty line is kept as one row, so a failure never shows as nothing.
+fn problems_from_build_output(module: &str, output: &str) -> Vec<EditorProblem> {
+    let parsed = pill_editor_core::problems::parse_build_output(output);
+    if parsed.is_empty() {
+        let message = output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("build failed")
+            .to_string();
+        return vec![EditorProblem {
+            module: module.to_string(),
+            level: EditorProblemLevel::Error,
+            message,
+            file: None,
+            line: None,
+            column: None,
+        }];
+    }
+    parsed
+        .into_iter()
+        .map(|problem| EditorProblem {
+            module: module.to_string(),
+            level: match problem.severity {
+                pill_editor_core::problems::Severity::Error => EditorProblemLevel::Error,
+                pill_editor_core::problems::Severity::Warning => EditorProblemLevel::Warning,
+                pill_editor_core::problems::Severity::Note => EditorProblemLevel::Note,
+            },
+            message: problem.message,
+            file: problem.file,
+            line: problem.line,
+            column: problem.column,
+        })
+        .collect()
 }
 
 /// Show and place a view surface at its layout rectangle, in logical pixels,

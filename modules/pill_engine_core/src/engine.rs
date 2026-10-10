@@ -625,7 +625,12 @@ impl Engine {
         #[cfg(feature = "hot_patch")]
         let boxed_system = {
             let slot = std::sync::Arc::new(crate::hot_patch::HotSlot::new());
-            let boxed = system.into_hot_system(std::sync::Arc::clone(&slot));
+            // The qualified path is what a generated patch reports, and what a
+            // panic in a patched body is attributed to; the display name is
+            // the fallback when the function path cannot be resolved.
+            let function_path = crate::hot_patch::function_path::<F>();
+            let faults_key = function_path.clone().unwrap_or_else(|| system_name.clone());
+            let boxed = system.into_hot_system(std::sync::Arc::clone(&slot), faults_key);
 
             // Registered under BOTH names. The display name is what callers and
             // logs use; the function's real path is what `#[pill_hot]` derives
@@ -635,7 +640,7 @@ impl Engine {
             // find the slot.
             self.hot_patch_registry
                 .insert(system_name.clone(), std::sync::Arc::clone(&slot));
-            if let Some(path) = crate::hot_patch::function_path::<F>() {
+            if let Some(path) = function_path {
                 if path != system_name {
                     self.hot_patch_registry.insert(path, slot);
                 }
@@ -1555,6 +1560,44 @@ mod tests {
         engine.register_system("unit_system", || {});
         engine.process_frame().unwrap();
         assert!(engine.system_failures().is_empty());
+    }
+
+    /// A panicking system is contained: it becomes a recorded failure, the
+    /// frame survives, and three consecutive panics queue one fault report for
+    /// the host to roll the function back with (Stage 19, D22).
+    ///
+    /// Hot-patch only: containment lives in the dispatch slot a patched system
+    /// calls through, and without the feature there is no patch to roll back.
+    #[cfg(feature = "hot_patch")]
+    #[test]
+    fn a_panicking_system_is_contained_and_reports_a_fault() {
+        let mut engine = Engine::new();
+        // The streak table is process-global and tests share the process, so
+        // this function's name is unique to this test.
+        let name = "engine_tests::panicking_system";
+        engine.register_system(name, || -> () {
+            panic!("kaboom in the patched body");
+        });
+        let _ = crate::hot_patch::take_fault_reports();
+        for frame in 1..crate::hot_patch::PANIC_ROLLBACK_FRAMES {
+            engine.process_frame().unwrap();
+            let failures = engine.drain_system_failures();
+            assert_eq!(failures.len(), 1, "frame {frame}");
+            assert!(
+                failures[0].to_plain_message().contains("panicked: kaboom"),
+                "frame {frame}: {}",
+                failures[0].to_plain_message()
+            );
+            assert!(
+                crate::hot_patch::take_fault_reports().is_empty(),
+                "frame {frame} reported before the threshold"
+            );
+        }
+        engine.process_frame().unwrap();
+        let reports = crate::hot_patch::take_fault_reports();
+        assert_eq!(reports.len(), 1, "the third panic must report the function");
+        assert_eq!(reports[0].function, name);
+        assert!(reports[0].message.contains("kaboom"));
     }
 
     /// A failed system never aborts the systems that follow it.
