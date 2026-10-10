@@ -91,6 +91,11 @@ pub(crate) struct Interaction {
     pub active: Option<WidgetId>,
     /// The widget keyboard events go to.
     pub focus: Option<WidgetId>,
+    /// Whether this frame's press landed on a widget. Embedders that lay
+    /// several panels out in one frame (the editor shell) share this so a
+    /// press claimed by one panel is not treated as a background press by
+    /// the panels built after it.
+    pub press_claimed: bool,
 }
 
 impl Resource for UiState {}

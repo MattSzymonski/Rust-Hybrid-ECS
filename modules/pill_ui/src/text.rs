@@ -21,7 +21,7 @@
 //! once and reused for every later frame.
 
 // Standard library
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 // External crates
@@ -118,7 +118,37 @@ pub struct TextSystem {
     bundled_family: String,
     /// One atlas sprite per rasterized glyph.
     sprites: BTreeMap<CacheKey, GlyphSprite>,
+    /// Memoized shapings: panels redraw the same labels (and most console
+    /// rows) every frame, and shaping is the single most expensive step in
+    /// a paint on a debug build (the D32 measurement: 222 ms/frame for the
+    /// shell's panels before this cache).
+    shape_cache: HashMap<ShapeKey, CachedShape>,
+    /// Monotonic tick so the cache can evict the least recently used
+    /// entry without a linked list.
+    shape_tick: u64,
 }
+
+/// One memoized shaping: everything [`TextSystem::shape`] reads, with the
+/// floats folded to bits so equal inputs compare equal.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text: String,
+    font_size: u32,
+    line_height: u32,
+    family: Option<String>,
+    max_width: Option<u32>,
+}
+
+/// A memoized shaping and when it was last asked for.
+struct CachedShape {
+    shaped: ShapedText,
+    used_at: u64,
+}
+
+/// How many distinct shapings stay memoized. The steady state is hits; the
+/// bound only exists so a pathological caller cannot grow the map without
+/// limit.
+const SHAPE_CACHE_CAPACITY: usize = 1024;
 
 impl TextSystem {
     /// A text system with the bundled font guaranteed and every system font
@@ -147,6 +177,8 @@ impl TextSystem {
             swash_cache: SwashCache::new(),
             bundled_family,
             sprites: BTreeMap::new(),
+            shape_cache: HashMap::new(),
+            shape_tick: 0,
         }
     }
 
@@ -156,8 +188,48 @@ impl TextSystem {
     }
 
     /// Shape `text` into positioned glyphs, wrapping at `max_width` when one
-    /// is given.
+    /// is given. Repeated calls with the same inputs come out of the memo.
     pub fn shape(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> ShapedText {
+        let key = ShapeKey {
+            text: text.to_string(),
+            font_size: style.font_size.to_bits(),
+            line_height: style.line_height.to_bits(),
+            family: style.family.clone(),
+            max_width: max_width.map(f32::to_bits),
+        };
+        self.shape_tick += 1;
+        if let Some(entry) = self.shape_cache.get_mut(&key) {
+            entry.used_at = self.shape_tick;
+            return entry.shaped.clone();
+        }
+        let shaped = self.shape_uncached(text, style, max_width);
+        if self.shape_cache.len() >= SHAPE_CACHE_CAPACITY {
+            let oldest = self
+                .shape_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.used_at)
+                .map(|(key, _)| (*key).clone());
+            if let Some(oldest) = oldest {
+                self.shape_cache.remove(&oldest);
+            }
+        }
+        self.shape_cache.insert(
+            key,
+            CachedShape {
+                shaped: shaped.clone(),
+                used_at: self.shape_tick,
+            },
+        );
+        shaped
+    }
+
+    /// The actual shaping, bypassing the memo.
+    fn shape_uncached(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+    ) -> ShapedText {
         let metrics = Metrics::new(style.font_size, style.line_height);
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         buffer.set_size(max_width, None);
@@ -395,6 +467,28 @@ mod tests {
             atlas.take_updated_regions().is_empty(),
             "a second draw of the same text must not rasterize again"
         );
+    }
+
+    #[test]
+    fn repeated_shaping_is_memoized_and_bounded() {
+        let mut system = TextSystem::new();
+        let style = TextStyle::default();
+        let first = system.shape("hello", &style, None);
+        let second = system.shape("hello", &style, None);
+        assert_eq!(first.glyphs.len(), second.glyphs.len());
+        assert_eq!(
+            system.shape_cache.len(),
+            1,
+            "the identical shaping must be one entry"
+        );
+        // A style or width difference is a different shaping, not a hit.
+        system.shape("hello", &style, Some(100.0));
+        assert_eq!(system.shape_cache.len(), 2);
+        // The memo cannot grow past its capacity.
+        for index in 0..(SHAPE_CACHE_CAPACITY + 16) {
+            system.shape(&format!("label {index}"), &style, None);
+        }
+        assert!(system.shape_cache.len() <= SHAPE_CACHE_CAPACITY);
     }
 
     #[test]

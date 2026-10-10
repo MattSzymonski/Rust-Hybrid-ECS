@@ -94,14 +94,17 @@ const SCENE_SURFACE: SurfaceId = SurfaceId(1);
 /// Returns the first failure that ended the run - event loop, window, GPU
 /// device - with a setup failure recorded before the loop reported at the
 /// same boundary.
-pub fn run() -> Result<(), EditorError> {
+pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
     // Step 1: the event loop, polling rather than waiting so a frame is
     // always one redraw request away.
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
     event_loop.set_control_flow(ControlFlow::Poll);
     // Step 2: run until the last window closes.
-    let mut application = EditorApplication::default();
+    let mut application = EditorApplication {
+        log_buffer: Some(log_buffer),
+        ..EditorApplication::default()
+    };
     event_loop
         .run_app(&mut application)
         .map_err(|source| EditorError::EventLoopRun { source })?;
@@ -122,6 +125,9 @@ pub fn run() -> Result<(), EditorError> {
 struct EditorApplication {
     /// The editor window and its GPU state, once `resumed` created them.
     editor: Option<EditorWindow>,
+    /// The capture ring the console panel reads; installed with the
+    /// telemetry stack before the loop starts.
+    log_buffer: Option<pill_core::telemetry::capture::LogBuffer>,
     /// A failure recorded outside the event callbacks' return path;
     /// surfaced by [`run`] after the loop exits.
     failure: Option<EditorError>,
@@ -132,7 +138,7 @@ impl ApplicationHandler for EditorApplication {
         if self.editor.is_some() {
             return;
         }
-        match EditorWindow::open(event_loop) {
+        match EditorWindow::open(event_loop, self.log_buffer.clone()) {
             Ok(editor) => {
                 event_loop.set_control_flow(ControlFlow::Poll);
                 // The first frame draws before the loop's first redraw
@@ -261,6 +267,12 @@ struct EditorWindow {
     /// A module panel the scripted suite asked to focus or open, by id;
     /// delivered to the shell with the next frame's input.
     requested_panel: Option<String>,
+    /// A widget the scripted suite asked to activate, by name; delivered to
+    /// the shell with the next frame's input.
+    requested_widget: Option<String>,
+    /// Lines to wheel-scroll at the last activated widget; delivered to the
+    /// shell with the next frame's input.
+    requested_wheel: Option<f32>,
     /// Command ids the scripted suite asked to execute; delivered to the
     /// shell's dispatch with the next frame's input.
     requested_commands: Vec<String>,
@@ -273,6 +285,16 @@ struct EditorWindow {
     test_seconds: Option<f32>,
     /// A graceful quit the loop should take at the end of this frame.
     quit_requested: bool,
+    /// The asset browser's rows, refreshed periodically (the walk touches
+    /// the filesystem).
+    asset_entries: Vec<pill_editor_core::editor_state::AssetListing>,
+    /// The entity tier's change tracking: the entity count it was built
+    /// for, the frames since, and whether an applied edit made it stale.
+    /// Its per-entity strings make a per-frame rebuild too expensive on a
+    /// big world, so the tier follows these signals instead.
+    entity_tier_count: usize,
+    entity_tier_age: u32,
+    entity_tier_dirty: bool,
     /// Signature of the component registry at the last check; a reload that
     /// changes it invalidates stale history entries.
     registry_epoch: u64,
@@ -285,7 +307,10 @@ struct EditorWindow {
 impl EditorWindow {
     /// Create the window and its GPU state, and log the startup line the
     /// harness waits for.
-    fn open(event_loop: &ActiveEventLoop) -> Result<EditorWindow, EditorError> {
+    fn open(
+        event_loop: &ActiveEventLoop,
+        log_buffer: Option<pill_core::telemetry::capture::LogBuffer>,
+    ) -> Result<EditorWindow, EditorError> {
         // Step 1: the window.
         let attributes = Window::default_attributes()
             .with_title("Pill Editor")
@@ -366,6 +391,15 @@ impl EditorWindow {
             pill_host::setup_rendering(config, Arc::clone(&game.window), game_width, game_height)?;
         // The editor is an editor: asset metadata is maintained.
         host.host_mut().set_ensure_asset_metadata(true);
+        // The console's capture ring, for the shell's Console panel (Stage
+        // 17); present even when telemetry setup failed, so the panel
+        // always has a reader.
+        if let Some(log_buffer) = log_buffer {
+            host.host_mut()
+                .engine_mut()
+                .world_mut()
+                .insert_resource(pill_editor_api::EditorLogs(log_buffer));
+        }
         info!(
             target: telemetry_target::ENGINE,
             detached = game.detached,
@@ -443,11 +477,17 @@ impl EditorWindow {
             last_game_rect: None,
             requested_tab: None,
             requested_panel: None,
+            requested_widget: None,
+            requested_wheel: None,
             requested_commands: Vec::new(),
             test_channel: TestChannel::from_environment(),
             test_started: Some(Instant::now()),
             test_seconds: test_channel::seconds_from_environment(),
             quit_requested: false,
+            asset_entries: Vec::new(),
+            entity_tier_count: usize::MAX,
+            entity_tier_age: 0,
+            entity_tier_dirty: false,
             registry_epoch: 0,
             last_frame: Instant::now(),
             frames_per_second: 0.0,
@@ -570,6 +610,31 @@ impl EditorWindow {
                             "[editor] test channel: panel request"
                         );
                         self.requested_panel = Some(id);
+                    }
+                    TestCommand::Activate { name } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            name = %name,
+                            "[editor] test channel: activate request"
+                        );
+                        self.requested_widget = Some(name);
+                    }
+                    TestCommand::Select { entity } => self.select_entity_display(&entity),
+                    TestCommand::Wheel { lines } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            lines,
+                            "[editor] test channel: wheel request"
+                        );
+                        self.requested_wheel = Some(lines);
+                    }
+                    TestCommand::Type { text } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            text = %text,
+                            "[editor] test channel: type request"
+                        );
+                        self.pending_ui_events.push(InputEvent::TextInput { text });
                     }
                     TestCommand::Command { id } => {
                         info!(
@@ -749,6 +814,13 @@ impl EditorWindow {
                 label = "destroy".to_string();
                 EditorCommand::DestroyEntity { entity }
             }
+            test_channel::EditCommand::System { index, enabled } => {
+                label = format!("system {index} {}", if *enabled { "on" } else { "off" });
+                EditorCommand::SetSystemEnabled {
+                    index: *index,
+                    enabled: *enabled,
+                }
+            }
         };
         let world = engine.world_mut();
         if let Some(pending) =
@@ -825,8 +897,7 @@ impl EditorWindow {
                 component,
                 field,
             } => {
-                let resolved = resolve_entity(world, &entity)
-                    .zip(resolve_component(world, &component).map(|c| c));
+                let resolved = resolve_entity(world, &entity).zip(resolve_component(world, &component));
                 match resolved {
                     Some((resolved, component)) => {
                         match world.read_component_field(resolved, &component, &field) {
@@ -855,6 +926,31 @@ impl EditorWindow {
                 }
             }
         }
+    }
+
+    /// The scripted selection: the same shared resource a Hierarchy click
+    /// sets, resolved against the live entity table.
+    fn select_entity_display(&mut self, handle: &str) {
+        let engine = self.host.host_mut().engine_mut();
+        let world = engine.world_mut();
+        let Some(entity) = resolve_entity(world, handle) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                handle = %handle,
+                "[editor] test channel: selection target not resolvable"
+            );
+            return;
+        };
+        if let Some(selection) =
+            world.get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
+        {
+            selection.entity = Some(entity);
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            entity = %entity,
+            "[editor] selection changed"
+        );
     }
 
     /// A scripted click at a logical client point: delivered to the game,
@@ -1139,23 +1235,96 @@ impl EditorWindow {
             self.configuration.height as f32 / scale_factor,
         );
         {
+            // The Assets panel's rows come from the host's asset browser;
+            // gathered before the engine borrow below. The tree walk touches
+            // the filesystem, so it refreshes periodically rather than every
+            // frame.
+            if self.frame_count.is_multiple_of(ASSET_REFRESH_FRAMES) {
+                self.asset_entries = self
+                    .host
+                    .host()
+                    .asset_entries()
+                    .into_iter()
+                    .filter(|entry| !entry.is_directory)
+                    .take(256)
+                    .map(|entry| pill_editor_core::editor_state::AssetListing {
+                        path: entry.path,
+                        kind: entry.type_name.unwrap_or_else(|| "file".to_string()),
+                    })
+                    .collect();
+                info!(
+                    target: telemetry_target::ENGINE,
+                    count = self.asset_entries.len(),
+                    "[editor] asset listing refreshed"
+                );
+            }
             let systems_paused = self.host.host_mut().engine_mut().systems_paused();
             let engine = self.host.host_mut().engine_mut();
-            // The editor snapshot the shell's panels draw from (Stage 16):
-            // the cheap tiers rebuild each frame, the detail tier waits for
-            // the selection the panels own (Stage 17), and the revision
-            // counter is the host's when one is exposed here.
-            let snapshot = pill_editor_core::editor_state::EditorSnapshot::capture_list(
-                engine,
-                0,
-                &[],
-                Vec::new(),
-            );
-            let world = engine.world_mut();
-            match world.get_resource_mut::<pill_editor_core::editor_state::EditorSnapshot>() {
-                Some(current) => *current = snapshot,
-                None => world.insert_resource(snapshot),
+            // The editor snapshot the shell's panels draw from (Stage 16).
+            // The cheap tiers rebuild each frame; the entity tier is one row
+            // with owned strings per live entity and costs real time on a
+            // big world (circus_demo's 200k entities measured ~0.7 s/frame
+            // in debug), so it rebuilds on change - the entity count moved,
+            // or an edit batch applied - with a periodic backstop for
+            // component changes made off the command path.
+            let live_entities = engine.world().entity_count();
+            let refresh_entities = self.entity_tier_dirty
+                || live_entities != self.entity_tier_count
+                || self.entity_tier_age >= ENTITY_TIER_MAX_AGE_FRAMES;
+            let entities = refresh_entities
+                .then(|| pill_editor_core::editor_state::EditorSnapshot::capture_entities(engine));
+            let systems =
+                pill_editor_core::editor_state::EditorSnapshot::capture_systems(engine, &[]);
+            let components =
+                pill_editor_core::editor_state::EditorSnapshot::capture_components(engine);
+            let selected = engine
+                .world()
+                .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+                .and_then(|selection| selection.entity);
+            let has_snapshot = engine
+                .world()
+                .get_resource::<pill_editor_core::editor_state::EditorSnapshot>()
+                .is_some();
+            if has_snapshot {
+                let detail = selected.and_then(|entity| {
+                    pill_editor_core::editor_state::EditorSnapshot::capture_detail(engine, entity)
+                });
+                let world = engine.world_mut();
+                if let Some(current) =
+                    world.get_resource_mut::<pill_editor_core::editor_state::EditorSnapshot>()
+                {
+                    if let Some(entities) = entities {
+                        current.entities = entities;
+                    }
+                    current.systems = systems;
+                    current.components = components;
+                    current.assets = self.asset_entries.clone();
+                    current.paused = systems_paused;
+                    current.detail = detail;
+                }
+            } else {
+                // The first frame owns the full capture; later frames update
+                // the existing resource in place.
+                let mut snapshot = pill_editor_core::editor_state::EditorSnapshot::capture_list(
+                    engine,
+                    0,
+                    &[],
+                    Vec::new(),
+                );
+                snapshot.assets = self.asset_entries.clone();
+                snapshot.detail = selected.and_then(|entity| {
+                    pill_editor_core::editor_state::EditorSnapshot::capture_detail(engine, entity)
+                });
+                engine.world_mut().insert_resource(snapshot);
             }
+            if refresh_entities {
+                self.entity_tier_count = live_entities;
+                self.entity_tier_age = 0;
+                self.entity_tier_dirty = false;
+            } else {
+                self.entity_tier_age += 1;
+            }
+            let world = engine.world_mut();
             if let Some(input) = world.get_resource_mut::<EditorShellInput>() {
                 input.events.append(&mut self.pending_ui_events);
                 input.logical_size = available;
@@ -1163,6 +1332,8 @@ impl EditorWindow {
                 input.editor_frames_per_second = self.frames_per_second;
                 input.requested_tab = self.requested_tab.take();
                 input.requested_panel = self.requested_panel.take();
+                input.requested_widget = self.requested_widget.take();
+                input.requested_wheel = self.requested_wheel.take();
                 input
                     .requested_commands
                     .append(&mut self.requested_commands);
@@ -1266,6 +1437,11 @@ impl EditorWindow {
                     .map(|pending| std::mem::take(&mut pending.batches))
                     .unwrap_or_default()
             };
+            if !batches.is_empty() {
+                // An applied edit can change archetypes (add/remove
+                // component), so the snapshot's entity tier is stale.
+                self.entity_tier_dirty = true;
+            }
             let now_millis = self
                 .test_started
                 .map(|start| start.elapsed().as_millis() as u64)
@@ -1780,6 +1956,14 @@ fn quaternion_product(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
         lw * rw - lx * rx - ly * ry - lz * rz,
     ]
 }
+
+/// Frames between asset-browser refreshes (the walk touches the disk).
+const ASSET_REFRESH_FRAMES: u64 = 120;
+
+/// Backstop cadence for the snapshot's entity tier: even with no count
+/// change and no applied edit, it refreshes this often, because a system
+/// can add or remove a component without going through a command.
+const ENTITY_TIER_MAX_AGE_FRAMES: u32 = 600;
 
 /// A cheap signature of the component registry's shape.
 ///

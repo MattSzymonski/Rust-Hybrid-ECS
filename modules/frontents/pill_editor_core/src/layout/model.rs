@@ -44,6 +44,8 @@ pub enum PanelKind {
     Gallery,
     Systems,
     Assets,
+    /// The preferences editor (D31), backed by the preferences file.
+    Preferences,
     /// A panel registered by an editor crate, addressed by its panel id.
     Module(String),
 }
@@ -62,6 +64,7 @@ impl PanelKind {
             Self::Gallery => "UI Gallery",
             Self::Systems => "Systems",
             Self::Assets => "Assets",
+            Self::Preferences => "Preferences",
             Self::Module(panel_id) => panel_id,
         }
     }
@@ -135,11 +138,12 @@ impl LayoutModel {
         let console = model.add_tab(PanelKind::Console, true);
         let systems = model.add_tab(PanelKind::Systems, true);
         let assets = model.add_tab(PanelKind::Assets, true);
+        let preferences = model.add_tab(PanelKind::Preferences, true);
 
         let hierarchy_set = model.add_tabset(vec![hierarchy, assets], hierarchy);
         let scene_set = model.add_tabset(vec![scene, game], scene);
         let inspector_set = model.add_tabset(vec![inspector], inspector);
-        let statistics_set = model.add_tabset(vec![statistics], statistics);
+        let statistics_set = model.add_tabset(vec![statistics, preferences], statistics);
         let gallery_set = model.add_tabset(vec![gallery], gallery);
         let console_set = model.add_tabset(vec![console], console);
         let systems_set = model.add_tabset(vec![systems], systems);
