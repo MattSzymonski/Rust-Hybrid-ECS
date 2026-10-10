@@ -163,6 +163,7 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
             EditorCommand::DestroyEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
+            | EditorCommand::SetGizmoTool { .. }
             | EditorCommand::StepOnce => 0,
             EditorCommand::ImportFiles {
                 sources,

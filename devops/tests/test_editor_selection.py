@@ -7,7 +7,7 @@ REQUIREMENTS
 
 DESCRIPTION
   Starts the editor on the Italian Brainrot project and drives scene selection
-  through the renderer's pick contract:
+  and the transform gizmos through the renderer's pick contract:
 
     1. the Scene tab's rectangle is read from the shell's placement log;
     2. scripted clicks are aimed at a 3x3 grid inside it: at least one of them
@@ -16,7 +16,14 @@ DESCRIPTION
        the outline (`outline set`);
     3. a click on a corner of the view hits nothing, which clears the selection
        (`scene pick nothing`, `outline cleared`);
-    4. the editor exits cleanly.
+    4. a scripted `gizmo drag` presses on the translate X handle's own pixel
+       and moves: the pick must answer a handle id (`scene pick handle`), the
+       drag must run through the recorded path (one `history push`) and the
+       world must hold what the drag logged;
+    5. one undo puts the translation back; with snapping on the same drag lands
+       on the 0.5 step; the rotate and scale tools each drag through their own
+       handles, one history step each;
+    6. the editor exits cleanly.
 
   Everything is asserted on the editor's log tokens; the suite runs under its
   own LOCALAPPDATA sandbox.
@@ -111,6 +118,28 @@ def scene_rect() -> "tuple[float, float, float, float]":
     if not match:
         raise RuntimeError("no Scene placement in the log:\n" + read_log()[-3000:])
     return tuple(float(value) for value in match.groups())
+
+
+def dump_array(
+    process: subprocess.Popen, entity: str, component: str, field: str
+) -> "list[float]":
+    """The F32 elements one `dump field` reports for an array field, in order."""
+    begin = len(read_log())
+    append(f"dump field {entity} {component} {field}")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        text = read_log()[begin:]
+        match = re.search(r"value=Array\(\[([^\]]+)\]\)", text)
+        if match:
+            return [float(value) for value in re.findall(r"F32\(([-\d.eE+]+)\)", match.group(1))]
+        if "[test] field unreadable" in text:
+            raise RuntimeError(f"{entity} has no readable {component}.{field}\n" + text[-2000:])
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"the editor exited {process.returncode} during a dump\n" + text[-3000:]
+            )
+        time.sleep(0.4)
+    raise RuntimeError("the field dump never answered\n" + read_log()[-3000:])
 
 
 def main() -> int:
@@ -223,7 +252,192 @@ def main() -> int:
             process, r"\[editor\] outline cleared", 60, "the outline cleared with it", begin
         )
 
-        # Step 4: a clean exit.
+        # Step 4: the gizmos (Stage 20). The corner click cleared the
+        # selection, so the grid's entity is selected again and its gizmo
+        # must appear where the handles are drawn.
+        begin = len(read_log())
+        append(f"select {picked_entity}")
+        wait_token(
+            process,
+            rf"\[editor\] selection changed\s+entity={re.escape(picked_entity)}",
+            60,
+            "the picked entity is selected again",
+            begin,
+        )
+        wait_token(
+            process,
+            rf"\[editor\] gizmo anchor\s+entity={re.escape(picked_entity)}"
+            r'\s+mode="translate"\s+space="world"',
+            120,
+            "the translate handles are drawn for it",
+            begin,
+        )
+        before = dump_array(process, picked_entity, "TransformComponent", "translation")
+        print(f"  [OK] the entity's translation starts at {before}")
+
+        # Step 5: one translate drag - press on the X handle's own pixel,
+        # move 120 px right, release. The pick must answer a handle id, the
+        # drag must write through the recorded path, and the whole drag must
+        # be one undo step.
+        begin = len(read_log())
+        append("gizmo drag 0 120 0")
+        wait_token(
+            process, r"\[editor\] test channel: gizmo drag request", 30, "the scripted drag was read", begin
+        )
+        wait_token(
+            process,
+            r'\[editor\] gizmo drag press\s+axis="x"',
+            60,
+            "the press ray was aimed at the X handle",
+            begin,
+        )
+        wait_token(
+            process, r"\[editor\] scene pick handle\s+handle=\d+", 60, "the pick answered a handle", begin
+        )
+        wait_token(
+            process,
+            rf'\[editor\] gizmo drag started\s+mode="translate"\s+axis="x"'
+            rf"\s+entity={re.escape(picked_entity)}",
+            60,
+            "the drag started on the translate X handle",
+            begin,
+        )
+        wait_token(
+            process,
+            r'\[editor\] gizmo drag ended\s+mode="translate"\s+axis="x"\s+entity=\S+'
+            r"\s+value=\[([-\d.eE+]+),[^\n]*snapped=false",
+            60,
+            "the drag ended, unsnapped, with a value",
+            begin,
+        )
+        wait_token(
+            process, r'\[editor\] history push\s+label="gizmo translate"', 60, "the drag is one history step", begin
+        )
+        match = re.search(
+            r'\[editor\] gizmo drag ended\s+mode="translate"\s+axis="x"\s+entity=\S+'
+            r"\s+value=\[([-\d.eE+]+),",
+            read_log()[begin:],
+        )
+        logged_x = float(match.group(1))
+        after = dump_array(process, picked_entity, "TransformComponent", "translation")
+        assert abs(after[0] - logged_x) < 1e-3, f"the world holds {after[0]}, the drag logged {logged_x}"
+        assert abs(after[0] - before[0]) > 1e-4, "the drag must move the entity's X"
+        print(f"  [OK] the drag moved X {before[0]:.3f} -> {after[0]:.3f} (logged)")
+
+        # Step 6: one undo puts it back - the drag was a single step.
+        begin = len(read_log())
+        append("command editor.undo")
+        wait_token(
+            process, r'\[editor\] history undo\s+label="gizmo translate"', 60, "the undo step is the drag", begin
+        )
+        deadline = time.monotonic() + 30
+        while abs(dump_array(process, picked_entity, "TransformComponent", "translation")[0] - before[0]) > 1e-4:
+            if time.monotonic() > deadline:
+                raise AssertionError("the undo never restored the translation")
+        print(f"  [OK] one undo restored X to {before[0]:.3f}")
+
+        # Step 7: snapping (the Tools command, persisted), then the same
+        # handle dragged far enough that the 0.5 step is certain to bite.
+        begin = len(read_log())
+        append("command editor.tool_snap_toggle")
+        wait_token(
+            process, r"\[editor\] gizmo tool[^\n]*snap=Some\(true\)", 60, "snapping is on", begin
+        )
+        wait_token(
+            process, r"\[editor\] gizmo preferences written[^\n]*snap=true", 60, "the choice is persisted", begin
+        )
+        begin = len(read_log())
+        append("gizmo drag 0 200 0")
+        wait_token(
+            process,
+            r'\[editor\] gizmo drag ended\s+mode="translate"\s+axis="x"\s+entity=\S+'
+            r"\s+value=\[([-\d.eE+]+),[^\n]*snapped=true",
+            60,
+            "the snapped drag ended",
+            begin,
+        )
+        match = re.search(
+            r'\[editor\] gizmo drag ended\s+mode="translate"\s+axis="x"\s+entity=\S+'
+            r"\s+value=\[([-\d.eE+]+),",
+            read_log()[begin:],
+        )
+        snapped_x = float(match.group(1))
+        moved = snapped_x - before[0]
+        assert abs(moved) > 1e-4, "the snapped drag must still move"
+        assert abs(moved / 0.5 - round(moved / 0.5)) < 1e-3, f"{moved} is not on the 0.5 step"
+        after = dump_array(process, picked_entity, "TransformComponent", "translation")
+        assert abs(after[0] - snapped_x) < 1e-3, f"the world holds {after[0]}, the drag logged {snapped_x}"
+        print(f"  [OK] the snapped drag moved X to {snapped_x:.3f} (step {moved:.1f})")
+
+        # Step 8: the rotate tool: the Y ring is grabbed on its own plane and
+        # the drag writes the whole quaternion, still as one step.
+        begin = len(read_log())
+        append("command editor.tool_rotate")
+        wait_token(
+            process, r"\[editor\] gizmo tool[^\n]*mode=Some\(Rotate\)", 60, "the rotate tool is active", begin
+        )
+        begin = len(read_log())
+        append("gizmo drag 1 100 0")
+        wait_token(
+            process,
+            rf'\[editor\] gizmo drag started\s+mode="rotate"\s+axis="y"'
+            rf"\s+entity={re.escape(picked_entity)}",
+            60,
+            "the drag started on the Y ring",
+            begin,
+        )
+        wait_token(
+            process,
+            r'\[editor\] gizmo drag ended\s+mode="rotate"\s+axis="y"\s+entity=\S+'
+            r"\s+value=\[[-\d.eE+, ]+\]",
+            60,
+            "the ring drag ended with the quaternion",
+            begin,
+        )
+        wait_token(
+            process, r'\[editor\] history push\s+label="gizmo rotate"', 60, "the ring drag is one history step", begin
+        )
+        print("  [OK] the Y ring drag wrote the quaternion as one step")
+
+        # Step 9: the scale tool, through its X handle; the written value is
+        # the first element of the logged array.
+        begin = len(read_log())
+        append("command editor.tool_scale")
+        wait_token(
+            process, r"\[editor\] gizmo tool[^\n]*mode=Some\(Scale\)", 60, "the scale tool is active", begin
+        )
+        begin = len(read_log())
+        append("gizmo drag 0 120 0")
+        wait_token(
+            process,
+            rf'\[editor\] gizmo drag started\s+mode="scale"\s+axis="x"'
+            rf"\s+entity={re.escape(picked_entity)}",
+            60,
+            "the drag started on the scale X handle",
+            begin,
+        )
+        wait_token(
+            process,
+            r'\[editor\] gizmo drag ended\s+mode="scale"\s+axis="x"\s+entity=\S+'
+            r"\s+value=\[([-\d.eE+]+),",
+            60,
+            "the scale drag ended with a value",
+            begin,
+        )
+        wait_token(
+            process, r'\[editor\] history push\s+label="gizmo scale"', 60, "the scale drag is one history step", begin
+        )
+        before_scale = dump_array(process, picked_entity, "TransformComponent", "scale")
+        print(f"  [OK] the scale drag wrote it as one step (scale now {before_scale})")
+
+        # Leave the tool as it was found, and exit cleanly.
+        begin = len(read_log())
+        append("command editor.tool_translate")
+        wait_token(
+            process, r"\[editor\] gizmo tool[^\n]*mode=Some\(Translate\)", 60, "the translate tool is back", begin
+        )
+
+        # Step 10: a clean exit.
         append("quit")
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and process.poll() is None:

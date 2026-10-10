@@ -121,6 +121,17 @@ pub enum TestCommand {
     Edit(EditCommand),
     /// Ask the world a question; the answer goes to the log.
     Dump(DumpQuery),
+    /// Drive one gizmo drag (Stage 20): press on the named axis handle of
+    /// the active tool, move by a pixel delta, release - the same pick, drag
+    /// and command path the mouse takes.
+    GizmoDrag {
+        /// The axis index (0 X, 1 Y, 2 Z).
+        axis: usize,
+        /// Horizontal drag delta, in physical scene pixels.
+        dx: f32,
+        /// Vertical drag delta, in physical scene pixels.
+        dy: f32,
+    },
     /// Quit gracefully, so the process exit code is the clean-shutdown one.
     Quit,
     /// A line that did not parse; logged and skipped by the caller.
@@ -370,10 +381,32 @@ fn parse_command(line: &str) -> TestCommand {
         Some("quit") => TestCommand::Quit,
         Some("edit") => parse_edit(&mut parts, line),
         Some("dump") => parse_dump(&mut parts, line),
+        Some("gizmo") => parse_gizmo(&mut parts, line),
         _ => TestCommand::Unknown {
             line: line.to_string(),
         },
     }
+}
+
+/// Parse `gizmo drag <axis> <dx> <dy>`.
+fn parse_gizmo(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestCommand {
+    let unknown = || TestCommand::Unknown {
+        line: line.to_string(),
+    };
+    let Some(verb) = parts.next() else {
+        return unknown();
+    };
+    if verb != "drag" {
+        return unknown();
+    }
+    let (Some(axis), Some(dx), Some(dy)) = (parts.next(), parts.next(), parts.next()) else {
+        return unknown();
+    };
+    let (Ok(axis), Ok(dx), Ok(dy)) = (axis.parse::<usize>(), dx.parse::<f32>(), dy.parse::<f32>())
+    else {
+        return unknown();
+    };
+    TestCommand::GizmoDrag { axis, dx, dy }
 }
 
 /// Parse `edit <verb> ...`.

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
-# REQUIREMENTS: bash 4+, curl, ca-certificates. The system-package step needs
-#               apt-get plus root (the script uses sudo when it is not already
-#               root) and only runs on Debian/Ubuntu; every other step installs
-#               per-user and needs no privileges. Run from anywhere; the script
-#               locates the repository root itself.
+# REQUIREMENTS: bash 4+, curl, ca-certificates, unzip. The system-package step
+#               needs apt-get plus root (the script uses sudo when it is not
+#               already root) and only runs on Debian/Ubuntu; every other step
+#               installs per-user and needs no privileges. Run from anywhere;
+#               the script locates the repository root itself.
 
 # DESCRIPTION: Prepares a fresh Linux machine to build and run this workspace
 #   with:
@@ -20,13 +20,24 @@
 #      desktop needs the Vulkan loader plus an ICD (or the GL/EGL fallback),
 #      the X11/Wayland client libraries, and the C toolchain the build scripts
 #      shell out to. The managed host additionally starts the .NET runtime,
-#      which needs ICU and OpenSSL. The script installs only what is missing.
+#      which needs ICU and OpenSSL. Two crates in the graph also link system
+#      libraries at build time through pkg-config - gilrs (gamepads) against
+#      libudev, cpal (the audio extension) against alsa - so their `-dev`
+#      packages must be present, or the build fails before anything runs. The
+#      script installs only what is missing.
 #
 #   2. Rust toolchain (rustup). A plain `cargo run` needs it; the Windows
 #      script installs it with winget, this one with rustup's own installer
 #      into ~/.cargo.
 #
-#   3. .NET 8 SDK. This is the Linux stand-in for the Windows script's MSVC
+#   3. Shader compiler (Slang). The renderer-data crate's build script cooks
+#      every `.hlsl` through `slangc`, and the dev host's shader watcher
+#      re-cooks edits the same way; nothing builds without it on PATH. Debian
+#      has no Slang package, so the official release zip - at the version the
+#      CI image pins (devops/ci_cd/Dockerfile) - is installed into ~/.local
+#      and added to PATH in ~/.bashrc.
+#
+#   4. .NET 8 SDK. This is the Linux stand-in for the Windows script's MSVC
 #      step: the managed (`PROJECT_PATH=.../*.csproj`) backend builds the
 #      project with `dotnet build` and boots CoreCLR through hostfxr. The host
 #      looks for `libhostfxr.so` under DOTNET_ROOT, ~/.dotnet,
@@ -35,11 +46,11 @@
 #      needed) and DOTNET_ROOT/PATH are exported and appended to ~/.bashrc so
 #      later shells inherit them.
 #
-#   4. An optional VS Code debugging setup: the editor (Microsoft's .deb, on
+#   5. An optional VS Code debugging setup: the editor (Microsoft's .deb, on
 #      apt systems), the extensions the launch profiles and editing depend on,
 #      and the dotnet-trace global tool.
 #
-#   5. Offline cargo registry. The host builds every extension and the project
+#   6. Offline cargo registry. The host builds every extension and the project
 #      with `cargo build --offline`, so a reload never waits on the registry
 #      index. That only works once every dependency - including the pinned
 #      `trait_type_map` git dependency - is already cached, so the script runs
@@ -90,7 +101,7 @@ fail() { printf '%s[error]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 # warning can name which half is missing; both are covered by APT_PACKAGES.
 BUILD_COMMANDS=(cc pkg-config curl git)
 
-# Shared libraries the windowed host loads at runtime.
+# Shared libraries the running host or a loaded extension links at load time.
 RUNTIME_LIBRARIES=(
     libvulkan.so.1          # Vulkan loader (wgpu's primary backend)
     libGL.so.1              # GL fallback when no Vulkan ICD is present
@@ -99,19 +110,32 @@ RUNTIME_LIBRARIES=(
     libwayland-client.so.0  # Wayland windowing
     libX11.so.6             # X11 windowing
     libXcursor.so.1
+    libudev.so.1            # gamepads (gilrs, linked into the windowed binary)
+    libasound.so.2          # audio (cpal, linked into the audio extension)
     libicuuc.so             # ICU - the .NET runtime's globalization layer
     libssl.so.3             # OpenSSL 3 - the .NET runtime's crypto layer
 )
 
+# pkg-config modules build scripts probe before compiling. These come from the
+# `-dev` packages below and fail the build, not the run, when missing: the
+# runtime libraries above can all be present and a build still stops here.
+PKG_CONFIG_MODULES=(
+    libudev                 # gilrs-core (gamepads)
+    alsa                    # alsa-sys (audio through cpal)
+)
+
 # Debian Bookworm package names providing the commands and libraries above,
-# plus the C toolchain and certificate store the build scripts assume. Names
-# that a different distribution does not know (Ubuntu's libicu/libssl versions
+# plus the C toolchain and certificate store the build scripts assume, unzip
+# for the Slang release, and the runtime and `-dev` packages for the two
+# libraries the gamepad and audio crates link (libudev, alsa). Names that a
+# different distribution does not know (Ubuntu's libicu/libssl versions
 # differ) are filtered out at install time rather than failing the whole run.
 APT_PACKAGES=(
-    build-essential pkg-config curl git ca-certificates
+    build-essential pkg-config curl git ca-certificates unzip
     libvulkan1 mesa-vulkan-drivers libgl1 libegl1 libgles2
     libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1
     libx11-6 libxcursor1 libxi6 libxrandr2 libxcb1
+    libudev1 libudev-dev libasound2 libasound2-dev
     libicu72 libssl3 zlib1g
 )
 
@@ -137,6 +161,17 @@ missing_runtime_libraries() {
     done
 }
 
+# Print the pkg-config modules from the given list that pkg-config cannot
+# resolve. Without pkg-config itself nothing is printed - the command check
+# already flags that, and the install covers the modules anyway.
+missing_pkg_config_modules() {
+    command -v pkg-config > /dev/null 2>&1 || return 0
+    local module
+    for module in "$@"; do
+        pkg-config --exists "$module" 2> /dev/null || printf '%s\n' "$module"
+    done
+}
+
 # --- 1. System packages ------------------------------------------------------
 
 install_system_packages() {
@@ -149,8 +184,11 @@ install_system_packages() {
     local missing_libraries=()
     mapfile -t missing_libraries < <(missing_runtime_libraries "${RUNTIME_LIBRARIES[@]}")
 
-    if [[ ${#missing_commands[@]} -eq 0 && ${#missing_libraries[@]} -eq 0 ]]; then
-        info "system commands and runtime libraries already present"
+    local missing_modules=()
+    mapfile -t missing_modules < <(missing_pkg_config_modules "${PKG_CONFIG_MODULES[@]}")
+
+    if [[ ${#missing_commands[@]} -eq 0 && ${#missing_libraries[@]} -eq 0 && ${#missing_modules[@]} -eq 0 ]]; then
+        info "system commands, runtime libraries and build modules already present"
         return
     fi
     if [[ ${#missing_commands[@]} -gt 0 ]]; then
@@ -158,6 +196,9 @@ install_system_packages() {
     fi
     if [[ ${#missing_libraries[@]} -gt 0 ]]; then
         warn "missing runtime libraries: ${missing_libraries[*]}"
+    fi
+    if [[ ${#missing_modules[@]} -gt 0 ]]; then
+        warn "missing pkg-config modules (shipped by the -dev packages): ${missing_modules[*]}"
     fi
 
     if ! command -v apt-get > /dev/null 2>&1; then
@@ -217,7 +258,48 @@ install_rust() {
     info "Rust installed ($(cargo --version))"
 }
 
-# --- 3. .NET 8 SDK -----------------------------------------------------------
+# --- 3. Shader compiler (Slang) ----------------------------------------------
+
+# The release the CI image pins (devops/ci_cd/Dockerfile). The renderer-data
+# crate's build script and the host's shader watcher both shell out to
+# `slangc`; the zip is relocatable (its rpath is `$ORIGIN/../lib`), so an
+# install that keeps bin/ and lib/ together works from ~/.local without root.
+SLANG_VERSION="2025.21.2"
+
+install_slangc() {
+    if command -v slangc > /dev/null 2>&1; then
+        info "Slang shader compiler already installed ($(command -v slangc))"
+        return
+    fi
+    command -v curl > /dev/null 2>&1 || fail "curl is required to install the Slang shader compiler"
+    command -v unzip > /dev/null 2>&1 || fail "unzip is required to extract the Slang release (install it, then re-run)"
+    local install_dir="$HOME/.local/share/slang/$SLANG_VERSION"
+    info "installing the Slang shader compiler ($SLANG_VERSION) into $install_dir ..."
+    local archive
+    archive="$(mktemp --suffix=.zip)"
+    curl -fsSL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.zip" -o "$archive"
+    rm -rf "$install_dir"
+    mkdir -p "$install_dir"
+    unzip -q "$archive" -d "$install_dir"
+    rm -f "$archive"
+    export PATH="$install_dir/bin:$PATH"
+    hash -r
+    command -v slangc > /dev/null 2>&1 || fail "the Slang install did not produce a working 'slangc' on PATH"
+
+    # Make the compiler visible to future shells, like the .NET SDK below.
+    local rc_file="$HOME/.bashrc"
+    local marker="# Slang shader compiler, added by devops/setup/setup_linux_environment.sh"
+    if [[ ! -f "$rc_file" ]] || ! grep -qF "$marker" "$rc_file"; then
+        {
+            printf '\n%s\n' "$marker"
+            printf 'export PATH="%s/bin:$PATH"\n' "$install_dir"
+        } >> "$rc_file"
+        info "added $install_dir/bin to PATH in $rc_file"
+    fi
+    info "Slang shader compiler installed ($(command -v slangc))"
+}
+
+# --- 4. .NET 8 SDK -----------------------------------------------------------
 
 # Honour an existing DOTNET_ROOT, otherwise use the location the host already
 # searches. Both the install and the PATH entry are derived from this value.
@@ -260,7 +342,7 @@ persist_dotnet_environment() {
     info "added DOTNET_ROOT/PATH to $rc_file"
 }
 
-# --- 4. Optional VS Code debugging setup -------------------------------------
+# --- 5. Optional VS Code debugging setup -------------------------------------
 
 # Extensions the launch profiles and day-to-day editing rely on: CodeLLDB and
 # C/C++ (gdb) debug the native host, the C# extensions attach coreclr to the
@@ -340,7 +422,7 @@ install_vscode_debugging() {
     fi
 }
 
-# --- 5. Offline cargo registry ----------------------------------------------
+# --- 6. Offline cargo registry ----------------------------------------------
 
 fetch_cargo_dependencies() {
     info "fetching cargo dependencies (online, one-time)..."
@@ -369,13 +451,17 @@ This script prepares this machine to build and run the engine. It will:
 
   1. System packages    Install the missing build tools and runtime libraries with apt
                         (C toolchain, pkg-config, git, Vulkan/GL, X11/Wayland, ICU,
-                        OpenSSL). Uses sudo; on other distributions it only lists them.
+                        OpenSSL, gamepad/audio dev files). Uses sudo; on other
+                        distributions it only lists them.
   2. Rust toolchain     Install rustup and the stable toolchain into ~/.cargo.
-  3. .NET 8 SDK         Install it into ~/.dotnet and add DOTNET_ROOT and PATH to ~/.bashrc.
-  4. VS Code debugging  Optional. Install VS Code (with sudo), the dotnet-trace tool and
+  3. Slang compiler     Install the Slang shader compiler into ~/.local/share/slang
+                        and add it to PATH in ~/.bashrc; the renderer's build cooks
+                        every .hlsl through `slangc`.
+  4. .NET 8 SDK         Install it into ~/.dotnet and add DOTNET_ROOT and PATH to ~/.bashrc.
+  5. VS Code debugging  Optional. Install VS Code (with sudo), the dotnet-trace tool and
                         these extensions: rust-analyzer, C/C++, C#, C# Dev Kit, Hex Editor,
                         Even Better TOML and CodeLLDB.
-  5. Cargo cache        Download every crate dependency once (cargo fetch), so offline
+  6. Cargo cache        Download every crate dependency once (cargo fetch), so offline
                         builds during hot reload never wait on the network.
 
 Anything already installed is detected and skipped.
@@ -395,7 +481,7 @@ choose_vscode_debugging() {
         return
     fi
     local answer
-    read -r -p "Include the optional VS Code debugging setup (step 4)? [Y/n] " answer
+    read -r -p "Include the optional VS Code debugging setup (step 5)? [Y/n] " answer
     case "${answer,,}" in
         "" | y | yes) VSCODE_DEBUGGING=1 ;;
         *) VSCODE_DEBUGGING=0 ;;
@@ -424,6 +510,7 @@ main() {
     info "repository root: $REPO_ROOT"
     install_system_packages
     install_rust
+    install_slangc
     install_dotnet
     persist_dotnet_environment
     if [[ "$VSCODE_DEBUGGING" == "1" ]]; then

@@ -654,6 +654,37 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "ctrl+v")
             .bind(Godot, "ctrl+v")
             .bind(Unreal, "ctrl+v"),
+        // The transform tools (Stage 20): the chords are the ones Unity and
+        // Unreal already use, and Blender's own grab/rotate/scale keys.
+        CommandSpec::new("editor.tool_translate", "Translate Tool")
+            .menu(&["Tools", "Translate Tool"])
+            .bind(Blender, "g")
+            .bind(Unity, "w")
+            .bind(Godot, "w")
+            .bind(Unreal, "w"),
+        CommandSpec::new("editor.tool_rotate", "Rotate Tool")
+            .menu(&["Tools", "Rotate Tool"])
+            .bind(Blender, "r")
+            .bind(Unity, "e")
+            .bind(Godot, "e")
+            .bind(Unreal, "e"),
+        CommandSpec::new("editor.tool_scale", "Scale Tool")
+            .menu(&["Tools", "Scale Tool"])
+            .bind(Blender, "s")
+            .bind(Unity, "r")
+            .bind(Godot, "r")
+            .bind(Unreal, "r"),
+        CommandSpec::new("editor.tool_snap_toggle", "Toggle Snapping")
+            .menu(&["Tools", "Toggle Snapping"])
+            .bind(Blender, "shift+x")
+            .bind(Unity, "ctrl+shift+x")
+            .bind(Godot, "ctrl+shift+x")
+            .bind(Unreal, "ctrl+shift+x"),
+        // Unbound on purpose: the space toggle is a menu, palette and
+        // toolbar command, and the presets have no free chord that would
+        // mean "local" anywhere else either.
+        CommandSpec::new("editor.tool_space_toggle", "Toggle Local / World Space")
+            .menu(&["Tools", "Toggle Local / World Space"]),
     ]
 }
 
@@ -690,6 +721,9 @@ pub struct EditorPreferences {
     /// Transform snapping steps, in world units and degrees.
     #[serde(default)]
     pub snapping_steps: Option<SnappingSteps>,
+    /// The gizmo tool's persisted state (Stage 20).
+    #[serde(default)]
+    pub gizmo: Option<GizmoPreferences>,
     /// The command that opens the user's code editor.
     #[serde(default)]
     pub code_editor_command: Option<String>,
@@ -711,6 +745,157 @@ pub struct SnappingSteps {
     pub translation: f32,
     /// Rotation step in degrees.
     pub rotation_degrees: f32,
+    /// Scale step, as a factor increment (Stage 20).
+    #[serde(default = "default_scale_step")]
+    pub scale: f32,
+}
+
+/// The scale step a preferences file without one uses.
+fn default_scale_step() -> f32 {
+    0.1
+}
+
+/// The gizmo tool's persisted state (Stage 20).
+///
+/// The top-level fields are the defaults; `projects` remembers a choice per
+/// project - the plan's "per project" snapping decision - keyed by the
+/// project directory's name, so moving between projects brings each one's
+/// tool back.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GizmoPreferences {
+    /// The last active mode, when one was chosen.
+    #[serde(default)]
+    pub mode: Option<crate::gizmo::GizmoMode>,
+    /// The last active space, when one was chosen.
+    #[serde(default)]
+    pub space: Option<crate::gizmo::GizmoSpace>,
+    /// Whether dragging snapped, when the toggle was used.
+    #[serde(default)]
+    pub snap: Option<bool>,
+    /// Per-project overrides, by project directory name.
+    #[serde(default)]
+    pub projects: BTreeMap<String, GizmoProjectPreferences>,
+}
+
+/// One project's gizmo choices.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct GizmoProjectPreferences {
+    /// The project's last active mode.
+    #[serde(default)]
+    pub mode: Option<crate::gizmo::GizmoMode>,
+    /// The project's last active space.
+    #[serde(default)]
+    pub space: Option<crate::gizmo::GizmoSpace>,
+    /// The project's last snapping toggle.
+    #[serde(default)]
+    pub snap: Option<bool>,
+}
+
+/// The preferences file's name, next to the layout file (D31).
+///
+/// Declared here rather than in an editor frontend: the executable reads the
+/// file at startup and the shell writes it, and both link this crate.
+pub const PREFERENCES_FILE: &str = "preferences.json";
+
+/// The gizmo settings a project starts a session with (Stage 20).
+///
+/// Resolution order: the project's own remembered entry, then the file's
+/// last-used values, then the defaults; the snapping steps are the file's,
+/// one set for every project (D31). A missing or unreadable file is the
+/// defaults, never an error: the tool has to work before anyone edits
+/// preferences.
+pub fn read_gizmo_settings(
+    directory: &std::path::Path,
+    project: &str,
+) -> crate::gizmo::GizmoSettings {
+    let preferences: EditorPreferences = std::fs::read_to_string(directory.join(PREFERENCES_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let mut settings = crate::gizmo::GizmoSettings::default();
+    if let Some(steps) = preferences.snapping_steps {
+        settings.translate_step = steps.translation;
+        settings.rotate_step_degrees = steps.rotation_degrees;
+        settings.scale_step = steps.scale;
+    }
+    let Some(gizmo) = &preferences.gizmo else {
+        return settings;
+    };
+    if let Some(mode) = gizmo.mode {
+        settings.mode = mode;
+    }
+    if let Some(space) = gizmo.space {
+        settings.space = space;
+    }
+    if let Some(snap) = gizmo.snap {
+        settings.snap = snap;
+    }
+    if let Some(project) = gizmo.projects.get(project) {
+        if let Some(mode) = project.mode {
+            settings.mode = mode;
+        }
+        if let Some(space) = project.space {
+            settings.space = space;
+        }
+        if let Some(snap) = project.snap {
+            settings.snap = snap;
+        }
+    }
+    settings
+}
+
+/// Remember one project's gizmo choices in the preferences file (Stage 20).
+///
+/// Read-modify-write, so every other key survives; the top-level fields are
+/// the last-used values a shell toggles against, and the per-project entry
+/// is what the next session on this project starts with. Written through a
+/// temporary file and a rename, so the live reload reader never observes a
+/// half-written document.
+///
+/// # Errors
+///
+/// A message when the file cannot be read as JSON, serialized, or replaced.
+pub fn write_gizmo_preferences(
+    directory: &std::path::Path,
+    project: &str,
+    settings: &crate::gizmo::GizmoSettings,
+) -> Result<(), String> {
+    let path = directory.join(PREFERENCES_FILE);
+    let mut document = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let mut gizmo = document
+        .get("gizmo")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    gizmo.insert("mode".to_string(), serde_json::json!(settings.mode));
+    gizmo.insert("space".to_string(), serde_json::json!(settings.space));
+    gizmo.insert("snap".to_string(), serde_json::json!(settings.snap));
+    let mut projects = gizmo
+        .get("projects")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    projects.insert(
+        project.to_string(),
+        serde_json::json!({
+            "mode": settings.mode,
+            "space": settings.space,
+            "snap": settings.snap,
+        }),
+    );
+    gizmo.insert("projects".to_string(), serde_json::Value::Object(projects));
+    document.insert("gizmo".to_string(), serde_json::Value::Object(gizmo));
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(document))
+        .map_err(|error| error.to_string())?;
+    // The directory belongs to the layout, which may never have been saved
+    // in this profile: the write creates it rather than assuming a save
+    // came first.
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
 }
 
 /// The world resource carrying commands executed this frame to their owners.
@@ -807,6 +992,69 @@ pub fn ensure_command_resources(world: &mut pill_engine::World) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gizmo choices round-trip through the preferences file, and the
+    /// keys another writer owns survive.
+    #[test]
+    fn gizmo_preferences_round_trip_and_preserve_other_keys() {
+        let directory = std::env::temp_dir().join(format!(
+            "ecs-gizmo-preferences-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(PREFERENCES_FILE),
+            r#"{ "theme": "dark", "history_step_cap": 42 }"#,
+        )
+        .unwrap();
+        let settings = crate::gizmo::GizmoSettings {
+            mode: crate::gizmo::GizmoMode::Rotate,
+            space: crate::gizmo::GizmoSpace::Local,
+            snap: true,
+            ..crate::gizmo::GizmoSettings::default()
+        };
+        write_gizmo_preferences(&directory, "italian_brainrot", &settings).unwrap();
+        // A second project's write keeps the first project's entry.
+        let other = crate::gizmo::GizmoSettings {
+            mode: crate::gizmo::GizmoMode::Scale,
+            ..crate::gizmo::GizmoSettings::default()
+        };
+        write_gizmo_preferences(&directory, "project_rs", &other).unwrap();
+        let text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(document["theme"], "dark");
+        assert_eq!(document["history_step_cap"], 42);
+        assert_eq!(
+            document["gizmo"]["projects"]["italian_brainrot"]["mode"],
+            "rotate"
+        );
+        assert_eq!(document["gizmo"]["projects"]["project_rs"]["mode"], "scale");
+
+        let read_back = read_gizmo_settings(&directory, "italian_brainrot");
+        assert_eq!(read_back.mode, crate::gizmo::GizmoMode::Rotate);
+        assert_eq!(read_back.space, crate::gizmo::GizmoSpace::Local);
+        assert!(read_back.snap);
+        // A project the file never saw keeps the last-used values.
+        let unknown = read_gizmo_settings(&directory, "circus_demo");
+        assert_eq!(unknown.mode, crate::gizmo::GizmoMode::Scale);
+        // And no file at all is the defaults.
+        let empty = std::env::temp_dir().join("ecs-gizmo-nonexistent-dir");
+        let defaults = read_gizmo_settings(&empty, "anything");
+        assert_eq!(defaults, crate::gizmo::GizmoSettings::default());
+        // A profile whose layout was never saved has no directory yet: the
+        // write creates it instead of failing.
+        let fresh = directory.join("unsaved-profile");
+        write_gizmo_preferences(&fresh, "italian_brainrot", &settings).unwrap();
+        assert_eq!(
+            read_gizmo_settings(&fresh, "italian_brainrot").mode,
+            crate::gizmo::GizmoMode::Rotate
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn chords_parse_and_format_round_trip() {

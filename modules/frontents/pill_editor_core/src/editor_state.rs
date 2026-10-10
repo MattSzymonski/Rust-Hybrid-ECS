@@ -378,6 +378,16 @@ pub enum EditorCommand {
         /// Desired pause state.
         paused: bool,
     },
+    /// Choose what the transform gizmo edits (Stage 20): the tool's mode,
+    /// its space, or whether dragging snaps. Absent fields keep their value.
+    SetGizmoTool {
+        /// The mode to select.
+        mode: Option<crate::gizmo::GizmoMode>,
+        /// The space to select.
+        space: Option<crate::gizmo::GizmoSpace>,
+        /// The snapping toggle's new state.
+        snap: Option<bool>,
+    },
     /// Run exactly one system phase on the next frame, then pause again.
     StepOnce,
     /// Copy files from outside the project into the assets directory (a
@@ -497,6 +507,7 @@ impl EditorCommand {
             EditorCommand::DestroyEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
+            | EditorCommand::SetGizmoTool { .. }
             | EditorCommand::StepOnce
             | EditorCommand::ImportFiles { .. }
             | EditorCommand::RemoveFiles { .. } => {}
@@ -529,6 +540,7 @@ impl EditorCommand {
             EditorCommand::CreateEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
+            | EditorCommand::SetGizmoTool { .. }
             | EditorCommand::StepOnce
             | EditorCommand::ImportFiles { .. }
             | EditorCommand::RemoveFiles { .. } => {}
@@ -691,6 +703,26 @@ impl EditorCommand {
 
             EditorCommand::SetPaused { paused } => {
                 engine.set_systems_paused(*paused);
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SetGizmoTool { mode, space, snap } => {
+                let world = engine.world_mut();
+                if world.get_resource::<crate::gizmo::GizmoState>().is_none() {
+                    world.insert_resource(crate::gizmo::GizmoState::default());
+                }
+                let Some(state) = world.get_resource_mut::<crate::gizmo::GizmoState>() else {
+                    return Err(format!("{command:?}: the gizmo state could not be claimed"));
+                };
+                if let Some(mode) = mode {
+                    state.settings.mode = *mode;
+                }
+                if let Some(space) = space {
+                    state.settings.space = *space;
+                }
+                if let Some(snap) = snap {
+                    state.settings.snap = *snap;
+                }
                 Ok(CommandOutcome::plain())
             }
 
