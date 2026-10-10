@@ -30,12 +30,15 @@ use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
 use pill_core::telemetry::capture::LogBuffer;
 use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
-use pill_editor_api::EditorShellFrame;
+use pill_editor_api::{ClipboardObject, EditorClipboardAnswer, EditorShellFrame, EditorShellInput};
+use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
     menu_tree, CommandInbox, CommandRegistry, CommandSpec, EditorPreferences, KeybindingsFile,
     PendingEditorCommands,
 };
-use pill_editor_core::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
+use pill_editor_core::editor_state::{
+    ComponentSeed, EditorCommand, EditorSelection, EditorSnapshot,
+};
 use pill_editor_core::history::{CommandHistory, HistoryEntryKind};
 use pill_editor_core::layout::{
     LayoutAction, LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
@@ -112,6 +115,18 @@ pub struct EditorShellState {
     /// microseconds: the heartbeat reports it, so a panel regression is
     /// visible in any log (the D32 measurement found one this way).
     pub last_panels_us: u64,
+    /// The clipboard work a command queued this frame (Stage 18): the hot
+    /// root runs it where the frame, the snapshot and the clipboard answer
+    /// are in scope.
+    pub clipboard_action: Option<ClipboardAction>,
+    /// The clipboard answer sequence last consumed, so a paste only applies
+    /// an answer newer than the one it has seen.
+    pub clipboard_seq_seen: u64,
+    /// Whether a paste is waiting for the executable's clipboard read.
+    pub clipboard_paste_pending: bool,
+    /// How many files an OS drag is hovering over the Assets panel with,
+    /// when one is (Stage 18); the preview paints from this.
+    pub drop_hover: Option<usize>,
     /// The top-level menu currently open, when one is.
     pub menu_open: Option<String>,
     /// Whether the command palette is open, and its search text.
@@ -228,6 +243,28 @@ pub struct ConsoleLine {
     pub channel: u8,
 }
 
+/// The clipboard work a copy, cut or paste command queued (Stage 18, D28).
+///
+/// The commands run inside [`execute_command`], which has neither the frame
+/// to answer through nor the snapshot to copy from; they record the intent
+/// here and the hot root runs it with everything in scope.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ClipboardAction {
+    /// Offer the selection (the entity's detail, or the asset) to the
+    /// system clipboard.
+    Copy,
+    /// Offer it, then remove it as one recorded step.
+    Cut,
+    /// Offer one component of the selection's entity, by type name (the
+    /// Inspector's per-component Copy button).
+    CopyComponent {
+        /// Registered component type name.
+        type_name: String,
+    },
+    /// Read the clipboard through the executable and apply what it carries.
+    Paste,
+}
+
 impl EditorShellState {
     /// The state's first value: the native layout file when one exists,
     /// the classic editor's file migrated once when only that exists, the
@@ -242,6 +279,10 @@ impl EditorShellState {
             atlas: Atlas::new(ATLAS_SIZE.0, ATLAS_SIZE.1),
             frame_index: 0,
             last_panels_us: 0,
+            clipboard_action: None,
+            clipboard_seq_seen: 0,
+            clipboard_paste_pending: false,
+            drop_hover: None,
             menu_open: None,
             palette_query: None,
             modifiers: pill_engine::Modifiers::default(),
@@ -420,11 +461,13 @@ fn save_native_layout(model: &LayoutModel) {
 
 /// One visible panel: its kind and its rectangle in logical pixels.
 ///
-/// Opaque to the crate root: it collects the placements and hands them to
-/// [`paint_panels`] unchanged.
+/// Plain data both the paint pass and the crate root read (the root forwards
+/// the Assets panel's rectangle to the executable for scripted drops).
 pub struct PanelPlacement {
-    kind: PanelKind,
-    rect: LayoutRect,
+    /// The panel the placement belongs to.
+    pub kind: PanelKind,
+    /// Where the panel sits, in logical pixels of the client area.
+    pub rect: LayoutRect,
 }
 
 /// The selected panel of every tabset, with its content rectangle.
@@ -830,8 +873,17 @@ pub fn paint_panels(
         if work.preferences.is_some() {
             collected.preferences = work.preferences;
         }
+        if work.copy_component.is_some() {
+            collected.copy_component = work.copy_component;
+        }
+        if work.drag_candidate.is_some() {
+            collected.drag_candidate = work.drag_candidate;
+        }
     }
     ui.set_hit_rects(merged);
+    // The frame closes here: every panel has seen this frame's release edge,
+    // so the drag (if any) ends now, once.
+    ui.end_frame();
     *widget_names = names;
     collected
 }
@@ -1002,13 +1054,18 @@ fn inspector_panel(
                 }
             }
         }
-        let remove = {
-            let mut clicked = false;
+        let (copy, remove) = {
+            let mut copy = false;
+            let mut remove = false;
             builder.row(|row| {
-                clicked = row.button(&format!("Remove {}", short_name(&component.type_name)));
+                copy = row.button(&format!("Copy {}", short_name(&component.type_name)));
+                remove = row.button(&format!("Remove {}", short_name(&component.type_name)));
             });
-            clicked
+            (copy, remove)
         };
+        if copy {
+            work.copy_component(component.type_name.clone());
+        }
         if remove {
             work.edit(
                 vec![EditorCommand::RemoveComponent {
@@ -1260,12 +1317,14 @@ fn preferences_panel(
     }
 }
 
-/// The Assets: the browser's rows, a click selects for the shared selection.
+/// The Assets: the browser's rows, a click selects for the shared selection,
+/// and a row held down is offered to an OS drag (Stage 18).
 fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
     builder.heading("Assets");
     builder.label(&format!("{} files", view.snapshot.assets.len()));
     builder.separator();
     let mut selected: Option<String> = None;
+    let mut held: Option<String> = None;
     for asset in view.snapshot.assets.iter().take(PANEL_ROWS * 2) {
         let label = if view.selection.asset.as_deref() == Some(asset.path.as_str()) {
             format!("> {} [{}]", asset.path, asset.kind)
@@ -1273,8 +1332,12 @@ fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut
             format!("  {} [{}]", asset.path, asset.kind)
         };
         builder.row(|row| {
-            if row.button(&label) {
+            let (clicked, is_held) = row.button_held(&label);
+            if clicked {
                 selected = Some(asset.path.clone());
+            }
+            if is_held {
+                held = Some(asset.path.clone());
             }
         });
     }
@@ -1286,6 +1349,9 @@ fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut
     }
     if let Some(path) = selected {
         work.select_asset(path);
+    }
+    if let Some(path) = held {
+        work.drag_candidate(path);
     }
 }
 
@@ -1729,6 +1795,11 @@ pub fn execute_command(
             }]);
         }
         "editor.step" => pending.push(vec![EditorCommand::StepOnce]),
+        // The clipboard commands queue their intent; the hot root runs it
+        // where the frame and the snapshot are in scope (Stage 18, D28).
+        "editor.copy" => state.clipboard_action = Some(ClipboardAction::Copy),
+        "editor.cut" => state.clipboard_action = Some(ClipboardAction::Cut),
+        "editor.paste" => state.clipboard_action = Some(ClipboardAction::Paste),
         "editor.undo" => {
             let undo = match history.pop_undo() {
                 Some(entry) => Some(entry),
@@ -1849,6 +1920,477 @@ pub fn handle_command_shortcuts(
         }
         execute_command(state, registry, inbox, pending, history, &id);
     }
+}
+
+/// Run the clipboard work a command queued this frame (Stage 18, D28).
+///
+/// Copy and cut offer the selection - an entity's components, one component
+/// or an asset - as a structured payload plus its readable text; paste reads
+/// the clipboard through the executable (the answer arrives on a later
+/// frame, so a slow clipboard owner never stalls the loop) and queues
+/// recorded commands, making one paste one undo step.
+pub fn run_clipboard_action(
+    state: &mut EditorShellState,
+    frame: &mut EditorShellFrame,
+    snapshot: &EditorSnapshot,
+    selection: &mut EditorSelection,
+    pending: &mut PendingEditorCommands,
+    answer: &EditorClipboardAnswer,
+) {
+    // Step 1: a paste whose read the executable has now answered.
+    if state.clipboard_paste_pending && answer.seq > state.clipboard_seq_seen {
+        state.clipboard_paste_pending = false;
+        state.clipboard_seq_seen = answer.seq;
+        apply_clipboard_paste(snapshot, selection, pending, answer);
+    }
+    let Some(action) = state.clipboard_action.take() else {
+        return;
+    };
+    match action {
+        ClipboardAction::Copy | ClipboardAction::Cut => {
+            let selected_detail = selection.entity.and_then(|entity| {
+                snapshot
+                    .detail
+                    .as_ref()
+                    .filter(|detail| detail.entity == entity)
+            });
+            let offered = match selected_detail {
+                Some(detail) => {
+                    let text = clipboard::encode_entity(detail);
+                    offer_object(frame, text, "entity", "");
+                    Some(detail.entity)
+                }
+                None => match selection.asset.clone() {
+                    Some(path) => {
+                        let text = clipboard::encode_asset(&path);
+                        offer_object(frame, text, "asset", path.as_str());
+                        None
+                    }
+                    None => {
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ECS,
+                            "[editor] clipboard copy skipped nothing selected"
+                        );
+                        return;
+                    }
+                },
+            };
+            if action == ClipboardAction::Cut {
+                match offered {
+                    Some(entity) => {
+                        pending.push_recorded(
+                            vec![EditorCommand::DestroyEntity { entity }],
+                            "cut entity",
+                            None,
+                        );
+                        if selection.entity == Some(entity) {
+                            selection.entity = None;
+                        }
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ECS,
+                            entity = %entity,
+                            "[editor] clipboard cut"
+                        );
+                    }
+                    None => pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        "[editor] clipboard cut skipped kind=asset"
+                    ),
+                }
+            }
+        }
+        ClipboardAction::CopyComponent { type_name } => {
+            let component = snapshot.detail.as_ref().and_then(|detail| {
+                detail
+                    .components
+                    .iter()
+                    .find(|component| component.type_name == type_name)
+            });
+            let Some(component) = component else {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    type_name = type_name.as_str(),
+                    "[editor] clipboard copy skipped no such component"
+                );
+                return;
+            };
+            let text = clipboard::encode_component(
+                &component.type_name,
+                &clipboard::component_field_pairs(component),
+            );
+            offer_object(frame, text, "component", component.type_name.as_str());
+        }
+        ClipboardAction::Paste => {
+            if answer.seq > state.clipboard_seq_seen {
+                state.clipboard_seq_seen = answer.seq;
+                apply_clipboard_paste(snapshot, selection, pending, answer);
+            } else {
+                // The read is answered next frame; the pending flag applies
+                // it (or a fresh in-process answer) without another press.
+                frame.requested_clipboard = Some(clipboard::FORMAT_NAME.to_string());
+                state.clipboard_paste_pending = true;
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] clipboard read requested"
+                );
+            }
+        }
+    }
+}
+
+/// Offer one payload document to the system clipboard under the editor
+/// format, with the same document as its readable text.
+fn offer_object(frame: &mut EditorShellFrame, text: String, kind: &str, detail: &str) {
+    let bytes = text.clone().into_bytes();
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        kind,
+        detail,
+        bytes = bytes.len(),
+        "[editor] clipboard copied"
+    );
+    frame.objects.push(ClipboardObject {
+        format: clipboard::FORMAT_NAME.to_string(),
+        bytes,
+        text,
+    });
+}
+
+/// Apply whatever the clipboard held: decode the payload and queue the
+/// recorded commands the paste becomes.
+fn apply_clipboard_paste(
+    snapshot: &EditorSnapshot,
+    selection: &mut EditorSelection,
+    pending: &mut PendingEditorCommands,
+    answer: &EditorClipboardAnswer,
+) {
+    let source = answer
+        .bytes
+        .as_deref()
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(str::to_string)
+        .or_else(|| answer.text.clone());
+    let Some(text) = source else {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] clipboard paste skipped empty"
+        );
+        return;
+    };
+    let payload = match clipboard::decode(&text) {
+        Ok(payload) => payload,
+        Err(error) => {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                error = error.as_str(),
+                "[editor] clipboard payload not understood"
+            );
+            return;
+        }
+    };
+    match payload {
+        Payload::Entity { components } => {
+            let mut seeds = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for component in components {
+                if !component_type_registered(snapshot, &component.type_name) {
+                    skipped.push(component.type_name);
+                    continue;
+                }
+                seeds.push(seed_from(component));
+            }
+            if seeds.is_empty() {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    skipped = ?skipped,
+                    "[editor] clipboard paste skipped components"
+                );
+                return;
+            }
+            let carried = seeds.len();
+            pending.push_recorded(
+                vec![EditorCommand::CreateEntity { components: seeds }],
+                "paste entity",
+                None,
+            );
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                components = carried,
+                skipped = skipped.len(),
+                "[editor] clipboard paste entity"
+            );
+        }
+        Payload::Component { component } => {
+            let Some(entity) = selection.entity else {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] clipboard paste skipped no selection"
+                );
+                return;
+            };
+            if !component_type_registered(snapshot, &component.type_name) {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    type_name = component.type_name.as_str(),
+                    "[editor] clipboard paste skipped component"
+                );
+                return;
+            }
+            let present = snapshot
+                .detail
+                .as_ref()
+                .filter(|detail| detail.entity == entity)
+                .is_some_and(|detail| {
+                    detail
+                        .components
+                        .iter()
+                        .any(|view| view.type_name == component.type_name)
+                });
+            let seed = seed_from(component);
+            let mut commands = Vec::new();
+            if !present {
+                commands.push(EditorCommand::AddComponent {
+                    entity,
+                    component: seed.type_name.clone(),
+                });
+            }
+            for (field, value) in seed.fields {
+                commands.push(EditorCommand::SetField {
+                    entity,
+                    component: seed.type_name.clone(),
+                    field,
+                    value,
+                });
+            }
+            if commands.is_empty() {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] clipboard paste skipped empty component"
+                );
+                return;
+            }
+            let short = short_name(&seed.type_name);
+            pending.push_recorded(commands, format!("paste {short}"), None);
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                type_name = seed.type_name.as_str(),
+                "[editor] clipboard paste component"
+            );
+        }
+        Payload::Field {
+            component,
+            field,
+            value,
+        } => {
+            let Some(entity) = selection.entity else {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] clipboard paste skipped no selection"
+                );
+                return;
+            };
+            let Some(registered) = registered_name(snapshot, &component) else {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    component = component.as_str(),
+                    "[editor] clipboard paste skipped component"
+                );
+                return;
+            };
+            let Some(parsed) = clipboard::parse_value(&value) else {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    value = value.as_str(),
+                    "[editor] clipboard paste skipped value"
+                );
+                return;
+            };
+            let label = format!("paste {}.{}", short_name(&registered), field);
+            pending.push_recorded(
+                vec![EditorCommand::SetField {
+                    entity,
+                    component: registered,
+                    field,
+                    value: parsed,
+                }],
+                label,
+                None,
+            );
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] clipboard paste field"
+            );
+        }
+        Payload::Asset { path } => {
+            selection.asset = Some(path.clone());
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                path = path.as_str(),
+                "[editor] clipboard paste asset"
+            );
+        }
+    }
+}
+
+/// Whether the world snapshot lists a component type under this name.
+fn component_type_registered(snapshot: &EditorSnapshot, type_name: &str) -> bool {
+    snapshot
+        .components
+        .iter()
+        .any(|component| component.type_name == type_name)
+}
+
+/// Resolve a component name (exact or `::Name` suffix) against the
+/// snapshot's registry; an ambiguous suffix resolves to nothing.
+fn registered_name(snapshot: &EditorSnapshot, name: &str) -> Option<String> {
+    let suffix = format!("::{name}");
+    let mut matches = snapshot
+        .components
+        .iter()
+        .filter(|component| component.type_name == name || component.type_name.ends_with(&suffix))
+        .map(|component| component.type_name.clone());
+    let first = matches.next()?;
+    if matches.any(|candidate| candidate != first) {
+        return None;
+    }
+    Some(first)
+}
+
+/// The payload's component seed with every parseable field; a token this
+/// build does not understand is dropped from the seed (best-effort paste).
+fn seed_from(component: SeededComponent) -> ComponentSeed {
+    let fields = component
+        .fields
+        .into_iter()
+        .filter_map(|(name, token)| clipboard::parse_value(&token).map(|value| (name, value)))
+        .collect();
+    ComponentSeed {
+        type_name: component.type_name,
+        fields,
+    }
+}
+
+/// Decide what a hovering or dropped OS file drag means (Stage 18, D28).
+///
+/// A drag over the Assets panel previews an import; a drop there queues it
+/// as one recorded step, so undo removes the copies. A drop anywhere else
+/// is ignored with a log line (v1 imports into the asset root).
+pub fn handle_file_drops(
+    state: &mut EditorShellState,
+    input: &mut EditorShellInput,
+    placements: &[PanelPlacement],
+    pending: &mut PendingEditorCommands,
+) {
+    let assets_rect = placements
+        .iter()
+        .find(|placement| placement.kind == PanelKind::Assets)
+        .map(|placement| placement.rect);
+    let over_assets = assets_rect
+        .map(|rect| {
+            let cursor = state.cursor;
+            cursor.x as f64 >= rect.x
+                && cursor.x as f64 <= rect.x + rect.width
+                && cursor.y as f64 >= rect.y
+                && cursor.y as f64 <= rect.y + rect.height
+        })
+        .unwrap_or(false);
+    // Step 1: the preview's state, logged on change so a suite can see it.
+    let hover = if !input.hovered_files.is_empty() && over_assets {
+        Some(input.hovered_files.len())
+    } else {
+        None
+    };
+    if hover != state.drop_hover {
+        match hover {
+            Some(count) => pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                count,
+                "[editor] drop preview shown"
+            ),
+            None => pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] drop preview cleared"
+            ),
+        }
+        state.drop_hover = hover;
+    }
+    // Step 2: a drop queues the import; the runner applies it at the frame
+    // boundary and the asset watcher imports the new files.
+    if input.dropped_files.is_empty() {
+        return;
+    }
+    let dropped = std::mem::take(&mut input.dropped_files);
+    if !over_assets {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            count = dropped.len(),
+            "[editor] file drop ignored outside the assets panel"
+        );
+        return;
+    }
+    let Some(root) = input.asset_root.clone() else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] file drop ignored: the project has no asset root"
+        );
+        return;
+    };
+    let count = dropped.len();
+    let label = if count == 1 {
+        "import file".to_string()
+    } else {
+        format!("import {count} files")
+    };
+    pending.push_recorded(
+        vec![EditorCommand::ImportFiles {
+            sources: dropped,
+            destination: root,
+        }],
+        label,
+        None,
+    );
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        count,
+        "[editor] file drop import queued"
+    );
+}
+
+/// Draw the drop preview (Stage 18): a band across the Assets panel while
+/// a file drag hovers over it.
+pub fn paint_drop_preview(
+    state: &mut EditorShellState,
+    frame: &mut EditorShellFrame,
+    placements: &[PanelPlacement],
+) {
+    let Some(count) = state.drop_hover else {
+        return;
+    };
+    let Some(rect) = placements
+        .iter()
+        .find(|placement| placement.kind == PanelKind::Assets)
+        .map(|placement| placement.rect)
+    else {
+        return;
+    };
+    let band = Rect::from_min_size(
+        Vector2f::new(rect.x as f32, rect.y as f32),
+        Vector2f::new(rect.width as f32, 28.0),
+    );
+    frame
+        .panels
+        .push_fill(band, pill_ui::Color::rgba(0.15, 0.45, 0.9, 0.85));
+    let message = format!("Drop {count} file(s) to import");
+    let style = pill_ui::text::TextStyle::default();
+    let _ = state.text.draw_text(
+        &mut frame.panels,
+        &mut state.atlas,
+        &message,
+        Vector2f::new(rect.x as f32 + 8.0, rect.y as f32 + 4.0),
+        &style,
+        None,
+        pill_ui::Color::WHITE,
+    );
 }
 
 /// Routes one pointer event to the menu bar, an open dropdown or the palette.

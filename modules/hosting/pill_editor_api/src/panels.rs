@@ -85,6 +85,13 @@ pub struct PanelWork {
     pub console_search: Option<String>,
     /// New preferences JSON to write to the preferences file (D31).
     pub preferences: Option<String>,
+    /// A component the panel asked to copy to the clipboard, by type name
+    /// (the Inspector's per-component Copy button, Stage 18).
+    pub copy_component: Option<String>,
+    /// An asset row held down, by its path relative to the asset root
+    /// (Stage 18): the executable turns a drag that leaves the window into
+    /// an OS drag of that file. Set only while the row is held.
+    pub drag_candidate: Option<String>,
 }
 
 impl PanelWork {
@@ -133,6 +140,16 @@ impl PanelWork {
     /// Ask for an asset path to become the shared selection.
     pub fn select_asset(&mut self, path: impl Into<String>) {
         self.select_asset = Some(path.into());
+    }
+
+    /// Ask for one component of the selection's entity to be copied.
+    pub fn copy_component(&mut self, type_name: impl Into<String>) {
+        self.copy_component = Some(type_name.into());
+    }
+
+    /// Offer an asset row to an OS drag while it is held.
+    pub fn drag_candidate(&mut self, source: impl Into<String>) {
+        self.drag_candidate = Some(source.into());
     }
 }
 

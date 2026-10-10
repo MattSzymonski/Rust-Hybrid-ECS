@@ -481,7 +481,10 @@ impl<'a> PanelBuilder<'a> {
     ///
     /// Escape reports [`PanelInput::Cancelled`]; Tab and Shift+Tab move the
     /// focus through this frame's widgets; a press on the background clears
-    /// the focus; a release anywhere ends any stale drag.
+    /// the focus. A completed release is left alone here: an embedder that
+    /// builds several panels in one frame ends the drag once, with
+    /// [`UiState::end_frame`](crate::state::UiState::end_frame), after every
+    /// panel has seen the release edge.
     pub fn finish(mut self) -> PanelOutput {
         if self.input.key_pressed(KeyCode::Escape) {
             self.inputs.push(PanelInput::Cancelled);
@@ -496,9 +499,6 @@ impl<'a> PanelBuilder<'a> {
         // builder that runs with no press edge resets it for the next one.
         if !self.input.mouse_button_pressed(MouseButton::Left) {
             self.interaction.press_claimed = false;
-        }
-        if self.input.mouse_button_released(MouseButton::Left) {
-            self.interaction.active = None;
         }
         debug_assert_eq!(self.stack.len(), 1, "every group closes before finish");
         let root = self
@@ -654,6 +654,25 @@ impl<'a> PanelBuilder<'a> {
     /// input.
     pub fn button(&mut self, label: &str) -> bool {
         self.button_enabled(label, true)
+    }
+
+    /// A push button that also reports whether it is being held down: the
+    /// pointer went down on it and has not been released, which is where a
+    /// drag out of the row starts.
+    pub fn button_held(&mut self, label: &str) -> (bool, bool) {
+        let id = self.id_of(label);
+        let frame = self.interact(id, true);
+        let enter = self.input.key_pressed(KeyCode::Enter);
+        let activated = frame.clicked || (frame.focused && enter);
+        if activated {
+            self.inputs.push(PanelInput::Activated(id));
+        }
+        self.add(PanelNode::Button {
+            id,
+            label: label.to_string(),
+            enabled: true,
+        });
+        (activated, frame.held)
     }
 
     /// A push button that may be disabled.

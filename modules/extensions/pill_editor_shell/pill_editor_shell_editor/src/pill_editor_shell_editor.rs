@@ -41,9 +41,10 @@ use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 // Current crate
 use pill_editor_shell_editor::shell::{
     activate_widget, collect_panel_placements, console_channel, execute_command,
-    focus_module_panel, handle_command_shortcuts, handle_menu_pointer, paint_dock_chrome,
-    paint_menu, paint_palette, paint_panels, scroll_last_widget, select_tab_by_title,
-    sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState, CONSOLE_LINES_MAX,
+    focus_module_panel, handle_command_shortcuts, handle_file_drops, handle_menu_pointer,
+    paint_dock_chrome, paint_drop_preview, paint_menu, paint_palette, paint_panels,
+    run_clipboard_action, scroll_last_widget, select_tab_by_title, sync_command_files,
+    sync_panel_commands, ClipboardAction, ConsoleLine, EditorShellState, CONSOLE_LINES_MAX,
     MENU_BAR_HEIGHT, PREFERENCES_FILE,
 };
 
@@ -130,6 +131,7 @@ pub fn editor_shell_update(
         ResMut<EditorShellFrame>,
         Res<EditorSnapshot>,
         Res<pill_editor_api::EditorLogs>,
+        Res<pill_editor_api::EditorClipboardAnswer>,
     ),
     commands: (
         ResMut<CommandRegistry>,
@@ -142,7 +144,7 @@ pub fn editor_shell_update(
 ) {
     // The resources are this crate's own registrations; a world without
     // them is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, editor_snapshot, logs) = view;
+    let (mut state, mut input, mut frame, editor_snapshot, logs, clipboard_answer) = view;
     let (mut registry, mut inbox, mut pending, mut history, mut panels, mut selection) = commands;
     let (
         Some(mut state),
@@ -150,6 +152,7 @@ pub fn editor_shell_update(
         Some(mut frame),
         Some(editor_snapshot),
         Some(logs),
+        Some(clipboard_answer),
         Some(mut registry),
         Some(mut inbox),
         Some(mut pending),
@@ -162,6 +165,7 @@ pub fn editor_shell_update(
         frame.get_mut(),
         editor_snapshot.get(),
         logs.get(),
+        clipboard_answer.get(),
         registry.get_mut(),
         inbox.get_mut(),
         pending.get_mut(),
@@ -336,6 +340,24 @@ pub fn editor_shell_update(
     // previous frame's full map, not the panels painted before it.
     let previous_hits = state.ui.hit_rects().clone();
     let placements = collect_panel_placements(&state.layout, &snapshot);
+    // The Assets panel's rectangle goes to the executable (a scripted file
+    // drop aims at it); a hovering or dropped OS drag resolves here, where
+    // the placements and the cursor both live (Stage 18).
+    frame.assets_rect = placements
+        .iter()
+        .find(|placement| placement.kind == pill_editor_core::layout::PanelKind::Assets)
+        .map(|placement| {
+            EditorRect::new(
+                placement.rect.x as f32,
+                placement.rect.y as f32,
+                placement.rect.width as f32,
+                placement.rect.height as f32,
+            )
+        });
+    // The resource guard derefs to the input; take one plain reference for
+    // the drop routing and everything the frame does after it.
+    let input: &mut EditorShellInput = &mut input;
+    handle_file_drops(&mut state, input, &placements, &mut pending);
     // The heartbeat the end-to-end suite waits on, and the reload proof:
     // the frame counter keeps climbing across a shell reload because the
     // state resource is re-claimed, not reset.
@@ -358,6 +380,17 @@ pub fn editor_shell_update(
             "[editor] shell frame"
         );
     }
+    // The clipboard work a command queued (Stage 18), run after the frame's
+    // clear so its object and read request survive to the executable, and
+    // before the panel view borrows the selection (a cut clears it).
+    run_clipboard_action(
+        &mut state,
+        &mut frame,
+        editor_snapshot,
+        &mut selection,
+        &mut pending,
+        clipboard_answer,
+    );
     // Step 5: chrome first (it sits under the panels' content), then the
     // panel contents themselves, then the menu layer over everything. The
     // panels hand back queued edits, command ids and state changes the
@@ -379,6 +412,8 @@ pub fn editor_shell_update(
         &previous_hits,
     );
     state.last_panels_us = panels_started.elapsed().as_micros() as u64;
+    // The drop preview paints over the panel content while a drag hovers.
+    paint_drop_preview(&mut state, &mut frame, &placements);
     for batch in work.batches {
         pending.batches.push(batch);
     }
@@ -405,6 +440,22 @@ pub fn editor_shell_update(
                 "[editor] asset selected"
             );
         }
+    }
+    // The Inspector's per-component Copy button (Stage 18): the panel layer
+    // cannot reach the frame, so the request joins the clipboard actions.
+    if let Some(type_name) = work.copy_component {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            type_name = type_name.as_str(),
+            "[editor] clipboard component requested"
+        );
+        state.clipboard_action = Some(ClipboardAction::CopyComponent { type_name });
+    }
+    // An asset row held down goes to the executable (Stage 18): a drag that
+    // leaves the window becomes an OS drag of that file. The frame clears
+    // every frame, so a row that is no longer held drops out here.
+    if let Some(source) = work.drag_candidate {
+        frame.drag_candidate = Some(source);
     }
     if let Some(level) = work.console_level {
         state.console_level = level;

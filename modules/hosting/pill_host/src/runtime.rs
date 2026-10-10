@@ -157,8 +157,8 @@ pub struct DevHost {
     #[cfg(feature = "hot_patch")]
     loaded_patches: Vec<crate::hot_patch::LoadedPatch>,
     /// Watches the project's `res` and queues the assets whose source or
-    /// metadata file changed; `None` when the project has no `res` or the
-    /// watch could not start.
+    /// metadata file changed; `None` when no asset directory is configured or
+    /// the watch could not start.
     asset_watcher: Option<crate::asset_watcher::AssetWatcher>,
     /// The project's `res` directory, for the asset browser; `None` when the
     /// configuration did not come from a project directory.
@@ -2571,10 +2571,26 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
 
 /// Start watching the project's asset directory, or `None` when there is none
 /// or the watch cannot start (logged; the host runs on without it).
+///
+/// A configured directory that does not exist yet is created before the watch
+/// starts: the editor imports dropped files into it, and a project that has
+/// never had a `res` would otherwise stay unwatched for the whole run while
+/// the same files sat there unimported.
 fn start_asset_watcher(
     asset_directory: Option<&Path>,
 ) -> Option<crate::asset_watcher::AssetWatcher> {
     let asset_directory = asset_directory?;
+    if !asset_directory.is_dir() {
+        if let Err(error) = std::fs::create_dir_all(asset_directory) {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                directory = %asset_directory.display(),
+                error = %error,
+                "[assets] could not create the project's asset directory; asset edits will not be reimported"
+            );
+            return None;
+        }
+    }
     match crate::asset_watcher::AssetWatcher::spawn(asset_directory.to_owned()) {
         Ok(watcher) => watcher,
         Err(error) => {

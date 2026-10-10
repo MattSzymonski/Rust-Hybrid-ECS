@@ -45,6 +45,9 @@ use pill_runtime::FrameDriver;
 use pill_runtime::{CameraBinding, CameraComponent, SurfaceId, SurfaceOptions, TransformComponent};
 use pill_ui::panel::ClipboardRequest;
 use pill_ui::{paint, run_frame};
+
+// Current crate
+use crate::platform;
 use pill_ui::{
     Atlas, AtlasUpdate, DrawList, PanelBuilder, Rect, Stylesheet, TextSystem, Theme, UiState,
 };
@@ -183,6 +186,31 @@ impl ApplicationHandler for EditorApplication {
             WindowEvent::Resized(size) => {
                 editor.resize(size.width, size.height);
             }
+            // The OS drag-and-drop events (Stage 18): hover state feeds the
+            // shell's drop preview; a dropped file becomes an import.
+            WindowEvent::HoveredFile(path) => {
+                editor.hover_file(path);
+            }
+            WindowEvent::HoveredFileCancelled => {
+                editor.clear_hovered_files();
+            }
+            WindowEvent::DroppedFile(path) => {
+                editor.drop_file(path);
+            }
+            // A press that began on an asset row and then left the window is
+            // a drag out (Stage 18): OLE takes over and the file travels as
+            // `CF_HDROP`. While the button is down Windows keeps delivering
+            // mouse moves to the window that captured it, and a `CursorLeft`
+            // never arrives, so the position itself is the signal; the row's
+            // held state reached the executable as the last frame's output.
+            WindowEvent::CursorMoved { position, .. } => {
+                editor.drag_out_if_past_the_edge(&position);
+                editor.push_ui_input(&event);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                editor.drag_out_if_past_the_edge(&winit::dpi::PhysicalPosition::new(-1.0, -1.0));
+                editor.push_ui_input(&event);
+            }
             WindowEvent::RedrawRequested => match editor.frame() {
                 Ok(()) => {
                     if editor.quit_requested() {
@@ -302,6 +330,32 @@ struct EditorWindow {
     last_frame: Instant,
     frames_per_second: f32,
     frame_count: u64,
+    /// The clipboard read counter, so the shell matches its pending paste to
+    /// the answer it asked for (Stage 18).
+    clipboard_seq: u64,
+    /// Files the OS drag is hovering over the window (Stage 18).
+    hovered_files: Vec<String>,
+    /// Files the OS dropped, drained into the shell's input next frame.
+    dropped_files: Vec<String>,
+    /// The project's asset root, the import's destination.
+    asset_root: Option<String>,
+    /// An asset row held down in the shell's last frame, by its source path
+    /// relative to the asset root (Stage 18); a drag that leaves the window
+    /// hands this file to the OS.
+    drag_candidate: Option<String>,
+    /// A drag waiting for the frame boundary. OLE's modal loop must not run
+    /// inside winit's event dispatch: a drop back on the editor's own window
+    /// re-enters that dispatch mid-callback and the loop stalls afterwards.
+    /// The scripted drag-out verb runs at the frame boundary and never
+    /// stalls, so the real gesture goes through the same door.
+    drag_request: Option<String>,
+    /// Whether the left mouse button is down as the real window events
+    /// reported it; a scripted press never sets it, so a scripted click
+    /// cannot start a drag out.
+    mouse_left_held: bool,
+    /// The Assets panel's rectangle, from the shell's last frame; a
+    /// scripted drop aims its pointer at it.
+    last_assets_rect: Option<EditorRect>,
 }
 
 impl EditorWindow {
@@ -391,6 +445,12 @@ impl EditorWindow {
             pill_host::setup_rendering(config, Arc::clone(&game.window), game_width, game_height)?;
         // The editor is an editor: asset metadata is maintained.
         host.host_mut().set_ensure_asset_metadata(true);
+        // The import destination for dropped files: resolved once, the
+        // project does not move mid-run.
+        let asset_root = host
+            .host()
+            .asset_directory()
+            .map(|path| path.to_string_lossy().into_owned());
         // The console's capture ring, for the shell's Console panel (Stage
         // 17); present even when telemetry setup failed, so the panel
         // always has a reader.
@@ -400,6 +460,13 @@ impl EditorWindow {
                 .world_mut()
                 .insert_resource(pill_editor_api::EditorLogs(log_buffer));
         }
+        // The clipboard answer resource (Stage 18): the shell's system
+        // takes it as a parameter from the first frame, so it must exist
+        // before the shell runs even though the first read lands later.
+        host.host_mut()
+            .engine_mut()
+            .world_mut()
+            .insert_resource(pill_editor_api::EditorClipboardAnswer::default());
         info!(
             target: telemetry_target::ENGINE,
             detached = game.detached,
@@ -492,6 +559,14 @@ impl EditorWindow {
             last_frame: Instant::now(),
             frames_per_second: 0.0,
             frame_count: 0,
+            clipboard_seq: 0,
+            hovered_files: Vec::new(),
+            dropped_files: Vec::new(),
+            asset_root,
+            last_assets_rect: None,
+            drag_candidate: None,
+            drag_request: None,
+            mouse_left_held: false,
         })
     }
 
@@ -511,6 +586,13 @@ impl EditorWindow {
     /// Queue one `winit` event's engine form into the UI input, in logical
     /// pixels.
     fn push_ui_input(&mut self, event: &WindowEvent) {
+        // The real button state, for the drag-out trigger: `CursorLeft`
+        // carries no button information of its own.
+        if let WindowEvent::MouseInput { state, button, .. } = event {
+            if *button == winit::event::MouseButton::Left {
+                self.mouse_left_held = *state == winit::event::ElementState::Pressed;
+            }
+        }
         let scale_factor = self.window.scale_factor() as f32;
         for mut event in translate_window_event(event) {
             // The UI works in logical pixels; winit reports physical ones.
@@ -550,6 +632,7 @@ impl EditorWindow {
             available,
             |ui| statistics_panel(ui, frames_per_second, frame_count),
         );
+        self.state.end_frame();
         let mut list = DrawList::new();
         list.push_fill(
             Rect::from_min_size(Vector2f::ZERO, available),
@@ -645,6 +728,32 @@ impl EditorWindow {
                         self.requested_commands.push(id);
                     }
                     TestCommand::Chord { text } => self.inject_chord(&text),
+                    TestCommand::HoverFile { path } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            path = %path,
+                            "[editor] test channel: hover-file request"
+                        );
+                        self.aim_at_assets();
+                        self.hover_file(std::path::PathBuf::from(path));
+                    }
+                    TestCommand::DropFile { path } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            path = %path,
+                            "[editor] test channel: drop-file request"
+                        );
+                        self.aim_at_assets();
+                        self.drop_file(std::path::PathBuf::from(path));
+                    }
+                    TestCommand::DragOut { path } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            path = %path,
+                            "[editor] test channel: drag-out request"
+                        );
+                        self.start_drag_out(&path);
+                    }
                     TestCommand::Edit(edit) => self.apply_edit(edit),
                     TestCommand::Dump(query) => self.dump_world(query),
                     TestCommand::Quit => {
@@ -897,7 +1006,8 @@ impl EditorWindow {
                 component,
                 field,
             } => {
-                let resolved = resolve_entity(world, &entity).zip(resolve_component(world, &component));
+                let resolved =
+                    resolve_entity(world, &entity).zip(resolve_component(world, &component));
                 match resolved {
                     Some((resolved, component)) => {
                         match world.read_component_field(resolved, &component, &field) {
@@ -1210,6 +1320,128 @@ impl EditorWindow {
         }
     }
 
+    /// A file the OS drag brought over the window (Stage 18); recorded until
+    /// the drag ends or the file drops.
+    fn hover_file(&mut self, path: std::path::PathBuf) {
+        let file = path.to_string_lossy().into_owned();
+        info!(
+            target: telemetry_target::ENGINE,
+            path = file.as_str(),
+            "[editor] file hovered"
+        );
+        self.hovered_files.push(file);
+    }
+
+    /// The drag left the window without dropping.
+    fn clear_hovered_files(&mut self) {
+        if !self.hovered_files.is_empty() {
+            self.hovered_files.clear();
+            info!(
+                target: telemetry_target::ENGINE,
+                "[editor] file hover cleared"
+            );
+        }
+    }
+
+    /// A file was dropped on the window (Stage 18); the shell decides the
+    /// target and queues the import.
+    fn drop_file(&mut self, path: std::path::PathBuf) {
+        let file = path.to_string_lossy().into_owned();
+        info!(
+            target: telemetry_target::ENGINE,
+            path = file.as_str(),
+            "[editor] file dropped"
+        );
+        self.hovered_files.clear();
+        self.dropped_files.push(file);
+    }
+
+    /// A held asset row dragged past the window edge asks for an OS drag
+    /// (Stage 18); inside the window the move is just UI input. The drag
+    /// itself starts at the next frame boundary, not here (see
+    /// [`Self::drag_request`]).
+    fn drag_out_if_past_the_edge(&mut self, position: &winit::dpi::PhysicalPosition<f64>) {
+        if !self.mouse_left_held {
+            return;
+        }
+        let Some(source) = self.drag_candidate.clone() else {
+            return;
+        };
+        let width = self.configuration.width as f64;
+        let height = self.configuration.height as f64;
+        if position.x < 0.0 || position.y < 0.0 || position.x > width || position.y > height {
+            self.drag_request = Some(source);
+            self.drag_candidate = None;
+        }
+    }
+
+    /// Drag one project file out to the OS (Stage 18): the shell reports an
+    /// asset row held down, and a drag that leaves the window hands the file
+    /// to the system as `CF_HDROP` (D28). Blocks in OLE's modal drag loop
+    /// until the drag ends; frames resume after.
+    fn start_drag_out(&mut self, source: &str) {
+        let absolute = match &self.asset_root {
+            Some(root) if !std::path::Path::new(source).is_absolute() => {
+                std::path::Path::new(root).join(source)
+            }
+            _ => std::path::PathBuf::from(source),
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            source = %absolute.display(),
+            "[editor] drag out began"
+        );
+        match platform::drag_out(&absolute) {
+            Ok(platform::DragOutcome::Dropped) => info!(
+                target: telemetry_target::ENGINE,
+                outcome = "dropped",
+                "[editor] drag out ended"
+            ),
+            Ok(platform::DragOutcome::Cancelled) => info!(
+                target: telemetry_target::ENGINE,
+                outcome = "cancelled",
+                "[editor] drag out ended"
+            ),
+            Ok(platform::DragOutcome::Other(code)) => info!(
+                target: telemetry_target::ENGINE,
+                outcome = "other",
+                code,
+                "[editor] drag out ended"
+            ),
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                outcome = "failed",
+                error = %error,
+                "[editor] drag out ended"
+            ),
+        }
+        // The release that ended the gesture may have happened outside the
+        // window, so the UI gets one here; otherwise the row would stay held
+        // with no release ever arriving.
+        self.pending_ui_events.push(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: ButtonState::Released,
+        });
+        self.drag_candidate = None;
+        self.mouse_left_held = false;
+    }
+
+    /// Aim the pointer at the Assets panel, for the scripted drag verbs; a
+    /// real drag's pointer is wherever the user's cursor is.
+    fn aim_at_assets(&mut self) {
+        let position = self
+            .last_assets_rect
+            .map(|rect| Vector2f::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0))
+            .unwrap_or_else(|| {
+                Vector2f::new(
+                    self.configuration.width as f32 / 2.0,
+                    self.configuration.height as f32 / 2.0,
+                )
+            });
+        self.pending_ui_events
+            .push(InputEvent::CursorMoved { position });
+    }
+
     /// Draw and present one frame of the editor UI.
     fn frame(&mut self) -> Result<(), EditorError> {
         // Step 1: pace the frame and update the displayed FPS.
@@ -1226,6 +1458,11 @@ impl EditorWindow {
         self.frame_count += 1;
         // Step 2: the scripted suite's commands, and its seconds deadline.
         self.poll_test_channel();
+        // Step 2b: a drag the previous input asked for. OLE's modal loop runs
+        // here, at the frame boundary, never inside winit's dispatch.
+        if let Some(source) = self.drag_request.take() {
+            self.start_drag_out(&source);
+        }
         // Step 3: this frame's size, and the input queued since the last
         // frame, delivered to the shell module's input resource; the
         // executable's own state keeps its copy for the fallback.
@@ -1337,6 +1574,9 @@ impl EditorWindow {
                 input
                     .requested_commands
                     .append(&mut self.requested_commands);
+                input.hovered_files = self.hovered_files.clone();
+                input.dropped_files = std::mem::take(&mut self.dropped_files);
+                input.asset_root = self.asset_root.clone();
                 input.systems_paused = systems_paused;
             } else {
                 // No shell module: the fallback already consumed the events.
@@ -1371,6 +1611,10 @@ impl EditorWindow {
                     panels: std::mem::take(&mut frame.panels),
                     atlas: frame.atlas.take(),
                     clipboard: std::mem::take(&mut frame.clipboard),
+                    objects: std::mem::take(&mut frame.objects),
+                    clipboard_read: frame.requested_clipboard.take(),
+                    assets_rect: frame.assets_rect,
+                    drag_candidate: frame.drag_candidate.take(),
                     scene_rect: frame.scene_rect,
                     game_rect: frame.game_rect,
                 })
@@ -1383,6 +1627,10 @@ impl EditorWindow {
                     panels,
                     atlas: None,
                     clipboard,
+                    objects: Vec::new(),
+                    clipboard_read: None,
+                    assets_rect: self.last_assets_rect,
+                    drag_candidate: None,
                     scene_rect: self.last_scene_rect,
                     game_rect: self.last_game_rect,
                 }
@@ -1518,6 +1766,8 @@ impl EditorWindow {
         // output, which keeps the placement stable.
         self.last_scene_rect = output.scene_rect;
         self.last_game_rect = output.game_rect;
+        self.last_assets_rect = output.assets_rect;
+        self.drag_candidate = output.drag_candidate;
         let scene_rect = if self.scene_attached {
             self.last_scene_rect
         } else {
@@ -1529,15 +1779,81 @@ impl EditorWindow {
         if let Some(update) = output.atlas {
             self.ui.apply_atlas_update(&self.queue, &update);
         }
-        // Step 7: clipboard requests wait for the platform layer's Win32
-        // implementation (a later milestone of this stage); report them
-        // meanwhile so nothing is silently dropped.
+        // Step 7: clipboard traffic (D28). Widget requests and the shell's
+        // structured objects are written through the platform layer; a
+        // payload read the shell asked for lands in `EditorClipboardAnswer`
+        // for a later frame, so a slow clipboard owner never stalls here.
         for request in &output.clipboard {
+            match request {
+                ClipboardRequest::SetText(text) => match platform::set_text(text) {
+                    Ok(()) => info!(
+                        target: telemetry_target::ENGINE,
+                        len = text.len(),
+                        "[editor] clipboard set text"
+                    ),
+                    Err(error) => warn!(
+                        target: telemetry_target::ENGINE,
+                        error = error.as_str(),
+                        "[editor] clipboard write failed"
+                    ),
+                },
+                ClipboardRequest::GetText => match platform::text() {
+                    Some(text) => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            len = text.len(),
+                            "[editor] clipboard read text"
+                        );
+                        // The paste lands as typed text in the focused field
+                        // next frame, the same path `type` takes.
+                        self.pending_ui_events.push(InputEvent::TextInput { text });
+                    }
+                    None => info!(
+                        target: telemetry_target::ENGINE,
+                        len = 0,
+                        "[editor] clipboard read text"
+                    ),
+                },
+            }
+        }
+        for object in &output.objects {
+            match platform::set_object(&object.format, &object.bytes, &object.text) {
+                Ok(()) => info!(
+                    target: telemetry_target::ENGINE,
+                    format = object.format.as_str(),
+                    bytes = object.bytes.len(),
+                    "[editor] clipboard wrote object"
+                ),
+                Err(error) => warn!(
+                    target: telemetry_target::ENGINE,
+                    format = object.format.as_str(),
+                    error = error.as_str(),
+                    "[editor] clipboard object write failed"
+                ),
+            }
+        }
+        if let Some(format) = output.clipboard_read {
+            self.clipboard_seq += 1;
+            let bytes = platform::object(&format);
+            let text = platform::text();
             info!(
                 target: telemetry_target::ENGINE,
-                request = ?request,
-                "[editor] clipboard request pending platform support"
+                format = format.as_str(),
+                bytes = bytes.as_ref().map_or(0, Vec::len),
+                text = text.as_ref().map_or(0, String::len),
+                "[editor] clipboard read"
             );
+            let answer = pill_editor_api::EditorClipboardAnswer {
+                format,
+                bytes,
+                text,
+                seq: self.clipboard_seq,
+            };
+            let world = self.host.host_mut().engine_mut().world_mut();
+            match world.get_resource_mut::<pill_editor_api::EditorClipboardAnswer>() {
+                Some(current) => *current = answer,
+                None => world.insert_resource(answer),
+            }
         }
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
@@ -1595,8 +1911,17 @@ struct ShellOutput {
     panels: DrawList,
     /// The frame's atlas additions, for the executable's renderer.
     atlas: Option<AtlasUpdate>,
-    /// Clipboard requests to fulfil (platform support pending).
+    /// Widget clipboard requests to fulfil (text copy, paste reads).
     clipboard: Vec<ClipboardRequest>,
+    /// Structured payloads to offer the system clipboard.
+    objects: Vec<pill_editor_api::ClipboardObject>,
+    /// A payload the shell asked the executable to read, by format name.
+    clipboard_read: Option<String>,
+    /// Where the Assets panel sits, for aiming a scripted file drop.
+    assets_rect: Option<EditorRect>,
+    /// An asset row held down, for an OS drag when the pointer leaves the
+    /// window (Stage 18).
+    drag_candidate: Option<String>,
     /// Where the scene surface goes, in logical pixels.
     scene_rect: Option<EditorRect>,
     /// Where the game surface goes, in logical pixels.

@@ -1225,6 +1225,7 @@ mod tests {
             Vector2f::new(400.0, 300.0),
             panel,
         );
+        state.end_frame();
         let mut atlas = Atlas::new(512, 512);
         let mut list = DrawList::new();
         paint(

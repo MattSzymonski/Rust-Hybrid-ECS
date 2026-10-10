@@ -195,6 +195,7 @@ fn render_scene(device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) -> Ve
         available,
         scene.build,
     );
+    state.end_frame();
     let mut list = DrawList::new();
     // The window fill an embedder paints behind the panel (the theme's
     // window colour, the same value as `--bg-window` in the stylesheet), so

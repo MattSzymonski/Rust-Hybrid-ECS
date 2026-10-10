@@ -63,6 +63,26 @@ impl UiState {
         self.interaction.active
     }
 
+    /// Close the frame: nothing stays active once the button is up.
+    ///
+    /// The release that ends a drag is visible to every widget's build
+    /// during its frame - that is how a click completes when the press
+    /// arrived in an earlier frame - so the drag ends here, once per frame.
+    /// An embedder that builds several panels in one frame calls this after
+    /// the last one: a panel's own finish must not clear a drag that a later
+    /// panel still needs to turn into a click.
+    pub fn end_frame(&mut self) {
+        if !self
+            .input
+            .mouse_button_held(pill_engine_core::MouseButton::Left)
+            && !self
+                .input
+                .mouse_button_pressed(pill_engine_core::MouseButton::Left)
+        {
+            self.interaction.active = None;
+        }
+    }
+
     /// Every widget's rectangle as the last layout stored it.
     ///
     /// An embedder that lays several panels out in one frame (the editor

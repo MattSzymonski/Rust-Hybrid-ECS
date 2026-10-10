@@ -30,6 +30,9 @@ use crate::frontend::EditorError;
 
 /// The editor's errors, with their stable diagnostic codes.
 mod frontend;
+/// The platform layer: the Windows clipboard and drag-and-drop today, the
+/// seam later stages fill (Stage 18, D28).
+mod platform;
 /// The window, the GPU device and the frame loop.
 mod runner;
 /// The devops suite's scripted input channel.

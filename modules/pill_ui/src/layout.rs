@@ -823,7 +823,10 @@ mod tests {
         state.input.begin_frame();
         let theme = Theme::default();
         let mut sheet = Stylesheet::empty();
-        run_frame(state, text, &theme, &mut sheet, ctrl(400.0, 300.0), panel)
+        let (output, layout) =
+            run_frame(state, text, &theme, &mut sheet, ctrl(400.0, 300.0), panel);
+        state.end_frame();
+        (output, layout)
     }
 
     #[test]
@@ -864,6 +867,74 @@ mod tests {
             },
         );
         assert!(activated, "the click activates on the next frame");
+        assert_eq!(output.inputs, vec![crate::panel::PanelInput::Activated(id)]);
+    }
+
+    #[test]
+    fn a_release_still_clicks_when_another_panel_builds_first() {
+        // The editor shell builds several panels in one frame. The release
+        // that completes a click must survive the first panel's build: its
+        // finish may not end the drag the later panel still needs.
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let id = WidgetId::from_name("Bake");
+        let mut activated = true;
+
+        fn two_panels(
+            state: &mut UiState,
+            text: &mut TextSystem,
+            events: &[InputEvent],
+            panel: impl FnOnce(&mut PanelBuilder<'_>),
+        ) -> PanelOutput {
+            for event in events {
+                state.input.apply(event);
+            }
+            state.input.begin_frame();
+            // The shell's pattern: every panel builds against the previous
+            // frame's map, so the first (unrelated) panel's empty map must
+            // not hide the second one's button.
+            let theme = Theme::default();
+            let mut sheet = Stylesheet::empty();
+            let previous = state.hit_rects().clone();
+            state.set_hit_rects(previous.clone());
+            let _ = run_frame(state, text, &theme, &mut sheet, ctrl(400.0, 300.0), |ui| {
+                ui.label("an unrelated first panel");
+            });
+            state.set_hit_rects(previous);
+            let (output, _layout) =
+                run_frame(state, text, &theme, &mut sheet, ctrl(400.0, 300.0), panel);
+            state.end_frame();
+            output
+        }
+
+        two_panels(&mut state, &mut text, &[], |ui| {
+            activated = ui.button("Bake");
+        });
+        assert!(!activated);
+        let rect = state.hit_rects[&id];
+
+        two_panels(
+            &mut state,
+            &mut text,
+            &[
+                pointer(rect.min.x + 2.0, rect.min.y + 2.0),
+                click(ButtonState::Pressed),
+            ],
+            |ui| {
+                activated = ui.button("Bake");
+            },
+        );
+        assert!(!activated, "the press alone does not activate");
+
+        let output = two_panels(
+            &mut state,
+            &mut text,
+            &[click(ButtonState::Released)],
+            |ui| {
+                activated = ui.button("Bake");
+            },
+        );
+        assert!(activated, "the second panel turns the release into a click");
         assert_eq!(output.inputs, vec![crate::panel::PanelInput::Activated(id)]);
     }
 

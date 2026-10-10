@@ -131,6 +131,9 @@ impl UiContext {
     /// corner overlay; `scale_factor` converts the engine's physical-pixel
     /// cursor and scroll values.
     pub fn begin_frame(&mut self, input: &Input, viewport: Vector2f, scale_factor: f32) {
+        // The previous frame closes: a release it saw has already been
+        // offered to every widget's build, so nothing may stay active.
+        self.state.end_frame();
         self.viewport = viewport;
         self.scale_factor = if scale_factor > 0.0 {
             scale_factor
