@@ -66,6 +66,29 @@ pub enum TestCommand {
         /// The panel id.
         id: String,
     },
+    /// Activate a named widget (a button or a field), by synthesizing a
+    /// click on its rectangle in the shell.
+    Activate {
+        /// The widget's name, exactly as the panel called it.
+        name: String,
+    },
+    /// Select an entity by its `NvG` display handle (the scripted
+    /// equivalent of a Hierarchy row click).
+    Select {
+        /// The entity's display handle.
+        entity: String,
+    },
+    /// Type `text` into the focused field, as one committed run.
+    Type {
+        /// The text to commit.
+        text: String,
+    },
+    /// Scroll the panel area under the last activated widget by `lines`
+    /// (positive is up): the scripted wheel.
+    Wheel {
+        /// Lines to scroll; positive is up.
+        lines: f32,
+    },
     /// Execute a registered command by id, through the shell's own dispatch.
     Command {
         /// The command id, as registered (`editor.pause_toggle`).
@@ -147,6 +170,13 @@ pub enum EditCommand {
         /// The entity's `NvG` display handle.
         entity: String,
     },
+    /// Toggle one system by registration index (a recorded, undoable edit).
+    System {
+        /// Registration index from the systems snapshot.
+        index: usize,
+        /// Desired state.
+        enabled: bool,
+    },
 }
 
 /// One scripted world query.
@@ -216,6 +246,26 @@ impl TestChannel {
 
 /// Parse one command line.
 fn parse_command(line: &str) -> TestCommand {
+    // `type` and `activate` carry arbitrary text, so they take the rest of
+    // the line (widget names are panel labels, which contain spaces).
+    if let Some(text) = line.strip_prefix("type ") {
+        return TestCommand::Type {
+            text: text.to_string(),
+        };
+    }
+    if let Some(name) = line.strip_prefix("activate ") {
+        return TestCommand::Activate {
+            name: name.to_string(),
+        };
+    }
+    if let Some(rest) = line.strip_prefix("wheel ") {
+        return match rest.trim().parse::<f32>() {
+            Ok(lines) => TestCommand::Wheel { lines },
+            Err(_) => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        };
+    }
     let mut parts = line.split_whitespace();
     match parts.next() {
         Some("click") => {
@@ -250,6 +300,22 @@ fn parse_command(line: &str) -> TestCommand {
         },
         Some("panel") => match parts.next() {
             Some(id) => TestCommand::Panel { id: id.to_string() },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("activate") => match parts.next() {
+            Some(name) => TestCommand::Activate {
+                name: name.to_string(),
+            },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("select") => match parts.next() {
+            Some(entity) => TestCommand::Select {
+                entity: entity.to_string(),
+            },
             None => TestCommand::Unknown {
                 line: line.to_string(),
             },
@@ -312,6 +378,21 @@ fn parse_edit(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestComm
             entity: entity.to_string(),
         });
     }
+    // A system toggle names an index, not an entity.
+    if verb == "system" {
+        let (Some(index), Some(state)) = (parts.next(), parts.next()) else {
+            return unknown();
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            return unknown();
+        };
+        let enabled = match state {
+            "on" => true,
+            "off" => false,
+            _ => return unknown(),
+        };
+        return TestCommand::Edit(EditCommand::System { index, enabled });
+    }
     let (Some(entity), Some(component)) = (parts.next(), parts.next()) else {
         return unknown();
     };
@@ -352,7 +433,6 @@ fn parse_edit(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestComm
         }
         "add" => TestCommand::Edit(EditCommand::Add { entity, component }),
         "remove" => TestCommand::Edit(EditCommand::Remove { entity, component }),
-        "destroy" => TestCommand::Edit(EditCommand::Destroy { entity }),
         _ => unknown(),
     }
 }

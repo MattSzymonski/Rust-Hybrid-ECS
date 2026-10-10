@@ -53,8 +53,14 @@ use crate::EditorRect;
 pub struct PanelContext<'a> {
     /// The editor's per-frame snapshot: entities, systems, pause state.
     pub snapshot: &'a pill_editor_core::editor_state::EditorSnapshot,
+    /// The console's capture ring, for panels that show log lines.
+    pub logs: &'a pill_core::telemetry::capture::LogBuffer,
+    /// The shared selection, for panels that follow it.
+    pub selection: &'a pill_editor_core::editor_state::EditorSelection,
     /// The panel's dock rectangle in logical pixels, for size-aware layouts.
     pub rect: EditorRect,
+    /// Persistent text buffers by widget id, owned by the shell.
+    pub text_buffers: &'a mut std::collections::BTreeMap<String, String>,
     /// Work the panel hands back to the shell, drained after the build.
     pub work: &'a mut PanelWork,
 }
@@ -67,6 +73,18 @@ pub struct PanelWork {
     /// Command ids for the shell's dispatch (module-owned commands
     /// included).
     pub commands: Vec<String>,
+    /// An entity the panel selected, applied to the shared selection.
+    pub select_entity: Option<pill_engine_core::Entity>,
+    /// An asset path the panel selected, applied to the shared selection.
+    pub select_asset: Option<String>,
+    /// A new minimum console severity to apply (the Console's filter).
+    pub console_level: Option<u8>,
+    /// A new console channel filter: 0 all, 1 engine, 2 game.
+    pub console_channel: Option<u8>,
+    /// The console's search text after an edit, for the shell's log line.
+    pub console_search: Option<String>,
+    /// New preferences JSON to write to the preferences file (D31).
+    pub preferences: Option<String>,
 }
 
 impl PanelWork {
@@ -88,6 +106,33 @@ impl PanelWork {
     /// Queue a command id for the shell's dispatch.
     pub fn command(&mut self, id: impl Into<String>) {
         self.commands.push(id.into());
+    }
+
+    /// Queue an edit whose successive keystrokes merge into one undo step
+    /// while they arrive back to back (the same rule slider drags use).
+    pub fn edit_coalesced(
+        &mut self,
+        commands: Vec<pill_editor_core::editor_state::EditorCommand>,
+        label: impl Into<String>,
+        coalesce_key: impl Into<String>,
+    ) {
+        self.batches
+            .push(pill_editor_core::commands::PendingCommandBatch {
+                commands,
+                record: true,
+                label: label.into(),
+                coalesce_key: Some(coalesce_key.into()),
+            });
+    }
+
+    /// Ask for an entity to become the shared selection.
+    pub fn select(&mut self, entity: pill_engine_core::Entity) {
+        self.select_entity = Some(entity);
+    }
+
+    /// Ask for an asset path to become the shared selection.
+    pub fn select_asset(&mut self, path: impl Into<String>) {
+        self.select_asset = Some(path.into());
     }
 }
 
@@ -127,20 +172,12 @@ pub struct EditorPanelInfo {
 }
 
 /// Every panel registered by every module, in the world.
+#[derive(Default)]
 pub struct EditorPanelRegistry {
     entries: Vec<EditorPanel>,
     /// The strong half of each owner's current generation marker. Replacing
     /// one drops the previous strong count, killing its registrations.
     generations: BTreeMap<String, Arc<()>>,
-}
-
-impl Default for EditorPanelRegistry {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            generations: BTreeMap::new(),
-        }
-    }
 }
 
 impl EditorPanelRegistry {

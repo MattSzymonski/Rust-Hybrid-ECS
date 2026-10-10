@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 
 // External crates
 use pill_core::math::{Vector2f, Vector3f};
-use pill_engine_core::{KeyCode, MouseButton};
+use pill_engine_core::{KeyCode, Modifiers, MouseButton};
 
 // Current crate
 use crate::draw::{Color, Rect, TextureId};
@@ -91,6 +91,11 @@ pub struct PanelOutput {
     pub inputs: Vec<PanelInput>,
     /// Clipboard operations for the shell, in order.
     pub clipboard: Vec<ClipboardRequest>,
+    /// Every named widget's id: the name as built (including a row's scope)
+    /// to the id it resolved to. Embedders that must address a widget by
+    /// name from outside a build (the editor shell's scripted activation)
+    /// read this instead of re-deriving the scope chain.
+    pub named: BTreeMap<String, WidgetId>,
 }
 
 // =============================================================================
@@ -421,6 +426,8 @@ pub struct PanelBuilder<'a> {
     stack: Vec<OpenNode>,
     /// The name the last `id_of` call used, waiting for the node it names.
     last_name: Option<String>,
+    /// Every named widget's id this frame, name as built to resolved id.
+    named: BTreeMap<String, WidgetId>,
     /// Classes the next widget or group will carry.
     pending_classes: Vec<String>,
     /// Focusable ids, in build order.
@@ -431,8 +438,6 @@ pub struct PanelBuilder<'a> {
     clipboard: Vec<ClipboardRequest>,
     /// Whether a scroll area already claimed this frame's wheel.
     scroll_claimed: bool,
-    /// Whether a widget already claimed this frame's press.
-    press_claimed: bool,
 }
 
 impl<'a> PanelBuilder<'a> {
@@ -458,12 +463,12 @@ impl<'a> PanelBuilder<'a> {
                 None,
             )],
             last_name: None,
+            named: BTreeMap::new(),
             pending_classes: Vec::new(),
             focusable: Vec::new(),
             inputs: Vec::new(),
             clipboard: Vec::new(),
             scroll_claimed: false,
-            press_claimed: false,
         }
     }
 
@@ -484,8 +489,13 @@ impl<'a> PanelBuilder<'a> {
         if self.input.key_pressed(KeyCode::Tab) {
             self.move_focus(self.input.modifiers().shift);
         }
-        if self.input.mouse_button_pressed(MouseButton::Left) && !self.press_claimed {
+        if self.input.mouse_button_pressed(MouseButton::Left) && !self.interaction.press_claimed {
             self.interaction.focus = None;
+        }
+        // The claim lasts only for the frame that saw the press, so a
+        // builder that runs with no press edge resets it for the next one.
+        if !self.input.mouse_button_pressed(MouseButton::Left) {
+            self.interaction.press_claimed = false;
         }
         if self.input.mouse_button_released(MouseButton::Left) {
             self.interaction.active = None;
@@ -505,6 +515,7 @@ impl<'a> PanelBuilder<'a> {
             },
             inputs: self.inputs,
             clipboard: self.clipboard,
+            named: self.named,
         }
     }
 
@@ -792,17 +803,18 @@ impl<'a> PanelBuilder<'a> {
                 .text
                 .get_or_insert_with(|| TextEditState::at_end(text));
             if frame.focused {
-                let modifiers = self.input.modifiers();
-                // Presses and repeats in arrival order: held backspace
-                // deletes like repeated presses.
-                let keys: Vec<KeyCode> = self
+                // Presses and repeats in arrival order, each with the
+                // modifiers it carried: held backspace deletes like
+                // repeated presses, and an injected chord's key keeps its
+                // modifier even when the release lands in the same frame.
+                let keys: Vec<(KeyCode, Modifiers)> = self
                     .input
-                    .keys_pressed()
+                    .keys_pressed_modifiers()
                     .iter()
-                    .chain(self.input.keys_repeated().iter())
+                    .chain(self.input.keys_repeated_modifiers().iter())
                     .copied()
                     .collect();
-                for key in keys {
+                for (key, modifiers) in keys {
                     match key {
                         KeyCode::Backspace => {
                             edit.backspace(text);
@@ -1233,7 +1245,9 @@ impl<'a> PanelBuilder<'a> {
         for segment in &self.path {
             parent = WidgetId::named(parent, segment);
         }
-        WidgetId::named(parent, name)
+        let id = WidgetId::named(parent, name);
+        self.named.insert(name.to_string(), id);
+        id
     }
 
     /// A name unique among widgets of `kind` in the current group.
@@ -1322,7 +1336,7 @@ impl<'a> PanelBuilder<'a> {
         if pressed {
             self.interaction.active = Some(id);
             self.interaction.focus = Some(focus_target);
-            self.press_claimed = true;
+            self.interaction.press_claimed = true;
         }
         let released = self.input.mouse_button_released(MouseButton::Left);
         let held =

@@ -549,6 +549,7 @@ mod tests {
             PanelKind::Systems,
             PanelKind::Console,
             PanelKind::Statistics,
+            PanelKind::Preferences,
             PanelKind::Gallery,
             PanelKind::Assets,
             // The Game view shares the Scene view's tab set, so it has to

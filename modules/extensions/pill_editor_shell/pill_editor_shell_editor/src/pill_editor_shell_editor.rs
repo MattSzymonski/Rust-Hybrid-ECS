@@ -40,10 +40,11 @@ use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // Current crate
 use pill_editor_shell_editor::shell::{
-    collect_panel_placements, execute_command, focus_module_panel, handle_command_shortcuts,
-    handle_menu_pointer, paint_dock_chrome, paint_menu, paint_palette, paint_panels,
-    select_tab_by_title, sync_command_files, sync_panel_commands, EditorShellState,
-    MENU_BAR_HEIGHT,
+    activate_widget, collect_panel_placements, console_channel, execute_command,
+    focus_module_panel, handle_command_shortcuts, handle_menu_pointer, paint_dock_chrome,
+    paint_menu, paint_palette, paint_panels, scroll_last_widget, select_tab_by_title,
+    sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState, CONSOLE_LINES_MAX,
+    MENU_BAR_HEIGHT, PREFERENCES_FILE,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -83,6 +84,15 @@ pub fn register(engine: &mut Engine) -> u32 {
     // built-in commands), the inbox module owners drain and the queue of
     // engine mutations the executable applies.
     ensure_command_resources(world);
+    // Step 3b: the shared selection (Stage 17), re-claimed so a reload
+    // keeps which entity and asset were selected.
+    world.register_resource::<pill_editor_core::editor_state::EditorSelection>();
+    if world
+        .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+        .is_none()
+    {
+        world.insert_resource(pill_editor_core::editor_state::EditorSelection::default());
+    }
     // Step 4: the per-frame system that builds the editor UI. Post-update,
     // like the renderer's frame build: it keeps running while the engine is
     // paused - which is what lets the pause command be its own undo, and
@@ -105,15 +115,21 @@ pub fn register(engine: &mut Engine) -> u32 {
 /// Runs inside the host's frame, between the executable's input queueing and
 /// its presentation: the executable writes [`EditorShellInput`] before
 /// `run_frame` and drains [`EditorShellFrame`] after it.
+// The two tuples are the engine's resource-parameter shape (a system
+// accepts at most six parameters, and the tuples carry the shell's eleven
+// resources); the macro reads the tuple types literally, so a pair of type
+// aliases would defeat it.
+#[allow(clippy::type_complexity)]
 #[pill_hot]
 pub fn editor_shell_update(
     // The function takes two tuple parameters because a system accepts at
-    // most six; the tuples carry the seven resources the shell works with.
+    // most six; the tuples carry the shell's eleven resources.
     view: (
         ResMut<EditorShellState>,
         ResMut<EditorShellInput>,
         ResMut<EditorShellFrame>,
         Res<EditorSnapshot>,
+        Res<pill_editor_api::EditorLogs>,
     ),
     commands: (
         ResMut<CommandRegistry>,
@@ -121,36 +137,76 @@ pub fn editor_shell_update(
         ResMut<PendingEditorCommands>,
         ResMut<CommandHistory>,
         ResMut<EditorPanelRegistry>,
+        ResMut<pill_editor_core::editor_state::EditorSelection>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without
     // them is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, editor_snapshot) = view;
-    let (mut registry, mut inbox, mut pending, mut history, mut panels) = commands;
+    let (mut state, mut input, mut frame, editor_snapshot, logs) = view;
+    let (mut registry, mut inbox, mut pending, mut history, mut panels, mut selection) = commands;
     let (
         Some(mut state),
         Some(mut input),
         Some(mut frame),
         Some(editor_snapshot),
+        Some(logs),
         Some(mut registry),
         Some(mut inbox),
         Some(mut pending),
         Some(mut history),
         Some(panels),
+        Some(mut selection),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
         editor_snapshot.get(),
+        logs.get(),
         registry.get_mut(),
         inbox.get_mut(),
         pending.get_mut(),
         history.get_mut(),
         panels.get_mut(),
+        selection.get_mut(),
     )
     else {
         return;
     };
+    // Step 0: copy the capture ring's new lines into the console's bounded
+    // window (owned strings only; the ring is shared with every module).
+    let new_lines = logs.0.since(state.console_watermark);
+    if !new_lines.is_empty() {
+        state.console_watermark = new_lines.last().map(|line| line.seq).unwrap_or(0);
+        for line in new_lines {
+            state.console_total += 1;
+            state.console_lines.push_back(ConsoleLine {
+                level: line.level,
+                channel: console_channel(&line.target),
+                target: line.target,
+                message: line.message,
+            });
+        }
+        while state.console_lines.len() > CONSOLE_LINES_MAX {
+            state.console_lines.pop_front();
+        }
+    }
+    // The console's heartbeat: channel counts, on the same cadence as the
+    // shell heartbeat (the suite reads it to prove both channels carry
+    // lines and that a reload did not drop them).
+    if state.frame_index.is_multiple_of(210) && !state.console_lines.is_empty() {
+        let engine_lines = state
+            .console_lines
+            .iter()
+            .filter(|line| line.channel == 1)
+            .count();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            lines = state.console_lines.len(),
+            engine = engine_lines,
+            game = state.console_lines.len() - engine_lines,
+            "[editor] console state"
+        );
+    }
     // Step 1: this frame's input. The menu layer gets first refusal on
     // pointer events - a dropdown click must not also press a widget under
     // it - and key presses are collected with the modifiers current at
@@ -190,6 +246,12 @@ pub fn editor_shell_update(
     }
     if let Some(panel_id) = input.requested_panel.take() {
         focus_module_panel(&mut state, &panel_id);
+    }
+    if let Some(widget) = input.requested_widget.take() {
+        activate_widget(&mut state, &widget);
+    }
+    if let Some(lines) = input.requested_wheel.take() {
+        scroll_last_widget(&mut state, lines);
     }
     // Step 1b: the keybindings and preferences files, then the dispatch:
     // commands the scripted channel requested run through the same path a
@@ -277,33 +339,158 @@ pub fn editor_shell_update(
     // The heartbeat the end-to-end suite waits on, and the reload proof:
     // the frame counter keeps climbing across a shell reload because the
     // state resource is re-claimed, not reset.
-    if state.frame_index % 210 == 0 {
+    if state.frame_index.is_multiple_of(210) {
+        let mut by_cost: Vec<(&String, &f32)> = state.panel_draw_millis.iter().collect();
+        by_cost.sort_by(|left, right| right.1.total_cmp(left.1));
+        let slowest = by_cost
+            .iter()
+            .take(3)
+            .map(|(title, millis)| format!("{title} {millis:.1} ms"))
+            .collect::<Vec<_>>()
+            .join(", ");
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
             frames = state.frame_index,
             panels = placements.len(),
+            hits = state.ui.hit_rects().len(),
+            paint_us = state.last_panels_us,
+            slowest = slowest.as_str(),
             "[editor] shell frame"
         );
     }
     // Step 5: chrome first (it sits under the panels' content), then the
     // panel contents themselves, then the menu layer over everything. The
-    // panels hand back queued edits and command ids the shell drains into
-    // its own queues (Stage 16).
+    // panels hand back queued edits, command ids and state changes the
+    // shell drains here (Stage 16/17).
+    let view = pill_editor_shell_editor::shell::PanelView {
+        snapshot: editor_snapshot,
+        logs: &logs.0,
+        selection: &selection,
+        panels: &panels,
+    };
     paint_dock_chrome(&mut state, &snapshot, &mut frame, &previous_hits);
+    let panels_started = pill_core::platform::Instant::now();
     let work = paint_panels(
         &mut state,
         &placements,
         &mut frame,
-        &editor_snapshot,
-        &panels,
+        &view,
         editor_frames_per_second,
         &previous_hits,
     );
+    state.last_panels_us = panels_started.elapsed().as_micros() as u64;
     for batch in work.batches {
         pending.batches.push(batch);
     }
     for command in work.commands {
         inbox.executed.push(command);
+    }
+    if let Some(entity) = work.select_entity {
+        if selection.entity != Some(entity) {
+            selection.entity = Some(entity);
+            // NOTE: asserted on by the editor's end-to-end suite.
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                entity = %entity,
+                "[editor] selection changed"
+            );
+        }
+    }
+    if let Some(path) = work.select_asset {
+        if selection.asset.as_deref() != Some(path.as_str()) {
+            selection.asset = Some(path.clone());
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                path = path.as_str(),
+                "[editor] asset selected"
+            );
+        }
+    }
+    if let Some(level) = work.console_level {
+        state.console_level = level;
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            level,
+            "[editor] console filter level"
+        );
+    }
+    if let Some(channel) = work.console_channel {
+        state.console_channel = channel;
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            channel,
+            "[editor] console filter channel"
+        );
+    }
+    if let Some(search) = work.console_search {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            search = search.as_str(),
+            "[editor] console search"
+        );
+    }
+    // The asset listing came in (or grew): one line for the suite and for
+    // anyone reading the log.
+    if state.assets_listed != editor_snapshot.assets.len() {
+        state.assets_listed = editor_snapshot.assets.len();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            count = state.assets_listed,
+            "[editor] assets listed"
+        );
+    }
+    if let Some(preferences) = work.preferences {
+        // The Preferences panel's save (D31): write the file; the
+        // live-reload reader applies it next frame and logs that it did.
+        let path = pill_editor_core::layout::layout_directory().join(PREFERENCES_FILE);
+        match std::fs::write(&path, preferences) {
+            Ok(()) => pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                path = %path.display(),
+                "[editor] preferences written"
+            ),
+            Err(error) => pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                error = %error,
+                "[editor] preferences write failed"
+            ),
+        }
+    }
+    let focus = state.ui.focus();
+    if state.frame_index % 210 == 0 {
+        let inspector_built = state
+            .widget_names
+            .keys()
+            .filter(|name| name.starts_with("inspector."))
+            .count();
+        let inspector_hits = state
+            .widget_names
+            .iter()
+            .filter(|(name, id)| {
+                name.starts_with("inspector.") && state.ui.hit_rects().contains_key(id)
+            })
+            .count();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            built = inspector_built,
+            hits = inspector_hits,
+            "[editor] inspector census"
+        );
+    }
+    if focus != state.last_focus {
+        state.last_focus = focus;
+        let aliases: Vec<&String> = state
+            .widget_names
+            .iter()
+            .filter(|(_, widget)| Some(**widget) == focus)
+            .map(|(name, _)| name)
+            .collect();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            focus = ?focus,
+            names = ?aliases,
+            "[editor] ui focus"
+        );
     }
     paint_menu(&mut state, &registry, &mut frame, available);
     paint_palette(&mut state, &registry, &mut frame, available);

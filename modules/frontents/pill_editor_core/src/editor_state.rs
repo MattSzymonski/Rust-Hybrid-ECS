@@ -79,6 +79,30 @@ pub struct SystemSummary {
     pub name_is_ambiguous: bool,
 }
 
+/// One row of the Assets panel: a file the browser knows about.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetListing {
+    /// Project-relative path, forward slashes.
+    pub path: String,
+    /// A short kind label (the asset type or file extension).
+    pub kind: String,
+}
+
+/// The editor's shared selection, read by every data panel and the scene.
+///
+/// One entity slot and one asset slot: the Hierarchy selects entities, the
+/// Assets panel selects files, and the Inspector follows whichever entity
+/// slot holds while the asset slot drives the assets panel's detail.
+#[derive(Default)]
+pub struct EditorSelection {
+    /// The selected entity, when one is.
+    pub entity: Option<Entity>,
+    /// The selected asset's project-relative path, when one is.
+    pub asset: Option<String>,
+}
+
+impl pill_engine::Resource for EditorSelection {}
+
 /// The complete per-refresh view the editor renders.
 ///
 /// Owned by [`EditorContext`](crate::EditorContext) and handed out by clone;
@@ -93,6 +117,11 @@ pub struct EditorSnapshot {
     pub detail: Option<EntityDetail>,
     /// Registered systems with owner labels.
     pub systems: Vec<SystemSummary>,
+    /// Registered components with a usable field layout (the Inspector's
+    /// add picker).
+    pub components: Vec<RegisteredComponent>,
+    /// The asset browser's rows (the Assets panel).
+    pub assets: Vec<AssetListing>,
     /// Whether the engine's system phase is paused.
     pub paused: bool,
     /// Command failures from the last apply batch, newest first.
@@ -102,15 +131,32 @@ pub struct EditorSnapshot {
 impl pill_engine::Resource for EditorSnapshot {}
 
 impl EditorSnapshot {
-    /// Rebuild the cheap tiers (entities, systems, pause state) from a live
-    /// engine. Never mutates the world.
+    /// Rebuild every tier from a live engine. Never mutates the world.
     pub fn capture_list(
         engine: &Engine,
         revision: u64,
         extension_names: &[String],
         errors: Vec<String>,
     ) -> Self {
-        let entities = engine
+        Self {
+            revision,
+            entities: Self::capture_entities(engine),
+            detail: None,
+            systems: Self::capture_systems(engine, extension_names),
+            components: Self::capture_components(engine),
+            assets: Vec::new(),
+            paused: engine.systems_paused(),
+            errors,
+        }
+    }
+
+    /// The entity tier - the only expensive one: one row per live entity,
+    /// each with owned label strings. A 200k-entity world spends real time
+    /// here in debug builds, so a caller that already holds a snapshot can
+    /// rebuild this tier on change (entity count, an edit) instead of every
+    /// frame; the runner does.
+    pub fn capture_entities(engine: &Engine) -> Vec<EntityListEntry> {
+        engine
             .world()
             .entity_rows()
             .into_iter()
@@ -125,8 +171,12 @@ impl EditorSnapshot {
                     archetype_label,
                 }
             })
-            .collect();
-        let systems = engine
+            .collect()
+    }
+
+    /// The system tier: one summary per registered system; cheap.
+    pub fn capture_systems(engine: &Engine, extension_names: &[String]) -> Vec<SystemSummary> {
+        engine
             .system_snapshots()
             .into_iter()
             .map(|system| SystemSummary {
@@ -137,15 +187,12 @@ impl EditorSnapshot {
                 hot_patchable: system.hot_patchable,
                 name_is_ambiguous: system.name_is_ambiguous,
             })
-            .collect();
-        Self {
-            revision,
-            entities,
-            detail: None,
-            systems,
-            paused: engine.systems_paused(),
-            errors,
-        }
+            .collect()
+    }
+
+    /// The component tier: the registry's usable field layouts; cheap.
+    pub fn capture_components(engine: &Engine) -> Vec<RegisteredComponent> {
+        registered_components(engine.world())
     }
 
     /// Rebuild the expensive detail tier for one selected entity.
@@ -380,8 +427,9 @@ pub struct RecordedApply {
 impl EditorCommand {
     /// Whether this command is an undoable edit.
     ///
-    /// Engine controls (pause, step, system toggles) and the restore commands
-    /// themselves are not edits: they never enter the history.
+    /// Engine controls (pause, step) and the restore commands themselves are
+    /// not edits: they never enter the history. A system toggle is an edit -
+    /// it is persisted project state - so it records.
     pub fn recordable(&self) -> bool {
         matches!(
             self,
@@ -391,6 +439,7 @@ impl EditorCommand {
                 | EditorCommand::RemoveComponent { .. }
                 | EditorCommand::SetField { .. }
                 | EditorCommand::SetArrayElement { .. }
+                | EditorCommand::SetSystemEnabled { .. }
         )
     }
 
@@ -596,8 +645,18 @@ impl EditorCommand {
             }
 
             EditorCommand::SetSystemEnabled { index, enabled } => {
+                let previous = engine
+                    .system_snapshots()
+                    .get(*index)
+                    .map(|system| system.enabled)
+                    .ok_or_else(|| {
+                        format!("{command:?}: no system at registration index {index}")
+                    })?;
                 if engine.set_system_enabled_at(*index, *enabled) {
-                    Ok(CommandOutcome::plain())
+                    Ok(CommandOutcome::inverse(EditorCommand::SetSystemEnabled {
+                        index: *index,
+                        enabled: previous,
+                    }))
                 } else {
                     Err(format!(
                         "{command:?}: no system at registration index {index}"

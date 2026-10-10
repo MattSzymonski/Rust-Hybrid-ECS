@@ -41,18 +41,25 @@ mod test_channel;
 
 /// Install the shared telemetry stack before the run loop starts.
 ///
-/// Terminal logging is always active. A file lane is added when `ECS_LOG_DIR`
-/// is set. Setup is best-effort: a failure only degrades telemetry and is
-/// reported to stderr without aborting the run.
-fn init_telemetry() {
+/// Terminal logging is always active, and the editor console's capture ring
+/// is installed with it. A file lane is added when `ECS_LOG_DIR` is set.
+/// Setup is best-effort: a failure only degrades telemetry and is reported
+/// to stderr without aborting the run.
+fn init_telemetry() -> pill_core::telemetry::capture::LogBuffer {
     // Step 1: resolve the optional log directory from the environment.
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
-    // Step 2: install the stack, reporting setup failures to stderr.
-    if let Err(error) = pill_runtime::init_telemetry(file_directory) {
+    // Step 2: install the stack, reporting setup failures to stderr. The
+    // buffer survives a failed install so the console panel still reads an
+    // (empty) ring rather than nothing.
+    let buffer = pill_core::telemetry::capture::LogBuffer::default();
+    if let Err(error) =
+        pill_runtime::init_telemetry_with_capture(file_directory, Some(buffer.clone()))
+    {
         // The one message that cannot go through the logger: it reports that
         // the logger itself did not install.
         eprintln!("[editor] telemetry setup failed: {error}");
     }
+    buffer
 }
 
 // =============================================================================
@@ -69,10 +76,11 @@ fn init_telemetry() {
 fn main() -> miette::Result<()> {
     // Step 1: install the miette report handler before anything can fail.
     install_engine_report_handler();
-    // Step 2: bring up the shared telemetry stack (best-effort).
-    init_telemetry();
+    // Step 2: bring up the shared telemetry stack (best-effort) and keep
+    // the console's capture ring.
+    let log_buffer = init_telemetry();
     // Step 3: run the editor and convert the error once.
-    let outcome: Result<(), EditorError> = runner::run();
+    let outcome: Result<(), EditorError> = runner::run(log_buffer);
     outcome.map_err(|error| {
         // Error correlation: the fatal failure also enters the tracing lane
         // so it appears inside any active spans and log files.

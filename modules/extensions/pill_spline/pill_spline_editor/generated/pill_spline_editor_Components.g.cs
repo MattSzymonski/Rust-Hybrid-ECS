@@ -58,3 +58,23 @@ public partial struct Spline
 
 }
 
+namespace pill_master_renderer.component {
+
+using pill_spline;
+
+[StructLayout(LayoutKind.Explicit, Size = 20)]
+public partial struct CameraComponent
+{
+    [FieldOffset(0)] public byte Enabled;
+    [FieldOffset(4)] public int Priority;
+    [FieldOffset(8)] public float VerticalFov;
+    [FieldOffset(12)] public float Near;
+    [FieldOffset(16)] public float Far;
+    /// Live ABI bytes of this component row (safe code).
+    public readonly Span<byte> Raw =>
+        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
+}
+
+
+}
+

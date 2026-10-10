@@ -64,10 +64,17 @@ pub struct UiInput {
     keys_held: Vec<KeyCode>,
     /// Keys that went down since the previous frame, in order.
     keys_pressed: Vec<KeyCode>,
+    /// The modifier state in effect when each of `keys_pressed` arrived.
+    /// Text fields read these rather than the live modifiers: a key and
+    /// its modifier release can land in the same frame (injected chords),
+    /// and the press still carried the modifier.
+    keys_pressed_modifiers: Vec<(KeyCode, Modifiers)>,
     /// Keys that came up since the previous frame, in order.
     keys_released: Vec<KeyCode>,
     /// Keys that repeated since the previous frame, in order.
     keys_repeated: Vec<KeyCode>,
+    /// The modifier state in effect when each of `keys_repeated` arrived.
+    keys_repeated_modifiers: Vec<(KeyCode, Modifiers)>,
     /// Events applied at the next [`Self::begin_frame`], in arrival order.
     pending: Vec<InputEvent>,
 }
@@ -91,7 +98,10 @@ impl UiInput {
     fn apply_event(&mut self, event: InputEvent) {
         match event {
             InputEvent::Key { key, state } => self.apply_key(key, state),
-            InputEvent::KeyRepeat { key } => self.keys_repeated.push(key),
+            InputEvent::KeyRepeat { key } => {
+                self.keys_repeated.push(key);
+                self.keys_repeated_modifiers.push((key, self.modifiers));
+            }
             InputEvent::ModifiersChanged { modifiers } => self.modifiers = modifiers,
             InputEvent::TextInput { text } => self.text.push_str(&text),
             InputEvent::ImePreedit { text, cursor } => {
@@ -147,8 +157,10 @@ impl UiInput {
         self.scroll_pixels = Vector2f::ZERO;
         self.text.clear();
         self.keys_pressed.clear();
+        self.keys_pressed_modifiers.clear();
         self.keys_released.clear();
         self.keys_repeated.clear();
+        self.keys_repeated_modifiers.clear();
 
         // Taken out and put back so the buffer's capacity is reused.
         let mut events = std::mem::take(&mut self.pending);
@@ -239,6 +251,18 @@ impl UiInput {
         &self.keys_pressed
     }
 
+    /// Every key that went down since the previous frame with the modifiers
+    /// in effect at its arrival, in order.
+    pub fn keys_pressed_modifiers(&self) -> &[(KeyCode, Modifiers)] {
+        &self.keys_pressed_modifiers
+    }
+
+    /// Every key that repeated since the previous frame with the modifiers
+    /// in effect at its arrival, in order.
+    pub fn keys_repeated_modifiers(&self) -> &[(KeyCode, Modifiers)] {
+        &self.keys_repeated_modifiers
+    }
+
     /// Every key that came up since the previous frame, in order.
     pub fn keys_released(&self) -> &[KeyCode] {
         &self.keys_released
@@ -257,6 +281,7 @@ impl UiInput {
                 if !self.keys_held.contains(&key) {
                     self.keys_held.push(key);
                     self.keys_pressed.push(key);
+                    self.keys_pressed_modifiers.push((key, self.modifiers));
                 }
             }
             ButtonState::Released => {

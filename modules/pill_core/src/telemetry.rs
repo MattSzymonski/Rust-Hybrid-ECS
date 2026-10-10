@@ -49,6 +49,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
+/// Bounded in-process log capture for the editor console (Stage 17).
+pub mod capture;
+
 // Current crate
 use crate::platform::log_output::{self, FileGuard, FileWriter, TerminalWriter};
 
@@ -548,6 +551,7 @@ type FileLaneArtifacts = (
 pub struct TelemetryBuilder {
     logging: LoggingConfig,
     file_logging: Option<(LoggingConfig, PathBuf)>,
+    capture: Option<capture::LogBuffer>,
     tracy: bool,
     fine_profiling: bool,
 }
@@ -566,9 +570,20 @@ impl TelemetryBuilder {
         Self {
             logging: LoggingConfig::default_engine(),
             file_logging: None,
+            capture: None,
             tracy: false,
             fine_profiling: false,
         }
+    }
+
+    /// Capture `info` and above into a bounded in-process ring.
+    ///
+    /// The editor's console panel reads the ring; the terminal and file
+    /// lanes are unaffected, and the ring never borrows from the emitting
+    /// crate - lines are owned strings.
+    pub fn with_capture(mut self, buffer: capture::LogBuffer) -> Self {
+        self.capture = Some(buffer);
+        self
     }
 
     /// Replace the terminal logging configuration.
@@ -712,11 +727,17 @@ impl TelemetryBuilder {
         #[cfg(not(feature = "tracy"))]
         let tracy_layer: Option<tracing_subscriber::layer::Identity> = None;
 
-        // Step 4: Assemble the three-layer stack and install it as the
+        // Step 3b: the optional capture lane, feeding the editor console.
+        let capture_layer = self
+            .capture
+            .map(|buffer| capture::CaptureLayer::new(buffer, tracing::Level::INFO));
+
+        // Step 4: Assemble the layers and install the stack as the
         // process-wide default subscriber.
         let registry = tracing_subscriber::registry()
             .with(terminal_layer)
             .with(file_layer)
+            .with(capture_layer)
             .with(tracy_layer);
         registry.init();
 

@@ -62,7 +62,9 @@ pub use static_project::{
     ProjectBackend, StaticLogging, StaticModule, StaticProject, StaticProjectBackend,
     StaticRenderer, StaticRendererAttachFn,
 };
-pub use telemetry::{apply_logging_settings, init_telemetry, LoggingSettings};
+pub use telemetry::{
+    apply_logging_settings, init_telemetry, init_telemetry_with_capture, LoggingSettings,
+};
 
 #[cfg(feature = "rendering")]
 pub use error::RenderingError;

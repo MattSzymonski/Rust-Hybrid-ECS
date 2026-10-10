@@ -28,13 +28,14 @@ use std::collections::BTreeMap;
 // External crates
 use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
+use pill_core::telemetry::capture::LogBuffer;
 use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
 use pill_editor_api::EditorShellFrame;
 use pill_editor_core::commands::{
     menu_tree, CommandInbox, CommandRegistry, CommandSpec, EditorPreferences, KeybindingsFile,
     PendingEditorCommands,
 };
-use pill_editor_core::editor_state::{EditorCommand, EditorSnapshot};
+use pill_editor_core::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
 use pill_editor_core::history::{CommandHistory, HistoryEntryKind};
 use pill_editor_core::layout::{
     LayoutAction, LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
@@ -64,7 +65,8 @@ const CLASSIC_LAYOUT_FILE: &str = "editor_layout.json";
 const KEYBINDINGS_FILE: &str = "keybindings.json";
 
 /// The preferences file (D31).
-const PREFERENCES_FILE: &str = "preferences.json";
+/// The preferences file's name, next to the layout file (D31).
+pub const PREFERENCES_FILE: &str = "preferences.json";
 
 /// The menu bar's height, in logical pixels; the dock layout gets what is
 /// left below it.
@@ -106,6 +108,10 @@ pub struct EditorShellState {
     /// Frames the shell has drawn, for the Statistics panel and the
     /// reload-proof heartbeat.
     pub frame_index: u64,
+    /// Wall time the panels' paint took on the previous frame, in
+    /// microseconds: the heartbeat reports it, so a panel regression is
+    /// visible in any log (the D32 measurement found one this way).
+    pub last_panels_us: u64,
     /// The top-level menu currently open, when one is.
     pub menu_open: Option<String>,
     /// Whether the command palette is open, and its search text.
@@ -141,6 +147,10 @@ pub struct EditorShellState {
     /// Build time of every module panel last frame, in milliseconds (Stage
     /// 16's budget: measured, shown in Statistics, never throttled).
     pub panel_millis: std::collections::BTreeMap<String, f32>,
+    /// Build time of every visible panel last frame, keyed by title; the
+    /// heartbeat reports the slowest, which is how the D32 measurement's
+    /// 222 ms/frame paint regression was pinned to a panel.
+    pub panel_draw_millis: std::collections::BTreeMap<String, f32>,
     /// Consecutive over-budget frames per module panel, for the warning.
     pub panel_over_frames: std::collections::BTreeMap<String, u32>,
     /// Module panels currently over budget; their tabs carry the badge.
@@ -149,6 +159,73 @@ pub struct EditorShellState {
     pub panel_registry_signature: Vec<(String, String, String)>,
     /// Log-once keys for the panel layer (registered, built, missing).
     pub panel_reported: std::collections::BTreeSet<String>,
+    /// The console's captured lines, bounded, oldest first.
+    pub console_lines: std::collections::VecDeque<ConsoleLine>,
+    /// The newest captured sequence number the console has copied.
+    pub console_watermark: u64,
+    /// Total lines the console has seen since startup (for its header).
+    pub console_total: u64,
+    /// The minimum severity the console shows (1 trace .. 5 error).
+    pub console_level: u8,
+    /// The console's channel filter: 0 all, 1 engine/host, 2 game.
+    pub console_channel: u8,
+    /// The asset count the shell last reported (log-once on change).
+    pub assets_listed: usize,
+    /// Every panel widget's id by the name it was built with (including its
+    /// row's scope), refreshed every frame; the scripted activation path
+    /// addresses widgets through this.
+    pub widget_names: std::collections::BTreeMap<String, pill_ui::widget::WidgetId>,
+    /// The focus last reported, so a focus change logs once.
+    pub last_focus: Option<pill_ui::widget::WidgetId>,
+    /// The rectangle of the last activated widget, the anchor a scripted
+    /// wheel scrolls at.
+    pub last_activated_rect: Option<Rect>,
+    /// Persistent text buffers for panel widgets (search fields, inspector
+    /// editors), keyed by widget id.
+    pub panel_text: std::collections::BTreeMap<String, String>,
+}
+
+/// Classifies a tracing target into the console's channels: 1 for the
+/// engine, host and editor subsystems, 2 for everything else (the project
+/// and the module crates it loads).
+pub fn console_channel(target: &str) -> u8 {
+    const ENGINE_PREFIXES: [&str; 10] = [
+        "engine",
+        "host",
+        "editor",
+        "pill_core",
+        "pill_engine",
+        "pill_host",
+        "pill_runtime",
+        "pill_ui",
+        "pill_input",
+        "pill_assets",
+    ];
+    if ENGINE_PREFIXES
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+    {
+        1
+    } else {
+        2
+    }
+}
+
+/// Lines the console keeps in the shell (the capture ring is the fallback
+/// source, this is the display window).
+pub const CONSOLE_LINES_MAX: usize = 2048;
+
+/// One console row, owned by the shell.
+#[derive(Clone, Debug)]
+pub struct ConsoleLine {
+    /// Severity, 1 trace .. 5 error.
+    pub level: u8,
+    /// The tracing target, shown in the row.
+    pub target: String,
+    /// The rendered message.
+    pub message: String,
+    /// The classified channel: 1 engine/host, 2 game.
+    pub channel: u8,
 }
 
 impl EditorShellState {
@@ -164,6 +241,7 @@ impl EditorShellState {
             sheet: Stylesheet::parse(pill_ui::DEFAULT_SHEET),
             atlas: Atlas::new(ATLAS_SIZE.0, ATLAS_SIZE.1),
             frame_index: 0,
+            last_panels_us: 0,
             menu_open: None,
             palette_query: None,
             modifiers: pill_engine::Modifiers::default(),
@@ -179,10 +257,21 @@ impl EditorShellState {
             palette_rect: None,
             palette_item_hits: Vec::new(),
             panel_millis: std::collections::BTreeMap::new(),
+            panel_draw_millis: std::collections::BTreeMap::new(),
             panel_over_frames: std::collections::BTreeMap::new(),
             panel_over: std::collections::BTreeSet::new(),
             panel_registry_signature: Vec::new(),
             panel_reported: std::collections::BTreeSet::new(),
+            console_lines: std::collections::VecDeque::new(),
+            console_watermark: 0,
+            console_total: 0,
+            console_level: 3,
+            console_channel: 0,
+            assets_listed: 0,
+            widget_names: std::collections::BTreeMap::new(),
+            last_focus: None,
+            last_activated_rect: None,
+            panel_text: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -435,12 +524,16 @@ fn subframe(
     origin: Vector2f,
     size: Vector2f,
     build: impl FnOnce(&mut PanelBuilder<'_>),
-) -> (DrawList, Vec<ClipboardRequest>) {
+) -> (
+    DrawList,
+    Vec<ClipboardRequest>,
+    std::collections::BTreeMap<String, pill_ui::widget::WidgetId>,
+) {
     let (output, layout) = run_frame(ui, text, theme, sheet, size, build);
     let mut list = DrawList::new();
     paint(&output.tree, &layout, theme, ui, text, atlas, &mut list);
     list.translate(origin);
-    (list, output.clipboard)
+    (list, output.clipboard, output.named)
 }
 
 /// The docking chrome: a raised strip with the tab titles for every tabset,
@@ -479,7 +572,7 @@ pub fn paint_dock_chrome(
         // interactive widgets, so its build may replace the hit map; the
         // panel loop restores its own copy around each panel.
         ui.set_hit_rects(previous_hits.clone());
-        let (mut list, clipboard) = subframe(
+        let (mut list, clipboard, _named) = subframe(
             ui,
             text,
             theme,
@@ -519,6 +612,34 @@ pub fn paint_dock_chrome(
     }
 }
 
+/// The read-only view every panel builds from (Stage 17).
+pub struct PanelView<'a> {
+    /// The editor's per-frame snapshot: entities, systems, selections.
+    pub snapshot: &'a EditorSnapshot,
+    /// The console's capture ring.
+    pub logs: &'a LogBuffer,
+    /// The shared selection the Hierarchy, Inspector and Assets follow.
+    pub selection: &'a EditorSelection,
+    /// The live module-panel registry (the Window menu and module tabs).
+    pub panels: &'a EditorPanelRegistry,
+}
+
+/// Shell state the built-in panels read or commit through [`PanelWork`].
+pub struct PanelExtras<'a> {
+    /// Module panels' last build times, shown in Statistics.
+    pub panel_millis: &'a std::collections::BTreeMap<String, f32>,
+    /// Persistent widget text buffers (search, field editors).
+    pub text: &'a mut std::collections::BTreeMap<String, String>,
+    /// The console's captured lines, oldest first.
+    pub console_lines: &'a std::collections::VecDeque<ConsoleLine>,
+    /// The console's minimum severity and channel filters.
+    pub console_level: u8,
+    /// 0 all, 1 engine/host, 2 game.
+    pub console_channel: u8,
+    /// The preferences file's current text, when one exists.
+    pub preferences_text: Option<&'a str>,
+}
+
 /// The visible panels' contents, merged into `frame` with their hit
 /// rectangles restored around each build.
 ///
@@ -526,13 +647,12 @@ pub fn paint_dock_chrome(
 /// registration paints the placeholder, a panicking one is contained, and
 /// every build's duration feeds the budget badge. The returned [`PanelWork`]
 /// is what the panels handed back; the caller drains it into the command
-/// queues.
+/// queues, the selection and the console filters.
 pub fn paint_panels(
     state: &mut EditorShellState,
     placements: &[PanelPlacement],
     frame: &mut EditorShellFrame,
-    snapshot: &EditorSnapshot,
-    panels: &EditorPanelRegistry,
+    view: &PanelView<'_>,
     editor_frames_per_second: f32,
     previous_hits: &BTreeMap<WidgetId, Rect>,
 ) -> PanelWork {
@@ -543,13 +663,34 @@ pub fn paint_panels(
         sheet,
         atlas,
         panel_millis,
+        panel_draw_millis,
         panel_over_frames,
         panel_over,
         panel_reported,
+        panel_text,
+        console_lines,
+        console_level,
+        console_channel,
+        preferences_text,
+        widget_names,
         ..
     } = state;
     let mut merged: BTreeMap<WidgetId, Rect> = BTreeMap::new();
+    let mut names: BTreeMap<String, WidgetId> = BTreeMap::new();
     let mut collected = PanelWork::default();
+    if state.frame_index.is_multiple_of(210) {
+        for placement in placements {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                kind = placement.kind.title(),
+                x = placement.rect.x,
+                y = placement.rect.y,
+                width = placement.rect.width,
+                height = placement.rect.height,
+                "[editor] panel placement"
+            );
+        }
+    }
     for placement in placements {
         // The scene and game tabs' rectangles belong to their surfaces; the
         // shell draws nothing there.
@@ -562,27 +703,42 @@ pub fn paint_panels(
         let mut work = PanelWork::default();
         let origin = Vector2f::new(placement.rect.x as f32, placement.rect.y as f32);
         let size = Vector2f::new(placement.rect.width as f32, placement.rect.height as f32);
-        // A module panel may panic; the shell contains it and keeps going
-        // (the plan's rule: the panel shows its error, everything else
+        // A panel may panic; the shell contains it and keeps going (the
+        // plan's rule: the panel shows its error, everything else
         // survives). Build time is measured for the Statistics panel and
         // the over-budget badge, and nothing is ever throttled.
         let started = Instant::now();
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The extras borrow the shell's text buffers and console window
+            // for this panel's build only.
+            let mut extras = PanelExtras {
+                panel_millis,
+                text: &mut *panel_text,
+                console_lines,
+                console_level: *console_level,
+                console_channel: *console_channel,
+                preferences_text: preferences_text.as_deref(),
+            };
             subframe(ui, text, theme, sheet, atlas, origin, size, |builder| {
-                build_panel(
-                    builder,
-                    &placement.kind,
-                    editor_frames_per_second,
-                    snapshot,
-                    panels,
-                    panel_millis,
-                    &placement.rect,
-                    &mut work,
-                )
+                // A scroll area per panel: it clips the content to the dock
+                // rectangle (rows that do not fit neither draw nor hit-test
+                // outside it) and makes the overflow reachable by wheel.
+                let area = format!("panel_scroll_{}", placement.kind.title());
+                builder.scroll_area(&area, size.y, |panel| {
+                    build_panel(
+                        panel,
+                        &placement.kind,
+                        editor_frames_per_second,
+                        view,
+                        &mut extras,
+                        &placement.rect,
+                        &mut work,
+                    )
+                });
             })
         }));
         let millis = started.elapsed().as_secs_f32() * 1000.0;
-        let (list, clipboard) = match built {
+        let (list, clipboard, named) = match built {
             Ok(built) => built,
             Err(payload) => {
                 let message = panic_message(&payload);
@@ -599,6 +755,8 @@ pub fn paint_panels(
                 })
             }
         };
+        names.extend(named);
+        panel_draw_millis.insert(placement.kind.title().to_string(), millis);
         // The budget tracking and the log-once lines, for module panels.
         if let PanelKind::Module(id) = &placement.kind {
             panel_millis.insert(id.clone(), millis);
@@ -619,7 +777,7 @@ pub fn paint_panels(
                 panel_over.remove(id);
             }
             let built_key = format!("built:{id}");
-            if !panel_reported.contains(&built_key) && panels.panel(id).is_some() {
+            if !panel_reported.contains(&built_key) && view.panels.panel(id).is_some() {
                 panel_reported.insert(built_key);
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ECS,
@@ -629,7 +787,7 @@ pub fn paint_panels(
                 );
             }
             let missing_key = format!("missing:{id}");
-            if panels.panel(id).is_none() && !panel_reported.contains(&missing_key) {
+            if view.panels.panel(id).is_none() && !panel_reported.contains(&missing_key) {
                 panel_reported.insert(missing_key);
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ECS,
@@ -638,13 +796,43 @@ pub fn paint_panels(
                 );
             }
         }
-        merged.extend(ui.hit_rects().iter().map(|(id, rect)| (*id, *rect)));
+        // The panel's fresh rectangles, moved into client space: the
+        // layout produces them in the panel's own frame, while input (and
+        // so hit-testing) is in client coordinates.
+        merged.extend(ui.hit_rects().iter().map(|(id, rect)| {
+            (
+                *id,
+                Rect::from_min_size(
+                    Vector2f::new(rect.min.x + origin.x, rect.min.y + origin.y),
+                    Vector2f::new(rect.width(), rect.height()),
+                ),
+            )
+        }));
         frame.panels.append(list);
         frame.clipboard.extend(clipboard);
         collected.batches.extend(work.batches);
         collected.commands.extend(work.commands);
+        if work.select_entity.is_some() {
+            collected.select_entity = work.select_entity;
+        }
+        if work.select_asset.is_some() {
+            collected.select_asset = work.select_asset;
+        }
+        if work.console_level.is_some() {
+            collected.console_level = work.console_level;
+        }
+        if work.console_channel.is_some() {
+            collected.console_channel = work.console_channel;
+        }
+        if work.console_search.is_some() {
+            collected.console_search = work.console_search;
+        }
+        if work.preferences.is_some() {
+            collected.preferences = work.preferences;
+        }
     }
     ui.set_hit_rects(merged);
+    *widget_names = names;
     collected
 }
 
@@ -658,16 +846,14 @@ const PANEL_OVER_FRAMES: u32 = 120;
 /// The badge a tab title carries while its panel is over budget.
 const PANEL_BADGE: &str = " [!]";
 
-/// One panel's content by kind. Built-in placeholders stand until the stage
-/// that fills them; module panels are built through their registration
-/// (Stage 16); the gallery is real, proving the widget vocabulary.
+/// One panel's content by kind: the built-ins of this crate, the registered
+/// module panels, or the not-yet stage's placeholder.
 fn build_panel(
     builder: &mut PanelBuilder<'_>,
     kind: &PanelKind,
     editor_frames_per_second: f32,
-    snapshot: &EditorSnapshot,
-    panels: &EditorPanelRegistry,
-    panel_millis: &std::collections::BTreeMap<String, f32>,
+    view: &PanelView<'_>,
+    extras: &mut PanelExtras<'_>,
     rect: &LayoutRect,
     work: &mut PanelWork,
 ) {
@@ -678,24 +864,29 @@ fn build_panel(
         PanelKind::Game => {
             builder.label("The game view draws into its own surface.");
         }
-        PanelKind::Statistics => statistics_panel(
-            builder,
-            editor_frames_per_second,
-            snapshot,
-            panels,
-            panel_millis,
-        ),
+        PanelKind::Hierarchy => hierarchy_panel(builder, view, work),
+        PanelKind::Inspector => inspector_panel(builder, view, extras, work),
+        PanelKind::Systems => systems_panel(builder, view, work),
+        PanelKind::Console => console_panel(builder, extras, work),
+        PanelKind::Preferences => preferences_panel(builder, extras, work),
+        PanelKind::Assets => assets_panel(builder, view, work),
+        PanelKind::Statistics => {
+            statistics_panel(builder, editor_frames_per_second, view, extras, work)
+        }
         PanelKind::Gallery => pill_ui::ui_gallery(builder),
-        PanelKind::Module(id) => match panels.panel(id) {
+        PanelKind::Module(id) => match view.panels.panel(id) {
             Some(build) => {
                 let mut context = PanelContext {
-                    snapshot,
+                    snapshot: view.snapshot,
+                    logs: view.logs,
+                    selection: view.selection,
                     rect: pill_editor_api::EditorRect::new(
                         rect.x as f32,
                         rect.y as f32,
                         rect.width as f32,
                         rect.height as f32,
                     ),
+                    text_buffers: &mut *extras.text,
                     work,
                 };
                 build(builder, &mut context);
@@ -706,11 +897,395 @@ fn build_panel(
                 builder.label("module not loaded");
             }
         },
-        other => {
-            builder.heading(other.title());
-            builder.separator();
-            builder.label("This panel arrives in a later stage.");
+    }
+}
+
+/// The Hierarchy: every live entity, the selection highlighted, a click
+/// selects (the shared selection the Inspector and Stage 20 follow).
+fn hierarchy_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
+    builder.heading("Hierarchy");
+    builder.label(&format!("{} entities", view.snapshot.entities.len()));
+    builder.separator();
+    let mut selected: Option<pill_engine::Entity> = None;
+    let shown = view.snapshot.entities.len().min(PANEL_ROWS);
+    for entry in view.snapshot.entities.iter().take(shown) {
+        let label = if view.selection.entity == Some(entry.entity) {
+            format!("> {} ({})", entry.display, entry.archetype_label)
+        } else {
+            format!("  {} ({})", entry.display, entry.archetype_label)
+        };
+        builder.row(|row| {
+            if row.button(&label) {
+                selected = Some(entry.entity);
+            }
+        });
+    }
+    if view.snapshot.entities.len() > shown {
+        builder.label(&format!(
+            "... {} more",
+            view.snapshot.entities.len() - shown
+        ));
+    }
+    if let Some(entity) = selected {
+        work.select(entity);
+    }
+}
+
+/// Rows a list panel paints before summarising the rest.
+const PANEL_ROWS: usize = 24;
+
+/// The Inspector: the selected entity's components, every editable field
+/// live, all commits recorded `SetField`/`RemoveComponent` edits.
+fn inspector_panel(
+    builder: &mut PanelBuilder<'_>,
+    view: &PanelView<'_>,
+    extras: &mut PanelExtras<'_>,
+    work: &mut PanelWork,
+) {
+    builder.heading("Inspector");
+    let Some(detail) = view.snapshot.detail.as_ref() else {
+        builder.separator();
+        match view.selection.entity {
+            Some(entity) => builder.label(&format!("entity {entity} is not alive")),
+            None => builder.label("Select an entity in the Hierarchy."),
         }
+        return;
+    };
+    builder.label(&format!("entity {}", detail.entity));
+    builder.separator();
+    for component in &detail.components {
+        builder.label(&component.type_name);
+        if !component.editable {
+            builder.label("  (no editable fields)");
+            continue;
+        }
+        let entity = detail.entity;
+        for (index, descriptor) in component.fields.iter().enumerate() {
+            let Some(value) = component.values.get(index) else {
+                continue;
+            };
+            let widget_id = format!(
+                "inspector.{}.{}.{}",
+                detail.entity, component.type_name, descriptor.name
+            );
+            let buffer = extras
+                .text
+                .entry(widget_id.clone())
+                .or_insert_with(|| format_field_value(value));
+            let mut committed = false;
+            builder.row(|row| {
+                row.label(descriptor.name);
+                committed = row.text_field(&widget_id, buffer);
+            });
+            if committed {
+                match parse_field_value(buffer, value) {
+                    Ok(new_value) => work.edit_coalesced(
+                        vec![EditorCommand::SetField {
+                            entity,
+                            component: component.type_name.clone(),
+                            field: descriptor.name.to_string(),
+                            value: new_value,
+                        }],
+                        format!(
+                            "set {}.{}",
+                            short_name(&component.type_name),
+                            descriptor.name
+                        ),
+                        widget_id.clone(),
+                    ),
+                    Err(message) => pill_core::warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        field = descriptor.name,
+                        message = message.as_str(),
+                        "[editor] inspector value not understood"
+                    ),
+                }
+            }
+        }
+        let remove = {
+            let mut clicked = false;
+            builder.row(|row| {
+                clicked = row.button(&format!("Remove {}", short_name(&component.type_name)));
+            });
+            clicked
+        };
+        if remove {
+            work.edit(
+                vec![EditorCommand::RemoveComponent {
+                    entity,
+                    component: component.type_name.clone(),
+                }],
+                format!("remove {}", short_name(&component.type_name)),
+            );
+        }
+        builder.separator();
+    }
+    // The add-component picker: one button per registered addable type.
+    builder.label("Add component");
+    let mut add: Option<String> = None;
+    for registered in view
+        .snapshot
+        .components
+        .iter()
+        .filter(|c| c.addable)
+        .take(PANEL_ROWS)
+    {
+        builder.row(|row| {
+            if row.button(&registered.type_name) {
+                add = Some(registered.type_name.clone());
+            }
+        });
+    }
+    if let Some(component) = add {
+        work.edit(
+            vec![EditorCommand::AddComponent {
+                entity: detail.entity,
+                component: component.clone(),
+            }],
+            format!("add {}", short_name(&component)),
+        );
+    }
+}
+
+/// The Systems tab: every registered system with its toggle (undoable), a
+/// pause/resume button and a single-step button.
+fn systems_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
+    builder.heading("Systems");
+    builder.separator();
+    let pause_label = if view.snapshot.paused {
+        "Resume"
+    } else {
+        "Pause"
+    };
+    let mut pause = false;
+    let mut step = false;
+    builder.row(|row| {
+        pause = row.button(pause_label);
+        step = row.button("Step");
+    });
+    if pause {
+        work.command("editor.pause_toggle");
+    }
+    if step {
+        work.command("editor.step");
+    }
+    builder.separator();
+    let mut toggle: Option<(usize, bool)> = None;
+    for system in view.snapshot.systems.iter().take(PANEL_ROWS) {
+        let state_label = if system.enabled { "on" } else { "off" };
+        let name = if system.name_is_ambiguous {
+            format!("{} ({}) [ambiguous]", system.name, system.owner_label)
+        } else {
+            format!("{} ({})", system.name, system.owner_label)
+        };
+        builder.row(|row| {
+            row.label(&name);
+            if row.button(state_label) {
+                toggle = Some((system.index, !system.enabled));
+            }
+        });
+    }
+    if let Some((index, enabled)) = toggle {
+        work.edit(
+            vec![EditorCommand::SetSystemEnabled { index, enabled }],
+            format!("system {} {}", index, if enabled { "on" } else { "off" }),
+        );
+    }
+}
+
+/// The Console: captured engine/host and game lines, the shared command
+/// failures, a level filter, a channel filter and a live search.
+fn console_panel(
+    builder: &mut PanelBuilder<'_>,
+    extras: &mut PanelExtras<'_>,
+    work: &mut PanelWork,
+) {
+    builder.heading("Console");
+    let search = extras.text.entry("console_search".to_string()).or_default();
+    let mut changed = false;
+    builder.row(|row| {
+        row.label("search");
+        changed = row.text_field("console_search_field", search);
+    });
+    let mut level = None;
+    let mut channel = None;
+    builder.row(|row| {
+        if row.button("Errors") {
+            level = Some(5);
+        }
+        if row.button("Warnings+") {
+            level = Some(4);
+        }
+        if row.button("Info+") {
+            level = Some(3);
+        }
+        if row.button("All levels") {
+            level = Some(1);
+        }
+    });
+    builder.row(|row| {
+        if row.button("Engine") {
+            channel = Some(1);
+        }
+        if row.button("Game") {
+            channel = Some(2);
+        }
+        if row.button("All channels") {
+            channel = Some(0);
+        }
+    });
+    let needle = search.to_lowercase();
+    let visible: Vec<&ConsoleLine> = extras
+        .console_lines
+        .iter()
+        .filter(|line| line.level >= extras.console_level)
+        .filter(|line| extras.console_channel == 0 || line.channel == extras.console_channel)
+        .filter(|line| {
+            needle.is_empty()
+                || line.message.to_lowercase().contains(&needle)
+                || line.target.to_lowercase().contains(&needle)
+        })
+        .collect();
+    builder.label(&format!(
+        "{} of {} lines (level {}, channel {})",
+        visible.len(),
+        extras.console_lines.len(),
+        extras.console_level,
+        extras.console_channel
+    ));
+    builder.separator();
+    // Newest first, a bounded window.
+    for line in visible.iter().rev().take(PANEL_ROWS).rev() {
+        let severity = match line.level {
+            5 => "ERROR",
+            4 => "WARN",
+            3 => "INFO",
+            2 => "DEBUG",
+            _ => "TRACE",
+        };
+        builder.label(&format!("{severity} {}: {}", line.target, line.message));
+    }
+    if let Some(level) = level {
+        work.console_level = Some(level);
+    }
+    if let Some(channel) = channel {
+        work.console_channel = Some(channel);
+    }
+    if changed {
+        work.console_search = Some(search.clone());
+    }
+}
+
+/// The Preferences panel (D31): edits the preferences file; the file and the
+/// panel stay in step because both sides go through
+/// `sync_command_files`' reader.
+fn preferences_panel(
+    builder: &mut PanelBuilder<'_>,
+    extras: &mut PanelExtras<'_>,
+    work: &mut PanelWork,
+) {
+    builder.heading("Preferences");
+    builder.label("Preferences file (live-reloaded; blank keeps the default).");
+    builder.separator();
+    // Seed the buffers once from the file, so the fields start where the
+    // file is; later edits live in the buffers until saved.
+    if !extras.text.contains_key("preferences_seeded") {
+        let current: serde_json::Value = extras
+            .preferences_text
+            .and_then(|text| serde_json::from_str(text).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let seed =
+            |key: &str, source: &str, buffer: &mut std::collections::BTreeMap<String, String>| {
+                let value = current
+                    .get(source)
+                    .map(|value| match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                buffer.entry(format!("preferences_{key}")).or_insert(value);
+            };
+        seed("preset", "keymap_preset", extras.text);
+        seed("code_editor", "code_editor_command", extras.text);
+        seed("autosave", "autosave_interval_seconds", extras.text);
+        seed("step_cap", "history_step_cap", extras.text);
+        seed("memory_mb", "history_memory_budget_mb", extras.text);
+        extras
+            .text
+            .insert("preferences_seeded".to_string(), "1".to_string());
+    }
+    let mut save = false;
+    for (key, label) in [
+        ("preset", "keymap preset"),
+        ("code_editor", "code editor command"),
+        ("autosave", "autosave seconds"),
+        ("step_cap", "undo step cap"),
+        ("memory_mb", "undo memory MB"),
+    ] {
+        let buffer = extras.text.entry(format!("preferences_{key}")).or_default();
+        builder.row(|row| {
+            row.label(label);
+            row.text_field(&format!("preferences_field_{key}"), buffer);
+        });
+    }
+    builder.row(|row| {
+        save = row.button("Save preferences");
+    });
+    if save {
+        let mut document = serde_json::Map::new();
+        let take =
+            |key: &str, source: &str, target: &mut serde_json::Map<String, serde_json::Value>| {
+                let text = extras
+                    .text
+                    .get(&format!("preferences_{key}"))
+                    .cloned()
+                    .unwrap_or_default();
+                let text = text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                // Bare JSON first, so a number or a boolean round-trips;
+                // anything else is the string it looks like.
+                let parsed = serde_json::from_str::<serde_json::Value>(text)
+                    .or_else(|_| serde_json::from_str::<serde_json::Value>(&format!("\"{text}\"")))
+                    .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+                target.insert(source.to_string(), parsed);
+            };
+        take("preset", "keymap_preset", &mut document);
+        take("code_editor", "code_editor_command", &mut document);
+        take("autosave", "autosave_interval_seconds", &mut document);
+        take("step_cap", "history_step_cap", &mut document);
+        take("memory_mb", "history_memory_budget_mb", &mut document);
+        work.preferences = Some(serde_json::Value::Object(document).to_string());
+    }
+}
+
+/// The Assets: the browser's rows, a click selects for the shared selection.
+fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
+    builder.heading("Assets");
+    builder.label(&format!("{} files", view.snapshot.assets.len()));
+    builder.separator();
+    let mut selected: Option<String> = None;
+    for asset in view.snapshot.assets.iter().take(PANEL_ROWS * 2) {
+        let label = if view.selection.asset.as_deref() == Some(asset.path.as_str()) {
+            format!("> {} [{}]", asset.path, asset.kind)
+        } else {
+            format!("  {} [{}]", asset.path, asset.kind)
+        };
+        builder.row(|row| {
+            if row.button(&label) {
+                selected = Some(asset.path.clone());
+            }
+        });
+    }
+    if view.snapshot.assets.len() > PANEL_ROWS * 2 {
+        builder.label(&format!(
+            "... {} more",
+            view.snapshot.assets.len() - PANEL_ROWS * 2
+        ));
+    }
+    if let Some(path) = selected {
+        work.select_asset(path);
     }
 }
 
@@ -719,25 +1294,85 @@ fn build_panel(
 fn statistics_panel(
     builder: &mut PanelBuilder<'_>,
     editor_frames_per_second: f32,
-    snapshot: &EditorSnapshot,
-    panels: &EditorPanelRegistry,
-    panel_millis: &std::collections::BTreeMap<String, f32>,
+    view: &PanelView<'_>,
+    extras: &mut PanelExtras<'_>,
+    work: &mut PanelWork,
 ) {
     builder.heading("Statistics");
     builder.separator();
     builder.label(&format!("{editor_frames_per_second:.1} FPS"));
-    builder.label(&format!("entities={}", snapshot.entities.len()));
+    builder.label(&format!("entities={}", view.snapshot.entities.len()));
+    builder.label(&format!(
+        "console lines={} (total {})",
+        extras.console_lines.len(),
+        view.logs.latest_seq()
+    ));
     builder.separator();
-    for info in panels.list() {
-        let millis = panel_millis.get(&info.id).copied().unwrap_or(0.0);
+    for info in view.panels.list() {
+        let millis = extras.panel_millis.get(&info.id).copied().unwrap_or(0.0);
         builder.row(|row| {
             row.label(&format!("panel {} {millis:.1}ms", info.title));
         });
     }
+    let mut reset = false;
     builder.row(|row| {
-        row.button_enabled("Reset Layout", true);
+        reset = row.button("Reset Layout");
         row.button_enabled("Detach Scene", false);
     });
+    if reset {
+        work.command("editor.reset_layout");
+    }
+}
+
+/// The name after the last `::`, for labels and history entries.
+fn short_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+/// A field value as editable text.
+fn format_field_value(value: &pill_engine::FieldValue) -> String {
+    match value {
+        pill_engine::FieldValue::F32(number) => format!("{number}"),
+        pill_engine::FieldValue::F64(number) => format!("{number}"),
+        pill_engine::FieldValue::I8(number) => format!("{number}"),
+        pill_engine::FieldValue::I16(number) => format!("{number}"),
+        pill_engine::FieldValue::I32(number) => format!("{number}"),
+        pill_engine::FieldValue::I64(number) => format!("{number}"),
+        pill_engine::FieldValue::U8(number) => format!("{number}"),
+        pill_engine::FieldValue::U16(number) => format!("{number}"),
+        pill_engine::FieldValue::U32(number) => format!("{number}"),
+        pill_engine::FieldValue::U64(number) => format!("{number}"),
+        pill_engine::FieldValue::Usize(number) => format!("{number}"),
+        pill_engine::FieldValue::Bool(flag) => format!("{flag}"),
+        pill_engine::FieldValue::Text(text) => text.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Parse an edited field's text back into the value's own kind.
+fn parse_field_value(
+    text: &str,
+    current: &pill_engine::FieldValue,
+) -> Result<pill_engine::FieldValue, String> {
+    use pill_engine::FieldValue;
+    let text = text.trim();
+    let parsed = match current {
+        FieldValue::F32(_) => FieldValue::F32(text.parse().map_err(|_| "not a float")?),
+        FieldValue::F64(_) => FieldValue::F64(text.parse().map_err(|_| "not a float")?),
+        FieldValue::I8(_) => FieldValue::I8(text.parse().map_err(|_| "not an integer")?),
+        FieldValue::I16(_) => FieldValue::I16(text.parse().map_err(|_| "not an integer")?),
+        FieldValue::I32(_) => FieldValue::I32(text.parse().map_err(|_| "not an integer")?),
+        FieldValue::I64(_) => FieldValue::I64(text.parse().map_err(|_| "not an integer")?),
+        FieldValue::U8(_) => FieldValue::U8(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::U16(_) => FieldValue::U16(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::U32(_) => FieldValue::U32(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::U64(_) => FieldValue::U64(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::Usize(_) => FieldValue::Usize(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::Bool(_) => FieldValue::Bool(text.parse().map_err(|_| "not a boolean")?),
+        FieldValue::Text(_) => FieldValue::Text(text.to_string()),
+        other => return Err(format!("`{other:?}` fields are not editable here")),
+    };
+    Ok(parsed)
 }
 
 /// The panic payload as text, for the log line that contains it.
@@ -850,6 +1485,87 @@ fn report_once(state: &mut EditorShellState, message: &str) {
             "[editor] command layer problem"
         );
     }
+}
+
+/// Synthesizes a click on the widget called `name`.
+///
+/// Panel widgets built at their panel's root scope are addressed by name
+/// (`WidgetId::from_name`), so the scripted channel can activate a button or
+/// focus a field without knowing the layout: the click lands on the
+/// rectangle the last paint recorded, through the same input path real
+/// input takes.
+pub fn activate_widget(state: &mut EditorShellState, name: &str) {
+    // Prefer the id the panel actually built the widget under (a widget in
+    // a row derives its id from the row's scope); plain panel-root names
+    // fall back to the single-segment form.
+    let id = state
+        .widget_names
+        .get(name)
+        .copied()
+        .unwrap_or_else(|| pill_ui::widget::WidgetId::from_name(name));
+    let Some(rect) = state.ui.hit_rects().get(&id).copied() else {
+        let names: Vec<&String> = state.widget_names.keys().collect();
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            name,
+            hits = state.ui.hit_rects().len(),
+            names = ?names,
+            "[editor] widget not found"
+        );
+        return;
+    };
+    state.last_activated_rect = Some(rect);
+    let center = Vector2f::new(
+        rect.min.x + rect.width() / 2.0,
+        rect.min.y + rect.height() / 2.0,
+    );
+    for event in [
+        pill_engine::InputEvent::CursorMoved { position: center },
+        pill_engine::InputEvent::MouseButton {
+            button: pill_engine::MouseButton::Left,
+            state: pill_engine::ButtonState::Pressed,
+        },
+        pill_engine::InputEvent::MouseButton {
+            button: pill_engine::MouseButton::Left,
+            state: pill_engine::ButtonState::Released,
+        },
+    ] {
+        state.ui.input.apply(&event);
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        name,
+        "[editor] widget activated"
+    );
+}
+
+/// Synthesizes a wheel at the last activated widget: the area under it
+/// scrolls exactly as it does under a real wheel there.
+pub fn scroll_last_widget(state: &mut EditorShellState, lines: f32) {
+    let Some(rect) = state.last_activated_rect else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] wheel with no activated widget"
+        );
+        return;
+    };
+    let center = Vector2f::new(
+        rect.min.x + rect.width() / 2.0,
+        rect.min.y + rect.height() / 2.0,
+    );
+    for event in [
+        pill_engine::InputEvent::CursorMoved { position: center },
+        pill_engine::InputEvent::MouseWheel {
+            delta: pill_engine::ScrollDelta::Lines(Vector2f::new(0.0, lines)),
+        },
+    ] {
+        state.ui.input.apply(&event);
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        lines,
+        "[editor] widget wheeled"
+    );
 }
 
 // =============================================================================
@@ -1266,6 +1982,11 @@ pub fn paint_menu(
     frame: &mut EditorShellFrame,
     available: Vector2f,
 ) {
+    // The menu layer draws over the panels but does not own their hit
+    // rectangles: its own builds isolate against an empty map (its pointer
+    // handling uses the manual rectangles below), and the panels' map goes
+    // back before returning so widget input keeps working.
+    let saved_hits = state.ui.hit_rects().clone();
     let menus: MenuPaint = menu_tree(registry)
         .into_iter()
         .map(|(top, specs)| {
@@ -1286,6 +2007,7 @@ pub fn paint_menu(
     state.menu_dropdown_rect = None;
     state.menu_dropdown_item_hits.clear();
     if menus.is_empty() {
+        state.ui.set_hit_rects(saved_hits);
         return;
     }
     {
@@ -1305,7 +2027,7 @@ pub fn paint_menu(
             theme.raised,
         );
         ui.set_hit_rects(BTreeMap::new());
-        let (mut list, clipboard) = subframe(
+        let (mut list, clipboard, _named) = subframe(
             ui,
             text,
             theme,
@@ -1335,10 +2057,12 @@ pub fn paint_menu(
     }
     // The dropdown, when one is open.
     let Some(open) = state.menu_open.clone() else {
+        state.ui.set_hit_rects(saved_hits);
         return;
     };
     let Some((top, items)) = menus.iter().find(|(name, _)| *name == open) else {
         state.menu_open = None;
+        state.ui.set_hit_rects(saved_hits);
         return;
     };
     let title_x = state
@@ -1391,7 +2115,7 @@ pub fn paint_menu(
             theme.border,
         );
         ui.set_hit_rects(BTreeMap::new());
-        let (mut list, clipboard) = subframe(
+        let (mut list, clipboard, _named) = subframe(
             ui,
             text,
             theme,
@@ -1417,6 +2141,7 @@ pub fn paint_menu(
         ));
         y += MENU_ITEM_HEIGHT;
     }
+    state.ui.set_hit_rects(saved_hits);
 }
 
 /// Paints the command palette when open: a search field and the matching
@@ -1427,9 +2152,13 @@ pub fn paint_palette(
     frame: &mut EditorShellFrame,
     available: Vector2f,
 ) {
+    // Like the menu layer: the palette isolates its own builds and puts the
+    // panels' hit rectangles back before returning.
+    let saved_hits = state.ui.hit_rects().clone();
     let Some(mut query) = state.palette_query.clone() else {
         state.palette_rect = None;
         state.palette_item_hits.clear();
+        state.ui.set_hit_rects(saved_hits);
         return;
     };
     let mut commands: Vec<(String, String, String)> = registry
@@ -1510,7 +2239,7 @@ pub fn paint_palette(
             theme.border,
         );
         ui.set_hit_rects(BTreeMap::new());
-        let (mut list, clipboard) = subframe(
+        let (mut list, clipboard, _named) = subframe(
             ui,
             text,
             theme,
@@ -1532,4 +2261,5 @@ pub fn paint_palette(
     if changed {
         state.palette_query = Some(query);
     }
+    state.ui.set_hit_rects(saved_hits);
 }

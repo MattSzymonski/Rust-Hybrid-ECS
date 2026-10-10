@@ -215,7 +215,27 @@ static TELEMETRY_HANDLES: OnceLock<TelemetryHandles> = OnceLock::new();
 pub fn init_telemetry(
     file_log_directory: Option<PathBuf>,
 ) -> Result<TelemetryHandles, TelemetryError> {
+    init_telemetry_with_capture(file_log_directory, None)
+}
+
+/// [`init_telemetry`], plus an optional in-process capture ring.
+///
+/// The editor's console panel owns the ring's reader side; passing `None`
+/// installs the stack without a capture lane.
+///
+/// # Errors
+///
+/// Same as [`init_telemetry`].
+pub fn init_telemetry_with_capture(
+    file_log_directory: Option<PathBuf>,
+    capture: Option<pill_core::telemetry::capture::LogBuffer>,
+) -> Result<TelemetryHandles, TelemetryError> {
     let mut builder = TelemetryBuilder::new().with_logging_config(terminal_defaults());
+
+    // Step 0: install the console's capture lane when one was supplied.
+    if let Some(buffer) = capture {
+        builder = builder.with_capture(buffer);
+    }
 
     // Step 1: Add a rolling file lane when a log directory is supplied.
     if let Some(directory) = file_log_directory {

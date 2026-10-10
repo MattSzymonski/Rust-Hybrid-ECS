@@ -32,6 +32,15 @@ use pill_ui::{AtlasUpdate, DrawList};
 /// Panel registration: the registry, the context and the liveness rule.
 pub mod panels;
 
+/// The editor's console ring: the bounded capture buffer lines land in.
+///
+/// A thin newtype so the resource lives at the editor boundary; the buffer
+/// itself is `pill_core`'s (a shared dylib), so its identity crosses the
+/// executable, the shell and every module that logs into it.
+pub struct EditorLogs(pub pill_core::telemetry::capture::LogBuffer);
+
+impl Resource for EditorLogs {}
+
 // =============================================================================
 // EditorRect
 // =============================================================================
@@ -93,6 +102,13 @@ pub struct EditorShellInput {
     /// scripted test channel; the same path a restored layout takes for a
     /// panel whose module is not loaded).
     pub requested_panel: Option<String>,
+    /// A widget the executable asks the shell to activate, by name: the
+    /// shell synthesizes a click on the named widget's rectangle (the
+    /// scripted test channel's addressable activation).
+    pub requested_widget: Option<String>,
+    /// Lines to wheel-scroll at the last activated widget, positive up
+    /// (the scripted test channel).
+    pub requested_wheel: Option<f32>,
     /// Command ids the executable asks the shell to execute (the scripted
     /// test channel); drained through the same dispatch a shortcut uses.
     pub requested_commands: Vec<String>,
