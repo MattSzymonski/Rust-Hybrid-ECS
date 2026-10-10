@@ -6,7 +6,8 @@
 //! - Reads a command file (path in `PILL_EDITOR_TEST_COMMANDS`) that the
 //!   suite appends to while the editor runs.
 //! - Parses each new line into a [`TestCommand`]: a synthetic click, a key
-//!   with a delivery target, a tab selection, or a quit request.
+//!   with a delivery target, a chord (modifiers plus key), a command id to
+//!   execute, a tab selection, or a quit request.
 //!
 //! # Design
 //!
@@ -57,6 +58,16 @@ pub enum TestCommand {
     Tab {
         /// The tab title to select.
         title: String,
+    },
+    /// Execute a registered command by id, through the shell's own dispatch.
+    Command {
+        /// The command id, as registered (`editor.pause_toggle`).
+        id: String,
+    },
+    /// Press a chord in the `ctrl+shift+p` form, modifiers included.
+    Chord {
+        /// The chord text.
+        text: String,
     },
     /// Quit gracefully, so the process exit code is the clean-shutdown one.
     Quit,
@@ -143,6 +154,20 @@ fn parse_command(line: &str) -> TestCommand {
                 line: line.to_string(),
             },
         },
+        Some("command") => match parts.next() {
+            Some(id) => TestCommand::Command { id: id.to_string() },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("chord") => match parts.next() {
+            Some(text) => TestCommand::Chord {
+                text: text.to_string(),
+            },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
         Some("quit") => TestCommand::Quit,
         _ => TestCommand::Unknown {
             line: line.to_string(),
@@ -189,6 +214,18 @@ mod tests {
             parse_command("tab Game"),
             TestCommand::Tab {
                 title: "Game".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("command editor.pause_toggle"),
+            TestCommand::Command {
+                id: "editor.pause_toggle".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("chord ctrl+shift+p"),
+            TestCommand::Chord {
+                text: "ctrl+shift+p".to_string()
             }
         );
         assert_eq!(parse_command("quit"), TestCommand::Quit);

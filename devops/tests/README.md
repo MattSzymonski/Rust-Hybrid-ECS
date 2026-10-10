@@ -136,6 +136,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_editor_crates.py` | `pill_spline.rs`, `pill_spline_editor.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies |
 | `test_editor_revision.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
 | `test_editor_native.py` | The shell module's source (`pill_editor_shell_editor.rs`, one cadence constant); writes `local/editor-validation/` | Its own text copy, in `finally` |
+| `test_editor_commands.py` | `pill_spline_editor.rs` (one appended comment); writes `local/editor-validation/` and a sandboxed `LOCALAPPDATA` there | Its own text copy, in `finally` |
 | `test_shared_component_identity.py` | `pill_spline.rs`, `examples/project_rs/src/lib.rs`, `examples/project_rs/project_settings.yaml` | `BackupRegistry` for the sources (fresh timestamp), its own text copy for the settings |
 | `test_csharp_bridge.py` | `examples/project_cs/project_settings.yaml`, `src/Components.cs`, `src/Systems.cs`, `pill_spline.rs`, the generated C# mirror files (deleted once to check they regenerate); creates `src/BridgeProbe.cs` | `BACKUP`, original bytes and timestamp; the probe file is deleted |
 | `test_csharp_analyzer.py` | Creates `examples/project_cs/src/_AnalyzerProbe.cs` | Deleted at the end unless `--keep-probe` |
@@ -222,6 +223,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_patch_bookkeeping.py` | A live patch, then a reload that fails to build: the failed reload must keep the patch records, so rolling the patch back still works. |
 | `test_editor_revision.py` | A module reload bumps the host's editor revision counter (`editor revision bumped`), which the editor uses to drop its caches. |
 | `test_editor_native.py` | The native editor end to end: startup, the shell module loading (`pill_editor_shell_editor loaded`) and painting panels, scripted clicks routed to the scene surface or the UI (`test click ... target=`), a live patch of the shell's system with its frame counter continuing (state kept), and the clean exit code on five further runs. Needs the built `pill_editor_native` binary; skips off Windows until the platform layer grows its X11 and Wayland implementations (Stage 24). |
+| `test_editor_commands.py` | The command layer end to end: the built-in commands (pause, step, save/reset layout) by id with the engine batch applied at the frame boundary, a menu title and item clicked with pointer events, the palette opened and clicked, a keymap preset switched live through the keybindings file with a single override on top and a conflict reported by both names, and the spline editor crate's command surviving a reload of that crate. Needs the built `pill_editor_native` binary; skips off Windows until Stage 24. |
 
 ### Build and smoke checks
 

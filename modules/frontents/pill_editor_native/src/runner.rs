@@ -36,7 +36,7 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
-use pill_engine_core::{ButtonState, InputEvent, KeyCode, MouseButton, ScrollDelta};
+use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
 use pill_host::{HostConfig, RenderingHost};
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::FrameDriver;
@@ -256,6 +256,9 @@ struct EditorWindow {
     /// A tab the scripted suite asked to select, by title; delivered to the
     /// shell with the next frame's input.
     requested_tab: Option<String>,
+    /// Command ids the scripted suite asked to execute; delivered to the
+    /// shell's dispatch with the next frame's input.
+    requested_commands: Vec<String>,
     /// The devops suite's scripted input channel, when its environment
     /// variable named a file.
     test_channel: Option<TestChannel>,
@@ -418,6 +421,7 @@ impl EditorWindow {
             last_scene_rect: None,
             last_game_rect: None,
             requested_tab: None,
+            requested_commands: Vec::new(),
             test_channel: TestChannel::from_environment(),
             test_started: Some(Instant::now()),
             test_seconds: test_channel::seconds_from_environment(),
@@ -536,6 +540,15 @@ impl EditorWindow {
                         );
                         self.requested_tab = Some(title);
                     }
+                    TestCommand::Command { id } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            id = %id,
+                            "[editor] test channel: command request"
+                        );
+                        self.requested_commands.push(id);
+                    }
+                    TestCommand::Chord { text } => self.inject_chord(&text),
                     TestCommand::Quit => {
                         info!(
                             target: telemetry_target::ENGINE,
@@ -687,6 +700,61 @@ impl EditorWindow {
         }
     }
 
+    /// A scripted chord: modifiers plus a key, pressed and released, through
+    /// the same UI input stream real keys use, so the shell's shortcut
+    /// dispatch resolves it exactly as a physical key would.
+    fn inject_chord(&mut self, text: &str) {
+        let chord = match text.parse::<pill_editor_core::commands::Chord>() {
+            Ok(chord) => chord,
+            Err(error) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    text = %text,
+                    error = %error,
+                    "[editor] test channel: invalid chord"
+                );
+                return;
+            }
+        };
+        let Some(key) = chord.key.engine_key() else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                text = %text,
+                "[editor] test channel: chord key unknown to the engine"
+            );
+            return;
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            chord = %text,
+            target = "ui",
+            "[editor] test chord"
+        );
+        let modifiers = Modifiers {
+            shift: chord.shift,
+            control: chord.ctrl,
+            alt: chord.alt,
+            super_key: false,
+        };
+        for event in [
+            InputEvent::ModifiersChanged { modifiers },
+            InputEvent::Key {
+                key,
+                state: ButtonState::Pressed,
+            },
+            InputEvent::Key {
+                key,
+                state: ButtonState::Released,
+            },
+            InputEvent::ModifiersChanged {
+                modifiers: Modifiers::default(),
+            },
+        ] {
+            self.state.input.apply(&event);
+            self.pending_ui_events.push(event);
+        }
+    }
+
     /// Route one game-window event: input to the game, a resize marker to
     /// the placement logic. The operating system delivers keys to this
     /// window only while it holds focus, which is the explicit focus rule
@@ -792,6 +860,7 @@ impl EditorWindow {
             self.configuration.height as f32 / scale_factor,
         );
         {
+            let systems_paused = self.host.host_mut().engine_mut().systems_paused();
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(input) = world.get_resource_mut::<EditorShellInput>() {
                 input.events.append(&mut self.pending_ui_events);
@@ -799,6 +868,10 @@ impl EditorWindow {
                 input.scale_factor = scale_factor;
                 input.editor_frames_per_second = self.frames_per_second;
                 input.requested_tab = self.requested_tab.take();
+                input
+                    .requested_commands
+                    .append(&mut self.requested_commands);
+                input.systems_paused = systems_paused;
             } else {
                 // No shell module: the fallback already consumed the events.
                 self.pending_ui_events.clear();
@@ -849,6 +922,36 @@ impl EditorWindow {
                 }
             }
         };
+        // Step 4b: apply the engine mutations the shell's command handlers
+        // queued. This is the frame boundary the `EditorCommand` contract
+        // names; a failed command never aborts the rest of the batch.
+        {
+            let commands = {
+                let world = self.host.host_mut().engine_mut().world_mut();
+                world
+                    .get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
+                    .map(|pending| std::mem::take(&mut pending.commands))
+                    .unwrap_or_default()
+            };
+            if !commands.is_empty() {
+                let engine = self.host.host_mut().engine_mut();
+                let failures =
+                    pill_editor_core::editor_state::EditorCommand::apply(engine, &commands);
+                info!(
+                    target: telemetry_target::ENGINE,
+                    count = commands.len(),
+                    "[editor] engine commands applied"
+                );
+                for (index, message) in failures {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        index,
+                        message = %message,
+                        "[editor] command failed"
+                    );
+                }
+            }
+        }
         // Step 5: both view surfaces go where the shell's layout put them.
         // The shell reports a rectangle only for the selected view tab, so
         // the other view hides instead of sitting under it; a shell-less

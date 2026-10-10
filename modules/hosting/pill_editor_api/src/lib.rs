@@ -86,6 +86,12 @@ pub struct EditorShellInput {
     /// nothing was asked. The test channel drives focus between the Scene
     /// and Game views through this; nothing else in the editor writes it.
     pub requested_tab: Option<String>,
+    /// Command ids the executable asks the shell to execute (the scripted
+    /// test channel); drained through the same dispatch a shortcut uses.
+    pub requested_commands: Vec<String>,
+    /// Whether the engine's systems are paused, published by the executable
+    /// because only it holds the `Engine`; the pause command toggles from it.
+    pub systems_paused: bool,
 }
 
 impl Resource for EditorShellInput {}

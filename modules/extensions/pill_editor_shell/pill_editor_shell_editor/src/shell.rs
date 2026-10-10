@@ -28,6 +28,11 @@ use std::collections::BTreeMap;
 // External crates
 use pill_core::math::Vector2f;
 use pill_editor_api::EditorShellFrame;
+use pill_editor_core::commands::{
+    menu_tree, CommandInbox, CommandRegistry, EditorPreferences, KeybindingsFile,
+    PendingEditorCommands,
+};
+use pill_editor_core::editor_state::EditorCommand;
 use pill_editor_core::layout::{
     LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
 };
@@ -51,6 +56,26 @@ const NATIVE_LAYOUT_FILE: &str = "editor_layout_native.json";
 
 /// The classic (Dioxus) editor's layout file, read once for migration.
 const CLASSIC_LAYOUT_FILE: &str = "editor_layout.json";
+
+/// The keybindings file: the active keymap preset and binding overrides.
+const KEYBINDINGS_FILE: &str = "keybindings.json";
+
+/// The preferences file (D31).
+const PREFERENCES_FILE: &str = "preferences.json";
+
+/// The menu bar's height, in logical pixels; the dock layout gets what is
+/// left below it.
+pub const MENU_BAR_HEIGHT: f64 = 26.0;
+
+/// One dropdown or palette row's height, in logical pixels.
+const MENU_ITEM_HEIGHT: f64 = 24.0;
+
+/// How wide a top-level menu title is, in logical pixels (monospace rows).
+const MENU_TITLE_WIDTH: f64 = 84.0;
+
+/// The palette's size, in logical pixels.
+const PALETTE_WIDTH: f64 = 420.0;
+const PALETTE_HEIGHT: f64 = 260.0;
 
 // =============================================================================
 // EditorShellState
@@ -78,6 +103,38 @@ pub struct EditorShellState {
     /// Frames the shell has drawn, for the Statistics panel and the
     /// reload-proof heartbeat.
     pub frame_index: u64,
+    /// The top-level menu currently open, when one is.
+    pub menu_open: Option<String>,
+    /// Whether the command palette is open, and its search text.
+    pub palette_query: Option<String>,
+    /// The modifiers currently held, tracked from the input stream so a key
+    /// event can become a chord.
+    pub modifiers: pill_engine::Modifiers,
+    /// The cursor's last logical position, for menu hit-testing.
+    pub cursor: Vector2f,
+    /// The keybindings file's raw text last applied; a change re-applies it
+    /// live (Stage 14).
+    pub keybindings_text: Option<String>,
+    /// The preferences file's raw text last read.
+    pub preferences_text: Option<String>,
+    /// The last registry shape logged, so the ready line follows module
+    /// registrations instead of repeating.
+    pub registry_signature: (usize, usize),
+    /// Problems already reported once (a conflict printed every frame would
+    /// drown the log).
+    pub reported: std::collections::BTreeSet<String>,
+    /// Whether the engine's systems were paused as of this frame's input.
+    pub paused: bool,
+    /// Top-level menu titles with their hit rectangles, from the last paint.
+    pub menu_bar_hits: Vec<(String, LayoutRect)>,
+    /// The open dropdown's rectangle, from the last paint.
+    pub menu_dropdown_rect: Option<LayoutRect>,
+    /// The open dropdown's command rows, from the last paint.
+    pub menu_dropdown_item_hits: Vec<(String, LayoutRect)>,
+    /// The palette's rectangle, from the last paint.
+    pub palette_rect: Option<LayoutRect>,
+    /// The palette's command rows, from the last paint.
+    pub palette_item_hits: Vec<(String, LayoutRect)>,
 }
 
 impl EditorShellState {
@@ -93,6 +150,20 @@ impl EditorShellState {
             sheet: Stylesheet::parse(pill_ui::DEFAULT_SHEET),
             atlas: Atlas::new(ATLAS_SIZE.0, ATLAS_SIZE.1),
             frame_index: 0,
+            menu_open: None,
+            palette_query: None,
+            modifiers: pill_engine::Modifiers::default(),
+            cursor: Vector2f::ZERO,
+            keybindings_text: None,
+            preferences_text: None,
+            registry_signature: (0, 0),
+            reported: std::collections::BTreeSet::new(),
+            paused: false,
+            menu_bar_hits: Vec::new(),
+            menu_dropdown_rect: None,
+            menu_dropdown_item_hits: Vec::new(),
+            palette_rect: None,
+            palette_item_hits: Vec::new(),
         }
     }
 }
@@ -493,4 +564,577 @@ fn statistics_panel(builder: &mut PanelBuilder<'_>, editor_frames_per_second: f3
         row.button_enabled("Reset Layout", true);
         row.button_enabled("Detach Scene", false);
     });
+}
+
+// =============================================================================
+// Commands (Stage 14)
+// =============================================================================
+
+/// Re-reads the keybindings and preferences files when their text changed.
+///
+/// The keybindings file carries the active keymap preset and the overrides;
+/// both apply live, and what changed (or went wrong) is reported once: the
+/// preset logs, conflicts name both commands, and parse problems surface as
+/// warnings rather than silently keeping a stale map.
+pub fn sync_command_files(state: &mut EditorShellState, registry: &mut CommandRegistry) {
+    let directory = pill_editor_core::layout::layout_directory();
+    // Step 1: the keybindings file, when its bytes differ from the last pass.
+    let keybindings_text = std::fs::read_to_string(directory.join(KEYBINDINGS_FILE)).ok();
+    if keybindings_text != state.keybindings_text {
+        state.keybindings_text = keybindings_text.clone();
+        if let Some(text) = keybindings_text {
+            match serde_json::from_str::<KeybindingsFile>(&text) {
+                Ok(file) => {
+                    let problems = registry.apply_file(&file);
+                    let preset = registry.preset();
+                    let overrides = registry.override_count();
+                    let conflicts = registry.conflicts();
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        preset = %preset,
+                        overrides,
+                        "[editor] keymap applied"
+                    );
+                    for problem in problems {
+                        report_once(state, &problem);
+                    }
+                    for (chord, ids) in conflicts {
+                        report_once(
+                            state,
+                            &format!(
+                                "[editor] keybinding conflict  chord=\"{chord}\" commands={}",
+                                ids.join(",")
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    report_once(state, &format!("keybindings: could not parse: {error}"));
+                }
+            }
+        }
+    }
+    // Step 2: the preferences file (D31), parsed so one reader owns it; the
+    // fields themselves arrive with the stages that consume them.
+    let preferences_text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).ok();
+    if preferences_text != state.preferences_text {
+        state.preferences_text = preferences_text.clone();
+        if let Some(text) = preferences_text {
+            if let Err(error) = serde_json::from_str::<EditorPreferences>(&text) {
+                report_once(state, &format!("preferences: could not parse: {error}"));
+            }
+        }
+    }
+}
+
+/// Reports one problem the first time; repeats are dropped.
+fn report_once(state: &mut EditorShellState, message: &str) {
+    if state.reported.insert(message.to_string()) {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            message,
+            "[editor] command layer problem"
+        );
+    }
+}
+
+/// Executes a registered command by id: logs it, hands it to every module
+/// owner through the inbox, and runs the built-ins of this crate.
+///
+/// Engine mutations are queued as `EditorCommand`s; the executable applies
+/// the batch at the frame boundary, which is the only place they may run.
+pub fn execute_command(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    id: &str,
+) -> bool {
+    if registry.command(id).is_none() {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id,
+            "[editor] command has no registration"
+        );
+        return false;
+    }
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        id,
+        "[editor] command executed"
+    );
+    inbox.executed.push(id.to_string());
+    match id {
+        "editor.pause_toggle" => {
+            pending.commands.push(EditorCommand::SetPaused {
+                paused: !state.paused,
+            });
+        }
+        "editor.step" => pending.commands.push(EditorCommand::StepOnce),
+        "editor.save_layout" => {
+            save_native_layout(&state.layout);
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] layout saved"
+            );
+        }
+        "editor.reset_layout" => {
+            state.layout = LayoutModel::default_editor();
+            save_native_layout(&state.layout);
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] layout reset"
+            );
+        }
+        "editor.command_palette" => {
+            state.palette_query = match state.palette_query.take() {
+                Some(_) => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        "[editor] command palette closed"
+                    );
+                    None
+                }
+                None => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        "[editor] command palette opened"
+                    );
+                    Some(String::new())
+                }
+            };
+        }
+        // A module's command: the inbox entry above is what its owning
+        // system drains; having a registration is what proves a handler will.
+        _ => {}
+    }
+    true
+}
+
+/// Dispatches the frame's key presses through the registry.
+///
+/// While the palette is open its field owns the keys; otherwise a press that
+/// matches an effective binding executes its command, except inside a focused
+/// text field, where only a global binding wins (the plan's focus rule).
+pub fn handle_command_shortcuts(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    pressed: &[(pill_engine::KeyCode, pill_engine::Modifiers)],
+) {
+    if state.palette_query.is_some() {
+        return;
+    }
+    for (key, modifiers) in pressed {
+        let resolved = registry
+            .resolve(*key, *modifiers)
+            .map(|spec| (spec.id.clone(), spec.global));
+        let Some((id, global)) = resolved else {
+            continue;
+        };
+        if state.ui.focus().is_some() && !global {
+            continue;
+        }
+        execute_command(state, registry, inbox, pending, &id);
+    }
+}
+
+/// Routes one pointer event to the menu bar, an open dropdown or the palette.
+///
+/// Returns whether the event was consumed; a consumed event never reaches the
+/// panels, so a dropdown item click cannot also press a widget underneath it.
+/// The rectangles are the previous paint's, matching how the widgets
+/// themselves hit-test.
+pub fn handle_menu_pointer(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    event: &pill_engine::InputEvent,
+) -> bool {
+    let pill_engine::InputEvent::MouseButton {
+        button: pill_engine::MouseButton::Left,
+        state: pill_engine::ButtonState::Released,
+    } = event
+    else {
+        return false;
+    };
+    let cursor = state.cursor;
+    let in_rect = |rect: &LayoutRect| {
+        cursor.x as f64 >= rect.x
+            && cursor.x as f64 <= rect.x + rect.width
+            && cursor.y as f64 >= rect.y
+            && cursor.y as f64 <= rect.y + rect.height
+    };
+    // Step 1: the palette owns the pointer while it is open.
+    if state.palette_query.is_some() {
+        if state.palette_rect.is_some_and(|rect| in_rect(&rect)) {
+            let hit = state
+                .palette_item_hits
+                .iter()
+                .find(|(_, rect)| in_rect(rect))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = hit {
+                state.palette_query = None;
+                execute_command(state, registry, inbox, pending, &id);
+            }
+            return true;
+        }
+        state.palette_query = None;
+        return true;
+    }
+    // Step 2: an open dropdown runs its item, or closes.
+    if state.menu_open.is_some() {
+        if state.menu_dropdown_rect.is_some_and(|rect| in_rect(&rect)) {
+            let hit = state
+                .menu_dropdown_item_hits
+                .iter()
+                .find(|(_, rect)| in_rect(rect))
+                .map(|(id, _)| id.clone());
+            if let Some(id) = hit {
+                state.menu_open = None;
+                execute_command(state, registry, inbox, pending, &id);
+            }
+            return true;
+        }
+        // A click on another title switches menus; anything else closes.
+        let title = state
+            .menu_bar_hits
+            .iter()
+            .find(|(_, rect)| in_rect(rect))
+            .map(|(top, _)| top.clone());
+        state.menu_open = match title {
+            Some(top) if Some(&top) != state.menu_open.as_ref() => {
+                // NOTE: asserted on by the editor's end-to-end suite.
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    path = %top,
+                    "[editor] menu opened"
+                );
+                Some(top)
+            }
+            _ => None,
+        };
+        return true;
+    }
+    // Step 3: the bar itself opens a menu.
+    let title = state
+        .menu_bar_hits
+        .iter()
+        .find(|(_, rect)| in_rect(rect))
+        .map(|(top, _)| top.clone());
+    if let Some(top) = title {
+        // NOTE: asserted on by the editor's end-to-end suite.
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            path = %top,
+            "[editor] menu opened"
+        );
+        state.menu_open = Some(top);
+        return true;
+    }
+    false
+}
+
+/// The chords a command answers to, as menu text (`space / ctrl+p`).
+fn chord_label(registry: &CommandRegistry, id: &str) -> String {
+    registry
+        .effective_chords(id)
+        .iter()
+        .map(|chord| chord.to_string())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// A layout rectangle as the UI's rectangle type.
+fn layout_rect_to_ui(rect: LayoutRect) -> Rect {
+    Rect::from_min_size(
+        Vector2f::new(rect.x as f32, rect.y as f32),
+        Vector2f::new(rect.width as f32, rect.height as f32),
+    )
+}
+
+/// The commands of one open menu, as painted: id, title, shortcut text.
+type MenuPaint = Vec<(String, Vec<(String, String, String)>)>;
+
+/// Paints the menu bar and, when one is open, its dropdown (Stage 14).
+///
+/// The bar sits over the top of the client area, above the dock layout; the
+/// dropdown paints after the panels, so it covers their content. The hit
+/// rectangles the pointer router reads are recorded here, for the next
+/// frame's events, the way widgets do.
+pub fn paint_menu(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    frame: &mut EditorShellFrame,
+    available: Vector2f,
+) {
+    let menus: MenuPaint = menu_tree(registry)
+        .into_iter()
+        .map(|(top, specs)| {
+            let items = specs
+                .iter()
+                .map(|spec| {
+                    (
+                        spec.id.clone(),
+                        spec.title.clone(),
+                        chord_label(registry, &spec.id),
+                    )
+                })
+                .collect();
+            (top, items)
+        })
+        .collect();
+    state.menu_bar_hits.clear();
+    state.menu_dropdown_rect = None;
+    state.menu_dropdown_item_hits.clear();
+    if menus.is_empty() {
+        return;
+    }
+    {
+        let EditorShellState {
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            ..
+        } = state;
+        frame.panels.push_fill(
+            Rect::from_min_size(
+                Vector2f::ZERO,
+                Vector2f::new(available.x, MENU_BAR_HEIGHT as f32),
+            ),
+            theme.raised,
+        );
+        ui.set_hit_rects(BTreeMap::new());
+        let (mut list, clipboard) = subframe(
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            Vector2f::ZERO,
+            Vector2f::new(available.x, MENU_BAR_HEIGHT as f32),
+            |builder| {
+                builder.row(|row| {
+                    for (top, _) in &menus {
+                        row.label(top);
+                    }
+                });
+            },
+        );
+        frame.panels.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+    }
+    // The titles' hit rectangles, matching the uniform layout above.
+    let mut x = 6.0;
+    for (top, _) in &menus {
+        state.menu_bar_hits.push((
+            top.clone(),
+            LayoutRect::new(x, 0.0, MENU_TITLE_WIDTH, MENU_BAR_HEIGHT),
+        ));
+        x += MENU_TITLE_WIDTH;
+    }
+    // The dropdown, when one is open.
+    let Some(open) = state.menu_open.clone() else {
+        return;
+    };
+    let Some((top, items)) = menus.iter().find(|(name, _)| *name == open) else {
+        state.menu_open = None;
+        return;
+    };
+    let title_x = state
+        .menu_bar_hits
+        .iter()
+        .find(|(name, _)| name == top)
+        .map(|(_, rect)| rect.x)
+        .unwrap_or(6.0);
+    // The view surface is a real child window: anything drawn over its
+    // rectangle is covered. Until the composition overlay exists (Stage 13
+    // deviation, D24), popups clamp to the area left of it.
+    let view_left = frame
+        .game_rect
+        .or(frame.scene_rect)
+        .map(|rect| rect.x as f64)
+        .unwrap_or(available.x as f64);
+    let width = items
+        .iter()
+        .map(|(_, title, chord)| (title.chars().count() + chord.chars().count() + 8) as f64 * 7.2)
+        .fold(240.0_f64, f64::max)
+        .min(460.0)
+        .min((view_left - title_x - 8.0).max(200.0));
+    let height = items.len() as f64 * MENU_ITEM_HEIGHT + 8.0;
+    let rect = LayoutRect::new(title_x, MENU_BAR_HEIGHT, width, height);
+    state.menu_dropdown_rect = Some(rect);
+    let rows: Vec<String> = items
+        .iter()
+        .map(|(_, title, chord)| {
+            if chord.is_empty() {
+                title.clone()
+            } else {
+                format!("{title}   {chord}")
+            }
+        })
+        .collect();
+    {
+        let EditorShellState {
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            ..
+        } = state;
+        frame
+            .panels
+            .push_fill(layout_rect_to_ui(rect), theme.window);
+        frame.panels.push_fill(
+            layout_rect_to_ui(LayoutRect::new(rect.x, rect.y, rect.width, 1.0)),
+            theme.border,
+        );
+        ui.set_hit_rects(BTreeMap::new());
+        let (mut list, clipboard) = subframe(
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            Vector2f::new(rect.x as f32 + 6.0, rect.y as f32 + 4.0),
+            Vector2f::new(rect.width as f32 - 12.0, rect.height as f32 - 8.0),
+            |builder| {
+                for row_text in &rows {
+                    builder.label(row_text);
+                }
+            },
+        );
+        frame.panels.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+    }
+    // The item hit rectangles, one per row.
+    let mut y = rect.y + 4.0;
+    for (id, _, _) in items {
+        state.menu_dropdown_item_hits.push((
+            id.clone(),
+            LayoutRect::new(rect.x + 4.0, y, rect.width - 8.0, MENU_ITEM_HEIGHT),
+        ));
+        y += MENU_ITEM_HEIGHT;
+    }
+}
+
+/// Paints the command palette when open: a search field and the matching
+/// commands, clickable (Stage 14).
+pub fn paint_palette(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    frame: &mut EditorShellFrame,
+    available: Vector2f,
+) {
+    let Some(mut query) = state.palette_query.clone() else {
+        state.palette_rect = None;
+        state.palette_item_hits.clear();
+        return;
+    };
+    let mut commands: Vec<(String, String, String)> = registry
+        .commands()
+        .map(|spec| {
+            (
+                spec.id.clone(),
+                spec.title.clone(),
+                chord_label(registry, &spec.id),
+            )
+        })
+        .collect();
+    let needle = query.to_lowercase();
+    commands.retain(|(id, title, _)| {
+        needle.is_empty()
+            || title.to_lowercase().contains(&needle)
+            || id.to_lowercase().contains(&needle)
+    });
+    // Clamped left of the view surface, like the menu dropdowns: an
+    // in-window popup cannot paint over the child window (D24 pending).
+    let view_left = frame
+        .game_rect
+        .or(frame.scene_rect)
+        .map(|rect| rect.x as f64)
+        .unwrap_or(available.x as f64);
+    let width = PALETTE_WIDTH
+        .min(view_left - 32.0)
+        .max(200.0)
+        .min(available.x as f64 - 32.0);
+    let height = PALETTE_HEIGHT.min(available.y as f64 - 60.0).max(80.0);
+    let rect = LayoutRect::new(16.0, 40.0, width, height);
+    state.palette_rect = Some(rect);
+    state.palette_item_hits.clear();
+    // The rows start below the search field and fit the visible box.
+    let row_y = rect.y + MENU_ITEM_HEIGHT + 6.0;
+    let visible = commands
+        .iter()
+        .take(
+            (((rect.y + rect.height - row_y) / MENU_ITEM_HEIGHT)
+                .floor()
+                .max(0.0)) as usize,
+        )
+        .count();
+    let mut y = row_y;
+    for (id, _, _) in commands.iter().take(visible) {
+        state.palette_item_hits.push((
+            id.clone(),
+            LayoutRect::new(rect.x + 4.0, y, rect.width - 8.0, MENU_ITEM_HEIGHT),
+        ));
+        y += MENU_ITEM_HEIGHT;
+    }
+    let rows: Vec<String> = commands
+        .iter()
+        .take(visible)
+        .map(|(_, title, chord)| {
+            if chord.is_empty() {
+                title.clone()
+            } else {
+                format!("{title}   {chord}")
+            }
+        })
+        .collect();
+    let mut changed = false;
+    {
+        let EditorShellState {
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            ..
+        } = state;
+        frame
+            .panels
+            .push_fill(layout_rect_to_ui(rect), theme.window);
+        frame.panels.push_fill(
+            layout_rect_to_ui(LayoutRect::new(rect.x, rect.y, rect.width, 1.0)),
+            theme.border,
+        );
+        ui.set_hit_rects(BTreeMap::new());
+        let (mut list, clipboard) = subframe(
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            Vector2f::new(rect.x as f32 + 6.0, rect.y as f32 + 2.0),
+            Vector2f::new(rect.width as f32 - 12.0, rect.height as f32 - 4.0),
+            |builder| {
+                changed = builder.text_field("palette_query", &mut query);
+                builder.separator();
+                for row_text in &rows {
+                    builder.label(row_text);
+                }
+            },
+        );
+        frame.panels.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+    }
+    if changed {
+        state.palette_query = Some(query);
+    }
 }
