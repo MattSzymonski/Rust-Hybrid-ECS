@@ -7,6 +7,8 @@
 //!   geometry and on-disk persistence ([`layout`]).
 //! - Own the editor's snapshots of the engine and the commands it applies at
 //!   the frame boundary ([`editor_state`]).
+//! - Own the clipboard payload documents the copy and paste commands share
+//!   ([`clipboard`]).
 //! - Declare the layout persistence failures ([`error`]).
 //!
 //! # Design
@@ -16,6 +18,8 @@
 //! shared `dylib` (see its manifest) because its values cross between the
 //! editor executable and the reloadable editor shell module.
 
+/// The clipboard payload documents the copy and paste commands share.
+pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.
 pub mod commands;
 /// The editor's snapshots of the engine and the commands it applies to it.

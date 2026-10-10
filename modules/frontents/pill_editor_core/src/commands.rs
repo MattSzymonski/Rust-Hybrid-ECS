@@ -633,6 +633,27 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Godot, "ctrl+shift+z")
             .bind(Unreal, "ctrl+y")
             .global(),
+        // The clipboard commands stay un-global on purpose: while a widget
+        // holds the focus (a text field), ctrl+c/x/v belong to the field's
+        // own Edit handling (Stage 18).
+        CommandSpec::new("editor.copy", "Copy")
+            .menu(&["Edit", "Copy"])
+            .bind(Blender, "ctrl+c")
+            .bind(Unity, "ctrl+c")
+            .bind(Godot, "ctrl+c")
+            .bind(Unreal, "ctrl+c"),
+        CommandSpec::new("editor.cut", "Cut")
+            .menu(&["Edit", "Cut"])
+            .bind(Blender, "ctrl+x")
+            .bind(Unity, "ctrl+x")
+            .bind(Godot, "ctrl+x")
+            .bind(Unreal, "ctrl+x"),
+        CommandSpec::new("editor.paste", "Paste")
+            .menu(&["Edit", "Paste"])
+            .bind(Blender, "ctrl+v")
+            .bind(Unity, "ctrl+v")
+            .bind(Godot, "ctrl+v")
+            .bind(Unreal, "ctrl+v"),
     ]
 }
 

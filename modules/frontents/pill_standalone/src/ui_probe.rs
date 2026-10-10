@@ -157,6 +157,7 @@ fn style_watch(path: &str) {
                 pill_ui::gallery::ui_gallery(ui);
             },
         );
+        state.end_frame();
         let mut list = DrawList::new();
         paint(&output.tree, &layout, theme, state, text, atlas, &mut list);
         (

@@ -1,12 +1,16 @@
 """End-to-end acceptance for the native editor (W-0004 Stage 13, D26 level 3).
 
 Builds against an already-built `pill_editor_native` binary, starts it on
-`circus_demo` with the scripted input channel (`PILL_EDITOR_TEST_COMMANDS`),
-and asserts on its log tokens: startup, the shell module loading, panel
-dispatch, input routing between the scene view and the editor UI, the Game
-view on its own surface with editor-camera navigation in the scene view, a
-live patch of the shell's system keeping its state, and a clean exit. Then
-it checks the clean exit code on five further runs.
+`italian_brainrot` - a three-entity project, so the frames are fast and the
+suite's heartbeat waits are short - with the scripted input channel
+(`PILL_EDITOR_TEST_COMMANDS`), and asserts on its log tokens: startup, the
+shell module loading, panel dispatch, input routing between the scene view
+and the editor UI, the Game view on its own surface with editor-camera
+navigation in the scene view, a live patch of the shell's system keeping its
+state, and a clean exit. Then it checks the clean exit code on five further
+runs. (The 200k-entity `circus_demo` this suite used to start is the
+pill-lab editor-shell measurement's job; it only made these phases race the
+executable's seconds deadline.)
 
 The only files this suite edits are the shell module's source (restored in a
 `finally`) and its own sandboxed layout files under `LOCALAPPDATA`;
@@ -93,6 +97,11 @@ def start_editor(
     needed.
     """
     environment = dict(os.environ)
+    # Never inherit the scripted channel from the calling shell: a stale
+    # value would feed the editor another run's commands (each launch here
+    # either names its own file in `extra_environment` or runs without one).
+    environment.pop("PILL_EDITOR_TEST_COMMANDS", None)
+    environment.pop("PILL_EDITOR_TEST_SECONDS", None)
     environment["PROJECT_PATH"] = project
     environment.update(extra_environment)
     log = log_path.open("w", encoding="utf-8")
@@ -124,7 +133,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--project",
-        default="../examples/circus_demo",
+        default="../examples/italian_brainrot",
         help="the project, resolved the way the editor resolves PROJECT_PATH (from modules/)",
     )
     parser.add_argument("--timeout", type=int, default=300)
@@ -195,6 +204,10 @@ def main() -> int:
         {
             "LOCALAPPDATA": str(appdata),
             "PILL_EDITOR_TEST_COMMANDS": str(commands_path),
+            # The phases wait for two shell heartbeats and a patch compile;
+            # the executable's seconds deadline is a hang guard, kept
+            # comfortably above the phases even on a slow machine.
+            "PILL_EDITOR_TEST_SECONDS": "120",
         },
     )
     try:

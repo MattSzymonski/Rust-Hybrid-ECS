@@ -380,6 +380,25 @@ pub enum EditorCommand {
     },
     /// Run exactly one system phase on the next frame, then pause again.
     StepOnce,
+    /// Copy files from outside the project into the assets directory (a
+    /// drag-and-drop import, Stage 18). Undo removes the copies; a file of
+    /// the same name is overwritten.
+    ImportFiles {
+        /// Absolute source paths, as the OS reported them.
+        sources: Vec<String>,
+        /// The destination directory (the project's asset root).
+        destination: String,
+    },
+    /// Delete the copies an import created (its inverse, and a redoable step
+    /// of its own); it carries the origins so redo can copy them again.
+    RemoveFiles {
+        /// The created copies, absolute paths.
+        paths: Vec<String>,
+        /// The original source paths, the redo's sources.
+        sources: Vec<String>,
+        /// Where the copies live (the redo's destination).
+        destination: String,
+    },
 }
 
 /// What one applied command hands back to the recording layer.
@@ -440,6 +459,8 @@ impl EditorCommand {
                 | EditorCommand::SetField { .. }
                 | EditorCommand::SetArrayElement { .. }
                 | EditorCommand::SetSystemEnabled { .. }
+                | EditorCommand::ImportFiles { .. }
+                | EditorCommand::RemoveFiles { .. }
         )
     }
 
@@ -476,7 +497,9 @@ impl EditorCommand {
             EditorCommand::DestroyEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
-            | EditorCommand::StepOnce => {}
+            | EditorCommand::StepOnce
+            | EditorCommand::ImportFiles { .. }
+            | EditorCommand::RemoveFiles { .. } => {}
         }
         identifiers
     }
@@ -506,7 +529,9 @@ impl EditorCommand {
             EditorCommand::CreateEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
-            | EditorCommand::StepOnce => {}
+            | EditorCommand::StepOnce
+            | EditorCommand::ImportFiles { .. }
+            | EditorCommand::RemoveFiles { .. } => {}
         }
     }
 
@@ -672,6 +697,78 @@ impl EditorCommand {
             EditorCommand::StepOnce => {
                 engine.request_single_step();
                 Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::ImportFiles {
+                sources,
+                destination,
+            } => {
+                // Validate every source before copying anything, so one bad
+                // path in a multi-file drop changes nothing.
+                for source in sources {
+                    if !std::path::Path::new(source).is_file() {
+                        return Err(format!("{command:?}: `{source}` is not a file"));
+                    }
+                }
+                std::fs::create_dir_all(destination)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let mut created: Vec<String> = Vec::new();
+                for source in sources {
+                    let file_name = std::path::Path::new(source)
+                        .file_name()
+                        .ok_or_else(|| format!("{command:?}: `{source}` has no file name"))?;
+                    let target = std::path::Path::new(destination).join(file_name);
+                    // A source that already is the destination file - a drop
+                    // of something the project already has - is nothing to
+                    // copy; copying a file onto itself would at best fail and
+                    // at worst truncate it.
+                    let source_path = std::path::Path::new(source);
+                    let same = match (source_path.canonicalize(), target.canonicalize()) {
+                        (Ok(source), Ok(target)) => source == target,
+                        _ => source_path == target,
+                    };
+                    if same {
+                        continue;
+                    }
+                    if let Err(error) = std::fs::copy(source, &target) {
+                        // Best-effort rollback of this command's own copies:
+                        // a partial import must not stay on disk unrecorded.
+                        for path in &created {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        return Err(format!("{command:?}: {error}"));
+                    }
+                    created.push(target.to_string_lossy().into_owned());
+                }
+                if created.is_empty() {
+                    // Every source was already in place: nothing changed, and
+                    // nothing is recorded.
+                    return Ok(CommandOutcome::plain());
+                }
+                Ok(CommandOutcome::inverse(EditorCommand::RemoveFiles {
+                    paths: created,
+                    sources: sources.clone(),
+                    destination: destination.clone(),
+                }))
+            }
+
+            EditorCommand::RemoveFiles {
+                paths,
+                sources,
+                destination,
+            } => {
+                for path in paths {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        // Already gone is the state undo wanted anyway.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(format!("{command:?}: {error}")),
+                    }
+                }
+                Ok(CommandOutcome::inverse(EditorCommand::ImportFiles {
+                    sources: sources.clone(),
+                    destination: destination.clone(),
+                }))
             }
 
             EditorCommand::DestroyEntity { entity } => {

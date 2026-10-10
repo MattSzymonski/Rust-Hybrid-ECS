@@ -210,6 +210,7 @@ mod tests {
                 ui_gallery(ui);
             },
         );
+        state.end_frame();
         let mut atlas = Atlas::new(2048, 2048);
         let mut list = DrawList::new();
         crate::paint::paint(

@@ -99,6 +99,23 @@ pub enum TestCommand {
         /// The chord text.
         text: String,
     },
+    /// Hover a file over the window (a scripted OS drag, Stage 18).
+    HoverFile {
+        /// The file's path, as the OS would report it.
+        path: String,
+    },
+    /// Drop a file on the window.
+    DropFile {
+        /// The file's path, as the OS would report it.
+        path: String,
+    },
+    /// Start an OS drag of one file out of the window (Stage 18). Blocks in
+    /// OLE's drag loop until the drag ends, so only a manual checklist or a
+    /// deliberate smoke run drives it.
+    DragOut {
+        /// The file's path: absolute, or relative to the asset root.
+        path: String,
+    },
     /// Drive one edit through the recorded command path (Stage 15), so the
     /// suite exercises the same route the UI issues.
     Edit(EditCommand),
@@ -256,6 +273,22 @@ fn parse_command(line: &str) -> TestCommand {
     if let Some(name) = line.strip_prefix("activate ") {
         return TestCommand::Activate {
             name: name.to_string(),
+        };
+    }
+    // Paths contain spaces, so the file-drop verbs take the rest of the line.
+    if let Some(path) = line.strip_prefix("hover-file ") {
+        return TestCommand::HoverFile {
+            path: path.to_string(),
+        };
+    }
+    if let Some(path) = line.strip_prefix("drop-file ") {
+        return TestCommand::DropFile {
+            path: path.to_string(),
+        };
+    }
+    if let Some(path) = line.strip_prefix("drag-out ") {
+        return TestCommand::DragOut {
+            path: path.to_string(),
         };
     }
     if let Some(rest) = line.strip_prefix("wheel ") {

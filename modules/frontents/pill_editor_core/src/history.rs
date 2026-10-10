@@ -164,6 +164,19 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
             | EditorCommand::StepOnce => 0,
+            EditorCommand::ImportFiles {
+                sources,
+                destination,
+            } => sources.iter().map(String::len).sum::<usize>() + destination.len(),
+            EditorCommand::RemoveFiles {
+                paths,
+                sources,
+                destination,
+            } => {
+                paths.iter().map(String::len).sum::<usize>()
+                    + sources.iter().map(String::len).sum::<usize>()
+                    + destination.len()
+            }
         };
         bytes += strings;
     }

@@ -112,12 +112,50 @@ pub struct EditorShellInput {
     /// Command ids the executable asks the shell to execute (the scripted
     /// test channel); drained through the same dispatch a shortcut uses.
     pub requested_commands: Vec<String>,
+    /// Files the OS drag currently hovers over the window (Stage 18); the
+    /// shell previews where they would land.
+    pub hovered_files: Vec<String>,
+    /// Files the OS dropped this frame; the shell queues the import.
+    pub dropped_files: Vec<String>,
+    /// The project's asset root (absolute), for building the import's
+    /// destination; `None` when the project has none.
+    pub asset_root: Option<String>,
     /// Whether the engine's systems are paused, published by the executable
     /// because only it holds the `Engine`; the pause command toggles from it.
     pub systems_paused: bool,
 }
 
 impl Resource for EditorShellInput {}
+
+/// One structured clipboard write the shell requests (Stage 18): the payload
+/// bytes under `format`, offered to other applications alongside `text`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipboardObject {
+    /// Registered clipboard format name (see
+    /// `pill_editor_core::clipboard::FORMAT_NAME`).
+    pub format: String,
+    /// The payload document's bytes.
+    pub bytes: Vec<u8>,
+    /// The same payload as readable text (what a plain editor pastes).
+    pub text: String,
+}
+
+/// The answer to a clipboard read, filled by the executable and consumed by
+/// the shell on a later frame.
+#[derive(Clone, Debug, Default)]
+pub struct EditorClipboardAnswer {
+    /// The format that was asked for.
+    pub format: String,
+    /// The payload bytes, when the owner offered the format.
+    pub bytes: Option<Vec<u8>>,
+    /// The plain text, when the owner offered any (the fallback source).
+    pub text: Option<String>,
+    /// The read this answer belongs to; the shell matches its pending
+    /// request against it.
+    pub seq: u64,
+}
+
+impl Resource for EditorClipboardAnswer {}
 
 // =============================================================================
 // EditorShellFrame
@@ -139,6 +177,21 @@ pub struct EditorShellFrame {
     /// Clipboard operations the widgets asked for (D28), fulfilled by the
     /// executable's platform layer.
     pub clipboard: Vec<ClipboardRequest>,
+    /// Structured payloads the shell's copy commands produced (D28); the
+    /// executable writes each under its format plus its readable text.
+    pub objects: Vec<ClipboardObject>,
+    /// A clipboard payload the shell asks the executable to read, by
+    /// registered format name (the paste command's side of D28); the answer
+    /// lands in [`EditorClipboardAnswer`] on a later frame, so a slow
+    /// clipboard owner never stalls the event loop.
+    pub requested_clipboard: Option<String>,
+    /// Where the Assets panel sits, in logical pixels, when it is visible;
+    /// the executable aims a scripted file drop at it (Stage 18).
+    pub assets_rect: Option<EditorRect>,
+    /// An asset row held down this frame, named by its source path relative
+    /// to the asset root; the executable turns a drag that leaves the window
+    /// into an OS drag of that file (Stage 18).
+    pub drag_candidate: Option<String>,
     /// Where the scene surface goes, in logical pixels of the client area;
     /// `None` while no Scene tab is selected.
     pub scene_rect: Option<EditorRect>,
@@ -154,6 +207,10 @@ impl EditorShellFrame {
         self.overlay.clear();
         self.atlas = None;
         self.clipboard.clear();
+        self.objects.clear();
+        self.requested_clipboard = None;
+        self.assets_rect = None;
+        self.drag_candidate = None;
         self.scene_rect = None;
         self.game_rect = None;
     }
@@ -182,10 +239,20 @@ mod tests {
             pill_ui::Color::WHITE,
         );
         frame.clipboard.push(ClipboardRequest::GetText);
+        frame.objects.push(ClipboardObject {
+            format: "PillEditor.Object".to_string(),
+            bytes: vec![1, 2, 3],
+            text: "{}".to_string(),
+        });
+        frame.requested_clipboard = Some("PillEditor.Object".to_string());
+        frame.drag_candidate = Some("a.png".to_string());
         frame.clear();
         assert!(frame.panels.is_empty());
         assert!(frame.overlay.is_empty());
         assert!(frame.clipboard.is_empty());
+        assert!(frame.objects.is_empty());
+        assert!(frame.requested_clipboard.is_none());
+        assert!(frame.drag_candidate.is_none());
         assert!(frame.scene_rect.is_none());
         assert!(frame.game_rect.is_none());
         assert!(frame.atlas.is_none());
