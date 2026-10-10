@@ -45,7 +45,10 @@ use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton,
 use pill_host::{HostConfig, HostNotice, RenderingHost};
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::FrameDriver;
-use pill_runtime::{CameraBinding, CameraComponent, SurfaceId, SurfaceOptions, TransformComponent};
+use pill_runtime::{
+    CameraBinding, CameraComponent, PickHit, PickRequests, PickResults, SelectionOutlines,
+    SurfaceId, SurfaceOptions, TransformComponent,
+};
 use pill_ui::panel::ClipboardRequest;
 use pill_ui::{paint, run_frame};
 
@@ -367,6 +370,16 @@ struct EditorWindow {
     /// from the host's notices; the shell's input carries what it draws
     /// from and drains.
     notices: EditorNotices,
+    /// The pick this executable is waiting for (Stage 20), by its request
+    /// id; answers land frames later and match by id.
+    pending_pick: Option<u64>,
+    /// Where the left mouse button went down on the scene window, in
+    /// physical pixels, so its release can ask what is under it. A real
+    /// click only; the scripted channel requests its pick directly.
+    scene_press: Option<(f32, f32)>,
+    /// The entity the outlines currently name, so the world resource is
+    /// rewritten only on a change.
+    outlined_entity: Option<pill_engine_core::Entity>,
 }
 
 impl EditorWindow {
@@ -579,6 +592,9 @@ impl EditorWindow {
             drag_request: None,
             mouse_left_held: false,
             notices: EditorNotices::default(),
+            pending_pick: None,
+            scene_press: None,
+            outlined_entity: None,
         })
     }
 
@@ -1121,14 +1137,20 @@ impl EditorWindow {
                 self.host.push_input(event);
             }
         } else if scene_target {
-            // Selection in the scene view arrives with Stage 20; the click
-            // is accounted for and goes no further.
+            // The scene view's click asks the renderer what is under the
+            // pixel (Stage 20); the answer selects, frames later.
             info!(
                 target: telemetry_target::ENGINE,
                 x,
                 y,
-                "[editor] scene view click (selection arrives with Stage 20)"
+                "[editor] scene view click"
             );
+            let scale_factor = self.window.scale_factor() as f32;
+            if let Some(rect) = self.last_scene_rect {
+                let physical_x = ((x - rect.x) * scale_factor).max(0.0).round() as u32;
+                let physical_y = ((y - rect.y) * scale_factor).max(0.0).round() as u32;
+                self.request_scene_pick(physical_x, physical_y);
+            }
         } else {
             for event in presses(Vector2f::new(x, y)) {
                 self.state.input.apply(&event);
@@ -1293,6 +1315,21 @@ impl EditorWindow {
                 winit::event::MouseButton::Middle => {
                     self.scene.panning = *state == winit::event::ElementState::Pressed;
                 }
+                // A left click asks what is under the pixel (Stage 20). The
+                // release does the asking, so a press that turned into a
+                // scene drag is not read as a click; the position is the
+                // scene window's own client area, which is what a pick
+                // wants.
+                winit::event::MouseButton::Left => match *state {
+                    winit::event::ElementState::Pressed => {
+                        self.scene_press = self.scene.last_cursor;
+                    }
+                    winit::event::ElementState::Released => {
+                        if let Some((x, y)) = self.scene_press.take() {
+                            self.request_scene_pick(x as u32, y as u32);
+                        }
+                    }
+                },
                 _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1496,6 +1533,129 @@ impl EditorWindow {
         }
     }
 
+    /// Ask the renderer what is under one physical pixel of the scene
+    /// surface (Stage 20).
+    ///
+    /// The answer never stalls a frame: the request rides the world
+    /// resource into the next render, and [`Self::drain_scene_picks`] applies
+    /// whatever comes back, matched by request id.
+    fn request_scene_pick(&mut self, physical_x: u32, physical_y: u32) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if world.get_resource::<PickRequests>().is_none() {
+            world.insert_resource(PickRequests::default());
+        }
+        let Some(requests) = world.get_resource_mut::<PickRequests>() else {
+            return;
+        };
+        let id = requests.request(SCENE_SURFACE, physical_x, physical_y);
+        self.pending_pick = Some(id);
+        info!(
+            target: telemetry_target::ENGINE,
+            x = physical_x,
+            y = physical_y,
+            id,
+            "[editor] pick requested"
+        );
+    }
+
+    /// Publish the selection as the renderer's outline set (Stage 20).
+    ///
+    /// One resource write per change: the world's [`SelectionOutlines`] is
+    /// what the renderer reads to outline, and the executable owns it
+    /// because it owns the world's frame order - the selection changes in
+    /// many places (Hierarchy, Inspector, scene picks) and the outline
+    /// belongs to all of them.
+    fn publish_selection_outline(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let selected = world
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.entity);
+        if selected == self.outlined_entity {
+            return;
+        }
+        self.outlined_entity = selected;
+        if world.get_resource::<SelectionOutlines>().is_none() {
+            world.insert_resource(SelectionOutlines::default());
+        }
+        if let Some(outlines) = world.get_resource_mut::<SelectionOutlines>() {
+            outlines.entities = selected.into_iter().collect();
+        }
+        match selected {
+            Some(entity) => info!(
+                target: telemetry_target::ENGINE,
+                entity = %entity,
+                "[editor] outline set"
+            ),
+            None => info!(
+                target: telemetry_target::ENGINE,
+                "[editor] outline cleared"
+            ),
+        }
+    }
+
+    /// Apply the answers to scene picks that arrived since the last frame
+    /// (Stage 20): an entity selects everywhere, empty space clears, and a
+    /// gizmo handle is recorded for the drag whose press asked for it.
+    fn drain_scene_picks(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let results = match world.get_resource_mut::<PickResults>() {
+            Some(results) => results.take(),
+            None => return,
+        };
+        for result in results {
+            if Some(result.request.id) != self.pending_pick {
+                continue;
+            }
+            self.pending_pick = None;
+            match result.hit {
+                PickHit::Entity(entity) => {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        entity = %entity,
+                        "[editor] scene pick entity"
+                    );
+                    let changed = match world
+                        .get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
+                    {
+                        Some(selection) => {
+                            let changed = selection.entity != Some(entity);
+                            selection.entity = Some(entity);
+                            changed
+                        }
+                        None => false,
+                    };
+                    // The same token the shell logs when a panel selects, so
+                    // a suite reads one shape for "the selection moved".
+                    if changed {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            entity = %entity,
+                            "[editor] selection changed"
+                        );
+                    }
+                }
+                PickHit::Nothing => {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] scene pick nothing"
+                    );
+                    if let Some(selection) =
+                        world.get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
+                    {
+                        selection.entity = None;
+                    }
+                }
+                PickHit::Handle(handle) => {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        handle,
+                        "[editor] scene pick handle"
+                    );
+                }
+            }
+        }
+    }
+
     /// Open a reported file in the developer's editor (Stage 19).
     ///
     /// `code -g <file>:<line>` is the default; `PILL_EDITOR_OPEN_COMMAND`
@@ -1648,6 +1808,9 @@ impl EditorWindow {
         // shell's Problems rows and toasts (Stage 19). Published before the
         // frame so the shell sees them the moment the host produced them.
         self.publish_host_notices();
+        // Step 2d: the selection's outline, published before the frame
+        // renders through it (Stage 20); one resource write per change.
+        self.publish_selection_outline();
         // Step 3: this frame's size, and the input queued since the last
         // frame, delivered to the shell module's input resource; the
         // executable's own state keeps its copy for the fallback.
@@ -2054,11 +2217,14 @@ impl EditorWindow {
                 None => world.insert_resource(answer),
             }
         }
-        // A Problems row asked for a file (Stage 19): hand it to the
+        // Step 4c: a Problems row asked for a file (Stage 19): hand it to the
         // developer's editor, out of band.
         if let Some(request) = output.requested_open {
             self.open_file_in_editor(&request);
         }
+        // Step 4d: answers to scene picks (Stage 20) arrived during the
+        // frame's render; the selection they name is applied here.
+        self.drain_scene_picks();
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
         let frame = match self.surface.get_current_texture() {
