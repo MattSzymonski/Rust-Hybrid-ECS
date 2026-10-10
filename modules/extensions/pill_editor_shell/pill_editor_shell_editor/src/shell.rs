@@ -33,6 +33,7 @@ use pill_editor_core::commands::{
     PendingEditorCommands,
 };
 use pill_editor_core::editor_state::EditorCommand;
+use pill_editor_core::history::{CommandHistory, HistoryEntryKind};
 use pill_editor_core::layout::{
     LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
 };
@@ -576,7 +577,11 @@ fn statistics_panel(builder: &mut PanelBuilder<'_>, editor_frames_per_second: f3
 /// both apply live, and what changed (or went wrong) is reported once: the
 /// preset logs, conflicts name both commands, and parse problems surface as
 /// warnings rather than silently keeping a stale map.
-pub fn sync_command_files(state: &mut EditorShellState, registry: &mut CommandRegistry) {
+pub fn sync_command_files(
+    state: &mut EditorShellState,
+    registry: &mut CommandRegistry,
+    history: &mut CommandHistory,
+) {
     let directory = pill_editor_core::layout::layout_directory();
     // Step 1: the keybindings file, when its bytes differ from the last pass.
     let keybindings_text = std::fs::read_to_string(directory.join(KEYBINDINGS_FILE)).ok();
@@ -614,14 +619,39 @@ pub fn sync_command_files(state: &mut EditorShellState, registry: &mut CommandRe
             }
         }
     }
-    // Step 2: the preferences file (D31), parsed so one reader owns it; the
-    // fields themselves arrive with the stages that consume them.
+    // Step 2: the preferences file (D31); the history limits apply live,
+    // the remaining fields arrive with the stages that consume them.
     let preferences_text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).ok();
     if preferences_text != state.preferences_text {
         state.preferences_text = preferences_text.clone();
         if let Some(text) = preferences_text {
-            if let Err(error) = serde_json::from_str::<EditorPreferences>(&text) {
-                report_once(state, &format!("preferences: could not parse: {error}"));
+            match serde_json::from_str::<EditorPreferences>(&text) {
+                Ok(preferences) => {
+                    let step_cap = preferences
+                        .history_step_cap
+                        .unwrap_or(CommandHistory::DEFAULT_STEP_CAP);
+                    let memory_mb = preferences
+                        .history_memory_budget_mb
+                        .unwrap_or(CommandHistory::DEFAULT_MEMORY_BUDGET_BYTES / (1024 * 1024));
+                    let outcome = history.set_limits(step_cap, memory_mb * 1024 * 1024);
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        step_cap,
+                        memory_mb,
+                        "[editor] preferences applied"
+                    );
+                    if outcome.trimmed > 0 {
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ECS,
+                            dropped = outcome.trimmed,
+                            reason = ?outcome.trim_reason,
+                            "[editor] history trimmed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    report_once(state, &format!("preferences: could not parse: {error}"));
+                }
             }
         }
     }
@@ -648,6 +678,7 @@ pub fn execute_command(
     registry: &CommandRegistry,
     inbox: &mut CommandInbox,
     pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
     id: &str,
 ) -> bool {
     if registry.command(id).is_none() {
@@ -667,11 +698,63 @@ pub fn execute_command(
     inbox.executed.push(id.to_string());
     match id {
         "editor.pause_toggle" => {
-            pending.commands.push(EditorCommand::SetPaused {
+            pending.push(vec![EditorCommand::SetPaused {
                 paused: !state.paused,
-            });
+            }]);
         }
-        "editor.step" => pending.commands.push(EditorCommand::StepOnce),
+        "editor.step" => pending.push(vec![EditorCommand::StepOnce]),
+        "editor.undo" => {
+            let undo = match history.pop_undo() {
+                Some(entry) => Some(entry),
+                None => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        "[editor] history undo empty"
+                    );
+                    None
+                }
+            };
+            if let Some(entry) = undo {
+                let label = entry.label.clone();
+                match entry.entry {
+                    HistoryEntryKind::Engine { inverse, .. } => pending.push(inverse),
+                    // Selection entries need the selection state the panels
+                    // own (Stage 16+); the entry type carries it already.
+                    HistoryEntryKind::Selection { .. } => {}
+                }
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    label = label.as_str(),
+                    remaining = history.undo_depth(),
+                    "[editor] history undo"
+                );
+            }
+        }
+        "editor.redo" => {
+            let redo = match history.pop_redo() {
+                Some(entry) => Some(entry),
+                None => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        "[editor] history redo empty"
+                    );
+                    None
+                }
+            };
+            if let Some(entry) = redo {
+                let label = entry.label.clone();
+                match entry.entry {
+                    HistoryEntryKind::Engine { forward, .. } => pending.push(forward),
+                    HistoryEntryKind::Selection { .. } => {}
+                }
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    label = label.as_str(),
+                    remaining = history.redo_depth(),
+                    "[editor] history redo"
+                );
+            }
+        }
         "editor.save_layout" => {
             save_native_layout(&state.layout);
             pill_core::info!(
@@ -722,6 +805,7 @@ pub fn handle_command_shortcuts(
     registry: &CommandRegistry,
     inbox: &mut CommandInbox,
     pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
     pressed: &[(pill_engine::KeyCode, pill_engine::Modifiers)],
 ) {
     if state.palette_query.is_some() {
@@ -737,7 +821,7 @@ pub fn handle_command_shortcuts(
         if state.ui.focus().is_some() && !global {
             continue;
         }
-        execute_command(state, registry, inbox, pending, &id);
+        execute_command(state, registry, inbox, pending, history, &id);
     }
 }
 
@@ -752,6 +836,7 @@ pub fn handle_menu_pointer(
     registry: &CommandRegistry,
     inbox: &mut CommandInbox,
     pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
     event: &pill_engine::InputEvent,
 ) -> bool {
     let pill_engine::InputEvent::MouseButton {
@@ -778,7 +863,7 @@ pub fn handle_menu_pointer(
                 .map(|(id, _)| id.clone());
             if let Some(id) = hit {
                 state.palette_query = None;
-                execute_command(state, registry, inbox, pending, &id);
+                execute_command(state, registry, inbox, pending, history, &id);
             }
             return true;
         }
@@ -795,7 +880,7 @@ pub fn handle_menu_pointer(
                 .map(|(id, _)| id.clone());
             if let Some(id) = hit {
                 state.menu_open = None;
-                execute_command(state, registry, inbox, pending, &id);
+                execute_command(state, registry, inbox, pending, history, &id);
             }
             return true;
         }

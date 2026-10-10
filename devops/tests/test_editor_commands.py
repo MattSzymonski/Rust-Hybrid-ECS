@@ -169,19 +169,22 @@ def main() -> int:
             "engine batch applied",
         )
 
-        # Step 2: the menu bar, clicked with ordinary pointer events.
+        # Step 2: the menu bar, clicked with ordinary pointer events. The
+        # first title is Edit (the built-in menus sort before Layout), and
+        # its first item is Undo; the history is still empty here, so the
+        # item's observable effect is the `history undo empty` line.
         before = len(read_log())
         append("click 30 10")
         position = wait_token(
-            process, r'\[editor\] menu opened\s+path="?Layout"?', 30,
+            process, r'\[editor\] menu opened\s+path="?Edit"?', 30,
             "menu opened by click", before,
         )
         append("click 100 42")
         wait_token(
             process,
-            r'\[editor\] command executed\s+id="?editor\.save_layout"?',
+            r"\[editor\] history undo empty",
             30,
-            "menu item ran save layout",
+            "menu item ran undo",
             position,
         )
 

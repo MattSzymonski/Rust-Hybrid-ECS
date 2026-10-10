@@ -619,6 +619,20 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Godot, "ctrl+shift+p")
             .bind(Unreal, "ctrl+shift+p")
             .global(),
+        CommandSpec::new("editor.undo", "Undo")
+            .menu(&["Edit", "Undo"])
+            .bind(Blender, "ctrl+z")
+            .bind(Unity, "ctrl+z")
+            .bind(Godot, "ctrl+z")
+            .bind(Unreal, "ctrl+z")
+            .global(),
+        CommandSpec::new("editor.redo", "Redo")
+            .menu(&["Edit", "Redo"])
+            .bind(Blender, "ctrl+shift+z")
+            .bind(Unity, "ctrl+y")
+            .bind(Godot, "ctrl+shift+z")
+            .bind(Unreal, "ctrl+y")
+            .global(),
     ]
 }
 
@@ -661,6 +675,12 @@ pub struct EditorPreferences {
     /// Autosave interval for the editor state, in seconds.
     #[serde(default)]
     pub autosave_interval_seconds: Option<f64>,
+    /// Maximum undo steps kept (absent uses the history default, 500).
+    #[serde(default)]
+    pub history_step_cap: Option<usize>,
+    /// Undo memory budget in megabytes (absent uses the default, 256).
+    #[serde(default)]
+    pub history_memory_budget_mb: Option<usize>,
 }
 
 /// Snapping steps for a later stage's transforms.
@@ -693,8 +713,53 @@ impl pill_engine::Resource for CommandInbox {}
 /// ([`EditorCommand::apply`]), exactly the contract the plan states.
 #[derive(Clone, Debug, Default)]
 pub struct PendingEditorCommands {
-    /// The queued batch, drained by the executable.
+    /// The queued batches, drained by the executable.
+    pub batches: Vec<PendingCommandBatch>,
+}
+
+impl PendingEditorCommands {
+    /// Queue a batch that engine controls issue (pause, step, undo replays):
+    /// it is applied, never recorded as a new undo step.
+    pub fn push(&mut self, commands: Vec<EditorCommand>) {
+        self.batches.push(PendingCommandBatch {
+            commands,
+            record: false,
+            label: String::new(),
+            coalesce_key: None,
+        });
+    }
+
+    /// Queue an edit the history should record as one undo step.
+    ///
+    /// `coalesce_key` merges continuous edits (a slider drag) that arrive
+    /// back to back under the same key into the previous step.
+    pub fn push_recorded(
+        &mut self,
+        commands: Vec<EditorCommand>,
+        label: impl Into<String>,
+        coalesce_key: Option<String>,
+    ) {
+        self.batches.push(PendingCommandBatch {
+            commands,
+            record: true,
+            label: label.into(),
+            coalesce_key,
+        });
+    }
+}
+
+/// One queued batch and what the executable does with it at the frame
+/// boundary.
+#[derive(Clone, Debug)]
+pub struct PendingCommandBatch {
+    /// The commands to apply, in order.
     pub commands: Vec<EditorCommand>,
+    /// Whether the batch is an edit the history records.
+    pub record: bool,
+    /// History label, when recorded.
+    pub label: String,
+    /// Continuous-edit key, when recorded.
+    pub coalesce_key: Option<String>,
 }
 
 impl pill_engine::Resource for PendingEditorCommands {}
@@ -711,6 +776,7 @@ pub fn ensure_command_resources(world: &mut pill_engine::World) {
     if world.get_resource::<PendingEditorCommands>().is_none() {
         world.insert_resource(PendingEditorCommands::default());
     }
+    crate::history::CommandHistory::ensure(world);
 }
 
 // =============================================================================

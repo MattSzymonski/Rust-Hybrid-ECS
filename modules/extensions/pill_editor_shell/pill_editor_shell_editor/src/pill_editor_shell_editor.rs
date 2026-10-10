@@ -32,6 +32,7 @@ use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::commands::{
     ensure_command_resources, CommandInbox, CommandRegistry, PendingEditorCommands,
 };
+use pill_editor_core::history::CommandHistory;
 use pill_editor_core::layout::{compute_layout, LayoutMetrics, Rect as LayoutRect};
 use pill_engine::{pill_hot, pill_module, Engine, ResMut};
 
@@ -103,15 +104,24 @@ pub fn register(engine: &mut Engine) -> u32 {
 /// `run_frame` and drains [`EditorShellFrame`] after it.
 #[pill_hot]
 pub fn editor_shell_update(
-    mut state: ResMut<EditorShellState>,
-    mut input: ResMut<EditorShellInput>,
-    mut frame: ResMut<EditorShellFrame>,
-    mut registry: ResMut<CommandRegistry>,
-    mut inbox: ResMut<CommandInbox>,
-    mut pending: ResMut<PendingEditorCommands>,
+    // The function takes two tuple parameters because a system accepts at
+    // most six; the tuples carry the seven resources the shell works with.
+    view: (
+        ResMut<EditorShellState>,
+        ResMut<EditorShellInput>,
+        ResMut<EditorShellFrame>,
+    ),
+    commands: (
+        ResMut<CommandRegistry>,
+        ResMut<CommandInbox>,
+        ResMut<PendingEditorCommands>,
+        ResMut<CommandHistory>,
+    ),
 ) {
     // The resources are this crate's own registrations; a world without
     // them is not an editor's, and there is nothing to do.
+    let (mut state, mut input, mut frame) = view;
+    let (mut registry, mut inbox, mut pending, mut history) = commands;
     let (
         Some(mut state),
         Some(mut input),
@@ -119,6 +129,7 @@ pub fn editor_shell_update(
         Some(mut registry),
         Some(mut inbox),
         Some(mut pending),
+        Some(mut history),
     ) = (
         state.get_mut(),
         input.get_mut(),
@@ -126,6 +137,7 @@ pub fn editor_shell_update(
         registry.get_mut(),
         inbox.get_mut(),
         pending.get_mut(),
+        history.get_mut(),
     )
     else {
         return;
@@ -153,7 +165,14 @@ pub fn editor_shell_update(
         {
             pressed.push((*key, state.modifiers));
         }
-        if !handle_menu_pointer(&mut state, &registry, &mut inbox, &mut pending, &event) {
+        if !handle_menu_pointer(
+            &mut state,
+            &registry,
+            &mut inbox,
+            &mut pending,
+            &mut history,
+            &event,
+        ) {
             state.ui.input.apply(&event);
         }
     }
@@ -163,11 +182,25 @@ pub fn editor_shell_update(
     // Step 1b: the keybindings and preferences files, then the dispatch:
     // commands the scripted channel requested run through the same path a
     // binding does.
-    sync_command_files(&mut state, &mut registry);
+    sync_command_files(&mut state, &mut registry, &mut history);
     for id in input.requested_commands.drain(..) {
-        execute_command(&mut state, &registry, &mut inbox, &mut pending, &id);
+        execute_command(
+            &mut state,
+            &registry,
+            &mut inbox,
+            &mut pending,
+            &mut history,
+            &id,
+        );
     }
-    handle_command_shortcuts(&mut state, &registry, &mut inbox, &mut pending, &pressed);
+    handle_command_shortcuts(
+        &mut state,
+        &registry,
+        &mut inbox,
+        &mut pending,
+        &mut history,
+        &pressed,
+    );
     state.ui.input.begin_frame();
     state.frame_index += 1;
     // Step 1c: the registry's shape, logged whenever it changes, so a

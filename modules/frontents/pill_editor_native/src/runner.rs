@@ -36,6 +36,8 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
+use pill_editor_core::editor_state::EditorCommand;
+use pill_editor_core::history::{CommandHistory, HistoryEntry};
 use pill_engine_core::{ButtonState, InputEvent, KeyCode, Modifiers, MouseButton, ScrollDelta};
 use pill_host::{HostConfig, RenderingHost};
 use pill_input::winit_events::translate_window_event;
@@ -268,6 +270,9 @@ struct EditorWindow {
     test_seconds: Option<f32>,
     /// A graceful quit the loop should take at the end of this frame.
     quit_requested: bool,
+    /// Signature of the component registry at the last check; a reload that
+    /// changes it invalidates stale history entries.
+    registry_epoch: u64,
     /// Frame pacing for the displayed FPS.
     last_frame: Instant,
     frames_per_second: f32,
@@ -426,6 +431,7 @@ impl EditorWindow {
             test_started: Some(Instant::now()),
             test_seconds: test_channel::seconds_from_environment(),
             quit_requested: false,
+            registry_epoch: 0,
             last_frame: Instant::now(),
             frames_per_second: 0.0,
             frame_count: 0,
@@ -549,6 +555,8 @@ impl EditorWindow {
                         self.requested_commands.push(id);
                     }
                     TestCommand::Chord { text } => self.inject_chord(&text),
+                    TestCommand::Edit(edit) => self.apply_edit(edit),
+                    TestCommand::Dump(query) => self.dump_world(query),
                     TestCommand::Quit => {
                         info!(
                             target: telemetry_target::ENGINE,
@@ -574,6 +582,252 @@ impl EditorWindow {
                     "[editor] test seconds elapsed: quit requested"
                 );
                 self.quit_requested = true;
+            }
+        }
+    }
+
+    /// Queue one scripted edit through the recorded command path.
+    ///
+    /// The suite's edits take exactly the route a panel's edit takes: an
+    /// `EditorCommand` batch queued for the frame boundary with recording on,
+    /// so undo and redo cover scripted edits like any other.
+    fn apply_edit(&mut self, edit: test_channel::EditCommand) {
+        let engine = self.host.host_mut().engine_mut();
+        let world = engine.world();
+        let label: String;
+        let mut coalesce = None;
+        let command = match &edit {
+            test_channel::EditCommand::Create { component, fields } => {
+                let Some(component) = resolve_component(world, component) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        component = component.as_str(),
+                        "[editor] test edit: component not resolvable"
+                    );
+                    return;
+                };
+                let mut seeds = Vec::new();
+                let mut resolved = Vec::new();
+                for (field, value) in fields {
+                    match parse_field_value(value) {
+                        Ok(value) => resolved.push((field.clone(), value)),
+                        Err(message) => {
+                            warn!(target: telemetry_target::ENGINE, message, "[editor] test edit: bad value");
+                            return;
+                        }
+                    }
+                }
+                seeds.push(pill_editor_core::editor_state::ComponentSeed {
+                    type_name: component.clone(),
+                    fields: resolved,
+                });
+                label = format!("create {}", short_component_name(&component));
+                EditorCommand::CreateEntity { components: seeds }
+            }
+            test_channel::EditCommand::Set {
+                entity,
+                component,
+                field,
+                value,
+                coalesce: key,
+            } => {
+                let (Some(entity), Some(component), Ok(value)) = (
+                    resolve_entity(world, entity),
+                    resolve_component(world, component),
+                    parse_field_value(value),
+                ) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] test edit: set target not resolvable"
+                    );
+                    return;
+                };
+                label = format!("set {}.{}", short_component_name(&component), field);
+                coalesce = key.clone();
+                EditorCommand::SetField {
+                    entity,
+                    component,
+                    field: field.clone(),
+                    value,
+                }
+            }
+            test_channel::EditCommand::Array {
+                entity,
+                component,
+                field,
+                index,
+                value,
+                coalesce: key,
+            } => {
+                let (Some(entity), Some(component), Ok(value)) = (
+                    resolve_entity(world, entity),
+                    resolve_component(world, component),
+                    parse_field_value(value),
+                ) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] test edit: array target not resolvable"
+                    );
+                    return;
+                };
+                label = format!(
+                    "set {}[{}].{}",
+                    short_component_name(&component),
+                    index,
+                    field
+                );
+                coalesce = key.clone();
+                EditorCommand::SetArrayElement {
+                    entity,
+                    component,
+                    field: field.clone(),
+                    index: *index,
+                    value,
+                }
+            }
+            test_channel::EditCommand::Add { entity, component } => {
+                let (Some(entity), Some(component)) = (
+                    resolve_entity(world, entity),
+                    resolve_component(world, component),
+                ) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] test edit: add target not resolvable"
+                    );
+                    return;
+                };
+                label = format!("add {}", short_component_name(&component));
+                EditorCommand::AddComponent { entity, component }
+            }
+            test_channel::EditCommand::Remove { entity, component } => {
+                let (Some(entity), Some(component)) = (
+                    resolve_entity(world, entity),
+                    resolve_component(world, component),
+                ) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] test edit: remove target not resolvable"
+                    );
+                    return;
+                };
+                label = format!("remove {}", short_component_name(&component));
+                EditorCommand::RemoveComponent { entity, component }
+            }
+            test_channel::EditCommand::Destroy { entity } => {
+                let Some(entity) = resolve_entity(world, entity) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] test edit: destroy target not resolvable"
+                    );
+                    return;
+                };
+                label = "destroy".to_string();
+                EditorCommand::DestroyEntity { entity }
+            }
+        };
+        let world = engine.world_mut();
+        if let Some(pending) =
+            world.get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
+        {
+            pending.push_recorded(vec![command], label, coalesce);
+        }
+    }
+
+    /// Answer one scripted world query on the log, for the suite to assert.
+    fn dump_world(&mut self, query: test_channel::DumpQuery) {
+        let engine = self.host.host_mut().engine_mut();
+        let world = engine.world();
+        match query {
+            test_channel::DumpQuery::Components => {
+                // Deduplicated by name: the registry remembers one entry per
+                // reload generation of a type.
+                let mut seen: Vec<String> = Vec::new();
+                for (name, id) in world.registered_components() {
+                    if seen.contains(&name) {
+                        continue;
+                    }
+                    seen.push(name.clone());
+                    let fields = world
+                        .component_field_layout(id)
+                        .map(|layout| {
+                            layout
+                                .iter()
+                                .map(|field| field.name.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        name = name.as_str(),
+                        fields = fields.as_str(),
+                        "[test] component"
+                    );
+                }
+            }
+            test_channel::DumpQuery::Entities => {
+                // Every live entity with its component names; the suite
+                // diffs these lists to learn a created handle.
+                let rows = world.entity_rows();
+                info!(
+                    target: telemetry_target::ENGINE,
+                    count = rows.len(),
+                    "[test] entities"
+                );
+                for row in rows.iter().take(256) {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        entity = %row.entity,
+                        components = row.components.join(",").as_str(),
+                        "[test] entity"
+                    );
+                }
+            }
+            test_channel::DumpQuery::Entity { entity } => match resolve_entity(world, &entity) {
+                Some(resolved) => info!(
+                    target: telemetry_target::ENGINE,
+                    entity = %resolved,
+                    "[test] entity alive"
+                ),
+                None => info!(
+                    target: telemetry_target::ENGINE,
+                    entity = entity.as_str(),
+                    "[test] entity gone"
+                ),
+            },
+            test_channel::DumpQuery::Field {
+                entity,
+                component,
+                field,
+            } => {
+                let resolved = resolve_entity(world, &entity)
+                    .zip(resolve_component(world, &component).map(|c| c));
+                match resolved {
+                    Some((resolved, component)) => {
+                        match world.read_component_field(resolved, &component, &field) {
+                            Ok(value) => info!(
+                                target: telemetry_target::ENGINE,
+                                entity = %resolved,
+                                field = field.as_str(),
+                                value = ?value,
+                                "[test] field"
+                            ),
+                            Err(error) => info!(
+                                target: telemetry_target::ENGINE,
+                                entity = %resolved,
+                                field = field.as_str(),
+                                error = %error,
+                                "[test] field unreadable"
+                            ),
+                        }
+                    }
+                    None => info!(
+                        target: telemetry_target::ENGINE,
+                        entity = entity.as_str(),
+                        field = field.as_str(),
+                        "[test] field unreadable"
+                    ),
+                }
             }
         }
     }
@@ -926,29 +1180,117 @@ impl EditorWindow {
         // queued. This is the frame boundary the `EditorCommand` contract
         // names; a failed command never aborts the rest of the batch.
         {
-            let commands = {
+            // Step 4b-1: a reload that changed the component registry or a
+            // layout invalidates history entries that name what is gone.
+            {
+                let engine = self.host.host_mut().engine_mut();
+                let epoch = component_registry_epoch(engine);
+                if epoch != self.registry_epoch {
+                    self.registry_epoch = epoch;
+                    let world = engine.world_mut();
+                    // Snapshot what exists now; the validity walk then needs
+                    // no engine borrow of its own.
+                    let mut layouts: Vec<(String, Vec<String>)> = Vec::new();
+                    for (name, id) in world.registered_components() {
+                        let fields = world
+                            .component_field_layout(id)
+                            .map(|layout| {
+                                layout.iter().map(|field| field.name.to_string()).collect()
+                            })
+                            .unwrap_or_default();
+                        layouts.push((name, fields));
+                    }
+                    if let Some(history) = world.get_resource_mut::<CommandHistory>() {
+                        let dropped =
+                            history.drop_stale(|identifier| match identifier.split_once('.') {
+                                Some((component, field)) => layouts.iter().any(|(name, fields)| {
+                                    name == component && fields.iter().any(|known| known == field)
+                                }),
+                                None => layouts.iter().any(|(name, _)| name == identifier),
+                            });
+                        if dropped > 0 {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                dropped,
+                                "[editor] history dropped stale entries"
+                            );
+                        }
+                    }
+                }
+            }
+            let batches = {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 world
                     .get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
-                    .map(|pending| std::mem::take(&mut pending.commands))
+                    .map(|pending| std::mem::take(&mut pending.batches))
                     .unwrap_or_default()
             };
-            if !commands.is_empty() {
+            let now_millis = self
+                .test_started
+                .map(|start| start.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            for batch in batches {
                 let engine = self.host.host_mut().engine_mut();
-                let failures =
-                    pill_editor_core::editor_state::EditorCommand::apply(engine, &commands);
+                let recorded = EditorCommand::apply_recorded(engine, &batch.commands);
                 info!(
                     target: telemetry_target::ENGINE,
-                    count = commands.len(),
+                    count = batch.commands.len(),
                     "[editor] engine commands applied"
                 );
-                for (index, message) in failures {
+                for (index, message) in recorded.failures {
                     warn!(
                         target: telemetry_target::ENGINE,
                         index,
                         message = %message,
                         "[editor] command failed"
                     );
+                }
+                // Step 4b-2: a restore assigned fresh handles; the history
+                // follows them before anything else is recorded, so a later
+                // undo cannot target the dead handle.
+                let world = self.host.host_mut().engine_mut().world_mut();
+                let Some(history) = world.get_resource_mut::<CommandHistory>() else {
+                    continue;
+                };
+                for (previous, assigned) in &recorded.remaps {
+                    history.remap_entity(*previous, *assigned);
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        previous = %previous,
+                        assigned = %assigned,
+                        "[editor] history remap"
+                    );
+                }
+                // Step 4b-3: an edit batch becomes one undo step, unless it
+                // failed or could not be inverted in full - a step that could
+                // not be undone would be worse than no step.
+                if batch.record && recorded.fully_invertible && !batch.commands.is_empty() {
+                    let entry = HistoryEntry::engine(
+                        batch.label.clone(),
+                        batch.commands.clone(),
+                        recorded.inverses.clone(),
+                    );
+                    let entry = match &batch.coalesce_key {
+                        Some(key) => entry.coalescing(key.clone(), now_millis),
+                        None => entry,
+                    };
+                    let outcome =
+                        history.push(entry, now_millis, CommandHistory::DEFAULT_COALESCE_WINDOW);
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        label = batch.label.as_str(),
+                        steps = outcome.steps,
+                        coalesced = outcome.coalesced,
+                        "[editor] history push"
+                    );
+                    if outcome.trimmed > 0 {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            dropped = outcome.trimmed,
+                            reason = ?outcome.trim_reason,
+                            "[editor] history trimmed"
+                        );
+                    }
                 }
             }
         }
@@ -1396,6 +1738,84 @@ fn quaternion_product(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
         lw * rz + lz * rw + lx * ry - ly * rx,
         lw * rw - lx * rx - ly * ry - lz * rz,
     ]
+}
+
+/// A cheap signature of the component registry's shape.
+///
+/// Both a removed type and a changed layout move it, which is exactly what
+/// makes a history entry stale; rebuilding the layout list every frame would
+/// cost more than the comparison.
+fn component_registry_epoch(engine: &pill_engine_core::Engine) -> u64 {
+    let world = engine.world();
+    let registered = world.registered_components();
+    let mut signature = registered.len() as u64;
+    for (_, id) in &registered {
+        let fields = world
+            .component_field_layout(*id)
+            .map(|layout| layout.len() as u64)
+            .unwrap_or(0);
+        signature = signature
+            .wrapping_mul(31)
+            .wrapping_add(fields.wrapping_add(7));
+    }
+    signature
+}
+
+/// The name after the last `::`, for logs and history labels.
+fn short_component_name(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+/// Parse a scripted field value: `true`/`false`, a float (one with a `.`),
+/// or a plain integer.
+fn parse_field_value(token: &str) -> Result<pill_engine_core::FieldValue, String> {
+    use pill_engine_core::FieldValue;
+    match token {
+        "true" => return Ok(FieldValue::Bool(true)),
+        "false" => return Ok(FieldValue::Bool(false)),
+        _ => {}
+    }
+    if token.contains('.') {
+        if let Ok(value) = token.parse::<f32>() {
+            return Ok(FieldValue::F32(value));
+        }
+    }
+    if let Ok(value) = token.parse::<i32>() {
+        return Ok(FieldValue::I32(value));
+    }
+    Err(format!("`{token}` is not a scriptable field value"))
+}
+
+/// Resolve a `NvG` display handle against the live entity table, so a script
+/// can never address an entity the world does not hold.
+fn resolve_entity(
+    world: &pill_engine_core::World,
+    display: &str,
+) -> Option<pill_engine_core::Entity> {
+    let (id, generation) = display.split_once('v')?;
+    let id: u64 = id.parse().ok()?;
+    let generation: u32 = generation.parse().ok()?;
+    world
+        .entity_rows()
+        .into_iter()
+        .find(|row| row.entity.id() == id && row.entity.generation() == generation)
+        .map(|row| row.entity)
+}
+
+/// Resolve a component type name that may be abbreviated to its `::Name`
+/// suffix; an ambiguous abbreviation resolves to nothing.
+fn resolve_component(world: &pill_engine_core::World, name: &str) -> Option<String> {
+    let suffix = format!("::{name}");
+    let mut matches = world
+        .registered_components()
+        .into_iter()
+        .filter(|(registered, _)| registered == name || registered.ends_with(&suffix))
+        .map(|(registered, _)| registered);
+    let first = matches.next()?;
+    if matches.any(|candidate| candidate != first) {
+        return None;
+    }
+    Some(first)
 }
 
 // =============================================================================

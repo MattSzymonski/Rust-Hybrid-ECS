@@ -22,5 +22,7 @@ pub mod commands;
 pub mod editor_state;
 /// Layout persistence failures.
 pub mod error;
+/// The undo and redo history of editor edits.
+pub mod history;
 /// Serializable dock model, validated mutations, and deterministic geometry.
 pub mod layout;
