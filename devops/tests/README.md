@@ -135,6 +135,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_module_project_auto_reload.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
 | `test_editor_crates.py` | `pill_spline.rs`, `pill_spline_editor.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies |
 | `test_editor_revision.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
+| `test_editor_native.py` | The shell module's source (`pill_editor_shell_editor.rs`, one cadence constant); writes `local/editor-validation/` | Its own text copy, in `finally` |
 | `test_shared_component_identity.py` | `pill_spline.rs`, `examples/project_rs/src/lib.rs`, `examples/project_rs/project_settings.yaml` | `BackupRegistry` for the sources (fresh timestamp), its own text copy for the settings |
 | `test_csharp_bridge.py` | `examples/project_cs/project_settings.yaml`, `src/Components.cs`, `src/Systems.cs`, `pill_spline.rs`, the generated C# mirror files (deleted once to check they regenerate); creates `src/BridgeProbe.cs` | `BACKUP`, original bytes and timestamp; the probe file is deleted |
 | `test_csharp_analyzer.py` | Creates `examples/project_cs/src/_AnalyzerProbe.cs` | Deleted at the end unless `--keep-probe` |
@@ -220,6 +221,7 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_hot_patch_coverage.py` | Live patching per crate. Makes one body-only edit in every loaded crate (discovered from the project settings) and reports the host's verdict: `PATCHED`, `FELL BACK` with the reason, or `NO FAST PATH`. Also checks the cached compiler flags for split arguments. `--strict` fails on crates with no fast path. |
 | `test_patch_bookkeeping.py` | A live patch, then a reload that fails to build: the failed reload must keep the patch records, so rolling the patch back still works. |
 | `test_editor_revision.py` | A module reload bumps the host's editor revision counter (`editor revision bumped`), which the editor uses to drop its caches. |
+| `test_editor_native.py` | The native editor end to end: startup, the shell module loading (`pill_editor_shell_editor loaded`) and painting panels, scripted clicks routed to the scene surface or the UI (`test click ... target=`), a live patch of the shell's system with its frame counter continuing (state kept), and the clean exit code on five further runs. Needs the built `pill_editor_native` binary; skips off Windows until the platform layer grows its X11 and Wayland implementations (Stage 24). |
 
 ### Build and smoke checks
 

@@ -92,6 +92,7 @@ from core.paths import MANIFEST_PATH, MEASUREMENTS_ROOT, PILL_LAB_ROOT  # noqa: 
 # step; the subcommands below just mount them, so a flag added to a benchmark
 # appears here with no change to this file.
 import cold_start as cold_start_benchmark  # noqa: E402
+import editor_shell as editor_shell_benchmark  # noqa: E402
 import engine as engine_benchmark  # noqa: E402
 import hot_reload as hot_reload_benchmark  # noqa: E402
 
@@ -99,6 +100,7 @@ BENCHMARKS = {
     "engine": engine_benchmark,
     "hot-reload": hot_reload_benchmark,
     "cold-start": cold_start_benchmark,
+    "editor-shell": editor_shell_benchmark,
 }
 
 # =============================================================================

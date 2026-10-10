@@ -101,7 +101,20 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// joined them with the UI library (plan decision D17): the editor shell
 /// module and editor crates import it, and a module-world copy differing
 /// from the host's needs the same co-located treatment as the engine's own.
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 3] = ["pill_core", "pill_engine_core", "pill_ui"];
+/// `pill_editor_api` joined with the editor shell (Stage 13): the executable
+/// and the reloadable shell module exchange resources of its types, and both
+/// sides must resolve it to the one copy the process loaded.
+/// `pill_editor_core` joined for the same reason: the shell imports it, and a
+/// host that does not itself map it (the renderer standalone running the
+/// editor crates) must find it staged beside the module - a mapped copy wins
+/// by basename and makes the staging a no-op where the executable links it.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 5] = [
+    "pill_core",
+    "pill_engine_core",
+    "pill_ui",
+    "pill_editor_core",
+    "pill_editor_api",
+];
 
 /// Whether a module build produced engine dylibs different from the ones the
 /// host has mapped, which means the module must load against its own copies.
@@ -628,9 +641,14 @@ impl NativeLibrary {
         // does not pay off: the loader resolves an already-mapped DLL by module
         // name, so a second `pill_core.dll` only wins where the host has not
         // mapped one - which on Windows is never.
+        // Staged beside the copy, in this generation's own directory: the
+        // altered search path starts at the directory of the library being
+        // loaded, so a copy anywhere else is never consulted - and a stem the
+        // host process has not mapped (the editor crates in a renderer host)
+        // has no other place to be found.
         let isolated_engine = engine_dylib_needs_isolation(workspace_root);
         if isolated_engine {
-            stage_module_engine_dylib(workspace_root, &temporary_directory);
+            stage_module_engine_dylib(workspace_root, &generation_directory);
         }
 
         // Step 3: Load the copy and validate its required exports.
@@ -657,7 +675,7 @@ impl NativeLibrary {
             // the next attempt stages a fresh copy either way.
             if isolated_engine {
                 for stem in ENGINE_DYLIB_STEMS {
-                    let _ = std::fs::remove_file(temporary_directory.join(format!("{stem}.dll")));
+                    let _ = std::fs::remove_file(generation_directory.join(format!("{stem}.dll")));
                 }
             }
         })

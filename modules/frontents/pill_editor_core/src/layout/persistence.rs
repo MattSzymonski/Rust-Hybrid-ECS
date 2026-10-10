@@ -131,9 +131,15 @@ fn save_to_path(model: &LayoutModel, path: PathBuf) -> Result<(), LayoutPersiste
 /// Where the editor keeps its layout: the platform's per-user state directory,
 /// so it survives temp-directory cleanup.
 fn layout_path() -> PathBuf {
-    editor_state_directory()
-        .join(APPLICATION_DIRECTORY)
-        .join(LAYOUT_FILE)
+    layout_directory().join(LAYOUT_FILE)
+}
+
+/// The directory the editor's layout files live in.
+///
+/// The classic editor's file and the native editor's own file sit side by
+/// side here; the native editor reads the classic one once for migration.
+pub fn layout_directory() -> PathBuf {
+    editor_state_directory().join(APPLICATION_DIRECTORY)
 }
 
 /// The per-user directory editor state belongs in.

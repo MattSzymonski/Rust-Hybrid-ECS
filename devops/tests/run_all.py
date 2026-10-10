@@ -79,6 +79,7 @@ SUITE_ORDER: Sequence[str] = (
     "test_hot_patch_coverage.py",
     "test_patch_bookkeeping.py",
     "test_editor_revision.py",
+    "test_editor_native.py",
     "test_multi_surface.py",
     "test_picking.py",
     "test_pill_ui.py",

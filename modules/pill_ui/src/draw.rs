@@ -388,6 +388,58 @@ impl DrawList {
         }
         None
     }
+
+    /// Shift every vertex and clip rectangle by `offset`.
+    ///
+    /// A list is painted at the origin; a caller that puts it into a
+    /// sub-region - an editor panel at its dock rectangle - translates it
+    /// after painting instead of painting in a translated space. Draw
+    /// commands carry no positions, so only the vertices and the push-clip
+    /// rectangles move.
+    pub fn translate(&mut self, offset: Vector2f) {
+        for vertex in &mut self.vertices {
+            vertex.position += offset;
+        }
+        for command in &mut self.commands {
+            if let DrawCommand::PushClip(rect) = command {
+                rect.min += offset;
+                rect.max += offset;
+            }
+        }
+    }
+
+    /// Append `other`'s work after this list's own, renumbering vertex
+    /// indices and draw ranges.
+    ///
+    /// `other` must have its clips balanced (every push matched by a pop),
+    /// which every painter produced by [`crate::paint::paint`] is; an
+    /// unbalanced list would leave this list's clip state wrong.
+    pub fn append(&mut self, other: DrawList) {
+        debug_assert!(
+            other.clip_depth == 0,
+            "append needs a list with balanced clips"
+        );
+        let vertex_base = self.vertices.len() as u32;
+        let index_base = self.indices.len() as u32;
+        self.vertices.extend(other.vertices);
+        self.indices
+            .extend(other.indices.into_iter().map(|index| index + vertex_base));
+        for command in other.commands {
+            self.commands.push(match command {
+                DrawCommand::Draw {
+                    texture,
+                    first_index,
+                    index_count,
+                } => DrawCommand::Draw {
+                    texture,
+                    first_index: first_index + index_base,
+                    index_count,
+                },
+                DrawCommand::PushClip(rect) => DrawCommand::PushClip(rect),
+                DrawCommand::PopClip => DrawCommand::PopClip,
+            });
+        }
+    }
 }
 
 // =============================================================================
@@ -499,5 +551,43 @@ mod tests {
         );
         let apart = Rect::from_min_size(Vector2f::new(50.0, 50.0), Vector2f::new(1.0, 1.0));
         assert_eq!(rect.intersection(&apart), None);
+    }
+
+    #[test]
+    fn translate_shifts_vertices_and_clip_rectangles() {
+        let mut list = DrawList::new();
+        let rect = quad_rect(0.0, 0.0, 10.0);
+        list.push_clip(rect);
+        list.push_fill(rect, Color::WHITE);
+        list.pop_clip();
+        list.translate(Vector2f::new(100.0, 50.0));
+        for vertex in &list.vertices {
+            assert!(vertex.position.x >= 100.0);
+            assert!(vertex.position.y >= 50.0);
+        }
+        let Some(DrawCommand::PushClip(clip)) = list.commands.first() else {
+            panic!("the push-clip survives the shift");
+        };
+        assert_eq!(clip.min, Vector2f::new(100.0, 50.0));
+        assert_eq!(clip.max, Vector2f::new(110.0, 60.0));
+    }
+
+    #[test]
+    fn append_renumbers_indices_and_draw_ranges() {
+        let mut first = DrawList::new();
+        first.push_fill(quad_rect(0.0, 0.0, 10.0), Color::WHITE);
+        let mut second = DrawList::new();
+        second.push_fill(quad_rect(20.0, 0.0, 10.0), Color::BLACK);
+        let second_vertices = second.vertices.len() as u32;
+        first.append(second);
+        // Both quads' indices now address the merged vertex array.
+        assert_eq!(first.vertices.len(), 8);
+        assert_eq!(first.indices.len(), 12);
+        for index in &first.indices {
+            assert!(*index < first.vertices.len() as u32);
+        }
+        // The second quad's draw range starts after the first quad's.
+        assert_eq!(first.draw_range(1), Some(6..(6 + 6)));
+        assert_eq!(second_vertices, 4);
     }
 }

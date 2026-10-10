@@ -43,7 +43,7 @@ SCHEMA_VERSION = 2
 # Pill Lab's own version, recorded in every measurement for traceability.
 PILL_LAB_VERSION = "1.0.0"
 
-CATEGORIES = ("engine", "hot_reload", "cold_start")
+CATEGORIES = ("engine", "hot_reload", "cold_start", "editor_shell")
 
 # Human-facing labels, kept next to the identifiers so the CLI and the
 # frontend agree on the wording.
@@ -51,4 +51,5 @@ CATEGORY_LABELS = {
     "engine": "Engine Performance",
     "hot_reload": "Hot Reloading",
     "cold_start": "Cold Start",
+    "editor_shell": "Editor Shell",
 }

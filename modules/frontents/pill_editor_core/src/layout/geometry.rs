@@ -97,6 +97,7 @@ pub struct LayoutSnapshot {
     pub splitters: Vec<Splitter>,
     pub drop_targets: Vec<DropTarget>,
     pub scene_rect: Option<Rect>,
+    pub game_rect: Option<Rect>,
 }
 
 impl LayoutSnapshot {
@@ -212,11 +213,10 @@ fn layout_node(
 
             if let Some(selected) = tabset.selected {
                 snapshot.selected_panel_rects.insert(selected, content);
-                if model
-                    .tab(selected)
-                    .is_some_and(|tab| tab.panel == PanelKind::Scene)
-                {
-                    snapshot.scene_rect = Some(content);
+                match model.tab(selected).map(|tab| &tab.panel) {
+                    Some(PanelKind::Scene) => snapshot.scene_rect = Some(content),
+                    Some(PanelKind::Game) => snapshot.game_rect = Some(content),
+                    _ => {}
                 }
             }
             add_drop_targets(snapshot, id, content, metrics);

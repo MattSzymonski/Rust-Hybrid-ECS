@@ -38,14 +38,21 @@ pill_engine_core = { path = "../pill_engine_core" }
 # FontSystem setup, which `pill_ui` replaces with its own font database (the
 # bundled font first, system fonts after). `swash` is the shaping and
 # rasterization backend (no `rustybuzz`, no C shaping stack).
-cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+cosmic-text = { version = "0.19", default-features = false, features = [
+    "std",
+    "swash",
+] }
 # Font discovery and loading, version-matched to the crate `cosmic-text`
 # 0.19 resolves (its `fontdb` edge is 0.23, `default-features = false`), so
 # one copy serves both. `fs` reads font files through `std`; `fontconfig`
 # parses the platform's fontconfig configuration on Linux (pure Rust); the
 # `memmap` feature arrives through `cosmic-text`'s `std` and has a web-target
 # stub, so it costs the web build nothing.
-fontdb = { version = "0.23", default-features = false, features = ["std", "fs", "fontconfig"] }
+fontdb = { version = "0.23", default-features = false, features = [
+    "std",
+    "fs",
+    "fontconfig",
+] }
 # SVG icon rasterization on the CPU (plan decision D6). Defaults off: icons
 # are plain vector SVGs, so the text, raster-image, gzip and font features are
 # dead weight (and the text feature would pull a second shaping stack).

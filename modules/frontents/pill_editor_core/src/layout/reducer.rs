@@ -549,7 +549,11 @@ mod tests {
             PanelKind::Systems,
             PanelKind::Console,
             PanelKind::Statistics,
+            PanelKind::Gallery,
             PanelKind::Assets,
+            // The Game view shares the Scene view's tab set, so it has to
+            // go first for the Scene detach below to be the last one.
+            PanelKind::Game,
         ] {
             let tab = tab_for(&model, panel);
             model.apply(LayoutAction::DetachTab { tab }).unwrap();
@@ -576,16 +580,22 @@ mod tests {
             })
             .unwrap();
         let third_before = model.row(row).unwrap().children[2].weight;
+        // The pair's new weights keep its old sum: only then is the third
+        // child's weight untouched (a sum that changes rescales the row).
+        let pair_sum =
+            model.row(row).unwrap().children[0].weight + model.row(row).unwrap().children[1].weight;
         model
             .apply(LayoutAction::ResizeSplit {
                 row,
                 splitter_index: 0,
-                first_weight: 30.0,
-                second_weight: 45.0,
+                first_weight: pair_sum * 0.4,
+                second_weight: pair_sum * 0.6,
             })
             .unwrap();
         let resized = model.row(row).unwrap();
-        assert_eq!(resized.children[2].weight, third_before);
+        // The third child stays where it was, within the rounding a rescale
+        // by one introduces.
+        assert!((resized.children[2].weight - third_before).abs() < 0.001);
         assert!(resized.children[0].weight < resized.children[1].weight);
     }
 
