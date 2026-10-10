@@ -20,9 +20,18 @@
 //! (the shell cannot call into a module's code across the reload boundary).
 
 // External crates
-use pill_editor_core::commands::{CommandInbox, CommandRegistry, CommandSpec, KeymapPreset};
+use pill_core::math::Vector3f;
+use pill_editor_api::panels::{register_editor_panel, PanelContext};
+use pill_editor_core::commands::{
+    CommandInbox, CommandRegistry, CommandSpec, KeymapPreset, PendingEditorCommands,
+};
+use pill_editor_core::editor_state::{EditorCommand, EntityListEntry};
 use pill_engine::pill_module;
-use pill_engine::{Engine, ResMut, Resource};
+use pill_engine::{
+    pill_hot_fn, DebugDraw, DebugStyle, Engine, Entity, FieldValue, Query, ResMut, Resource,
+};
+use pill_spline::{Spline, MAX_CONTROL_POINTS};
+use pill_ui::panel::PanelBuilder;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -103,21 +112,89 @@ pub fn register(engine: &mut Engine) -> u32 {
                     .bind(KeymapPreset::Unity, "ctrl+j")
                     .bind(KeymapPreset::Godot, "ctrl+j")
                     .bind(KeymapPreset::Unreal, "ctrl+j"),
+                CommandSpec::new("spline_editor.reseed", "Re-seed Splines")
+                    .menu(&["Spline", "Re-seed Splines"]),
+                CommandSpec::new("spline_editor.add_point", "Add Control Point")
+                    .menu(&["Spline", "Add Control Point"]),
             ],
         );
     }
+    // The Spline Tool panel (Stage 16): registered through the panel API, so
+    // it appears in the Window menu and docks like a built-in; its
+    // registration dies with this crate's generation (the registry's
+    // liveness rule), and the reload below re-registers it.
+    register_editor_panel(
+        engine,
+        "pill_spline_editor",
+        "spline_tool",
+        "Spline Tool",
+        spline_tool_panel,
+    );
     engine.register_system("pill_spline_editor_commands", spline_editor_commands);
     0
 }
 
-/// Runs the editor commands this crate owns, drained from the inbox.
+/// The Spline Tool: the world's splines, with the extension's actions.
 ///
-/// The shell dispatches every executed command id into
-/// [`CommandInbox`]; this system claims its own ids, bumps the marker's
-/// counter - the count is what the tests read across a reload - and logs
-/// each run.
-fn spline_editor_commands(mut inbox: ResMut<CommandInbox>, mut marker: ResMut<SplineEditorMarker>) {
-    let (Some(mut inbox), Some(mut marker)) = (inbox.get_mut(), marker.get_mut()) else {
+/// Panels never mutate the world directly: the buttons queue the crate's
+/// command ids, drained by [`spline_editor_commands`] in its own system.
+/// Marked `#[pill_hot_fn]` so a body-only edit to the panel live-patches
+/// (D19).
+#[pill_hot_fn]
+pub fn spline_tool_panel(builder: &mut PanelBuilder<'_>, context: &mut PanelContext<'_>) {
+    builder.heading("Spline Tool");
+    builder.separator();
+    let splines: Vec<&EntityListEntry> = context
+        .snapshot
+        .entities
+        .iter()
+        .filter(|entry| {
+            entry
+                .archetype_label
+                .split(", ")
+                .any(|name| name.ends_with("::Spline"))
+        })
+        .collect();
+    builder.label(&format!("{} splines in the world", splines.len()));
+    for entry in splines.iter().take(8) {
+        builder.row(|row| {
+            row.label(&entry.display);
+        });
+    }
+    builder.separator();
+    let reseed = builder.button("Re-seed Splines");
+    let add_point = builder.button("Add Control Point");
+    if reseed {
+        context.work.command("spline_editor.reseed");
+    }
+    if add_point {
+        context.work.command("spline_editor.add_point");
+    }
+    builder.label("Control points draw in the scene's debug overlay.");
+}
+
+/// Runs the editor commands this crate owns, drained from the inbox, and
+/// keeps the splines' control points in the debug overlay.
+///
+/// The shell dispatches every executed command id into [`CommandInbox`];
+/// this system claims its own ids. `add_point` queues a recorded
+/// `SetField` on the first spline's `control_point_count` (undoable through
+/// the shared history); `re-seed` rewrites the control points directly,
+/// which - like any direct world mutation - is not undoable (the rule
+/// Stage 15 states for module tools).
+fn spline_editor_commands(
+    mut inbox: ResMut<CommandInbox>,
+    mut marker: ResMut<SplineEditorMarker>,
+    mut splines: Query<(Entity, &mut Spline)>,
+    mut debug: ResMut<DebugDraw>,
+    mut pending: ResMut<PendingEditorCommands>,
+) {
+    let (Some(mut inbox), Some(mut marker), Some(mut debug), Some(mut pending)) = (
+        inbox.get_mut(),
+        marker.get_mut(),
+        debug.get_mut(),
+        pending.get_mut(),
+    ) else {
         return;
     };
     let owned: Vec<String> = inbox
@@ -126,12 +203,53 @@ fn spline_editor_commands(mut inbox: ResMut<CommandInbox>, mut marker: ResMut<Sp
         .filter(|id| id.starts_with("spline_editor."))
         .cloned()
         .collect();
-    if owned.is_empty() {
-        return;
-    }
-    inbox.executed.retain(|id| !owned.contains(id));
     for id in owned {
+        inbox.executed.retain(|candidate| candidate != &id);
         marker.commands_ran += 1;
+        match id.as_str() {
+            "spline_editor.add_point" => {
+                // One recorded field write on the first spline; the runner
+                // applies it at the frame boundary and the history keeps it.
+                // The write is NOT done here: the recorded command is the
+                // only writer, so the inverse it computes sees the pre-edit
+                // value.
+                if let Some((entity, spline)) = splines.iter_mut().next() {
+                    let new_count = (spline.control_point_count + 1).min(MAX_CONTROL_POINTS as u32);
+                    pending.push_recorded(
+                        vec![EditorCommand::SetField {
+                            entity,
+                            component: std::any::type_name::<Spline>().to_string(),
+                            field: "control_point_count".to_string(),
+                            value: FieldValue::U32(new_count),
+                        }],
+                        "spline_editor.add_point",
+                        None,
+                    );
+                    // NOTE: asserted on by the editor's end-to-end suite.
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        entity = %entity,
+                        control_points = new_count,
+                        "[spline_editor] control point added"
+                    );
+                }
+            }
+            "spline_editor.reseed" => {
+                let mut reseeded = 0;
+                for (_, mut spline) in splines.iter_mut() {
+                    reseed_control_points(&mut spline);
+                    reseeded += 1;
+                }
+                // NOTE: asserted on by the editor's end-to-end suite.
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    splines = reseeded,
+                    control_points = MAX_CONTROL_POINTS,
+                    "[spline_editor] reseeded"
+                );
+            }
+            _ => {}
+        }
         // NOTE: asserted on by the editor's end-to-end suite.
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
@@ -140,4 +258,39 @@ fn spline_editor_commands(mut inbox: ResMut<CommandInbox>, mut marker: ResMut<Sp
             "[spline_editor] command ran"
         );
     }
+    // Every run, keep the control points visible in the debug overlay: a
+    // polyline through the used points plus a small cross per point. The
+    // OneFrame lifetime means the next collection drops them.
+    let style = DebugStyle::default();
+    for (_, spline) in splines.iter_mut() {
+        let used = (spline.control_point_count as usize).min(MAX_CONTROL_POINTS);
+        for index in 0..used {
+            let point = spline.control_points[index];
+            debug.line(
+                [point.x - 0.15, point.y, point.z],
+                [point.x + 0.15, point.y, point.z],
+                style,
+            );
+            debug.line(
+                [point.x, point.y - 0.15, point.z],
+                [point.x, point.y + 0.15, point.z],
+                style,
+            );
+            if index + 1 < used {
+                let next = spline.control_points[index + 1];
+                debug.line([point.x, point.y, point.z], [next.x, next.y, next.z], style);
+            }
+        }
+    }
+}
+
+/// Rewrites a spline's control points as a re-seed: a flat spiral over the
+/// origin, deterministic so tests can read it back.
+fn reseed_control_points(spline: &mut Spline) {
+    for (index, point) in spline.control_points.iter_mut().enumerate() {
+        let angle = index as f32 * std::f32::consts::TAU / MAX_CONTROL_POINTS as f32;
+        let radius = 2.0 + index as f32 * 0.25;
+        *point = Vector3f::new(angle.cos() * radius, 0.0, angle.sin() * radius);
+    }
+    spline.control_point_count = MAX_CONTROL_POINTS as u32;
 }

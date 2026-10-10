@@ -29,6 +29,9 @@ use pill_engine_core::{InputEvent, Resource};
 use pill_ui::panel::ClipboardRequest;
 use pill_ui::{AtlasUpdate, DrawList};
 
+/// Panel registration: the registry, the context and the liveness rule.
+pub mod panels;
+
 // =============================================================================
 // EditorRect
 // =============================================================================
@@ -86,6 +89,10 @@ pub struct EditorShellInput {
     /// nothing was asked. The test channel drives focus between the Scene
     /// and Game views through this; nothing else in the editor writes it.
     pub requested_tab: Option<String>,
+    /// A module panel the executable asks the shell to focus or open (the
+    /// scripted test channel; the same path a restored layout takes for a
+    /// panel whose module is not loaded).
+    pub requested_panel: Option<String>,
     /// Command ids the executable asks the shell to execute (the scripted
     /// test channel); drained through the same dispatch a shortcut uses.
     pub requested_commands: Vec<String>,

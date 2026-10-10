@@ -59,6 +59,13 @@ pub enum TestCommand {
         /// The tab title to select.
         title: String,
     },
+    /// Focus (or open) a module panel by id, through the shell's panel
+    /// path - the same path a restored layout takes for a panel whose
+    /// module is not loaded.
+    Panel {
+        /// The panel id.
+        id: String,
+    },
     /// Execute a registered command by id, through the shell's own dispatch.
     Command {
         /// The command id, as registered (`editor.pause_toggle`).
@@ -237,6 +244,12 @@ fn parse_command(line: &str) -> TestCommand {
             Some(title) => TestCommand::Tab {
                 title: title.to_string(),
             },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("panel") => match parts.next() {
+            Some(id) => TestCommand::Panel { id: id.to_string() },
             None => TestCommand::Unknown {
                 line: line.to_string(),
             },

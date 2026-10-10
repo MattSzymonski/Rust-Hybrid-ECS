@@ -23,3 +23,6 @@ pill_engine_core = { path = "../../pill_engine_core" }
 # The UI vocabulary the boundary carries: draw lists, atlas updates and
 # clipboard requests (plan decision D28: clipboard is plain data).
 pill_ui = { path = "../../pill_ui" }
+# The editor's own shared types: the panel work carries pending command
+# batches, and panels draw from the editor snapshot.
+pill_editor_core = { path = "../../frontents/pill_editor_core" }
