@@ -271,6 +271,28 @@ pub enum EditorCommand {
         /// Registered component type name.
         component: String,
     },
+    /// Re-create a destroyed entity from captured component images.
+    ///
+    /// The world assigns a fresh handle; the recording layer reports the
+    /// `(previous, assigned)` pair so the history remaps older entries to it.
+    /// Components without a field layout cannot be rebuilt and are absent
+    /// from `components`: an entity carrying one restores without it.
+    RestoreEntity {
+        /// The handle the entity had before it was destroyed.
+        previous: Entity,
+        /// Component images to recreate, values included.
+        components: Vec<ComponentSeed>,
+    },
+    /// Re-attach one component with captured field values, the inverse of
+    /// removing it.
+    RestoreComponent {
+        /// The target entity.
+        entity: Entity,
+        /// Registered component type name.
+        component: String,
+        /// Field values to write over the zero-initialised image.
+        fields: Vec<(String, FieldValue)>,
+    },
     /// Write one field of a component.
     SetField {
         /// The target entity.
@@ -311,7 +333,132 @@ pub enum EditorCommand {
     StepOnce,
 }
 
+/// What one applied command hands back to the recording layer.
+struct CommandOutcome {
+    /// The command that reverses this one, when one exists.
+    inverse: Option<EditorCommand>,
+    /// A `(previous, assigned)` handle pair when the command re-created an
+    /// entity; the history remaps older entries to the new handle.
+    remap: Option<(Entity, Entity)>,
+}
+
+impl CommandOutcome {
+    /// A successful command that produced an inverse.
+    fn inverse(inverse: EditorCommand) -> Self {
+        Self {
+            inverse: Some(inverse),
+            remap: None,
+        }
+    }
+
+    /// A successful command without an inverse (engine controls, restores).
+    fn plain() -> Self {
+        Self {
+            inverse: None,
+            remap: None,
+        }
+    }
+}
+
+/// The result of [`EditorCommand::apply_recorded`].
+#[derive(Debug, Default)]
+pub struct RecordedApply {
+    /// One `(index, message)` per failed command.
+    pub failures: Vec<(usize, String)>,
+    /// Inverses of the successful edits, in undo order (reverse application
+    /// order).
+    pub inverses: Vec<EditorCommand>,
+    /// True when every command succeeded and produced an inverse; only then
+    /// may the batch be recorded as one undo step.
+    pub fully_invertible: bool,
+    /// `(previous, assigned)` handle pairs from entity restores.
+    pub remaps: Vec<(Entity, Entity)>,
+}
+
 impl EditorCommand {
+    /// Whether this command is an undoable edit.
+    ///
+    /// Engine controls (pause, step, system toggles) and the restore commands
+    /// themselves are not edits: they never enter the history.
+    pub fn recordable(&self) -> bool {
+        matches!(
+            self,
+            EditorCommand::CreateEntity { .. }
+                | EditorCommand::DestroyEntity { .. }
+                | EditorCommand::AddComponent { .. }
+                | EditorCommand::RemoveComponent { .. }
+                | EditorCommand::SetField { .. }
+                | EditorCommand::SetArrayElement { .. }
+        )
+    }
+
+    /// Component and field identifiers this command addresses.
+    ///
+    /// Field identifiers are `"component.field"`. The history keeps them per
+    /// entry so a reload can drop entries whose types or fields are gone.
+    pub fn touched_identifiers(&self) -> Vec<String> {
+        let mut identifiers = Vec::new();
+        match self {
+            EditorCommand::SetField {
+                component, field, ..
+            }
+            | EditorCommand::SetArrayElement {
+                component, field, ..
+            } => {
+                identifiers.push(component.clone());
+                identifiers.push(format!("{component}.{field}"));
+            }
+            EditorCommand::AddComponent { component, .. }
+            | EditorCommand::RemoveComponent { component, .. }
+            | EditorCommand::RestoreComponent { component, .. } => {
+                identifiers.push(component.clone());
+            }
+            EditorCommand::CreateEntity { components }
+            | EditorCommand::RestoreEntity { components, .. } => {
+                for seed in components {
+                    identifiers.push(seed.type_name.clone());
+                    for (field, _) in &seed.fields {
+                        identifiers.push(format!("{}.{}", seed.type_name, field));
+                    }
+                }
+            }
+            EditorCommand::DestroyEntity { .. }
+            | EditorCommand::SetSystemEnabled { .. }
+            | EditorCommand::SetPaused { .. }
+            | EditorCommand::StepOnce => {}
+        }
+        identifiers
+    }
+
+    /// Replace one entity handle with another wherever this command names it.
+    ///
+    /// Used after an undo re-created a destroyed entity under a fresh handle:
+    /// every remaining history entry must follow the entity to its new
+    /// identity, or a later undo would target the dead handle.
+    pub fn remap_entity(&mut self, previous: Entity, assigned: Entity) {
+        match self {
+            EditorCommand::DestroyEntity { entity }
+            | EditorCommand::AddComponent { entity, .. }
+            | EditorCommand::RemoveComponent { entity, .. }
+            | EditorCommand::RestoreComponent { entity, .. }
+            | EditorCommand::SetField { entity, .. }
+            | EditorCommand::SetArrayElement { entity, .. } => {
+                if *entity == previous {
+                    *entity = assigned;
+                }
+            }
+            EditorCommand::RestoreEntity { previous: old, .. } => {
+                if *old == previous {
+                    *old = assigned;
+                }
+            }
+            EditorCommand::CreateEntity { .. }
+            | EditorCommand::SetSystemEnabled { .. }
+            | EditorCommand::SetPaused { .. }
+            | EditorCommand::StepOnce => {}
+        }
+    }
+
     /// Apply a batch at the frame boundary.
     ///
     /// Returns one `(index, message)` per failed command so the Console panel
@@ -319,27 +466,99 @@ impl EditorCommand {
     /// leaves partial state: every engine call this dispatches is
     /// all-or-nothing, and structural commands validate before they commit.
     pub fn apply(engine: &mut Engine, commands: &[EditorCommand]) -> Vec<(usize, String)> {
-        let mut failures = Vec::new();
+        Self::apply_recorded(engine, commands).failures
+    }
+
+    /// Apply a batch and compute the inverse of every edit it performed.
+    ///
+    /// This is the single application path: the plain [`Self::apply`] only
+    /// discards the recording. A command is only recorded when it succeeded
+    /// and produced an inverse, so an undo can never half-restore a batch;
+    /// [`RecordedApply::fully_invertible`] reports whether that held.
+    pub fn apply_recorded(engine: &mut Engine, commands: &[EditorCommand]) -> RecordedApply {
+        let mut outcome = RecordedApply {
+            fully_invertible: true,
+            ..RecordedApply::default()
+        };
         for (index, command) in commands.iter().enumerate() {
-            if let Err(message) = Self::apply_one(engine, command) {
-                failures.push((index, message));
+            if !command.recordable() {
+                outcome.fully_invertible = false;
+            }
+            match Self::apply_one(engine, command) {
+                Ok(applied) => {
+                    if let Some(inverse) = applied.inverse {
+                        outcome.inverses.push(inverse);
+                    } else {
+                        outcome.fully_invertible = false;
+                    }
+                    if let Some(pair) = applied.remap {
+                        outcome.remaps.push(pair);
+                    }
+                }
+                Err(message) => {
+                    outcome.failures.push((index, message));
+                    outcome.fully_invertible = false;
+                }
             }
         }
-        failures
+        // Undo walks the batch backwards, so hand the inverses back reversed.
+        outcome.inverses.reverse();
+        outcome
+    }
+
+    /// Capture a live entity's component images for a later restore.
+    ///
+    /// Only components with a field layout can be rebuilt; a layout-less
+    /// component is skipped, so restoring an entity that carried one brings
+    /// back everything the editor can read and describe.
+    fn capture_seeds(engine: &Engine, entity: Entity) -> Result<Vec<ComponentSeed>, String> {
+        let detail = EditorSnapshot::capture_detail(engine, entity)
+            .ok_or_else(|| format!("entity {entity} is not alive"))?;
+        let mut seeds = Vec::new();
+        for view in detail.components {
+            if !view.editable {
+                continue;
+            }
+            let fields = view
+                .fields
+                .iter()
+                .map(|descriptor| descriptor.name.to_string())
+                .zip(view.values.iter().cloned())
+                .collect();
+            seeds.push(ComponentSeed {
+                type_name: view.type_name,
+                fields,
+            });
+        }
+        Ok(seeds)
     }
 
     /// Apply one command; the message is empty on success.
-    fn apply_one(engine: &mut Engine, command: &EditorCommand) -> Result<(), String> {
+    fn apply_one(engine: &mut Engine, command: &EditorCommand) -> Result<CommandOutcome, String> {
         match command {
             EditorCommand::SetField {
                 entity,
                 component,
                 field,
                 value,
-            } => engine
-                .world_mut()
-                .write_component_field(*entity, component, field, value.clone())
-                .map_err(|error| format!("{command:?}: {error}")),
+            } => {
+                // Read the old value first: it is what the inverse restores,
+                // and a field that cannot be read cannot be written either.
+                let previous = engine
+                    .world()
+                    .read_component_field(*entity, component, field)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                engine
+                    .world_mut()
+                    .write_component_field(*entity, component, field, value.clone())
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::SetField {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    value: previous,
+                }))
+            }
 
             EditorCommand::SetArrayElement {
                 entity,
@@ -347,14 +566,36 @@ impl EditorCommand {
                 field,
                 index,
                 value,
-            } => engine
-                .world_mut()
-                .write_component_array_element(*entity, component, field, *index, value.clone())
-                .map_err(|error| format!("{command:?}: {error}")),
+            } => {
+                // The whole array reads back as one value; the old element is
+                // the inverse's new value.
+                let current = engine
+                    .world()
+                    .read_component_field(*entity, component, field)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let FieldValue::Array(elements) = current else {
+                    return Err(format!("{command:?}: `{field}` is not an array field"));
+                };
+                let previous = elements
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| format!("{command:?}: element {index} is outside the array"))?;
+                engine
+                    .world_mut()
+                    .write_component_array_element(*entity, component, field, *index, value.clone())
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::SetArrayElement {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    index: *index,
+                    value: previous,
+                }))
+            }
 
             EditorCommand::SetSystemEnabled { index, enabled } => {
                 if engine.set_system_enabled_at(*index, *enabled) {
-                    Ok(())
+                    Ok(CommandOutcome::plain())
                 } else {
                     Err(format!(
                         "{command:?}: no system at registration index {index}"
@@ -364,17 +605,22 @@ impl EditorCommand {
 
             EditorCommand::SetPaused { paused } => {
                 engine.set_systems_paused(*paused);
-                Ok(())
+                Ok(CommandOutcome::plain())
             }
 
             EditorCommand::StepOnce => {
                 engine.request_single_step();
-                Ok(())
+                Ok(CommandOutcome::plain())
             }
 
             EditorCommand::DestroyEntity { entity } => {
+                // Capture the images before the destroy: they are the inverse.
+                let seeds = Self::capture_seeds(engine, *entity)?;
                 if engine.world_mut().destroy_entity(*entity) {
-                    Ok(())
+                    Ok(CommandOutcome::inverse(EditorCommand::RestoreEntity {
+                        previous: *entity,
+                        components: seeds,
+                    }))
                 } else {
                     Err(format!("{command:?}: entity was already gone"))
                 }
@@ -412,14 +658,29 @@ impl EditorCommand {
                 }
 
                 // Step 2: Reserve the handle and queue the creation inside the
-                // same closure that holds the world.
+                // same closure that holds the world; the closure records the
+                // assigned handle so the inverse can name it.
+                let slot: std::sync::Arc<std::sync::Mutex<Option<Entity>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let writer = std::sync::Arc::clone(&slot);
                 engine.queue_deferred_commands(move |world, queue| {
                     let entity = world.reserve_entity();
+                    if let Ok(mut cell) = writer.lock() {
+                        *cell = Some(entity);
+                    }
                     queue.create_mixed_entity(entity, native, descriptor_components);
                 });
                 engine
                     .flush_deferred_commands()
-                    .map_err(|errors| format!("{command:?}: {errors:?}"))
+                    .map_err(|errors| format!("{command:?}: {errors:?}"))?;
+                let assigned = slot
+                    .lock()
+                    .ok()
+                    .and_then(|cell| *cell)
+                    .ok_or_else(|| format!("{command:?}: the creation reserved no handle"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::DestroyEntity {
+                    entity: assigned,
+                }))
             }
 
             EditorCommand::AddComponent { entity, component } => {
@@ -461,7 +722,11 @@ impl EditorCommand {
                 });
                 engine
                     .flush_deferred_commands()
-                    .map_err(|errors| format!("{command:?}: {errors:?}"))
+                    .map_err(|errors| format!("{command:?}: {errors:?}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::RemoveComponent {
+                    entity: *entity,
+                    component: component.clone(),
+                }))
             }
 
             EditorCommand::RemoveComponent { entity, component } => {
@@ -469,12 +734,89 @@ impl EditorCommand {
                     .world()
                     .resolve_entity_component_id(*entity, component)
                     .ok_or_else(|| format!("{command:?}: `{component}` is not on the entity"))?;
+                // Capture the values first: the inverse re-attaches the
+                // component with them. A layout-less component cannot be
+                // rebuilt from images, so its removal is not invertible.
+                let names: Vec<String> = engine
+                    .world()
+                    .component_field_layout(component_id)
+                    .map(|layout| layout.iter().map(|d| d.name.to_string()).collect())
+                    .unwrap_or_default();
+                let removed = if names.is_empty() {
+                    None
+                } else {
+                    let values = engine
+                        .world()
+                        .read_component_fields(*entity, component)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
+                    Some(
+                        names
+                            .into_iter()
+                            .zip(values)
+                            .collect::<Vec<(String, FieldValue)>>(),
+                    )
+                };
                 engine.queue_deferred_commands(move |_world, queue| {
                     queue.remove_component_by_id(*entity, component_id);
                 });
                 engine
                     .flush_deferred_commands()
-                    .map_err(|errors| format!("{command:?}: {errors:?}"))
+                    .map_err(|errors| format!("{command:?}: {errors:?}"))?;
+                Ok(match removed {
+                    Some(fields) => CommandOutcome::inverse(EditorCommand::RestoreComponent {
+                        entity: *entity,
+                        component: component.clone(),
+                        fields,
+                    }),
+                    None => CommandOutcome::plain(),
+                })
+            }
+
+            EditorCommand::RestoreEntity {
+                previous,
+                components,
+            } => {
+                // Restores go through the creation path, which is what makes
+                // the assigned handle observable; the inverse this produced
+                // (a destroy of the fresh handle) is deliberately dropped: a
+                // restore is already part of the history, never an entry.
+                let create = EditorCommand::CreateEntity {
+                    components: components.clone(),
+                };
+                let created = Self::apply_one(engine, &create)?;
+                let Some(EditorCommand::DestroyEntity { entity: assigned }) = created.inverse
+                else {
+                    return Err(format!("{command:?}: the restore reserved no handle"));
+                };
+                Ok(CommandOutcome {
+                    inverse: None,
+                    remap: Some((*previous, assigned)),
+                })
+            }
+
+            EditorCommand::RestoreComponent {
+                entity,
+                component,
+                fields,
+            } => {
+                // Zero-initialised attach first, then the captured values, so
+                // the restore reuses exactly the validation of the commands
+                // the UI issues.
+                let add = EditorCommand::AddComponent {
+                    entity: *entity,
+                    component: component.clone(),
+                };
+                Self::apply_one(engine, &add)?;
+                for (field, value) in fields {
+                    let set = EditorCommand::SetField {
+                        entity: *entity,
+                        component: component.clone(),
+                        field: field.clone(),
+                        value: value.clone(),
+                    };
+                    Self::apply_one(engine, &set)?;
+                }
+                Ok(CommandOutcome::plain())
             }
         }
     }
@@ -860,5 +1202,270 @@ mod tests {
         let after = engine.system_snapshots();
         assert!(!after[0].enabled);
         assert!(after[1].enabled);
+    }
+
+    /// Apply a recorded batch, undo it, and check a field's value.
+    fn round_trip_field(engine: &mut Engine, entity: Entity, component: &str, value: FieldValue) {
+        let before = engine
+            .world()
+            .read_component_field(entity, component, "strength")
+            .expect("read before");
+        let command = EditorCommand::SetField {
+            entity,
+            component: component.to_string(),
+            field: "strength".to_string(),
+            value: value.clone(),
+        };
+        let recorded = EditorCommand::apply_recorded(engine, std::slice::from_ref(&command));
+        assert!(recorded.failures.is_empty());
+        assert!(recorded.fully_invertible);
+        assert_eq!(recorded.inverses.len(), 1);
+
+        // Undo restores the previous value; redo applies the edit again.
+        let undo = EditorCommand::apply_recorded(engine, &recorded.inverses);
+        assert!(undo.failures.is_empty());
+        let restored = engine
+            .world()
+            .read_component_field(entity, component, "strength")
+            .expect("read restored");
+        assert_eq!(restored, before);
+        let redo = EditorCommand::apply_recorded(engine, std::slice::from_ref(&command));
+        assert!(redo.failures.is_empty());
+        let reapplied = engine
+            .world()
+            .read_component_field(entity, component, "strength")
+            .expect("read reapplied");
+        assert_eq!(reapplied, value);
+    }
+
+    #[test]
+    fn recorded_apply_inverts_field_edits() {
+        let mut engine = demo_engine();
+        let entity = engine
+            .world_mut()
+            .create_entity()
+            .with(DemoComponent {
+                strength: 2.0,
+                enabled: true,
+            })
+            .build()
+            .expect("entity builds");
+        let component = demo_component_name();
+        round_trip_field(&mut engine, entity, &component, FieldValue::F32(7.5));
+    }
+
+    #[test]
+    fn recorded_apply_inverts_array_element_edits() {
+        let mut engine = demo_engine();
+        engine
+            .world_mut()
+            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+        let entity = engine
+            .world_mut()
+            .create_entity()
+            .with(ArrayComponent {
+                values: [10, 20, 30],
+            })
+            .build()
+            .expect("entity builds");
+        let component = array_component_name();
+
+        let edit = EditorCommand::SetArrayElement {
+            entity,
+            component: component.clone(),
+            field: "values".to_string(),
+            index: 1,
+            value: FieldValue::I16(99),
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&edit));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        assert!(recorded.fully_invertible);
+
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty());
+        let values = engine
+            .world()
+            .read_component_field(entity, &component, "values")
+            .expect("read array");
+        assert_eq!(
+            values,
+            FieldValue::Array(vec![
+                FieldValue::I16(10),
+                FieldValue::I16(20),
+                FieldValue::I16(30)
+            ])
+        );
+
+        // An element outside the array is never applied, so it is never
+        // recorded either.
+        let bad = EditorCommand::SetArrayElement {
+            entity,
+            component,
+            field: "values".to_string(),
+            index: 9,
+            value: FieldValue::I16(1),
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&bad));
+        assert_eq!(recorded.failures.len(), 1);
+        assert!(!recorded.fully_invertible);
+        assert!(recorded.inverses.is_empty());
+    }
+
+    #[test]
+    fn recorded_apply_inverts_create_and_destroy_with_restore() {
+        let mut engine = demo_engine();
+        let component = demo_component_name();
+
+        // Create: the inverse destroys the very handle the creation took.
+        let create = EditorCommand::CreateEntity {
+            components: vec![ComponentSeed {
+                type_name: component.clone(),
+                fields: vec![
+                    ("strength".to_string(), FieldValue::F32(4.5)),
+                    ("enabled".to_string(), FieldValue::Bool(true)),
+                ],
+            }],
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&create));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        let [EditorCommand::DestroyEntity { entity: created }] = recorded.inverses.as_slice()
+        else {
+            panic!(
+                "create must invert to a destroy, got {:?}",
+                recorded.inverses
+            );
+        };
+        let created = *created;
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty());
+        assert!(!engine.world().is_entity_valid(created));
+
+        // Destroy: the inverse restores the entity, with its values, under a
+        // fresh handle reported as a remap.
+        let entity = engine
+            .world_mut()
+            .create_entity()
+            .with(DemoComponent {
+                strength: 6.5,
+                enabled: false,
+            })
+            .build()
+            .expect("entity builds");
+        let destroy = EditorCommand::DestroyEntity { entity };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&destroy));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        let [EditorCommand::RestoreEntity { previous, .. }] = recorded.inverses.as_slice() else {
+            panic!(
+                "destroy must invert to a restore, got {:?}",
+                recorded.inverses
+            );
+        };
+        assert_eq!(*previous, entity);
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty(), "{:?}", undo.failures);
+        let [(old, restored)] = undo.remaps.as_slice() else {
+            panic!("restore must report the remap, got {:?}", undo.remaps);
+        };
+        assert_eq!(*old, entity);
+        let strength = engine
+            .world()
+            .read_component_field(*restored, &component, "strength")
+            .expect("restored value");
+        assert_eq!(strength, FieldValue::F32(6.5));
+
+        // The remap rewrites a command naming the dead handle.
+        let mut later = destroy.clone();
+        later.remap_entity(entity, *restored);
+        assert_eq!(later, EditorCommand::DestroyEntity { entity: *restored });
+    }
+
+    #[test]
+    fn recorded_apply_inverts_component_add_and_remove_with_values() {
+        let mut engine = demo_engine();
+        engine
+            .world_mut()
+            .register_component_with_layout::<ArrayComponent>(ARRAY_FIELDS);
+        let entity = engine
+            .world_mut()
+            .create_entity()
+            .with(DemoComponent {
+                strength: 3.0,
+                enabled: true,
+            })
+            .build()
+            .expect("entity builds");
+        let component = array_component_name();
+
+        // Add inverts to remove.
+        let add = EditorCommand::AddComponent {
+            entity,
+            component: component.clone(),
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&add));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        assert!(matches!(
+            recorded.inverses.as_slice(),
+            [EditorCommand::RemoveComponent { .. }]
+        ));
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty());
+
+        // Remove inverts to a restore that brings the values back.
+        let failures = EditorCommand::apply(
+            &mut engine,
+            &[EditorCommand::AddComponent {
+                entity,
+                component: component.clone(),
+            }],
+        );
+        assert!(failures.is_empty());
+        let failures = EditorCommand::apply(
+            &mut engine,
+            &[EditorCommand::SetArrayElement {
+                entity,
+                component: component.clone(),
+                field: "values".to_string(),
+                index: 2,
+                value: FieldValue::I16(42),
+            }],
+        );
+        assert!(failures.is_empty());
+
+        let remove = EditorCommand::RemoveComponent {
+            entity,
+            component: component.clone(),
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&remove));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty(), "{:?}", undo.failures);
+        let values = engine
+            .world()
+            .read_component_field(entity, &component, "values")
+            .expect("values restored");
+        assert_eq!(
+            values,
+            FieldValue::Array(vec![
+                FieldValue::I16(0),
+                FieldValue::I16(0),
+                FieldValue::I16(42)
+            ])
+        );
+    }
+
+    #[test]
+    fn recorded_apply_marks_engine_controls_unrecordable() {
+        let mut engine = demo_engine();
+        let recorded = EditorCommand::apply_recorded(
+            &mut engine,
+            &[
+                EditorCommand::SetPaused { paused: true },
+                EditorCommand::StepOnce,
+            ],
+        );
+        assert!(recorded.failures.is_empty());
+        // Controls never enter the history as steps.
+        assert!(!recorded.fully_invertible);
+        assert!(recorded.inverses.is_empty());
     }
 }
