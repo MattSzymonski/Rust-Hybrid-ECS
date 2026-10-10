@@ -445,9 +445,15 @@ pub trait IntoSystem<Input: SystemParam> {
     /// and the system's metadata all stay put, and the `World` is untouched.
     ///
     /// The slot is initialized here because this is the only place the concrete
-    /// `F` and `Input` are known.
+    /// `F` and `Input` are known; `name` is the identity a panicking patched
+    /// body is attributed to, so its host can roll that function back
+    /// (Stage 19).
     #[cfg(feature = "hot_patch")]
-    fn into_hot_system(self, slot: std::sync::Arc<crate::hot_patch::HotSlot>) -> Box<dyn System>;
+    fn into_hot_system(
+        self,
+        slot: std::sync::Arc<crate::hot_patch::HotSlot>,
+        name: String,
+    ) -> Box<dyn System>;
 }
 
 /// Implement IntoSystem for any function that implements SystemParamFunction
@@ -481,6 +487,7 @@ where
     fn into_hot_system(
         mut self,
         slot: std::sync::Arc<crate::hot_patch::HotSlot>,
+        name: String,
     ) -> Box<dyn System> {
         // The baseline implementation and the signature to gate replacements
         // against. This is the only place the concrete `F` and `Input` exist.
@@ -495,7 +502,9 @@ where
             //
             // SAFETY: as in `into_system` - `input` is dropped before this
             // closure returns, so the `'static` marker never outlives the
-            // borrows it stands for.
+            // borrows it stands for. A panicking callee unwinds through the
+            // call, which drops `input` on the way out, before the `Err` arm
+            // below is reached.
             let input = unsafe { Input::fetch(world, queue) };
 
             // One acquire load from a hot cache line, then an indirect call.
@@ -514,7 +523,24 @@ where
             let run: fn(&mut F, Input) -> F::Output =
                 unsafe { std::mem::transmute::<usize, fn(&mut F, Input) -> F::Output>(address) };
 
-            run(&mut self, input).into_system_result()
+            // A patched body can panic (Stage 19, D22): the panic is caught
+            // here, where the failing function is still nameable, and turned
+            // into the system failure the engine already knows how to record
+            // and survive. `panic_into_failure` also counts the streak that
+            // makes the host roll the patch back after three invocations.
+            //
+            // `AssertUnwindSafe`: the world and the function are lent to the
+            // call and nothing observably inconsistent survives it - the
+            // engine treats the invocation as failed and resumes at the next
+            // frame boundary, exactly as it does for a system that returned
+            // an error.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut self, input))) {
+                Ok(output) => {
+                    crate::hot_patch::record_success(&name);
+                    output.into_system_result()
+                }
+                Err(payload) => Err(crate::hot_patch::panic_into_failure(&name, payload)),
+            }
         })
     }
 }

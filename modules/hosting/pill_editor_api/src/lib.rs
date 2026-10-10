@@ -123,6 +123,11 @@ pub struct EditorShellInput {
     /// Whether the engine's systems are paused, published by the executable
     /// because only it holds the `Engine`; the pause command toggles from it.
     pub systems_paused: bool,
+    /// The problems the host's notices produced, and fresh toast events
+    /// (Stage 19). The executable rewrites `problems` and `revision` and
+    /// appends to `events`; the shell drains `events` and reacts to a
+    /// revision change.
+    pub notices: EditorNotices,
 }
 
 impl Resource for EditorShellInput {}
@@ -156,6 +161,79 @@ pub struct EditorClipboardAnswer {
 }
 
 impl Resource for EditorClipboardAnswer {}
+
+// =============================================================================
+// EditorNotices
+// =============================================================================
+
+/// How serious one notice or problem entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditorProblemLevel {
+    /// A build or a patch failed; the previous generation keeps running.
+    Error,
+    /// The compiler's warning.
+    Warning,
+    /// Anything else worth listing.
+    Note,
+}
+
+/// One row of the Problems panel (Stage 19).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorProblem {
+    /// The module whose build, load or patch reported it.
+    pub module: String,
+    /// How serious it is.
+    pub level: EditorProblemLevel,
+    /// The message, the compiler's own words for a build failure.
+    pub message: String,
+    /// The source file the report named, workspace-relative as written.
+    pub file: Option<String>,
+    /// 1-based line inside `file`.
+    pub line: Option<u32>,
+    /// 1-based column inside `line`.
+    pub column: Option<u32>,
+}
+
+/// One toast event (Stage 19): a short-lived line about something the host
+/// did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorNoticeEvent {
+    /// A per-session monotonic id; the shell's toast list keys on it.
+    pub seq: u64,
+    /// How serious it is, choosing the toast's color.
+    pub level: EditorProblemLevel,
+    /// The line to show.
+    pub text: String,
+}
+
+/// What the executable publishes for the shell: the problems the host's
+/// notices produced, and fresh toast events (Stage 19).
+///
+/// Carried inside [`EditorShellInput`] rather than as a resource of its own:
+/// the shell's system already takes the input, and the executable already
+/// rewrites it every frame.
+#[derive(Clone, Debug, Default)]
+pub struct EditorNotices {
+    /// Bumped whenever `problems` or `events` changed; the shell reacts to a
+    /// new value instead of diffing the lists.
+    pub revision: u64,
+    /// The current problems, unsorted: `module` names the owner.
+    pub problems: Vec<EditorProblem>,
+    /// Toast events not yet consumed by the shell.
+    pub events: Vec<EditorNoticeEvent>,
+    /// The id `events`' next entry takes.
+    pub next_event_seq: u64,
+}
+
+/// A file the shell asks the executable to open in the developer's editor
+/// (Stage 19): where a Problems row points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorOpenRequest {
+    /// Project- or workspace-relative path, as the compiler named it.
+    pub file: String,
+    /// 1-based line to land on; 0 opens the file at its start.
+    pub line: u32,
+}
 
 // =============================================================================
 // EditorShellFrame
@@ -192,6 +270,9 @@ pub struct EditorShellFrame {
     /// to the asset root; the executable turns a drag that leaves the window
     /// into an OS drag of that file (Stage 18).
     pub drag_candidate: Option<String>,
+    /// A file the shell asks the executable to open in the developer's
+    /// editor, from a Problems row (Stage 19).
+    pub requested_open: Option<EditorOpenRequest>,
     /// Where the scene surface goes, in logical pixels of the client area;
     /// `None` while no Scene tab is selected.
     pub scene_rect: Option<EditorRect>,
@@ -211,6 +292,7 @@ impl EditorShellFrame {
         self.requested_clipboard = None;
         self.assets_rect = None;
         self.drag_candidate = None;
+        self.requested_open = None;
         self.scene_rect = None;
         self.game_rect = None;
     }
@@ -246,6 +328,10 @@ mod tests {
         });
         frame.requested_clipboard = Some("PillEditor.Object".to_string());
         frame.drag_candidate = Some("a.png".to_string());
+        frame.requested_open = Some(EditorOpenRequest {
+            file: "modules/x.rs".to_string(),
+            line: 7,
+        });
         frame.clear();
         assert!(frame.panels.is_empty());
         assert!(frame.overlay.is_empty());
@@ -253,6 +339,7 @@ mod tests {
         assert!(frame.objects.is_empty());
         assert!(frame.requested_clipboard.is_none());
         assert!(frame.drag_candidate.is_none());
+        assert!(frame.requested_open.is_none());
         assert!(frame.scene_rect.is_none());
         assert!(frame.game_rect.is_none());
         assert!(frame.atlas.is_none());

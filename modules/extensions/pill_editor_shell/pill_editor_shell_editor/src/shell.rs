@@ -30,7 +30,10 @@ use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
 use pill_core::telemetry::capture::LogBuffer;
 use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
-use pill_editor_api::{ClipboardObject, EditorClipboardAnswer, EditorShellFrame, EditorShellInput};
+use pill_editor_api::{
+    ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorProblem, EditorProblemLevel,
+    EditorShellFrame, EditorShellInput,
+};
 use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
     menu_tree, CommandInbox, CommandRegistry, CommandSpec, EditorPreferences, KeybindingsFile,
@@ -198,7 +201,33 @@ pub struct EditorShellState {
     /// Persistent text buffers for panel widgets (search fields, inspector
     /// editors), keyed by widget id.
     pub panel_text: std::collections::BTreeMap<String, String>,
+    /// The toasts the executable's notices produced (Stage 19), newest
+    /// last; each expires by frame count.
+    pub toasts: std::collections::VecDeque<Toast>,
+    /// The problems revision last handled, so the shell logs a change once.
+    pub notices_revision_seen: u64,
 }
+
+/// One toast: a short-lived line about something the host did (Stage 19).
+#[derive(Clone, Debug)]
+pub struct Toast {
+    /// Error, warning or plain notice; picks the marker.
+    pub level: EditorProblemLevel,
+    /// The line to show.
+    pub text: String,
+    /// The frame index at which it disappears.
+    pub expires_at_frame: u64,
+}
+
+/// Frames a toast stays on screen (about four seconds at 60 fps).
+pub const TOAST_FRAMES: u64 = 240;
+
+/// How many toasts show at once; older ones drop off the stack.
+const TOASTS_MAX: usize = 5;
+
+/// The toast stack's width and row height, in logical pixels.
+const TOAST_WIDTH: f32 = 420.0;
+const TOAST_HEIGHT: f32 = 22.0;
 
 /// Classifies a tracing target into the console's channels: 1 for the
 /// engine, host and editor subsystems, 2 for everything else (the project
@@ -313,6 +342,8 @@ impl EditorShellState {
             last_focus: None,
             last_activated_rect: None,
             panel_text: std::collections::BTreeMap::new(),
+            toasts: std::collections::VecDeque::new(),
+            notices_revision_seen: 0,
         }
     }
 }
@@ -665,6 +696,9 @@ pub struct PanelView<'a> {
     pub selection: &'a EditorSelection,
     /// The live module-panel registry (the Window menu and module tabs).
     pub panels: &'a EditorPanelRegistry,
+    /// The host's problems, from the executable's notice feed (Stage 19);
+    /// the Problems panel draws them.
+    pub problems: &'a [EditorProblem],
 }
 
 /// Shell state the built-in panels read or commit through [`PanelWork`].
@@ -879,6 +913,9 @@ pub fn paint_panels(
         if work.drag_candidate.is_some() {
             collected.drag_candidate = work.drag_candidate;
         }
+        if work.open_file.is_some() {
+            collected.open_file = work.open_file;
+        }
     }
     ui.set_hit_rects(merged);
     // The frame closes here: every panel has seen this frame's release edge,
@@ -922,6 +959,7 @@ fn build_panel(
         PanelKind::Console => console_panel(builder, extras, work),
         PanelKind::Preferences => preferences_panel(builder, extras, work),
         PanelKind::Assets => assets_panel(builder, view, work),
+        PanelKind::Problems => problems_panel(builder, view, work),
         PanelKind::Statistics => {
             statistics_panel(builder, editor_frames_per_second, view, extras, work)
         }
@@ -1314,6 +1352,69 @@ fn preferences_panel(
         take("step_cap", "history_step_cap", &mut document);
         take("memory_mb", "history_memory_budget_mb", &mut document);
         work.preferences = Some(serde_json::Value::Object(document).to_string());
+    }
+}
+
+/// The Problems panel (Stage 19): the host's build and patch failures, a
+/// row per problem, and a click that opens the file at its line.
+///
+/// The list is the executable's; the panel only draws it and asks. A row
+/// without a file - a load failure, a failed patch - has nowhere to jump to
+/// and stays inert.
+fn problems_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
+    builder.heading("Problems");
+    let errors = view
+        .problems
+        .iter()
+        .filter(|problem| problem.level == EditorProblemLevel::Error)
+        .count();
+    builder.label(&format!(
+        "{} problems ({errors} errors)",
+        view.problems.len()
+    ));
+    builder.label("Click a row to open the file at its line.");
+    builder.separator();
+    if view.problems.is_empty() {
+        builder.label("No build or patch problems.");
+        return;
+    }
+    let mut open: Option<EditorOpenRequest> = None;
+    for (index, problem) in view.problems.iter().take(PANEL_ROWS * 2).enumerate() {
+        let location = match (&problem.file, problem.line) {
+            (Some(file), Some(line)) => format!("{file}:{line}"),
+            (Some(file), None) => file.clone(),
+            _ => String::new(),
+        };
+        let severity = match problem.level {
+            EditorProblemLevel::Error => "error",
+            EditorProblemLevel::Warning => "warn",
+            EditorProblemLevel::Note => "note",
+        };
+        let label = format!(
+            "{severity} [{}] {location} {}",
+            problem.module, problem.message
+        );
+        let target = problem.file.clone().map(|file| EditorOpenRequest {
+            file,
+            line: problem.line.unwrap_or(0),
+        });
+        // The row is addressed by a stable name (`problems.open.N`) because
+        // its visible text carries the compiler's own words; the scripted
+        // channel clicks a row by the name, never by the message.
+        builder.row(|row| {
+            if row.button_named(&format!("problems.open.{index}"), &label) {
+                open = target;
+            }
+        });
+    }
+    if view.problems.len() > PANEL_ROWS * 2 {
+        builder.label(&format!(
+            "... {} more",
+            view.problems.len() - PANEL_ROWS * 2
+        ));
+    }
+    if let Some(request) = open {
+        work.open_file(request);
     }
 }
 
@@ -2391,6 +2492,69 @@ pub fn paint_drop_preview(
         None,
         pill_ui::Color::WHITE,
     );
+}
+
+/// Paint the toast stack: the newest notices the executable published, one
+/// filled row each, the stack expiring by frame count (Stage 19).
+///
+/// Drawn into the panel layer's end (the topmost list entry), under the menu
+/// chrome. The view surfaces are real child windows and always cover their
+/// rectangle (D24's pending composition overlay), so the stack sits at the
+/// client area's top-left, over the dock's left column.
+pub fn paint_toasts(
+    state: &mut EditorShellState,
+    frame: &mut EditorShellFrame,
+    available: Vector2f,
+) {
+    let current_frame = state.frame_index;
+    state
+        .toasts
+        .retain(|toast| toast.expires_at_frame > current_frame);
+    while state.toasts.len() > TOASTS_MAX {
+        state.toasts.pop_front();
+    }
+    if state.toasts.is_empty() {
+        return;
+    }
+    let mut y = MENU_BAR_HEIGHT as f32 + 6.0;
+    let style = pill_ui::text::TextStyle::default();
+    // Newest at the top of the stack: the reason the user just saw a flash
+    // of activity is the one they are looking for.
+    let toasts: Vec<(EditorProblemLevel, String)> = state
+        .toasts
+        .iter()
+        .rev()
+        .map(|toast| (toast.level, toast.text.clone()))
+        .collect();
+    for (level, text) in toasts {
+        let width = TOAST_WIDTH.min(available.x - 16.0).max(120.0);
+        let rect = Rect::from_min_size(Vector2f::new(8.0, y), Vector2f::new(width, TOAST_HEIGHT));
+        frame.panels.push_fill(rect, state.theme.raised);
+        frame.panels.push_fill(
+            Rect::from_min_size(Vector2f::new(8.0, y), Vector2f::new(3.0, TOAST_HEIGHT)),
+            match level {
+                EditorProblemLevel::Error => pill_ui::Color::rgba(0.85, 0.25, 0.2, 1.0),
+                EditorProblemLevel::Warning => pill_ui::Color::rgba(0.9, 0.7, 0.2, 1.0),
+                EditorProblemLevel::Note => pill_ui::Color::rgba(0.35, 0.65, 0.9, 1.0),
+            },
+        );
+        let marker = match level {
+            EditorProblemLevel::Error => "error",
+            EditorProblemLevel::Warning => "warning",
+            EditorProblemLevel::Note => "info",
+        };
+        let message = format!("{marker}: {text}");
+        let _ = state.text.draw_text(
+            &mut frame.panels,
+            &mut state.atlas,
+            &message,
+            Vector2f::new(rect.min.x + 8.0, rect.min.y + 3.0),
+            &style,
+            None,
+            state.theme.text,
+        );
+        y += TOAST_HEIGHT + 4.0;
+    }
 }
 
 /// Routes one pointer event to the menu bar, an open dropdown or the palette.

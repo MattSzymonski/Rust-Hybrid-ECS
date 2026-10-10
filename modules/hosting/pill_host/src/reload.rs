@@ -56,6 +56,7 @@ use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 // Current crate
 use crate::analytics;
 use crate::native_library::NativeLibrary;
+use crate::notices::{self, HostNotice};
 
 /// Consecutive deferred evictions tolerated before the warning becomes an
 /// error.
@@ -463,6 +464,12 @@ pub(crate) fn build_load_and_commit(
                 error = %error,
                 "{}", kind.build_failed_message()
             );
+            // The editor shows the compiler's own words: whatever the build
+            // runner captured for this failure.
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: crate::build_runner::recent_build_output(),
+            });
             return None;
         }
     };
@@ -478,6 +485,12 @@ pub(crate) fn build_load_and_commit(
                 error = %error,
                 "{}", kind.load_failed_message()
             );
+            // No compiler text belongs here: the build this failure follows
+            // succeeded, so the ring holds its (successful) tail.
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: format!("{}: {error}", kind.load_failed_message()),
+            });
             return None;
         }
     };
@@ -489,6 +502,10 @@ pub(crate) fn build_load_and_commit(
                 error = %error,
                 "{}", kind.rejected_message()
             );
+            notices::push(HostNotice::ModuleFailed {
+                module: subject.to_string(),
+                output: format!("{}: {error}", kind.rejected_message()),
+            });
             return None;
         }
     }

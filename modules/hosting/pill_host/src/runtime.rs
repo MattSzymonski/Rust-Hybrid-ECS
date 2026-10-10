@@ -55,6 +55,7 @@ use crate::extension::{ExtensionSlot, ReloadOutcome};
 #[cfg(feature = "hot_patch")]
 use crate::hot_patch::{BeginOutcome, PatchOutcome};
 use crate::native_library::cleanup_temporary_files;
+use crate::notices::{self, HostNotice};
 use crate::project_module::{LoadedProject, ManagedReloadStart};
 use crate::watcher::spawn_source_watcher;
 use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
@@ -287,6 +288,14 @@ impl DevHost {
     /// The project's `res` directory, when the host knows it.
     pub fn asset_directory(&self) -> Option<&Path> {
         self.asset_directory.as_deref()
+    }
+
+    /// The workspace root every spawned build ran from.
+    ///
+    /// Compiler diagnostics name sources relative to it, so a frontend
+    /// handing a stripped path to another tool resolves it against this.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// The project's `res` tree with each file's asset type, load state and
@@ -2091,6 +2100,12 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
                     diagnostics.lines()
                 )
             );
+            // The managed compiler hands its diagnostics over directly, so
+            // the Problems panel needs no capture ring for this path.
+            notices::push(HostNotice::ModuleFailed {
+                module: host.module_config.name.clone(),
+                output: diagnostics,
+            });
             host.loaded_project.abandon_managed_reload_timing();
         }
         BuildOutcome::Full(Ok(())) => {
@@ -2110,11 +2125,21 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
                 error = message.as_str(),
                 "C# build failed; keeping the currently loaded C# project assembly"
             );
+            notices::push(HostNotice::ModuleFailed {
+                module: host.module_config.name.clone(),
+                output: message,
+            });
             host.loaded_project.abandon_managed_reload_timing();
         }
     }
     if replaced {
         forget_prologue_records(host);
+        // The editor's side of the swap, mirroring the extension reload's:
+        // a toast and a cleared problem list for the project.
+        notices::push(HostNotice::Reloaded {
+            module: host.module_config.name.clone(),
+            build_ms: 0,
+        });
     }
     // The project now runs the sources on disk, so the patch classifier's
     // baseline has to say so too, and the editor must refresh its metadata.
@@ -2178,8 +2203,10 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
 
     // Step 2: Honour a rollback request, at the same frame boundary the
     // patch installs use - the prologue route rewrites live code, so this is a
-    // requirement rather than a convenience.
+    // requirement rather than a convenience. A function whose patched body has
+    // been panicking rolls itself back at the same boundary (Stage 19, D22).
     process_rollback_request(host);
+    process_patch_faults(host);
 
     // Step 3: Try the per-function fast path for the extensions, before
     // the reload below turns a pending change into a full module rebuild.
@@ -2240,6 +2267,13 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                     generation,
                     "extension reload processed"
                 );
+                // The editor's side of the reload: a toast, and the module's
+                // problem list clears. The wall time only exists when this
+                // reload ran a build (a shader-only change is a load).
+                notices::push(HostNotice::Reloaded {
+                    module: slot.name().to_string(),
+                    build_ms: analytics::module_build_ms(slot.name()).unwrap_or(0),
+                });
                 // A module the project links directly is compiled into the project
                 // DLL as well as its own DLL, so after the module swaps, the
                 // project still runs the old embedded copy of that crate. Queue a
@@ -2269,6 +2303,9 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                     generation,
                     "extension reload failed; keeping the previous generation and its patch state"
                 );
+                // The refusal itself - its wording and the compiler output -
+                // was already pushed by the shared reload sequence; nothing
+                // more to report here.
             }
             ReloadOutcome::Unchanged => {}
         }
@@ -2829,14 +2866,8 @@ fn process_rollback_request(host: &mut DevHost) {
     // `previous` saves a developer looking up numbers to undo the last edit,
     // which is what a rollback is wanted for almost every time.
     let generation = if wanted.eq_ignore_ascii_case("previous") {
-        match host
-            .patch_generations()
-            .iter()
-            .filter(|generation| generation.function == function)
-            .map(|generation| generation.number)
-            .max()
-        {
-            Some(newest) => newest.saturating_sub(1),
+        match previous_patch_generation(host, function) {
+            Some(previous) => previous,
             None => {
                 warn!(
                     target: telemetry_target::HOT_RELOAD,
@@ -2870,6 +2901,11 @@ fn process_rollback_request(host: &mut DevHost) {
     } else {
         // A rollback changed which implementation is live; refresh the editor.
         host.bump_editor_revision();
+        notices::push(HostNotice::RolledBack {
+            function: function.to_string(),
+            to_generation: generation,
+            automatic: false,
+        });
     }
 }
 
@@ -2877,6 +2913,75 @@ fn process_rollback_request(host: &mut DevHost) {
 /// roll back to.
 #[cfg(not(feature = "hot_patch"))]
 fn process_rollback_request(_host: &mut DevHost) {}
+
+/// The generation a rollback naming `previous` resolves to for `function`.
+///
+/// `None` when the function has no recorded generations at all, which is what
+/// a refusal reads as.
+#[cfg(feature = "hot_patch")]
+fn previous_patch_generation(host: &DevHost, function: &str) -> Option<u32> {
+    host.patch_generations()
+        .iter()
+        .filter(|generation| generation.function == function)
+        .map(|generation| generation.number)
+        .max()
+        .map(|newest| newest.saturating_sub(1))
+}
+
+/// Roll back a function whose patched body kept panicking (Stage 19, D22).
+///
+/// The engine's dispatch slot counts consecutive panicking invocations and
+/// queues one report when a function crosses the threshold; the rollback
+/// itself belongs here, at the frame boundary, where no system is executing -
+/// the same requirement the prologue route imposes on the requested rollback.
+/// Rolling back to the previous generation is what the plan asks for, and a
+/// function that was patched only once rolls back to generation zero, which is
+/// the code the running artifact was built with. Nothing retries the rejected
+/// patch: the edit's signal was consumed when it was applied, so the function
+/// stays on the working generation until the next source edit.
+#[cfg(feature = "hot_patch")]
+fn process_patch_faults(host: &mut DevHost) {
+    for report in pill_engine::hot_patch::take_fault_reports() {
+        let function = report.function;
+        let Some(generation) = previous_patch_generation(host, &function) else {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                function = function.as_str(),
+                "a patched function kept panicking, but this session records no generation to roll it back to; the panics stay contained"
+            );
+            continue;
+        };
+        match host.rollback_patch(&function, generation) {
+            Ok(()) => {
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    function = function.as_str(),
+                    generation,
+                    panic = report.message.as_str(),
+                    "patch rolled back automatically after repeated panics; the previous generation keeps running"
+                );
+                host.bump_editor_revision();
+                notices::push(HostNotice::RolledBack {
+                    function,
+                    to_generation: generation,
+                    automatic: true,
+                });
+            }
+            Err(detail) => warn!(
+                target: telemetry_target::HOT_RELOAD,
+                function = function.as_str(),
+                generation,
+                detail = detail.as_str(),
+                "automatic rollback failed; the panicking generation keeps running"
+            ),
+        }
+    }
+}
+
+/// See the `hot_patch` version above; without the feature there is no dispatch
+/// slot to count panics in.
+#[cfg(not(feature = "hot_patch"))]
+fn process_patch_faults(_host: &mut DevHost) {}
 
 /// Print every generation this session has installed.
 ///
@@ -3009,6 +3114,10 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 &routes,
                 copies,
             );
+            notices::push(HostNotice::PatchApplied {
+                function,
+                milliseconds: elapsed_milliseconds,
+            });
             true
         }
         crate::hot_patch::PatchOutcome::NotPatchable { refusal } => {
@@ -3041,6 +3150,10 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 failure.code,
                 failure.detail.as_str(),
             );
+            notices::push(HostNotice::PatchFailed {
+                function,
+                detail: failure.detail,
+            });
             false
         }
         crate::hot_patch::PatchOutcome::Unchanged => false,

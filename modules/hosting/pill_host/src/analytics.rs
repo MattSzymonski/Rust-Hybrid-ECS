@@ -799,6 +799,23 @@ pub(crate) fn record_load(name: &str, load_ms: f64) {
     collector.modules[index].load_ms = load_ms;
 }
 
+/// The last cargo build wall time recorded for `name`, when there is one.
+///
+/// The reload toasts show it ("reloaded in 820 ms"); a module that never ran
+/// a recorded build - a load-only extension, or the first reload after a
+/// restart - reports `None` rather than a misleading zero.
+pub(crate) fn module_build_ms(name: &str) -> Option<u64> {
+    let collector = analytics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    collector
+        .modules
+        .iter()
+        .find(|module| module.name == name)
+        .map(|module| module.build_wall_ms)
+        .filter(|milliseconds| *milliseconds != 0)
+}
+
 /// Record the registration (`init`) time of one module.
 pub(crate) fn record_init(name: &str, init_ms: f64) {
     let mut collector = analytics()

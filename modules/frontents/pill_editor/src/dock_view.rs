@@ -614,11 +614,13 @@ pub(crate) fn PanelContent(
         PanelKind::Console => rsx! { ConsoleTab { editor } },
         PanelKind::Assets => rsx! { AssetsTab { editor } },
         // Panels this editor never implemented (the native editor's Game
-        // view, UI Gallery and Preferences): a saved layout restored here
-        // keeps each tab's place with a note instead.
-        PanelKind::Game | PanelKind::Gallery | PanelKind::Preferences => rsx! {
-            div { class: "dock-panel-placeholder", "This panel belongs to the native editor." }
-        },
+        // view, UI Gallery, Preferences and Problems panel): a saved layout
+        // restored here keeps each tab's place with a note instead.
+        PanelKind::Game | PanelKind::Gallery | PanelKind::Preferences | PanelKind::Problems => {
+            rsx! {
+                div { class: "dock-panel-placeholder", "This panel belongs to the native editor." }
+            }
+        }
         // A panel an editor crate registers: this editor hosts none, so a saved
         // layout's module tab keeps its place with a note instead.
         PanelKind::Module(panel_id) => rsx! {

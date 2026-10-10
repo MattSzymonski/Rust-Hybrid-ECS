@@ -24,7 +24,6 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
-
 // External crates
 #[cfg(feature = "hot_patch")]
 use pill_core::debug;
@@ -36,6 +35,78 @@ use pill_core::warn;
 // Current crate
 use crate::analytics::{self, ModuleKind};
 use crate::{ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig};
+
+// =============================================================================
+// Build output (Stage 19)
+// =============================================================================
+
+/// The tail of the most recent build's stderr, for the editor's Problems
+/// panel.
+///
+/// Process-global: `pill_host.dll` has exactly one copy per process. Builds
+/// are serialized (a patch attempt in flight defers reloads and managed
+/// builds), so the ring holds one build's output when a failure reads it.
+static BUILD_OUTPUT: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// How many stderr lines the ring keeps.
+const BUILD_OUTPUT_LINES: usize = 400;
+
+/// Start a fresh ring section for one build.
+fn begin_build_output(name: &str) {
+    let mut ring = BUILD_OUTPUT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ring.clear();
+    ring.push_back(format!("--- build: {name}"));
+}
+
+/// Append one stderr line to the ring, dropping the oldest past the cap.
+fn push_build_output(line: &str) {
+    let mut ring = BUILD_OUTPUT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ring.push_back(line.to_string());
+    while ring.len() > BUILD_OUTPUT_LINES {
+        ring.pop_front();
+    }
+}
+
+/// The ring's current contents, oldest first: what the last build printed.
+///
+/// The editor parses this into the Problems panel's entries after a failure
+/// ([`pill_editor_core::problems`]); an ordinary host never reads it.
+pub(crate) fn recent_build_output() -> String {
+    let ring = BUILD_OUTPUT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ring.iter().cloned().collect::<Vec<String>>().join("\n")
+}
+
+/// Drain `child`'s piped stderr on a thread: every line goes through to the
+/// host's stderr and into [`BUILD_OUTPUT`].
+///
+/// The caller joins the handle before inspecting the ring, so a failed
+/// build's diagnostics are complete when it reports them.
+fn tee_stderr(child: &mut Child) -> Option<std::thread::JoinHandle<()>> {
+    let stderr = child.stderr.take()?;
+    std::thread::Builder::new()
+        .name("pill-build-output".to_string())
+        .spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut reader = BufReader::new(stderr);
+            let mut line = Vec::new();
+            // Bytes rather than `lines()`: compiler output is not guaranteed
+            // to be valid UTF-8 on every locale.
+            while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                let _ = std::io::stderr().write_all(&line);
+                push_build_output(String::from_utf8_lossy(&line).trim_end());
+                line.clear();
+            }
+            let _ = std::io::stderr().flush();
+        })
+        .ok()
+}
 
 // =============================================================================
 // Constants
@@ -679,6 +750,7 @@ impl VerboseCapture {
                     }
                     if !is_verbose_only_line(&text) {
                         let _ = std::io::stderr().write_all(&line);
+                        push_build_output(text.trim_end());
                     }
                     line.clear();
                 }
@@ -725,6 +797,17 @@ impl VerboseCapture {
                     "could not cache the patch compiler flags; the next patch will re-capture"
                 ),
             }
+        }
+    }
+
+    /// Join the reader without caching anything.
+    ///
+    /// A failed build's stderr still has to finish draining before the ring
+    /// (`recent_build_output`) is read for the Problems panel; the harvested
+    /// rustc lines are discarded because no artifact appeared to describe.
+    fn abandon(self) {
+        if let Some(reader) = self.reader {
+            let _ = reader.join();
         }
     }
 }
@@ -1183,6 +1266,18 @@ pub(crate) fn run_build_command(
     let capture = VerboseCapture::arm(&mut command, program, &capture_names, workspace_root);
     #[cfg(not(feature = "hot_patch"))]
     let _ = capture_entries;
+    // A cargo build without the capture still tees its stderr into the ring:
+    // a failed build's Problems entry is parsed from it (Stage 19). The child
+    // used to inherit the stream outright, which lost the text once the
+    // terminal scrolled.
+    #[cfg(feature = "hot_patch")]
+    let tee_needed = capture.is_none() && program == "cargo";
+    #[cfg(not(feature = "hot_patch"))]
+    let tee_needed = program == "cargo";
+    if tee_needed {
+        command.stderr(std::process::Stdio::piped());
+    }
+    begin_build_output(name);
     // The tree is created before the spawn so the child can never run outside
     // it, and joined immediately after: a process started between the two
     // would survive a cancellation of the rest.
@@ -1196,6 +1291,11 @@ pub(crate) fn run_build_command(
     // the build runs, or the pipe fills and the compiler blocks forever.
     #[cfg(feature = "hot_patch")]
     let capture = capture.map(|capture| capture.start(&mut child));
+    let tee = if tee_needed {
+        tee_stderr(&mut child)
+    } else {
+        None
+    };
 
     // Step 3: Poll for completion, cancellation, or timeout under a watchdog.
     //
@@ -1242,11 +1342,23 @@ pub(crate) fn run_build_command(
     //
     // A failed compiler must stop the load transaction. During hot reload the
     // caller handles this error by leaving the current project module untouched.
+    // The stderr readers are joined first: the ring the failure is reported
+    // from (`recent_build_output`) must hold every line the build printed.
     if !status.success() {
+        if let Some(tee) = tee {
+            let _ = tee.join();
+        }
+        #[cfg(feature = "hot_patch")]
+        if let Some(capture) = capture {
+            capture.abandon();
+        }
         return Err(BuildError::CommandFailed {
             name: name.to_string(),
             status,
         });
+    }
+    if let Some(tee) = tee {
+        let _ = tee.join();
     }
     // Only after a successful build: a failed one may have recompiled the crate
     // with flags that never produced the artifact now on disk.

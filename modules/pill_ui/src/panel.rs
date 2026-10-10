@@ -675,6 +675,28 @@ impl<'a> PanelBuilder<'a> {
         (activated, frame.held)
     }
 
+    /// A push button whose registered name differs from the text it shows.
+    ///
+    /// The name is what the scripted channel's activation addresses and what
+    /// the widget's metadata carries; the label is what the user reads. For a
+    /// row whose visible text varies per frame but whose handle should not
+    /// (the Problems panel's rows, one per problem).
+    pub fn button_named(&mut self, name: &str, label: &str) -> bool {
+        let id = self.id_of(name);
+        let frame = self.interact(id, true);
+        let enter = self.input.key_pressed(KeyCode::Enter);
+        let activated = frame.clicked || (frame.focused && enter);
+        if activated {
+            self.inputs.push(PanelInput::Activated(id));
+        }
+        self.add(PanelNode::Button {
+            id,
+            label: label.to_string(),
+            enabled: true,
+        });
+        activated
+    }
+
     /// A push button that may be disabled.
     pub fn button_enabled(&mut self, label: &str, enabled: bool) -> bool {
         let id = self.id_of(label);

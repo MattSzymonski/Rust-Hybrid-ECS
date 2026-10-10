@@ -49,12 +49,130 @@
 //! module build.
 
 // Standard library
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // Current crate
 use crate::system::{SystemParam, SystemParamFunction};
+
+// =============================================================================
+// Panic attribution
+// =============================================================================
+
+/// Consecutive panicking invocations that make a patched function's host roll
+/// it back (Stage 19, D22).
+///
+/// A system runs once per frame, so three consecutive invocations are the
+/// three consecutive frames the plan names. Counting invocations rather than
+/// frames keeps the decision where the panic is observable at all: this layer
+/// has no frame identity, and the dispatcher is the only place that knows
+/// which function failed.
+pub const PANIC_ROLLBACK_FRAMES: u32 = 3;
+
+/// One function whose patched body kept panicking, queued for its host.
+#[derive(Clone, Debug)]
+pub struct FaultReport {
+    /// The function's qualified path: the identity a rollback resolves.
+    pub function: String,
+    /// The panic message, for the toast and the Problems panel.
+    pub message: String,
+}
+
+/// Consecutive panics per function, with the last message seen.
+///
+/// Touched only on a panicking call or while some function is mid-streak, so
+/// the steady state pays nothing but one relaxed load (see [`record_success`]).
+static PANIC_STREAKS: Mutex<Option<HashMap<String, (u32, String)>>> = Mutex::new(None);
+
+/// How many functions currently hold a non-zero streak.
+static FLAKY_FUNCTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Reports waiting for the host's next frame boundary.
+static FAULT_REPORTS: Mutex<Vec<FaultReport>> = Mutex::new(Vec::new());
+
+/// Count one panicking invocation of `function`.
+///
+/// A function reports a [`FaultReport`] exactly once per streak: when the
+/// streak reaches [`PANIC_ROLLBACK_FRAMES`]. Counting stops there, so a host
+/// that could not roll the function back is told once rather than every
+/// frame, and only a later successful invocation (a rollback, or a new patch)
+/// starts a fresh streak.
+pub fn record_panic(function: &str, message: &str) {
+    let mut guard = PANIC_STREAKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let streaks = guard.get_or_insert_with(HashMap::new);
+    let entry = streaks.entry(function.to_string()).or_insert_with(|| {
+        FLAKY_FUNCTIONS.fetch_add(1, Ordering::Relaxed);
+        (0, String::new())
+    });
+    entry.1 = message.to_string();
+    if entry.0 >= PANIC_ROLLBACK_FRAMES {
+        return;
+    }
+    entry.0 += 1;
+    if entry.0 == PANIC_ROLLBACK_FRAMES {
+        let report = FaultReport {
+            function: function.to_string(),
+            message: message.to_string(),
+        };
+        FAULT_REPORTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(report);
+    }
+}
+
+/// Clear a function's streak after an invocation that did not panic.
+///
+/// The check is one relaxed load: a process where nothing has panicked - the
+/// ordinary one - never touches the map.
+#[inline]
+pub fn record_success(function: &str) {
+    if FLAKY_FUNCTIONS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut guard = PANIC_STREAKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(streaks) = guard.as_mut() else {
+        return;
+    };
+    if streaks.remove(function).is_some() {
+        FLAKY_FUNCTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Turn a caught panic payload into the system failure the engine records.
+///
+/// The payload came from another artifact's copy of `std`, so only the two
+/// shapes `panic!` produces are read; anything else is reported by kind rather
+/// than dropped. Recording the panic here keeps attribution in one place: the
+/// dispatcher knows the function's name, the host only reads the reports.
+pub fn panic_into_failure(name: &str, payload: Box<dyn Any + Send>) -> crate::error::SystemError {
+    let message = payload
+        .downcast_ref::<&'static str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    record_panic(name, &message);
+    crate::error::SystemError::Failure {
+        message: format!("panicked: {message}"),
+    }
+}
+
+/// Take the fault reports queued since the last call, oldest first.
+///
+/// The host calls this at a frame boundary and rolls each function back to its
+/// previous generation.
+pub fn take_fault_reports() -> Vec<FaultReport> {
+    let mut reports = FAULT_REPORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *reports)
+}
 
 // =============================================================================
 // Errors
@@ -882,6 +1000,7 @@ mod integration_tests {
     use super::*;
     use crate::error::SystemError;
     use crate::{Engine, SystemOwner};
+    use pill_core::error::EngineMessage;
 
     /// Declares an isolated observable counter plus the two system bodies that
     /// drive it.
@@ -909,6 +1028,13 @@ mod integration_tests {
                     OBSERVED.fetch_add(10, Ordering::SeqCst);
                 }
 
+                /// A patched body that panics on every call: the containment
+                /// and the fault streak are what the host's automatic rollback
+                /// acts on.
+                pub fn panicking() {
+                    panic!("patched body panicked");
+                }
+
                 /// Total count observed so far, weighted by which body ran.
                 pub fn observed() -> u32 {
                     OBSERVED.load(Ordering::SeqCst)
@@ -924,6 +1050,7 @@ mod integration_tests {
     isolated_systems!(cleared_slots);
     isolated_systems!(second_patch);
     isolated_systems!(rolled_back);
+    isolated_systems!(panicking_patch);
 
     /// A different signature, used to prove the gate refuses it.
     fn differently_shaped_system() -> Result<(), SystemError> {
@@ -934,6 +1061,51 @@ mod integration_tests {
         let mut engine = Engine::new();
         engine.set_parallel_execution(false);
         engine
+    }
+
+    /// A patch whose body panics is contained by the dispatcher: each frame
+    /// records one system failure instead of unwinding through the engine, and
+    /// the third consecutive one queues the fault report a host rolls back
+    /// from (Stage 19, D22).
+    #[test]
+    fn a_panicking_patch_is_contained_and_reported() {
+        use panicking_patch as systems;
+        let mut engine = sequential_engine();
+        engine.register_system("panicking_counter", systems::original);
+        engine.process_frame().expect("frame");
+        engine
+            .hot_patch(
+                "panicking_counter",
+                local_implementation_address::<_, ()>(&systems::panicking),
+                signature_hash_of::<_, ()>(&systems::panicking),
+            )
+            .expect("patch accepted");
+        // Drain anything an earlier test queued, so the count below is ours.
+        let _ = take_fault_reports();
+        for frame in 1..PANIC_ROLLBACK_FRAMES {
+            engine.process_frame().expect("frame");
+            assert_eq!(engine.drain_system_failures().len(), 1, "frame {frame}");
+            assert!(
+                take_fault_reports().is_empty(),
+                "frame {frame} reported before the threshold"
+            );
+        }
+        engine.process_frame().expect("frame");
+        let failures = engine.drain_system_failures();
+        assert_eq!(failures[0].system, "panicking_counter");
+        assert!(failures[0]
+            .to_plain_message()
+            .contains("panicked: patched body panicked"));
+        let reports = take_fault_reports();
+        assert_eq!(reports.len(), 1, "the third panicking frame must report");
+        // The report names the function path the slot was registered under,
+        // which is the identity a host's rollback resolves.
+        assert!(
+            reports[0].function.ends_with("panicking_patch::original"),
+            "reported function: {}",
+            reports[0].function
+        );
+        assert!(reports[0].message.contains("patched body panicked"));
     }
 
     /// The headline behavior: a patched system runs new code on the next frame.

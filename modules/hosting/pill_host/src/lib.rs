@@ -55,6 +55,9 @@ mod extension;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 #[cfg(feature = "hot_reload")]
 mod native_library;
+/// Reloads, patches, failures and rollbacks, queued for an attached editor.
+#[cfg(feature = "hot_reload")]
+mod notices;
 /// Lifecycle management for the active native or managed project module.
 mod project_module;
 /// The sequence every reload runs once its replacement image is loaded.
@@ -87,6 +90,9 @@ mod shader_watcher;
 // Local host modules and the shared crate-root error surface.
 pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 pub use extension::EXTENSION_ABI_VERSION;
+/// The notices an editor frontend drains each frame; see [`HostNotice`].
+#[cfg(feature = "hot_reload")]
+pub use notices::{take as take_notices, HostNotice};
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,

@@ -42,10 +42,10 @@ use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 use pill_editor_shell_editor::shell::{
     activate_widget, collect_panel_placements, console_channel, execute_command,
     focus_module_panel, handle_command_shortcuts, handle_file_drops, handle_menu_pointer,
-    paint_dock_chrome, paint_drop_preview, paint_menu, paint_palette, paint_panels,
+    paint_dock_chrome, paint_drop_preview, paint_menu, paint_palette, paint_panels, paint_toasts,
     run_clipboard_action, scroll_last_widget, select_tab_by_title, sync_command_files,
-    sync_panel_commands, ClipboardAction, ConsoleLine, EditorShellState, CONSOLE_LINES_MAX,
-    MENU_BAR_HEIGHT, PREFERENCES_FILE,
+    sync_panel_commands, ClipboardAction, ConsoleLine, EditorShellState, Toast, CONSOLE_LINES_MAX,
+    MENU_BAR_HEIGHT, PREFERENCES_FILE, TOAST_FRAMES,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -358,6 +358,32 @@ pub fn editor_shell_update(
     // the drop routing and everything the frame does after it.
     let input: &mut EditorShellInput = &mut input;
     handle_file_drops(&mut state, input, &placements, &mut pending);
+    // The executable's host notices (Stage 19): toast events drain into the
+    // shell's own stack, and a problems revision that moved is logged once,
+    // so the suite can see the panel took it.
+    let current_frame = state.frame_index;
+    for event in input.notices.events.drain(..) {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            seq = event.seq,
+            text = event.text.as_str(),
+            "[editor] toast shown"
+        );
+        state.toasts.push_back(Toast {
+            level: event.level,
+            text: event.text,
+            expires_at_frame: current_frame + TOAST_FRAMES,
+        });
+    }
+    if input.notices.revision != state.notices_revision_seen {
+        state.notices_revision_seen = input.notices.revision;
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            revision = input.notices.revision,
+            count = input.notices.problems.len(),
+            "[editor] problems panel updated"
+        );
+    }
     // The heartbeat the end-to-end suite waits on, and the reload proof:
     // the frame counter keeps climbing across a shell reload because the
     // state resource is re-claimed, not reset.
@@ -400,6 +426,7 @@ pub fn editor_shell_update(
         logs: &logs.0,
         selection: &selection,
         panels: &panels,
+        problems: &input.notices.problems,
     };
     paint_dock_chrome(&mut state, &snapshot, &mut frame, &previous_hits);
     let panels_started = pill_core::platform::Instant::now();
@@ -456,6 +483,17 @@ pub fn editor_shell_update(
     // every frame, so a row that is no longer held drops out here.
     if let Some(source) = work.drag_candidate {
         frame.drag_candidate = Some(source);
+    }
+    // A Problems row's click (Stage 19) goes to the executable, which hands
+    // the file to the developer's editor.
+    if let Some(request) = work.open_file {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            file = request.file.as_str(),
+            line = request.line,
+            "[editor] problems row activated"
+        );
+        frame.requested_open = Some(request);
     }
     if let Some(level) = work.console_level {
         state.console_level = level;
@@ -545,6 +583,8 @@ pub fn editor_shell_update(
     }
     paint_menu(&mut state, &registry, &mut frame, available);
     paint_palette(&mut state, &registry, &mut frame, available);
+    // Step 5b: the toast stack, over everything the panels drew.
+    paint_toasts(&mut state, &mut frame, available);
     // Step 6: this frame's atlas additions, for the executable to upload.
     frame.atlas = state.atlas.take_update();
 }
