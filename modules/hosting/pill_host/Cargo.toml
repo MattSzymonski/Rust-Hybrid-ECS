@@ -87,9 +87,17 @@ hot_reload = ["dep:notify", "dep:pill_assets", "pill_csharp_bridge/hot_reload"]
 # what lets a module and a hot patch link the same engine the host does.
 rendering = ["dep:renderer_dependency_graph", "pill_runtime/rendering"]
 # Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
-profiling = ["pill_engine/profiling", "pill_core/tracy", "pill_runtime/profiling"]
+profiling = [
+    "pill_engine/profiling",
+    "pill_core/tracy",
+    "pill_runtime/profiling",
+]
 # Investigative fine-grained profiling zones.
-profiling-fine = ["profiling", "pill_engine/profiling-fine", "pill_runtime/profiling-fine"]
+profiling-fine = [
+    "profiling",
+    "pill_engine/profiling-fine",
+    "pill_runtime/profiling-fine",
+]
 # Profiling with instrumentation verification (~50% overhead).
 profiling-verify = ["profiling", "pill_engine/profiling-verify"]
 # Repeated numerical measurements through the shared metrics recorder.

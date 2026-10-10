@@ -1,0 +1,50 @@
+[package]
+name = "pill_editor_native"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+pill_core = { path = "../../pill_core" }
+# The `#[engine_error]` attribute behind this binary's error type.
+pill_core_macros = { path = "../../pill_core_macros" }
+# The engine's input event types this executable translates winit events
+# into, the same shared dylib `pill_input` maps into: frontends name the
+# core, never the `pill_engine` facade with its per-DLL registries.
+pill_engine_core = { path = "../../pill_engine_core" }
+thiserror = "2"
+miette = { version = "7", features = ["derive"] }
+tracing = "0.1"
+# What runs the game: the frame driver this executable's loop is written
+# against, for hosting the project and its extensions in every posture.
+pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
+# The development host: builds, loads, watches and hot-patches the project
+# and every extension, including the editor shell module. The editor has no
+# shipping posture yet (Stage 25 decides what a shipped editor is), so
+# unlike `pill_standalone` this dependency is unconditional.
+pill_host = { path = "../../hosting/pill_host", default-features = false, features = [
+    "hot_reload",
+    "hot_patch",
+    "rendering",
+] }
+# The window and event loop: only frontends link winit.
+winit = "0.30"
+# winit's keyboard and mouse events as engine input events, shared with the
+# standalone.
+pill_input = { path = "../pill_input", features = ["winit", "gamepad"] }
+# The editor's own renderer for its UI: the executable owns its wgpu device
+# and presents the editor with it (D8, D19). The same wgpu the renderer
+# module uses - a second version in one process would bring a second copy of
+# its global types.
+wgpu = "25.0.0"
+pill_ui = { path = "../../pill_ui" }
+pill_ui_wgpu = { path = "../../pill_ui_wgpu" }
+# Docking: the layout model, geometry and actions, shared with the shell
+# module through the same dylib the executable loads.
+pill_editor_core = { path = "../pill_editor_core" }
+# The shell boundary: the plain data the executable and the reloadable shell
+# module exchange through world resources. A shared dylib, like `pill_ui`,
+# so both sides agree on the resource types' identity.
+pill_editor_api = { path = "../../hosting/pill_editor_api" }

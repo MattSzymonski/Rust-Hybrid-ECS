@@ -32,10 +32,16 @@ pub enum Axis {
 #[serde(rename_all = "snake_case")]
 pub enum PanelKind {
     Scene,
+    /// The project's own camera on its own surface (D29); the Scene tab
+    /// draws through the editor camera instead.
+    Game,
     Hierarchy,
     Inspector,
     Console,
     Statistics,
+    /// The widget gallery: everything the UI library can draw, for trying a
+    /// later stage's widgets before its real panels exist.
+    Gallery,
     Systems,
     Assets,
     /// A panel registered by an editor crate, addressed by its panel id.
@@ -48,10 +54,12 @@ impl PanelKind {
     pub fn title(&self) -> &str {
         match self {
             Self::Scene => "Scene",
+            Self::Game => "Game",
             Self::Hierarchy => "Hierarchy",
             Self::Inspector => "Inspector",
             Self::Console => "Console",
             Self::Statistics => "Statistics",
+            Self::Gallery => "UI Gallery",
             Self::Systems => "Systems",
             Self::Assets => "Assets",
             Self::Module(panel_id) => panel_id,
@@ -120,22 +128,29 @@ impl LayoutModel {
 
         let hierarchy = model.add_tab(PanelKind::Hierarchy, true);
         let scene = model.add_tab(PanelKind::Scene, false);
+        let game = model.add_tab(PanelKind::Game, false);
         let inspector = model.add_tab(PanelKind::Inspector, true);
         let statistics = model.add_tab(PanelKind::Statistics, true);
+        let gallery = model.add_tab(PanelKind::Gallery, true);
         let console = model.add_tab(PanelKind::Console, true);
         let systems = model.add_tab(PanelKind::Systems, true);
         let assets = model.add_tab(PanelKind::Assets, true);
 
         let hierarchy_set = model.add_tabset(vec![hierarchy, assets], hierarchy);
-        let scene_set = model.add_tabset(vec![scene], scene);
+        let scene_set = model.add_tabset(vec![scene, game], scene);
         let inspector_set = model.add_tabset(vec![inspector], inspector);
         let statistics_set = model.add_tabset(vec![statistics], statistics);
+        let gallery_set = model.add_tabset(vec![gallery], gallery);
         let console_set = model.add_tabset(vec![console], console);
         let systems_set = model.add_tabset(vec![systems], systems);
 
         let right = model.add_row(
             Axis::Vertical,
-            vec![(inspector_set, 55.0), (statistics_set, 45.0)],
+            vec![
+                (inspector_set, 40.0),
+                (statistics_set, 30.0),
+                (gallery_set, 30.0),
+            ],
         );
         let top = model.add_row(
             Axis::Horizontal,

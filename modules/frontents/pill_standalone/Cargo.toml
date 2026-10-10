@@ -29,7 +29,10 @@ winit = { version = "0.30", optional = true }
 pill_ui = { path = "../../pill_ui", optional = true }
 # A windowed run's input: winit's keyboard and mouse events as engine input
 # events, and the gamepads.
-pill_input = { path = "../pill_input", features = ["winit", "gamepad"], optional = true }
+pill_input = { path = "../pill_input", features = [
+    "winit",
+    "gamepad",
+], optional = true }
 
 # The generated shipping bundle, linked only by `shipping`. It declares the
 # project and every extension selected by the project's

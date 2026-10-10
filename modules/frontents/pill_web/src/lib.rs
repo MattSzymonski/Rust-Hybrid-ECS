@@ -121,7 +121,7 @@ impl ApplicationHandler for WebApplication {
             Ok(window) => Arc::new(window),
             Err(error) => return report_failure("canvas window creation", &error),
         };
-        if let Err(error) = focus_target.focus() {
+        if let Err(error) = focus_without_scrolling(&focus_target) {
             warn!(
                 target: telemetry_target::ENGINE,
                 error = ?error,
@@ -246,6 +246,34 @@ fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
     element
         .dyn_into::<HtmlCanvasElement>()
         .map_err(|_| format!("the element `{canvas_id}` is not a canvas"))
+}
+
+/// Focus `element` without scrolling it into view.
+///
+/// A plain `focus()` scrolls the element into view, which cancels any scroll
+/// in flight (for example a smooth scroll toward an anchor below the canvas)
+/// whenever it runs mid scroll. `web-sys` has no typed `focus(options)` yet,
+/// so the call goes through raw JS.
+///
+/// # Errors
+///
+/// Returns the JS error if `focus` is missing or the call rejects.
+fn focus_without_scrolling(element: &HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
+    let element: &wasm_bindgen::JsValue = element.as_ref();
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &options,
+        &wasm_bindgen::JsValue::from_str("preventScroll"),
+        &wasm_bindgen::JsValue::TRUE,
+    )?;
+
+    let focus = js_sys::Reflect::get(element, &wasm_bindgen::JsValue::from_str("focus"))?;
+    let focus = focus
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| wasm_bindgen::JsValue::from_str("focus is not a function"))?;
+    focus.call1(element, &options)?;
+
+    Ok(())
 }
 
 /// The canvas's laid-out size in physical pixels, at least 1x1.

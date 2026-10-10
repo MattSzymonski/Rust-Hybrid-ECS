@@ -62,6 +62,25 @@ impl UiState {
     pub fn active(&self) -> Option<WidgetId> {
         self.interaction.active
     }
+
+    /// Every widget's rectangle as the last layout stored it.
+    ///
+    /// An embedder that lays several panels out in one frame (the editor
+    /// shell) reads this before each panel so the panel's widgets hit-test
+    /// against the previous frame, and merges the fresh rectangles of every
+    /// panel into one map for the next frame.
+    pub fn hit_rects(&self) -> &BTreeMap<WidgetId, Rect> {
+        &self.hit_rects
+    }
+
+    /// Replace the stored hit rectangles with a merged map.
+    ///
+    /// Paired with [`Self::hit_rects`]: the embedder restores the previous
+    /// frame's map around each panel's build and stores the union of the
+    /// panels' fresh rectangles after the last one.
+    pub fn set_hit_rects(&mut self, hit_rects: BTreeMap<WidgetId, Rect>) {
+        self.hit_rects = hit_rects;
+    }
 }
 
 /// The interaction state a frame advances: at most one widget is being
