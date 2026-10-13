@@ -1806,8 +1806,11 @@ impl EditorWindow {
         };
         // A handle press starts a drag through methods that borrow all of
         // `self`, while the world borrow below is still alive; the press is
-        // collected here and acted on once that borrow ends.
-        let mut handle_press: Option<(u32, f32, f32, Option<(f32, f32)>)> = None;
+        // collected here and acted on once that borrow ends. The recorded
+        // press: the handle id, the press position, and the scripted delta
+        // when the press was synthetic.
+        type HandlePress = (u32, f32, f32, Option<(f32, f32)>);
+        let mut handle_press: Option<HandlePress> = None;
         for result in results {
             // A scripted press answers on any pixel of its neighbourhood:
             // the first that names a handle starts the drag, and only a full

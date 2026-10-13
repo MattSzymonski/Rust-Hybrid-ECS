@@ -180,13 +180,19 @@ pub const AXIS_COLORS: [[f32; 4]; 3] = [
 // Geometry
 // =============================================================================
 
+/// One gizmo line: its two endpoints, its colour, and its handle id.
+pub type GizmoLine = ([f32; 3], [f32; 3], [f32; 4], u32);
+
+/// One gizmo triangle: its three points, its colour, and its handle id.
+pub type GizmoTriangle = ([[f32; 3]; 3], [f32; 4], u32);
+
 /// The handle geometry one gizmo draws: contract primitives, handle ids set.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GizmoGeometry {
     /// Handle lines.
-    pub lines: Vec<([f32; 3], [f32; 3], [f32; 4], u32)>,
+    pub lines: Vec<GizmoLine>,
     /// Handle triangles (arrow and cube heads).
-    pub triangles: Vec<([[f32; 3]; 3], [f32; 4], u32)>,
+    pub triangles: Vec<GizmoTriangle>,
 }
 
 /// Build the handles of `mode`, `length` long, centred on `origin`.
@@ -250,7 +256,7 @@ fn ring_point(origin: [f32; 3], u: [f32; 3], v: [f32; 3], radius: f32, angle: f3
 /// Four triangles forming a square head around the tip, flattened along the
 /// axis so the head reads as an arrow from any side.
 fn head_triangles(
-    triangles: &mut Vec<([[f32; 3]; 3], [f32; 4], u32)>,
+    triangles: &mut Vec<GizmoTriangle>,
     origin: [f32; 3],
     axis: [f32; 3],
     tip: [f32; 3],
@@ -274,7 +280,7 @@ fn head_triangles(
 
 /// Twelve triangles forming a small cube around `center`.
 fn cube_triangles(
-    triangles: &mut Vec<([[f32; 3]; 3], [f32; 4], u32)>,
+    triangles: &mut Vec<GizmoTriangle>,
     center: [f32; 3],
     axis: [f32; 3],
     half: f32,

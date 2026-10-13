@@ -237,12 +237,6 @@ fn host_engine_features() -> Vec<&'static str> {
     if cfg!(feature = "hot_patch") {
         features.push("pill_engine/hot_patch");
     }
-    if cfg!(feature = "profiling")
-        || cfg!(feature = "profiling-fine")
-        || cfg!(feature = "profiling-verify")
-    {
-        features.push("pill_core/tracy");
-    }
     if cfg!(feature = "profiling-fine") {
         features.push("pill_engine/profiling-fine");
     } else if cfg!(feature = "profiling-verify") {
