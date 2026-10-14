@@ -21,7 +21,8 @@
 
 // External crates
 use pill_core::math::Vector3f;
-use pill_editor_api::panels::{register_editor_panel, PanelContext};
+use pill_editor_api::panels::{register_editor_panels, EditorPanelSpec, PanelContext};
+use pill_editor_api::EditorWindowButton;
 use pill_editor_core::commands::{
     CommandInbox, CommandRegistry, CommandSpec, KeymapPreset, PendingEditorCommands,
 };
@@ -119,16 +120,19 @@ pub fn register(engine: &mut Engine) -> u32 {
             ],
         );
     }
-    // The Spline Tool panel (Stage 16): registered through the panel API, so
-    // it appears in the Window menu and docks like a built-in; its
-    // registration dies with this crate's generation (the registry's
-    // liveness rule), and the reload below re-registers it.
-    register_editor_panel(
+    // The Spline Tool panel (Stage 16) and the modal's body panel
+    // (Stage 24), registered as one set: a generation registers its panels
+    // in a single call, so this reload replaces exactly this set, and a
+    // panel a later generation drops retires with it. `spline_tool` shows
+    // in the dock and detaches into a tool window of its own; the modal's
+    // buttons are part of the window request, not of `spline_reseed`.
+    register_editor_panels(
         engine,
         "pill_spline_editor",
-        "spline_tool",
-        "Spline Tool",
-        spline_tool_panel,
+        &[
+            EditorPanelSpec::new("spline_tool", "Spline Tool", spline_tool_panel),
+            EditorPanelSpec::new("spline_reseed", "Spline Re-seed", spline_reseed_panel),
+        ],
     );
     engine.register_system("pill_spline_editor_commands", spline_editor_commands);
     0
@@ -170,7 +174,51 @@ pub fn spline_tool_panel(builder: &mut PanelBuilder<'_>, context: &mut PanelCont
     if add_point {
         context.work.command("spline_editor.add_point");
     }
+    // The free-standing windows (Stage 24): this button detaches the tool
+    // into a window of its own, and this one asks before re-seeding through
+    // a modal. Both name registered panels - the tool window shows this
+    // panel, the modal shows `spline_reseed` above its request's buttons.
+    let detach = builder.button_named("spline.open_window", "Detach Tool Window");
+    let confirm = builder.button_named("spline.confirm_reseed", "Re-seed (confirm)");
+    if detach {
+        context.work.open_tool_window(
+            "spline_tool_window",
+            "Spline Tool",
+            320.0,
+            240.0,
+            "spline_tool",
+        );
+    }
+    if confirm {
+        context.work.open_modal(
+            "spline_reseed_confirm",
+            "Re-seed Splines",
+            380.0,
+            170.0,
+            "spline_reseed",
+            vec![
+                EditorWindowButton {
+                    label: "Re-seed".to_string(),
+                    command: "spline_editor.reseed".to_string(),
+                },
+                EditorWindowButton {
+                    label: "Cancel".to_string(),
+                    command: String::new(),
+                },
+            ],
+        );
+    }
     builder.label("Control points draw in the scene's debug overlay.");
+}
+
+/// The modal's body (Stage 24): what the confirm is about. The buttons
+/// below it come from the window request, answered by the shell.
+#[pill_hot_fn]
+pub fn spline_reseed_panel(builder: &mut PanelBuilder<'_>, _context: &mut PanelContext<'_>) {
+    builder.heading("Re-seed Splines");
+    builder.separator();
+    builder.label("This rewrites every spline's control points.");
+    builder.label("The simulation keeps running while this dialog is open.");
 }
 
 /// Runs the editor commands this crate owns, drained from the inbox, and

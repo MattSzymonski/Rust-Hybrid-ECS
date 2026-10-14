@@ -33,7 +33,8 @@ use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
 use pill_editor_api::{
     ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
     EditorPopupPointer, EditorProblem, EditorProblemLevel, EditorRect, EditorShellFrame,
-    EditorShellInput,
+    EditorShellInput, EditorWindowKey, EditorWindowKeyKind, EditorWindowKind, EditorWindowPointer,
+    EditorWindowPointerKind, EditorWindowRequest,
 };
 use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
@@ -250,6 +251,41 @@ pub struct EditorShellState {
     /// owns the per-project entry and writes it back; the file returning
     /// through `sync_command_files` is what keeps this mirror honest.
     pub gizmo: pill_editor_core::commands::GizmoProjectPreferences,
+    /// The free-standing windows the shell owns (Stage 24), in open order:
+    /// tool windows and modal dialogs, each drawing one registered panel.
+    pub windows: Vec<OpenWindow>,
+}
+
+/// One free-standing window the shell owns (Stage 24).
+///
+/// The shell owns the lifetime, the layout and the drawing; the executable
+/// owns the platform window, its surface and its input, all named through
+/// [`EditorWindowRequest::id`]. The window draws the registered panel its
+/// request names, resolved through the registry every frame, so it always
+/// shows the current generation's code and dies when that code does.
+pub struct OpenWindow {
+    /// What the shell asked for: id, kind, title, size, panel and buttons;
+    /// the frame's draw is filled from the build below.
+    pub request: EditorWindowRequest,
+    /// The registering crate's name, from the registry at open time.
+    pub owner: String,
+    /// The panel registration this window draws through; a changed value
+    /// means a reload replaced it, a missing one that it died.
+    pub epoch: u64,
+    /// The window's own widget state: its input and its hit rectangles,
+    /// separate from the main window's so the two never mix coordinates.
+    pub ui: UiState,
+    /// The window's own persistent text buffers, for its panel's fields.
+    pub text: BTreeMap<String, String>,
+    /// The window's widget rectangles from the previous frame, in its own
+    /// logical pixels.
+    pub previous_hits: BTreeMap<WidgetId, Rect>,
+    /// Every widget name the window's panel registered this frame; the
+    /// scripted activation path addresses them through this.
+    pub names: BTreeMap<String, WidgetId>,
+    /// The epoch of the panel generation [Self::names] was built from; a
+    /// mismatch logs one "window panel built" line per generation.
+    pub built_epoch: u64,
 }
 
 /// One toast: a short-lived line about something the host did (Stage 19).
@@ -408,6 +444,7 @@ impl EditorShellState {
             toasts: std::collections::VecDeque::new(),
             notices_revision_seen: 0,
             gizmo: pill_editor_core::commands::GizmoProjectPreferences::default(),
+            windows: Vec::new(),
         }
     }
 }
@@ -814,6 +851,7 @@ pub fn paint_panels(
         console_channel,
         preferences_text,
         widget_names,
+        toasts,
         ..
     } = state;
     let mut merged: BTreeMap<WidgetId, Rect> = BTreeMap::new();
@@ -912,6 +950,21 @@ pub fn paint_panels(
                         millis,
                         "[editor] panel over budget"
                     );
+                    // The on-screen half of the warning (Stage 24): the tab
+                    // badge is easy to miss in a dock nobody is looking at,
+                    // so the same transition raises a toast over the whole
+                    // editor.
+                    toasts.push_back(Toast {
+                        level: EditorProblemLevel::Warning,
+                        text: format!("panel {id} is over budget ({millis:.1} ms)"),
+                        expires_at_frame: state.frame_index + TOAST_FRAMES,
+                    });
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        id = id.as_str(),
+                        millis,
+                        "[editor] panel budget toast"
+                    );
                 }
             } else {
                 panel_over_frames.insert(id.clone(), 0);
@@ -980,6 +1033,12 @@ pub fn paint_panels(
         if work.open_file.is_some() {
             collected.open_file = work.open_file;
         }
+        // The free-standing windows a docked panel asked for (Stage 24):
+        // forwarded whole, opened by the drain that follows the paint.
+        if work.close_window.is_some() {
+            collected.close_window = work.close_window;
+        }
+        collected.windows.extend(work.windows);
     }
     ui.set_hit_rects(merged);
     // The frame closes here: every panel has seen this frame's release edge,
@@ -1832,6 +1891,17 @@ fn report_once(state: &mut EditorShellState, message: &str) {
 /// rectangle the last paint recorded, through the same input path real
 /// input takes.
 pub fn activate_widget(state: &mut EditorShellState, name: &str) {
+    // A widget inside a free-standing window (Stage 24) is addressed as
+    // `window.<window id>.<name>`: the window has its own widget state and
+    // its own coordinates, so the activation goes through its input, not
+    // the main window's. Modals name their shell-drawn buttons
+    // `window.<modal id>.button.<index>` the same way.
+    if let Some(rest) = name.strip_prefix("window.") {
+        if let Some((window_id, _widget)) = rest.split_once('.') {
+            activate_window_widget(state, name, window_id);
+            return;
+        }
+    }
     // Prefer the id the panel actually built the widget under (a widget in
     // a row derives its id from the row's scope); plain panel-root names
     // fall back to the single-segment form.
@@ -1873,6 +1943,73 @@ pub fn activate_widget(state: &mut EditorShellState, name: &str) {
         target: pill_core::telemetry::telemetry_target::ECS,
         name,
         "[editor] widget activated"
+    );
+}
+
+/// Activates one widget a free-standing window's panel built (Stage 24).
+///
+/// The activation is the same move-press-release a widget in the dock gets,
+/// only through the window's own input state and at its own coordinates, so
+/// a button in a tool window answers exactly as it would docked.
+fn activate_window_widget(state: &mut EditorShellState, name: &str, window_id: &str) {
+    let Some(window) = state
+        .windows
+        .iter_mut()
+        .find(|window| window.request.id == window_id)
+    else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            name,
+            window = window_id,
+            "[editor] widget not found: no such window"
+        );
+        return;
+    };
+    // A panel widget answers to its own name; a shell-drawn modal button
+    // answers to the full `window.<id>.button.<index>` name it was built
+    // under.
+    let widget = name
+        .strip_prefix(&format!("window.{window_id}."))
+        .unwrap_or(name);
+    let id = window
+        .names
+        .get(name)
+        .or_else(|| window.names.get(widget))
+        .copied()
+        .unwrap_or_else(|| pill_ui::widget::WidgetId::from_name(widget));
+    let Some(rect) = window.previous_hits.get(&id).copied() else {
+        let names: Vec<&String> = window.names.keys().collect();
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            name,
+            window = window_id,
+            names = ?names,
+            "[editor] widget not found"
+        );
+        return;
+    };
+    let center = Vector2f::new(
+        rect.min.x + rect.width() / 2.0,
+        rect.min.y + rect.height() / 2.0,
+    );
+    for event in [
+        pill_engine::InputEvent::CursorMoved { position: center },
+        pill_engine::InputEvent::MouseButton {
+            button: pill_engine::MouseButton::Left,
+            state: pill_engine::ButtonState::Pressed,
+        },
+        pill_engine::InputEvent::MouseButton {
+            button: pill_engine::MouseButton::Left,
+            state: pill_engine::ButtonState::Released,
+        },
+    ] {
+        window.ui.input.apply(&event);
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        name,
+        window = window_id,
+        "[editor] window widget activated"
     );
 }
 
@@ -3457,4 +3594,589 @@ pub fn handle_popup_closed(state: &mut EditorShellState, id: &str) {
         popup = id,
         "[editor] popup dismissed"
     );
+}
+
+// =============================================================================
+// Free-standing windows (Stage 24)
+// =============================================================================
+
+/// The modal button row's height and one button's width, in logical pixels.
+const MODAL_BUTTON_ROW_HEIGHT: f32 = 34.0;
+const MODAL_BUTTON_WIDTH: f32 = 92.0;
+
+/// The gap between a window's edge and its panel content, in logical pixels.
+const WINDOW_CONTENT_PADDING: f32 = 8.0;
+
+/// Opens the windows the panels asked for and applies a asked-for close.
+///
+/// A request names a registered panel id and never code: the registry is
+/// resolved here, once per request, and a request for a panel that is not
+/// registered right now is refused with a warning - the window's lifetime
+/// is bound to the panel's registration, so a window that had no code to
+/// draw would only ever show a hole.
+pub fn apply_window_requests(
+    state: &mut EditorShellState,
+    requests: Vec<EditorWindowRequest>,
+    panels: &EditorPanelRegistry,
+) {
+    for request in requests {
+        if request.id.is_empty()
+            || state
+                .windows
+                .iter()
+                .any(|window| window.request.id == request.id)
+        {
+            continue;
+        }
+        let Some(epoch) = panels.panel_epoch(&request.panel) else {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                id = request.id.as_str(),
+                panel = request.panel.as_str(),
+                "[editor] window request for an unregistered panel"
+            );
+            continue;
+        };
+        let owner = panels
+            .list()
+            .into_iter()
+            .find(|info| info.id == request.panel)
+            .map(|info| info.owner)
+            .unwrap_or_default();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = request.id.as_str(),
+            kind = request.kind.title(),
+            panel = request.panel.as_str(),
+            owner = owner.as_str(),
+            width = request.width,
+            height = request.height,
+            "[editor] window opened"
+        );
+        state.windows.push(OpenWindow {
+            request,
+            owner,
+            epoch,
+            ui: UiState::new(),
+            text: BTreeMap::new(),
+            previous_hits: BTreeMap::new(),
+            names: BTreeMap::new(),
+            built_epoch: 0,
+        });
+    }
+}
+
+/// Closes one open window, logging why; `false` when no window has that id.
+fn close_window(state: &mut EditorShellState, id: &str, reason: &str) -> bool {
+    let Some(index) = state
+        .windows
+        .iter()
+        .position(|window| window.request.id == id)
+    else {
+        return false;
+    };
+    let window = state.windows.remove(index);
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        id,
+        kind = window.request.kind.title(),
+        reason,
+        "[editor] window closed"
+    );
+    true
+}
+
+/// Feeds one pointer event of one window into that window's own input
+/// (Stage 24). A window's pointer never reaches the main window's stream,
+/// so its widgets answer through its own state, in its own coordinates.
+pub fn handle_window_pointer(state: &mut EditorShellState, pointer: &EditorWindowPointer) {
+    let Some(window) = state
+        .windows
+        .iter_mut()
+        .find(|window| window.request.id == pointer.id)
+    else {
+        return;
+    };
+    let event = match pointer.kind {
+        EditorWindowPointerKind::Moved => pill_engine::InputEvent::CursorMoved {
+            position: pointer.position,
+        },
+        EditorWindowPointerKind::Pressed | EditorWindowPointerKind::Released => {
+            pill_engine::InputEvent::MouseButton {
+                button: pill_engine::MouseButton::Left,
+                state: match pointer.kind {
+                    EditorWindowPointerKind::Pressed => pill_engine::ButtonState::Pressed,
+                    _ => pill_engine::ButtonState::Released,
+                },
+            }
+        }
+    };
+    window.ui.input.apply(&event);
+}
+
+/// Clears the state behind a window the platform closed (Stage 24): the
+/// user pressed the title bar's close button, so the window stays gone and
+/// a later reload of its module does not bring it back.
+pub fn handle_window_closed(state: &mut EditorShellState, id: &str) {
+    close_window(state, id, "platform");
+}
+
+/// Answers one key of one window (Stage 24). Only modals answer: Enter
+/// activates their default button, Escape dismisses them without a command.
+pub fn handle_window_key(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
+    key: &EditorWindowKey,
+) {
+    let Some(window) = state
+        .windows
+        .iter()
+        .find(|window| window.request.id == key.id)
+    else {
+        return;
+    };
+    if window.request.kind != EditorWindowKind::Modal {
+        return;
+    }
+    match key.key {
+        EditorWindowKeyKind::Enter => {
+            answer_window(state, registry, inbox, pending, history, &key.id, 0)
+        }
+        EditorWindowKeyKind::Escape => {
+            close_window(state, &key.id, "escape");
+        }
+    }
+}
+
+/// Answers a modal with one of its buttons (Stage 24): the window closes
+/// and the button's command, when it has one, runs through the same
+/// dispatch a shortcut uses.
+fn answer_window(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
+    id: &str,
+    button_index: usize,
+) {
+    let Some(index) = state
+        .windows
+        .iter()
+        .position(|window| window.request.id == id)
+    else {
+        return;
+    };
+    let window = state.windows.remove(index);
+    if window.request.kind != EditorWindowKind::Modal {
+        return;
+    }
+    let label = window
+        .request
+        .buttons
+        .get(button_index)
+        .map(|button| button.label.clone())
+        .unwrap_or_default();
+    let command = window
+        .request
+        .buttons
+        .get(button_index)
+        .map(|button| button.command.clone())
+        .unwrap_or_default();
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        id,
+        button = label.as_str(),
+        command = command.as_str(),
+        "[editor] modal answered"
+    );
+    if !command.is_empty() {
+        execute_command(state, registry, inbox, pending, history, &command);
+    }
+}
+
+/// Builds every open window's content for this frame (Stage 24).
+///
+/// Runs the ownership pass first: a window whose panel registration changed
+/// closes (a modal) or reopens on the new generation (a tool window), and
+/// one whose registration died closes - so no window ever draws through the
+/// image of a module that has been replaced or unloaded. Each surviving
+/// window then builds its panel with the window's own widget state, and a
+/// modal adds the shell-drawn button row from its request. The returned
+/// [`PanelWork`] is everything the windows' panels asked for, drained by the
+/// caller exactly like a docked panel's.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_windows(
+    state: &mut EditorShellState,
+    view: &PanelView<'_>,
+    panels: &EditorPanelRegistry,
+    frame: &mut EditorShellFrame,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
+) -> PanelWork {
+    let EditorShellState {
+        windows,
+        text,
+        theme,
+        sheet,
+        atlas,
+        ..
+    } = state;
+    let mut collected = PanelWork::default();
+    let mut answers: Vec<(String, usize)> = Vec::new();
+    // Step 1: the ownership pass. A registration that changed reopens a
+    // tool window on the new generation and closes a modal - its answer
+    // belonged to the code that asked the question; a registration that
+    // died closes both.
+    let mut index = 0;
+    while index < windows.len() {
+        let window = &mut windows[index];
+        match panels.panel_epoch(&window.request.panel) {
+            None => {
+                let closed = windows.remove(index);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = closed.request.id.as_str(),
+                    kind = closed.request.kind.title(),
+                    reason = "panel-gone",
+                    "[editor] window closed"
+                );
+            }
+            Some(epoch) if epoch != window.epoch => {
+                if window.request.kind == EditorWindowKind::Tool {
+                    window.epoch = epoch;
+                    // NOTE: asserted on by the editor's end-to-end suite.
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        id = window.request.id.as_str(),
+                        panel = window.request.panel.as_str(),
+                        "[editor] window reopened"
+                    );
+                    index += 1;
+                } else {
+                    let closed = windows.remove(index);
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        id = closed.request.id.as_str(),
+                        reason = "reload",
+                        "[editor] modal closed"
+                    );
+                }
+            }
+            Some(_) => index += 1,
+        }
+    }
+    // Step 2: each window's content. The request is cloned because the
+    // output takes it whole and the draw is the only piece that changes
+    // while a window is open.
+    for window in windows.iter_mut() {
+        let request = window.request.clone();
+        let width = request.width.max(0.0);
+        let height = request.height.max(0.0);
+        let modal = request.kind == EditorWindowKind::Modal;
+        let body_height = if modal {
+            (height - MODAL_BUTTON_ROW_HEIGHT).max(0.0)
+        } else {
+            height
+        };
+        let content_size = Vector2f::new(
+            (width - 2.0 * WINDOW_CONTENT_PADDING).max(0.0),
+            (body_height - 2.0 * WINDOW_CONTENT_PADDING).max(0.0),
+        );
+        let mut draw = DrawList::default();
+        draw.push_fill(
+            Rect::from_min_size(Vector2f::ZERO, Vector2f::new(width, height)),
+            theme.window,
+        );
+        // The window's own widget state, one frame's worth: it hit-tests
+        // against last frame's rectangles, in the same window coordinates
+        // the window's pointer arrives in.
+        window.ui.input.begin_frame();
+        window.ui.set_hit_rects(window.previous_hits.clone());
+        let mut work = PanelWork::default();
+        let started = Instant::now();
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut context = PanelContext {
+                snapshot: view.snapshot,
+                logs: view.logs,
+                selection: view.selection,
+                rect: EditorRect::new(
+                    WINDOW_CONTENT_PADDING,
+                    WINDOW_CONTENT_PADDING,
+                    content_size.x,
+                    content_size.y,
+                ),
+                text_buffers: &mut window.text,
+                work: &mut work,
+            };
+            subframe(
+                &mut window.ui,
+                text,
+                theme,
+                sheet,
+                atlas,
+                Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
+                content_size,
+                |builder| match panels.panel(&request.panel) {
+                    Some(build) => build(builder, &mut context),
+                    None => {
+                        builder.heading(&request.title);
+                        builder.separator();
+                        builder.label("This panel is not registered; see the log.");
+                    }
+                },
+            )
+        }));
+        let millis = started.elapsed().as_secs_f32() * 1000.0;
+        let (mut list, clipboard, named) = match built {
+            Ok(built) => built,
+            Err(payload) => {
+                let message = panic_message(&payload);
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = request.id.as_str(),
+                    panel = request.panel.as_str(),
+                    message = message.as_str(),
+                    "[editor] window panel panicked"
+                );
+                subframe(
+                    &mut window.ui,
+                    text,
+                    theme,
+                    sheet,
+                    atlas,
+                    Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
+                    content_size,
+                    |builder| {
+                        builder.heading(&request.title);
+                        builder.separator();
+                        builder.label("This panel panicked; see the log.");
+                    },
+                )
+            }
+        };
+        window.names = named;
+        let panel_hits = translated_hits(
+            window.ui.hit_rects(),
+            Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
+        );
+        draw.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+        // One build line per generation: the suite reads it to prove the
+        // window draws the module's current code, and the measured time
+        // proves the same panel-cost discipline the docked panels get.
+        if window.built_epoch != window.epoch {
+            window.built_epoch = window.epoch;
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                id = request.id.as_str(),
+                panel = request.panel.as_str(),
+                owner = window.owner.as_str(),
+                millis,
+                "[editor] window panel built"
+            );
+        }
+        // The modal's button row (Stage 24): a separator, then the request's
+        // buttons right-aligned beside the window's bottom edge. They are
+        // real widgets, so their clicks arrive through the window's own
+        // pointer channel like everything else in it - hit-testing against
+        // the previous frame's map, which still holds both the panel's
+        // rectangles and the row's from last frame.
+        if modal && !request.buttons.is_empty() {
+            let count = request.buttons.len() as f32;
+            let row_width = count * MODAL_BUTTON_WIDTH + (count - 1.0) * 8.0;
+            let row_origin = Vector2f::new(
+                (width - WINDOW_CONTENT_PADDING - row_width).max(WINDOW_CONTENT_PADDING),
+                height - MODAL_BUTTON_ROW_HEIGHT + 5.0,
+            );
+            draw.push_fill(
+                Rect::from_min_size(
+                    Vector2f::new(0.0, height - MODAL_BUTTON_ROW_HEIGHT),
+                    Vector2f::new(width, 1.0),
+                ),
+                theme.border,
+            );
+            window.ui.set_hit_rects(window.previous_hits.clone());
+            let mut pressed: Option<usize> = None;
+            let (mut button_list, button_clipboard, button_named) = subframe(
+                &mut window.ui,
+                text,
+                theme,
+                sheet,
+                atlas,
+                row_origin,
+                Vector2f::new(row_width, 22.0),
+                |builder| {
+                    builder.row(|row| {
+                        for (button_index, button) in request.buttons.iter().enumerate() {
+                            let name = format!("window.{}.button.{button_index}", request.id);
+                            if row.button_named(&name, &button.label) {
+                                pressed = Some(button_index);
+                            }
+                        }
+                    });
+                },
+            );
+            window.names.extend(button_named);
+            let mut hits = panel_hits;
+            hits.extend(translated_hits(window.ui.hit_rects(), row_origin));
+            window.previous_hits = hits;
+            draw.append(std::mem::take(&mut button_list));
+            frame.clipboard.extend(button_clipboard);
+            if let Some(button_index) = pressed {
+                answers.push((request.id.clone(), button_index));
+            }
+        } else {
+            window.previous_hits = panel_hits;
+        }
+        // The window's frame closes: every widget of it has seen this
+        // frame's release edge, so a drag inside the window ends now, once.
+        window.ui.end_frame();
+        collected.batches.extend(work.batches);
+        collected.commands.extend(work.commands);
+        if work.select_entity.is_some() {
+            collected.select_entity = work.select_entity;
+        }
+        if work.select_asset.is_some() {
+            collected.select_asset = work.select_asset;
+        }
+        if work.close_window.is_some() {
+            collected.close_window = work.close_window;
+        }
+        collected.windows.extend(work.windows);
+        frame.windows.push(EditorWindowRequest { draw, ..request });
+    }
+    // Step 3: the modal the executable blocks the editor's input behind
+    // (the newest one, should more than one ever be open).
+    frame.modal = windows
+        .iter()
+        .rev()
+        .find(|window| window.request.kind == EditorWindowKind::Modal)
+        .map(|window| window.request.id.clone());
+    // Step 4: the buttons answered this frame, applied after the build loop
+    // released its borrow of the window list.
+    for (id, button_index) in answers {
+        answer_window(state, registry, inbox, pending, history, &id, button_index);
+    }
+    collected
+}
+
+/// The freshly built widget rectangles, moved from the panel's own origin
+/// into the window's coordinates - the space the window's pointer arrives
+/// in (Stage 24).
+fn translated_hits(hits: &BTreeMap<WidgetId, Rect>, origin: Vector2f) -> BTreeMap<WidgetId, Rect> {
+    hits.iter()
+        .map(|(id, rect)| {
+            (
+                *id,
+                Rect::from_min_size(
+                    Vector2f::new(rect.min.x + origin.x, rect.min.y + origin.y),
+                    Vector2f::new(rect.width(), rect.height()),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Drains one panel's [`PanelWork`] into the shell's queues and state
+/// (Stage 16 onward): the edits, the commands, the console filters, the
+/// preferences write, the windows asked for and the window asked closed.
+/// Called for the docked panels and again for the free-standing windows'
+/// (Stage 24). The selection changes stay with the caller: it applies them
+/// where the frame's shared view is no longer borrowed.
+#[allow(clippy::too_many_arguments)]
+pub fn drain_panel_work(
+    state: &mut EditorShellState,
+    work: PanelWork,
+    frame: &mut EditorShellFrame,
+    panels: &EditorPanelRegistry,
+    pending: &mut PendingEditorCommands,
+    inbox: &mut CommandInbox,
+) {
+    for batch in work.batches {
+        pending.batches.push(batch);
+    }
+    for command in work.commands {
+        inbox.executed.push(command);
+    }
+    // The Inspector's per-component Copy button (Stage 18): the panel layer
+    // cannot reach the frame, so the request joins the clipboard actions.
+    if let Some(type_name) = work.copy_component {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            type_name = type_name.as_str(),
+            "[editor] clipboard component requested"
+        );
+        state.clipboard_action = Some(ClipboardAction::CopyComponent { type_name });
+    }
+    // An asset row held down goes to the executable (Stage 18): a drag that
+    // leaves the window becomes an OS drag of that file. The frame clears
+    // every frame, so a row that is no longer held drops out here.
+    if let Some(source) = work.drag_candidate {
+        frame.drag_candidate = Some(source);
+    }
+    // A Problems row's click (Stage 19) goes to the executable, which hands
+    // the file to the developer's editor.
+    if let Some(request) = work.open_file {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            file = request.file.as_str(),
+            line = request.line,
+            "[editor] problems row activated"
+        );
+        frame.requested_open = Some(request);
+    }
+    if let Some(level) = work.console_level {
+        state.console_level = level;
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            level,
+            "[editor] console filter level"
+        );
+    }
+    if let Some(channel) = work.console_channel {
+        state.console_channel = channel;
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            channel,
+            "[editor] console filter channel"
+        );
+    }
+    if let Some(search) = work.console_search {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            search = search.as_str(),
+            "[editor] console search"
+        );
+    }
+    if let Some(preferences) = work.preferences {
+        // The Preferences panel's save (D31): write the file; the
+        // live-reload reader applies it next frame and logs that it did.
+        let path = pill_editor_core::layout::layout_directory().join(PREFERENCES_FILE);
+        match std::fs::write(&path, preferences) {
+            Ok(()) => pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                path = %path.display(),
+                "[editor] preferences written"
+            ),
+            Err(error) => pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                error = %error,
+                "[editor] preferences write failed"
+            ),
+        }
+    }
+    // The free-standing windows the panel asked for (Stage 24), and the one
+    // it asked closed: resolved here, where the registry is in reach.
+    if let Some(id) = work.close_window {
+        close_window(state, &id, "request");
+    }
+    apply_window_requests(state, work.windows, panels);
 }
