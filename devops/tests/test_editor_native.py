@@ -10,7 +10,10 @@ navigation in the scene view, a live patch of the shell's system keeping its
 state, and a clean exit. Then it checks the clean exit code on five further
 runs. (The 200k-entity `circus_demo` this suite used to start is the
 pill-lab editor-shell measurement's job; it only made these phases race the
-executable's seconds deadline.)
+executable's seconds deadline.) Stage 22 adds the safe-mode paths - a shell
+that never loads, and a shell generation that panics on every frame - the
+Retry button that brings the shell back, and the redraw-on-change idle check
+(the executable's own `dump ui-frames` counter through the scripted channel).
 
 The only files this suite edits are the shell module's source (restored in a
 `finally`) and its own sandboxed layout files under `LOCALAPPDATA`;
@@ -858,6 +861,327 @@ def main() -> int:
     status = detached_process.wait(timeout=120)
     assert status == 0, f"detached fallback exited {status}"
     print("  [OK] forced detached fallback: attached, rendered, exited 0")
+
+    # Step 7: safe mode after a failed first load (Stage 22, D33). The
+    # shell's sources do not build at startup, so no shell generation ever
+    # loads; the editor must stay up - not exit - with its built-in
+    # safe-mode UI: the shell's build errors as rows, the scene, and a
+    # Retry button. Fixing the source and clicking Retry loads the shell
+    # and leaves safe mode with the saved layout.
+    broken_source = original_source.replace(
+        "let editor_frames_per_second = state.readout_frames_per_second;",
+        "let editor_frames_per_second = ;",
+        1,
+    )
+    assert broken_source != original_source, "the shell breakage anchor was not found"
+    shell_source.write_text(broken_source, encoding="utf-8")
+    safe_commands = logs / "commands-safe-mode.txt"
+    safe_commands.write_text("", encoding="utf-8")
+    safe_log = logs / "editor-native-safe-mode.log"
+    safe_process = start_editor(
+        binary,
+        arguments.project,
+        working_directory,
+        safe_log,
+        {
+            "LOCALAPPDATA": str(appdata),
+            "PILL_EDITOR_TEST_COMMANDS": str(safe_commands),
+            "PILL_EDITOR_TEST_SECONDS": "300",
+        },
+    )
+    try:
+        wait_for_token(safe_log, r"\[editor\] window created", safe_process, 180, "safe run")
+        wait_for_token(
+            safe_log,
+            r"optional module failed to load; the host continues without it",
+            safe_process,
+            240,
+            "tolerated shell failure",
+        )
+        wait_for_token(
+            safe_log,
+            r'\[editor\] problem\s+module="?pill_editor_shell_editor"?\s+'
+            r'level="?error"?\s+file="[^"]*pill_editor_shell_editor\.rs"\s+line=\d+',
+            safe_process,
+            120,
+            "shell build problem rows",
+        )
+        wait_for_token(
+            safe_log,
+            r'\[editor\] safe mode entered: no shell generation is running\s+'
+            r'reason="?shell-load-failed"?',
+            safe_process,
+            120,
+            "safe mode entered",
+        )
+        retry = wait_for_token(
+            safe_log,
+            r"\[editor\] safe mode retry button\s+x=([\d.]+)\s+y=([\d.]+)\s+"
+            r"width=([\d.]+)\s+height=([\d.]+)",
+            safe_process,
+            60,
+            "retry button",
+        )
+        retry_x, retry_y, retry_width, retry_height = [
+            float(entry) for entry in re.findall(r"=([\d.]+)", retry)
+        ]
+        # The safe layout keeps the Scene view: a click in the right column
+        # routes to the scene, not to the safe-mode UI.
+        append_command(safe_commands, "click 900 300")
+        wait_for_token(
+            safe_log,
+            r'\[editor\] test click\s+x=900(?:\.0)?\s+y=300(?:\.0)?\s+target="?scene"?',
+            safe_process,
+            30,
+            "safe mode scene view",
+        )
+        print(
+            f"  [OK] safe mode after a failed load; retry at "
+            f"({retry_x:.0f}, {retry_y:.0f})"
+        )
+        # Fix the source and click Retry; the rebuild and load run inside
+        # the click's own frame, so this wait covers the build too.
+        shell_source.write_text(original_source, encoding="utf-8")
+        append_command(
+            safe_commands,
+            f"click {retry_x + retry_width / 2:.0f} {retry_y + retry_height / 2:.0f}",
+        )
+        wait_for_token(
+            safe_log, r"\[editor\] safe mode retry requested", safe_process, 300,
+            "retry request",
+        )
+        wait_for_token(
+            safe_log, r"\[editor\] pill_editor_shell_editor loaded", safe_process, 120,
+            "shell load after retry",
+        )
+        wait_for_token(
+            safe_log, r"\[editor\] safe mode left: the shell runs again", safe_process,
+            120, "safe mode left",
+        )
+        wait_for_token(
+            safe_log, r"\[editor\] shell frame\s+frames=(\d+)\s+panels=([1-9]\d*)",
+            safe_process, 120, "panels after retry",
+        )
+        print("  [OK] retry loaded the shell and left safe mode, layout painted")
+        append_command(safe_commands, "quit")
+        wait_for_token(
+            safe_log, r"\[editor\] test channel: quit requested", safe_process, 30,
+            "safe mode quit",
+        )
+        status = safe_process.wait(timeout=60)
+        assert status == 0, f"the safe-mode run exited {status}"
+        print("  [OK] safe-mode run exited 0")
+    finally:
+        shell_source.write_text(original_source, encoding="utf-8")
+        if safe_process.poll() is None:
+            safe_process.kill()
+            safe_process.wait(timeout=30)
+
+    # Step 8: safe mode with a shell that never gets going (Stage 22, D33):
+    # the first generation loads but panics on every run, so no frame is
+    # ever stamped. Retrying the same panicking code stays in safe mode;
+    # fixing the source reloads it through the watcher and leaves it.
+    panic_anchor = (
+        "    let (mut state, mut input, mut frame, editor_snapshot, logs, "
+        "clipboard_answer) = view;"
+    )
+    panicking_source = original_source.replace(
+        panic_anchor,
+        '    panic!("stage 22: the shell generation panics on purpose");\n'
+        + panic_anchor,
+        1,
+    )
+    assert panicking_source != original_source, "the shell panic anchor was not found"
+    shell_source.write_text(panicking_source, encoding="utf-8")
+    stopped_commands = logs / "commands-safe-stopped.txt"
+    stopped_commands.write_text("", encoding="utf-8")
+    stopped_log = logs / "editor-native-safe-stopped.log"
+    stopped_process = start_editor(
+        binary,
+        arguments.project,
+        working_directory,
+        stopped_log,
+        {
+            "LOCALAPPDATA": str(appdata),
+            "PILL_EDITOR_TEST_COMMANDS": str(stopped_commands),
+            "PILL_EDITOR_TEST_SECONDS": "300",
+        },
+    )
+    live_pattern = r"LIVE \d+ ms|extension reload processed"
+    try:
+        wait_for_token(
+            stopped_log, r"\[editor\] window created", stopped_process, 180,
+            "stopped run",
+        )
+        wait_for_token(
+            stopped_log, r"\[editor\] pill_editor_shell_editor loaded",
+            stopped_process, 240, "stopped run shell load",
+        )
+        wait_for_token(
+            stopped_log,
+            r'\[editor\] safe mode entered: no shell generation is running\s+'
+            r'reason="?shell-stopped"?',
+            stopped_process,
+            180,
+            "safe mode entered (stopped)",
+        )
+        retry = wait_for_token(
+            stopped_log,
+            r"\[editor\] safe mode retry button\s+x=([\d.]+)\s+y=([\d.]+)\s+"
+            r"width=([\d.]+)\s+height=([\d.]+)",
+            stopped_process,
+            60,
+            "retry button (stopped)",
+        )
+        retry_x, retry_y, retry_width, retry_height = [
+            float(entry) for entry in re.findall(r"=([\d.]+)", retry)
+        ]
+        live_seen = len(re.findall(live_pattern, read_log(stopped_log)))
+        append_command(
+            stopped_commands,
+            f"click {retry_x + retry_width / 2:.0f} {retry_y + retry_height / 2:.0f}",
+        )
+        wait_for_token(
+            stopped_log, r"\[editor\] safe mode retry requested", stopped_process, 60,
+            "retry request (stopped)",
+        )
+        # The retry rebuilds and reloads the same panicking code; the shell
+        # must stay in safe mode.
+        wait_for_occurrence(
+            stopped_log, live_pattern, live_seen + 1, stopped_process, 240,
+            "retry reload",
+        )
+        time.sleep(2.0)
+        assert "safe mode left" not in read_log(stopped_log), (
+            "safe mode left while the shell's code still panics"
+        )
+        print("  [OK] safe mode with a panicking shell; retry kept waiting")
+        # Fix the source: the watcher reloads it and the frames resume.
+        shell_source.write_text(original_source, encoding="utf-8")
+        wait_for_occurrence(
+            stopped_log, live_pattern, live_seen + 2, stopped_process, 240,
+            "recovery reload",
+        )
+        wait_for_token(
+            stopped_log, r"\[editor\] safe mode left: the shell runs again",
+            stopped_process, 120, "safe mode left (stopped)",
+        )
+        wait_for_token(
+            stopped_log, r"\[editor\] shell frame\s+frames=(\d+)\s+panels=([1-9]\d*)",
+            stopped_process, 120, "panels after recovery",
+        )
+        print("  [OK] fixing the source reloaded the shell and left safe mode")
+        append_command(stopped_commands, "quit")
+        wait_for_token(
+            stopped_log, r"\[editor\] test channel: quit requested", stopped_process,
+            30, "stopped run quit",
+        )
+        status = stopped_process.wait(timeout=60)
+        assert status == 0, f"the panicking-shell run exited {status}"
+        print("  [OK] panicking-shell run exited 0")
+    finally:
+        shell_source.write_text(original_source, encoding="utf-8")
+        if stopped_process.poll() is None:
+            stopped_process.kill()
+            stopped_process.wait(timeout=30)
+
+    # Step 9: redraw on change (Stage 22, D25). With a static layout (one
+    # Scene tabset, no live Statistics text), the project paused and no
+    # input, the editor must not present UI frames; a pointer move onto a
+    # menu title must produce one. The counter is the executable's own,
+    # read through the scripted channel; the one thing still allowed to
+    # change is the badge's integer frame-rate text, so the quiet check
+    # tolerates the odd present it may cause.
+    STATIC_LAYOUT = """{
+  "schema_version": 2,
+  "root": 1,
+  "nodes": {
+    "1": { "type": "tab_set", "tabs": [2], "selected": 2 },
+    "2": { "type": "tab", "title": "Scene", "panel": "scene", "closeable": false }
+  },
+  "active_tabset": 1,
+  "next_id": 3
+}
+"""
+    native_layout.write_text(STATIC_LAYOUT, encoding="utf-8")
+    idle_commands = logs / "commands-idle.txt"
+    idle_commands.write_text("", encoding="utf-8")
+    idle_log = logs / "editor-native-idle.log"
+    idle_process = start_editor(
+        binary,
+        arguments.project,
+        working_directory,
+        idle_log,
+        {
+            "LOCALAPPDATA": str(appdata),
+            "PILL_EDITOR_TEST_COMMANDS": str(idle_commands),
+            "PILL_EDITOR_TEST_SECONDS": "180",
+        },
+    )
+    try:
+        wait_for_token(
+            idle_log, r"\[editor\] pill_editor_shell_editor loaded", idle_process,
+            180, "idle run",
+        )
+        wait_for_token(
+            idle_log, r"\[editor\] shell frame\s+frames=\d+\s+panels=([1-9]\d*)",
+            idle_process, 120, "idle layout",
+        )
+        # Pause the project's systems; the shell's own system keeps running
+        # (that is what safe mode's liveness check relies on).
+        append_command(idle_commands, "command editor.pause_toggle")
+        wait_for_token(
+            idle_log, r"\[editor\] test channel: command request", idle_process, 30,
+            "pause request",
+        )
+        time.sleep(2.0)
+
+        def ui_frames_so_far() -> int:
+            """The presented-frame count, by asking the editor to dump it."""
+            pattern = r"\[editor\] ui frames\s+presented=(\d+)"
+            seen = len(re.findall(pattern, read_log(idle_log)))
+            append_command(idle_commands, "dump ui-frames")
+            wait_for_occurrence(
+                idle_log, pattern, seen + 1, idle_process, 60, "ui frames dump"
+            )
+            return int(re.findall(pattern, read_log(idle_log))[-1])
+
+        first = ui_frames_so_far()
+        time.sleep(5.0)
+        second = ui_frames_so_far()
+        assert second - first <= 2, (
+            f"the idle editor kept presenting UI frames: {first} -> {second}"
+        )
+        print(
+            f"  [OK] idle: {second - first} UI frames in five seconds"
+        )
+        append_command(idle_commands, "move 40 13")
+        wait_for_token(
+            idle_log, r"\[editor\] test move\s+x=40(?:\.0)?\s+y=13(?:\.0)?",
+            idle_process, 30, "move command",
+        )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if ui_frames_so_far() > second:
+                break
+        else:
+            raise TimeoutError(
+                "hovering the UI did not redraw it\n" + read_log(idle_log)[-4000:]
+            )
+        print("  [OK] a pointer move onto the UI redrew it")
+        append_command(idle_commands, "quit")
+        wait_for_token(
+            idle_log, r"\[editor\] test channel: quit requested", idle_process, 30,
+            "idle run quit",
+        )
+        status = idle_process.wait(timeout=60)
+        assert status == 0, f"the idle run exited {status}"
+        print("  [OK] idle run exited 0")
+    finally:
+        if idle_process.poll() is None:
+            idle_process.kill()
+            idle_process.wait(timeout=30)
+
     print("PASS: editor native end-to-end")
     return 0
 

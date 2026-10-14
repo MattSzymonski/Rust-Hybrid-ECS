@@ -80,6 +80,12 @@ pub const PREFERENCES_FILE: &str = pill_editor_core::commands::PREFERENCES_FILE;
 /// left below it.
 pub const MENU_BAR_HEIGHT: f64 = 26.0;
 
+/// How often the live readouts - the frame-rate badge's text and the
+/// Statistics panel's numbers - refresh, in shell frames (Stage 22, D25):
+/// with the value sampled, an otherwise-clean UI presents at this cadence
+/// instead of every frame.
+pub const READOUT_REFRESH_FRAMES: u64 = 120;
+
 /// One dropdown or palette row's height, in logical pixels.
 const MENU_ITEM_HEIGHT: f64 = 24.0;
 
@@ -132,6 +138,11 @@ pub struct EditorShellState {
     /// Frames the shell has drawn, for the Statistics panel and the
     /// reload-proof heartbeat.
     pub frame_index: u64,
+    /// The frame rate the badge and the Statistics panel show: sampled from
+    /// the executable's feed every `READOUT_REFRESH_FRAMES`, and held while
+    /// the project is paused (Stage 22, D25) - a readout changing every
+    /// frame would defeat the redraw-on-change gate and flicker.
+    pub readout_frames_per_second: f32,
     /// Wall time the panels' paint took on the previous frame, in
     /// microseconds: the heartbeat reports it, so a panel regression is
     /// visible in any log (the D32 measurement found one this way).
@@ -328,6 +339,22 @@ pub enum ClipboardAction {
 }
 
 impl EditorShellState {
+    /// Refresh the badge and Statistics readouts (Stage 22, D25): sampled
+    /// every `READOUT_REFRESH_FRAMES`, and not at all while the project's
+    /// systems are paused - the numbers would describe a world that is not
+    /// advancing, and a pause must leave the UI still.
+    pub fn refresh_readout(&mut self, frames_per_second: f32) {
+        if self.paused && self.readout_frames_per_second != 0.0 {
+            return;
+        }
+        if self.readout_frames_per_second != 0.0
+            && !self.frame_index.is_multiple_of(READOUT_REFRESH_FRAMES)
+        {
+            return;
+        }
+        self.readout_frames_per_second = frames_per_second;
+    }
+
     /// The state's first value: the native layout file when one exists,
     /// the classic editor's file migrated once when only that exists, the
     /// default workspace otherwise.
@@ -340,6 +367,7 @@ impl EditorShellState {
             sheet: Stylesheet::parse(pill_ui::DEFAULT_SHEET),
             atlas: Atlas::new(ATLAS_SIZE.0, ATLAS_SIZE.1),
             frame_index: 0,
+            readout_frames_per_second: 0.0,
             last_panels_us: 0,
             clipboard_action: None,
             clipboard_seq_seen: 0,

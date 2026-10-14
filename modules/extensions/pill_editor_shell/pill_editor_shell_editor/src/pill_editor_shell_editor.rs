@@ -223,6 +223,10 @@ pub fn editor_shell_update(
     // it - and key presses are collected with the modifiers current at
     // their moment, for the shortcut pass once the files are current.
     state.paused = input.systems_paused;
+    // The live readouts refresh at their own cadence, and hold while the
+    // project is paused (Stage 22, D25); both the badge and the Statistics
+    // panel read the sampled value.
+    state.refresh_readout(input.editor_frames_per_second);
     let mut pressed: Vec<(pill_engine::KeyCode, pill_engine::Modifiers)> = Vec::new();
     for event in input.events.drain(..) {
         match &event {
@@ -351,7 +355,9 @@ pub fn editor_shell_update(
             rect.height as f32,
         )
     });
-    let editor_frames_per_second = input.editor_frames_per_second;
+    // The badge and the Statistics panel show the sampled readout, not the
+    // executable's live feed (Stage 22, D25).
+    let editor_frames_per_second = state.readout_frames_per_second;
     // Step 4: the panels' hit rectangles from the previous frame, saved
     // before anything repaints: each panel's build must test against the
     // previous frame's full map, not the panels painted before it.
@@ -609,4 +615,8 @@ pub fn editor_shell_update(
     paint_overlay_badge(&mut state, &mut frame, editor_frames_per_second);
     // Step 6: this frame's atlas additions, for the executable to upload.
     frame.atlas = state.atlas.take_update();
+    // The frame stamp the executable watches (Stage 22): at the end, so any
+    // panic in the update's body leaves it where it was and the shell reads
+    // as stopped, not as healthy.
+    frame.frames = state.frame_index;
 }

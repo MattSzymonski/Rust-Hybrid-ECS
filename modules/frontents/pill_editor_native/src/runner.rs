@@ -77,6 +77,17 @@ use crate::test_channel::{self, TestChannel, TestCommand};
 // Constants
 // =============================================================================
 
+/// The shell module's crate name - the editor-only module's convention
+/// (`extensions/pill_editor_shell/pill_editor_shell_editor`). The editor
+/// watches its frame stamp and retries it from safe mode (Stage 22, D33).
+const SHELL_MODULE_NAME: &str = "pill_editor_shell_editor";
+
+/// World frames without a fresh shell frame stamp before no shell generation
+/// counts as running (Stage 22): about two seconds at the editor's frame
+/// rate, so a reload in flight or a slow first system run cannot trip safe
+/// mode.
+const SHELL_STALL_FRAMES: u64 = 150;
+
 /// The editor UI's atlas size, in pixels; the sampler's one texture holds
 /// every glyph and icon the UI draws.
 const ATLAS_SIZE: (u32, u32) = (2048, 2048);
@@ -233,11 +244,12 @@ mod gizmo_tests {
 /// device - with a setup failure recorded before the loop reported at the
 /// same boundary.
 pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
-    // Step 1: the event loop, polling rather than waiting so a frame is
-    // always one redraw request away.
+    // Step 1: the event loop. It waits between frames and wakes on its
+    // redraw requests, input and popups; the frame boundary asks for the
+    // next frame only while something needs one (Stage 22, D25).
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     // Step 2: run until the last window closes.
     let mut application = EditorApplication {
         log_buffer: Some(log_buffer),
@@ -278,9 +290,9 @@ impl ApplicationHandler for EditorApplication {
         }
         match EditorWindow::open(event_loop, self.log_buffer.clone()) {
             Ok(editor) => {
-                event_loop.set_control_flow(ControlFlow::Poll);
-                // The first frame draws before the loop's first redraw
-                // request, so the window is never shown empty.
+                event_loop.set_control_flow(ControlFlow::Wait);
+                // The loop's first boundary asks for the first frame, so the
+                // window is never shown empty.
                 self.editor = Some(editor);
             }
             Err(error) => {
@@ -387,6 +399,7 @@ impl ApplicationHandler for EditorApplication {
             return;
         };
         editor.sync_popups(event_loop);
+        editor.schedule_frame(event_loop);
     }
 }
 
@@ -563,6 +576,10 @@ struct EditorWindow {
     /// Whether the overlay was refused on purpose (`PILL_EDITOR_NO_OVERLAY`),
     /// so the fallback path stays exercised.
     overlay_forced_failure: bool,
+    /// Whether every UI frame presents regardless of content
+    /// (`PILL_EDITOR_CONTINUOUS_REDRAW`): the debugging switch that shows
+    /// what the redraw-on-change gate saves (Stage 22, D25).
+    continuous_redraw: bool,
     /// The overlay list the shell built last frame, waiting for its draw:
     /// the composition overlay takes it at the end of the frame, and without
     /// one the world's UI context takes it at the start of the next.
@@ -588,6 +605,31 @@ struct EditorWindow {
     /// The overlay list's vertex count at the last heartbeat log, so the
     /// overlay's path and content log on a change rather than every frame.
     overlay_vertices_logged: usize,
+    /// The last shell frame stamp seen (Stage 22). A stamp that does not
+    /// change while the world runs means no shell generation is running.
+    shell_frames: u64,
+    /// World frames spent without such a change; safe mode engages past
+    /// `SHELL_STALL_FRAMES`.
+    shell_still_frames: u64,
+    /// Set while no shell generation runs and the built-in safe-mode UI is
+    /// showing (Stage 22, D33).
+    safe_mode: Option<SafeMode>,
+    /// Input, scripted commands, resize, safe-mode transitions and the
+    /// fallback UI mark the next UI frame dirty; the content hash covers
+    /// everything else (Stage 22, D25).
+    ui_dirty: bool,
+    /// The last presented UI content's signature; equal means nothing to
+    /// present.
+    ui_signature: Option<u64>,
+    /// How many window-surface UI frames were presented: the scripted idle
+    /// check counts it (Stage 22).
+    ui_frames_presented: u64,
+    /// The same count split by what changed: panels' content, and the
+    /// overlay's (the frame-rate badge's text is the time-varying one).
+    ui_panels_presented: u64,
+    ui_overlay_presented: u64,
+    ui_panels_signature: Option<u64>,
+    ui_overlay_signature: Option<u64>,
 }
 
 impl EditorWindow {
@@ -678,6 +720,15 @@ impl EditorWindow {
         // refusal, the same list draws through the renderer's UI pass into
         // the scene instead.
         let overlay_forced_failure = std::env::var_os("PILL_EDITOR_NO_OVERLAY").is_some();
+        // Forced continuous redraw: the gate below is skipped, every frame
+        // presents, and the loop keeps requesting frames (Stage 22, D25).
+        let continuous_redraw = std::env::var_os("PILL_EDITOR_CONTINUOUS_REDRAW").is_some();
+        if continuous_redraw {
+            info!(
+                target: telemetry_target::ENGINE,
+                "[editor] continuous redraw forced by PILL_EDITOR_CONTINUOUS_REDRAW"
+            );
+        }
         let overlay = if overlay_forced_failure {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -900,6 +951,7 @@ impl EditorWindow {
             gizmo_drag_seq: 0,
             overlay,
             overlay_forced_failure,
+            continuous_redraw,
             pending_overlay: None,
             overlay_opaque: Vec::new(),
             overlay_labels: Vec::new(),
@@ -907,6 +959,16 @@ impl EditorWindow {
             requested_popups: None,
             popup_closed: Vec::new(),
             overlay_vertices_logged: usize::MAX,
+            shell_frames: 0,
+            shell_still_frames: 0,
+            safe_mode: None,
+            ui_dirty: true,
+            ui_signature: None,
+            ui_frames_presented: 0,
+            ui_panels_presented: 0,
+            ui_overlay_presented: 0,
+            ui_panels_signature: None,
+            ui_overlay_signature: None,
         })
     }
 
@@ -925,12 +987,15 @@ impl EditorWindow {
         }
         // A resize redraws immediately; the scene surfaces follow through
         // the host's own resize path.
+        self.ui_dirty = true;
         self.window.request_redraw();
     }
 
     /// Queue one `winit` event's engine form into the UI input, in logical
     /// pixels.
     fn push_ui_input(&mut self, event: &WindowEvent) {
+        // Any input redraws the UI (Stage 22, D25).
+        self.ui_dirty = true;
         // The real button state, for the drag-out trigger: `CursorLeft`
         // carries no button information of its own.
         if let WindowEvent::MouseInput { state, button, .. } = event {
@@ -962,9 +1027,9 @@ impl EditorWindow {
         }
     }
 
-    /// The executable's own minimal UI, used while the shell module is not
-    /// loaded (or failed): the temporary Statistics panel over the window
-    /// fill. Also the base the safe mode of a later milestone builds on.
+    /// The executable's own minimal UI, used while no shell output has been
+    /// read yet: the temporary Statistics panel over the window fill. Safe
+    /// mode (Stage 22) replaces it once a stall is detected.
     fn fallback_ui_frame(&mut self, available: Vector2f) -> (DrawList, Vec<ClipboardRequest>) {
         self.state.input.begin_frame();
         let frames_per_second = self.frames_per_second;
@@ -996,6 +1061,127 @@ impl EditorWindow {
             self.ui.apply_atlas_update(&self.queue, &update);
         }
         (list, output.clipboard)
+    }
+
+    /// Swap the shell's output for safe mode's while no shell generation
+    /// runs (Stage 22, D33): the shell's problems over the scene, with a
+    /// Retry button that rebuilds the shell.
+    fn safe_mode_output(&mut self, available: Vector2f) -> ShellOutput {
+        let (panels, retry_rect, clicked) = self.safe_mode_frame(available);
+        if clicked {
+            match self.host.host_mut().retry_extension(SHELL_MODULE_NAME) {
+                Ok(()) => info!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] safe mode retry requested"
+                ),
+                Err(error) => warn!(
+                    target: telemetry_target::ENGINE,
+                    error = error.as_str(),
+                    "[editor] safe mode retry failed"
+                ),
+            }
+        }
+        // Log the retry button's rectangle when it moves: the suite clicks
+        // it through the test channel.
+        let previous = self
+            .safe_mode
+            .as_ref()
+            .and_then(|safe_mode| safe_mode.retry_rect);
+        if previous != retry_rect {
+            if let Some(rect) = retry_rect {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    x = rect.x,
+                    y = rect.y,
+                    width = rect.width,
+                    height = rect.height,
+                    "[editor] safe mode retry button"
+                );
+            }
+            if let Some(safe_mode) = self.safe_mode.as_mut() {
+                safe_mode.retry_rect = retry_rect;
+            }
+        }
+        ShellOutput {
+            panels,
+            atlas: None,
+            clipboard: Vec::new(),
+            objects: Vec::new(),
+            clipboard_read: None,
+            assets_rect: self.last_assets_rect,
+            drag_candidate: None,
+            requested_open: None,
+            scene_rect: Some(safe_mode_scene_rect(available)),
+            game_rect: None,
+            overlay: DrawList::default(),
+            overlay_opaque: Vec::new(),
+            popups: Vec::new(),
+            frames: 0,
+        }
+    }
+
+    /// Safe mode's UI (Stage 22, D33). Returns the draw list, the retry
+    /// button's rectangle when the layout gave it one, and whether it was
+    /// activated.
+    fn safe_mode_frame(&mut self, available: Vector2f) -> (DrawList, Option<EditorRect>, bool) {
+        let reason = self
+            .safe_mode
+            .as_ref()
+            .map(|safe_mode| safe_mode.reason)
+            .unwrap_or(SafeModeReason::LoadFailed);
+        // The shell's problems: its build's parsed diagnostics (file:line
+        // rows) when it failed to load, or its patch failures.
+        let rows: Vec<String> = self
+            .notices
+            .problems
+            .iter()
+            .filter(|problem| problem.module == SHELL_MODULE_NAME)
+            .take(16)
+            .map(problem_row)
+            .collect();
+        let mut retry_clicked = false;
+        self.state.input.begin_frame();
+        let (output, layout) = run_frame(
+            &mut self.state,
+            &mut self.text,
+            &self.theme,
+            &mut self.sheet,
+            available,
+            |ui| {
+                retry_clicked = safe_mode_panel(ui, reason, &rows);
+            },
+        );
+        self.state.end_frame();
+        let mut list = DrawList::new();
+        list.push_fill(
+            Rect::from_min_size(Vector2f::ZERO, available),
+            self.theme.window,
+        );
+        paint(
+            &output.tree,
+            &layout,
+            &self.theme,
+            &self.state,
+            &mut self.text,
+            &mut self.atlas,
+            &mut list,
+        );
+        if let Some(update) = self.atlas.take_update() {
+            self.ui.apply_atlas_update(&self.queue, &update);
+        }
+        let retry_rect = output
+            .named
+            .get(RETRY_WIDGET_NAME)
+            .and_then(|id| self.state.hit_rects().get(id))
+            .map(|rect| {
+                EditorRect::new(
+                    rect.min.x,
+                    rect.min.y,
+                    rect.max.x - rect.min.x,
+                    rect.max.y - rect.min.y,
+                )
+            });
+        (list, retry_rect, retry_clicked)
     }
 
     /// Whether a window id is the scene surface's.
@@ -1066,13 +1252,46 @@ impl EditorWindow {
         self.quit_requested
     }
 
+    /// Ask for the next frame only while something needs one (Stage 22,
+    /// D25): the scene keeps its pace, while a clean, idle UI sleeps - input
+    /// and popups wake the wait through their own events. The forced
+    /// continuous redraw keeps the old always-on pacing.
+    fn schedule_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let need_frames = self.continuous_redraw
+            || self.scene_attached
+            || self.ui_dirty
+            || self.overlay.is_some()
+            || !self.popups.is_empty()
+            || self.test_channel.is_some()
+            || self.safe_mode.is_some();
+        event_loop.set_control_flow(ControlFlow::Wait);
+        if need_frames {
+            self.window.request_redraw();
+        }
+    }
+
     /// Execute whatever the scripted suite appended since the last frame,
     /// and enforce `PILL_EDITOR_TEST_SECONDS`.
     fn poll_test_channel(&mut self) {
         if let Some(channel) = &mut self.test_channel {
             for command in channel.poll() {
+                // A scripted command that changes what the UI shows marks
+                // the next frame dirty (Stage 22, D25); the pure
+                // diagnostics - dumps, edits, unknown lines - do not, so
+                // the idle check's own dumps do not count as redraws.
+                if !matches!(
+                    command,
+                    TestCommand::Dump(_)
+                        | TestCommand::Quit
+                        | TestCommand::Edit(_)
+                        | TestCommand::DragOut { .. }
+                        | TestCommand::Unknown { .. }
+                ) {
+                    self.ui_dirty = true;
+                }
                 match command {
                     TestCommand::Click { x, y } => self.inject_click(x, y),
+                    TestCommand::Move { x, y } => self.inject_move(x, y),
                     TestCommand::RightClick { x, y } => self.inject_right_click(x, y),
                     TestCommand::PopupPointer { id, x, y, released } => {
                         let position = Vector2f::new(x, y);
@@ -1392,6 +1611,17 @@ impl EditorWindow {
 
     /// Answer one scripted world query on the log, for the suite to assert.
     fn dump_world(&mut self, query: test_channel::DumpQuery) {
+        // The UI-frame count is the executable's own; no world needed.
+        if matches!(query, test_channel::DumpQuery::UiFrames) {
+            info!(
+                target: telemetry_target::ENGINE,
+                presented = self.ui_frames_presented,
+                panels = self.ui_panels_presented,
+                overlay = self.ui_overlay_presented,
+                "[editor] ui frames"
+            );
+            return;
+        }
         let engine = self.host.host_mut().engine_mut();
         let world = engine.world();
         match query {
@@ -1486,6 +1716,9 @@ impl EditorWindow {
                     ),
                 }
             }
+            // Handled above, before the world borrow; here to keep the
+            // match exhaustive.
+            test_channel::DumpQuery::UiFrames => {}
         }
     }
 
@@ -1593,6 +1826,22 @@ impl EditorWindow {
                 self.pending_ui_events.push(event);
             }
         }
+    }
+
+    /// Inject a bare pointer move at a logical position (Stage 22): the
+    /// suite's idle check hovers a button and expects the UI to redraw.
+    fn inject_move(&mut self, x: f32, y: f32) {
+        info!(
+            target: telemetry_target::ENGINE,
+            x,
+            y,
+            "[editor] test move"
+        );
+        let event = InputEvent::CursorMoved {
+            position: Vector2f::new(x, y),
+        };
+        self.state.input.apply(&event);
+        self.pending_ui_events.push(event);
     }
 
     /// A scripted right-click: press and release the right button over the
@@ -3095,11 +3344,54 @@ impl EditorWindow {
                     overlay: std::mem::take(&mut frame.overlay),
                     overlay_opaque: std::mem::take(&mut frame.overlay_opaque),
                     popups: std::mem::take(&mut frame.popups),
+                    frames: frame.frames,
                 })
         };
+        // Step 4a: the shell's liveness (Stage 22, D33). The world's frame
+        // runs the shell's system, which stamps its frame number at the end
+        // of each update; a missing stamp on an established world, or one
+        // that stands still, means no shell generation is left running. The
+        // executable takes over with safe mode until a retry brings one
+        // back.
+        let shell_frames = shell_output.as_ref().map(|output| output.frames);
+        match shell_frames {
+            Some(frames) if frames != self.shell_frames => {
+                self.shell_frames = frames;
+                self.shell_still_frames = 0;
+                if let Some(safe_mode) = self.safe_mode.take() {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        reason = safe_mode.reason.as_str(),
+                        "[editor] safe mode left: the shell runs again"
+                    );
+                    self.ui_dirty = true;
+                }
+            }
+            _ => {
+                self.shell_still_frames += 1;
+                if self.safe_mode.is_none() && self.shell_still_frames > SHELL_STALL_FRAMES {
+                    let reason = match shell_frames {
+                        Some(_) => SafeModeReason::Stopped,
+                        None => SafeModeReason::LoadFailed,
+                    };
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        reason = reason.as_str(),
+                        "[editor] safe mode entered: no shell generation is running"
+                    );
+                    self.safe_mode = Some(SafeMode {
+                        reason,
+                        retry_rect: None,
+                    });
+                    self.ui_dirty = true;
+                }
+            }
+        }
         let output = match shell_output {
-            Some(output) => output,
-            None => {
+            Some(output) if self.safe_mode.is_none() => output,
+            _ if self.safe_mode.is_some() => self.safe_mode_output(available),
+            _ => {
+                // The grace before safe mode engages: the plain fallback.
                 let (panels, clipboard) = self.fallback_ui_frame(available);
                 ShellOutput {
                     panels,
@@ -3115,9 +3407,15 @@ impl EditorWindow {
                     overlay: DrawList::default(),
                     overlay_opaque: Vec::new(),
                     popups: Vec::new(),
+                    frames: 0,
                 }
             }
         };
+        // The signature of what this frame would draw, taken before any of
+        // the output is consumed below; the present gate compares it, and
+        // the overlay's own hash feeds the idle check's split (Stage 22).
+        let signature = ui_content_signature(&output);
+        let overlay_signature = overlay::content_signature(&output.overlay);
         // Step 4b: apply the engine mutations the shell's command handlers
         // queued. This is the frame boundary the `EditorCommand` contract
         // names; a failed command never aborts the rest of the batch.
@@ -3402,6 +3700,27 @@ impl EditorWindow {
         // the project's preferences entry, once, from the side that knows
         // the project.
         self.persist_gizmo_settings();
+        // Step 8: present the UI only when it changed (Stage 22, D25): an
+        // unchanged frame costs no window present and no UI GPU work. Input,
+        // scripted commands, resize and safe-mode transitions mark the UI
+        // dirty; the content hash catches everything else. The forced
+        // continuous redraw skips the gate entirely.
+        if !self.continuous_redraw && !self.ui_dirty && self.ui_signature == Some(signature) {
+            return Ok(());
+        }
+        self.ui_signature = Some(signature);
+        self.ui_dirty = false;
+        self.ui_frames_presented += 1;
+        // Which half changed; the split is what the idle check reads.
+        let panels_signature = overlay::content_signature(&output.panels);
+        if self.ui_panels_signature != Some(panels_signature) {
+            self.ui_panels_signature = Some(panels_signature);
+            self.ui_panels_presented += 1;
+        }
+        if self.ui_overlay_signature != Some(overlay_signature) {
+            self.ui_overlay_signature = Some(overlay_signature);
+            self.ui_overlay_presented += 1;
+        }
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
         let frame = match self.surface.get_current_texture() {
@@ -3457,11 +3776,126 @@ impl EditorWindow {
         }
         self.popups
             .render(&self.device, &self.queue, &mut self.ui, self.theme.window);
-        // Step 9: the loop is the pacing; the next frame starts when this
-        // one finished.
-        self.window.request_redraw();
+        // Step 9: the frame boundary schedules the next frame; this one only
+        // returns the pacing to the loop (Stage 22, D25).
         Ok(())
     }
+}
+
+// =============================================================================
+// Safe mode (Stage 22, D33)
+// =============================================================================
+
+/// Why safe mode engaged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SafeModeReason {
+    /// No shell generation ever loaded: the first load failed.
+    LoadFailed,
+    /// A shell generation stopped running after a good one had loaded.
+    Stopped,
+}
+
+impl SafeModeReason {
+    /// The reason for the log line, as the suite matches it.
+    fn as_str(self) -> &'static str {
+        match self {
+            SafeModeReason::LoadFailed => "shell-load-failed",
+            SafeModeReason::Stopped => "shell-stopped",
+        }
+    }
+}
+
+/// Safe mode's own state, kept across frames while the built-in UI shows.
+struct SafeMode {
+    /// Why it engaged; the status line and the log name it.
+    reason: SafeModeReason,
+    /// The retry button's rectangle, logged when it moves so the suite can
+    /// click it.
+    retry_rect: Option<EditorRect>,
+}
+
+/// The name the safe-mode Retry button registers under.
+const RETRY_WIDGET_NAME: &str = "safe_mode.retry";
+
+/// Safe mode's report panel: why the shell is not running, its problems,
+/// and the Retry button. Returns whether Retry was activated this frame.
+fn safe_mode_panel(ui: &mut PanelBuilder<'_>, reason: SafeModeReason, rows: &[String]) -> bool {
+    let mut retry = false;
+    ui.column_named("safe_mode", |ui| {
+        ui.heading("Safe mode");
+        ui.separator();
+        let status = match reason {
+            SafeModeReason::LoadFailed => {
+                "The shell module failed to load; showing the built-in UI."
+            }
+            SafeModeReason::Stopped => "The shell stopped running; showing the built-in UI.",
+        };
+        ui.label(status);
+        if rows.is_empty() {
+            ui.label("The log has the details; the console output names the failure.");
+        } else {
+            for row in rows {
+                ui.label(row);
+            }
+        }
+        ui.separator();
+        if ui.button_named(RETRY_WIDGET_NAME, "Retry") {
+            retry = true;
+        }
+    });
+    retry
+}
+
+/// One problem row: single-line, clipped to a length a panel row shows.
+fn problem_row(problem: &EditorProblem) -> String {
+    const MAX_CHARS: usize = 96;
+    let location = match (&problem.file, problem.line) {
+        (Some(file), Some(line)) => format!("{file}:{line}"),
+        (Some(file), None) => file.clone(),
+        _ => String::new(),
+    };
+    let level = match problem.level {
+        EditorProblemLevel::Error => "error",
+        EditorProblemLevel::Warning => "warning",
+        EditorProblemLevel::Note => "info",
+    };
+    let first_line = problem.message.lines().next().unwrap_or("");
+    let mut message: String = first_line.chars().take(MAX_CHARS).collect();
+    if first_line.chars().count() > MAX_CHARS {
+        message.push_str("...");
+    }
+    if location.is_empty() {
+        format!("[{level}] {message}")
+    } else {
+        format!("[{level}] {location} {message}")
+    }
+}
+
+/// The scene view's rectangle in the safe mode layout: the right column,
+/// mirroring the fallback UI's split.
+fn safe_mode_scene_rect(available: Vector2f) -> EditorRect {
+    let x = (available.x * 0.55).max(320.0);
+    let margin = 12.0;
+    EditorRect::new(
+        x,
+        56.0,
+        (available.x - x - margin).max(120.0),
+        (available.y - 68.0).max(120.0),
+    )
+}
+
+/// A hash of every UI list the editor presents, for the redraw-on-change
+/// gate (D25): the shell output's panels, overlay and popups, plus the
+/// counts that change the GPU work without changing a list.
+fn ui_content_signature(output: &ShellOutput) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    overlay::content_signature(&output.panels).hash(&mut hasher);
+    overlay::content_signature(&output.overlay).hash(&mut hasher);
+    output.overlay_opaque.len().hash(&mut hasher);
+    output.objects.len().hash(&mut hasher);
+    output.popups.len().hash(&mut hasher);
+    hasher.finish()
 }
 
 // =============================================================================
@@ -3503,6 +3937,9 @@ struct ShellOutput {
     overlay_opaque: Vec<EditorRect>,
     /// The popups the shell wants open (Stage 21, D23).
     popups: Vec<EditorPopup>,
+    /// The shell's frame stamp when this output was read (Stage 22): a
+    /// stamp that never moves while the world runs is a stopped generation.
+    frames: u64,
 }
 
 // =============================================================================

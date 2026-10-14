@@ -233,8 +233,10 @@ impl OverlaySurface {
 ///
 /// Vertices, indices and clips all feed it, so any visible change - a moved
 /// badge, a re-coloured toast, an appearing preview - changes it, while two
-/// frames of identical content hash the same and cost no GPU work.
-fn content_signature(list: &DrawList) -> u64 {
+/// frames of identical content hash the same and cost no GPU work. The
+/// editor's UI gate reuses it across the panel, overlay and popup lists
+/// (Stage 22).
+pub(crate) fn content_signature(list: &DrawList) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |value: u64| {
         hash ^= value;

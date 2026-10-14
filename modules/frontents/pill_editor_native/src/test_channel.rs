@@ -45,6 +45,14 @@ pub enum TestCommand {
         /// Distance from the client area's top edge.
         y: f32,
     },
+    /// Move the pointer without pressing anything (Stage 22): the suite
+    /// hovers a button to prove the UI redraws on input.
+    Move {
+        /// Distance from the client area's left edge.
+        x: f32,
+        /// Distance from the client area's top edge.
+        y: f32,
+    },
     /// Right-click at a point in logical client-area pixels: the gesture
     /// that asks the shell for a context menu (Stage 21).
     RightClick {
@@ -264,6 +272,9 @@ pub enum DumpQuery {
     Components,
     /// The live entity list, first few with their component names.
     Entities,
+    /// How many window-surface UI frames the editor has presented (Stage
+    /// 22): the idle check counts it across a quiet stretch.
+    UiFrames,
 }
 
 // =============================================================================
@@ -356,6 +367,19 @@ fn parse_command(line: &str) -> TestCommand {
             })();
             match point {
                 Some((x, y)) => TestCommand::Click { x, y },
+                None => TestCommand::Unknown {
+                    line: line.to_string(),
+                },
+            }
+        }
+        Some("move") => {
+            let point = (|| {
+                let x: f32 = parts.next()?.parse().ok()?;
+                let y: f32 = parts.next()?.parse().ok()?;
+                Some((x, y))
+            })();
+            match point {
+                Some((x, y)) => TestCommand::Move { x, y },
                 None => TestCommand::Unknown {
                     line: line.to_string(),
                 },
@@ -605,6 +629,7 @@ fn parse_dump(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestComm
     match parts.next() {
         Some("components") => TestCommand::Dump(DumpQuery::Components),
         Some("entities") => TestCommand::Dump(DumpQuery::Entities),
+        Some("ui-frames") => TestCommand::Dump(DumpQuery::UiFrames),
         Some("entity") => match parts.next() {
             Some(entity) => TestCommand::Dump(DumpQuery::Entity {
                 entity: entity.to_string(),
@@ -703,6 +728,10 @@ mod tests {
             parse_command("window-move 1900 40"),
             TestCommand::WindowMove { x: 1900, y: 40 }
         );
+        assert_eq!(
+            parse_command("move 40 13"),
+            TestCommand::Move { x: 40.0, y: 13.0 }
+        );
         assert!(matches!(
             parse_command("click nope"),
             TestCommand::Unknown { .. }
@@ -711,6 +740,18 @@ mod tests {
             parse_command("dance"),
             TestCommand::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn dump_lines_parse() {
+        assert_eq!(
+            parse_command("dump entities"),
+            TestCommand::Dump(DumpQuery::Entities)
+        );
+        assert_eq!(
+            parse_command("dump ui-frames"),
+            TestCommand::Dump(DumpQuery::UiFrames)
+        );
     }
 
     #[test]
