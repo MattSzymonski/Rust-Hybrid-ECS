@@ -30,11 +30,16 @@
 //! the editor from being a special case of the live-reload rules.
 
 // Standard library
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 // External crates
 use pill_engine::asset_metadata::METADATA_FORMAT_VERSION;
 use pill_engine::{AssetGuid, AssetManager, ImportRegistry, MetadataPolicy, World};
+
+// Re-exported from the engine's metadata module: the naming and path rules
+// are the asset format's, shared with every other writer (the editor core's
+// asset commands ride the same ones).
+pub use pill_engine::asset_metadata::{checked_relative, standalone_file_name};
 
 /// The suffix of a metadata sidecar.
 const METADATA_SUFFIX: &str = ".meta";
@@ -157,28 +162,6 @@ fn read_guid(path: &Path) -> Option<String> {
 /// `path` as a `/`-separated string.
 fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-/// `path` checked to stay inside `res`: relative, without `..`, and naming
-/// something. Returns it as a `PathBuf`.
-///
-/// # Errors
-///
-/// A message naming the path when it is absolute, climbs out, or is empty.
-pub fn checked_relative(path: &str) -> Result<PathBuf, String> {
-    let candidate = PathBuf::from(path.replace('\\', "/"));
-    let mut normal = PathBuf::new();
-    for component in candidate.components() {
-        match component {
-            Component::Normal(part) => normal.push(part),
-            Component::CurDir => {}
-            _ => return Err(format!("`{path}` is not a path inside `res`")),
-        }
-    }
-    if normal.as_os_str().is_empty() {
-        return Err("the path is empty".to_owned());
-    }
-    Ok(normal)
 }
 
 /// The import settings of the asset at `path` - or, for a standalone asset,
@@ -341,59 +324,6 @@ pub fn standalone_types(world: &World) -> Vec<StandaloneType> {
         .collect();
     types.sort_by(|left, right| left.display_name.cmp(&right.display_name));
     types
-}
-
-/// Names Windows refuses as a file's base name, whatever the extension.
-const RESERVED_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-/// Characters Windows refuses in a file name.
-const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-
-/// The file name a new asset called `name` gets with `extension`: `name.extension`,
-/// unless `name` already ends with that extension.
-///
-/// # Errors
-///
-/// A message when `name` is empty, contains a path separator or a character
-/// Windows refuses, is `.` or `..`, ends with a dot or a space, or is a reserved
-/// Windows name (`CON`, `NUL`, `COM1`, ...).
-pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("the name is empty".to_owned());
-    }
-    if let Some(character) = name
-        .chars()
-        .find(|character| INVALID_CHARACTERS.contains(character) || character.is_control())
-    {
-        return Err(format!("the name cannot contain `{character}`"));
-    }
-    if name == "." || name == ".." || name.contains("..") {
-        return Err("the name cannot contain `..`".to_owned());
-    }
-    if name.ends_with('.') || name.ends_with(' ') {
-        return Err("the name cannot end with a dot or a space".to_owned());
-    }
-    let suffix = format!(".{extension}");
-    let file_name = if name
-        .to_ascii_lowercase()
-        .ends_with(&suffix.to_ascii_lowercase())
-    {
-        name.to_owned()
-    } else {
-        format!("{name}{suffix}")
-    };
-    let base = file_name.split('.').next().unwrap_or_default();
-    if RESERVED_NAMES
-        .iter()
-        .any(|reserved| reserved.eq_ignore_ascii_case(base))
-    {
-        return Err(format!("`{base}` is a name Windows reserves"));
-    }
-    Ok(file_name)
 }
 
 /// Create a new standalone asset of `type_name` called `name` in `folder`

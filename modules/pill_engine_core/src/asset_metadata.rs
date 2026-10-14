@@ -94,6 +94,87 @@ fn is_metadata_file(name: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(METADATA_EXTENSION))
 }
 
+/// `path` checked to stay inside the asset directory: relative, without
+/// `..`, and naming something. Returns it as a `PathBuf`.
+///
+/// The one validator every tool-side asset path goes through, so a path that
+/// would escape the directory is refused before it reaches the file system.
+///
+/// # Errors
+///
+/// A message naming the path when it is absolute, climbs out, or is empty.
+pub fn checked_relative(path: &str) -> Result<PathBuf, String> {
+    let candidate = PathBuf::from(path.replace('\\', "/"));
+    let mut normal = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(part) => normal.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("`{path}` is not a path inside the asset directory")),
+        }
+    }
+    if normal.as_os_str().is_empty() {
+        return Err("the path is empty".to_owned());
+    }
+    Ok(normal)
+}
+
+/// Names Windows refuses as a file's base name, whatever the extension.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Characters Windows refuses in a file name.
+const INVALID_CHARACTERS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// The file name a new asset called `name` gets with `extension`:
+/// `name.extension`, unless `name` already ends with that extension.
+///
+/// The naming rule a "create asset" dialog validates against, kept here so
+/// every editor builds the same name.
+///
+/// # Errors
+///
+/// A message when `name` is empty, contains a path separator or a character
+/// Windows refuses, is `.` or `..`, ends with a dot or a space, or is a
+/// reserved Windows name (`CON`, `NUL`, `COM1`, ...).
+pub fn standalone_file_name(name: &str, extension: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the name is empty".to_owned());
+    }
+    if let Some(character) = name
+        .chars()
+        .find(|character| INVALID_CHARACTERS.contains(character) || character.is_control())
+    {
+        return Err(format!("the name cannot contain `{character}`"));
+    }
+    if name == "." || name == ".." || name.contains("..") {
+        return Err("the name cannot contain `..`".to_owned());
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("the name cannot end with a dot or a space".to_owned());
+    }
+    let suffix = format!(".{extension}");
+    let file_name = if name
+        .to_ascii_lowercase()
+        .ends_with(&suffix.to_ascii_lowercase())
+    {
+        name.to_owned()
+    } else {
+        format!("{name}{suffix}")
+    };
+    let base = file_name.split('.').next().unwrap_or_default();
+    if RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(base))
+    {
+        return Err(format!("`{base}` is a name Windows reserves"));
+    }
+    Ok(file_name)
+}
+
 // =============================================================================
 // ImportedAsset
 // =============================================================================
