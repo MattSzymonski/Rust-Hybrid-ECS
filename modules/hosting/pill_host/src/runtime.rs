@@ -1512,6 +1512,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // mirror (see the load loop): the fast path reads `module_hot_patch`
     // beside `extensions`, so the two stay index-aligned.
 
+    // The project's asset directory is mounted before anything reads
+    // through it: relative asset paths resolve below it first, and the
+    // authoring commands (the editor's asset panel) write into it. A host
+    // without one - a shipped bundle, a project whose root is not known -
+    // keeps reading through the packs and the development fallbacks.
+    if let Some(directory) = &host_config.asset_directory {
+        pill_engine::asset_store::mount_directory(directory.clone());
+    }
     let host = DevHost {
         workspace_root,
         module_config,
@@ -1544,7 +1552,6 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
 
     Ok(host)
 }
-
 /// Set up the engine, project module, hot reload, and renderer together.
 ///
 /// A frontend owns its platform event loop and supplies its cloneable window

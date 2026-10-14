@@ -106,6 +106,19 @@ pub enum TestCommand {
         /// The window's id, as the shell named it.
         id: String,
     },
+    /// Type into a free-standing window (Stage 25): the rest of the line is
+    /// the text a focused field in that window receives.
+    WindowType {
+        /// The window's id, as the shell named it.
+        id: String,
+        /// The text to commit.
+        text: String,
+    },
+    /// Rebuild the asset listing on the next frame (Stage 25): a suite that
+    /// writes files from outside the editor needs the rows - and the meta
+    /// state they carry - to catch up at once instead of at the next
+    /// periodic walk.
+    RefreshAssets,
     /// Move the editor window's outer position, in physical pixels
     /// (Stage 21: a popup flips at the monitor's work area, which the suite
     /// reaches by moving the window to a monitor edge).
@@ -147,6 +160,12 @@ pub enum TestCommand {
     Select {
         /// The entity's display handle.
         entity: String,
+    },
+    /// Select an asset by its path (Stage 25), the scripted equivalent of
+    /// an Assets row click; recorded like every other selection change.
+    SelectAsset {
+        /// The asset's path relative to the asset root.
+        path: String,
     },
     /// Type `text` into the focused field, as one committed run.
     Type {
@@ -275,6 +294,44 @@ pub enum EditCommand {
         /// Desired state.
         enabled: bool,
     },
+    /// Create a standalone asset (Stage 25): the recorded, undoable file
+    /// edit the Assets panel's create dialog issues.
+    AssetCreate {
+        /// The registered standalone type's name.
+        type_name: String,
+        /// The destination folder, relative to the asset root; empty for
+        /// the root.
+        folder: String,
+        /// The name to create.
+        name: String,
+    },
+    /// Delete one asset file and its `.meta` sidecar (Stage 25).
+    AssetDelete {
+        /// The asset's path relative to the asset root.
+        path: String,
+    },
+    /// Move or rename one asset file and its `.meta` sidecar (Stage 25).
+    AssetMove {
+        /// The current path, relative to the asset root.
+        from: String,
+        /// The new path, relative to the asset root.
+        to: String,
+    },
+    /// Write an asset's missing `.meta` sidecar (Stage 25).
+    AssetMeta {
+        /// The asset's path relative to the asset root.
+        path: String,
+    },
+    /// Write one resource field through the recorded command path
+    /// (Stage 25).
+    ResourceSet {
+        /// The resource's stable name.
+        resource: String,
+        /// The field's name within the resource.
+        field: String,
+        /// The new value, in the scripted scalar syntax.
+        value: String,
+    },
 }
 
 /// One scripted world query.
@@ -298,6 +355,18 @@ pub enum DumpQuery {
     Components,
     /// The live entity list, first few with their component names.
     Entities,
+    /// One resource field's current value (Stage 25).
+    Resource {
+        /// The resource's stable name.
+        resource: String,
+        /// The field's name within the resource.
+        field: String,
+    },
+    /// The shared selection, entity and asset (Stage 25).
+    Selection,
+    /// Every live standalone asset type (Stage 25): the create dialog's
+    /// rows, and the names a suite uses with `edit asset create`.
+    StandaloneTypes,
     /// How many window-surface UI frames the editor has presented (Stage
     /// 22): the idle check counts it across a quiet stretch.
     UiFrames,
@@ -481,6 +550,24 @@ fn parse_command(line: &str) -> TestCommand {
                 line: line.to_string(),
             },
         },
+        Some("window-type") => {
+            // The rest of the line is the text, spaces included.
+            let rest = line.trim_start();
+            let rest = rest
+                .strip_prefix("window-type")
+                .unwrap_or(rest)
+                .trim_start();
+            let rest = rest.trim_end();
+            match rest.split_once(char::is_whitespace) {
+                Some((id, text)) if !text.trim().is_empty() => TestCommand::WindowType {
+                    id: id.to_string(),
+                    text: text.trim().to_string(),
+                },
+                _ => TestCommand::Unknown {
+                    line: line.to_string(),
+                },
+            }
+        }
         Some("window-move") => {
             let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
                 return TestCommand::Unknown {
@@ -542,6 +629,14 @@ fn parse_command(line: &str) -> TestCommand {
                 line: line.to_string(),
             },
         },
+        Some("select-asset") => match parts.next() {
+            Some(path) => TestCommand::SelectAsset {
+                path: path.to_string(),
+            },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
         Some("command") => match parts.next() {
             Some(id) => TestCommand::Command { id: id.to_string() },
             None => TestCommand::Unknown {
@@ -557,6 +652,7 @@ fn parse_command(line: &str) -> TestCommand {
             },
         },
         Some("quit") => TestCommand::Quit,
+        Some("refresh-assets") => TestCommand::RefreshAssets,
         Some("edit") => parse_edit(&mut parts, line),
         Some("dump") => parse_dump(&mut parts, line),
         Some("gizmo") => parse_gizmo(&mut parts, line),
@@ -637,6 +733,69 @@ fn parse_edit(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestComm
         };
         return TestCommand::Edit(EditCommand::System { index, enabled });
     }
+    // The asset commands (Stage 25) name files, not entities; `create`
+    // names the type, the folder (`-` for the asset root) and the name.
+    if verb == "asset" {
+        let Some(action) = parts.next() else {
+            return unknown();
+        };
+        return match action {
+            "create" => {
+                let (Some(type_name), Some(folder), Some(name)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return unknown();
+                };
+                let folder = if folder == "-" {
+                    String::new()
+                } else {
+                    folder.to_string()
+                };
+                TestCommand::Edit(EditCommand::AssetCreate {
+                    type_name: type_name.to_string(),
+                    folder,
+                    name: name.to_string(),
+                })
+            }
+            "delete" => match parts.next() {
+                Some(path) => TestCommand::Edit(EditCommand::AssetDelete {
+                    path: path.to_string(),
+                }),
+                None => unknown(),
+            },
+            "move" => match (parts.next(), parts.next()) {
+                (Some(from), Some(to)) => TestCommand::Edit(EditCommand::AssetMove {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                }),
+                _ => unknown(),
+            },
+            "meta" => match parts.next() {
+                Some(path) => TestCommand::Edit(EditCommand::AssetMeta {
+                    path: path.to_string(),
+                }),
+                None => unknown(),
+            },
+            _ => unknown(),
+        };
+    }
+    // The resource command (Stage 25) names a resource and a field, never
+    // an entity.
+    if verb == "resource" {
+        let (Some(action), Some(resource), Some(field), Some(value)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return unknown();
+        };
+        if action != "set" {
+            return unknown();
+        }
+        return TestCommand::Edit(EditCommand::ResourceSet {
+            resource: resource.to_string(),
+            field: field.to_string(),
+            value: value.to_string(),
+        });
+    }
     let (Some(entity), Some(component)) = (parts.next(), parts.next()) else {
         return unknown();
     };
@@ -712,6 +871,15 @@ fn parse_dump(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestComm
             }),
             _ => unknown(),
         },
+        Some("resource") => match (parts.next(), parts.next()) {
+            (Some(resource), Some(field)) => TestCommand::Dump(DumpQuery::Resource {
+                resource: resource.to_string(),
+                field: field.to_string(),
+            }),
+            _ => unknown(),
+        },
+        Some("selection") => TestCommand::Dump(DumpQuery::Selection),
+        Some("standalone-types") => TestCommand::Dump(DumpQuery::StandaloneTypes),
         _ => unknown(),
     }
 }
@@ -770,6 +938,7 @@ mod tests {
             }
         );
         assert_eq!(parse_command("quit"), TestCommand::Quit);
+        assert_eq!(parse_command("refresh-assets"), TestCommand::RefreshAssets);
         assert_eq!(
             parse_command("rightclick 1240 300"),
             TestCommand::RightClick {

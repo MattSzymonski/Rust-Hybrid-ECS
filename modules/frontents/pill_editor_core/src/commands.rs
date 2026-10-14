@@ -685,6 +685,12 @@ fn builtin_commands() -> Vec<CommandSpec> {
         // mean "local" anywhere else either.
         CommandSpec::new("editor.tool_space_toggle", "Toggle Local / World Space")
             .menu(&["Tools", "Toggle Local / World Space"]),
+        // The Assets dialogs' buttons (Stage 25). They are registered like
+        // any other command - the button row runs them by id - with no menu
+        // entry of their own: they answer through the dialog they were
+        // pressed on, and invoked without one they warn and do nothing.
+        CommandSpec::new("editor.asset.create", "Create Asset"),
+        CommandSpec::new("editor.asset.rename", "Rename Asset"),
     ]
 }
 

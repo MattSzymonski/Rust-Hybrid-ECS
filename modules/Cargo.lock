@@ -4959,6 +4959,7 @@ name = "pill_editor_core"
 version = "0.1.0"
 dependencies = [
  "miette",
+ "pill_assets",
  "pill_core",
  "pill_core_macros",
  "pill_engine",

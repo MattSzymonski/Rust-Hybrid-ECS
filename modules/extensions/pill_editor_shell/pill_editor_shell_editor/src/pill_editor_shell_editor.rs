@@ -33,7 +33,7 @@ use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::commands::{
     ensure_command_resources, CommandInbox, CommandRegistry, PendingEditorCommands,
 };
-use pill_editor_core::editor_state::EditorSnapshot;
+use pill_editor_core::editor_state::{EditorCommand, EditorSnapshot};
 use pill_editor_core::history::CommandHistory;
 use pill_editor_core::layout::{compute_layout, LayoutMetrics, Rect as LayoutRect};
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
@@ -43,11 +43,11 @@ use pill_editor_shell_editor::shell::{
     activate_widget, collect_panel_placements, console_channel, drain_panel_work, execute_command,
     focus_module_panel, handle_command_shortcuts, handle_file_drops, handle_menu_pointer,
     handle_popup_closed, handle_popup_pointer, handle_window_closed, handle_window_key,
-    handle_window_pointer, paint_context_menu, paint_dock_chrome, paint_drop_preview, paint_menu,
-    paint_overlay_badge, paint_overlay_labels, paint_palette, paint_panels, paint_toasts,
-    paint_windows, run_clipboard_action, scroll_last_widget, select_tab_by_title,
-    sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState, Toast,
-    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
+    handle_window_pointer, handle_window_text, paint_context_menu, paint_dock_chrome,
+    paint_drop_preview, paint_menu, paint_overlay_badge, paint_overlay_labels, paint_palette,
+    paint_panels, paint_toasts, paint_windows, run_clipboard_action, scroll_last_widget,
+    select_tab_by_title, sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState,
+    Toast, CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -287,6 +287,9 @@ pub fn editor_shell_update(
     for id in input.window_closed.drain(..) {
         handle_window_closed(&mut state, &id);
     }
+    for text in input.window_text.drain(..) {
+        handle_window_text(&mut state, &text);
+    }
     if let Some(title) = input.requested_tab.take() {
         select_tab_by_title(&mut state.layout, &title);
     }
@@ -401,7 +404,22 @@ pub fn editor_shell_update(
     // The resource guard derefs to the input; take one plain reference for
     // the drop routing and everything the frame does after it.
     let input: &mut EditorShellInput = &mut input;
-    handle_file_drops(&mut state, input, &placements, &mut pending);
+    // A selected folder targets a drop (Stage 25): the panel writes folders
+    // into the shared asset selection, and the import lands there.
+    let drop_folder = selection.asset.as_deref().and_then(|path| {
+        editor_snapshot
+            .assets
+            .iter()
+            .any(|asset| asset.path == path && asset.kind == "folder")
+            .then(|| path.to_string())
+    });
+    handle_file_drops(
+        &mut state,
+        input,
+        &placements,
+        &mut pending,
+        drop_folder.as_deref(),
+    );
     // The executable's host notices (Stage 19): toast events drain into the
     // shell's own stack, and a problems revision that moved is logged once,
     // so the suite can see the panel took it.
@@ -525,11 +543,20 @@ pub fn editor_shell_update(
         &mut pending,
         &mut inbox,
     );
-    // The selection a panel asked for, from either layer, applies once the
-    // frame's shared view is done with it (Stage 17).
+    // The selection a panel asked for, from either layer, goes through the
+    // recorded command path (Stage 25): consecutive changes merge into one
+    // undo step and undo walks selections back like it walks edits. The
+    // apply lands at this frame's boundary, so panels see it next frame.
     if let Some(entity) = selected.0.or(window_selected.0) {
         if selection.entity != Some(entity) {
-            selection.entity = Some(entity);
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection {
+                    entity: Some(entity),
+                    asset: selection.asset.clone(),
+                }],
+                "select entity",
+                Some("editor.selection".to_string()),
+            );
             // NOTE: asserted on by the editor's end-to-end suite.
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ECS,
@@ -540,7 +567,14 @@ pub fn editor_shell_update(
     }
     if let Some(path) = selected.1.or(window_selected.1) {
         if selection.asset.as_deref() != Some(path.as_str()) {
-            selection.asset = Some(path.clone());
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection {
+                    entity: selection.entity,
+                    asset: Some(path.clone()),
+                }],
+                "select asset",
+                Some("editor.selection".to_string()),
+            );
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ECS,
                 path = path.as_str(),

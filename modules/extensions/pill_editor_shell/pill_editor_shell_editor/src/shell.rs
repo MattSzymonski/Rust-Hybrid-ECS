@@ -29,12 +29,12 @@ use std::collections::BTreeMap;
 use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
 use pill_core::telemetry::capture::LogBuffer;
-use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
+use pill_editor_api::panels::{EditorPanelRegistry, PanelBuildFn, PanelContext, PanelWork};
 use pill_editor_api::{
     ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
     EditorPopupPointer, EditorProblem, EditorProblemLevel, EditorRect, EditorShellFrame,
-    EditorShellInput, EditorWindowKey, EditorWindowKeyKind, EditorWindowKind, EditorWindowPointer,
-    EditorWindowPointerKind, EditorWindowRequest,
+    EditorShellInput, EditorWindowButton, EditorWindowKey, EditorWindowKeyKind, EditorWindowKind,
+    EditorWindowPointer, EditorWindowPointerKind, EditorWindowRequest, EditorWindowText,
 };
 use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
@@ -1038,6 +1038,14 @@ pub fn paint_panels(
         if work.close_window.is_some() {
             collected.close_window = work.close_window;
         }
+        // The asset file commands a docked panel's toolbar asked for
+        // (Stage 25): the same forwarding the windows get.
+        if work.delete_asset.is_some() {
+            collected.delete_asset = work.delete_asset;
+        }
+        if work.write_asset_meta.is_some() {
+            collected.write_asset_meta = work.write_asset_meta;
+        }
         collected.windows.extend(work.windows);
     }
     ui.set_hit_rects(merged);
@@ -1081,7 +1089,7 @@ fn build_panel(
         PanelKind::Systems => systems_panel(builder, view, work),
         PanelKind::Console => console_panel(builder, extras, work),
         PanelKind::Preferences => preferences_panel(builder, extras, work),
-        PanelKind::Assets => assets_panel(builder, view, work),
+        PanelKind::Assets => assets_panel(builder, view, extras, work),
         PanelKind::Problems => problems_panel(builder, view, work),
         PanelKind::Statistics => {
             statistics_panel(builder, editor_frames_per_second, view, extras, work)
@@ -1603,24 +1611,130 @@ fn problems_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &m
 
 /// The Assets: the browser's rows, a click selects for the shared selection,
 /// and a row held down is offered to an OS drag (Stage 18).
-fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
+/// The Assets panel: the project's entries, the toolbar that edits them
+/// (Stage 25), and the create/rename dialogs' launches.
+fn assets_panel(
+    builder: &mut PanelBuilder<'_>,
+    view: &PanelView<'_>,
+    extras: &mut PanelExtras<'_>,
+    work: &mut PanelWork,
+) {
     builder.heading("Assets");
-    builder.label(&format!("{} files", view.snapshot.assets.len()));
+    let selected = view.selection.asset.clone();
+    let selected_row = selected
+        .as_deref()
+        .and_then(|path| view.snapshot.assets.iter().find(|asset| asset.path == path));
+    let selected_is_file = selected_row.is_some_and(|asset| asset.kind != "folder");
+    let missing_meta = selected_row
+        .is_some_and(|asset| asset.kind != "folder" && !asset.standalone && !asset.has_meta);
+    builder.label(&format!("{} entries", view.snapshot.assets.len()));
+    // The toolbar: creating opens the dialog; the rest are recorded file
+    // commands for the selected entry.
+    let mut create = false;
+    let mut delete = false;
+    let mut rename = false;
+    let mut write_meta = false;
+    builder.row(|row| {
+        create = row.button("Create Asset...");
+        if selected_is_file {
+            delete = row.button("Delete Asset");
+            rename = row.button("Rename Asset...");
+        }
+        if missing_meta {
+            write_meta = row.button("Write Asset Meta");
+        }
+    });
+    if create {
+        // The dialog creates into the selected folder - or the selected
+        // file's folder - and remembers it for its Create button.
+        let folder = match selected_row {
+            Some(asset) if asset.kind == "folder" => asset.path.clone(),
+            Some(asset) => asset
+                .path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        extras.text.insert(CREATE_FOLDER_KEY.to_string(), folder);
+        work.open_modal(
+            "create_asset_dialog",
+            "Create Asset",
+            420.0,
+            320.0,
+            DIALOG_CREATE_PANEL,
+            vec![
+                EditorWindowButton {
+                    label: "Create".to_string(),
+                    command: "editor.asset.create".to_string(),
+                },
+                EditorWindowButton {
+                    label: "Cancel".to_string(),
+                    command: String::new(),
+                },
+            ],
+        );
+    }
+    if rename {
+        if let Some(asset) = selected_row {
+            let file_name = asset.path.rsplit('/').next().unwrap_or(&asset.path);
+            let stem = file_name.split('.').next().unwrap_or(file_name);
+            extras
+                .text
+                .insert(RENAME_PATH_KEY.to_string(), asset.path.clone());
+            extras
+                .text
+                .insert(RENAME_NAME_KEY.to_string(), stem.to_string());
+            work.open_modal(
+                "rename_asset_dialog",
+                "Rename Asset",
+                420.0,
+                190.0,
+                DIALOG_RENAME_PANEL,
+                vec![
+                    EditorWindowButton {
+                        label: "Rename".to_string(),
+                        command: "editor.asset.rename".to_string(),
+                    },
+                    EditorWindowButton {
+                        label: "Cancel".to_string(),
+                        command: String::new(),
+                    },
+                ],
+            );
+        }
+    }
+    if delete {
+        if let Some(path) = &selected {
+            work.delete_asset(path.clone());
+        }
+    }
+    if write_meta {
+        if let Some(path) = &selected {
+            work.write_asset_meta(path.clone());
+        }
+    }
     builder.separator();
-    let mut selected: Option<String> = None;
+    let mut selected_new: Option<String> = None;
     let mut held: Option<String> = None;
     for asset in view.snapshot.assets.iter().take(PANEL_ROWS * 2) {
-        let label = if view.selection.asset.as_deref() == Some(asset.path.as_str()) {
-            format!("> {} [{}]", asset.path, asset.kind)
+        let marker = if view.selection.asset.as_deref() == Some(asset.path.as_str()) {
+            ">"
         } else {
-            format!("  {} [{}]", asset.path, asset.kind)
+            " "
         };
+        let label = if asset.kind == "folder" {
+            format!("{marker} {}/", asset.path)
+        } else {
+            format!("{marker} {} [{}]", asset.path, asset.kind)
+        };
+        let is_folder = asset.kind == "folder";
         builder.row(|row| {
             let (clicked, is_held) = row.button_held(&label);
             if clicked {
-                selected = Some(asset.path.clone());
+                selected_new = Some(asset.path.clone());
             }
-            if is_held {
+            if is_held && !is_folder {
                 held = Some(asset.path.clone());
             }
         });
@@ -1631,12 +1745,109 @@ fn assets_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut
             view.snapshot.assets.len() - PANEL_ROWS * 2
         ));
     }
-    if let Some(path) = selected {
+    if let Some(path) = selected_new {
         work.select_asset(path);
     }
     if let Some(path) = held {
         work.drag_candidate(path);
     }
+}
+
+/// The create dialog's body (Stage 25): the standalone types the loaded
+/// modules offer, one row each, over the name field.
+///
+/// The choice, the name and the target folder live in the window's text
+/// buffers - a panel is rebuilt from scratch every frame and owns no state -
+/// and the request's Create button runs the command that reads them back.
+pub fn assets_create_panel(builder: &mut PanelBuilder<'_>, context: &mut PanelContext<'_>) {
+    let folder = context
+        .text_buffers
+        .get(CREATE_FOLDER_KEY)
+        .cloned()
+        .unwrap_or_default();
+    builder.label(&format!(
+        "In res{}{}",
+        if folder.is_empty() { "" } else { "/" },
+        folder
+    ));
+    builder.separator();
+    let types: Vec<(String, String, String)> = context
+        .snapshot
+        .standalone_types
+        .iter()
+        .map(|info| {
+            (
+                info.type_name.clone(),
+                info.display_name.clone(),
+                info.extension.clone(),
+            )
+        })
+        .collect();
+    let chosen = context.text_buffers.get(CREATE_TYPE_KEY).cloned();
+    let mut pick: Option<String> = None;
+    if types.is_empty() {
+        builder.label("No asset types are loaded.");
+    }
+    for (index, (type_name, display, extension)) in types.iter().enumerate() {
+        let marker = if chosen.as_deref() == Some(type_name.as_str()) {
+            ">"
+        } else {
+            " "
+        };
+        let label = format!("{marker} {display} (.{extension})");
+        // Rows are named by index (`create.type.0`): the label carries a
+        // selection marker and spaces, and the scripted activation path
+        // addresses the row by its stable name.
+        let name = format!("create.type.{index}");
+        builder.row(|row| {
+            if row.button_named(&name, &label) {
+                pick = Some(type_name.clone());
+            }
+        });
+    }
+    if let Some(type_name) = pick {
+        context
+            .text_buffers
+            .insert(CREATE_TYPE_KEY.to_string(), type_name);
+    }
+    builder.separator();
+    let mut name = context
+        .text_buffers
+        .get(CREATE_NAME_KEY)
+        .cloned()
+        .unwrap_or_default();
+    builder.row(|row| {
+        row.label("Name");
+    });
+    if builder.text_field(CREATE_NAME_KEY, &mut name) {
+        context
+            .text_buffers
+            .insert(CREATE_NAME_KEY.to_string(), name);
+    }
+}
+
+/// The rename dialog's body (Stage 25): the current path and the new-name
+/// field; the extension stays with the file.
+pub fn assets_rename_panel(builder: &mut PanelBuilder<'_>, context: &mut PanelContext<'_>) {
+    let path = context
+        .text_buffers
+        .get(RENAME_PATH_KEY)
+        .cloned()
+        .unwrap_or_default();
+    builder.label(&format!("Rename {path}"));
+    builder.separator();
+    builder.label("New name");
+    let mut name = context
+        .text_buffers
+        .get(RENAME_NAME_KEY)
+        .cloned()
+        .unwrap_or_default();
+    if builder.text_field(RENAME_NAME_KEY, &mut name) {
+        context
+            .text_buffers
+            .insert(RENAME_NAME_KEY.to_string(), name);
+    }
+    builder.label("The file keeps its extension.");
 }
 
 /// The Statistics panel: the editor's frame rate, the module panels' build
@@ -2239,6 +2450,12 @@ pub fn execute_command(
             };
             gizmo_command(state, pending, None, Some(space), None);
         }
+        // The Assets dialogs' buttons (Stage 25): queue the recorded create
+        // from the create dialog's chosen type and typed name, or the
+        // recorded move the rename dialog's typed name builds. Both read
+        // the state their dialog wrote while it was open.
+        "editor.asset.create" => create_asset_dialog_submit(state, pending),
+        "editor.asset.rename" => rename_asset_dialog_submit(state, pending),
         // The clipboard commands queue their intent; the hot root runs it
         // where the frame and the snapshot are in scope (Stage 18, D28).
         "editor.copy" => state.clipboard_action = Some(ClipboardAction::Copy),
@@ -2392,6 +2609,15 @@ pub fn run_clipboard_action(
     };
     match action {
         ClipboardAction::Copy | ClipboardAction::Cut => {
+            // A focused Inspector field copies as a field payload (Stage 25):
+            // the value's token, which a paste into any field accepts. Cut
+            // keeps its entity meaning, so only Copy answers here.
+            if action == ClipboardAction::Copy {
+                if let Some(text) = focused_field_document(state, snapshot) {
+                    offer_object(frame, text, "field", "");
+                    return;
+                }
+            }
             let selected_detail = selection.entity.and_then(|entity| {
                 snapshot
                     .detail
@@ -2422,14 +2648,17 @@ pub fn run_clipboard_action(
             if action == ClipboardAction::Cut {
                 match offered {
                     Some(entity) => {
-                        pending.push_recorded(
-                            vec![EditorCommand::DestroyEntity { entity }],
-                            "cut entity",
-                            None,
-                        );
+                        // The destroy and the selection clear are one step:
+                        // undo restores the entity and the selection that
+                        // pointed at it (Stage 25).
+                        let mut commands = vec![EditorCommand::DestroyEntity { entity }];
                         if selection.entity == Some(entity) {
-                            selection.entity = None;
+                            commands.push(EditorCommand::SetSelection {
+                                entity: None,
+                                asset: selection.asset.clone(),
+                            });
                         }
+                        pending.push_recorded(commands, "cut entity", None);
                         pill_core::info!(
                             target: pill_core::telemetry::telemetry_target::ECS,
                             entity = %entity,
@@ -2480,6 +2709,45 @@ pub fn run_clipboard_action(
             }
         }
     }
+}
+
+/// The payload document for the value of the Inspector field holding the
+/// keyboard focus, when one does (Stage 25).
+///
+/// Copying with a field focused copies the value, not the entity: the token
+/// a paste into any field of the same shape accepts. The field widgets are
+/// named `inspector.<entity>.<component>.<field>`, so the focused name
+/// carries what the document needs.
+fn focused_field_document(state: &EditorShellState, snapshot: &EditorSnapshot) -> Option<String> {
+    let focus = state.ui.focus()?;
+    let name = state
+        .widget_names
+        .iter()
+        .find_map(|(name, id)| (*id == focus).then_some(name.as_str()))?;
+    let mut parts = name.split('.').filter(|part| !part.is_empty());
+    if parts.next() != Some("inspector") {
+        return None;
+    }
+    let entity_text = parts.next()?;
+    let component = parts.next()?;
+    let field = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let detail = snapshot.detail.as_ref()?;
+    if detail.entity.to_string() != entity_text {
+        return None;
+    }
+    let view = detail
+        .components
+        .iter()
+        .find(|view| view.type_name == component)?;
+    let index = view
+        .fields
+        .iter()
+        .position(|descriptor| descriptor.name == field)?;
+    let value = view.values.get(index)?;
+    clipboard::encode_field(&view.type_name, field, value)
 }
 
 /// Offer one payload document to the system clipboard under the editor
@@ -2666,7 +2934,14 @@ fn apply_clipboard_paste(
             );
         }
         Payload::Asset { path } => {
-            selection.asset = Some(path.clone());
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection {
+                    entity: selection.entity,
+                    asset: Some(path.clone()),
+                }],
+                "select asset",
+                Some("editor.selection".to_string()),
+            );
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ECS,
                 path = path.as_str(),
@@ -2724,6 +2999,7 @@ pub fn handle_file_drops(
     input: &mut EditorShellInput,
     placements: &[PanelPlacement],
     pending: &mut PendingEditorCommands,
+    drop_folder: Option<&str>,
 ) {
     let assets_rect = placements
         .iter()
@@ -2779,6 +3055,20 @@ pub fn handle_file_drops(
         );
         return;
     };
+    // A selected folder targets the drop (Stage 25): the copies land in it
+    // instead of the asset directory's root.
+    let destination = match drop_folder {
+        Some(folder) if !folder.is_empty() => {
+            let folder = folder.trim_matches('/');
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                folder = folder,
+                "[editor] file drop targeted"
+            );
+            format!("{}/{}", root.trim_end_matches(['/', '\\']), folder)
+        }
+        _ => root,
+    };
     let count = dropped.len();
     let label = if count == 1 {
         "import file".to_string()
@@ -2788,7 +3078,7 @@ pub fn handle_file_drops(
     pending.push_recorded(
         vec![EditorCommand::ImportFiles {
             sources: dropped,
-            destination: root,
+            destination,
         }],
         label,
         None,
@@ -3607,6 +3897,42 @@ const MODAL_BUTTON_WIDTH: f32 = 92.0;
 /// The gap between a window's edge and its panel content, in logical pixels.
 const WINDOW_CONTENT_PADDING: f32 = 8.0;
 
+/// The shell's own dialog panels (Stage 25): create and rename asset. They
+/// live in this crate, not in a module's registry, so a window drawing one
+/// treats it as always present - the epoch below is the shell's stable
+/// one, and building resolves through [`dialog_panel_build`].
+pub const DIALOG_CREATE_PANEL: &str = "shell.assets_create";
+pub const DIALOG_RENAME_PANEL: &str = "shell.assets_rename";
+
+/// The buffer keys a dialog's widgets persist under; the panels write them
+/// and the submitting commands read them back from the window's map.
+const CREATE_TYPE_KEY: &str = "create.type";
+const CREATE_NAME_KEY: &str = "create.name";
+const CREATE_FOLDER_KEY: &str = "create.folder";
+const RENAME_PATH_KEY: &str = "rename.path";
+const RENAME_NAME_KEY: &str = "rename.name";
+
+/// The epoch a window's panel reports: a registry epoch for module panels,
+/// and the shell's own stable one for the built-in dialogs, which no reload
+/// ever replaces.
+fn window_panel_epoch(panels: &EditorPanelRegistry, panel: &str) -> Option<u64> {
+    if panel == DIALOG_CREATE_PANEL || panel == DIALOG_RENAME_PANEL {
+        Some(u64::MAX)
+    } else {
+        panels.panel_epoch(panel)
+    }
+}
+
+/// The build function of one of the shell's dialog panels, when the id
+/// names one.
+fn dialog_panel_build(panel: &str) -> Option<PanelBuildFn> {
+    match panel {
+        DIALOG_CREATE_PANEL => Some(assets_create_panel),
+        DIALOG_RENAME_PANEL => Some(assets_rename_panel),
+        _ => None,
+    }
+}
+
 /// Opens the windows the panels asked for and applies a asked-for close.
 ///
 /// A request names a registered panel id and never code: the registry is
@@ -3628,7 +3954,7 @@ pub fn apply_window_requests(
         {
             continue;
         }
-        let Some(epoch) = panels.panel_epoch(&request.panel) else {
+        let Some(epoch) = window_panel_epoch(panels, &request.panel) else {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::ECS,
                 id = request.id.as_str(),
@@ -3653,12 +3979,21 @@ pub fn apply_window_requests(
             height = request.height,
             "[editor] window opened"
         );
+        // A dialog's fields start from the text state of the docked panel
+        // that opened it (Stage 25): the Assets panel seeds the target
+        // folder, the rename dialog its path and stem, before the window
+        // exists. The dialog's own edits stay in its map; only this one
+        // opening copy looks across.
+        let text = match dialog_panel_build(&request.panel) {
+            Some(_) => state.panel_text.clone(),
+            None => BTreeMap::new(),
+        };
         state.windows.push(OpenWindow {
             request,
             owner,
             epoch,
             ui: UiState::new(),
-            text: BTreeMap::new(),
+            text,
             previous_hits: BTreeMap::new(),
             names: BTreeMap::new(),
             built_epoch: 0,
@@ -3713,6 +4048,21 @@ pub fn handle_window_pointer(state: &mut EditorShellState, pointer: &EditorWindo
         }
     };
     window.ui.input.apply(&event);
+}
+
+/// Feeds one committed text run into one window's own input (Stage 25):
+/// what a field inside a tool window or dialog receives.
+pub fn handle_window_text(state: &mut EditorShellState, text: &EditorWindowText) {
+    let Some(window) = state
+        .windows
+        .iter_mut()
+        .find(|window| window.request.id == text.id)
+    else {
+        return;
+    };
+    window.ui.input.apply(&pill_engine::InputEvent::TextInput {
+        text: text.text.clone(),
+    });
 }
 
 /// Clears the state behind a window the platform closed (Stage 24): the
@@ -3771,17 +4121,19 @@ fn answer_window(
     else {
         return;
     };
-    let window = state.windows.remove(index);
-    if window.request.kind != EditorWindowKind::Modal {
+    // A dialog's button command reads the dialog's own state - the typed
+    // name, the chosen type - so the command runs while the window is still
+    // in reach, and the window is dropped afterwards.
+    if state.windows[index].request.kind != EditorWindowKind::Modal {
         return;
     }
-    let label = window
+    let label = state.windows[index]
         .request
         .buttons
         .get(button_index)
         .map(|button| button.label.clone())
         .unwrap_or_default();
-    let command = window
+    let command = state.windows[index]
         .request
         .buttons
         .get(button_index)
@@ -3797,6 +4149,13 @@ fn answer_window(
     );
     if !command.is_empty() {
         execute_command(state, registry, inbox, pending, history, &command);
+    }
+    if let Some(index) = state
+        .windows
+        .iter()
+        .position(|window| window.request.id == id)
+    {
+        state.windows.remove(index);
     }
 }
 
@@ -3838,7 +4197,7 @@ pub fn paint_windows(
     let mut index = 0;
     while index < windows.len() {
         let window = &mut windows[index];
-        match panels.panel_epoch(&window.request.panel) {
+        match window_panel_epoch(panels, &window.request.panel) {
             None => {
                 let closed = windows.remove(index);
                 pill_core::info!(
@@ -3924,12 +4283,16 @@ pub fn paint_windows(
                 atlas,
                 Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
                 content_size,
-                |builder| match panels.panel(&request.panel) {
-                    Some(build) => build(builder, &mut context),
-                    None => {
-                        builder.heading(&request.title);
-                        builder.separator();
-                        builder.label("This panel is not registered; see the log.");
+                |builder| {
+                    let build =
+                        dialog_panel_build(&request.panel).or_else(|| panels.panel(&request.panel));
+                    match build {
+                        Some(build) => build(builder, &mut context),
+                        None => {
+                            builder.heading(&request.title);
+                            builder.separator();
+                            builder.label("This panel is not registered; see the log.");
+                        }
                     }
                 },
             )
@@ -4085,6 +4448,147 @@ fn translated_hits(hits: &BTreeMap<WidgetId, Rect>, origin: Vector2f) -> BTreeMa
         .collect()
 }
 
+/// The Create button of the create dialog (Stage 25): read the dialog's
+/// choice, name and folder from its window's buffers and queue the recorded
+/// create command.
+pub fn create_asset_dialog_submit(
+    state: &mut EditorShellState,
+    pending: &mut PendingEditorCommands,
+) {
+    let Some(window) = state
+        .windows
+        .iter()
+        .find(|window| window.request.id == "create_asset_dialog")
+    else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] create asset without its dialog"
+        );
+        return;
+    };
+    let type_name = window
+        .text
+        .get(CREATE_TYPE_KEY)
+        .cloned()
+        .unwrap_or_default();
+    let name = window
+        .text
+        .get(CREATE_NAME_KEY)
+        .cloned()
+        .unwrap_or_default();
+    let folder = window
+        .text
+        .get(CREATE_FOLDER_KEY)
+        .cloned()
+        .unwrap_or_default();
+    if type_name.is_empty() || name.trim().is_empty() {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] create asset needs a type and a name"
+        );
+        return;
+    }
+    pending.push_recorded(
+        vec![EditorCommand::CreateStandaloneAsset {
+            type_name: type_name.clone(),
+            folder,
+            name: name.clone(),
+        }],
+        format!("create asset {name}"),
+        None,
+    );
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        type_name = type_name.as_str(),
+        name = name.as_str(),
+        "[editor] asset create queued"
+    );
+}
+
+/// The Rename button of the rename dialog (Stage 25): build the new path
+/// from the typed name - the extension stays - and queue the recorded move.
+pub fn rename_asset_dialog_submit(
+    state: &mut EditorShellState,
+    pending: &mut PendingEditorCommands,
+) {
+    let Some(window) = state
+        .windows
+        .iter()
+        .find(|window| window.request.id == "rename_asset_dialog")
+    else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] rename asset without its dialog"
+        );
+        return;
+    };
+    let from = window
+        .text
+        .get(RENAME_PATH_KEY)
+        .cloned()
+        .unwrap_or_default();
+    let typed = window
+        .text
+        .get(RENAME_NAME_KEY)
+        .cloned()
+        .unwrap_or_default();
+    let typed = typed.trim();
+    if from.is_empty() || typed.is_empty() {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] rename asset needs a name"
+        );
+        return;
+    }
+    if typed.contains(['/', '\\']) {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            name = typed,
+            "[editor] rename asset refuses a path separator"
+        );
+        return;
+    }
+    // The extension stays with the file unless the typed name already ends
+    // with it.
+    let file_name = from.rsplit('/').next().unwrap_or(&from);
+    let extension = file_name
+        .split_once('.')
+        .map(|(_, extension)| extension.to_owned());
+    let new_file = match &extension {
+        Some(extension)
+            if !typed
+                .to_ascii_lowercase()
+                .ends_with(&extension.to_ascii_lowercase()) =>
+        {
+            format!("{typed}.{extension}")
+        }
+        _ => typed.to_owned(),
+    };
+    let folder = from
+        .rsplit_once('/')
+        .map(|(folder, _)| folder.to_string())
+        .unwrap_or_default();
+    let to = if folder.is_empty() {
+        new_file.clone()
+    } else {
+        format!("{folder}/{new_file}")
+    };
+    pending.push_recorded(
+        vec![EditorCommand::MoveAssetFile {
+            from: from.clone(),
+            to: to.clone(),
+        }],
+        format!("rename asset {new_file}"),
+        None,
+    );
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        from = from.as_str(),
+        to = to.as_str(),
+        "[editor] asset rename queued"
+    );
+}
+
 /// Drains one panel's [`PanelWork`] into the shell's queues and state
 /// (Stage 16 onward): the edits, the commands, the console filters, the
 /// preferences write, the windows asked for and the window asked closed.
@@ -4179,4 +4683,30 @@ pub fn drain_panel_work(
         close_window(state, &id, "request");
     }
     apply_window_requests(state, work.windows, panels);
+    // The asset file actions a panel asked for (Stage 25): recorded
+    // commands, so undo and redo walk them like any other edit.
+    if let Some(path) = work.delete_asset {
+        pending.push_recorded(
+            vec![EditorCommand::DeleteAssetFile { path: path.clone() }],
+            format!("delete asset {path}"),
+            None,
+        );
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            path = path.as_str(),
+            "[editor] asset delete queued"
+        );
+    }
+    if let Some(path) = work.write_asset_meta {
+        pending.push_recorded(
+            vec![EditorCommand::WriteAssetMeta { path: path.clone() }],
+            format!("write meta {path}"),
+            None,
+        );
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            path = path.as_str(),
+            "[editor] asset meta queued"
+        );
+    }
 }

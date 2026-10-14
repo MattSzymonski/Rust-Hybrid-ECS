@@ -20,10 +20,13 @@ DESCRIPTION
        (the file is written by the suite, then by the panel, and the file is
        read back);
     5. the Assets panel lists the project's files;
-    6. a body edit of the shell live-patches with its state kept, and a
+    6. the Assets toolbar's dialogs create an asset, rename it, delete it
+       and write a missing sidecar, each a recorded step that undo walks
+       back (Stage 25);
+    7. a body edit of the shell live-patches with its state kept, and a
        structural edit of the shell crate reloads it with tabs, selection
        and console kept (an Inspector edit still works without re-selecting);
-    7. the editor exits cleanly.
+    8. the editor exits cleanly.
 
   Everything is asserted on the editor's log tokens; the edited sources are
   restored in a `finally`. The suite runs under its own LOCALAPPDATA sandbox.
@@ -37,6 +40,7 @@ EXAMPLE USAGE
 --- SCRIPT ---
 """
 
+import base64
 import json
 import os
 import re
@@ -147,6 +151,22 @@ def main() -> int:
         stderr=subprocess.STDOUT,
     )
     log.close()
+    # The Assets step (Stage 25) stages its own files: project_rs's res/
+    # tree may not exist yet, so it is made here and removed in the end when
+    # this step left it empty. The probe is a real 1x1 PNG - the import
+    # decodes it, so its sidecar behaves the way a sourced file's does - and
+    # emptying that sidecar later is what the Write Asset Meta button
+    # answers to.
+    res_directory = ROOT / "examples" / "project_rs" / "res"
+    probe_source = res_directory / "w25_probe_source.png"
+    probe_meta = res_directory / "w25_probe_source.png.meta"
+    res_directory.mkdir(parents=True, exist_ok=True)
+    probe_source.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+    )
+    staged: list[Path] = [probe_source, probe_meta]
     try:
         # Startup lines land within one poll interval of each other, so these
         # waits search the whole log.
@@ -551,6 +571,211 @@ def main() -> int:
             begin,
         )
 
+        # Step 6b: the Assets toolbar and its dialogs (Stage 25). The Assets
+        # panel is a tab behind Hierarchy in the default layout, so it is
+        # selected first; the file the dialog creates is the row the
+        # toolbar's other buttons act on, and every queued command is
+        # recorded and walks back through undo. The probe png the meta
+        # button answers to was staged before the run.
+        begin = len(read_log())
+        append("tab Assets")
+        wait_token(process, r'tab selected\s+title="?Assets"?', 30, "Assets tab", begin)
+        begin = len(read_log())
+        append("dump standalone-types")
+        wait_token(process, r"\[test\] standalone type\s", 30, "standalone types dumped", begin)
+        found = find_in_log(
+            r'\[test\] standalone type\s+type_name="([^"]+)"\s+display="([^"]+)"'
+            r'\s+extension="([^"]+)"',
+            begin,
+        )
+        type_name, display, extension = found.groups()
+        print(f"  [OK] first standalone type {display} (.{extension})")
+        created_name = f"w25_panel.{extension}"
+
+        # Create through the dialog: open it from the toolbar, pick the first
+        # type row, type a name into the field, press Create.
+        begin = len(read_log())
+        append("activate Create Asset...")
+        wait_token(
+            process, r'window opened\s+id="?create_asset_dialog"?', 60, "create dialog opened", begin
+        )
+        wait_token(
+            process, r'window panel built\s+id="?create_asset_dialog"?', 60, "create dialog built", begin
+        )
+        begin = len(read_log())
+        append("activate window.create_asset_dialog.create.type.0")
+        wait_token(
+            process,
+            r'window widget activated\s+name="?window\.create_asset_dialog\.create\.type\.0"?',
+            30,
+            "type row chosen",
+            begin,
+        )
+        begin = len(read_log())
+        append("activate window.create_asset_dialog.create.name")
+        wait_token(
+            process,
+            r'window widget activated\s+name="?window\.create_asset_dialog\.create\.name"?',
+            30,
+            "name field focused",
+            begin,
+        )
+        begin = len(read_log())
+        append("window-type create_asset_dialog w25_panel")
+        wait_token(process, r"\[editor\] test window type", 30, "name typed", begin)
+        begin = len(read_log())
+        append("activate window.create_asset_dialog.button.0")
+        wait_token(process, r"\[editor\] asset create queued", 30, "create queued", begin)
+        wait_token(
+            process, r'history push\s+label="create asset w25_panel"', 30, "create recorded", begin
+        )
+        wait_token(
+            process, r'modal answered\s+id="?create_asset_dialog"?', 30, "create dialog answered", begin
+        )
+        assert (res_directory / created_name).is_file(), "the dialog created no file"
+        staged.append(res_directory / created_name)
+        print(f"  [OK] created {created_name} through the dialog")
+
+        # The creation undoes (the file goes) and redoes (it comes back),
+        # and the listing picks the row up for the toolbar.
+        begin = len(read_log())
+        append("command editor.undo")
+        wait_token(
+            process, r'history undo\s+label="create asset w25_panel"', 30, "create undone", begin
+        )
+        assert not (res_directory / created_name).exists(), "the creation survived its undo"
+        begin = len(read_log())
+        append("command editor.redo")
+        wait_token(
+            process, r'history redo\s+label="create asset w25_panel"', 30, "create redone", begin
+        )
+        assert (res_directory / created_name).is_file(), "the redo restored no file"
+        wait_token(process, r"asset listing refreshed", 60, "listing sees the created file", begin)
+
+        # Rename through the dialog: the field arrives with the stem in it,
+        # the typed suffix lands after it, and the queued paths are read back
+        # rather than assumed.
+        begin = len(read_log())
+        append(f"select-asset {created_name}")
+        wait_token(process, r"\[editor\] asset selected", 30, "created row selected", begin)
+        begin = len(read_log())
+        append("activate Rename Asset...")
+        wait_token(
+            process, r'window opened\s+id="?rename_asset_dialog"?', 60, "rename dialog opened", begin
+        )
+        wait_token(
+            process, r'window panel built\s+id="?rename_asset_dialog"?', 60, "rename dialog built", begin
+        )
+        begin = len(read_log())
+        append("activate window.rename_asset_dialog.rename.name")
+        wait_token(
+            process,
+            r'window widget activated\s+name="?window\.rename_asset_dialog\.rename\.name"?',
+            30,
+            "rename field focused",
+            begin,
+        )
+        begin = len(read_log())
+        append("window-type rename_asset_dialog 2")
+        wait_token(process, r"\[editor\] test window type", 30, "suffix typed", begin)
+        begin = len(read_log())
+        append("activate window.rename_asset_dialog.button.0")
+        wait_token(process, r"\[editor\] asset rename queued", 30, "rename queued", begin)
+        queued = find_in_log(
+            r'\[editor\] asset rename queued\s+from="?([^"\s]+)"?\s+to="?([^"\s]+)"?',
+            begin,
+        )
+        renamed_from = queued.group(1)
+        renamed_to = queued.group(2)
+        assert renamed_from == created_name, f"the rename read {renamed_from}"
+        assert renamed_to != created_name, "the rename kept the old name"
+        assert renamed_to.endswith(extension), f"the rename lost the extension: {renamed_to}"
+        wait_token(process, r'history push\s+label="rename asset ', 30, "rename recorded", begin)
+        assert not (res_directory / renamed_from).exists(), "the old name survived the rename"
+        assert (res_directory / renamed_to).is_file(), "the new name is missing"
+        staged.append(res_directory / renamed_to)
+        print(f"  [OK] renamed to {renamed_to} through the dialog")
+
+        # Undo restores the old name; redo renames again.
+        begin = len(read_log())
+        append("command editor.undo")
+        wait_token(process, r'history undo\s+label="rename asset ', 30, "rename undone", begin)
+        assert (res_directory / renamed_from).is_file(), "the undo did not restore the name"
+        assert not (res_directory / renamed_to).exists(), "the new name survived the undo"
+        begin = len(read_log())
+        append("command editor.redo")
+        wait_token(process, r'history redo\s+label="rename asset ', 30, "rename redone", begin)
+        assert (res_directory / renamed_to).is_file(), "the redo renamed nothing"
+
+        # Delete through the toolbar; undo brings the bytes back.
+        begin = len(read_log())
+        append("activate Delete Asset")
+        wait_token(process, r"\[editor\] asset delete queued", 30, "delete queued", begin)
+        wait_token(process, r'history push\s+label="delete asset ', 30, "delete recorded", begin)
+        assert not (res_directory / renamed_to).exists(), "the delete left the file"
+        begin = len(read_log())
+        append("command editor.undo")
+        wait_token(process, r'history undo\s+label="delete asset ', 30, "delete undone", begin)
+        assert (res_directory / renamed_to).is_file(), "the undo restored no file"
+        assert (res_directory / renamed_to).stat().st_size > 0, "the restored file is empty"
+        begin = len(read_log())
+        append("command editor.redo")
+        wait_token(process, r'history redo\s+label="delete asset ', 30, "delete redone", begin)
+        assert not (res_directory / renamed_to).exists(), "the redo left the file"
+
+        # Write Asset Meta through the toolbar. The host keeps every importable
+        # source's sidecar in step, so a file without usable metadata is made
+        # by emptying the staged probe's sidecar: the row lists the file, its
+        # metadata reads as missing, and the button answers. The suite nudges
+        # the listing so the rows catch up at once; the write records and its
+        # undo removes the replacement.
+        probe_meta.write_bytes(b"")
+        begin = len(read_log())
+        append("refresh-assets")
+        wait_token(process, r"\[editor\] test assets refresh", 30, "listing nudged", begin)
+        wait_token(process, r"asset listing refreshed", 60, "listing sees the empty sidecar", begin)
+        begin = len(read_log())
+        append("select-asset w25_probe_source.png")
+        wait_token(process, r"\[editor\] asset selected", 30, "sourced row selected", begin)
+        begin = len(read_log())
+        append("activate Write Asset Meta")
+        wait_token(process, r"\[editor\] asset meta queued", 30, "write meta queued", begin)
+        wait_token(
+            process,
+            r'history push\s+label="write meta w25_probe_source\.png"',
+            30,
+            "write meta recorded",
+            begin,
+        )
+        assert probe_meta.is_file() and probe_meta.stat().st_size > 0, "no sidecar was written"
+        written_meta = probe_meta.read_text(encoding="utf-8")
+        written_stamp = probe_meta.stat().st_mtime_ns
+        begin = len(read_log())
+        append("command editor.undo")
+        wait_token(
+            process,
+            r'history undo\s+label="write meta w25_probe_source\.png"',
+            30,
+            "write meta undone",
+            begin,
+        )
+        # The undo removes the replacement; the host then heals a sidecar
+        # back in (its ensure is on) - for a loaded source with the same
+        # guid - so the walk-back shows as the file being gone, rewritten or
+        # fresh.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if not probe_meta.exists():
+                break
+            if probe_meta.stat().st_mtime_ns != written_stamp:
+                break
+            if probe_meta.read_text(encoding="utf-8") != written_meta:
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError("the written sidecar survived its undo")
+        print("  [OK] empty sidecar replaced through the toolbar and walked back")
+
         # Step 7: a graceful quit, with the clean exit code.
         append("quit")
         wait_token(process, r"\[editor\] test channel: quit requested", 30, "quit command")
@@ -564,6 +789,15 @@ def main() -> int:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)
+        for path in staged:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            res_directory.rmdir()
+        except OSError:
+            pass
 
     print("PASS: built-in panels, console and preferences")
     return 0

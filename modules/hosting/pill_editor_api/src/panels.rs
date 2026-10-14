@@ -100,6 +100,12 @@ pub struct PanelWork {
     pub windows: Vec<EditorWindowRequest>,
     /// A window the panel asks the shell to close (Stage 24), by its id.
     pub close_window: Option<String>,
+    /// An asset file the panel asks deleted (Stage 25), by its path relative
+    /// to the asset directory; the shell queues the recorded command.
+    pub delete_asset: Option<String>,
+    /// An asset whose missing `.meta` sidecar the panel asks written
+    /// (Stage 25).
+    pub write_asset_meta: Option<String>,
 }
 
 impl PanelWork {
@@ -216,6 +222,18 @@ impl PanelWork {
     /// its id.
     pub fn close_window(&mut self, id: impl Into<String>) {
         self.close_window = Some(id.into());
+    }
+
+    /// Ask for the asset at `path` (relative to the asset directory) to be
+    /// deleted (Stage 25), through a recorded, undoable command.
+    pub fn delete_asset(&mut self, path: impl Into<String>) {
+        self.delete_asset = Some(path.into());
+    }
+
+    /// Ask for the missing `.meta` sidecar of the asset at `path` to be
+    /// written (Stage 25), through a recorded, undoable command.
+    pub fn write_asset_meta(&mut self, path: impl Into<String>) {
+        self.write_asset_meta = Some(path.into());
     }
 }
 

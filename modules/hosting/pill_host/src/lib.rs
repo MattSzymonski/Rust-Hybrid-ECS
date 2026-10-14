@@ -107,7 +107,7 @@ pub use pill_runtime::{FrameDriver, FrameReport};
 
 // The development host.
 #[cfg(feature = "hot_reload")]
-pub use asset_browser::{standalone_file_name, AssetEntry, StandaloneType};
+pub use asset_browser::{standalone_file_name, standalone_types, AssetEntry, StandaloneType};
 #[cfg(feature = "hot_reload")]
 pub use runtime::{run_one_frame, setup, DevHost};
 
