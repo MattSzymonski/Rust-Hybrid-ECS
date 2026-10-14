@@ -242,9 +242,8 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | Script | Checks |
 | --- | --- |
 | `test_examples.py` | Builds every example under `examples/` in release (found by `Cargo.toml` or `*.csproj`) and reports artifact sizes. |
-| `test_shipping_smoke.py` | Builds the statically linked shipping binary for `examples/project_rs`, then checks it reaches the project loop, initializes its extensions, and never starts cargo or any reload machinery. |
+| `test_shipping_smoke.py` | Builds the statically linked shipping binary for `examples/project_rs`, checks the binary contains no reload-only strings, then that it reaches the project loop, initializes its extensions, and never starts cargo or any reload machinery. |
 | `test_web_smoke.py` | Builds `examples/master_renderer_test` for the browser, serves it, and opens it in headless Chrome or Edge with WebGPU. Checks the asset pack mounts, frames are presented with a camera, and no engine, WebGPU or page error occurs. Needs the wasm target and `wasm-pack`; `PILL_WEB_BROWSER` picks the browser. |
-| `test_basic.py` | `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test --workspace` with and without `hot_patch`. The launcher-driven checks in it skip in this repository. Last in `run_all.py` because it is the slowest. |
 
 ### Manual scripts (not in `run_all.py`)
 

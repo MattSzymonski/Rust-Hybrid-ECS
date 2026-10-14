@@ -4,9 +4,9 @@ Terminal result reporting for the Python test and benchmark scripts.
 REQUIREMENTS: Python 3.8+ (standard library only).
 
 DESCRIPTION
-    The pass/fail/skip tally, the summary block and the binary-size report,
-    ported from the equivalents in `core/common.sh` so a suite rewritten from
-    shell to Python keeps producing the same output shape.
+    The pass/fail/skip tally, the summary block, the binary-size report and
+    the cargo test-result summary, shared by the lint, build and harness
+    scripts so they all print the same output shape.
 
     The color handling is deliberately kept here rather than imported from
     `core.suite_common`: a lint or a build check has no business pulling in
@@ -17,6 +17,7 @@ DESCRIPTION
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,12 +78,7 @@ def section(title: str) -> None:
 
 
 class ResultTally:
-    """Counts pass/fail/skip results and prints the closing summary.
-
-    Mirrors `report_pass` / `report_fail` / `report_skip` / `print_summary`
-    from `core/common.sh`, so a shell suite ported to Python reads the same
-    in a CI log.
-    """
+    """Counts pass/fail/skip results and prints the closing summary."""
 
     def __init__(self) -> None:
         self.passed = 0
@@ -200,36 +196,22 @@ def print_size_report(
 
 
 # =============================================================================
-# System information
+# Cargo test output
 # =============================================================================
 
 
-def print_system_info() -> None:
-    """Prints the machine specs a build or benchmark result depends on.
+def summarize_test_results(output: str) -> str:
+    """Totals the per-binary `test result:` lines cargo prints.
 
-    Replaces `print_system_info` from `core/common.sh` by rendering the
-    metadata `core.environment` already collects, rather than re-probing the
-    machine with a second set of shell commands.
+    Cargo reports one line per test binary, so a run spanning a dozen crates
+    scrolls the interesting number off the screen. This collapses them into the
+    single figure a developer actually wants.
     """
-    from .environment import collect_environment
-
-    environment = collect_environment()
-    labels = [
-        ("os", "OS"),
-        ("os_version", "OS version"),
-        ("architecture", "Architecture"),
-        ("cpu", "CPU"),
-        ("physical_cores", "Physical cores"),
-        ("logical_cpus", "Logical processors"),
-        ("ram_gb", "RAM (GB)"),
-        ("rustc", "rustc"),
-        ("cargo", "cargo"),
-        ("active_toolchain", "Toolchain"),
-        ("dotnet", ".NET SDK"),
-    ]
-    print()
-    print("---------- System Information ----------")
-    for key, label in labels:
-        if key in environment:
-            print(f"  {label:<20} {environment[key]}")
-    print("----------------------------------------")
+    passed = failed = ignored = 0
+    for match in re.finditer(
+        r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored", output
+    ):
+        passed += int(match.group(1))
+        failed += int(match.group(2))
+        ignored += int(match.group(3))
+    return f"  {passed} passed, {failed} failed, {ignored} ignored"

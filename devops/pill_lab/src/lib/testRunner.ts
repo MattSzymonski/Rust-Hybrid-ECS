@@ -8,7 +8,7 @@
 //     * `[OK]` / `[FAIL]` lines complete it (matched by label, else the most
 //       recent running step - the tagged suites print both sides);
 //     * ANSI-bold section headers start a step for the untagged suites
-//       (test_basic, test_coding_standards, test_examples);
+//       (test_coding_standards, test_examples);
 //     * everything else is appended to the bounded log.
 //
 // --- SCRIPT ---

@@ -10,9 +10,8 @@ DESCRIPTION
     checks are line-oriented heuristics, so they are a fast first-pass signal,
     not a substitute for a full per-file audit.
 
-    Ported from `devops/ci_cd/run_coding_standards_test.sh`, which now just
-    invokes this script. The heuristics are reproduced exactly, including
-    their deliberate exemptions, so the two report the same violations.
+    The heuristics were ported from an earlier shell script, deliberate
+    exemptions included.
 
     Checks performed:
       1. module header   - every file opens with a `//!` block and contains a

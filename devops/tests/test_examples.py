@@ -6,10 +6,9 @@ REQUIREMENTS: Python 3.8+, Rust toolchain (cargo) on PATH, .NET SDK for any
               C# example (a missing SDK skips those rather than failing).
 
 DESCRIPTION
-    Ported from `devops/ci_cd/run_examples_tests.sh`, which now just invokes
-    this script. The behaviour is the same: build each example in release,
-    report a per-file artifact size breakdown, and finish with a pass/fail/
-    skip summary whose exit code is non-zero when anything failed.
+    Builds each example in release, reports a per-file artifact size
+    breakdown, and finishes with a pass/fail/skip summary whose exit code is
+    non-zero when anything failed.
 
     DISCOVERY, NOT A HARDCODED LIST. The shell version enumerated eight
     example paths (`examples/cube`, `examples/city`, ...) that no longer exist

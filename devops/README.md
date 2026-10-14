@@ -8,14 +8,13 @@ devops/
 ├── tests/        things that assert    - each runs standalone
 ├── core/         shared code both import
 ├── pill_lab/     the web app and the CLI that drives the scripts
-├── ci_cd/        container plus the shell entry points CI calls
+├── ci_cd/        the CI gate (verify.py), release builds and shell entry points
 └── docs/         the rustdoc -> Markdown documentation pipeline
 ```
 
-The shell scripts in `ci_cd/` hold no logic of their own: each one locates the
-repository root and forwards its arguments to a Python script in `tests/`,
-`benchmarks/` or `docs/`. That way a check behaves the same whether CI runs
-the wrapper or a developer runs the Python directly.
+`ci_cd/verify.py` is the CI gate: CI runs its steps, and a local run is the
+same gate. The shell scripts in `ci_cd/` hold no check logic of their own; each
+locates the repository root and runs Python scripts in `tests/` or `docs/`.
 
 The dependency direction is one-way: `benchmarks/` and `tests/` import
 `core/`, and `pill_lab/` imports both. Nothing in `core/` imports upward.
@@ -58,15 +57,13 @@ python devops/tests/test_web_smoke.py          # browser build in headless Chrom
 # Static, build and CI checks (no host launch)
 python devops/tests/test_coding_standards.py
 python devops/tests/test_examples.py
-python devops/tests/test_basic.py --list
+python devops/ci_cd/verify.py --quick           # the CI gate's inner loop
 ```
 
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
-layout rules, `test_examples.py` builds each example in release and reports
-artifact sizes, and `test_basic.py` runs the CI fast checks (fmt, clippy,
-launcher builds, WASM size budget, benchmark). All three were ported from the
-shell scripts that now just invoke them. See `tests/README.md` for what each
-suite pins down.
+layout rules, and `test_examples.py` builds each example in release and reports
+artifact sizes. Formatting, clippy and the cargo test lanes are `verify.py`
+steps. See `tests/README.md` for what each suite pins down.
 
 `tools/build_web.py` builds a Rust project for the browser (bundle and web app
 generation, `wasm-pack`, the page from `tools/web/index.html`); the web smoke
@@ -89,9 +86,8 @@ or asserts anything.
 | `criterion.py` | Criterion output parsing |
 | `cargo_timings.py` | cargo `--timings` report parsing |
 | `cli.py` | the argument-parser and store/report contract benchmarks share |
-| `test_report.py` | pass/fail/skip tally, summary block and size reports |
+| `test_report.py` | pass/fail/skip tally, summary block, size reports, cargo test totals |
 | `suite_common.py` | host process plumbing: log tokens, output monitor, backup/restore |
-| `common.sh` | the shell equivalent, sourced by the ci_cd scripts |
 
 A standalone script reaches it by putting `devops/` on `sys.path` first:
 
@@ -114,30 +110,17 @@ python devops/pill_lab/pill_lab.py serve     # browse the history
 
 ## ci_cd/
 
-The CI container and the shell entry points CI calls. Each is a thin wrapper
-around a Python script elsewhere in `devops/`.
+The CI gate, the release build and the shell entry points.
 
-Every script here is a thin wrapper: it locates the repository root and
-forwards its arguments to a Python script elsewhere in `devops/`. None of them
-holds check logic any more.
-
-| Wrapper | Delegates to |
+| File | What it is |
 | --- | --- |
-| `run_hot_reload_tests.sh` | the four suites in `tests/` |
-| `run_basic_tests.sh` | `tests/test_basic.py` |
-| `run_coding_standards_test.sh` | `tests/test_coding_standards.py` |
-| `run_examples_tests.sh` | `tests/test_examples.py` |
+| `verify.py` | the CI gate: every check CI runs, as named steps (`--list`, `--only`, `--quick`) |
+| `build_release.py` / `.sh` | release builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails) |
+| `run_hot_reload_tests.sh` | the hot-reload regression net: a fixed set of suites in `tests/` |
 | `generate_documentation.sh` | `docs/generate_documentation_markdown.py` |
 
 ```powershell
-bash devops/ci_cd/run_hot_reload_tests.sh       # 4 suites
-bash devops/ci_cd/run_basic_tests.sh code_linting
-bash devops/ci_cd/run_coding_standards_test.sh --root modules
-bash devops/ci_cd/run_examples_tests.sh --list
+python devops/ci_cd/verify.py --list
+bash devops/ci_cd/run_hot_reload_tests.sh
 bash devops/ci_cd/generate_documentation.sh
 ```
-
-Arguments pass straight through, so `run_coding_standards_test.sh --root
-modules` and `python devops/tests/test_coding_standards.py --root modules` do
-the same thing. `core/common.sh` is no longer sourced by any of them; it
-remains for any future shell script that needs its helpers.

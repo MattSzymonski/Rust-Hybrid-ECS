@@ -136,7 +136,7 @@ def _apply_timeout_scale(harness: ModuleType, scale: float) -> None:
         "BUILD_TIMEOUT",
     ):
         setattr(harness, name, int(getattr(harness, name) * scale))
-    for name in ("STABILITY_SLEEP", "SETTLE_SLEEP"):
+    for name in ("STABILITY_SLEEP",):
         setattr(harness, name, max(1, int(getattr(harness, name) * scale)))
 
 

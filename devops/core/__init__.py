@@ -20,7 +20,6 @@ DESCRIPTION
       * `suite_common`  - host process plumbing: log tokens, the output
                           monitor, atomic source edits, backup/restore. Shared
                           by the functional suites and the benchmark harness.
-      * `common.sh`     - the shell equivalent, sourced by the ci_cd scripts.
 
     A standalone script reaches this package with:
 

@@ -1303,7 +1303,7 @@ def main() -> None:
         sys.exit(1)
 
     global STARTUP_TIMEOUT, RELOAD_TIMEOUT, PROBE_TIMEOUT, SETTLE_TIMEOUT
-    global STABILITY_SLEEP, SETTLE_SLEEP, BUILD_TIMEOUT
+    global STABILITY_SLEEP, BUILD_TIMEOUT
 
     scale = args.timeout_scale
     STARTUP_TIMEOUT = int(STARTUP_TIMEOUT * scale)
@@ -1311,7 +1311,6 @@ def main() -> None:
     PROBE_TIMEOUT = int(PROBE_TIMEOUT * scale)
     SETTLE_TIMEOUT = int(SETTLE_TIMEOUT * scale)
     STABILITY_SLEEP = max(1, int(STABILITY_SLEEP * scale))
-    SETTLE_SLEEP = max(1, int(SETTLE_SLEEP * scale))
     BUILD_TIMEOUT = int(BUILD_TIMEOUT * scale)
 
     # Capture originals for every file the suite may touch, including the

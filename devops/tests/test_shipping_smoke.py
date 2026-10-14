@@ -7,12 +7,15 @@ REQUIREMENTS
 
 DESCRIPTION
     The hot-reload net cannot cover the shipping build: by construction none of
-    its eight suites apply to a binary with reloading compiled out. `test_basic`
-    checks that such a binary *builds* and that the reload-only strings are
-    gone, which is a static assertion. This one checks that it actually runs.
+    its eight suites apply to a binary with reloading compiled out. This suite
+    builds that binary, checks it statically, then checks that it actually runs.
 
-    Three things are asserted, and the third is the point:
+    Four things are asserted:
 
+      0. The binary contains none of the strings only the reloading path
+         produces, which shows that machinery was gated out rather than merely
+         unused (the same technique `test_log_contract.py` uses in the other
+         direction).
       1. The binary reaches the project loop and reports frames.
       2. It prints the project's own probe line, so the statically linked
          project and its extensions really did initialize - a build that
@@ -80,6 +83,18 @@ FORBIDDEN_TOKENS = (
     "building project module",
     "watching for source changes",
     "module DLL loaded successfully",
+)
+
+# Strings only the reloading path contains; any of them in the shipping binary
+# means that machinery was compiled in rather than gated out.
+RELOAD_ONLY_STRINGS = (
+    "watching for source changes",
+    "module DLL loaded successfully",
+    "building project module",
+    "pill_standalone_temp",
+    "cargo build",
+    "--offline",
+    "--timings",
 )
 
 # Seconds to wait for the binary to reach the project loop, before scaling.
@@ -214,6 +229,14 @@ def run_and_observe(timeout_scale: float) -> int:
         print(f"  [FAIL] {SHIPPING_BINARY} was not produced")
         return 1
     print(f"  [OK] built, {SHIPPING_BINARY.stat().st_size:,} bytes")
+
+    # Static check: the reload machinery must be absent from the image itself.
+    image = SHIPPING_BINARY.read_bytes()
+    present = [text for text in RELOAD_ONLY_STRINGS if text.encode() in image]
+    if present:
+        print("  [FAIL] the shipping binary contains reload-only strings: " + ", ".join(present))
+        return 1
+    print(f"  [OK] none of {len(RELOAD_ONLY_STRINGS)} reload-only strings in the binary")
 
     print("\n  [RUN] launching it")
     process = subprocess.Popen(
