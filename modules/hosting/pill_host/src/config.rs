@@ -638,6 +638,13 @@ pub struct HostConfig {
     /// editor-only folder.
     pub load_editor_crates: bool,
 
+    /// Editor-only modules (a folder holding only its `<folder>_editor`
+    /// crate) whose first load may fail without aborting setup; the embedder
+    /// handles their absence - the editor's safe mode covers the shell
+    /// (Stage 22, D33). Filled by [`Self::from_environment_for_editor`], empty
+    /// in every other posture.
+    pub first_load_optional: Vec<String>,
+
     /// The renderer's GPU module, from the settings' `renderer:` key
     /// (`pill_master_renderer` when absent); `None` for `renderer: none`.
     ///
@@ -827,6 +834,7 @@ impl HostConfig {
         let module_names =
             Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
         let mut extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
+        let mut first_load_optional: Vec<String> = Vec::new();
         // An editor host also loads the editor crates, after every runtime
         // crate, so each finds its extension already registered.
         if load_editor_crates {
@@ -839,10 +847,13 @@ impl HostConfig {
                     runtime_folders.push(folder);
                 }
             }
-            extensions.extend(Self::resolve_editor_crates(
-                &runtime_folders,
-                &extensions_root,
-            ));
+            let (editor_crates, editor_only) =
+                Self::resolve_editor_crates(&runtime_folders, &extensions_root);
+            extensions.extend(editor_crates);
+            // The editor-only modules may fail their first load without
+            // taking the editor down; the embedder surfaces the errors and
+            // offers a retry (D33).
+            first_load_optional = editor_only;
         }
 
         // Step 5: Write every loaded extension crate's wrapper into its
@@ -879,6 +890,7 @@ impl HostConfig {
             project,
             extensions,
             load_editor_crates,
+            first_load_optional,
             renderer,
             assets: project_settings.assets,
             logging,
@@ -979,18 +991,21 @@ impl HostConfig {
         Ok(modules)
     }
 
-    /// The editor crates an editor host loads, in load order.
+    /// The editor crates an editor host loads, in load order, and the names
+    /// of the editor-only ones.
     ///
     /// First the editor crate of each folder in `runtime_folders` that has one,
     /// in that order (a folder loads its editor crate once, after its runtime
     /// crates); then every editor-only folder - a folder whose only crate is its
     /// editor crate - in name order, loaded unconditionally. A folder without an
     /// editor crate contributes nothing, silently. Bookkeeping folders (`_...`)
-    /// and the old renderers (`rendering`) are never searched.
+    /// and the old renderers (`rendering`) are never searched. The second half
+    /// of the return names the editor-only crates, which an editor host may
+    /// load tolerantly (`HostConfig::first_load_optional`).
     fn resolve_editor_crates(
         runtime_folders: &[String],
         extensions_root: &Path,
-    ) -> Vec<ExtensionConfig> {
+    ) -> (Vec<ExtensionConfig>, Vec<String>) {
         let editor_crate_of = |folder: &str| format!("{folder}{EDITOR_CRATE_SUFFIX}");
         let has_editor_crate = |folder: &str| {
             extensions_root
@@ -1016,6 +1031,7 @@ impl HostConfig {
             })
             .unwrap_or_default();
         all_folders.sort();
+        let mut editor_only: Vec<String> = Vec::new();
         for folder in all_folders {
             if folder.starts_with('_') || folder == "rendering" || folders.contains(&folder) {
                 continue;
@@ -1036,12 +1052,14 @@ impl HostConfig {
                 .unwrap_or(false);
             if !holds_runtime_crate {
                 folders.push(folder);
+                editor_only.push(editor_crate);
             }
         }
-        folders
+        let crates = folders
             .iter()
             .map(|folder| ExtensionConfig::workspace_member(&editor_crate_of(folder), folder))
-            .collect()
+            .collect();
+        (crates, editor_only)
     }
 }
 
@@ -1056,6 +1074,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             project,
             extensions: Vec::new(),
             load_editor_crates: false,
+            first_load_optional: Vec::new(),
             renderer: None,
             assets: ProjectAssetSettings::default(),
             logging: pill_runtime::LoggingSettings::default(),
@@ -2415,7 +2434,7 @@ serde = { version = "1", features = ["derive"] }
         seed_extension_crate(&root, "pill_editor_shell", "pill_editor_shell_editor");
         seed_extension_crate(&root, "_workspace_anchor", "_workspace_anchor_editor");
 
-        let resolved = HostConfig::resolve_editor_crates(
+        let (resolved, editor_only) = HostConfig::resolve_editor_crates(
             &["pill_audio".to_string(), "pill_spline".to_string()],
             &root,
         );
@@ -2424,6 +2443,11 @@ serde = { version = "1", features = ["derive"] }
             .map(|crate_config| crate_config.name.as_str())
             .collect();
         assert_eq!(names, ["pill_spline_editor", "pill_editor_shell_editor"]);
+        assert_eq!(
+            editor_only,
+            ["pill_editor_shell_editor"],
+            "only a folder whose editor crate is its only crate is optional at first load"
+        );
         assert!(resolved
             .iter()
             .all(|crate_config| crate_config.is_editor_crate));
@@ -2432,7 +2456,8 @@ serde = { version = "1", features = ["derive"] }
             "extensions/pill_spline/pill_spline_editor/src"
         );
 
-        let none = HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root);
+        let (none, none_optional) =
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root);
         assert_eq!(
             none.iter()
                 .map(|crate_config| crate_config.name.as_str())
@@ -2440,6 +2465,7 @@ serde = { version = "1", features = ["derive"] }
             ["pill_editor_shell_editor"],
             "only the editor-only folder loads when no loaded folder has an editor crate"
         );
+        assert_eq!(none_optional, ["pill_editor_shell_editor"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

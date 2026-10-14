@@ -365,6 +365,13 @@ mod slot {
             self.queued_cascade_reload = true;
         }
 
+        /// Force a full rebuild and reload on the next pass, as if a source
+        /// save had arrived: the editor's safe mode retries a shell whose
+        /// generation stopped this way (Stage 22, D33).
+        pub(crate) fn request_reload(&mut self) {
+            self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
+        }
+
         /// The module's crate directory, relative to the workspace root: the
         /// parent of the source directory its watcher watches.
         #[cfg(feature = "rendering")]

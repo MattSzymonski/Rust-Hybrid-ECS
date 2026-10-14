@@ -66,6 +66,16 @@ use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 /// Everything the frame-step loop needs, assembled once during startup.
 ///
+/// An editor-only module whose tolerated first load failed (Stage 22, D33):
+/// kept with the owner tag and watcher counter its first load would have had,
+/// so [`DevHost::retry_extension`] can build and load it later without
+/// restarting the host.
+struct PendingModule {
+    config: crate::config::ExtensionConfig,
+    owner: pill_engine::SystemOwner,
+    source_edit_generation: Arc<AtomicU64>,
+}
+
 /// Bundling this state lets headless, windowed, and editor frontends share the
 /// same engine lifetime and hot-reload behavior through [`run_one_frame`].
 pub struct DevHost {
@@ -89,6 +99,9 @@ pub struct DevHost {
     loaded_project: LoadedProject,
     /// Extensions, each with its own watcher and reload transaction.
     extensions: Vec<ExtensionSlot>,
+    /// Tolerated editor-only modules whose first load failed (D33): no slot
+    /// and no watcher; [`DevHost::retry_extension`] is their only way in.
+    pending_modules: Vec<PendingModule>,
     /// Counter bumped by the project watcher on every relevant source save.
     ///
     /// One producer (the watcher) and two consumers: `try_project_fast_path`,
@@ -277,6 +290,87 @@ impl DevHost {
             .iter()
             .map(|slot| slot.name().to_string())
             .collect()
+    }
+
+    /// Rebuild and load a module the host may have skipped, or force a
+    /// rebuild of a loaded one (Stage 22, D33).
+    ///
+    /// For a tolerated editor-only module whose first load failed, runs that
+    /// load again and starts its watcher on success. For a loaded module,
+    /// asks its reload path to rebuild as if its sources were saved - the
+    /// way the editor's safe mode retries a shell whose generation stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure text when the module still does not build, load
+    /// or register; the notice queue carries the same failure for the
+    /// embedder's error UI.
+    pub fn retry_extension(&mut self, name: &str) -> Result<(), String> {
+        if let Some(slot) = self.extensions.iter_mut().find(|slot| slot.name() == name) {
+            slot.request_reload();
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                module = name,
+                "module rebuild requested"
+            );
+            return Ok(());
+        }
+        let Some(index) = self
+            .pending_modules
+            .iter()
+            .position(|pending| pending.config.name == name)
+        else {
+            return Err(format!("no module named `{name}` to retry"));
+        };
+        let pending = self.pending_modules.remove(index);
+        match ExtensionSlot::start(
+            self.runtime.engine_mut(),
+            &self.engine_api,
+            &self.workspace_root,
+            &pending.config,
+            pending.owner,
+            Arc::clone(&pending.source_edit_generation),
+            crate::reload::FirstLoadFailure::ClearWorld,
+        ) {
+            Ok(slot) => {
+                if let Err(error) = spawn_source_watcher(
+                    self.workspace_root.clone(),
+                    &pending.config.name,
+                    &pending.config.watch_directory,
+                    Arc::clone(&pending.source_edit_generation),
+                    None,
+                ) {
+                    // The module works; only its watcher failed to start, so
+                    // a later edit will not reload it until a restart. Keep
+                    // the module - the retry's purpose is the working load.
+                    warn!(
+                        target: telemetry_target::HOT_RELOAD,
+                        module = pending.config.name.as_str(),
+                        error = %error,
+                        "the module loaded, but its source watcher did not start"
+                    );
+                }
+                self.extensions.push(slot);
+                #[cfg(feature = "hot_patch")]
+                self.module_hot_patch
+                    .push(crate::hot_patch::HotPatchSession::new(
+                        &self.workspace_root,
+                        &pending.config.name,
+                        &pending.config.watch_directory,
+                        &pending.config.output_subdirectory,
+                        &pending.config.build_command,
+                    ));
+                Ok(())
+            }
+            Err(error) => {
+                notices::push(HostNotice::ModuleFailed {
+                    module: pending.config.name.clone(),
+                    output: optional_failure_output(&error),
+                });
+                self.pending_modules.insert(index, pending);
+                Err(error.to_string())
+            }
+        }
     }
 
     /// Snapshot the current frame rate and entity count without resetting the
@@ -1078,6 +1172,17 @@ fn fail_setup(runtime: Runtime, error: HostError) -> HostError {
     reported
 }
 
+/// The text a tolerated first-load failure reports to the notice queue: the
+/// captured compiler output when the build itself failed (the editor's
+/// Problems rows parse `file:line` out of it), the error's own words
+/// otherwise.
+fn optional_failure_output(error: &HostError) -> String {
+    match error {
+        HostError::Build(_) => crate::build_runner::recent_build_output(),
+        other => other.to_string(),
+    }
+}
+
 /// Build/load the project module, create the engine, and start its source watcher.
 ///
 /// # Errors
@@ -1177,6 +1282,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // bridge binds them like any extension's, headless included. Each gets its own owner tag and its own
     // generation counter, so later reloads stay isolated from each other.
     let mut extensions = Vec::with_capacity(host_config.extensions.len());
+    let mut pending_modules: Vec<PendingModule> = Vec::new();
+    // One patch session per LOADED extension, index-aligned with
+    // `extensions` (the frame's fast path walks the two together); a module
+    // whose first load failed - or waits for a retry - has none until it
+    // loads (Stage 22, D33).
+    #[cfg(feature = "hot_patch")]
+    let mut module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = Vec::new();
     for (index, module_config) in host_config.extensions.iter().enumerate() {
         let module_generation = Arc::new(AtomicU64::new(0));
         let slot = match ExtensionSlot::start(
@@ -1189,7 +1301,35 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             crate::reload::FirstLoadFailure::ClearWorld,
         ) {
             Ok(slot) => slot,
-            Err(error) => return Err(fail_setup(runtime, error)),
+            Err(error) => {
+                // An editor-only module the embedder asked to tolerate (D33):
+                // report the failure the way a failed reload does and carry
+                // on; the editor's safe mode owns what happens next, and
+                // `DevHost::retry_extension` can build it again later.
+                if host_config
+                    .first_load_optional
+                    .iter()
+                    .any(|name| name == &module_config.name)
+                {
+                    warn!(
+                        target: telemetry_target::HOT_RELOAD,
+                        module = module_config.name.as_str(),
+                        error = %error,
+                        "optional module failed to load; the host continues without it"
+                    );
+                    notices::push(HostNotice::ModuleFailed {
+                        module: module_config.name.clone(),
+                        output: optional_failure_output(&error),
+                    });
+                    pending_modules.push(PendingModule {
+                        config: module_config.clone(),
+                        owner: extension_owner(index),
+                        source_edit_generation: module_generation,
+                    });
+                    continue;
+                }
+                return Err(fail_setup(runtime, error));
+            }
         };
         if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
@@ -1201,6 +1341,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             return Err(fail_setup(runtime, error.into()));
         }
         extensions.push(slot);
+        #[cfg(feature = "hot_patch")]
+        module_hot_patch.push(crate::hot_patch::HotPatchSession::new(
+            &workspace_root,
+            &module_config.name,
+            &module_config.watch_directory,
+            &module_config.output_subdirectory,
+            &module_config.build_command,
+        ));
     }
     // Step 5: Build and load the project module, then start its source watcher.
     // Extensions load first, so the C# backend can be handed every
@@ -1295,24 +1443,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         &module_config.build_command,
     );
 
-    // The same fast path for each extension. A module's `#[pill_hot_fn]`
-    // functions are compiled into every artifact that links the crate, so this
-    // is what lets an edit reach the project's embedded copy without the
-    // cascading project reload a module swap would otherwise queue.
-    #[cfg(feature = "hot_patch")]
-    let module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = host_config
-        .extensions
-        .iter()
-        .map(|configuration| {
-            crate::hot_patch::HotPatchSession::new(
-                &workspace_root,
-                &configuration.name,
-                &configuration.watch_directory,
-                &configuration.output_subdirectory,
-                &configuration.build_command,
-            )
-        })
-        .collect();
+    // The per-extension fast path's sessions were built with the slots they
+    // mirror (see the load loop): the fast path reads `module_hot_patch`
+    // beside `extensions`, so the two stay index-aligned.
 
     let host = DevHost {
         workspace_root,
@@ -1323,6 +1456,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         engine_api,
         loaded_project,
         extensions,
+        pending_modules,
         source_edit_generation,
         last_processed_source_edit: 0,
         queued_reload_generation: 0,

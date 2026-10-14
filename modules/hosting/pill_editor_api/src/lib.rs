@@ -306,6 +306,11 @@ pub struct EditorOpenRequest {
 /// upload, draw and route.
 #[derive(Clone, Debug, Default)]
 pub struct EditorShellFrame {
+    /// Frames the shell has built since it loaded (Stage 22), stamped at the
+    /// end of each update: the executable watches it advance to tell a live
+    /// shell from a generation that stopped running, which is what its safe
+    /// mode recovers from.
+    pub frames: u64,
     /// The UI under the scene layer: panels, tabs, docking chrome.
     pub panels: DrawList,
     /// The UI above the scene layer: badges, menus, drop previews, toasts.
