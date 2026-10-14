@@ -236,6 +236,48 @@ mod gizmo_tests {
 // run
 // =============================================================================
 
+/// The loop's own wake-ups (Stage 23, D32): a slow heartbeat that keeps the
+/// watchers and the scripted channel polled while an idle editor sleeps.
+enum UserEvent {
+    /// One heartbeat: poll what does not need a frame, and let the frame
+    /// boundary decide whether one is needed.
+    Tick,
+}
+
+/// How often the sleeping loop is woken (Stage 23, D32).
+///
+/// The reload watchers, the asset watcher and the scripted channel are all
+/// frame-polled, so a sleeping editor keeps this heartbeat: a frame is taken
+/// when a watcher's work waits or every few ticks, and the scripted channel
+/// stays responsive, at a fraction of a percent of one core.
+const QUIET_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How many heartbeat ticks between catch-all frames while the editor
+/// sleeps (Stage 23, D32): every watcher - shaders, assets, the renderer -
+/// is then polled within a couple of seconds without per-watcher plumbing.
+const QUIET_TICKS_PER_FRAME: u64 = 8;
+
+/// Shell frames to keep taking after a host notice (Stage 23, D32): a toast
+/// appears and lives out its frames even when the editor was asleep when it
+/// arrived (the shell's own `TOAST_FRAMES` is 240).
+const NOTICE_KEEP_FRAMES: u64 = 300;
+
+/// Wake the sleeping loop a few times a second (Stage 23, D32): the reload
+/// watchers, the asset watcher and the scripted channel are frame-polled,
+/// so an idle editor keeps this heartbeat. The proxy fails once the loop is
+/// gone, which ends the thread with it.
+fn spawn_heartbeat(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    std::thread::Builder::new()
+        .name("editor-heartbeat".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(QUIET_TICK);
+            if proxy.send_event(UserEvent::Tick).is_err() {
+                break;
+            }
+        })
+        .ok();
+}
+
 /// Run the editor: the event loop, the window and every presented frame.
 ///
 /// # Errors
@@ -247,12 +289,15 @@ pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), E
     // Step 1: the event loop. It waits between frames and wakes on its
     // redraw requests, input and popups; the frame boundary asks for the
     // next frame only while something needs one (Stage 22, D25).
-    let event_loop =
-        EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .map_err(|source| EditorError::EventLoopCreation { source })?;
     event_loop.set_control_flow(ControlFlow::Wait);
+    let heartbeat_proxy = event_loop.create_proxy();
     // Step 2: run until the last window closes.
     let mut application = EditorApplication {
         log_buffer: Some(log_buffer),
+        heartbeat_proxy: Some(heartbeat_proxy),
         ..EditorApplication::default()
     };
     event_loop
@@ -278,12 +323,14 @@ struct EditorApplication {
     /// The capture ring the console panel reads; installed with the
     /// telemetry stack before the loop starts.
     log_buffer: Option<pill_core::telemetry::capture::LogBuffer>,
+    /// The loop proxy the heartbeat thread sends through (Stage 23, D32).
+    heartbeat_proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
     /// A failure recorded outside the event callbacks' return path;
     /// surfaced by [`run`] after the loop exits.
     failure: Option<EditorError>,
 }
 
-impl ApplicationHandler for EditorApplication {
+impl ApplicationHandler<UserEvent> for EditorApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.editor.is_some() {
             return;
@@ -291,6 +338,9 @@ impl ApplicationHandler for EditorApplication {
         match EditorWindow::open(event_loop, self.log_buffer.clone()) {
             Ok(editor) => {
                 event_loop.set_control_flow(ControlFlow::Wait);
+                if let Some(proxy) = self.heartbeat_proxy.take() {
+                    spawn_heartbeat(proxy);
+                }
                 // The loop's first boundary asks for the first frame, so the
                 // window is never shown empty.
                 self.editor = Some(editor);
@@ -386,6 +436,14 @@ impl ApplicationHandler for EditorApplication {
             // Everything else is input for the editor UI.
             event => editor.push_ui_input(&event),
         }
+    }
+
+    /// The heartbeat of a sleeping editor (Stage 23, D32).
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        editor.tick();
     }
 
     /// The frame boundary between event batches: where the popups the
@@ -630,6 +688,17 @@ struct EditorWindow {
     ui_overlay_presented: u64,
     ui_panels_signature: Option<u64>,
     ui_overlay_signature: Option<u64>,
+    /// Whether anything the scene surfaces show changed since the last frame
+    /// the host drew (Stage 23, D32). Events, commands, notices and a moved
+    /// or (un)placed view set it; a drawn frame clears it.
+    scene_dirty: bool,
+    /// The frame count until which the loop keeps taking frames after a
+    /// notice, so a toast can appear and expire (Stage 23, D32).
+    quiet_keep_frames: u64,
+    /// Heartbeat ticks since the editor last slept; every
+    /// `QUIET_TICKS_PER_FRAME` of them take one catch-all frame so every
+    /// frame-polled watcher is served.
+    quiet_ticks: u64,
 }
 
 impl EditorWindow {
@@ -969,6 +1038,9 @@ impl EditorWindow {
             ui_overlay_presented: 0,
             ui_panels_signature: None,
             ui_overlay_signature: None,
+            scene_dirty: true,
+            quiet_keep_frames: 0,
+            quiet_ticks: 0,
         })
     }
 
@@ -1252,20 +1324,44 @@ impl EditorWindow {
         self.quit_requested
     }
 
-    /// Ask for the next frame only while something needs one (Stage 22,
-    /// D25): the scene keeps its pace, while a clean, idle UI sleeps - input
-    /// and popups wake the wait through their own events. The forced
-    /// continuous redraw keeps the old always-on pacing.
+    /// Ask for the next frame only while something needs one (Stages 22-23,
+    /// D25/D32): the scene keeps its pace while it runs, a clean UI waits,
+    /// and an idle paused editor sleeps - the heartbeat tick and input wake
+    /// the wait through their own events. The forced continuous redraw
+    /// keeps the old always-on pacing.
     fn schedule_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let scene_active = self.scene_attached && !self.scene_quiet_now();
         let need_frames = self.continuous_redraw
-            || self.scene_attached
+            || scene_active
             || self.ui_dirty
-            || self.overlay.is_some()
+            || self.safe_mode.is_some()
             || !self.popups.is_empty()
-            || self.test_channel.is_some()
-            || self.safe_mode.is_some();
+            || self.quit_requested
+            || self.frame_count < self.quiet_keep_frames;
         event_loop.set_control_flow(ControlFlow::Wait);
         if need_frames {
+            self.window.request_redraw();
+        }
+    }
+
+    /// Whether the scene has nothing to draw: nothing changed it since the
+    /// last drawn frame, and the project's systems are paused (Stage 23,
+    /// D32). The host then holds the surfaces' last image instead of
+    /// rendering an unchanging world.
+    fn scene_quiet_now(&mut self) -> bool {
+        !self.scene_dirty && self.host.host_mut().engine_mut().systems_paused()
+    }
+
+    /// The sleeping editor's heartbeat (Stage 23, D32): poll the scripted
+    /// channel, take a frame when a watcher's work waits - an edit must
+    /// reach a slept editor without anyone touching it - and take one
+    /// catch-all frame every few ticks so every frame-polled watcher is
+    /// served.
+    fn tick(&mut self) {
+        self.poll_test_channel();
+        self.quiet_ticks += 1;
+        let catch_all = self.quiet_ticks.is_multiple_of(QUIET_TICKS_PER_FRAME);
+        if catch_all || self.host.host().source_work_pending() {
             self.window.request_redraw();
         }
     }
@@ -2010,6 +2106,8 @@ impl EditorWindow {
     /// view never forwards input to the game. Orbit on right drag, pan on
     /// middle drag, dolly on the wheel, and WASD moves the focus point.
     fn scene_view_event(&mut self, event: &WindowEvent) {
+        // Anything the scene window sends can change what it shows.
+        self.scene_dirty = true;
         if let WindowEvent::Resized(size) = event {
             // The scene surface reconfigures with its window: the render
             // target is what pick pixels are counted in, and a stale target
@@ -2166,6 +2264,13 @@ impl EditorWindow {
             self.notices
                 .events
                 .push(EditorNoticeEvent { seq, level, text });
+            // A notice is worth drawing (Stage 23, D32): the toast, the
+            // problems it may touch, and the world a reload changed. The
+            // keep-window also holds the quiet editor awake long enough for
+            // the toast to live out its frames.
+            self.scene_dirty = true;
+            self.ui_dirty = true;
+            self.quiet_keep_frames = self.frame_count + NOTICE_KEEP_FRAMES;
             match &notice {
                 HostNotice::ModuleFailed { module, output } => {
                     self.notices
@@ -2274,6 +2379,9 @@ impl EditorWindow {
     /// resource into the next render, and [`Self::drain_scene_picks`] applies
     /// whatever comes back, matched by request id.
     fn request_scene_pick(&mut self, physical_x: u32, physical_y: u32) {
+        // The answer rides the next render, so the scene cannot sleep
+        // through it (Stage 23, D32).
+        self.scene_dirty = true;
         self.pending_pick = self.queue_scene_pick(physical_x, physical_y);
     }
 
@@ -3315,6 +3423,12 @@ impl EditorWindow {
         }
         // Step 3: run the project's frame. The shell's system runs inside
         // it, between the input just delivered and the output read next.
+        // The scene surfaces stay quiet while the project is paused and
+        // nothing changed them (Stage 23, D32): the host holds its last
+        // image, and the idle editor pays no scene render. The flag clears
+        // on the frames the host actually drew.
+        self.host
+            .set_scene_quiet(!self.scene_dirty && !self.continuous_redraw);
         if let Some(report) = self.host.run_frame().map_err(EditorError::Renderer)? {
             info!(
                 target: telemetry_target::ENGINE,
@@ -3322,6 +3436,9 @@ impl EditorWindow {
                 entities = report.entity_count,
                 "[editor] scene frame report"
             );
+        }
+        if self.host.scene_drawn_last_frame() {
+            self.scene_dirty = false;
         }
         // Step 4: take the shell's output back out of the world. The lists
         // are moved out and the shell rebuilds them next frame, so no large
@@ -3469,6 +3586,9 @@ impl EditorWindow {
                 // An applied edit can change archetypes (add/remove
                 // component), so the snapshot's entity tier is stale.
                 self.entity_tier_dirty = true;
+                // A batch can also change what the scene draws - the gizmo
+                // settings, a camera, an inspected transform.
+                self.scene_dirty = true;
             }
             let now_millis = self
                 .test_started
@@ -3544,6 +3664,11 @@ impl EditorWindow {
         // the other view hides instead of sitting under it; a shell-less
         // frame carries the previous frame's rectangles through the fallback
         // output, which keeps the placement stable.
+        // A moved, shown or hidden view changes what the surfaces show
+        // (Stage 23, D32): the scene is dirty for the next frame.
+        if output.scene_rect != self.last_scene_rect || output.game_rect != self.last_game_rect {
+            self.scene_dirty = true;
+        }
         self.last_scene_rect = output.scene_rect;
         self.last_game_rect = output.game_rect;
         self.last_assets_rect = output.assets_rect;

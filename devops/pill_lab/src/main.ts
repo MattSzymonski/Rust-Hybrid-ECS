@@ -15,6 +15,7 @@ import './styles/tests.css';
 
 import { renderCategoryPicker } from './components/CategoryPicker';
 import { renderColdStartReport } from './components/ColdStartReport';
+import { renderEditorShellReport } from './components/EditorShellReport';
 import { renderEngineReport } from './components/EngineReport';
 import { renderEnvironments } from './components/EnvironmentInfo';
 import { renderHotReloadReport } from './components/HotReloadReport';
@@ -142,6 +143,7 @@ function emptyState(category: MeasurementCategory): HTMLElement {
     engine: 'python devops/pill_lab/pill_lab.py engine',
     hot_reload: 'python devops/pill_lab/pill_lab.py hot-reload',
     cold_start: 'python devops/pill_lab/pill_lab.py cold-start',
+    editor_shell: 'python devops/pill_lab/pill_lab.py editor-shell',
   };
   return element(
     'div',
@@ -183,6 +185,11 @@ function renderReport(
       return renderColdStartReport(
         measurement,
         baseline?.category === 'cold_start' ? baseline : null,
+      );
+    case 'editor_shell':
+      return renderEditorShellReport(
+        measurement,
+        baseline?.category === 'editor_shell' ? baseline : null,
       );
   }
 }

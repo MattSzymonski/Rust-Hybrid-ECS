@@ -408,25 +408,32 @@ def _cold_start_rows(measurement: Dict[str, Any]) -> List[MetricRow]:
 
 
 def _editor_shell_rows(measurement: Dict[str, Any]) -> List[MetricRow]:
-    """Extracts one row per editor-shell case, plus the steady frame rate.
+    """Extracts one row per editor-shell case, plus a rate row for the
+    frame-rate cases.
 
-    The steady-rate row is in frames per second (higher is better), unlike
-    the duration rows around it.
+    A case's own unit wins (`ms` by default; `%` for the idle CPU, `x` for
+    the ratio cases) and its `better_when` too. The steady-rate rows are in
+    frames per second (higher is better), unlike the duration rows around
+    them.
     """
     rows: List[MetricRow] = []
     for case in measurement.get("cases", []) or []:
-        samples = case.get("samples_ms")
+        samples = case.get("samples_ms") or case.get("samples")
+        value = case.get("value")
+        if value is None:
+            value = case.get("duration_ms", 0.0)
         rows.append(
             MetricRow(
                 key=case["name"],
                 label=case["name"],
                 group=case.get("kind", "case"),
-                unit="ms",
-                value=float(case.get("duration_ms", 0.0)),
+                unit=case.get("unit", "ms"),
+                value=float(value),
                 std_dev=(
                     statistics.stdev(samples) if samples and len(samples) > 1 else None
                 ),
                 samples=len(samples) if samples else None,
+                better_when=case.get("better_when", "lower"),
             )
         )
         rate = case.get("frames_per_second")
