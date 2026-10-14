@@ -560,6 +560,12 @@ struct EditorWindow {
     /// The asset browser's rows, refreshed periodically (the walk touches
     /// the filesystem).
     asset_entries: Vec<pill_editor_core::editor_state::AssetListing>,
+    /// Set by a command that changed a file (Stage 25): the rows are
+    /// rebuilt on the next frame instead of waiting for the periodic walk.
+    asset_listing_dirty: bool,
+    /// The live standalone asset types (Stage 25), refreshed with the rows:
+    /// the create dialog's list.
+    standalone_types: Vec<pill_editor_core::editor_state::StandaloneTypeInfo>,
     /// The entity tier's change tracking: the entity count it was built
     /// for, the frames since, and whether an applied edit made it stale.
     /// Its per-entity strings make a per-frame rebuild too expensive on a
@@ -1032,6 +1038,8 @@ impl EditorWindow {
             test_seconds: test_channel::seconds_from_environment(),
             quit_requested: false,
             asset_entries: Vec::new(),
+            standalone_types: Vec::new(),
+            asset_listing_dirty: false,
             entity_tier_count: usize::MAX,
             entity_tier_age: 0,
             entity_tier_dirty: false,
@@ -1597,6 +1605,29 @@ impl EditorWindow {
                             );
                         }
                     }
+                    TestCommand::WindowType { id, text } => {
+                        if self.windows.push_text(&id, &text) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                text = %text,
+                                "[editor] test window type"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window type: no such window"
+                            );
+                        }
+                    }
+                    TestCommand::RefreshAssets => {
+                        self.asset_listing_dirty = true;
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] test assets refresh"
+                        );
+                    }
                     TestCommand::WindowMove { x, y } => {
                         info!(
                             target: telemetry_target::ENGINE,
@@ -1633,6 +1664,7 @@ impl EditorWindow {
                         self.requested_widget = Some(name);
                     }
                     TestCommand::Select { entity } => self.select_entity_display(&entity),
+                    TestCommand::SelectAsset { path } => self.select_asset_display(&path),
                     TestCommand::Wheel { lines } => {
                         info!(
                             target: telemetry_target::ENGINE,
@@ -1870,6 +1902,53 @@ impl EditorWindow {
                     enabled: *enabled,
                 }
             }
+            test_channel::EditCommand::AssetCreate {
+                type_name,
+                folder,
+                name,
+            } => {
+                label = format!("create asset {name}");
+                EditorCommand::CreateStandaloneAsset {
+                    type_name: type_name.clone(),
+                    folder: folder.clone(),
+                    name: name.clone(),
+                }
+            }
+            test_channel::EditCommand::AssetDelete { path } => {
+                label = format!("delete asset {path}");
+                EditorCommand::DeleteAssetFile { path: path.clone() }
+            }
+            test_channel::EditCommand::AssetMove { from, to } => {
+                label = format!("move asset {from}");
+                EditorCommand::MoveAssetFile {
+                    from: from.clone(),
+                    to: to.clone(),
+                }
+            }
+            test_channel::EditCommand::AssetMeta { path } => {
+                label = format!("write meta {path}");
+                EditorCommand::WriteAssetMeta { path: path.clone() }
+            }
+            test_channel::EditCommand::ResourceSet {
+                resource,
+                field,
+                value,
+            } => {
+                let Ok(value) = parse_field_value(value) else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        value = value.as_str(),
+                        "[editor] test edit: bad resource value"
+                    );
+                    return;
+                };
+                label = format!("set {field}");
+                EditorCommand::SetResourceField {
+                    resource: resource.clone(),
+                    field: field.clone(),
+                    value,
+                }
+            }
         };
         let world = engine.world_mut();
         if let Some(pending) =
@@ -1989,11 +2068,74 @@ impl EditorWindow {
             // Handled above, before the world borrow; here to keep the
             // match exhaustive.
             test_channel::DumpQuery::UiFrames => {}
+            test_channel::DumpQuery::Resource { resource, field } => {
+                let value = world
+                    .get_resource::<pill_editor_core::gizmo::GizmoState>()
+                    .map(|state| {
+                        pill_editor_core::gizmo::resource_field_value(
+                            &state.settings,
+                            &resource,
+                            &field,
+                        )
+                    });
+                match value {
+                    Some(Ok(value)) => info!(
+                        target: telemetry_target::ENGINE,
+                        resource = resource.as_str(),
+                        field = field.as_str(),
+                        value = ?value,
+                        "[test] resource"
+                    ),
+                    Some(Err(error)) => info!(
+                        target: telemetry_target::ENGINE,
+                        resource = resource.as_str(),
+                        field = field.as_str(),
+                        error = %error,
+                        "[test] resource unreadable"
+                    ),
+                    None => info!(
+                        target: telemetry_target::ENGINE,
+                        resource = resource.as_str(),
+                        field = field.as_str(),
+                        "[test] resource unreadable"
+                    ),
+                }
+            }
+            test_channel::DumpQuery::Selection => {
+                let selection =
+                    world.get_resource::<pill_editor_core::editor_state::EditorSelection>();
+                let entity = selection
+                    .and_then(|selection| selection.entity)
+                    .map(|entity| entity.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let asset = selection
+                    .and_then(|selection| selection.asset.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                info!(
+                    target: telemetry_target::ENGINE,
+                    entity = entity.as_str(),
+                    asset = asset.as_str(),
+                    "[test] selection"
+                );
+            }
+            test_channel::DumpQuery::StandaloneTypes => {
+                for info in pill_host::standalone_types(world) {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        type_name = info.type_name.as_str(),
+                        display = info.display_name.as_str(),
+                        extension = info.extension.as_str(),
+                        "[test] standalone type"
+                    );
+                }
+            }
         }
     }
 
     /// The scripted selection: the same shared resource a Hierarchy click
-    /// sets, resolved against the live entity table.
+    /// sets, resolved against the live entity table and recorded through the
+    /// command path like any other edit (Stage 25), so undo walks selections
+    /// back the way it walks edits.
     fn select_entity_display(&mut self, handle: &str) {
         let engine = self.host.host_mut().engine_mut();
         let world = engine.world_mut();
@@ -2005,15 +2147,52 @@ impl EditorWindow {
             );
             return;
         };
-        if let Some(selection) =
-            world.get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
+        let asset = world
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.asset.clone());
+        if let Some(pending) =
+            world.get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
         {
-            selection.entity = Some(entity);
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection {
+                    entity: Some(entity),
+                    asset,
+                }],
+                "select entity",
+                Some("editor.selection".to_string()),
+            );
         }
         info!(
             target: telemetry_target::ENGINE,
             entity = %entity,
             "[editor] selection changed"
+        );
+    }
+
+    /// The scripted asset selection (Stage 25): recorded through the command
+    /// path like the entity one, so undo walks it back too.
+    fn select_asset_display(&mut self, path: &str) {
+        let engine = self.host.host_mut().engine_mut();
+        let world = engine.world_mut();
+        let entity = world
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.entity);
+        if let Some(pending) =
+            world.get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>()
+        {
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection {
+                    entity,
+                    asset: Some(path.to_string()),
+                }],
+                "select asset",
+                Some("editor.selection".to_string()),
+            );
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            path,
+            "[editor] asset selected"
         );
     }
 
@@ -2703,16 +2882,27 @@ impl EditorWindow {
                     let changed = match world
                         .get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
                     {
-                        Some(selection) => {
-                            let changed = selection.entity != Some(entity);
-                            selection.entity = Some(entity);
-                            changed
-                        }
+                        Some(selection) => selection.entity != Some(entity),
                         None => false,
                     };
-                    // The same token the shell logs when a panel selects, so
-                    // a suite reads one shape for "the selection moved".
                     if changed {
+                        let asset = world
+                            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+                            .and_then(|selection| selection.asset.clone());
+                        if let Some(pending) = world
+                            .get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>(
+                        ) {
+                            pending.push_recorded(
+                                vec![EditorCommand::SetSelection {
+                                    entity: Some(entity),
+                                    asset,
+                                }],
+                                "select entity",
+                                Some("editor.selection".to_string()),
+                            );
+                        }
+                        // The same token the shell logs when a panel selects, so
+                        // a suite reads one shape for "the selection moved".
                         info!(
                             target: telemetry_target::ENGINE,
                             entity = %entity,
@@ -2725,10 +2915,25 @@ impl EditorWindow {
                         target: telemetry_target::ENGINE,
                         "[editor] scene pick nothing"
                     );
-                    if let Some(selection) =
-                        world.get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
-                    {
-                        selection.entity = None;
+                    let had_entity = world
+                        .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+                        .is_some_and(|selection| selection.entity.is_some());
+                    if had_entity {
+                        let asset = world
+                            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+                            .and_then(|selection| selection.asset.clone());
+                        if let Some(pending) = world
+                            .get_resource_mut::<pill_editor_core::commands::PendingEditorCommands>(
+                        ) {
+                            pending.push_recorded(
+                                vec![EditorCommand::SetSelection {
+                                    entity: None,
+                                    asset,
+                                }],
+                                "clear selection",
+                                Some("editor.selection".to_string()),
+                            );
+                        }
                     }
                 }
                 PickHit::Handle(handle) => {
@@ -3473,24 +3678,43 @@ impl EditorWindow {
         {
             // The Assets panel's rows come from the host's asset browser;
             // gathered before the engine borrow below. The tree walk touches
-            // the filesystem, so it refreshes periodically rather than every
-            // frame.
-            if self.frame_count.is_multiple_of(ASSET_REFRESH_FRAMES) {
+            // the filesystem, so it refreshes periodically, and at once
+            // after a command that changed a file (Stage 25) - a rename's
+            // row must move before the panel's toolbar is used again.
+            if self.frame_count.is_multiple_of(ASSET_REFRESH_FRAMES) || self.asset_listing_dirty {
+                self.asset_listing_dirty = false;
                 self.asset_entries = self
                     .host
                     .host()
                     .asset_entries()
                     .into_iter()
-                    .filter(|entry| !entry.is_directory)
                     .take(256)
                     .map(|entry| pill_editor_core::editor_state::AssetListing {
                         path: entry.path,
-                        kind: entry.type_name.unwrap_or_else(|| "file".to_string()),
+                        kind: if entry.is_directory {
+                            "folder".to_string()
+                        } else {
+                            entry.type_name.unwrap_or_else(|| "file".to_string())
+                        },
+                        standalone: entry.standalone,
+                        has_meta: entry.guid.is_some(),
                     })
                     .collect();
+                // The standalone asset types a create dialog may offer
+                // (Stage 25): straight from the loaded modules' registrations.
+                self.standalone_types =
+                    pill_host::standalone_types(self.host.host_mut().engine_mut().world())
+                        .into_iter()
+                        .map(|info| pill_editor_core::editor_state::StandaloneTypeInfo {
+                            type_name: info.type_name,
+                            display_name: info.display_name,
+                            extension: info.extension,
+                        })
+                        .collect();
                 info!(
                     target: telemetry_target::ENGINE,
                     count = self.asset_entries.len(),
+                    types = self.standalone_types.len(),
                     "[editor] asset listing refreshed"
                 );
             }
@@ -3535,6 +3759,7 @@ impl EditorWindow {
                     current.systems = systems;
                     current.components = components;
                     current.assets = self.asset_entries.clone();
+                    current.standalone_types = self.standalone_types.clone();
                     current.paused = systems_paused;
                     current.detail = detail;
                 }
@@ -3548,6 +3773,7 @@ impl EditorWindow {
                     Vec::new(),
                 );
                 snapshot.assets = self.asset_entries.clone();
+                snapshot.standalone_types = self.standalone_types.clone();
                 snapshot.detail = selected.and_then(|entity| {
                     pill_editor_core::editor_state::EditorSnapshot::capture_detail(engine, entity)
                 });
@@ -3600,6 +3826,7 @@ impl EditorWindow {
                     .window_pointers
                     .append(&mut self.windows.take_pointers());
                 input.window_keys.append(&mut self.windows.take_keys());
+                input.window_text.append(&mut self.windows.take_texts());
                 input.window_closed.append(&mut self.window_closed);
                 input.overlay_labels.clone_from(&self.overlay_labels);
                 // A shell that never drains (the fallback UI, or a module
@@ -3616,6 +3843,7 @@ impl EditorWindow {
                 // The windows' queues get the same treatment (Stage 24).
                 self.windows.take_pointers();
                 self.windows.take_keys();
+                self.windows.take_texts();
                 self.window_closed.clear();
             }
         }
@@ -3811,6 +4039,78 @@ impl EditorWindow {
                     count = batch.commands.len(),
                     "[editor] engine commands applied"
                 );
+                // A selection change is recorded like any other edit
+                // (Stage 25); the applied value is logged so a suite can see
+                // an undo walk it back.
+                for command in &batch.commands {
+                    if let EditorCommand::SetSelection { entity, asset } = command {
+                        let entity_text = entity
+                            .map(|entity| entity.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            entity = entity_text.as_str(),
+                            asset = asset.as_deref().unwrap_or("-"),
+                            "[editor] selection applied"
+                        );
+                    }
+                }
+                // The shared selection follows its file (Stage 25): a rename
+                // leaves it on the old path and a delete on nothing unless
+                // the batch said otherwise. Unrecorded, like the history's
+                // remap - it is the resource agreeing with what the disk now
+                // holds, not an edit of its own.
+                for command in &batch.commands {
+                    let Some(selection) =
+                        self.host
+                            .host_mut()
+                            .engine_mut()
+                            .world_mut()
+                            .get_resource_mut::<pill_editor_core::editor_state::EditorSelection>()
+                    else {
+                        break;
+                    };
+                    match command {
+                        EditorCommand::MoveAssetFile { from, to }
+                            if selection.asset.as_deref() == Some(from.as_str()) =>
+                        {
+                            selection.asset = Some(to.clone());
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                path = to.as_str(),
+                                "[editor] selection followed the move"
+                            );
+                        }
+                        EditorCommand::DeleteAssetFile { path }
+                            if selection.asset.as_deref() == Some(path.as_str()) =>
+                        {
+                            selection.asset = None;
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                path = path.as_str(),
+                                "[editor] selection cleared with the delete"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // A batch that moved files on disk brings the rows up to
+                // date at once (Stage 25): the panel's toolbar acts on what
+                // the rows say.
+                if batch.commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        EditorCommand::CreateStandaloneAsset { .. }
+                            | EditorCommand::RestoreAssetFile { .. }
+                            | EditorCommand::DeleteAssetFile { .. }
+                            | EditorCommand::MoveAssetFile { .. }
+                            | EditorCommand::WriteAssetMeta { .. }
+                            | EditorCommand::ImportFiles { .. }
+                            | EditorCommand::RemoveFiles { .. }
+                    )
+                }) {
+                    self.asset_listing_dirty = true;
+                }
                 for (index, message) in recorded.failures {
                     warn!(
                         target: telemetry_target::ENGINE,

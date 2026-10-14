@@ -31,8 +31,10 @@ use std::sync::Arc;
 use pill_core::math::Vector2f;
 use pill_editor_api::{
     EditorWindowKey, EditorWindowKeyKind, EditorWindowPointer, EditorWindowPointerKind,
-    EditorWindowRequest,
+    EditorWindowRequest, EditorWindowText,
 };
+use pill_engine_core::InputEvent;
+use pill_input::winit_events::translate_window_event;
 use pill_ui::draw::{Color, DrawList};
 use pill_ui_wgpu::UiRenderer;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -61,6 +63,8 @@ pub struct WindowHost {
     pointers: Vec<EditorWindowPointer>,
     /// Enter and Escape presses collected since the last read.
     keys: Vec<EditorWindowKey>,
+    /// Committed text runs collected since the last read (Stage 25).
+    texts: Vec<EditorWindowText>,
     /// Windows opened since startup; the suite reads it.
     opened: u64,
 }
@@ -103,11 +107,29 @@ impl WindowHost {
         std::mem::take(&mut self.keys)
     }
 
+    /// Take the text runs collected since the last call.
+    pub fn take_texts(&mut self) -> Vec<EditorWindowText> {
+        std::mem::take(&mut self.texts)
+    }
+
+    /// Queue a text run for one window (the scripted test channel).
+    pub fn push_text(&mut self, id: &str, text: &str) -> bool {
+        if !self.windows.iter().any(|window| window.id == id) {
+            return false;
+        }
+        self.texts.push(EditorWindowText {
+            id: id.to_string(),
+            text: text.to_string(),
+        });
+        true
+    }
+
     /// Close every window, for shutdown.
     pub fn close_all(&mut self) {
         self.windows.clear();
         self.pointers.clear();
         self.keys.clear();
+        self.texts.clear();
     }
 
     /// Close one window the way the user does with the title bar (the
@@ -303,6 +325,21 @@ impl WindowHost {
                     id: window.id.clone(),
                     key,
                 });
+            }
+            // Committed text (Stage 25): what a field inside the window
+            // receives; the window's other keys stay with it until a panel
+            // needs them.
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_) => {
+                for event in translate_window_event(event) {
+                    if let InputEvent::TextInput { text } = event {
+                        if !text.is_empty() {
+                            self.texts.push(EditorWindowText {
+                                id: window.id.clone(),
+                                text,
+                            });
+                        }
+                    }
+                }
             }
             _ => {}
         }

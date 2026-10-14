@@ -145,6 +145,11 @@ pub struct EditorShellInput {
     /// Enter and Escape presses from a window's own keyboard stream
     /// (Stage 24); a modal answers them, anything else ignores them.
     pub window_keys: Vec<EditorWindowKey>,
+    /// Committed text from a window's own keyboard stream (Stage 25): the
+    /// typing a panel's field inside a tool window or dialog receives. A
+    /// window's keys beyond Enter and Escape stay on its side of the
+    /// channel until a panel needs them.
+    pub window_text: Vec<EditorWindowText>,
     /// Windows the platform closed this frame (Stage 24): the user pressed
     /// the close button. The shell drops the window's state, exactly as it
     /// would have on its own close.
@@ -321,6 +326,16 @@ pub enum EditorWindowKeyKind {
     Enter,
     /// The modal closes, nothing runs.
     Escape,
+}
+
+/// One committed text run from one free-standing window (Stage 25): what a
+/// field inside it receives when the user types there.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorWindowText {
+    /// Which window, by [`EditorWindowRequest::id`].
+    pub id: String,
+    /// The text just committed.
+    pub text: String,
 }
 
 /// One structured clipboard write the shell requests (Stage 18): the payload

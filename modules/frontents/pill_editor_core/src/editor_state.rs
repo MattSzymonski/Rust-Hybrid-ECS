@@ -83,13 +83,31 @@ pub struct SystemSummary {
     pub name_is_ambiguous: bool,
 }
 
-/// One row of the Assets panel: a file the browser knows about.
+/// One row of the Assets panel: a file or folder the browser knows about.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetListing {
     /// Project-relative path, forward slashes.
     pub path: String,
-    /// A short kind label (the asset type or file extension).
+    /// A short kind label: the asset type, `file`, or `folder`.
     pub kind: String,
+    /// Whether the entry is a standalone asset (it holds its own header).
+    pub standalone: bool,
+    /// Whether a `.meta` sidecar - or a standalone header - carries a guid;
+    /// a sourced file without one can get a written sidecar (Stage 25).
+    pub has_meta: bool,
+}
+
+/// One standalone asset type a new file can be created for (Stage 25): a
+/// row of the create dialog, straight from the loaded modules'
+/// registrations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StandaloneTypeInfo {
+    /// The registered type name, written to the file's `asset_type`.
+    pub type_name: String,
+    /// The last `::` segment of the type name, for the dialog row.
+    pub display_name: String,
+    /// The file extension, without the dot.
+    pub extension: String,
 }
 
 /// The editor's shared selection, read by every data panel and the scene.
@@ -126,6 +144,9 @@ pub struct EditorSnapshot {
     pub components: Vec<RegisteredComponent>,
     /// The asset browser's rows (the Assets panel).
     pub assets: Vec<AssetListing>,
+    /// The live standalone asset types (Stage 25): what a create dialog may
+    /// offer.
+    pub standalone_types: Vec<StandaloneTypeInfo>,
     /// Whether the engine's system phase is paused.
     pub paused: bool,
     /// Command failures from the last apply batch, newest first.
@@ -149,6 +170,7 @@ impl EditorSnapshot {
             systems: Self::capture_systems(engine, extension_names),
             components: Self::capture_components(engine),
             assets: Vec::new(),
+            standalone_types: Vec::new(),
             paused: engine.systems_paused(),
             errors,
         }
@@ -986,10 +1008,18 @@ impl EditorCommand {
                 };
                 let directory = root.join(&relative_folder);
                 if !directory.is_dir() {
-                    return Err(format!(
-                        "{command:?}: the folder `{}` does not exist",
-                        asset_slash(&relative_folder)
-                    ));
+                    // A project whose asset directory does not exist yet gets
+                    // its root made on demand; a named folder must exist, the
+                    // same refusal the host's browser states.
+                    if relative_folder.as_os_str().is_empty() {
+                        std::fs::create_dir_all(&directory)
+                            .map_err(|error| format!("{command:?}: {error}"))?;
+                    } else {
+                        return Err(format!(
+                            "{command:?}: the folder `{}` does not exist",
+                            asset_slash(&relative_folder)
+                        ));
+                    }
                 }
                 let file_name = pill_engine::asset_metadata::standalone_file_name(name, &extension)
                     .map_err(|message| format!("{command:?}: {message}"))?;
@@ -1129,9 +1159,27 @@ impl EditorCommand {
                 else {
                     return Err(format!("{command:?}: `{path}` cannot have a sidecar"));
                 };
-                if root.join(&meta_relative).exists() {
-                    // Nothing was missing: nothing changed, nothing recorded.
-                    return Ok(CommandOutcome::plain());
+                let meta_path = root.join(&meta_relative);
+                if meta_path.is_file() {
+                    // A sidecar that carries a guid is not missing: nothing
+                    // changes, nothing is recorded. One left empty or
+                    // unreadable by an interrupted write counts as missing
+                    // and is replaced; the undo removes the replacement.
+                    let usable = std::fs::read_to_string(&meta_path)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                        .and_then(|document| {
+                            document
+                                .get("guid")
+                                .and_then(|guid| guid.as_str())
+                                .map(str::to_owned)
+                        })
+                        .is_some();
+                    if usable {
+                        return Ok(CommandOutcome::plain());
+                    }
+                    std::fs::remove_file(&meta_path)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
                 }
                 let registry = engine
                     .world()
