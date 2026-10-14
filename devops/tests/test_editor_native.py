@@ -193,6 +193,21 @@ def main() -> int:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+    # A concurrent cargo build rewrites the shared dylibs under the modules
+    # this suite loads, which turns a clean start into a loader failure
+    # (Stage 14 follow-up): detect it and say so, instead of failing on a
+    # load whose log cannot tell the difference.
+    cargo = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq cargo.exe", "/NH"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    if "cargo.exe" in cargo:
+        raise SystemExit(
+            "a cargo build (cargo.exe) is running; wait for it to finish "
+            "before running the editor suite - it rewrites the shared dylibs "
+            "the modules load against"
+        )
     root = Path(__file__).resolve().parents[2]
     binary = (
         arguments.binary.resolve()

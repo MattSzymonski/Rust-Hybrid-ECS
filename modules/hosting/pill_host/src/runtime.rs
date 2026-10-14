@@ -300,6 +300,7 @@ impl DevHost {
         if self.patch_attempt.is_some() {
             return true;
         }
+        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         if self
             .extensions
             .iter()

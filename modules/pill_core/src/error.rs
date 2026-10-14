@@ -732,6 +732,31 @@ pub enum LibraryError {
         module_engine: String,
     },
 
+    /// A named import the module needs is not exported by the copy of the
+    /// imported DLL the loader would use (Stage 27).
+    ///
+    /// Windows reports a missing named import as `LoadLibrary` error 127,
+    /// "The specified procedure could not be found", naming neither the DLL
+    /// nor the symbol. The module's own import tables against the candidate
+    /// copy's export table say exactly which symbol is missing and where it
+    /// was looked for.
+    #[message(
+        "native library for ",
+        name_style(subject),
+        " imports ",
+        name_style(symbol),
+        " from ",
+        name_style(dll),
+        ", which does not export it; the copy the loader would use is ",
+        name_style(path)
+    )]
+    MissingImport {
+        subject: String,
+        dll: String,
+        symbol: String,
+        path: String,
+    },
+
     /// The library does not export a required entry point.
     ///
     /// Names the subject as well as the symbol: a project and an extension

@@ -143,22 +143,181 @@ fn first_engine_dylib_mismatch(workspace_root: &Path) -> Option<(PathBuf, PathBu
     })
 }
 
-/// Explain a load failure that an engine-dylib mismatch accounts for.
+/// A named import the module needs that a candidate copy of its DLL does
+/// not export, with the copy the loader would try first.
+#[derive(Debug, PartialEq, Eq)]
+struct UnresolvedImport {
+    /// The DLL as the import table names it.
+    dll: String,
+    /// The symbol the module needs from it.
+    symbol: String,
+    /// The copy the loader would resolve for that DLL, when any exists.
+    path: PathBuf,
+}
+
+/// What the gathered evidence says about a failed load (Stage 27).
+#[derive(Debug, PartialEq, Eq)]
+enum LoadFailureExplanation {
+    /// A named import no candidate copy of its DLL exports; the concrete
+    /// answer, naming the DLL and the symbol.
+    MissingImport(UnresolvedImport),
+    /// An engine dylib the module was linked against differs from the host's
+    /// copy, and the unresolved import belongs to it (or nothing else
+    /// explains the failure).
+    EngineDylibMismatch {
+        host_engine: PathBuf,
+        module_engine: PathBuf,
+    },
+    /// Nothing read from the tables explains it; keep the loader's own words.
+    Unknown,
+}
+
+/// The explanation the gathered evidence supports (Stage 27).
 ///
-/// A missing export is almost never a missing export. The usual cause is that
-/// the artifact was linked against one `pill_core.dll` or
-/// `pill_engine_core.dll` and is being loaded against another: cargo folds a
-/// dependency's resolved features into the dependent's `-C metadata`, that hash
-/// is part of every symbol name the dylib exports, and two builds that resolve
-/// different dependency graphs therefore disagree about names the loader can
-/// only report as "procedure not found".
+/// The named import wins in general: it names a symbol and a file. It yields
+/// to the engine-dylib story only when the import belongs to an engine dylib
+/// whose module-world copy demonstrably differs - that mismatch is then what
+/// makes the symbol unresolvable, and it names both builds. Pure, so the
+/// decision is unit-testable without files on disk.
 ///
-/// Passing the original error through unchanged leaves the reader with
-/// `os error 127` and nothing to act on, so a failure that coincides with two
-/// differing engine dylibs is re-reported as the mismatch it is - with both
-/// paths and the two ways out.
+/// `unresolved_mismatch` is the mismatch pair for the unresolved import's
+/// own engine dylib, when it is one and differs; `fallback_mismatch` is the
+/// first differing engine pair, for the no-import case.
+fn choose_explanation(
+    unresolved: Option<UnresolvedImport>,
+    unresolved_mismatch: Option<(PathBuf, PathBuf)>,
+    fallback_mismatch: Option<(PathBuf, PathBuf)>,
+) -> LoadFailureExplanation {
+    match unresolved {
+        Some(unresolved) => match unresolved_mismatch {
+            Some((host_engine, module_engine)) => LoadFailureExplanation::EngineDylibMismatch {
+                host_engine,
+                module_engine,
+            },
+            None => LoadFailureExplanation::MissingImport(unresolved),
+        },
+        None => match fallback_mismatch {
+            Some((host_engine, module_engine)) => LoadFailureExplanation::EngineDylibMismatch {
+                host_engine,
+                module_engine,
+            },
+            None => LoadFailureExplanation::Unknown,
+        },
+    }
+}
+
+/// The error one explanation becomes, or `None` to keep the loader's own.
+fn explanation_error(
+    module_name: &str,
+    explanation: LoadFailureExplanation,
+) -> Option<LibraryError> {
+    match explanation {
+        LoadFailureExplanation::MissingImport(unresolved) => Some(LibraryError::MissingImport {
+            subject: module_name.to_string(),
+            dll: unresolved.dll,
+            symbol: unresolved.symbol,
+            path: unresolved.path.display().to_string(),
+        }),
+        LoadFailureExplanation::EngineDylibMismatch {
+            host_engine,
+            module_engine,
+        } => Some(LibraryError::EngineDylibMismatch {
+            subject: module_name.to_string(),
+            host_engine: host_engine.display().to_string(),
+            module_engine: module_engine.display().to_string(),
+        }),
+        LoadFailureExplanation::Unknown => None,
+    }
+}
+
+/// The first named import of `artifact` that a copy of its DLL the loader
+/// would consider does not export (Stage 27).
+///
+/// The copies checked are the ones the staging puts in reach: the host's own
+/// directory (a copy the process already maps wins by basename), beside the
+/// loaded module, and the staged hot directory the module builds write. A
+/// DLL with every candidate missing from disk is left alone - the loader's
+/// own answer is all there is.
+fn first_unresolved_import(artifact: &Path, workspace_root: &Path) -> Option<UnresolvedImport> {
+    let inspection = crate::analytics::inspect_pe(artifact)?;
+    for import in &inspection.imports {
+        if import.symbols.is_empty() {
+            continue;
+        }
+        let candidates = import_candidate_copies(&import.dll, artifact, workspace_root);
+        for candidate in candidates {
+            if !candidate.is_file() {
+                continue;
+            }
+            let Some(candidate_inspection) = crate::analytics::inspect_pe(&candidate) else {
+                continue;
+            };
+            let missing = import
+                .symbols
+                .iter()
+                .find(|symbol| !candidate_inspection.exports.contains(symbol));
+            if let Some(symbol) = missing {
+                return Some(UnresolvedImport {
+                    dll: import.dll.clone(),
+                    symbol: symbol.clone(),
+                    path: candidate,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// The copies of an imported DLL the loader would consider, in its own
+/// order: a copy the process already maps (the host's engines), one beside
+/// the loaded module, one in the staged hot directory.
+fn import_candidate_copies(dll: &str, artifact: &Path, workspace_root: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(
+        workspace_root
+            .join(crate::config::host_target_directory())
+            .join(dll),
+    );
+    if let Some(directory) = artifact.parent() {
+        candidates.push(directory.join(dll));
+    }
+    candidates.push(
+        workspace_root
+            .join(crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+            .join(dll),
+    );
+    candidates
+}
+
+/// The mismatch pair for `unresolved`'s engine dylib, when the import names
+/// one and its module-world copy differs from the host's.
+fn unresolved_engine_mismatch(
+    unresolved: &UnresolvedImport,
+    workspace_root: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let lowered = unresolved.dll.to_ascii_lowercase();
+    let stem = lowered.strip_suffix(".dll").unwrap_or(&lowered);
+    if !ENGINE_DYLIB_STEMS.contains(&stem) {
+        return None;
+    }
+    let module_engine = module_world_engine_dylib(workspace_root, stem)?;
+    let host_engine = workspace_root
+        .join(crate::config::host_target_directory())
+        .join(format!("{stem}.dll"));
+    let matches = host_engine.is_file() && files_equal(&module_engine, &host_engine);
+    (!matches).then_some((host_engine, module_engine))
+}
+
+/// Explain a load failure with the best evidence available (Stage 27).
+///
+/// The module's own import tables are read first: a symbol that no candidate
+/// copy of its DLL exports is a concrete answer, naming both the DLL and the
+/// symbol where the loader only said "procedure could not be found". The
+/// engine-dylib mismatch story is kept for the cases it truly explains - the
+/// unresolved import belongs to the mismatching dylib, or nothing else does.
 fn diagnose_load_failure(
     error: LibraryError,
+    artifact: &Path,
     workspace_root: &Path,
     module_name: &str,
 ) -> LibraryError {
@@ -167,24 +326,37 @@ fn diagnose_load_failure(
     if !matches!(error, LibraryError::LoadFailed { .. }) {
         return error;
     }
-    // Every pair agrees, so whatever failed is not this.
-    let Some((host_engine, module_engine)) = first_engine_dylib_mismatch(workspace_root) else {
-        return error;
-    };
-    // Differing bytes are not proof: two builds of one graph can still differ,
-    // and then the real cause is in the loader's own message, which the
-    // returned error replaces.
-    warn!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = module_name,
-        error = %error,
-        "load failed while the engine dylibs differ; the loader reported this"
-    );
-    LibraryError::EngineDylibMismatch {
-        subject: module_name.to_string(),
-        host_engine: host_engine.display().to_string(),
-        module_engine: module_engine.display().to_string(),
+    let unresolved = first_unresolved_import(artifact, workspace_root);
+    let unresolved_mismatch = unresolved
+        .as_ref()
+        .and_then(|unresolved| unresolved_engine_mismatch(unresolved, workspace_root));
+    let fallback_mismatch = first_engine_dylib_mismatch(workspace_root);
+    let explanation = choose_explanation(unresolved, unresolved_mismatch, fallback_mismatch);
+    match &explanation {
+        LoadFailureExplanation::MissingImport(unresolved) => {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = module_name,
+                dll = unresolved.dll.as_str(),
+                symbol = unresolved.symbol.as_str(),
+                path = %unresolved.path.display(),
+                "load failed: the module imports a symbol the copy of its DLL does not export"
+            );
+        }
+        LoadFailureExplanation::EngineDylibMismatch { .. } => {
+            // Differing bytes are not proof: two builds of one graph can
+            // still differ, and then the real cause is in the loader's own
+            // message, which the returned error replaces.
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = module_name,
+                error = %error,
+                "load failed while the engine dylibs differ; the loader reported this"
+            );
+        }
+        LoadFailureExplanation::Unknown => {}
     }
+    explanation_error(module_name, explanation).unwrap_or(error)
 }
 
 /// Copy the module-world engine dylibs into `directory` so a module loaded
@@ -679,7 +851,9 @@ impl NativeLibrary {
                 }
             }
         })
-        .map_err(|error| diagnose_load_failure(error, workspace_root, module_name))?;
+        .map_err(|error| {
+            diagnose_load_failure(error, temporary_copy.path(), workspace_root, module_name)
+        })?;
         temporary_copy.disarm();
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
@@ -1501,10 +1675,81 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        files_equal, staging_directories_to_evict, TemporaryCopy, MAX_RETAINED_STAGING_DIRECTORIES,
+        choose_explanation, explanation_error, files_equal, staging_directories_to_evict,
+        LoadFailureExplanation, TemporaryCopy, UnresolvedImport, MAX_RETAINED_STAGING_DIRECTORIES,
         STAGING_GRACE_PERIOD,
     };
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+
+    /// The Stage 27 case: the artifact imports a symbol `pill_ui` does not
+    /// export while `pill_core`'s copies differ. The message must name
+    /// `pill_ui` and the symbol - the mismatch story must not win and bury
+    /// the real answer.
+    #[test]
+    fn a_missing_pill_ui_import_wins_over_a_pill_core_mismatch() {
+        let unresolved = UnresolvedImport {
+            dll: "pill_ui.dll".to_string(),
+            symbol: "pill_ui_text_metrics_v2".to_string(),
+            path: PathBuf::from("target/hot/pill_ui.dll"),
+        };
+        let mismatch = Some((
+            PathBuf::from("target/debug/pill_core.dll"),
+            PathBuf::from("target/hot/pill_core.dll"),
+        ));
+        let explanation = choose_explanation(Some(unresolved), None, mismatch);
+        let error = explanation_error("editor_shell", explanation).expect("an explanation");
+        let text = error.to_string();
+        assert!(text.contains("pill_ui.dll"), "{text}");
+        assert!(text.contains("pill_ui_text_metrics_v2"), "{text}");
+        assert!(
+            !text.contains("pill_core"),
+            "the mismatch story must not win: {text}"
+        );
+    }
+
+    /// A resolved feature-hash mismatch whose unresolved import belongs to
+    /// the mismatching dylib keeps the mismatch story, with both paths.
+    #[test]
+    fn an_engine_import_keeps_the_mismatch_story_with_both_paths() {
+        let unresolved = UnresolvedImport {
+            dll: "pill_core.dll".to_string(),
+            symbol: "pill_core_register".to_string(),
+            path: PathBuf::from("target/hot/pill_core.dll"),
+        };
+        let pair = (
+            PathBuf::from("target/debug/pill_core.dll"),
+            PathBuf::from("target/hot/pill_core.dll"),
+        );
+        let explanation = choose_explanation(Some(unresolved), Some(pair.clone()), Some(pair));
+        assert!(matches!(
+            explanation,
+            LoadFailureExplanation::EngineDylibMismatch { .. }
+        ));
+        let error = explanation_error("renderer", explanation).expect("an explanation");
+        let text = error.to_string();
+        assert!(text.contains("target/debug/pill_core.dll"), "{text}");
+        assert!(text.contains("target/hot/pill_core.dll"), "{text}");
+        assert!(text.contains("different engine dylib"), "{text}");
+    }
+
+    /// Without an unresolved import the first differing pair still explains
+    /// the failure; without either, the loader's own words stand.
+    #[test]
+    fn the_fallback_is_the_mismatch_then_the_loader_message() {
+        let pair = (
+            PathBuf::from("target/debug/pill_core.dll"),
+            PathBuf::from("target/hot/pill_core.dll"),
+        );
+        assert!(matches!(
+            choose_explanation(None, None, Some(pair)),
+            LoadFailureExplanation::EngineDylibMismatch { .. }
+        ));
+        assert_eq!(
+            choose_explanation(None, None, None),
+            LoadFailureExplanation::Unknown
+        );
+    }
 
     /// A directory that has been quiet past the grace period is stale; one
     /// written to recently is left alone.

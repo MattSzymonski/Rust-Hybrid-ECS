@@ -99,22 +99,33 @@ impl ModuleKind {
 // PE Inspection
 // =============================================================================
 
+/// One imported DLL and the function names the image needs from it.
+pub(crate) struct PeImport {
+    /// The DLL as the import table names it (a file name, `.dll` included).
+    pub dll: String,
+    /// Named imports; ordinal-only entries are skipped - nothing to name.
+    pub symbols: Vec<String>,
+}
+
 /// The interesting parts of a Windows PE executable header.
 pub(crate) struct PeInspection {
     /// DLL names referenced by the import directory.
     pub import_dlls: Vec<String>,
+    /// The same DLLs with their named imports, in table order.
+    pub imports: Vec<PeImport>,
+    /// Exported names, so a caller can check that an import resolves.
+    pub exports: Vec<String>,
     /// `SizeOfImage` from the optional header, in bytes.
     pub image_size: u64,
 }
 
-/// Parse a Windows PE file's import directory and image size.
+/// Parse a Windows PE file's import and export directories and image size.
 ///
 /// Returns `None` for anything that is not a PE32/PE32+ image (including
 /// `.so` and `.dylib` on other platforms). Pure byte parsing: no OS calls, so
 /// it compiles and runs everywhere even though it only understands PE files.
-/// The export directory is deliberately not walked: the report keeps the
-/// image size and the imported DLLs, and an unexercised export parser is
-/// maintenance cost with no reader.
+/// The parse degrades rather than fails: a truncated or malformed table
+/// yields what was readable up to that point.
 pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     let data = std::fs::read(path).ok()?;
     if data.len() < 0x40 || &data[0..2] != b"MZ" {
@@ -156,6 +167,16 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
             .try_into()
             .ok()?,
     );
+    let export_rva = u32::from_le_bytes(
+        data[data_directory_offset..data_directory_offset + 4]
+            .try_into()
+            .ok()?,
+    );
+    let export_size = u32::from_le_bytes(
+        data[data_directory_offset + 4..data_directory_offset + 8]
+            .try_into()
+            .ok()?,
+    );
 
     // Map an RVA to a file offset through the section table.
     let sections = coff + 20 + size_of_optional;
@@ -185,16 +206,63 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     };
 
     // Import directory: a null-terminated list of image import descriptors,
-    // each naming one imported DLL.
-    let import_dlls = if import_rva != 0 && import_size != 0 {
-        let mut dlls = Vec::new();
+    // each naming one imported DLL and the symbols taken from it.
+    let mut import_dlls = Vec::new();
+    let mut imports = Vec::new();
+    if import_rva != 0 && import_size != 0 {
         if let Some(directory) = rva_to_offset(import_rva) {
+            // The named entries of one lookup table (the original thunk table
+            // when present, the address table otherwise).
+            let symbol_names = |lookup_rva: u32| -> Vec<String> {
+                let mut names = Vec::new();
+                let Some(mut offset) = rva_to_offset(lookup_rva) else {
+                    return names;
+                };
+                let entry_size = if magic == 0x20b { 8 } else { 4 };
+                while names.len() < 4096 {
+                    let Some(bytes) = data.get(offset..offset + entry_size) else {
+                        break;
+                    };
+                    let entry = if entry_size == 8 {
+                        u64::from_le_bytes(bytes.try_into().ok().unwrap_or_default())
+                    } else {
+                        u32::from_le_bytes(bytes.try_into().ok().unwrap_or_default()) as u64
+                    };
+                    if entry == 0 {
+                        break; // A null thunk terminates the table.
+                    }
+                    offset += entry_size;
+                    let ordinal = 1u64 << (entry_size * 8 - 1);
+                    if entry & ordinal != 0 {
+                        continue; // An ordinal import; nothing to name.
+                    }
+                    let Some(name_offset) = rva_to_offset(entry as u32) else {
+                        break;
+                    };
+                    // `IMAGE_IMPORT_BY_NAME`: a u16 hint, then the name.
+                    let name_start = name_offset + 2;
+                    if name_start >= data.len() {
+                        break;
+                    }
+                    let end = data[name_start..]
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .map(|position| name_start + position)
+                        .unwrap_or(name_start);
+                    if let Ok(name) = std::str::from_utf8(&data[name_start..end]) {
+                        names.push(name.to_string());
+                    }
+                }
+                names
+            };
             let mut index = 0usize;
             while index < 4096 {
                 let descriptor = directory + index * 20;
                 if descriptor + 20 > data.len() {
                     break;
                 }
+                let original_first_thunk =
+                    u32::from_le_bytes(data[descriptor..descriptor + 4].try_into().ok()?);
                 let name_rva =
                     u32::from_le_bytes(data[descriptor + 12..descriptor + 16].try_into().ok()?);
                 if name_rva == 0 {
@@ -207,19 +275,64 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
                         .map(|position| offset + position)
                         .unwrap_or(offset);
                     if let Ok(name) = std::str::from_utf8(&data[offset..end]) {
-                        dlls.push(name.to_string());
+                        let first_thunk = u32::from_le_bytes(
+                            data[descriptor + 16..descriptor + 20].try_into().ok()?,
+                        );
+                        let lookup = if original_first_thunk != 0 {
+                            original_first_thunk
+                        } else {
+                            first_thunk
+                        };
+                        let symbols = symbol_names(lookup);
+                        import_dlls.push(name.to_string());
+                        imports.push(PeImport {
+                            dll: name.to_string(),
+                            symbols,
+                        });
                     }
                 }
                 index += 1;
             }
         }
-        dlls
-    } else {
-        Vec::new()
-    };
+    }
+
+    // Export directory: the name-pointer table lists every exported name.
+    let mut exports = Vec::new();
+    if export_rva != 0 && export_size != 0 {
+        if let Some(directory) = rva_to_offset(export_rva) {
+            let read_u32 = |offset: usize| -> Option<u32> {
+                let bytes: [u8; 4] = data.get(offset..offset + 4)?.try_into().ok()?;
+                Some(u32::from_le_bytes(bytes))
+            };
+            let number_of_names = read_u32(directory + 24).unwrap_or(0) as usize;
+            // `AddressOfNames` (+32) is the name-pointer table; `+28` is the
+            // function-RVA table, which happens to parse as garbage names.
+            let names_rva = read_u32(directory + 32).unwrap_or(0);
+            if let Some(names_offset) = rva_to_offset(names_rva) {
+                for index in 0..number_of_names.min(16384) {
+                    let Some(name_rva) = read_u32(names_offset + index * 4) else {
+                        break;
+                    };
+                    let Some(name_offset) = rva_to_offset(name_rva) else {
+                        continue;
+                    };
+                    let end = data[name_offset..]
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .map(|position| name_offset + position)
+                        .unwrap_or(name_offset);
+                    if let Ok(name) = std::str::from_utf8(&data[name_offset..end]) {
+                        exports.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     Some(PeInspection {
         import_dlls,
+        imports,
+        exports,
         image_size,
     })
 }
@@ -1847,6 +1960,52 @@ const CONCURRENCY_DATA = [
                 "`{crate_name}` was kept, so it must have a non-zero duration"
             );
         }
+    }
+
+    /// The import and export walks, against a real system image.
+    ///
+    /// `kernel32.dll` imports named functions from `KERNELBASE.dll` and
+    /// exports thousands of names; a parser that read neither table would
+    /// still pass every synthetic test that only checks the DLL-name list.
+    /// Skipped where the file is not there (every non-Windows test machine).
+    #[test]
+    fn a_real_system_dll_yields_named_imports_and_exports() {
+        let path = Path::new("C:/Windows/System32/kernel32.dll");
+        if !path.is_file() {
+            return;
+        }
+        let inspection = inspect_pe(path).expect("kernel32 parses as PE");
+        assert!(
+            !inspection.exports.is_empty(),
+            "kernel32 exports thousands of names"
+        );
+        assert!(
+            inspection.exports.iter().any(|name| name == "LoadLibraryW"),
+            "a known export must be among them"
+        );
+        assert!(
+            !inspection.imports.is_empty(),
+            "kernel32 imports from kernelbase"
+        );
+        assert_eq!(
+            inspection.import_dlls.len(),
+            inspection.imports.len(),
+            "the DLL-name list and the detailed imports walk the same table"
+        );
+        for import in &inspection.imports {
+            assert!(
+                import.dll.to_ascii_lowercase().ends_with(".dll"),
+                "import names are file names: {}",
+                import.dll
+            );
+        }
+        assert!(
+            inspection
+                .imports
+                .iter()
+                .any(|import| !import.symbols.is_empty()),
+            "at least one import carries named symbols"
+        );
     }
 
     /// A truncated optional header must degrade the report, not panic.
