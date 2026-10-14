@@ -52,7 +52,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, find_executable  # noqa: E402
-from core.suite_common import run_suite_with_timing  # noqa: E402
+from core.suite_common import (  # noqa: E402
+    SHIPPING_BUNDLE_PATHS,
+    restore_paths,
+    run_suite_with_timing,
+    snapshot_paths,
+)
 
 # =============================================================================
 # Constants
@@ -223,7 +228,13 @@ def run_and_observe(timeout_scale: float) -> int:
     print("=" * 70)
 
     print("\n  [BUILD] cargo build --release -p pill_standalone " + " ".join(SHIPPING_FEATURES))
-    failure = build_shipping_binary(int(BUILD_TIMEOUT * timeout_scale))
+    # The build regenerates the tracked shipping bundle (and may touch the
+    # lockfile); put both back once the binary exists, whatever happened.
+    snapshot = snapshot_paths(SHIPPING_BUNDLE_PATHS)
+    try:
+        failure = build_shipping_binary(int(BUILD_TIMEOUT * timeout_scale))
+    finally:
+        restore_paths(SHIPPING_BUNDLE_PATHS, snapshot)
     if failure:
         print("  [FAIL] the shipping binary did not build:")
         print(failure)

@@ -181,7 +181,7 @@ def main() -> int:
         if not text.endswith("\n"):
             text += "\n"
         broken_line_number = text.count("\n") + 1
-        EXTENSION_SOURCE.write_text(text + BROKEN_LINE + "\n", encoding="utf-8")
+        EXTENSION_SOURCE.write_text(text + BROKEN_LINE + "\n", encoding="utf-8", newline="")
         print(f"  [OK] injected a type error at {EXTENSION_SOURCE.name}:{broken_line_number}")
 
         begin = len(read_log())
@@ -284,7 +284,7 @@ def main() -> int:
         print(f"  [OK] open recorder saw {recorded.strip()}")
 
         # Step 3: fix the source; the reload succeeds and the panel clears.
-        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8")
+        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8", newline="")
         begin = len(read_log())
         wait_token(
             process, r"extension hot reload complete", 300, "the fixed extension reloaded", begin
@@ -322,6 +322,7 @@ def main() -> int:
                 SHELL_BODY_ANCHOR, SHELL_PANIC_LINE + "\n" + SHELL_BODY_ANCHOR, 1
             ),
             encoding="utf-8",
+            newline="",
         )
         wait_token(
             process,
@@ -365,7 +366,7 @@ def main() -> int:
         # Step 5: restoring the body is a new edit, so a new patch applies (the
         # rollback suppressed only the rejected one).
         begin = len(read_log())
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8")
+        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
         wait_token(
             process,
             r"\[hot\] \S*editor_shell_update\S* LIVE",
@@ -384,8 +385,8 @@ def main() -> int:
         print("  [OK] the editor exited cleanly")
         return 0
     finally:
-        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8")
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8")
+        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8", newline="")
+        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)

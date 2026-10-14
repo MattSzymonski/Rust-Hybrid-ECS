@@ -499,13 +499,14 @@ def main() -> int:
             cadence.group(0), f"% {int(cadence.group(1)) + 2} == 0", 1
         )
         begin = len(read_log())
-        HOTROOT_SOURCE.write_text(patched, encoding="utf-8")
+        HOTROOT_SOURCE.write_text(patched, encoding="utf-8", newline="")
         wait_token(process, r"LIVE \d+ ms|extension reload processed", 180, "shell body live-patched", begin)
 
         begin = len(read_log())
         SHELL_SOURCE.write_text(
             original_shell + "\n// built-in panels suite: structural reload marker\n",
             encoding="utf-8",
+            newline="",
         )
         wait_token(
             process,
@@ -787,8 +788,8 @@ def main() -> int:
         assert "panic" not in read_log(), "a panic was logged"
         print("  [OK] clean exit, code 0")
     finally:
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8")
-        HOTROOT_SOURCE.write_text(original_hotroot, encoding="utf-8")
+        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
+        HOTROOT_SOURCE.write_text(original_hotroot, encoding="utf-8", newline="")
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)

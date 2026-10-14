@@ -111,7 +111,7 @@ def atomic_write(content: str) -> None:
     """Writes source through a temporary file then renames it, so the watcher
     sees one atomic change instead of a half-written file."""
     temporary_path = MODULE_LIB_RS.with_suffix(".rs.tmp")
-    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.write_text(content, encoding="utf-8", newline="")
     temporary_path.replace(MODULE_LIB_RS)
 
 
@@ -167,7 +167,7 @@ def install_test_project_settings() -> None:
         ORIGINAL_HOST_CONFIG = settings_path.read_text(encoding="utf-8")
     else:
         ORIGINAL_HOST_CONFIG = None
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8")
+    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
 
 
 def restore_project_settings() -> None:
@@ -176,7 +176,7 @@ def restore_project_settings() -> None:
     if ORIGINAL_HOST_CONFIG is None:
         settings_path.unlink(missing_ok=True)
     else:
-        settings_path.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8")
+        settings_path.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8", newline="")
 
 
 # =============================================================================

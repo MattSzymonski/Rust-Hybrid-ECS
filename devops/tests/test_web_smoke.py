@@ -74,7 +74,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT  # noqa: E402
-from core.suite_common import run_suite_with_timing  # noqa: E402
+from core.suite_common import (  # noqa: E402
+    SHIPPING_BUNDLE_PATHS,
+    restore_paths,
+    run_suite_with_timing,
+    snapshot_paths,
+)
 
 # =============================================================================
 # Constants
@@ -84,7 +89,6 @@ from core.suite_common import run_suite_with_timing  # noqa: E402
 # project's `build/web`.
 PROJECT = "examples/master_renderer_test"
 BUILD_SCRIPT = REPOSITORY_ROOT / "devops" / "tools" / "build_web.py"
-BUNDLE_DIRECTORY = REPOSITORY_ROOT / "build" / "pill_shipping_bundle"
 
 # Tokens the page's console must show.
 PACK_TOKEN = "mounted the embedded asset pack"
@@ -231,23 +235,6 @@ def find_browser():
     return next((path for path in BROWSER_CANDIDATES if Path(path).is_file()), None)
 
 
-def snapshot_bundle() -> dict:
-    """The shipping bundle's files and contents, to restore after the build."""
-    return {
-        path: path.read_bytes() for path in BUNDLE_DIRECTORY.rglob("*") if path.is_file()
-    }
-
-
-def restore_bundle(snapshot: dict) -> None:
-    """Put the shipping bundle back as `snapshot` recorded it."""
-    for path in BUNDLE_DIRECTORY.rglob("*"):
-        if path.is_file() and path not in snapshot:
-            path.unlink()
-    for path, contents in snapshot.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(contents)
-
-
 def serve(directory: Path) -> http.server.ThreadingHTTPServer:
     """Serve `directory` on a free local port, quietly, with the wasm MIME type."""
 
@@ -382,7 +369,7 @@ def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capt
 
     # Step 1: build, restoring the shipping bundle the build regenerates.
     print(f"\n  [BUILD] build_web.py --dev {project}")
-    snapshot = snapshot_bundle()
+    snapshot = snapshot_paths(SHIPPING_BUNDLE_PATHS)
     try:
         result = subprocess.run(
             [sys.executable, str(BUILD_SCRIPT), "--dev", project],
@@ -394,7 +381,7 @@ def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capt
             timeout=BUILD_TIMEOUT * timeout_scale,
         )
     finally:
-        restore_bundle(snapshot)
+        restore_paths(SHIPPING_BUNDLE_PATHS, snapshot)
     if result.returncode != 0:
         print("  [FAIL] the web build failed:")
         print((result.stdout + result.stderr)[-3000:])

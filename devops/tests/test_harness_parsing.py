@@ -53,7 +53,12 @@ from typing import Callable, List, Tuple
 DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
-from core.suite_common import run_suite_with_timing  # noqa: E402
+from core.suite_common import (  # noqa: E402
+    apply_replacements,
+    restore_paths,
+    run_suite_with_timing,
+    snapshot_paths,
+)
 from core.test_report import summarize_test_results  # noqa: E402
 
 
@@ -278,6 +283,48 @@ def check_shared_slot_detection_matches_cargo_naming() -> None:
     assert not is_shared("libpill_engine-190d6c0e2d2eaf24.rlib")
 
 
+def check_source_edits_keep_line_endings() -> None:
+    """An edit through the shared helpers changes only the edited line.
+
+    Without `newline=""` Windows wrote every LF back as CRLF, so a one-line
+    edit looked to the host like a whole-file change.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        for newline in ("\n", "\r\n"):
+            path = Path(directory) / "edited.rs"
+            original = newline.join(["fn a() {}", "fn b() { 1 }", "fn c() {}", ""]).encode("utf-8")
+            path.write_bytes(original)
+            assert apply_replacements(path, [("{ 1 }", "{ 2 }")]), "the edit anchor must be found"
+            expected = original.replace(b"{ 1 }", b"{ 2 }")
+            assert path.read_bytes() == expected, f"line endings changed for {newline!r}"
+
+
+def check_snapshot_restores_files_exactly() -> None:
+    """`restore_paths` puts back changed files and removes new ones."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        tracked = root / "bundle"
+        (tracked / "src").mkdir(parents=True)
+        (tracked / "src" / "lib.rs").write_bytes(b"original\n")
+        lockfile = root / "Cargo.lock"
+        lockfile.write_bytes(b"lock\n")
+        paths = (tracked, lockfile)
+
+        snapshot = snapshot_paths(paths)
+        (tracked / "src" / "lib.rs").write_bytes(b"regenerated\r\n")
+        (tracked / "src" / "extra.rs").write_bytes(b"new\n")
+        lockfile.write_bytes(b"changed\n")
+        restore_paths(paths, snapshot)
+
+        assert (tracked / "src" / "lib.rs").read_bytes() == b"original\n"
+        assert not (tracked / "src" / "extra.rs").exists(), "a new file must be removed"
+        assert lockfile.read_bytes() == b"lock\n"
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every real analytics line parses", check_every_real_analytics_line_parses),
     ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
@@ -290,6 +337,8 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("cfg(test) code is excluded", check_test_module_is_excluded_from_runtime_code),
     ("edit anchors are unique", check_unique_snippet_anchors_to_one_place),
     ("shared-slot detection matches cargo", check_shared_slot_detection_matches_cargo_naming),
+    ("source edits keep line endings", check_source_edits_keep_line_endings),
+    ("snapshot restores files exactly", check_snapshot_restores_files_exactly),
 ]
 
 
