@@ -13,9 +13,13 @@ DESCRIPTION
     run stops at the first failure unless `--keep-going` is given, and always
     ends with a PASS/FAIL table.
 
-    `--quick` keeps only the inner-loop steps (formatting, clippy, the default
-    check and the two lints): about a minute on a warm cache, and enough to
-    catch most mistakes before the full run.
+    `--quick` keeps only the inner-loop steps (formatting, clippy and the
+    lints): about a minute on a warm cache, and enough to catch most mistakes
+    before the full run.
+
+    Under GitHub Actions (`GITHUB_ACTIONS=true`) each step's output is a
+    collapsible log group and the summary table is also written to the job
+    summary, so CI runs this script as one step and still shows every check.
 
 USAGE
   python devops/ci_cd/verify.py [--quick] [--only NAME ...] [--skip NAME ...]
@@ -49,6 +53,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+# Set by GitHub Actions; switches on log groups and the job summary.
+RUNNING_IN_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 MODULES_ROOT = REPOSITORY_ROOT / "modules"
 PYTHON = sys.executable
 
@@ -74,8 +80,10 @@ class Step:
 
 STEPS: List[Step] = [
     Step("fmt", "Formatting", [["cargo", "fmt", "--check"]], quick=True),
-    Step("clippy", "Clippy", [["cargo", "clippy", "--", "-D", "warnings"]], quick=True),
-    Step("check", "Check (default posture)", [["cargo", "check", "--workspace"]], quick=True),
+    # Also the default posture's compile check: the workspace has no
+    # `default-members`, so a bare `cargo clippy` covers every member with its
+    # default features - exactly what `cargo check --workspace` would compile.
+    Step("clippy", "Clippy (default posture)", [["cargo", "clippy", "--", "-D", "warnings"]], quick=True),
     Step(
         "check-hot-patch",
         "Check (hot_patch posture)",
@@ -253,9 +261,16 @@ def main() -> int:
         if failed and not arguments.keep_going:
             results.append((step, "SKIP", 0.0))
             continue
-        print(f"\n=== {step.title} [{step.name}] ===", flush=True)
+        if RUNNING_IN_GITHUB_ACTIONS:
+            print(f"::group::{step.title} [{step.name}]", flush=True)
+        else:
+            print(f"\n=== {step.title} [{step.name}] ===", flush=True)
         started = time.monotonic()
         passed = run_step(step)
+        if RUNNING_IN_GITHUB_ACTIONS:
+            print("::endgroup::", flush=True)
+            if not passed:
+                print(f"::error::{step.name} failed", flush=True)
         results.append((step, "PASS" if passed else "FAIL", time.monotonic() - started))
         failed = failed or not passed
 
@@ -263,7 +278,21 @@ def main() -> int:
     for step, outcome, seconds in results:
         duration = f"{seconds:7.1f}s" if outcome != "SKIP" else "        "
         print(f"  {outcome}  {duration}  {step.name}")
+    write_job_summary(results)
     return 1 if failed else 0
+
+
+def write_job_summary(results: List[tuple]) -> None:
+    """Append the results as a Markdown table to the GitHub job summary, if any."""
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    lines = ["| Step | Result | Seconds |", "| --- | --- | ---: |"]
+    for step, outcome, seconds in results:
+        duration = f"{seconds:.1f}" if outcome != "SKIP" else ""
+        lines.append(f"| {step.name} | {outcome} | {duration} |")
+    with open(summary_path, "a", encoding="utf-8") as summary_file:
+        summary_file.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
