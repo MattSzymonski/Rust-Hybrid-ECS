@@ -538,7 +538,7 @@ def main() -> int:
         # rectangles the input routing uses.
         content = wait_for_token(
             overlay_log,
-            r"\[editor\] overlay content\s+path=composition\s+forced=false\s+"
+            r"\[editor\] overlay content\s+path=\"composition\"\s+forced=false\s+"
             r"frames=\d+\s+vertices=([1-9]\d*)\s+opaque=([1-9]\d*)",
             overlay_process,
             120,
@@ -610,7 +610,7 @@ def main() -> int:
         )
         append_command(overlay_commands, f"click {view_x + 40:.0f} {view_y + 40:.0f}")
         wait_for_token(
-            overlay_log, r"\[editor\] popup dismissed\s+popup=menu", overlay_process,
+            overlay_log, r"\[editor\] popup dismissed\s+popup=\"menu\"", overlay_process,
             30, "menu dismissed",
         )
         print("  [OK] menu dropdown is a popup window, dismissed by an outside click")
@@ -631,7 +631,7 @@ def main() -> int:
             30, "palette dismiss",
         )
         wait_for_token(
-            overlay_log, r"\[editor\] popup dismissed\s+popup=palette", overlay_process,
+            overlay_log, r"\[editor\] popup dismissed\s+popup=\"palette\"", overlay_process,
             30, "palette dismissed",
         )
         print("  [OK] palette popup opened and dismissed through the platform channel")
@@ -663,7 +663,7 @@ def main() -> int:
             "popup row command",
         )
         wait_for_occurrence(
-            overlay_log, r"\[editor\] popup dismissed\s+popup=context", 1,
+            overlay_log, r"\[editor\] popup dismissed\s+popup=\"context\"", 1,
             overlay_process, 30, "context dismissed",
         )
         print("  [OK] context menu popup: rows run their commands, then it closes")
@@ -711,7 +711,7 @@ def main() -> int:
         # click must flip the menu to the other side of the anchor.
         append_command(overlay_commands, f"click {view_x + 40:.0f} {view_y + 40:.0f}")
         wait_for_occurrence(
-            overlay_log, r"\[editor\] popup dismissed\s+popup=context", 2,
+            overlay_log, r"\[editor\] popup dismissed\s+popup=\"context\"", 2,
             overlay_process, 30, "context dismissed before the flip",
         )
         append_command(
@@ -779,7 +779,7 @@ def main() -> int:
         )
         fallback = wait_for_token(
             fallback_log,
-            r"\[editor\] overlay content\s+path=scene-pass\s+forced=true\s+"
+            r"\[editor\] overlay content\s+path=\"scene-pass\"\s+forced=true\s+"
             r"frames=0\s+vertices=([1-9]\d*)\s+opaque=([1-9]\d*)",
             fallback_process,
             120,
