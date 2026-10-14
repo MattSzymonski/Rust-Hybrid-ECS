@@ -3,6 +3,7 @@ Guards the host log strings that the end-to-end suites match on.
 
 PROTECTS: Every host log token a suite waits for still exists in the Rust sources.
 TIER: static
+SETS: hot-reload
 
 REQUIREMENTS
   - Python 3.8+

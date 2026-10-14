@@ -37,16 +37,16 @@ jobs:
       - name: Build the standalone host
         working-directory: modules
         run: cargo build -p pill_standalone --features rendering
-      - name: Migration suite
+      - name: "Nightly suites (SETS: nightly)"
         shell: pwsh
-        run: python devops/tests/test_hot_reload_migration.py *> migration-suite.log
-      - name: Hot-reload suite
-        # Session B carries a known fixture drift (recorded in
-        # local/docs/simplification_backlog.md), so a failure is captured and
-        # uploaded rather than failing the nightly.
+        run: python devops/tests/run_all.py --set nightly --keep-going *> nightly-suites.log
+      - name: "Nightly suites allowed to fail (SETS: nightly-allowed-to-fail)"
+        # These carry a known drift (the main hot-reload suite's session B), so
+        # a failure is captured and uploaded rather than failing the nightly.
+        # Remove the set from a suite once its drift is fixed.
         shell: pwsh
         continue-on-error: true
-        run: python devops/tests/test_hot_reload_suite.py *> hot-reload-suite.log
+        run: python devops/tests/run_all.py --set nightly-allowed-to-fail --keep-going *> nightly-allowed-to-fail.log
       - name: Hot-reload benchmark
         shell: pwsh
         continue-on-error: true

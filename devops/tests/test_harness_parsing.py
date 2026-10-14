@@ -3,6 +3,7 @@ Unit tests for the test harness itself.
 
 PROTECTS: The parsing the end-to-end suites decide pass or fail with, on real host output.
 TIER: static
+SETS: hot-reload
 
 REQUIREMENTS
   - Python 3.8+

@@ -3,6 +3,7 @@ Run after building the selected frontend. Only touches the process it starts.
 
 PROTECTS: The windowed frontend presents frames and shuts down cleanly.
 TIER: host
+RUN: manual - needs the windowed frontend binary as an argument
 
 """
 import argparse

@@ -3,6 +3,7 @@ Module-Project Auto-Reload Integration Test for Rust-Hybrid-ECS.
 
 PROTECTS: Editing a module the project links reloads the module, then the project.
 TIER: host
+SETS: hot-reload
 
 REQUIREMENTS
   - Python 3.8+

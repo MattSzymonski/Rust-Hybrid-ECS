@@ -2,6 +2,7 @@
 
 PROTECTS: The asset cooker's watch mode keeps asset IDs and its manifest consistent.
 TIER: build
+RUN: manual - needs a cooker binary with --watch as an argument
 """
 import argparse
 import json

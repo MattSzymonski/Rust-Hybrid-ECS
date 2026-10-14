@@ -5,37 +5,13 @@
 #               it needs a working native toolchain (it builds
 #               `pill_standalone` first unless --skip-build is given).
 
-# DESCRIPTION: Run the full hot-reload regression net
-#   (0) devops/tests/test_harness_parsing.py             - harness unit tests
-#        Tests the parsing logic the suites below use to decide pass or fail,
-#        against real captured host output. Sub-second, no toolchain needed.
-#        Runs first: a broken matcher fails these suites for the wrong reason,
-#        and its failure mode is silence rather than an error.
-#   (1) devops/tests/test_log_contract.py              - host log contract
-#        Asserts every literal the suites below match on is still printed by
-#        some Rust source. Also sub-second: a reworded log line otherwise
-#        surfaces twenty minutes later as a confusing 'no reload detected'.
-#   (2) devops/tests/test_hot_reload_suite.py            - full suite (sessions A/B:
-#        reloads, schema migration, forgotten-type detection, drop-at-detection
-#        re-seed, repeated-reload stability, rollback, cascade, coexistence)
-#   (3) devops/tests/test_hot_reload_migration.py        - table-driven migration suite
-#        (fast path, add/revert fields, rename field, downgrade)
-#   (4) devops/tests/test_module_project_auto_reload.py  - module->project cascade
-#   (5) devops/tests/test_csharp_bridge.py               - C# <-> Rust bridge suite
-#        (managed backend startup, codegen mirror content, empty-exposure
-#        handling, clean managed build, Rust->C# and C#->Rust bridge probes,
-#        behavior-only C# hot reload, mirror regeneration on restart)
-#   (6) devops/tests/test_reload_edit_during_build.py    - edit-during-build
-#        Saves twice, the second inside the build window opened by the first,
-#        and asserts the newer save is still built. Every other suite saves once
-#        and waits, so none of them can see a save being dropped.
-#   (7) devops/tests/test_hot_patch_coverage.py          - live-patch coverage
-#        Asserts every crate that CAN be live-patched actually is. A patch that
-#        cannot be built falls back to a full reload, so the fast path can die
-#        for an entire crate without any test noticing - the edit still lands,
-#        just seconds later. This suite reads the host's own verdict per crate
-#        and fails when one loses its fast path, and reports crates that have
-#        no fast path at all.
+# DESCRIPTION: Run the full hot-reload regression net: every suite in
+#   devops/tests/ whose docstring carries `SETS: hot-reload`, selected and
+#   ordered by devops/tests/run_all.py (static tier first - the harness parsing
+#   and log contract checks fail in a second instead of twenty minutes in - then
+#   the host suites by name). `python devops/tests/run_all.py --set hot-reload
+#   --list` prints the current members; `run_all.py --catalogue` says what each
+#   one protects. Every suite runs even after a failure (--keep-going).
 #
 #   Each suite launches the standalone host and drives live source edits
 #   against a real project and an extension, asserting the host's reload
@@ -49,17 +25,17 @@
 #   Expected runtime: ~15-20 minutes (plus the initial host build unless
 #   --skip-build is used).
 #
-#   NOTE: suite (4) needs the .NET SDK on PATH (the host runs `dotnet build`
-#   for the managed project).
+#   NOTE: the C# bridge suite needs the .NET SDK on PATH (the host runs
+#   `dotnet build` for the managed project).
 #
 #   Designed for both local development and GitHub Actions CI.
 
 # USAGE: bash devops/ci_cd/run_hot_reload_tests.sh [--skip-build] [--timeout-scale S]
 #
 #   --skip-build          skip the initial host build (assume pill_standalone
-#                         is already built; fastest lane for CI). Only the
-#                         main suite honours it; the migration and cascade
-#                         suites always build what they need.
+#                         is already built; fastest lane for CI). Passed only
+#                         to the suites that accept it; the others always
+#                         build what they need.
 #   --timeout-scale S     multiply all suite timeouts by S (default 1.5)
 
 # EXAMPLE USAGE:
@@ -118,125 +94,28 @@ esac
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-echo -e "${BOLD}${CYAN}Hot-reload regression net (8 suites)${NC}"
+echo -e "${BOLD}${CYAN}Hot-reload regression net (SETS: hot-reload)${NC}"
 echo "  timeout scale:  ${TIMEOUT_SCALE}"
 if [ "$SKIP_BUILD" = 1 ]; then
-    echo "  host build:     skipped (assumed up to date; main suite only)"
-else
-    echo "  host build:     yes"
-fi
-echo ""
-
-overall_exit=0
-
-# --- 0. Harness unit tests ----------------------------------------------------
-# First and fastest: the parsing logic every suite below depends on to decide
-# pass or fail. Runs in under a second and needs no toolchain, so a broken
-# matcher is caught before twenty minutes of end-to-end runs use it.
-echo -e "${BOLD}${CYAN}--- Suite 0/8: test_harness_parsing.py ---${NC}"
-set +e
-python devops/tests/test_harness_parsing.py
-harness_exit=$?
-set -e
-if [ "$harness_exit" -ne 0 ]; then
-    overall_exit="$harness_exit"
-fi
-echo ""
-
-# --- 1. Host log contract -----------------------------------------------------
-# Also static and instant. Every suite below decides pass or fail by finding a
-# literal string in host output, so a reworded log line breaks them with no
-# compiler error. Checking that here turns a twenty-minute "no reload detected"
-# into a one-second failure that names the token.
-echo -e "${BOLD}${CYAN}--- Suite 1/8: test_log_contract.py ---${NC}"
-set +e
-python devops/tests/test_log_contract.py
-log_contract_exit=$?
-set -e
-if [ "$log_contract_exit" -ne 0 ]; then
-    overall_exit="$log_contract_exit"
-fi
-echo ""
-
-# --- 2. Main hot-reload suite (sessions A/B) ---------------------------------
-echo -e "${BOLD}${CYAN}--- Suite 2/8: test_hot_reload_suite.py ---${NC}"
-if [ "$SKIP_BUILD" = 1 ]; then
+    echo "  host build:     skipped where a suite accepts --skip-build"
     extra_args=(--skip-build)
 else
+    echo "  host build:     yes"
     extra_args=()
 fi
-set +e
-python devops/tests/test_hot_reload_suite.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
-suite_exit=$?
-set -e
-if [ "$suite_exit" -ne 0 ]; then
-    overall_exit="$suite_exit"
-fi
-
-# --- 3. Migration suite -------------------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 3/8: test_hot_reload_migration.py ---${NC}"
-set +e
-python devops/tests/test_hot_reload_migration.py --timeout-scale "$TIMEOUT_SCALE"
-migration_exit=$?
-set -e
-if [ "$migration_exit" -ne 0 ]; then
-    overall_exit="$migration_exit"
-fi
 
-# --- 4. Module->project cascade suite -----------------------------------------
-echo ""
-echo -e "${BOLD}${CYAN}--- Suite 4/8: test_module_project_auto_reload.py ---${NC}"
+# run_all.py passes --timeout-scale and --skip-build only to the suites whose
+# own parser declares them.
 set +e
-python devops/tests/test_module_project_auto_reload.py --timeout-scale "$TIMEOUT_SCALE"
-cascade_exit=$?
+python devops/tests/run_all.py --set hot-reload --keep-going --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
+overall_exit=$?
 set -e
-if [ "$cascade_exit" -ne 0 ]; then
-    overall_exit="$cascade_exit"
-fi
-
-# --- 5. C# <-> Rust bridge suite ---------------------------------------------
-echo ""
-echo -e "${BOLD}${CYAN}--- Suite 5/8: test_csharp_bridge.py ---${NC}"
-set +e
-python devops/tests/test_csharp_bridge.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
-csharp_exit=$?
-set -e
-if [ "$csharp_exit" -ne 0 ]; then
-    overall_exit="$csharp_exit"
-fi
-
-# --- 6. Edit during build -----------------------------------------------------
-# Ordered before the coverage suite because it is the cheaper of the two and
-# exercises the reload bookkeeping the coverage suite depends on.
-echo ""
-echo -e "${BOLD}${CYAN}--- Suite 6/8: test_reload_edit_during_build.py ---${NC}"
-set +e
-python devops/tests/test_reload_edit_during_build.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
-edit_during_build_exit=$?
-set -e
-if [ "$edit_during_build_exit" -ne 0 ]; then
-    overall_exit="$edit_during_build_exit"
-fi
-
-# --- 7. Live-patch coverage ---------------------------------------------------
-# Runs last because it needs the host built and every module loadable, which the
-# suites above have already proven by this point. It also leaves the workspace
-# exactly as it found it, so its position does not affect the others.
-echo ""
-echo -e "${BOLD}${CYAN}--- Suite 7/8: test_hot_patch_coverage.py ---${NC}"
-set +e
-python devops/tests/test_hot_patch_coverage.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
-coverage_exit=$?
-set -e
-if [ "$coverage_exit" -ne 0 ]; then
-    overall_exit="$coverage_exit"
-fi
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
 if [ "$overall_exit" -eq 0 ]; then
-    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 8 suites)${NC}"
+    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED${NC}"
 else
     echo -e "${BOLD}${RED}Hot-reload regression net FAILED (exit $overall_exit)${NC}"
 fi

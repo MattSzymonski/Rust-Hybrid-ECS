@@ -2,6 +2,7 @@
 
 PROTECTS: A real OS drag out of the editor carries the dragged asset's file path.
 TIER: editor
+RUN: manual - moves the real mouse; needs an unattended screen
 
 REQUIREMENTS
   - Windows, Python 3.8+

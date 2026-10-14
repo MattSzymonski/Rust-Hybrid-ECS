@@ -3,6 +3,7 @@ C# <-> Rust Bridge Integration Suite for Rust-Hybrid-ECS.
 
 PROTECTS: C# hot reload: mirror layout, calls both ways, assembly swaps keeping state, layout migration.
 TIER: host
+SETS: hot-reload
 
 REQUIREMENTS
   - Python 3.8+
