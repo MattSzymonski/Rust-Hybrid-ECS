@@ -30,9 +30,19 @@ use crate::frontend::EditorError;
 
 /// The editor's errors, with their stable diagnostic codes.
 mod frontend;
+/// The composition overlay over the editor window (Stage 21, D24): a
+/// DirectComposition visual on Windows, its wgpu surface, and the
+/// redraw-on-change gate.
+mod overlay;
+/// Where a popup goes at the monitor's work area (Stage 21, D23): the flip
+/// and slide rules, free of any platform type.
+mod placement;
 /// The platform layer: the Windows clipboard and drag-and-drop today, the
 /// seam later stages fill (Stage 18, D28).
 mod platform;
+/// The shell's menus, combos and context menus as platform popups (Stage
+/// 21, D23).
+mod popup;
 /// The window, the GPU device and the frame loop.
 mod runner;
 /// The devops suite's scripted input channel.

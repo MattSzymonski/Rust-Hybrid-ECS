@@ -31,8 +31,9 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::capture::LogBuffer;
 use pill_editor_api::panels::{EditorPanelRegistry, PanelContext, PanelWork};
 use pill_editor_api::{
-    ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorProblem, EditorProblemLevel,
-    EditorShellFrame, EditorShellInput,
+    ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
+    EditorPopupPointer, EditorProblem, EditorProblemLevel, EditorRect, EditorShellFrame,
+    EditorShellInput,
 };
 use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
@@ -88,6 +89,22 @@ const MENU_TITLE_WIDTH: f64 = 84.0;
 /// The palette's size, in logical pixels.
 const PALETTE_WIDTH: f64 = 420.0;
 const PALETTE_HEIGHT: f64 = 260.0;
+
+/// The popup ids the shell asks the platform to open (Stage 21). One per
+/// kind of popup, so a pointer or a dismissal names the one it belongs to.
+pub const POPUP_MENU: &str = "menu";
+pub const POPUP_PALETTE: &str = "palette";
+pub const POPUP_CONTEXT: &str = "context";
+
+/// The context menu's size, in logical pixels, and the commands it offers.
+const CONTEXT_MENU_WIDTH: f64 = 220.0;
+const CONTEXT_MENU_COMMANDS: [&str; 5] = [
+    "editor.undo",
+    "editor.redo",
+    "editor.copy",
+    "editor.cut",
+    "editor.paste",
+];
 
 // =============================================================================
 // EditorShellState
@@ -155,14 +172,24 @@ pub struct EditorShellState {
     pub paused: bool,
     /// Top-level menu titles with their hit rectangles, from the last paint.
     pub menu_bar_hits: Vec<(String, LayoutRect)>,
-    /// The open dropdown's rectangle, from the last paint.
+    /// The open dropdown's rectangle, from the last paint, in the popup's
+    /// own logical pixels.
     pub menu_dropdown_rect: Option<LayoutRect>,
-    /// The open dropdown's command rows, from the last paint.
+    /// The open dropdown's command rows, from the last paint, in the
+    /// popup's own logical pixels.
     pub menu_dropdown_item_hits: Vec<(String, LayoutRect)>,
-    /// The palette's rectangle, from the last paint.
+    /// The context menu (Stage 21): its rows, in the popup's own pixels,
+    /// from the last paint; empty when none is open.
+    pub context_menu_hits: Vec<(String, LayoutRect)>,
+    /// The palette's rectangle, from the last paint, in the popup's own
+    /// logical pixels.
     pub palette_rect: Option<LayoutRect>,
     /// The palette's command rows, from the last paint.
     pub palette_item_hits: Vec<(String, LayoutRect)>,
+    /// Where a context menu was asked for, in logical client pixels, while
+    /// one is open (Stage 21); `None` when none is. The platform places the
+    /// popup from this anchor, flipping and sliding it at the work area.
+    pub context_menu_anchor: Option<Vector2f>,
     /// Build time of every module panel last frame, in milliseconds (Stage
     /// 16's budget: measured, shown in Statistics, never throttled).
     pub panel_millis: std::collections::BTreeMap<String, f32>,
@@ -332,6 +359,8 @@ impl EditorShellState {
             menu_dropdown_item_hits: Vec::new(),
             palette_rect: None,
             palette_item_hits: Vec::new(),
+            context_menu_anchor: None,
+            context_menu_hits: Vec::new(),
             panel_millis: std::collections::BTreeMap::new(),
             panel_draw_millis: std::collections::BTreeMap::new(),
             panel_over_frames: std::collections::BTreeMap::new(),
@@ -2608,6 +2637,11 @@ pub fn handle_file_drops(
 
 /// Draw the drop preview (Stage 18): a band across the Assets panel while
 /// a file drag hovers over it.
+///
+/// The band floats in the overlay layer (Stage 21, D24), so it draws with
+/// per-pixel alpha over whatever is beneath it, and its rectangle is
+/// published as opaque: a click on the preview belongs to the UI, not to a
+/// panel under it.
 pub fn paint_drop_preview(
     state: &mut EditorShellState,
     frame: &mut EditorShellFrame,
@@ -2628,12 +2662,18 @@ pub fn paint_drop_preview(
         Vector2f::new(rect.width as f32, 28.0),
     );
     frame
-        .panels
+        .overlay
         .push_fill(band, pill_ui::Color::rgba(0.15, 0.45, 0.9, 0.85));
+    frame.overlay_opaque.push(EditorRect::new(
+        band.min.x,
+        band.min.y,
+        band.max.x - band.min.x,
+        band.max.y - band.min.y,
+    ));
     let message = format!("Drop {count} file(s) to import");
     let style = pill_ui::text::TextStyle::default();
     let _ = state.text.draw_text(
-        &mut frame.panels,
+        &mut frame.overlay,
         &mut state.atlas,
         &message,
         Vector2f::new(rect.x as f32 + 8.0, rect.y as f32 + 4.0),
@@ -2646,10 +2686,10 @@ pub fn paint_drop_preview(
 /// Paint the toast stack: the newest notices the executable published, one
 /// filled row each, the stack expiring by frame count (Stage 19).
 ///
-/// Drawn into the panel layer's end (the topmost list entry), under the menu
-/// chrome. The view surfaces are real child windows and always cover their
-/// rectangle (D24's pending composition overlay), so the stack sits at the
-/// client area's top-left, over the dock's left column.
+/// Drawn in the overlay layer (Stage 21, D24), above the panels, the menu
+/// chrome and the view surfaces, with per-pixel alpha. Each row's rectangle
+/// is published as opaque, so a click on a toast belongs to the UI rather
+/// than to whatever is beneath it.
 pub fn paint_toasts(
     state: &mut EditorShellState,
     frame: &mut EditorShellFrame,
@@ -2678,8 +2718,8 @@ pub fn paint_toasts(
     for (level, text) in toasts {
         let width = TOAST_WIDTH.min(available.x - 16.0).max(120.0);
         let rect = Rect::from_min_size(Vector2f::new(8.0, y), Vector2f::new(width, TOAST_HEIGHT));
-        frame.panels.push_fill(rect, state.theme.raised);
-        frame.panels.push_fill(
+        frame.overlay.push_fill(rect, state.theme.raised);
+        frame.overlay.push_fill(
             Rect::from_min_size(Vector2f::new(8.0, y), Vector2f::new(3.0, TOAST_HEIGHT)),
             match level {
                 EditorProblemLevel::Error => pill_ui::Color::rgba(0.85, 0.25, 0.2, 1.0),
@@ -2687,6 +2727,12 @@ pub fn paint_toasts(
                 EditorProblemLevel::Note => pill_ui::Color::rgba(0.35, 0.65, 0.9, 1.0),
             },
         );
+        frame.overlay_opaque.push(EditorRect::new(
+            rect.min.x,
+            rect.min.y,
+            rect.max.x - rect.min.x,
+            rect.max.y - rect.min.y,
+        ));
         let marker = match level {
             EditorProblemLevel::Error => "error",
             EditorProblemLevel::Warning => "warning",
@@ -2694,7 +2740,7 @@ pub fn paint_toasts(
         };
         let message = format!("{marker}: {text}");
         let _ = state.text.draw_text(
-            &mut frame.panels,
+            &mut frame.overlay,
             &mut state.atlas,
             &message,
             Vector2f::new(rect.min.x + 8.0, rect.min.y + 3.0),
@@ -2706,20 +2752,103 @@ pub fn paint_toasts(
     }
 }
 
-/// Routes one pointer event to the menu bar, an open dropdown or the palette.
+/// The badge's size in logical pixels, and the gap to the view's corner.
+const BADGE_WIDTH: f32 = 76.0;
+const BADGE_HEIGHT: f32 = 20.0;
+const BADGE_MARGIN: f32 = 8.0;
+
+/// Paint the frame-rate badge over the view surface's top-right corner.
+///
+/// This is the overlay layer's proof of life (Stage 21, D24): it sits over
+/// the scene or game view - a real child window the panel layer can never
+/// draw over - and its rectangle is published as opaque, so a click on the
+/// badge reaches `pill_ui` while a click anywhere else in the view still
+/// reaches the scene.
+pub fn paint_overlay_badge(
+    state: &mut EditorShellState,
+    frame: &mut EditorShellFrame,
+    editor_frames_per_second: f32,
+) {
+    let Some(view) = frame.game_rect.or(frame.scene_rect) else {
+        return;
+    };
+    let rect = Rect::from_min_size(
+        Vector2f::new(
+            view.x + view.width - BADGE_WIDTH - BADGE_MARGIN,
+            view.y + BADGE_MARGIN,
+        ),
+        Vector2f::new(BADGE_WIDTH, BADGE_HEIGHT),
+    );
+    frame
+        .overlay
+        .push_fill(rect, pill_ui::Color::rgba(0.05, 0.05, 0.07, 0.7));
+    frame.overlay_opaque.push(EditorRect::new(
+        rect.min.x,
+        rect.min.y,
+        rect.max.x - rect.min.x,
+        rect.max.y - rect.min.y,
+    ));
+    let text = format!("{editor_frames_per_second:.0} fps");
+    let style = pill_ui::text::TextStyle::default();
+    let _ = state.text.draw_text(
+        &mut frame.overlay,
+        &mut state.atlas,
+        &text,
+        Vector2f::new(rect.min.x + 8.0, rect.min.y + 2.0),
+        &style,
+        None,
+        state.theme.text,
+    );
+}
+
+/// Paint the labels the executable projected (Stage 21): one line per label,
+/// already in client logical pixels.
+///
+/// Labels carry no opaque region: they are annotations over the scene, not
+/// targets, so a click on one still reaches the view underneath.
+pub fn paint_overlay_labels(
+    state: &mut EditorShellState,
+    frame: &mut EditorShellFrame,
+    labels: &[EditorOverlayLabel],
+) {
+    if labels.is_empty() {
+        return;
+    }
+    let style = pill_ui::text::TextStyle::default();
+    for label in labels {
+        let _ = state.text.draw_text(
+            &mut frame.overlay,
+            &mut state.atlas,
+            &label.text,
+            Vector2f::new(label.position.x, label.position.y),
+            &style,
+            None,
+            state.theme.text,
+        );
+    }
+}
+
+/// Routes one pointer event to the menu bar, or asks for a context menu.
 ///
 /// Returns whether the event was consumed; a consumed event never reaches the
-/// panels, so a dropdown item click cannot also press a widget underneath it.
-/// The rectangles are the previous paint's, matching how the widgets
-/// themselves hit-test.
-pub fn handle_menu_pointer(
-    state: &mut EditorShellState,
-    registry: &CommandRegistry,
-    inbox: &mut CommandInbox,
-    pending: &mut PendingEditorCommands,
-    history: &mut CommandHistory,
-    event: &pill_engine::InputEvent,
-) -> bool {
+/// panels, so a menu-bar click cannot also press a widget underneath it. The
+/// rectangles are the previous paint's, matching how the widgets themselves
+/// hit-test. An open dropdown's own rows are hit-tested through the popup
+/// pointer channel ([`handle_popup_pointer`]), because the dropdown is a
+/// window of its own.
+pub fn handle_menu_pointer(state: &mut EditorShellState, event: &pill_engine::InputEvent) -> bool {
+    let cursor = state.cursor;
+    // Step 0: the right button asks for a context menu (Stage 21). The view
+    // surfaces are windows of their own, so a right click here is over the
+    // panels or the chrome, where an edit menu belongs.
+    if let pill_engine::InputEvent::MouseButton {
+        button: pill_engine::MouseButton::Right,
+        state: pill_engine::ButtonState::Released,
+    } = event
+    {
+        open_context_menu(state, cursor);
+        return true;
+    }
     let pill_engine::InputEvent::MouseButton {
         button: pill_engine::MouseButton::Left,
         state: pill_engine::ButtonState::Released,
@@ -2727,45 +2856,18 @@ pub fn handle_menu_pointer(
     else {
         return false;
     };
-    let cursor = state.cursor;
     let in_rect = |rect: &LayoutRect| {
         cursor.x as f64 >= rect.x
             && cursor.x as f64 <= rect.x + rect.width
             && cursor.y as f64 >= rect.y
             && cursor.y as f64 <= rect.y + rect.height
     };
-    // Step 1: the palette owns the pointer while it is open.
-    if state.palette_query.is_some() {
-        if state.palette_rect.is_some_and(|rect| in_rect(&rect)) {
-            let hit = state
-                .palette_item_hits
-                .iter()
-                .find(|(_, rect)| in_rect(rect))
-                .map(|(id, _)| id.clone());
-            if let Some(id) = hit {
-                state.palette_query = None;
-                execute_command(state, registry, inbox, pending, history, &id);
-            }
-            return true;
-        }
+    // Step 1: the palette and the dropdowns are popups of their own, so a
+    // click here is outside them: the platform dismisses the popup on the
+    // focus change and the shell clears the state that asked for it. Their
+    // own rows are activated through the popup pointer channel.
+    if state.palette_query.is_some() || state.menu_open.is_some() {
         state.palette_query = None;
-        return true;
-    }
-    // Step 2: an open dropdown runs its item, or closes.
-    if state.menu_open.is_some() {
-        if state.menu_dropdown_rect.is_some_and(|rect| in_rect(&rect)) {
-            let hit = state
-                .menu_dropdown_item_hits
-                .iter()
-                .find(|(_, rect)| in_rect(rect))
-                .map(|(id, _)| id.clone());
-            if let Some(id) = hit {
-                state.menu_open = None;
-                execute_command(state, registry, inbox, pending, history, &id);
-            }
-            return true;
-        }
-        // A click on another title switches menus; anything else closes.
         let title = state
             .menu_bar_hits
             .iter()
@@ -2785,7 +2887,7 @@ pub fn handle_menu_pointer(
         };
         return true;
     }
-    // Step 3: the bar itself opens a menu.
+    // Step 2: the bar itself opens a menu.
     let title = state
         .menu_bar_hits
         .iter()
@@ -2819,6 +2921,17 @@ fn layout_rect_to_ui(rect: LayoutRect) -> Rect {
     Rect::from_min_size(
         Vector2f::new(rect.x as f32, rect.y as f32),
         Vector2f::new(rect.width as f32, rect.height as f32),
+    )
+}
+
+/// A layout rectangle as the contract's rectangle type, for the popup
+/// requests and the overlay's opaque regions.
+fn editor_rect(rect: LayoutRect) -> EditorRect {
+    EditorRect::new(
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
     )
 }
 
@@ -2926,23 +3039,20 @@ pub fn paint_menu(
         .find(|(name, _)| name == top)
         .map(|(_, rect)| rect.x)
         .unwrap_or(6.0);
-    // The view surface is a real child window: anything drawn over its
-    // rectangle is covered. Until the composition overlay exists (Stage 13
-    // deviation, D24), popups clamp to the area left of it.
-    let view_left = frame
-        .game_rect
-        .or(frame.scene_rect)
-        .map(|rect| rect.x as f64)
-        .unwrap_or(available.x as f64);
+    // The dropdown opens as a popup window of its own (Stage 21, D23): it
+    // may extend past the editor window, so its width no longer has to fit
+    // left of the view surface (the Stage 14 clamp is gone).
     let width = items
         .iter()
         .map(|(_, title, chord)| (title.chars().count() + chord.chars().count() + 8) as f64 * 7.2)
         .fold(240.0_f64, f64::max)
-        .min(460.0)
-        .min((view_left - title_x - 8.0).max(200.0));
+        .min(460.0);
     let height = items.len() as f64 * MENU_ITEM_HEIGHT + 8.0;
     let rect = LayoutRect::new(title_x, MENU_BAR_HEIGHT, width, height);
-    state.menu_dropdown_rect = Some(rect);
+    // The hit rectangles are the popup's own pixels: its pointer arrives
+    // through the popup channel, which knows nothing of where the platform
+    // placed or flipped the window.
+    state.menu_dropdown_rect = Some(LayoutRect::new(0.0, 0.0, width, height));
     let rows: Vec<String> = items
         .iter()
         .map(|(_, title, chord)| {
@@ -2953,6 +3063,7 @@ pub fn paint_menu(
             }
         })
         .collect();
+    let mut draw = DrawList::default();
     {
         let EditorShellState {
             ui,
@@ -2962,11 +3073,12 @@ pub fn paint_menu(
             atlas,
             ..
         } = state;
-        frame
-            .panels
-            .push_fill(layout_rect_to_ui(rect), theme.window);
-        frame.panels.push_fill(
-            layout_rect_to_ui(LayoutRect::new(rect.x, rect.y, rect.width, 1.0)),
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, height)),
+            theme.window,
+        );
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, 1.0)),
             theme.border,
         );
         ui.set_hit_rects(BTreeMap::new());
@@ -2976,23 +3088,28 @@ pub fn paint_menu(
             theme,
             sheet,
             atlas,
-            Vector2f::new(rect.x as f32 + 6.0, rect.y as f32 + 4.0),
-            Vector2f::new(rect.width as f32 - 12.0, rect.height as f32 - 8.0),
+            Vector2f::new(6.0, 4.0),
+            Vector2f::new(width as f32 - 12.0, height as f32 - 8.0),
             |builder| {
                 for row_text in &rows {
                     builder.label(row_text);
                 }
             },
         );
-        frame.panels.append(std::mem::take(&mut list));
+        draw.append(std::mem::take(&mut list));
         frame.clipboard.extend(clipboard);
     }
-    // The item hit rectangles, one per row.
-    let mut y = rect.y + 4.0;
+    frame.popups.push(EditorPopup {
+        id: POPUP_MENU.to_string(),
+        rect: editor_rect(rect),
+        draw,
+    });
+    // The item hit rectangles, one per row, in the popup's own pixels.
+    let mut y = 4.0;
     for (id, _, _) in items {
         state.menu_dropdown_item_hits.push((
             id.clone(),
-            LayoutRect::new(rect.x + 4.0, y, rect.width - 8.0, MENU_ITEM_HEIGHT),
+            LayoutRect::new(4.0, y, width - 8.0, MENU_ITEM_HEIGHT),
         ));
         y += MENU_ITEM_HEIGHT;
     }
@@ -3032,36 +3149,27 @@ pub fn paint_palette(
             || title.to_lowercase().contains(&needle)
             || id.to_lowercase().contains(&needle)
     });
-    // Clamped left of the view surface, like the menu dropdowns: an
-    // in-window popup cannot paint over the child window (D24 pending).
-    let view_left = frame
-        .game_rect
-        .or(frame.scene_rect)
-        .map(|rect| rect.x as f64)
-        .unwrap_or(available.x as f64);
-    let width = PALETTE_WIDTH
-        .min(view_left - 32.0)
-        .max(200.0)
-        .min(available.x as f64 - 32.0);
+    // The palette is a popup window of its own (Stage 21, D23), like the
+    // menu dropdowns: it may extend past the editor window, so its width
+    // no longer has to fit left of the view surface.
+    let width = PALETTE_WIDTH.min(available.x as f64 - 32.0).max(200.0);
     let height = PALETTE_HEIGHT.min(available.y as f64 - 60.0).max(80.0);
     let rect = LayoutRect::new(16.0, 40.0, width, height);
-    state.palette_rect = Some(rect);
+    // The popup's own pixels: its top-left is the origin, whatever the
+    // platform does with the requested rectangle.
+    state.palette_rect = Some(LayoutRect::new(0.0, 0.0, width, height));
     state.palette_item_hits.clear();
     // The rows start below the search field and fit the visible box.
-    let row_y = rect.y + MENU_ITEM_HEIGHT + 6.0;
+    let row_y = MENU_ITEM_HEIGHT + 6.0;
     let visible = commands
         .iter()
-        .take(
-            (((rect.y + rect.height - row_y) / MENU_ITEM_HEIGHT)
-                .floor()
-                .max(0.0)) as usize,
-        )
+        .take((((height - row_y) / MENU_ITEM_HEIGHT).floor().max(0.0)) as usize)
         .count();
     let mut y = row_y;
     for (id, _, _) in commands.iter().take(visible) {
         state.palette_item_hits.push((
             id.clone(),
-            LayoutRect::new(rect.x + 4.0, y, rect.width - 8.0, MENU_ITEM_HEIGHT),
+            LayoutRect::new(4.0, y, width - 8.0, MENU_ITEM_HEIGHT),
         ));
         y += MENU_ITEM_HEIGHT;
     }
@@ -3077,6 +3185,7 @@ pub fn paint_palette(
         })
         .collect();
     let mut changed = false;
+    let mut draw = DrawList::default();
     {
         let EditorShellState {
             ui,
@@ -3086,11 +3195,12 @@ pub fn paint_palette(
             atlas,
             ..
         } = state;
-        frame
-            .panels
-            .push_fill(layout_rect_to_ui(rect), theme.window);
-        frame.panels.push_fill(
-            layout_rect_to_ui(LayoutRect::new(rect.x, rect.y, rect.width, 1.0)),
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, height)),
+            theme.window,
+        );
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, 1.0)),
             theme.border,
         );
         ui.set_hit_rects(BTreeMap::new());
@@ -3100,8 +3210,8 @@ pub fn paint_palette(
             theme,
             sheet,
             atlas,
-            Vector2f::new(rect.x as f32 + 6.0, rect.y as f32 + 2.0),
-            Vector2f::new(rect.width as f32 - 12.0, rect.height as f32 - 4.0),
+            Vector2f::new(6.0, 2.0),
+            Vector2f::new(width as f32 - 12.0, height as f32 - 4.0),
             |builder| {
                 changed = builder.text_field("palette_query", &mut query);
                 builder.separator();
@@ -3110,11 +3220,213 @@ pub fn paint_palette(
                 }
             },
         );
-        frame.panels.append(std::mem::take(&mut list));
+        draw.append(std::mem::take(&mut list));
         frame.clipboard.extend(clipboard);
     }
+    frame.popups.push(EditorPopup {
+        id: POPUP_PALETTE.to_string(),
+        rect: editor_rect(rect),
+        draw,
+    });
     if changed {
         state.palette_query = Some(query);
     }
     state.ui.set_hit_rects(saved_hits);
+}
+
+/// Open the context menu at the pointer (Stage 21).
+///
+/// A right-click in the client area asks for one. The menu is a popup, so
+/// it may extend past the editor window; the platform places and flips it.
+pub fn open_context_menu(state: &mut EditorShellState, position: Vector2f) {
+    state.menu_open = None;
+    state.palette_query = None;
+    state.context_menu_anchor = Some(position);
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        x = position.x,
+        y = position.y,
+        "[editor] context menu opened"
+    );
+}
+
+/// Paint the context menu as a popup while one is open (Stage 21).
+///
+/// Like the menu dropdowns, the rows' hit rectangles are in the popup's own
+/// logical pixels: its pointer arrives through the popup channel, which
+/// knows nothing of where the platform placed or flipped the window.
+pub fn paint_context_menu(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    frame: &mut EditorShellFrame,
+) {
+    let Some(anchor) = state.context_menu_anchor else {
+        state.context_menu_hits.clear();
+        return;
+    };
+    let items: Vec<(String, String, String)> = CONTEXT_MENU_COMMANDS
+        .iter()
+        .filter_map(|id| {
+            registry.commands().find(|spec| spec.id == *id).map(|spec| {
+                (
+                    spec.id.clone(),
+                    spec.title.clone(),
+                    chord_label(registry, &spec.id),
+                )
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        state.context_menu_hits.clear();
+        return;
+    }
+    let width = CONTEXT_MENU_WIDTH;
+    let height = items.len() as f64 * MENU_ITEM_HEIGHT + 8.0;
+    let rows: Vec<String> = items
+        .iter()
+        .map(|(_, title, chord)| {
+            if chord.is_empty() {
+                title.clone()
+            } else {
+                format!("{title}   {chord}")
+            }
+        })
+        .collect();
+    let saved_hits = state.ui.hit_rects().clone();
+    let mut draw = DrawList::default();
+    {
+        let EditorShellState {
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            ..
+        } = state;
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, height)),
+            theme.window,
+        );
+        draw.push_fill(
+            layout_rect_to_ui(LayoutRect::new(0.0, 0.0, width, 1.0)),
+            theme.border,
+        );
+        ui.set_hit_rects(BTreeMap::new());
+        let (mut list, clipboard, _named) = subframe(
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            Vector2f::new(6.0, 4.0),
+            Vector2f::new(width as f32 - 12.0, height as f32 - 8.0),
+            |builder| {
+                for row_text in &rows {
+                    builder.label(row_text);
+                }
+            },
+        );
+        draw.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+    }
+    state.ui.set_hit_rects(saved_hits);
+    state.context_menu_hits.clear();
+    let mut y = 4.0;
+    for (id, _, _) in &items {
+        state.context_menu_hits.push((
+            id.clone(),
+            LayoutRect::new(4.0, y, width - 8.0, MENU_ITEM_HEIGHT),
+        ));
+        y += MENU_ITEM_HEIGHT;
+    }
+    frame.popups.push(EditorPopup {
+        id: POPUP_CONTEXT.to_string(),
+        rect: editor_rect(LayoutRect::new(
+            anchor.x as f64,
+            anchor.y as f64,
+            width,
+            height,
+        )),
+        draw,
+    });
+}
+
+/// Route one popup's pointer to that popup's own rows (Stage 21).
+///
+/// The pointer is in the popup's own logical pixels, so the rectangles
+/// painted for it are the ones to test. A release outside every row leaves
+/// the popup open, exactly as a menu keeps itself open on a stray click.
+pub fn handle_popup_pointer(
+    state: &mut EditorShellState,
+    registry: &CommandRegistry,
+    inbox: &mut CommandInbox,
+    pending: &mut PendingEditorCommands,
+    history: &mut CommandHistory,
+    pointer: &EditorPopupPointer,
+) {
+    if !pointer.released {
+        return;
+    }
+    let in_rect = |rect: &LayoutRect| {
+        pointer.position.x as f64 >= rect.x
+            && pointer.position.x as f64 <= rect.x + rect.width
+            && pointer.position.y as f64 >= rect.y
+            && pointer.position.y as f64 <= rect.y + rect.height
+    };
+    let (rect, hits, open) = match pointer.id.as_str() {
+        POPUP_MENU => (
+            state.menu_dropdown_rect,
+            state.menu_dropdown_item_hits.clone(),
+            state.menu_open.is_some(),
+        ),
+        POPUP_PALETTE => (
+            state.palette_rect,
+            state.palette_item_hits.clone(),
+            state.palette_query.is_some(),
+        ),
+        POPUP_CONTEXT => (
+            Some(LayoutRect::new(
+                0.0,
+                0.0,
+                CONTEXT_MENU_WIDTH,
+                state.context_menu_hits.len() as f64 * MENU_ITEM_HEIGHT + 8.0,
+            )),
+            state.context_menu_hits.clone(),
+            state.context_menu_anchor.is_some(),
+        ),
+        _ => return,
+    };
+    if !open || !rect.is_some_and(|rect| in_rect(&rect)) {
+        return;
+    }
+    let hit = hits
+        .iter()
+        .find(|(_, rect)| in_rect(rect))
+        .map(|(id, _)| id.clone());
+    match pointer.id.as_str() {
+        POPUP_MENU => state.menu_open = None,
+        POPUP_PALETTE => state.palette_query = None,
+        _ => state.context_menu_anchor = None,
+    }
+    if let Some(id) = hit {
+        execute_command(state, registry, inbox, pending, history, &id);
+    }
+}
+
+/// Clear the state behind a popup the platform closed (Stage 21): a click
+/// outside it, a lost focus, or an Escape the operating system took.
+pub fn handle_popup_closed(state: &mut EditorShellState, id: &str) {
+    match id {
+        POPUP_MENU => state.menu_open = None,
+        POPUP_PALETTE => state.palette_query = None,
+        POPUP_CONTEXT => state.context_menu_anchor = None,
+        _ => {}
+    }
+    // NOTE: asserted on by the editor's end-to-end suite.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        popup = id,
+        "[editor] popup dismissed"
+    );
 }

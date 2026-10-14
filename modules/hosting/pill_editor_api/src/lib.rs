@@ -128,9 +128,72 @@ pub struct EditorShellInput {
     /// appends to `events`; the shell drains `events` and reacts to a
     /// revision change.
     pub notices: EditorNotices,
+    /// Where the pointer is over each open popup (Stage 21), in the popup's
+    /// own logical coordinates, and whether the left button came up there
+    /// this frame. A popup is a window of its own, so its pointer never
+    /// arrives as an [`InputEvent`]; this is that channel.
+    pub popup_pointers: Vec<EditorPopupPointer>,
+    /// Popups the platform closed this frame (Stage 21): a click outside, a
+    /// lost focus or an Escape the operating system took. The shell clears
+    /// the matching state, exactly as it would have on its own dismissal.
+    pub popup_closed: Vec<String>,
+    /// Screen-space labels the overlay draws over the scene (Stage 21), in
+    /// logical client pixels. The executable publishes them because it is
+    /// the side that projects world positions; the shell only paints them.
+    pub overlay_labels: Vec<EditorOverlayLabel>,
 }
 
 impl Resource for EditorShellInput {}
+
+/// One label the overlay draws over the scene (Stage 21).
+///
+/// The executable projects a world position to the client area and hands the
+/// text over; the shell draws it in the overlay layer, where it can sit on
+/// top of the scene view's own window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorOverlayLabel {
+    /// The text to draw.
+    pub text: String,
+    /// Where the text's top-left goes, in logical client pixels.
+    pub position: Vector2f,
+}
+
+/// One popup's pointer this frame (Stage 21).
+///
+/// Positions are in the popup's own logical pixels, so the shell hit-tests
+/// the rectangles it painted for that popup without knowing where the
+/// platform put the window - it may have flipped or slid it at the monitor's
+/// work area.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorPopupPointer {
+    /// Which popup, by [`EditorPopup::id`].
+    pub id: String,
+    /// The pointer's position in the popup's own logical pixels.
+    pub position: Vector2f,
+    /// Whether the left button came up over the popup this frame.
+    pub released: bool,
+}
+
+/// One popup the shell asks the platform to open (Stage 21, D23).
+///
+/// A popup is an owned, undecorated top-level window of its own, so its
+/// content may extend past the editor window; the shell names where it wants
+/// it relative to the client area and what to draw in it. Nothing above the
+/// platform layer assumes the popup is a `winit` window (the Linux half,
+/// Stage 31, opens an `xdg_popup` for the same request).
+#[derive(Clone, Debug, Default)]
+pub struct EditorPopup {
+    /// The popup's identity, stable while it stays open; the shell and the
+    /// executable name it in [`EditorPopupPointer`] and
+    /// [`EditorShellInput::popup_closed`].
+    pub id: String,
+    /// Where the popup's top-left goes, in logical pixels of the client
+    /// area: the anchor the platform places and flips at the work area.
+    pub rect: EditorRect,
+    /// What to draw, in the popup's own logical pixels (its top-left is the
+    /// origin), premultiplied over whatever is behind it.
+    pub draw: DrawList,
+}
 
 /// One structured clipboard write the shell requests (Stage 18): the payload
 /// bytes under `format`, offered to other applications alongside `text`.
@@ -249,6 +312,15 @@ pub struct EditorShellFrame {
     /// Drawn through the composition overlay when one exists, through the
     /// project renderer's UI pass otherwise (D24).
     pub overlay: DrawList,
+    /// The overlay's opaque regions, in logical pixels of the client area
+    /// (Stage 21): input over one of them is the editor UI's, input beside
+    /// them is the scene's, and everything the list leaves out lets the
+    /// scene show through.
+    pub overlay_opaque: Vec<EditorRect>,
+    /// The popups the shell wants open (Stage 21, D23): menus, context menus
+    /// and tooltips that may extend past the editor window. A popup the
+    /// shell leaves out is closed.
+    pub popups: Vec<EditorPopup>,
     /// This frame's atlas update, uploaded once by the executable's
     /// renderer.
     pub atlas: Option<AtlasUpdate>,
@@ -286,6 +358,8 @@ impl EditorShellFrame {
     pub fn clear(&mut self) {
         self.panels.clear();
         self.overlay.clear();
+        self.overlay_opaque.clear();
+        self.popups.clear();
         self.atlas = None;
         self.clipboard.clear();
         self.objects.clear();
@@ -332,9 +406,19 @@ mod tests {
             file: "modules/x.rs".to_string(),
             line: 7,
         });
+        frame
+            .overlay_opaque
+            .push(EditorRect::new(1.0, 2.0, 3.0, 4.0));
+        frame.popups.push(EditorPopup {
+            id: "menu.dropdown".to_string(),
+            rect: EditorRect::new(1.0, 2.0, 30.0, 40.0),
+            draw: DrawList::default(),
+        });
         frame.clear();
         assert!(frame.panels.is_empty());
         assert!(frame.overlay.is_empty());
+        assert!(frame.overlay_opaque.is_empty());
+        assert!(frame.popups.is_empty());
         assert!(frame.clipboard.is_empty());
         assert!(frame.objects.is_empty());
         assert!(frame.requested_clipboard.is_none());
