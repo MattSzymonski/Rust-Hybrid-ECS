@@ -60,9 +60,14 @@ PYTHON = sys.executable
 
 # The two hot_patch feature switches, shared by the check and test steps.
 HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
-# `pill_standalone`'s defaults turn hot_patch on (Stage 7 of W-0010 revisits
-# whether this exclusion still keeps the default lane free of it).
-TEST_EXCLUSIONS = ["--exclude", "pill_standalone"]
+# The default test lane must compile without hot_patch, so the plain-reload
+# code paths (`cfg(not(feature = "hot_patch"))`) are built and tested. Cargo
+# unifies features across one invocation, and these three members turn
+# hot_patch on (`editor` by default, `pill_editor_native` unconditionally,
+# `pill_standalone` by default), so the lane leaves them out; the hot_patch lane
+# runs the whole workspace, them included. The `default-lane-features` step
+# fails if a new member brings hot_patch back.
+DEFAULT_LANE = ["--workspace", "--exclude", "pill_standalone", "--exclude", "editor", "--exclude", "pill_editor_native"]
 
 
 @dataclass
@@ -101,11 +106,17 @@ STEPS: List[Step] = [
         "Check (rendering posture)",
         [["cargo", "check", "-p", "pill_standalone", "--features", "rendering"]],
     ),
-    Step("test", "Unit tests", [["cargo", "test", "--workspace", *TEST_EXCLUSIONS]]),
+    Step(
+        "default-lane-features",
+        "Default test lane is free of hot_patch",
+        [[PYTHON, "devops/ci_cd/verify.py", "--assert-default-lane-features"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
+    Step("test", "Unit tests (default lane, no hot_patch)", [["cargo", "test", *DEFAULT_LANE]]),
     Step(
         "test-hot-patch",
         "Unit tests (hot_patch lane)",
-        [["cargo", "test", "--workspace", *TEST_EXCLUSIONS, "--features", HOT_PATCH_FEATURES]],
+        [["cargo", "test", "--workspace", "--features", HOT_PATCH_FEATURES]],
     ),
     Step(
         "coding-standards",
@@ -198,7 +209,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip", nargs="+", default=[], metavar="NAME", help="leave out these steps")
     parser.add_argument("--keep-going", action="store_true", help="continue after a failure")
     parser.add_argument("--list", action="store_true", help="print the steps and exit")
+    # Internal: the body of the `default-lane-features` step.
+    parser.add_argument("--assert-default-lane-features", action="store_true", help=argparse.SUPPRESS)
     return parser
+
+
+def assert_default_lane_features() -> int:
+    """0 when the default test lane's feature graph has no hot_patch, else 1.
+
+    Asks cargo which features of `pill_engine_core` the lane would enable; a
+    member that turns hot_patch on (directly or through a dependency) shows up
+    here before it silently turns the "no hot_patch" lane into a second
+    hot_patch lane.
+    """
+    command = ["cargo", "tree", "--offline", "-e", "features", *DEFAULT_LANE, "-i", "pill_engine_core"]
+    print(f"$ {format_command(command)}", flush=True)
+    try:
+        result = subprocess.run(command, cwd=MODULES_ROOT, capture_output=True, text=True)
+    except FileNotFoundError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    if result.returncode != 0:
+        print(result.stderr[-2000:], file=sys.stderr)
+        return 1
+    offenders = [line.strip() for line in result.stdout.splitlines() if "hot_patch" in line]
+    if offenders:
+        print("ERROR: the default test lane enables hot_patch through:", file=sys.stderr)
+        for line in offenders:
+            print(f"  {line}", file=sys.stderr)
+        print("Exclude the member that turns it on in DEFAULT_LANE (verify.py).", file=sys.stderr)
+        return 1
+    print("default test lane: no hot_patch in the feature graph")
+    return 0
 
 
 def select_steps(arguments: argparse.Namespace) -> Optional[List[Step]]:
@@ -242,6 +284,8 @@ def run_step(step: Step) -> bool:
 def main() -> int:
     """Run the selected steps and print the summary table."""
     arguments = build_parser().parse_args()
+    if arguments.assert_default_lane_features:
+        return assert_default_lane_features()
     steps = select_steps(arguments)
     if steps is None:
         return 2
