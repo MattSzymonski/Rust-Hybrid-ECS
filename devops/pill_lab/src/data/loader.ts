@@ -29,7 +29,7 @@ function emptyManifest(): Manifest {
   return {
     schema_version: SUPPORTED_SCHEMA_VERSION,
     generated: '',
-    categories: { engine: [], hot_reload: [], cold_start: [] },
+    categories: { engine: [], hot_reload: [], cold_start: [], editor_shell: [] },
   };
 }
 

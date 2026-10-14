@@ -292,6 +292,24 @@ impl DevHost {
             .collect()
     }
 
+    /// Whether any watcher's work waits for a frame boundary (Stage 23,
+    /// D32): the editor's sleeping heartbeat takes a frame when one does,
+    /// so an edit reaches a paused, idle editor without user input.
+    pub fn source_work_pending(&self) -> bool {
+        #[cfg(feature = "hot_patch")]
+        if self.patch_attempt.is_some() {
+            return true;
+        }
+        if self
+            .extensions
+            .iter()
+            .any(|slot| slot.pending_reload_generation().is_some())
+        {
+            return true;
+        }
+        self.source_edit_generation.load(Ordering::Acquire) != self.last_processed_source_edit
+    }
+
     /// Rebuild and load a module the host may have skipped, or force a
     /// rebuild of a loaded one (Stage 22, D33).
     ///
@@ -567,6 +585,14 @@ pub struct RenderingHost {
     /// rows through the old field offsets. While paused, the renderer's owner
     /// is disabled and `render` is skipped; the window keeps its last frame.
     paused: Option<PauseReason>,
+    /// Whether the frontend last reported the scene quiet (Stage 23, D32):
+    /// with the project also paused, a reload-free boundary and no renderer
+    /// change, the frame skips the render and the surfaces keep their last
+    /// image.
+    scene_quiet: bool,
+    /// Whether the last frame drew the surfaces; the frontend clears its
+    /// scene-changed flag on the frames this is true.
+    scene_drawn: bool,
     /// Watches the renderer data crate's `shaders/` and queues what it
     /// re-cooks; `None` without a renderer, or when its data crate has no
     /// shaders or the watch could not start.
@@ -786,7 +812,7 @@ impl RenderingHost {
         data_extension: Option<&str>,
         reloaded_extensions: &[String],
         schemas_before: Option<Vec<(String, Option<u64>)>>,
-    ) {
+    ) -> RendererStep {
         // Step 1: A reloaded data crate means the renderer's compiled-in copy
         // of it is stale: rebuild the renderer against the new source.
         let data_reloaded =
@@ -836,6 +862,8 @@ impl RenderingHost {
                 .engine_mut()
                 .set_systems_enabled_for_owner(owner, false);
         }
+
+        step
     }
 
     /// Hand every shader the watcher re-cooked to the renderer data crate's
@@ -848,13 +876,13 @@ impl RenderingHost {
     /// A data crate without the export (a shipping build, where the shader
     /// reload path is compiled out) leaves the edits undelivered, with a
     /// warning.
-    fn deliver_shader_changes(&mut self, data_extension: Option<&str>) {
+    fn deliver_shader_changes(&mut self, data_extension: Option<&str>) -> bool {
         let Some(watcher) = &self.shader_watcher else {
-            return;
+            return false;
         };
         let cooked = watcher.drain();
         if cooked.is_empty() {
-            return;
+            return false;
         }
         let DevHost {
             extensions,
@@ -865,7 +893,7 @@ impl RenderingHost {
         let Some(slot) =
             data_extension.and_then(|data| extensions.iter().find(|slot| slot.name() == data))
         else {
-            return;
+            return false;
         };
         let Some(address) = slot.export_address(SHADER_CHANGED_EXPORT) else {
             warn!(
@@ -874,7 +902,7 @@ impl RenderingHost {
                 export = SHADER_CHANGED_EXPORT,
                 "the renderer data module does not export the shader reload function; shader edits are not applied"
             );
-            return;
+            return false;
         };
         // SAFETY: the data crate exports this name with exactly
         // `ShaderChangedFunction`'s signature, and a function pointer and a data
@@ -882,6 +910,7 @@ impl RenderingHost {
         let shader_changed =
             unsafe { std::mem::transmute_copy::<*const (), ShaderChangedFunction>(&address.0) };
         let world: *mut pill_engine::World = engine.world_mut();
+        let mut delivered = false;
         for shader in cooked {
             // SAFETY: `world` is the live engine world, used by nothing else for
             // the call, and both buffers are the owned strings' bytes.
@@ -900,8 +929,11 @@ impl RenderingHost {
                     path = shader.relative_path.as_str(),
                     "the renderer data module refused a re-cooked shader"
                 );
+            } else {
+                delivered = true;
             }
         }
+        delivered
     }
 
     /// Warn once about each render component the attached renderer ignores.
@@ -947,6 +979,20 @@ impl RenderingHost {
         self.display.set_viewport(viewport);
     }
 
+    /// Tell the host the frontend has nothing for the scene surfaces to draw
+    /// (Stage 23, D32): with the project also paused and nothing reloading,
+    /// the next frame skips the render and the surfaces keep their last
+    /// image. The frontend clears the hint on anything that changes them.
+    pub fn set_scene_quiet(&mut self, quiet: bool) {
+        self.scene_quiet = quiet;
+    }
+
+    /// Whether the last frame drew the surfaces; the frontend clears its
+    /// scene-changed flag on the frames this is true.
+    pub fn scene_drawn_last_frame(&self) -> bool {
+        self.scene_drawn
+    }
+
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
         let frame_start = Instant::now();
@@ -972,20 +1018,37 @@ impl RenderingHost {
         // before any system runs: the renderer this frame draws with is built
         // against the data this frame holds, or rendering is paused.
         let reloaded_extensions = run_reload_phase(&mut self.host);
-        self.renderer_step(
+        let renderer_step = self.renderer_step(
             data_extension.as_deref(),
             &reloaded_extensions,
             schemas_before,
         );
         // Re-cooked shaders go to the data generation that is current now,
         // after every swap of this boundary.
-        self.deliver_shader_changes(data_extension.as_deref());
+        let shaders_delivered = self.deliver_shader_changes(data_extension.as_deref());
 
         // Step 3: The frame's systems.
         let report = run_frame_phase(&mut self.host, frame_start);
 
         // Step 4: While paused the live renderer must not read the world.
         if self.paused.is_some() {
+            self.scene_drawn = false;
+            return Ok(report);
+        }
+        // Step 4: an idle editor draws nothing (Stage 23, D32). When the
+        // frontend reports its scene quiet, the project's systems are paused
+        // and nothing this boundary touched the renderer, the surfaces keep
+        // their last presented image: with the world not advancing, the
+        // image cannot be stale. Anything that can change the picture -
+        // input, commands, reloads, a renderer rebuild, re-cooked shaders -
+        // clears the frontend's flag or is checked here.
+        if self.scene_quiet
+            && self.host.runtime.engine().systems_paused()
+            && reloaded_extensions.is_empty()
+            && matches!(renderer_step, RendererStep::Unchanged)
+            && !shaders_delivered
+        {
+            self.scene_drawn = false;
             return Ok(report);
         }
         // After the frame's systems, so entities a startup system spawns are
@@ -998,6 +1061,7 @@ impl RenderingHost {
         self.display.render(self.host.runtime.engine().world())?;
         self.display
             .deliver_pick_results(self.host.runtime.engine_mut().world_mut());
+        self.scene_drawn = true;
         Ok(report)
     }
 
@@ -1695,6 +1759,8 @@ where
         display,
         renderer_module,
         paused: None,
+        scene_quiet: false,
+        scene_drawn: true,
         shader_watcher,
         unsupported_data_check_pending: true,
     })

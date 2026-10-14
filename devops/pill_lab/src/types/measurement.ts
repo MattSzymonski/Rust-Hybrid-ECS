@@ -13,14 +13,15 @@
  */
 export const SUPPORTED_SCHEMA_VERSION = 2;
 
-export type MeasurementCategory = 'engine' | 'hot_reload' | 'cold_start';
+export type MeasurementCategory = 'engine' | 'hot_reload' | 'cold_start' | 'editor_shell';
 
-export const CATEGORY_ORDER: MeasurementCategory[] = ['engine', 'hot_reload', 'cold_start'];
+export const CATEGORY_ORDER: MeasurementCategory[] = ['engine', 'hot_reload', 'cold_start', 'editor_shell'];
 
 export const CATEGORY_LABELS: Record<MeasurementCategory, string> = {
   engine: 'Engine Performance',
   hot_reload: 'Hot Reloading',
   cold_start: 'Cold Start',
+  editor_shell: 'Editor Shell',
 };
 
 // =============================================================================
@@ -273,10 +274,61 @@ export interface ColdStartMeasurementPayload {
 export type ColdStartMeasurement = MeasurementEnvelope<'cold_start', ColdStartMeasurementPayload>;
 
 // =============================================================================
+// Editor Shell
+// =============================================================================
+
+export interface EditorShellTarget {
+  name: string;
+  met: boolean;
+}
+
+export interface EditorShellCase {
+  name: string;
+  kind: string;
+  description?: string;
+  /** Milliseconds for the duration cases; absent when `value` carries the number. */
+  duration_ms?: number;
+  /** The measured number when the case is not in milliseconds. */
+  value?: number;
+  /** 'ms' (default), '%' for the idle CPU, 'x' for the ratio cases. */
+  unit?: string;
+  better_when?: 'lower' | 'higher';
+  samples_ms?: number[];
+  samples?: number[];
+  frames_per_second?: number;
+  panels?: number;
+  steady_seconds?: number;
+  frames?: number;
+  target?: EditorShellTarget;
+}
+
+export interface EditorShellMeasurementPayload {
+  project: string;
+  startup_repetitions: number;
+  steady_seconds: number;
+  idle_seconds: number;
+  editor_binary: string;
+  standalone_binary: string | null;
+  present_mode: string;
+  /** The D32 targets by case name; an unmeasured case is simply absent. */
+  d32: Record<string, EditorShellTarget>;
+  cases: EditorShellCase[];
+}
+
+export type EditorShellMeasurement = MeasurementEnvelope<
+  'editor_shell',
+  EditorShellMeasurementPayload
+>;
+
+// =============================================================================
 // Union + manifest
 // =============================================================================
 
-export type Measurement = EngineMeasurement | HotReloadMeasurement | ColdStartMeasurement;
+export type Measurement =
+  | EngineMeasurement
+  | HotReloadMeasurement
+  | ColdStartMeasurement
+  | EditorShellMeasurement;
 
 export interface ManifestSummary {
   benchmark_count?: number;
