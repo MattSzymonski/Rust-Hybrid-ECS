@@ -647,12 +647,12 @@ SESSION_B_SCENARIOS = [
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
                 # The probe samples a reference spline over the project's ball
                 # spawn geometry, whose Catmull-Rom midpoint at t=0.5 is the
-                # middle spawn point, (990, 120), plus the module's vertical
+                # middle spawn point, (390, 120), plus the module's vertical
                 # offset, which this phase moves from 0.0 to 10.0. The value is
                 # stable because the spawn geometry is source constants; the
                 # sameness is the point, since the token below has to name it
                 # in advance.
-                wait_after=[("midpoint (990.0, 130.0", PROBE_TIMEOUT)],
+                wait_after=[("midpoint (390.0, 130.0", PROBE_TIMEOUT)],
             )
         ],
         restore_after=[SPLINE_LIB_RS],
