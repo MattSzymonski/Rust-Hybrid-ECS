@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the native editor (W-0004 Stage 13, D26 level 3).
+"""End-to-end acceptance for the native editor.
+
+PROTECTS: The native editor: startup, shell module, input routing, live patch, overlays, safe mode.
+TIER: editor
 
 Builds against an already-built `pill_editor_native` binary, starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the
@@ -10,7 +13,7 @@ navigation in the scene view, a live patch of the shell's system keeping its
 state, and a clean exit. Then it checks the clean exit code on five further
 runs. (The 200k-entity `circus_demo` this suite used to start is the
 pill-lab editor-shell measurement's job; it only made these phases race the
-executable's seconds deadline.) Stage 22 adds the safe-mode paths - a shell
+executable's seconds deadline.) It also covers the safe-mode paths - a shell
 that never loads, and a shell generation that panics on every frame - the
 Retry button that brings the shell back, and the redraw-on-change idle check
 (the executable's own `dump ui-frames` counter through the scripted channel).
@@ -125,7 +128,7 @@ def start_editor(
     """Starts the built editor binary and logs to `log_path`.
 
     The binary is spawned directly rather than through `cargo run`: it is
-    what a user runs, and - since the Stage 13 staging fix - a directly
+    what a user runs, and - since the shell's dylibs are staged beside it - a directly
     spawned editor resolves the shell's engine dylibs (staged beside the
     module it loads) without cargo's PATH help, so this launch keeps that
     fix proven. `cargo run` was the historical workaround and is no longer
@@ -180,10 +183,10 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     # The native editor is a Windows executable until the platform layer
-    # grows its X11 and Wayland implementations (Stage 24); elsewhere this
+    # grows its X11 and Wayland implementations; elsewhere this
     # suite has nothing to check.
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     # A stale editor from an interrupted run would fight this one over the
     # module build directory; every other host-driving suite does the same.
@@ -194,8 +197,8 @@ def main() -> int:
         check=False,
     )
     # A concurrent cargo build rewrites the shared dylibs under the modules
-    # this suite loads, which turns a clean start into a loader failure
-    # (Stage 14 follow-up): detect it and say so, instead of failing on a
+    # this suite loads, which turns a clean start into a loader failure:
+    # detect it and say so, instead of failing on a
     # load whose log cannot tell the difference.
     cargo = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq cargo.exe", "/NH"],
@@ -507,7 +510,7 @@ def main() -> int:
             game_process.kill()
             game_process.wait(timeout=30)
 
-    # Step 4c: the overlay layer and the platform popups (Stage 21, D23/D24).
+    # Step 4c: the overlay layer and the platform popups (D23/D24).
     # The FPS badge and the docking drop preview float over the scene's own
     # child window on a DirectComposition surface, and the menus, the
     # command palette and the context menu open as windows of their own,
@@ -772,7 +775,7 @@ def main() -> int:
             overlay_process.wait(timeout=30)
 
     # Step 4d: with the composition overlay forced to fail, the same content
-    # must reach the scene through the renderer's UI pass (the Stage 12
+    # must reach the scene through the renderer's UI pass (the overlay
     # fallback), with one warning and no loss.
     fallback_log = logs / "editor-native-overlay-fallback.log"
     fallback_process = start_editor(
@@ -877,7 +880,7 @@ def main() -> int:
     assert status == 0, f"detached fallback exited {status}"
     print("  [OK] forced detached fallback: attached, rendered, exited 0")
 
-    # Step 7: safe mode after a failed first load (Stage 22, D33). The
+    # Step 7: safe mode after a failed first load (D33). The
     # shell's sources do not build at startup, so no shell generation ever
     # loads; the editor must stay up - not exit - with its built-in
     # safe-mode UI: the shell's build errors as rows, the scene, and a
@@ -992,7 +995,7 @@ def main() -> int:
             safe_process.kill()
             safe_process.wait(timeout=30)
 
-    # Step 8: safe mode with a shell that never gets going (Stage 22, D33):
+    # Step 8: safe mode with a shell that never gets going (D33):
     # the first generation loads but panics on every run, so no frame is
     # ever stamped. Retrying the same panicking code stays in safe mode;
     # fixing the source reloads it through the watcher and leaves it.
@@ -1002,7 +1005,7 @@ def main() -> int:
     )
     panicking_source = original_source.replace(
         panic_anchor,
-        '    panic!("stage 22: the shell generation panics on purpose");\n'
+        '    panic!("safe mode probe: the shell generation panics on purpose");\n'
         + panic_anchor,
         1,
     )
@@ -1100,7 +1103,7 @@ def main() -> int:
             stopped_process.kill()
             stopped_process.wait(timeout=30)
 
-    # Step 9: redraw on change (Stage 22, D25). With a static layout (one
+    # Step 9: redraw on change (D25). With a static layout (one
     # Scene tabset, no live Statistics text), the project paused and no
     # input, the editor must not present UI frames; a pointer move onto a
     # menu title must produce one. The counter is the executable's own,

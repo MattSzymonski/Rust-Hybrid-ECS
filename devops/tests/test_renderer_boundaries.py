@@ -3,6 +3,9 @@
 Renderer boundary check: the dependency rules of the renderer data split,
 read from the Cargo manifests.
 
+PROTECTS: Only GPU modules link wgpu, the renderer API stays renderer-free, data crates GPU-free.
+TIER: static
+
 REQUIREMENTS: Python 3.11+ (standard library only: `tomllib`).
 
 DESCRIPTION
@@ -61,7 +64,7 @@ API_ALLOWED_DEPENDENCIES = {
     "pill_core",
     "pill_core_macros",
     "pill_engine",
-    # The UI draw lists the frame carries (Stage 12).
+    # The UI draw lists the frame carries.
     "pill_ui",
     "serde",
     "thiserror",

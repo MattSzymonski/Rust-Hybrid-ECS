@@ -1,6 +1,9 @@
 """
 Full Hot-Reloading Integration Suite for Rust-Hybrid-ECS.
 
+PROTECTS: Project and module hot reload keep data, migrate schemas, cascade and stay stable.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo) on PATH

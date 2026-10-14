@@ -1,6 +1,9 @@
 """
 Editor Revision Integration Test for Rust-Hybrid-ECS.
 
+PROTECTS: A module reload bumps the editor revision counter, so the editor drops its caches.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

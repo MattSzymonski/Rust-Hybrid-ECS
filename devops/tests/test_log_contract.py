@@ -1,6 +1,9 @@
 """
 Guards the host log strings that the end-to-end suites match on.
 
+PROTECTS: Every host log token a suite waits for still exists in the Rust sources.
+TIER: static
+
 REQUIREMENTS
   - Python 3.8+
   - No Rust toolchain, no host process, no .NET. Runs in well under a second.

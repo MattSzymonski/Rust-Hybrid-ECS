@@ -1,6 +1,9 @@
 """
 Patch bookkeeping survival test for Rust-Hybrid-ECS.
 
+PROTECTS: A failed reload keeps the live patch records, so rolling the patch back still works.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

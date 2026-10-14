@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the built-in panels (W-0004 Stage 17).
+"""End-to-end acceptance for the built-in panels.
+
+PROTECTS: The built-in panels: Inspector edits, system toggles, Console and Assets toolbar, undoable.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -22,7 +25,7 @@ DESCRIPTION
     5. the Assets panel lists the project's files;
     6. the Assets toolbar's dialogs create an asset, rename it, delete it
        and write a missing sidecar, each a recorded step that undo walks
-       back (Stage 25);
+       back;
     7. a body edit of the shell live-patches with its state kept, and a
        structural edit of the shell crate reloads it with tabs, selection
        and console kept (an Inspector edit still works without re-selecting);
@@ -55,8 +58,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-builtin-panels.log"
-COMMANDS = VALIDATION / "commands-stage17.txt"
-APPDATA = VALIDATION / "stage17_appdata"
+COMMANDS = VALIDATION / "commands-builtin-panels.txt"
+APPDATA = VALIDATION / "builtin_panels_appdata"
 PREFERENCES = APPDATA / "RustHybridEcs" / "preferences.json"
 SHELL_SOURCE = (
     MODULES
@@ -119,7 +122,7 @@ def append(line: str) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -136,7 +139,7 @@ def main() -> int:
     shutil.rmtree(APPDATA, ignore_errors=True)
     original_shell = SHELL_SOURCE.read_text(encoding="utf-8")
     original_hotroot = HOTROOT_SOURCE.read_text(encoding="utf-8")
-    COMMANDS.write_text("# stage 17 built-in panels suite\n", encoding="utf-8")
+    COMMANDS.write_text("# built-in panels suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -151,7 +154,7 @@ def main() -> int:
         stderr=subprocess.STDOUT,
     )
     log.close()
-    # The Assets step (Stage 25) stages its own files: project_rs's res/
+    # The Assets step stages its own files: project_rs's res/
     # tree may not exist yet, so it is made here and removed in the end when
     # this step left it empty. The probe is a real 1x1 PNG - the import
     # decodes it, so its sidecar behaves the way a sourced file's does - and
@@ -501,7 +504,7 @@ def main() -> int:
 
         begin = len(read_log())
         SHELL_SOURCE.write_text(
-            original_shell + "\n// stage 17 suite: structural reload marker\n",
+            original_shell + "\n// built-in panels suite: structural reload marker\n",
             encoding="utf-8",
         )
         wait_token(
@@ -571,7 +574,7 @@ def main() -> int:
             begin,
         )
 
-        # Step 6b: the Assets toolbar and its dialogs (Stage 25). The Assets
+        # Step 6b: the Assets toolbar and its dialogs. The Assets
         # panel is a tab behind Hierarchy in the default layout, so it is
         # selected first; the file the dialog creates is the row the
         # toolbar's other buttons act on, and every queued command is

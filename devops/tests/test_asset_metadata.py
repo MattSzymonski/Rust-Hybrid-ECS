@@ -1,6 +1,9 @@
 """
 Asset metadata consistency check for Rust-Hybrid-ECS.
 
+PROTECTS: Every .meta under examples/*/res has its asset, and no two assets share a guid.
+TIER: static
+
 REQUIREMENTS
   - Python 3.8+ (standard library only)
 

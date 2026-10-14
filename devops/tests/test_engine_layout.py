@@ -4,6 +4,9 @@ Engine layout check: the rules that keep the engine core shared and the
 `pill_engine` facade per DLL, read from the Cargo manifests and the core's
 sources.
 
+PROTECTS: The engine core never links the facade or reads a registry; shared dylibs stay UI-free.
+TIER: static
+
 REQUIREMENTS: Python 3.11+ (standard library only: `tomllib`).
 
 DESCRIPTION

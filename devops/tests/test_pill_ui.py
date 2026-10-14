@@ -1,5 +1,8 @@
 """Shared-dylib check for `pill_ui`: one copy loads in a dev host process.
 
+PROTECTS: Exactly one pill_ui dylib loads in a dev host, and it shapes and draws text.
+TIER: host
+
 Build the dev standalone first (`cargo build -p pill_standalone`) and pass its
 path. This suite runs it with `PILL_UI_PROBE=1`, which shapes and draws a
 sample through the library without a project (`PILL_UI_PROBE_HOLD_SECONDS`

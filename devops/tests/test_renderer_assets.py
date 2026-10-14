@@ -1,4 +1,8 @@
-"""Exercise the native cooker watcher: modify, remove, fail, preserve manifest."""
+"""Exercise the native cooker watcher: modify, remove, fail, preserve manifest.
+
+PROTECTS: The asset cooker's watch mode keeps asset IDs and its manifest consistent.
+TIER: build
+"""
 import argparse
 import json
 import os

@@ -1,6 +1,9 @@
 """
 Picking and selection outline integration test for Rust-Hybrid-ECS.
 
+PROTECTS: Picking returns the entity under the cursor, or nothing, and outlines the hit entity.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo); a GPU the windowed host can render with

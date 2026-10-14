@@ -3,6 +3,9 @@
 Engine export count check: each engine dylib stays clear of the Windows limit
 of 65,535 exported names per DLL.
 
+PROTECTS: Each engine dylib stays below the Windows limit of 65,535 exported symbols.
+TIER: build
+
 REQUIREMENTS: Python 3.8+ (standard library only). The engine dylibs built
   (`cargo build -p pill_core -p pill_engine_core` in `modules/`).
 

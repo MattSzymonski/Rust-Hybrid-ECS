@@ -1,6 +1,9 @@
 """
 Multi-surface renderer integration test for Rust-Hybrid-ECS.
 
+PROTECTS: One renderer drives two windows; a renderer reload reattaches the second surface.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo); a GPU the windowed host can render with

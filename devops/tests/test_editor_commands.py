@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the editor's command layer (W-0004 Stage 14).
+"""End-to-end acceptance for the editor's command layer.
+
+PROTECTS: The command layer: built-in commands by id, menus, the palette and live keymap presets.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -50,8 +53,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-commands.log"
-COMMANDS = VALIDATION / "commands-stage14.txt"
-APPDATA = VALIDATION / "stage14_appdata"
+COMMANDS = VALIDATION / "commands-command-layer.txt"
+APPDATA = VALIDATION / "command_layer_appdata"
 SPLINE_EDITOR_SOURCE = (
     MODULES
     / "extensions"
@@ -105,7 +108,7 @@ def write_keybindings(body: dict) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -123,7 +126,7 @@ def main() -> int:
     if keybindings.exists():
         keybindings.unlink()
     original_source = SPLINE_EDITOR_SOURCE.read_text(encoding="utf-8")
-    COMMANDS.write_text("# stage 14 commands suite\n", encoding="utf-8")
+    COMMANDS.write_text("# command layer suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -290,7 +293,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_source + "\n// stage 14 suite reload check\n", encoding="utf-8"
+            original_source + "\n// command layer suite reload check\n", encoding="utf-8"
         )
         position = wait_token(
             process,

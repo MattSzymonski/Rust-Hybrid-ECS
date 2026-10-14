@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the panel registration API (W-0004 Stage 16).
+"""End-to-end acceptance for the panel registration API.
+
+PROTECTS: The panel registration API: an extension panel opens, records undo steps and live-patches.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -18,7 +21,7 @@ DESCRIPTION
     4. a body-only edit of the panel function live-patches (`LIVE ms`);
     5. editing the runtime `pill_spline` crate reloads it and the editor
        crate, and the panel builds again in the new generation (kept open);
-    5b. the free-standing windows (Stage 24): the Spline Tool opens a tool
+    5b. the free-standing windows: the Spline Tool opens a tool
        window and a confirm modal, the modal blocks the editor's input and
        answers its button as a command, a reload closes the modal and
        reopens the tool window, a disappeared panel closes its window, a
@@ -52,8 +55,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-panels.log"
-COMMANDS = VALIDATION / "commands-stage16.txt"
-APPDATA = VALIDATION / "stage16_appdata"
+COMMANDS = VALIDATION / "commands-panels.txt"
+APPDATA = VALIDATION / "panels_appdata"
 SPLINE_EDITOR_SOURCE = (
     MODULES
     / "extensions"
@@ -111,7 +114,7 @@ def append(line: str) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -127,7 +130,7 @@ def main() -> int:
     VALIDATION.mkdir(parents=True, exist_ok=True)
     original_editor = SPLINE_EDITOR_SOURCE.read_text(encoding="utf-8")
     original_runtime = SPLINE_SOURCE.read_text(encoding="utf-8")
-    COMMANDS.write_text("# stage 16 panels suite\n", encoding="utf-8")
+    COMMANDS.write_text("# panels suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -287,7 +290,7 @@ def main() -> int:
         # `existing=true`) and the re-registered module command still runs.
         before = len(read_log())
         SPLINE_SOURCE.write_text(
-            original_runtime + "\n// stage 16 suite reload check\n", encoding="utf-8"
+            original_runtime + "\n// panels suite reload check\n", encoding="utf-8"
         )
         wait_token(
             process,
@@ -332,7 +335,7 @@ def main() -> int:
         # the sources stay edited until the `finally` instead, because rapid
         # consecutive reload cycles hit a pre-existing crash (W-0009).
 
-        # Step 6b: the free-standing windows (Stage 24). The Spline Tool
+        # Step 6b: the free-standing windows. The Spline Tool
         # detaches into a tool window of its own, opens a confirm modal, the
         # modal blocks the editor's own input and answers its button as a
         # command; a later reload closes the modal and reopens the tool
@@ -442,7 +445,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_editor + "\n// stage 24 window reload check\n", encoding="utf-8"
+            original_editor + "\n// panels suite window reload check\n", encoding="utf-8"
         )
         wait_token(
             process,
@@ -466,8 +469,8 @@ def main() -> int:
             before,
         )
 
-        # The panel-budget warning reaches the toast stack (Stage 16
-        # follow-up, Stage 24): the fixture panel builds past the budget on
+        # The panel-budget warning reaches the toast stack:
+        # the fixture panel builds past the budget on
         # every build, and the open tool window keeps the editor taking
         # frames, so 120 consecutive builds trip the badge and the toast.
         before = len(read_log())

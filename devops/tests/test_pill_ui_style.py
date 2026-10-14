@@ -1,6 +1,9 @@
 """The live-restyle check for `pill_ui`: editing a stylesheet restyles a
 running UI without a compile.
 
+PROTECTS: Editing a stylesheet restyles the running UI without a compile.
+TIER: host
+
 Build the dev standalone first (`cargo build -p pill_standalone`). This
 suite runs it with `PILL_UI_PROBE=1` and `PILL_UI_PROBE_STYLE=<file>`, which
 renders the UI Gallery through that stylesheet and then re-reads, re-parses

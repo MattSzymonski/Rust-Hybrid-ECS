@@ -2,6 +2,9 @@
 """
 Pill comment and layout lint for every Rust source file in the repository.
 
+PROTECTS: Every .rs file follows the Pill comment and layout rules.
+TIER: static
+
 REQUIREMENTS: Python 3.8+ (standard library only).
 
 DESCRIPTION

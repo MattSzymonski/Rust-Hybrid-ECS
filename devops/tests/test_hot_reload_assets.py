@@ -1,6 +1,9 @@
 """
 Live asset reimport suite for Rust-Hybrid-ECS.
 
+PROTECTS: Live asset reimport: .meta edits, broken and restored images, moved files, renderer reloads.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

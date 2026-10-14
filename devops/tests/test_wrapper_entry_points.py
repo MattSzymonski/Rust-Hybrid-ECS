@@ -3,6 +3,9 @@
 Wrapper entry points check: a wrapper DLL exports the whole loadable-artifact
 entry-point set.
 
+PROTECTS: A wrapper DLL exports the full loadable-artifact entry-point set.
+TIER: build
+
 REQUIREMENTS: Python 3.8+, cargo on PATH. Windows (the reader parses PE
   export directories).
 
