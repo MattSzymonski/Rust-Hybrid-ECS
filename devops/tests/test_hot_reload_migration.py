@@ -3,6 +3,7 @@ Hot-Reload Migration Integration Suite for Rust-Hybrid-ECS.
 
 PROTECTS: Component schema changes on reload migrate the data, or are refused and rolled back.
 TIER: host
+SETS: hot-reload, nightly
 
 REQUIREMENTS
   - Python 3.8+

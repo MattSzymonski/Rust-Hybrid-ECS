@@ -3,6 +3,7 @@ Full Hot-Reloading Integration Suite for Rust-Hybrid-ECS.
 
 PROTECTS: Project and module hot reload keep data, migrate schemas, cascade and stay stable.
 TIER: host
+SETS: hot-reload, nightly-allowed-to-fail
 
 REQUIREMENTS
   - Python 3.8+
