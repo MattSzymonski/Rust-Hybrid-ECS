@@ -22,6 +22,7 @@
 //! means.
 
 // External crates
+use pill_engine::FieldValue;
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -43,7 +44,150 @@ pub struct GizmoState {
 
 impl pill_engine::Resource for GizmoState {
     fn shared_name() -> Option<&'static str> {
-        Some("pill_editor_core::gizmo::GizmoState")
+        Some(RESOURCE_NAME)
+    }
+}
+
+// =============================================================================
+// Resource fields (Stage 25)
+// =============================================================================
+
+/// The name [`GizmoState`] answers to in `SetResourceField` - the same string
+/// the resource registers under, so a command written by hand finds it.
+pub const RESOURCE_NAME: &str = "pill_editor_core::gizmo::GizmoState";
+
+/// Set one field of the gizmo settings from a field value, and return the
+/// previous value for the command's inverse.
+///
+/// The engine keeps no resource reflection, so the writable fields are named
+/// here, one arm each; [`resource_field_value`] reads them back through the
+/// same table. An enum field travels as its `U32` discriminant, in
+/// declaration order, and a step as `F32`.
+pub fn set_resource_field(
+    settings: &mut GizmoSettings,
+    resource: &str,
+    field: &str,
+    value: &FieldValue,
+) -> Result<FieldValue, String> {
+    check_resource(resource)?;
+    match field {
+        "settings.mode" => {
+            let previous = settings.mode;
+            settings.mode = mode_from_index(field_u32(field, value)?)?;
+            Ok(FieldValue::U32(mode_index(previous)))
+        }
+        "settings.space" => {
+            let previous = settings.space;
+            settings.space = space_from_index(field_u32(field, value)?)?;
+            Ok(FieldValue::U32(space_index(previous)))
+        }
+        "settings.snap" => {
+            let previous = settings.snap;
+            settings.snap = match value {
+                FieldValue::Bool(value) => *value,
+                other => return Err(format!("`{field}` expects a Bool, got {other:?}")),
+            };
+            Ok(FieldValue::Bool(previous))
+        }
+        "settings.translate_step" => swap_f32(&mut settings.translate_step, field, value),
+        "settings.rotate_step_degrees" => swap_f32(&mut settings.rotate_step_degrees, field, value),
+        "settings.scale_step" => swap_f32(&mut settings.scale_step, field, value),
+        _ => Err(format!(
+            "`{field}` is not an editable field of `{RESOURCE_NAME}` (settings.mode, \
+             settings.space, settings.snap, settings.translate_step, \
+             settings.rotate_step_degrees, settings.scale_step)"
+        )),
+    }
+}
+
+/// Read one editable field of the gizmo settings: the reading half of the
+/// table [`set_resource_field`] writes through.
+pub fn resource_field_value(
+    settings: &GizmoSettings,
+    resource: &str,
+    field: &str,
+) -> Result<FieldValue, String> {
+    check_resource(resource)?;
+    match field {
+        "settings.mode" => Ok(FieldValue::U32(mode_index(settings.mode))),
+        "settings.space" => Ok(FieldValue::U32(space_index(settings.space))),
+        "settings.snap" => Ok(FieldValue::Bool(settings.snap)),
+        "settings.translate_step" => Ok(FieldValue::F32(settings.translate_step)),
+        "settings.rotate_step_degrees" => Ok(FieldValue::F32(settings.rotate_step_degrees)),
+        "settings.scale_step" => Ok(FieldValue::F32(settings.scale_step)),
+        _ => Err(format!(
+            "`{field}` is not a readable field of `{RESOURCE_NAME}`"
+        )),
+    }
+}
+
+/// Refuse any resource but the gizmo state, naming it in the message.
+fn check_resource(resource: &str) -> Result<(), String> {
+    if resource == RESOURCE_NAME {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{resource}` is not an editable resource (`{RESOURCE_NAME}` is)"
+        ))
+    }
+}
+
+/// A `U32` field value, accepting the wider unsigned forms too.
+fn field_u32(field: &str, value: &FieldValue) -> Result<u32, String> {
+    match value {
+        FieldValue::U32(value) => Ok(*value),
+        FieldValue::U64(value) => {
+            u32::try_from(*value).map_err(|_| format!("`{field}` does not fit a u32"))
+        }
+        other => Err(format!("`{field}` expects a U32, got {other:?}")),
+    }
+}
+
+/// Swap one `f32` field and hand back its previous value.
+fn swap_f32(slot: &mut f32, field: &str, value: &FieldValue) -> Result<FieldValue, String> {
+    let next = match value {
+        FieldValue::F32(value) => *value,
+        FieldValue::F64(value) => *value as f32,
+        other => return Err(format!("`{field}` expects an F32, got {other:?}")),
+    };
+    let previous = *slot;
+    *slot = next;
+    Ok(FieldValue::F32(previous))
+}
+
+/// The `U32` discriminant of a mode, in declaration order.
+fn mode_index(mode: GizmoMode) -> u32 {
+    match mode {
+        GizmoMode::Translate => 0,
+        GizmoMode::Rotate => 1,
+        GizmoMode::Scale => 2,
+    }
+}
+
+/// The mode a discriminant names.
+fn mode_from_index(index: u32) -> Result<GizmoMode, String> {
+    match index {
+        0 => Ok(GizmoMode::Translate),
+        1 => Ok(GizmoMode::Rotate),
+        2 => Ok(GizmoMode::Scale),
+        _ => Err("`settings.mode` is 0 (translate), 1 (rotate) or 2 (scale)".to_owned()),
+    }
+}
+
+/// The `U32` discriminant of a space, in declaration order.
+fn space_index(space: GizmoSpace) -> u32 {
+    match space {
+        GizmoSpace::World => 0,
+        GizmoSpace::Local => 1,
+    }
+}
+
+/// The space a discriminant names.
+fn space_from_index(index: u32) -> Result<GizmoSpace, String> {
+    match index {
+        0 => Ok(GizmoSpace::World),
+        1 => Ok(GizmoSpace::Local),
+        _ => Err("`settings.space` is 0 (world) or 1 (local)".to_owned()),
     }
 }
 

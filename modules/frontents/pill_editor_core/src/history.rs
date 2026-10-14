@@ -178,6 +178,31 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                     + sources.iter().map(String::len).sum::<usize>()
                     + destination.len()
             }
+            // The stage 25 asset commands: the restore carries the deleted
+            // file's whole pre-image, which is what the budget counts.
+            EditorCommand::CreateStandaloneAsset {
+                type_name,
+                folder,
+                name,
+            } => type_name.len() + folder.len() + name.len(),
+            EditorCommand::DeleteAssetFile { path } | EditorCommand::WriteAssetMeta { path } => {
+                path.len()
+            }
+            EditorCommand::RestoreAssetFile { path, bytes, meta } => {
+                path.len() + bytes.len() + meta.as_ref().map(Vec::len).unwrap_or(0)
+            }
+            EditorCommand::MoveAssetFile { from, to } => from.len() + to.len(),
+            EditorCommand::SetAssetSettings { path, settings } => {
+                path.len() + settings.to_string().len()
+            }
+            EditorCommand::SetResourceField {
+                resource,
+                field,
+                value,
+            } => resource.len() + field.len() + field_value_bytes(value),
+            EditorCommand::SetSelection { entity, asset } => {
+                entity.map(|_| 16).unwrap_or(0) + asset.as_ref().map(String::len).unwrap_or(0)
+            }
         };
         bytes += strings;
     }
@@ -463,6 +488,42 @@ mod tests {
 
     /// The window tests coalesce against, in milliseconds.
     const WINDOW: Duration = Duration::from_millis(400);
+
+    #[test]
+    fn the_memory_budget_counts_asset_pre_images() {
+        // The undo of an asset delete carries the whole file as its
+        // pre-image; that is the memory the budget must count (Stage 25).
+        let pre_image = vec![0u8; 64 * 1024];
+        let forward = EditorCommand::DeleteAssetFile {
+            path: "textures/helmet.png".to_string(),
+        };
+        let inverse = EditorCommand::RestoreAssetFile {
+            path: "textures/helmet.png".to_string(),
+            bytes: pre_image.clone(),
+            meta: Some(b"{\"guid\":\"abc\"}".to_vec()),
+        };
+        let entry = HistoryEntry::engine("delete asset", vec![forward], vec![inverse]);
+        assert!(
+            entry.memory_bytes >= pre_image.len(),
+            "the pre-image must land in memory_bytes ({} < {})",
+            entry.memory_bytes,
+            pre_image.len()
+        );
+
+        let mut history = CommandHistory::new(10, 32 * 1024);
+        history.push(entry.clone(), 0, WINDOW);
+        assert_eq!(
+            history.steps(),
+            0,
+            "an entry whose pre-image exceeds the budget is dropped"
+        );
+        // The same entry fits a larger budget: the drop above was the byte
+        // count, not the recording.
+        let mut roomy = CommandHistory::new(10, usize::MAX);
+        roomy.push(entry, 0, WINDOW);
+        assert_eq!(roomy.steps(), 1);
+        assert!(roomy.memory_bytes() >= pre_image.len());
+    }
 
     #[test]
     fn push_undo_redo_round_trip() {

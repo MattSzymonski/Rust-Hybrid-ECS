@@ -21,6 +21,10 @@
 //!   is all-or-nothing; failures are returned as `(index, message)` pairs for
 //!   the Console panel, never partially applied.
 
+// Standard library
+use std::path::{Path, PathBuf};
+
+// External crates
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Engine, Entity, FieldValue, SystemOwner};
 
@@ -409,6 +413,96 @@ pub enum EditorCommand {
         /// Where the copies live (the redo's destination).
         destination: String,
     },
+    /// Create a standalone asset of `type_name` called `name` in `folder`
+    /// (Stage 25), both relative to the asset directory.
+    ///
+    /// The file is the type's default document with a fresh guid, written so
+    /// an existing file is never replaced, then imported at once; its
+    /// inverse is the deletion of the new file.
+    CreateStandaloneAsset {
+        /// The registered standalone type's name.
+        type_name: String,
+        /// The destination folder, `/`-separated and relative; empty for the
+        /// asset directory's own root.
+        folder: String,
+        /// The name the user typed; the type's naming rules add the
+        /// extension.
+        name: String,
+    },
+    /// Delete the asset file at `path`, relative to the asset directory,
+    /// together with its `.meta` sidecar (Stage 25).
+    ///
+    /// The apply captures both files' bytes before deleting them; the
+    /// inverse is the restore that puts them back, the sidecar's guid
+    /// included, so the asset keeps its identity across an undo.
+    DeleteAssetFile {
+        /// The asset's path relative to the asset directory.
+        path: String,
+    },
+    /// Restore the asset files a delete captured (Stage 25): the file's
+    /// bytes, and the sidecar's when it had one. The inverse is the delete,
+    /// so the pair round-trips; like the other restore commands this is
+    /// never a recorded edit of its own.
+    RestoreAssetFile {
+        /// The asset's path relative to the asset directory.
+        path: String,
+        /// The file's bytes, exactly as they were.
+        bytes: Vec<u8>,
+        /// The `.meta` sidecar's bytes, when one existed.
+        meta: Option<Vec<u8>>,
+    },
+    /// Move or rename the asset at `from` to `to`, both relative to the
+    /// asset directory (Stage 25).
+    ///
+    /// The `.meta` sidecar travels with the file and the asset watcher
+    /// follows the move, so the loaded asset keeps its handle and guid; the
+    /// inverse moves it back.
+    MoveAssetFile {
+        /// The asset's current path relative to the asset directory.
+        from: String,
+        /// Where it goes, relative to the asset directory.
+        to: String,
+    },
+    /// Write the `.meta` sidecar the sourced asset at `path` is missing
+    /// (Stage 25), with the type's defaults and a fresh guid. A no-op - and
+    /// so nothing recorded - where a sidecar exists; the inverse deletes
+    /// the written sidecar.
+    WriteAssetMeta {
+        /// The asset's path relative to the asset directory.
+        path: String,
+    },
+    /// Replace the import settings of the asset at `path` - or a standalone
+    /// asset's own document - with `settings` (Stage 25). The inverse
+    /// carries the previous value, which the apply reads before writing.
+    SetAssetSettings {
+        /// The asset's path relative to the asset directory.
+        path: String,
+        /// The new settings (or document) body.
+        settings: serde_json::Value,
+    },
+    /// Set one field of one editor-editable resource (Stage 25).
+    ///
+    /// The engine keeps no resource reflection, so the resources this can
+    /// name are curated in [`crate::gizmo`], field by field; the inverse
+    /// carries the previous value.
+    SetResourceField {
+        /// The resource's stable name (its type path).
+        resource: String,
+        /// The field's name within the resource.
+        field: String,
+        /// The new value.
+        value: FieldValue,
+    },
+    /// Set the shared selection (Stage 25). Consecutive selection changes
+    /// merge into one history step through a coalesce key; the inverse
+    /// carries the previous pair, so undo goes back one selection at a
+    /// time.
+    SetSelection {
+        /// The selected entity, when one is.
+        entity: Option<Entity>,
+        /// The selected asset's path, when one is.
+        asset: Option<String>,
+    },
 }
 
 /// What one applied command hands back to the recording layer.
@@ -436,6 +530,40 @@ impl CommandOutcome {
             remap: None,
         }
     }
+}
+
+/// The mounted asset directory the asset commands resolve their relative
+/// paths against.
+fn asset_authoring_root() -> Result<PathBuf, String> {
+    pill_engine::asset_store::mounted_directory().ok_or("no asset directory is mounted".to_owned())
+}
+
+/// `path` as a `/`-separated string, the form asset commands carry.
+fn asset_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Write `bytes` to `file` through a temporary sibling, so a reader never
+/// sees a half-written file; the parent directory is created when missing.
+fn write_asset_bytes(file: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
+    }
+    let file_name = file
+        .file_name()
+        .ok_or_else(|| format!("`{}` has no file name", file.display()))?;
+    let temporary = file.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| format!("cannot write `{}`: {error}", temporary.display()))?;
+    std::fs::rename(&temporary, file).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("cannot write `{}`: {error}", file.display())
+    })
 }
 
 /// The result of [`EditorCommand::apply_recorded`].
@@ -471,6 +599,13 @@ impl EditorCommand {
                 | EditorCommand::SetSystemEnabled { .. }
                 | EditorCommand::ImportFiles { .. }
                 | EditorCommand::RemoveFiles { .. }
+                | EditorCommand::CreateStandaloneAsset { .. }
+                | EditorCommand::DeleteAssetFile { .. }
+                | EditorCommand::MoveAssetFile { .. }
+                | EditorCommand::WriteAssetMeta { .. }
+                | EditorCommand::SetAssetSettings { .. }
+                | EditorCommand::SetResourceField { .. }
+                | EditorCommand::SetSelection { .. }
         )
     }
 
@@ -510,7 +645,15 @@ impl EditorCommand {
             | EditorCommand::SetGizmoTool { .. }
             | EditorCommand::StepOnce
             | EditorCommand::ImportFiles { .. }
-            | EditorCommand::RemoveFiles { .. } => {}
+            | EditorCommand::RemoveFiles { .. }
+            | EditorCommand::CreateStandaloneAsset { .. }
+            | EditorCommand::DeleteAssetFile { .. }
+            | EditorCommand::RestoreAssetFile { .. }
+            | EditorCommand::MoveAssetFile { .. }
+            | EditorCommand::WriteAssetMeta { .. }
+            | EditorCommand::SetAssetSettings { .. }
+            | EditorCommand::SetResourceField { .. }
+            | EditorCommand::SetSelection { .. } => {}
         }
         identifiers
     }
@@ -537,13 +680,25 @@ impl EditorCommand {
                     *old = assigned;
                 }
             }
+            EditorCommand::SetSelection { entity, .. } => {
+                if *entity == Some(previous) {
+                    *entity = Some(assigned);
+                }
+            }
             EditorCommand::CreateEntity { .. }
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
             | EditorCommand::SetGizmoTool { .. }
             | EditorCommand::StepOnce
             | EditorCommand::ImportFiles { .. }
-            | EditorCommand::RemoveFiles { .. } => {}
+            | EditorCommand::RemoveFiles { .. }
+            | EditorCommand::CreateStandaloneAsset { .. }
+            | EditorCommand::DeleteAssetFile { .. }
+            | EditorCommand::RestoreAssetFile { .. }
+            | EditorCommand::MoveAssetFile { .. }
+            | EditorCommand::WriteAssetMeta { .. }
+            | EditorCommand::SetAssetSettings { .. }
+            | EditorCommand::SetResourceField { .. } => {}
         }
     }
 
@@ -801,6 +956,318 @@ impl EditorCommand {
                     sources: sources.clone(),
                     destination: destination.clone(),
                 }))
+            }
+
+            EditorCommand::CreateStandaloneAsset {
+                type_name,
+                folder,
+                name,
+            } => {
+                let root = asset_authoring_root()?;
+                let registry = engine
+                    .world()
+                    .get_resource::<pill_engine::ImportRegistry>()
+                    .cloned()
+                    .ok_or_else(|| format!("{command:?}: no asset types are registered"))?;
+                let extension = registry
+                    .standalone_types()
+                    .into_iter()
+                    .find(|(registered, _)| registered == type_name)
+                    .map(|(_, extension)| extension)
+                    .ok_or_else(|| {
+                        format!("{command:?}: `{type_name}` is not a standalone asset type")
+                    })?;
+                let folder = folder.trim().trim_matches('/');
+                let relative_folder = if folder.is_empty() {
+                    PathBuf::new()
+                } else {
+                    pill_engine::asset_metadata::checked_relative(folder)
+                        .map_err(|message| format!("{command:?}: {message}"))?
+                };
+                let directory = root.join(&relative_folder);
+                if !directory.is_dir() {
+                    return Err(format!(
+                        "{command:?}: the folder `{}` does not exist",
+                        asset_slash(&relative_folder)
+                    ));
+                }
+                let file_name = pill_engine::asset_metadata::standalone_file_name(name, &extension)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let relative = relative_folder.join(&file_name);
+                let destination = root.join(&relative);
+                if destination.exists() {
+                    return Err(format!(
+                        "{command:?}: `{}` already exists",
+                        asset_slash(&relative)
+                    ));
+                }
+                let document = registry
+                    .default_document(type_name)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let guid = pill_engine::AssetGuid::random().map_err(|error| {
+                    format!("{command:?}: no random source for a guid: {error}")
+                })?;
+                let file = serde_json::json!({
+                    "format_version": pill_engine::asset_metadata::METADATA_FORMAT_VERSION,
+                    "asset_type": type_name,
+                    "guid": guid,
+                    "asset": document,
+                });
+                let mut bytes = serde_json::to_vec_pretty(&file)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                bytes.push(b'\n');
+                pill_engine::asset_store::write_new(&destination, &bytes)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let assets = engine
+                    .world_mut()
+                    .get_resource_mut::<pill_engine::AssetManager>()
+                    .ok_or_else(|| format!("{command:?}: the engine has no AssetManager"))?;
+                registry
+                    .import(
+                        assets,
+                        &relative,
+                        pill_engine::MetadataPolicy::ReadIfPresent,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "{command:?}: `{}` was written but did not load: {error}",
+                            asset_slash(&relative)
+                        )
+                    })?;
+                Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
+                    path: asset_slash(&relative),
+                }))
+            }
+
+            EditorCommand::DeleteAssetFile { path } => {
+                let root = asset_authoring_root()?;
+                let relative = pill_engine::asset_metadata::checked_relative(path)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let file = root.join(&relative);
+                let bytes = std::fs::read(&file)
+                    .map_err(|error| format!("{command:?}: cannot read `{path}`: {error}"))?;
+                let meta_relative = pill_engine::asset_metadata::metadata_path_for(&relative);
+                let meta = match &meta_relative {
+                    Some(meta) => match std::fs::read(root.join(meta)) {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(format!("{command:?}: {error}")),
+                    },
+                    None => None,
+                };
+                std::fs::remove_file(&file)
+                    .map_err(|error| format!("{command:?}: cannot delete `{path}`: {error}"))?;
+                if let Some(meta) = meta_relative {
+                    match std::fs::remove_file(root.join(&meta)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(format!("{command:?}: {error}")),
+                    }
+                }
+                Ok(CommandOutcome::inverse(EditorCommand::RestoreAssetFile {
+                    path: path.clone(),
+                    bytes,
+                    meta,
+                }))
+            }
+
+            EditorCommand::RestoreAssetFile { path, bytes, meta } => {
+                let root = asset_authoring_root()?;
+                let relative = pill_engine::asset_metadata::checked_relative(path)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                write_asset_bytes(&root.join(&relative), bytes)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                if let Some(meta_relative) =
+                    pill_engine::asset_metadata::metadata_path_for(&relative)
+                {
+                    let meta_path = root.join(&meta_relative);
+                    match meta {
+                        Some(meta) => write_asset_bytes(&meta_path, meta)
+                            .map_err(|message| format!("{command:?}: {message}"))?,
+                        // A file that had no sidecar restores without one;
+                        // anything sitting there now is an orphan.
+                        None => {
+                            let _ = std::fs::remove_file(&meta_path);
+                        }
+                    }
+                }
+                Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
+                    path: path.clone(),
+                }))
+            }
+
+            EditorCommand::MoveAssetFile { from, to } => {
+                let root = asset_authoring_root()?;
+                let from_relative = pill_engine::asset_metadata::checked_relative(from)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let to_relative = pill_engine::asset_metadata::checked_relative(to)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let destination = root.join(&to_relative);
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
+                }
+                if destination.exists() {
+                    return Err(format!(
+                        "{command:?}: `{}` already exists",
+                        asset_slash(&to_relative)
+                    ));
+                }
+                pill_assets::move_asset(&root.join(&from_relative), &destination)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::MoveAssetFile {
+                    from: to.clone(),
+                    to: from.clone(),
+                }))
+            }
+
+            EditorCommand::WriteAssetMeta { path } => {
+                let root = asset_authoring_root()?;
+                let relative = pill_engine::asset_metadata::checked_relative(path)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let Some(meta_relative) = pill_engine::asset_metadata::metadata_path_for(&relative)
+                else {
+                    return Err(format!("{command:?}: `{path}` cannot have a sidecar"));
+                };
+                if root.join(&meta_relative).exists() {
+                    // Nothing was missing: nothing changed, nothing recorded.
+                    return Ok(CommandOutcome::plain());
+                }
+                let registry = engine
+                    .world()
+                    .get_resource::<pill_engine::ImportRegistry>()
+                    .cloned()
+                    .ok_or_else(|| format!("{command:?}: no asset types are registered"))?;
+                let assets = engine
+                    .world_mut()
+                    .get_resource_mut::<pill_engine::AssetManager>()
+                    .ok_or_else(|| format!("{command:?}: the engine has no AssetManager"))?;
+                registry
+                    .ensure_metadata(assets, &relative)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
+                    path: asset_slash(&meta_relative),
+                }))
+            }
+
+            EditorCommand::SetAssetSettings { path, settings } => {
+                let root = asset_authoring_root()?;
+                let relative = pill_engine::asset_metadata::checked_relative(path)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                let registry = engine
+                    .world()
+                    .get_resource::<pill_engine::ImportRegistry>()
+                    .cloned()
+                    .ok_or_else(|| format!("{command:?}: no asset types are registered"))?;
+                let extension = relative
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let type_name = registry
+                    .type_for_extension(&extension)
+                    .ok_or_else(|| {
+                        format!("{command:?}: no asset type imports `.{extension}` files")
+                    })?
+                    .to_owned();
+                let normalized = registry
+                    .normalize_settings_json(&type_name, settings.clone())
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let previous = registry
+                    .settings_json(&relative)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let standalone = registry.is_standalone_extension(&extension);
+                let body_field = if standalone { "asset" } else { "settings" };
+                let file = if standalone {
+                    root.join(&relative)
+                } else {
+                    let meta_relative = pill_engine::asset_metadata::metadata_path_for(&relative)
+                        .ok_or_else(|| {
+                        format!("{command:?}: `{path}` cannot have a sidecar")
+                    })?;
+                    let file = root.join(&meta_relative);
+                    if !file.is_file() {
+                        // The import writes the sidecar with the type's
+                        // defaults and a guid, which the write below then
+                        // replaces.
+                        let assets = engine
+                            .world_mut()
+                            .get_resource_mut::<pill_engine::AssetManager>()
+                            .ok_or_else(|| {
+                                format!("{command:?}: the engine has no AssetManager")
+                            })?;
+                        registry
+                            .import(
+                                assets,
+                                &relative,
+                                pill_engine::MetadataPolicy::CreateIfMissing,
+                            )
+                            .map_err(|error| format!("{command:?}: {error}"))?;
+                    }
+                    file
+                };
+                let text = std::fs::read_to_string(&file).map_err(|error| {
+                    format!("{command:?}: cannot read `{}`: {error}", file.display())
+                })?;
+                let mut document: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|error| {
+                        format!(
+                            "{command:?}: `{}` is not valid JSON: {error}",
+                            file.display()
+                        )
+                    })?;
+                let object = document.as_object_mut().ok_or_else(|| {
+                    format!("{command:?}: `{}` is not a JSON object", file.display())
+                })?;
+                object.insert(body_field.to_owned(), normalized);
+                let mut bytes = serde_json::to_vec_pretty(&document)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                bytes.push(b'\n');
+                write_asset_bytes(&file, &bytes)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::SetAssetSettings {
+                    path: path.clone(),
+                    settings: previous,
+                }))
+            }
+
+            EditorCommand::SetResourceField {
+                resource,
+                field,
+                value,
+            } => {
+                let world = engine.world_mut();
+                if world.get_resource::<crate::gizmo::GizmoState>().is_none() {
+                    world.insert_resource(crate::gizmo::GizmoState::default());
+                }
+                let Some(state) = world.get_resource_mut::<crate::gizmo::GizmoState>() else {
+                    return Err(format!("{command:?}: the gizmo state could not be claimed"));
+                };
+                let previous =
+                    crate::gizmo::set_resource_field(&mut state.settings, resource, field, value)
+                        .map_err(|message| format!("{command:?}: {message}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::SetResourceField {
+                    resource: resource.clone(),
+                    field: field.clone(),
+                    value: previous,
+                }))
+            }
+
+            EditorCommand::SetSelection { entity, asset } => {
+                let world = engine.world_mut();
+                if world.get_resource::<EditorSelection>().is_none() {
+                    world.insert_resource(EditorSelection::default());
+                }
+                let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
+                    return Err(format!("{command:?}: the selection could not be claimed"));
+                };
+                let previous = EditorCommand::SetSelection {
+                    entity: selection.entity,
+                    asset: selection.asset.clone(),
+                };
+                selection.entity = *entity;
+                selection.asset = asset.clone();
+                Ok(CommandOutcome::inverse(previous))
             }
 
             EditorCommand::DestroyEntity { entity } => {
