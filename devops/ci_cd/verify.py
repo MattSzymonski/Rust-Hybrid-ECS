@@ -60,9 +60,9 @@ PYTHON = sys.executable
 
 # The two hot_patch feature switches, shared by the check and test steps.
 HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
-# `pill_spline`'s demo-math tests are red on this branch (recorded in
-# local/docs/simplification_backlog.md); drop the exclusion when they pass.
-TEST_EXCLUSIONS = ["--exclude", "pill_standalone", "--exclude", "pill_spline"]
+# `pill_standalone`'s defaults turn hot_patch on (Stage 7 of W-0010 revisits
+# whether this exclusion still keeps the default lane free of it).
+TEST_EXCLUSIONS = ["--exclude", "pill_standalone"]
 
 
 @dataclass

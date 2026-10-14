@@ -284,7 +284,7 @@ impl Spline {
                 let segment_count = points.len() - 1;
                 let scaled = t.clamp(0.0, 1.0) * segment_count as f32;
                 let segment_index = (scaled.floor() as usize).min(segment_count - 1);
-                let local_t = scaled - segment_index as f32 + 4.0;
+                let local_t = scaled - segment_index as f32;
 
                 let start = points[segment_index];
                 let end = points[segment_index + 1];
@@ -471,6 +471,20 @@ mod tests {
     /// accumulated error of a cubic evaluation but far below any real spacing.
     const EPSILON: f32 = 1e-4;
 
+    /// Serializes the tests that call through the process-wide
+    /// `pill_spline::get_color_a` redirect slot: one of them installs a
+    /// replacement, and the harness runs tests on several threads, so a reader
+    /// running at the same moment would observe the replacement's value.
+    static COLOR_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the slot lock, ignoring poisoning so one failing test does not
+    /// fail every other slot test with it.
+    fn lock_color_slot() -> std::sync::MutexGuard<'static, ()> {
+        COLOR_SLOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// An empty spline has no path, so every sample reports the origin.
     #[test]
     fn empty_spline_samples_to_the_origin() {
@@ -509,6 +523,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "test-hooks"))]
     fn shipping_math_is_unshifted() {
+        let _slot = lock_color_slot();
         let omo = OmoMO { x: 12, y: 34 };
         assert_eq!(omo.get_sum(), 12 + 34, "the mirrored sum is the plain sum");
 
@@ -534,6 +549,7 @@ mod tests {
     #[test]
     #[cfg(feature = "test-hooks")]
     fn test_hooks_shift_the_observed_values() {
+        let _slot = lock_color_slot();
         let omo = OmoMO { x: 12, y: 34 };
         assert_eq!(omo.get_sum(), 12 + 34 + 1);
 
@@ -698,9 +714,11 @@ mod tests {
     ///
     /// One test rather than three: the slot is a process-wide `static` and the
     /// harness runs tests on several threads, so separate tests would observe
-    /// each other's installs in whatever order the threads interleaved.
+    /// each other's installs in whatever order the threads interleaved. The
+    /// slot lock keeps the other readers of the slot out while it is replaced.
     #[test]
     fn a_method_dispatches_installs_and_resets() {
+        let _slot = lock_color_slot();
         // The receiver is the replacement's first argument, which is what makes
         // a method patchable through the same mechanism as a free function.
         fn replacement(_spline: &Spline) -> f32 {
