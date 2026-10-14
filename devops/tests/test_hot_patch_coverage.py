@@ -412,19 +412,16 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
     print(f"\n  [EDIT] {crate.name}: {crate.edit_file.name} "
           f"fn {crate.function}  {crate.edit_from} -> {crate.edit_to}")
     backups.capture(crate.edit_file)
-    # Edited as bytes, deliberately. Reading with `read_source` and writing with
-    # `atomic_write` round-trips through universal newlines, which rewrites every
-    # line ending in an LF file to CRLF on Windows. The host would then be
-    # correct to report the whole file as changed - and this test would blame the
-    # engine for damage it had done itself.
-    raw = crate.edit_file.read_bytes()
-    edited = raw.replace(crate.edit_from.encode("utf-8"), crate.edit_to.encode("utf-8"), 1)
-    if edited == raw:
+    # The shared helpers keep line endings as stored, so only the edited line
+    # changes and the host sees a body-only edit.
+    original = read_source(crate.edit_file)
+    edited = original.replace(crate.edit_from, crate.edit_to, 1)
+    if edited == original:
         crate.outcome = "SKIPPED"
         crate.detail = f"edit text {crate.edit_from!r} not found as written"
         print(f"  [SKIP] {crate.name}: {crate.detail}")
         return
-    crate.edit_file.write_bytes(edited)
+    atomic_write(crate.edit_file, edited)
 
     start_index = monitor.line_count
     deadline = time.time() + OUTCOME_TIMEOUT

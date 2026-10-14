@@ -362,17 +362,63 @@ BACKUP = BackupRegistry()
 
 
 def read_source(path: Path) -> str:
-    """Reads a source file as UTF-8 text."""
-    return path.read_text(encoding="utf-8")
+    """Reads a source file as UTF-8 text, line endings exactly as stored.
+
+    `newline=""` turns off universal-newline translation, so a CRLF file reads
+    as CRLF and an LF file as LF, and `atomic_write` writes back the same bytes
+    for every line an edit did not touch.
+    """
+    with path.open("r", encoding="utf-8", newline="") as source_file:
+        return source_file.read()
 
 
 def atomic_write(path: Path, content: str) -> None:
-    """Writes source content atomically via temporary file + rename."""
+    """Writes source content atomically via temporary file + rename.
+
+    No newline translation: without `newline=""` Windows would write every LF
+    as CRLF, turning a one-line edit into a whole-file change.
+    """
     if not content.endswith("\n"):
         content += "\n"
     temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(content, encoding="utf-8")
+    with temporary_path.open("w", encoding="utf-8", newline="") as temporary_file:
+        temporary_file.write(content)
     os.replace(str(temporary_path), str(path))
+
+
+# What regenerating the shipping bundle rewrites: the tracked bundle crate and,
+# when its dependencies change, the workspace lockfile.
+SHIPPING_BUNDLE_PATHS = (
+    WORKSPACE_ROOT / "build" / "pill_shipping_bundle",
+    MODULES_ROOT / "Cargo.lock",
+)
+
+
+def snapshot_paths(paths: Sequence[Path]) -> Dict[Path, bytes]:
+    """Every file under `paths` (directories recursively) with its bytes."""
+    snapshot: Dict[Path, bytes] = {}
+    for root in paths:
+        files = [root] if root.is_file() else [path for path in root.rglob("*") if path.is_file()]
+        for path in files:
+            snapshot[path] = path.read_bytes()
+    return snapshot
+
+
+def restore_paths(paths: Sequence[Path], snapshot: Dict[Path, bytes]) -> None:
+    """Put `paths` back exactly as `snapshot` recorded them.
+
+    Files created since the snapshot under a snapshotted directory are removed;
+    every recorded file gets its recorded bytes back.
+    """
+    for root in paths:
+        if root.is_dir():
+            for path in root.rglob("*"):
+                if path.is_file() and path not in snapshot:
+                    path.unlink()
+    for path, contents in snapshot.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists() or path.read_bytes() != contents:
+            path.write_bytes(contents)
 
 
 def apply_replacements(path: Path, replacements: Sequence[Tuple[str, str]]) -> bool:
@@ -747,6 +793,9 @@ __all__ = [
     "read_source",
     "atomic_write",
     "apply_replacements",
+    "SHIPPING_BUNDLE_PATHS",
+    "snapshot_paths",
+    "restore_paths",
     "OutputMonitor",
     "has_crash_signals",
     "launch_process",

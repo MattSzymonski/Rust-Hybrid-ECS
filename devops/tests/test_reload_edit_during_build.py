@@ -94,8 +94,8 @@ BUILD_TIMEOUT_SECONDS = 600
 
 # A structural edit forces a real rebuild rather than a live patch, which is the
 # path under test. The marker is a bare comment so it cannot change behaviour.
-STRUCTURAL_MARKER = b"// EDIT-DURING-BUILD PROBE"
-ANCHOR = b"cubic_term) * 0.5"
+STRUCTURAL_MARKER = "// EDIT-DURING-BUILD PROBE"
+ANCHOR = "cubic_term) * 0.5"
 
 
 def count_occurrences(output: str, token: str) -> int:
@@ -122,19 +122,18 @@ def build_host() -> bool:
 def run_scenario(monitor: OutputMonitor, backups: BackupRegistry, delay: float) -> bool:
     """Save twice, the second during the build, and check the second is built."""
     backups.capture(MODULE_LIB_RS)
-    original = MODULE_LIB_RS.read_bytes()
+    original = read_source(MODULE_LIB_RS)
     if original.count(ANCHOR) != 1:
         print(f"  [FAIL] Anchor {ANCHOR!r} is not uniquely present in {MODULE_LIB_RS.name}.")
         return False
 
     start_index = monitor.line_count
 
-    # Save 1: structural, so the host rebuilds rather than patching. Written as
-    # bytes so an LF file is not silently rewritten to CRLF, which would look
-    # like every line changing.
-    first = original.replace(ANCHOR, b"cubic_term) * 0.5001", 1)
-    first = first.replace(b"// Free Functions", b"// Free Functions\n" + STRUCTURAL_MARKER, 1)
-    MODULE_LIB_RS.write_bytes(first)
+    # Save 1: structural, so the host rebuilds rather than patching. The shared
+    # helpers keep the file's line endings, so only these lines change.
+    first = original.replace(ANCHOR, "cubic_term) * 0.5001", 1)
+    first = first.replace("// Free Functions", "// Free Functions\n" + STRUCTURAL_MARKER, 1)
+    atomic_write(MODULE_LIB_RS, first)
     print(f"  [EDIT 1] structural change to {MODULE_LIB_RS.name}; a rebuild must start")
 
     if not monitor.wait_for(BUILD_STARTED, REBUILD_TIMEOUT, start_index):
@@ -144,10 +143,10 @@ def run_scenario(monitor: OutputMonitor, backups: BackupRegistry, delay: float) 
 
     # Save 2, inside the build window. This is the save the host must not lose.
     time.sleep(delay)
-    second = MODULE_LIB_RS.read_bytes().replace(
-        b"cubic_term) * 0.5001", b"cubic_term) * 0.5002", 1
+    second = read_source(MODULE_LIB_RS).replace(
+        "cubic_term) * 0.5001", "cubic_term) * 0.5002", 1
     )
-    MODULE_LIB_RS.write_bytes(second)
+    atomic_write(MODULE_LIB_RS, second)
     print(f"  [EDIT 2] second save {delay}s later, while the build is running")
 
     # The host may cancel the in-flight build; either way the second save has to

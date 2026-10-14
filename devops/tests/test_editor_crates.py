@@ -105,7 +105,7 @@ def restore_all() -> None:
     if ORIGINAL_SETTINGS is None:
         settings_path.unlink(missing_ok=True)
     else:
-        settings_path.write_text(ORIGINAL_SETTINGS, encoding="utf-8")
+        settings_path.write_text(ORIGINAL_SETTINGS, encoding="utf-8", newline="")
 
 
 def install_test_project_settings() -> None:
@@ -113,7 +113,7 @@ def install_test_project_settings() -> None:
     global ORIGINAL_SETTINGS
     settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
     ORIGINAL_SETTINGS = settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8")
+    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
 
 
 def edit_spline_offset() -> None:

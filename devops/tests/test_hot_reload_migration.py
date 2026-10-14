@@ -409,7 +409,7 @@ def atomic_write(content: str) -> None:
         content += "\n"
 
     temporary_path = PROJECT_LIB_RS.with_suffix(".rs.tmp")
-    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.write_text(content, encoding="utf-8", newline="")
     os.replace(str(temporary_path), str(PROJECT_LIB_RS))
 
 

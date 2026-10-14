@@ -326,7 +326,7 @@ def install_test_project_settings() -> None:
     ORIGINAL_PROJECT_SETTINGS = (
         settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
     )
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8")
+    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
 
 
 def restore_project_settings() -> None:
@@ -335,7 +335,7 @@ def restore_project_settings() -> None:
     if ORIGINAL_PROJECT_SETTINGS is None:
         settings_path.unlink(missing_ok=True)
     else:
-        settings_path.write_text(ORIGINAL_PROJECT_SETTINGS, encoding="utf-8")
+        settings_path.write_text(ORIGINAL_PROJECT_SETTINGS, encoding="utf-8", newline="")
 
 
 def set_shared_identity(enabled: bool) -> None:

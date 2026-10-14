@@ -335,7 +335,7 @@ def main() -> int:
         patched = original_source.replace(
             cadence.group(0), f"% {int(cadence.group(1)) + 1} == 0", 1
         )
-        shell_source.write_text(patched, encoding="utf-8")
+        shell_source.write_text(patched, encoding="utf-8", newline="")
         wait_for_token(
             log_path,
             r"LIVE \d+ ms|extension reload processed",
@@ -379,7 +379,7 @@ def main() -> int:
         assert "panic" not in read_log(log_path), "a panic was logged"
         print("  [OK] clean exit, code 0")
     finally:
-        shell_source.write_text(original_source, encoding="utf-8")
+        shell_source.write_text(original_source, encoding="utf-8", newline="")
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)
@@ -892,7 +892,7 @@ def main() -> int:
         1,
     )
     assert broken_source != original_source, "the shell breakage anchor was not found"
-    shell_source.write_text(broken_source, encoding="utf-8")
+    shell_source.write_text(broken_source, encoding="utf-8", newline="")
     safe_commands = logs / "commands-safe-mode.txt"
     safe_commands.write_text("", encoding="utf-8")
     safe_log = logs / "editor-native-safe-mode.log"
@@ -959,7 +959,7 @@ def main() -> int:
         )
         # Fix the source and click Retry; the rebuild and load run inside
         # the click's own frame, so this wait covers the build too.
-        shell_source.write_text(original_source, encoding="utf-8")
+        shell_source.write_text(original_source, encoding="utf-8", newline="")
         append_command(
             safe_commands,
             f"click {retry_x + retry_width / 2:.0f} {retry_y + retry_height / 2:.0f}",
@@ -990,7 +990,7 @@ def main() -> int:
         assert status == 0, f"the safe-mode run exited {status}"
         print("  [OK] safe-mode run exited 0")
     finally:
-        shell_source.write_text(original_source, encoding="utf-8")
+        shell_source.write_text(original_source, encoding="utf-8", newline="")
         if safe_process.poll() is None:
             safe_process.kill()
             safe_process.wait(timeout=30)
@@ -1010,7 +1010,7 @@ def main() -> int:
         1,
     )
     assert panicking_source != original_source, "the shell panic anchor was not found"
-    shell_source.write_text(panicking_source, encoding="utf-8")
+    shell_source.write_text(panicking_source, encoding="utf-8", newline="")
     stopped_commands = logs / "commands-safe-stopped.txt"
     stopped_commands.write_text("", encoding="utf-8")
     stopped_log = logs / "editor-native-safe-stopped.log"
@@ -1075,7 +1075,7 @@ def main() -> int:
         )
         print("  [OK] safe mode with a panicking shell; retry kept waiting")
         # Fix the source: the watcher reloads it and the frames resume.
-        shell_source.write_text(original_source, encoding="utf-8")
+        shell_source.write_text(original_source, encoding="utf-8", newline="")
         wait_for_occurrence(
             stopped_log, live_pattern, live_seen + 2, stopped_process, 240,
             "recovery reload",
@@ -1098,7 +1098,7 @@ def main() -> int:
         assert status == 0, f"the panicking-shell run exited {status}"
         print("  [OK] panicking-shell run exited 0")
     finally:
-        shell_source.write_text(original_source, encoding="utf-8")
+        shell_source.write_text(original_source, encoding="utf-8", newline="")
         if stopped_process.poll() is None:
             stopped_process.kill()
             stopped_process.wait(timeout=30)

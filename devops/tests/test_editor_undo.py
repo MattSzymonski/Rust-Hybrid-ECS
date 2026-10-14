@@ -690,7 +690,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_source + "\n// undo suite reload check\n", encoding="utf-8"
+            original_source + "\n// undo suite reload check\n", encoding="utf-8", newline=""
         )
         wait_token(
             process,
@@ -851,7 +851,7 @@ def main() -> int:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-        SPLINE_EDITOR_SOURCE.write_text(original_source, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(original_source, encoding="utf-8", newline="")
         PREFERENCES.unlink(missing_ok=True)
     print("PASS: editor undo history")
     return 0

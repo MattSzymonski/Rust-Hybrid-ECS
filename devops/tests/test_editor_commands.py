@@ -293,7 +293,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_source + "\n// command layer suite reload check\n", encoding="utf-8"
+            original_source + "\n// command layer suite reload check\n", encoding="utf-8", newline=""
         )
         position = wait_token(
             process,
@@ -318,7 +318,7 @@ def main() -> int:
         print("PASS: editor commands")
         return 0
     finally:
-        SPLINE_EDITOR_SOURCE.write_text(original_source, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(original_source, encoding="utf-8", newline="")
         if process.poll() is None:
             process.kill()
             process.wait(timeout=30)

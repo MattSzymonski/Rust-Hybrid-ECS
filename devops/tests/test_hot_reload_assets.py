@@ -124,7 +124,7 @@ def set_texture_type(texture_type: str) -> str:
     """Rewrites the metadata file's `texture_type`; returns the file's guid."""
     document = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
     document["settings"]["texture_type"] = texture_type
-    METADATA_FILE.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    METADATA_FILE.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="")
     return document["guid"]
 
 
@@ -265,7 +265,7 @@ def material_edit(monitor: OutputMonitor) -> bool:
     start_index = monitor.line_count
     document = json.loads(MATERIAL_FILE.read_text(encoding="utf-8"))
     document["asset"]["parameters"]["pbr_roughness"] = {"Scalar": 0.5}
-    MATERIAL_FILE.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    MATERIAL_FILE.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8", newline="")
     print(f"  [EDIT] {MATERIAL_FILE.name}: pbr_roughness 1.0 -> 0.5")
     if not monitor.wait_for(REIMPORTED_TOKEN, ASSET_TIMEOUT, start_index):
         print(f"  [FAIL] material edit: nothing was reimported within {ASSET_TIMEOUT}s.")

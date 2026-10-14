@@ -281,16 +281,16 @@ def main() -> int:
             'builder.heading("Spline Tool")', 'builder.heading("Spline Tool v2")', 1
         )
         assert patched != original_editor, "panel heading marker not found"
-        SPLINE_EDITOR_SOURCE.write_text(patched, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(patched, encoding="utf-8", newline="")
         wait_token(process, r"LIVE \d+ ms", 120, "panel body live-patched", before)
-        SPLINE_EDITOR_SOURCE.write_text(original_editor, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(original_editor, encoding="utf-8", newline="")
 
         # Step 6: editing the runtime crate reloads it and the editor crate;
         # the panel is kept open - its tab still exists (focus reports
         # `existing=true`) and the re-registered module command still runs.
         before = len(read_log())
         SPLINE_SOURCE.write_text(
-            original_runtime + "\n// panels suite reload check\n", encoding="utf-8"
+            original_runtime + "\n// panels suite reload check\n", encoding="utf-8", newline=""
         )
         wait_token(
             process,
@@ -445,7 +445,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_editor + "\n// panels suite window reload check\n", encoding="utf-8"
+            original_editor + "\n// panels suite window reload check\n", encoding="utf-8", newline=""
         )
         wait_token(
             process,
@@ -559,7 +559,7 @@ def main() -> int:
         assert gone != current and gone.count("_gone") == 2, (
             "spline_tool/spline_reseed registration markers not found"
         )
-        SPLINE_EDITOR_SOURCE.write_text(gone, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(gone, encoding="utf-8", newline="")
         wait_token(
             process,
             r'\[editor\] window closed\s+id="?spline_tool_window"?\s+kind="?tool"?\s+reason="?panel-gone"?',
@@ -632,8 +632,8 @@ def main() -> int:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
-        SPLINE_EDITOR_SOURCE.write_text(original_editor, encoding="utf-8")
-        SPLINE_SOURCE.write_text(original_runtime, encoding="utf-8")
+        SPLINE_EDITOR_SOURCE.write_text(original_editor, encoding="utf-8", newline="")
+        SPLINE_SOURCE.write_text(original_runtime, encoding="utf-8", newline="")
     print("PASS: editor panels")
     return 0
 
