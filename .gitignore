@@ -41,6 +41,9 @@ modules/pill_standalone_temp/
 # `host_module_*` wrappers in its own `generated/` folder, and the project's
 # `host_project_*` member. The READMEs anchoring the member globs stay tracked.
 modules/extensions/*/generated/
+# The C# mirrors the host writes beside a crate that declares mirrored types
+# (one level deeper than the wrapper folders above); regenerated every start.
+modules/extensions/*/*/generated/
 !modules/extensions/_workspace_anchor/generated/
 modules/projects_generated/*
 !modules/projects_generated/README.md
