@@ -1,5 +1,9 @@
 """Windows native presentation, lifecycle and clean-shutdown acceptance check.
 Run after building the selected frontend. Only touches the process it starts.
+
+PROTECTS: The windowed frontend presents frames and shuts down cleanly.
+TIER: host
+
 """
 import argparse
 import ctypes

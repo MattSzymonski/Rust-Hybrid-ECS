@@ -2,6 +2,9 @@
 """
 Build every example project in release mode and report artifact sizes.
 
+PROTECTS: Every example project builds in release.
+TIER: build
+
 REQUIREMENTS: Python 3.8+, Rust toolchain (cargo) on PATH, .NET SDK for any
               C# example (a missing SDK skips those rather than failing).
 

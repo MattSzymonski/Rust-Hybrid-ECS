@@ -1,6 +1,9 @@
 """
 Gameplay scripting analyzer suite for Rust-Hybrid-ECS.
 
+PROTECTS: The PILL Roslyn analyzer rules: the C# project builds clean and a rule-breaking probe fails.
+TIER: build
+
 REQUIREMENTS
   - Python 3.8+
   - .NET SDK 8 on PATH

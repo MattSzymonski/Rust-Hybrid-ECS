@@ -1,6 +1,9 @@
 """
 Launches the statically linked shipping binary and checks that it runs.
 
+PROTECTS: The shipping binary has no reload machinery, runs the project and never starts cargo.
+TIER: build
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain on PATH. No .NET, and no project sources are edited.

@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the clipboard (W-0004 Stage 18).
+"""End-to-end acceptance for the clipboard.
+
+PROTECTS: Clipboard and drag-and-drop: field copy and paste, entity round-trips and file drops.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -52,8 +55,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-clipboard.log"
-COMMANDS = VALIDATION / "commands-stage18.txt"
-APPDATA = VALIDATION / "stage18_appdata"
+COMMANDS = VALIDATION / "commands-clipboard.txt"
+APPDATA = VALIDATION / "clipboard_appdata"
 # The drop phase's fixtures: a source file outside the project and the
 # project's asset directory the import copies into.
 DROP_SOURCE = ROOT / "local" / "temp" / "s18_drop.png"
@@ -184,7 +187,7 @@ def end_the_ole_drag(editor_pid: int) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -199,7 +202,7 @@ def main() -> int:
     )
     VALIDATION.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(APPDATA, ignore_errors=True)
-    COMMANDS.write_text("# stage 18 clipboard suite\n", encoding="utf-8")
+    COMMANDS.write_text("# clipboard suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -462,7 +465,7 @@ def main() -> int:
         print("  [OK] unsupported type copied without metadata, undone")
 
         # Step 5: dragging a file out of the window starts OLE's modal drag
-        # loop (Stage 18); Explorer itself cannot be scripted, so this smoke
+        # loop; Explorer itself cannot be scripted, so this smoke
         # run starts the drag and ends it with an injected mouse move (the
         # gesture's own end, since no button is down). The manual checklist
         # (D26) covers the actual copy into Explorer.
@@ -497,8 +500,8 @@ def main() -> int:
         # fresh editor on the same project pastes the copied entity with
         # identical component values. Sequential instances only - two at
         # once would fight over the project's files.
-        second_commands = COMMANDS.with_name("commands-stage18b.txt")
-        second_commands.write_text("# stage 18 clipboard suite, second instance\n", encoding="utf-8")
+        second_commands = COMMANDS.with_name("commands-clipboard-second.txt")
+        second_commands.write_text("# clipboard suite, second instance\n", encoding="utf-8")
         second_environment = dict(environment)
         second_environment["PILL_EDITOR_TEST_COMMANDS"] = str(second_commands)
         second_log = LOG.open("a", encoding="utf-8")

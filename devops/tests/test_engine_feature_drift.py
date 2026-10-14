@@ -3,6 +3,9 @@
 Engine feature drift check: every build the development hosts run resolves the
 engine dylibs' dependency trees exactly as the host does.
 
+PROTECTS: Every build the host spawns resolves the same engine features as the host itself.
+TIER: static
+
 REQUIREMENTS: Python 3.8+, cargo on PATH (runs `cargo tree --offline`).
 
 DESCRIPTION

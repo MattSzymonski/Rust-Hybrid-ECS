@@ -1,6 +1,9 @@
 """
 Extension editor crates integration test for Rust-Hybrid-ECS.
 
+PROTECTS: Extension editor crates load only in the editor posture and reload with their runtime crate.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

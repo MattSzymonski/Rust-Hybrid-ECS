@@ -1,6 +1,9 @@
 """
 Shared Component Identity Integration Test for Rust-Hybrid-ECS.
 
+PROTECTS: Types linked by two DLLs share one registration with #[pill(shared)], else startup fails.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

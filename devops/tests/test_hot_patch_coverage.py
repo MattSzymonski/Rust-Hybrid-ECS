@@ -1,6 +1,9 @@
 """
 Hot-patch coverage test for Rust-Hybrid-ECS.
 
+PROTECTS: Body-only edits in every loaded crate are live-patched rather than reloaded.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

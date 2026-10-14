@@ -1,4 +1,7 @@
-"""End-to-end acceptance for scene selection (W-0004 Stage 20, selection half).
+"""End-to-end acceptance for scene selection.
+
+PROTECTS: Scene selection: clicks pick entities through the pick contract; gizmo drags are undoable.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -50,8 +53,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-selection.log"
-COMMANDS = VALIDATION / "commands-stage20.txt"
-APPDATA = VALIDATION / "stage20_appdata"
+COMMANDS = VALIDATION / "commands-selection.txt"
+APPDATA = VALIDATION / "selection_appdata"
 
 
 def read_log() -> str:
@@ -144,7 +147,7 @@ def dump_array(
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -159,7 +162,7 @@ def main() -> int:
     )
     VALIDATION.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(APPDATA, ignore_errors=True)
-    COMMANDS.write_text("# stage 20 selection suite\n", encoding="utf-8")
+    COMMANDS.write_text("# selection suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/italian_brainrot"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -252,7 +255,7 @@ def main() -> int:
             process, r"\[editor\] outline cleared", 60, "the outline cleared with it", begin
         )
 
-        # Step 4: the gizmos (Stage 20). The corner click cleared the
+        # Step 4: the gizmos. The corner click cleared the
         # selection, so the grid's entity is selected again and its gizmo
         # must appear where the handles are drawn.
         begin = len(read_log())

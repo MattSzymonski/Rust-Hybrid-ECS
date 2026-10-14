@@ -1,6 +1,9 @@
 """
 Builds a project for the browser and checks that it runs and draws there.
 
+PROTECTS: A project built for the browser mounts its assets and draws frames with WebGPU.
+TIER: build
+
 REQUIREMENTS
   - Python 3.8+ (standard library only; Pillow, when installed, adds the
     picture check)

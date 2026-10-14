@@ -1,6 +1,9 @@
 """
 Edit-during-build regression test for Rust-Hybrid-ECS.
 
+PROTECTS: A save made during a build wins: the newer edit is the one built and loaded.
+TIER: host
+
 REQUIREMENTS
   - Python 3.8+
   - Rust toolchain (cargo)

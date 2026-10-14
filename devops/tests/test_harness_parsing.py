@@ -1,6 +1,9 @@
 """
 Unit tests for the test harness itself.
 
+PROTECTS: The parsing the end-to-end suites decide pass or fail with, on real host output.
+TIER: static
+
 REQUIREMENTS
   - Python 3.8+
   - No Rust toolchain, no host process, no .NET. Runs in well under a second.

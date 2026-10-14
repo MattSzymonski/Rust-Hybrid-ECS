@@ -1,4 +1,7 @@
-"""A real drag out of the editor onto the desktop (W-0004 Stage 18, D26).
+"""A real drag out of the editor onto the desktop.
+
+PROTECTS: A real OS drag out of the editor carries the dragged asset's file path.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -52,8 +55,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-drag-out.log"
-COMMANDS = VALIDATION / "commands-stage18-drag.txt"
-APPDATA = VALIDATION / "stage18_drag_appdata"
+COMMANDS = VALIDATION / "commands-drag-out.txt"
+APPDATA = VALIDATION / "drag_out_appdata"
 ASSET_ROOT = ROOT / "examples" / "project_rs" / "res"
 DRAG_NAME = "s18_drag.png"
 DRAG_COPY = ASSET_ROOT / DRAG_NAME
@@ -173,7 +176,7 @@ def desktop_directories() -> list:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -188,7 +191,7 @@ def main() -> int:
     )
     VALIDATION.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(APPDATA, ignore_errors=True)
-    COMMANDS.write_text("# stage 18 drag-out script\n", encoding="utf-8")
+    COMMANDS.write_text("# drag-out script\n", encoding="utf-8")
     # A leftover from an interrupted run would make the desktop rename the
     # new copy on the name collision.
     for directory in desktop_directories():

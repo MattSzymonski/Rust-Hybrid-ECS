@@ -1,4 +1,7 @@
-"""End-to-end acceptance for reload feedback (W-0004 Stage 19).
+"""End-to-end acceptance for reload feedback.
+
+PROTECTS: Reload feedback: failed reloads become Problems rows and toasts, and bad patches roll back.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -54,10 +57,10 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-reload-feedback.log"
-COMMANDS = VALIDATION / "commands-stage19.txt"
-APPDATA = VALIDATION / "stage19_appdata"
-OPEN_RECORD = VALIDATION / "stage19_open_record.txt"
-OPEN_BAT = VALIDATION / "stage19_open.bat"
+COMMANDS = VALIDATION / "commands-reload-feedback.txt"
+APPDATA = VALIDATION / "reload_feedback_appdata"
+OPEN_RECORD = VALIDATION / "reload_feedback_open_record.txt"
+OPEN_BAT = VALIDATION / "reload_feedback_open.bat"
 EXTENSION_SOURCE = (
     MODULES
     / "extensions"
@@ -82,11 +85,11 @@ SHELL_SOURCE = (
 SHELL_BODY_ANCHOR = (
     "    let (mut state, mut input, mut frame, editor_snapshot, logs, clipboard_answer) = view;"
 )
-SHELL_PANIC_LINE = '    panic!("stage19 rollback probe");'
+SHELL_PANIC_LINE = '    panic!("reload feedback rollback probe");'
 
 # A type error with a span on the line it is appended as, so the expected
 # line number is the file's new last line and the parser must find it.
-BROKEN_LINE = 'pub fn stage19_broken() -> u32 { "not a number" }'
+BROKEN_LINE = 'pub fn reload_feedback_broken() -> u32 { "not a number" }'
 
 
 def read_log() -> str:
@@ -124,7 +127,7 @@ def append(line: str) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -147,7 +150,7 @@ def main() -> int:
         f'@echo %* >> "{OPEN_RECORD}"\n', encoding="utf-8"
     )
     OPEN_RECORD.unlink(missing_ok=True)
-    COMMANDS.write_text("# stage 19 reload feedback suite\n", encoding="utf-8")
+    COMMANDS.write_text("# reload feedback suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/italian_brainrot"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -311,7 +314,7 @@ def main() -> int:
 
         # Step 4: a patched body that panics every frame is rolled back
         # automatically, reported, and the editor keeps running on the
-        # previous code (Chunk B of Stage 19, D22/D33).
+        # previous code (D22/D33).
         begin = len(read_log())
         assert SHELL_BODY_ANCHOR in original_shell, "the shell body anchor moved"
         SHELL_SOURCE.write_text(
@@ -329,7 +332,7 @@ def main() -> int:
         )
         wait_token(
             process,
-            r'frame error: system "?editor_shell"? failed: panicked: stage19 rollback probe',
+            r'frame error: system "?editor_shell"? failed: panicked: reload feedback rollback probe',
             120,
             "the panic is contained and reported once",
             begin,

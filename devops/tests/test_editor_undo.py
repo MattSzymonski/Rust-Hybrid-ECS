@@ -1,4 +1,7 @@
-"""End-to-end acceptance for the editor's undo/redo history (W-0004 Stage 15).
+"""End-to-end acceptance for the editor's undo/redo history.
+
+PROTECTS: Undo and redo: field edits, drags, component, entity and asset commands round-trip.
+TIER: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
@@ -22,10 +25,10 @@ DESCRIPTION
     5. the step cap from the preferences file trims the oldest entry with a
        log line;
     6. an edit survives a reload of the spline editor crate and still undoes.    7. a resource field edit and a selection change each undo and redo as one
-       step (Stage 25);
+       step;
     8. create, move, write-meta and delete through the recorded asset
        commands each undo and redo cleanly, on the Rust and the C# example
-       project, each in its own editor run (Stage 25).
+       project, each in its own editor run.
   Everything is asserted on the editor's log tokens; the edited crate source
   is restored in a `finally`. The suite runs under its own LOCALAPPDATA
   sandbox, so the developer's real editor state is untouched.
@@ -53,8 +56,8 @@ MODULES = ROOT / "modules"
 BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
 VALIDATION = ROOT / "local" / "editor-validation"
 LOG = VALIDATION / "editor-undo.log"
-COMMANDS = VALIDATION / "commands-stage15.txt"
-APPDATA = VALIDATION / "stage15_appdata"
+COMMANDS = VALIDATION / "commands-undo.txt"
+APPDATA = VALIDATION / "undo_appdata"
 PREFERENCES = APPDATA / "RustHybridEcs" / "preferences.json"
 SPLINE_EDITOR_SOURCE = (
     MODULES
@@ -121,7 +124,7 @@ def write_preferences(body: dict) -> None:
 
 
 def run_asset_phase(project: str, label: str, sandbox_name: str) -> None:
-    """Drives the recorded asset commands on one project (Stage 25).
+    """Drives the recorded asset commands on one project.
 
     Create, move, write-meta and delete each undo and redo through
     `command editor.undo` / `command editor.redo`, with the files checked on
@@ -129,7 +132,7 @@ def run_asset_phase(project: str, label: str, sandbox_name: str) -> None:
     removed in a `finally`.
     """
     log_path = VALIDATION / f"editor-undo-{label}.log"
-    commands_path = VALIDATION / f"commands-stage25-{label}.txt"
+    commands_path = VALIDATION / f"commands-undo-assets-{label}.txt"
     appdata = VALIDATION / sandbox_name
     res = ROOT / "examples" / project / "res"
     probe = res / "w25_source.png"
@@ -173,7 +176,7 @@ def run_asset_phase(project: str, label: str, sandbox_name: str) -> None:
         raise RuntimeError(f"{label}: {description}: {path} {state}")
 
     created: list[Path] = []
-    commands_path.write_text(f"# stage 25 asset phase: {label}\n", encoding="utf-8")
+    commands_path.write_text(f"# undo suite asset phase: {label}\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = f"../examples/{project}"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(commands_path)
@@ -366,7 +369,7 @@ def run_asset_phase(project: str, label: str, sandbox_name: str) -> None:
 
 def main() -> int:
     if os.name != "nt":
-        print("SKIP: the native editor is Windows-only until Stage 24")
+        print("SKIP: the native editor suites need Windows")
         return 0
     if not BINARY.is_file():
         raise SystemExit(
@@ -382,7 +385,7 @@ def main() -> int:
     VALIDATION.mkdir(parents=True, exist_ok=True)
     PREFERENCES.unlink(missing_ok=True)
     original_source = SPLINE_EDITOR_SOURCE.read_text(encoding="utf-8")
-    COMMANDS.write_text("# stage 15 undo suite\n", encoding="utf-8")
+    COMMANDS.write_text("# undo suite\n", encoding="utf-8")
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
@@ -687,7 +690,7 @@ def main() -> int:
         )
         before = len(read_log())
         SPLINE_EDITOR_SOURCE.write_text(
-            original_source + "\n// stage 15 suite reload check\n", encoding="utf-8"
+            original_source + "\n// undo suite reload check\n", encoding="utf-8"
         )
         wait_token(
             process,
@@ -716,7 +719,7 @@ def main() -> int:
         )
 
         # Step 7b: a resource field edit and a selection change each undo as
-        # one step (Stage 25).
+        # one step.
         before = len(read_log())
         append(f"dump resource {GIZMO_RESOURCE} settings.snap")
         wait_token(process, r'\[test\] resource\s+resource="?', 30, "gizmo snap read", before)
@@ -835,11 +838,11 @@ def main() -> int:
         print("  [OK] clean exit, code 0")
 
         # Step 9: the recorded asset commands on the Rust and the C# example
-        # project, each in its own editor run (Stage 25). The C# side uses
+        # project, each in its own editor run. The C# side uses
         # examples/project_cs: the gitignored circus_demo_cs working copy on
         # this machine does not build (its AssetHandle work is unfinished).
-        run_asset_phase("circus_demo", "circus_demo", "stage25_circus_appdata")
-        run_asset_phase("project_cs", "project_cs", "stage25_project_cs_appdata")
+        run_asset_phase("circus_demo", "circus_demo", "undo_assets_circus_appdata")
+        run_asset_phase("project_cs", "project_cs", "undo_assets_project_cs_appdata")
     finally:
         if process.poll() is None:
             subprocess.run(
