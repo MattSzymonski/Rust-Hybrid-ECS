@@ -18,6 +18,12 @@ DESCRIPTION
     4. a body-only edit of the panel function live-patches (`LIVE ms`);
     5. editing the runtime `pill_spline` crate reloads it and the editor
        crate, and the panel builds again in the new generation (kept open);
+    5b. the free-standing windows (Stage 24): the Spline Tool opens a tool
+       window and a confirm modal, the modal blocks the editor's input and
+       answers its button as a command, a reload closes the modal and
+       reopens the tool window, a disappeared panel closes its window, a
+       user close sticks, and the over-budget fixture's warning reaches the
+       toast stack;
     6. the harness' panic panel is contained (a warn line, the shell keeps
        painting) and an unregistered panel shows the placeholder;
     7. the editor exits cleanly.
@@ -125,7 +131,7 @@ def main() -> int:
     environment = dict(os.environ)
     environment["PROJECT_PATH"] = "../examples/project_rs"
     environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
-    environment["PILL_EDITOR_TEST_SECONDS"] = "420"
+    environment["PILL_EDITOR_TEST_SECONDS"] = "600"
     environment["LOCALAPPDATA"] = str(APPDATA)
     log = LOG.open("w", encoding="utf-8")
     process = subprocess.Popen(
@@ -156,7 +162,7 @@ def main() -> int:
         )
         wait_token(
             process,
-            r"\[editor\] panel registry ready\s+panels=2",
+            r"\[editor\] panel registry ready\s+panels=4",
             60,
             "panel registry ready",
         )
@@ -322,7 +328,249 @@ def main() -> int:
             "command ran in the new generation",
             before_wait,
         )
-        SPLINE_SOURCE.write_text(original_runtime, encoding="utf-8")
+        # Restoring the runtime source in-step would trigger another reload;
+        # the sources stay edited until the `finally` instead, because rapid
+        # consecutive reload cycles hit a pre-existing crash (W-0009).
+
+        # Step 6b: the free-standing windows (Stage 24). The Spline Tool
+        # detaches into a tool window of its own, opens a confirm modal, the
+        # modal blocks the editor's own input and answers its button as a
+        # command; a later reload closes the modal and reopens the tool
+        # window; dropping the panel's registration closes its window; a
+        # user close sticks; and the over-budget fixture reaches the toast.
+        before = len(read_log())
+        append("activate spline.open_window")
+        wait_token(
+            process,
+            r'\[editor\] widget activated\s+name="?spline\.open_window"?',
+            30,
+            "detach button pressed",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window opened\s+id="?spline_tool_window"?\s+kind="?tool"?',
+            30,
+            "tool window opened",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window panel built\s+id="?spline_tool_window"?\s+panel="?spline_tool"?',
+            30,
+            "tool window panel built",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window created\s+id="?spline_tool_window"?\s+kind="?tool"?',
+            30,
+            "tool window's platform window created",
+            before,
+        )
+        before = len(read_log())
+        append("activate spline.confirm_reseed")
+        wait_token(
+            process,
+            r'\[editor\] window opened\s+id="?spline_reseed_confirm"?\s+kind="?modal"?',
+            30,
+            "confirm modal opened",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window panel built\s+id="?spline_reseed_confirm"?\s+panel="?spline_reseed"?',
+            30,
+            "modal body panel built",
+            before,
+        )
+
+        # The modal blocks the editor's own input: a right-click that would
+        # open the context menu is dropped, and the drop is stated once.
+        before = len(read_log())
+        append("rightclick 300 300")
+        wait_token(
+            process,
+            r'\[editor\] modal blocks editor input\s+id="?spline_reseed_confirm"?',
+            30,
+            "modal blocked the editor's input",
+            before,
+        )
+        assert "[editor] context menu opened" not in read_log()[before:], (
+            "a blocked right-click still opened the context menu"
+        )
+
+        # The modal answers its button as a command: Enter-equivalent
+        # activation of the first button runs spline_editor.reseed.
+        before = len(read_log())
+        append("activate window.spline_reseed_confirm.button.0")
+        wait_token(
+            process,
+            r'\[editor\] window widget activated\s+name="?window\.spline_reseed_confirm\.button\.0"?',
+            30,
+            "modal button activated",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] modal answered\s+id="?spline_reseed_confirm"?\s+button="?Re-seed"?\s+command="?spline_editor\.reseed"?',
+            30,
+            "modal answered with its command",
+            before,
+        )
+        wait_token(
+            process,
+            r"\[spline_editor\] reseeded\s+splines=\d+\s+control_points=16",
+            30,
+            "the modal's command ran the module system",
+            before,
+        )
+
+        # A reload of the module closes the modal - its question belonged to
+        # the old generation - and reopens the tool window on the new one.
+        # The editor crate's own source is edited here (a comment-only line),
+        # so the reload is its direct one; the runtime source stays as step 6
+        # left it.
+        before = len(read_log())
+        append("activate spline.confirm_reseed")
+        wait_token(
+            process,
+            r'\[editor\] window opened\s+id="?spline_reseed_confirm"?',
+            30,
+            "modal opened again",
+            before,
+        )
+        before = len(read_log())
+        SPLINE_EDITOR_SOURCE.write_text(
+            original_editor + "\n// stage 24 window reload check\n", encoding="utf-8"
+        )
+        wait_token(
+            process,
+            r"\[editor\] pill_spline_editor loaded\s+loaded_generations=3",
+            180,
+            "editor crate reloaded for the window check",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] modal closed\s+id="?spline_reseed_confirm"?\s+reason="?reload"?',
+            60,
+            "reload closed the modal",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window reopened\s+id="?spline_tool_window"?',
+            60,
+            "reload reopened the tool window",
+            before,
+        )
+
+        # The panel-budget warning reaches the toast stack (Stage 16
+        # follow-up, Stage 24): the fixture panel builds past the budget on
+        # every build, and the open tool window keeps the editor taking
+        # frames, so 120 consecutive builds trip the badge and the toast.
+        before = len(read_log())
+        append("panel budget_test")
+        wait_token(
+            process,
+            r'\[editor\] panel focused\s+id="?budget_test"?',
+            30,
+            "budget fixture focused",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] panel over budget\s+id="?budget_test"?',
+            120,
+            "budget fixture tripped its budget",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] panel budget toast\s+id="?budget_test"?',
+            30,
+            "budget warning raised a toast",
+            before,
+        )
+
+        # A tool window the user closes stays closed: no later frame reopens
+        # it - a reopen only ever happens when a reload replaces the code
+        # under a window that is still open.
+        before_close = len(read_log())
+        append("window-dismiss spline_tool_window")
+        wait_token(
+            process,
+            r'\[editor\] window closed\s+id="?spline_tool_window"?\s+kind="?tool"?\s+reason="?platform"?',
+            30,
+            "user-closed tool window",
+            before_close,
+        )
+        append("command editor.pause_toggle")
+        wait_token(
+            process,
+            r'\[editor\] command executed\s+id="?editor\.pause_toggle"?',
+            30,
+            "post-close frame check",
+            before_close,
+        )
+        after_check = len(read_log())
+        assert "[editor] window reopened" not in read_log()[before_close:after_check], (
+            "a user-closed window reopened on its own"
+        )
+        append("command editor.pause_toggle")
+
+        # With the panels gone (both registrations dropped, the module
+        # reloaded), its tool window and its modal both close instead of
+        # drawing through the dead registrations.
+        before = len(read_log())
+        append("panel spline_tool")
+        wait_token(
+            process,
+            r'\[editor\] panel focused\s+id="?spline_tool"?',
+            30,
+            "spline tool focused for the unload check",
+            before,
+        )
+        append("activate spline.open_window")
+        wait_token(
+            process,
+            r'\[editor\] window opened\s+id="?spline_tool_window"?',
+            30,
+            "tool window opened for the unload check",
+            before,
+        )
+        append("activate spline.confirm_reseed")
+        wait_token(
+            process,
+            r'\[editor\] window opened\s+id="?spline_reseed_confirm"?',
+            30,
+            "modal opened for the unload check",
+            before,
+        )
+        before = len(read_log())
+        current = SPLINE_EDITOR_SOURCE.read_text(encoding="utf-8")
+        gone = current.replace('"spline_tool",', '"spline_tool_gone",', 1).replace(
+            '"spline_reseed",', '"spline_reseed_gone",', 1
+        )
+        assert gone != current and gone.count("_gone") == 2, (
+            "spline_tool/spline_reseed registration markers not found"
+        )
+        SPLINE_EDITOR_SOURCE.write_text(gone, encoding="utf-8")
+        wait_token(
+            process,
+            r'\[editor\] window closed\s+id="?spline_tool_window"?\s+kind="?tool"?\s+reason="?panel-gone"?',
+            180,
+            "tool window closed with its panel gone",
+            before,
+        )
+        wait_token(
+            process,
+            r'\[editor\] window closed\s+id="?spline_reseed_confirm"?\s+kind="?modal"?\s+reason="?panel-gone"?',
+            60,
+            "modal closed with its panel gone",
+            before,
+        )
 
         # Step 7: the panic fixture is contained, and an unregistered panel
         # shows the placeholder.
@@ -335,8 +583,12 @@ def main() -> int:
             "panicking panel contained",
             before,
         )
+        # The raw panel request, not the Window-menu command: by now the
+        # unload check above has left spline_tool unregistered, and the
+        # command only exists while a panel is (a restored layout focus for
+        # a panel whose module is gone takes this same path).
         before_wait = len(read_log())
-        append("command editor.panel.spline_tool")
+        append("panel spline_tool")
         wait_token(
             process,
             r'\[editor\] panel focused\s+id="?spline_tool"?',

@@ -47,6 +47,7 @@ mod popup;
 mod runner;
 /// The devops suite's scripted input channel.
 mod test_channel;
+mod windows;
 
 // =============================================================================
 // Telemetry

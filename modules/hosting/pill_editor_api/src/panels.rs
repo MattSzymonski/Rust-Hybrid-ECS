@@ -4,7 +4,7 @@
 //! # Responsibilities
 //!
 //! - Defines [`EditorPanelRegistry`], the world resource holding every
-//!   registered panel, and [`register_editor_panel`], the helper an editor
+//!   registered panel, and [`register_editor_panels`], the helper an editor
 //!   crate calls from its registration.
 //! - Defines [`PanelContext`] / [`PanelWork`]: the read-only snapshot a panel
 //!   draws from and the plain-data work it hands back (queued undoable
@@ -38,7 +38,7 @@ use pill_engine_core::{Engine, Resource};
 use pill_ui::panel::PanelBuilder;
 
 // Current crate
-use crate::EditorRect;
+use crate::{EditorRect, EditorWindowButton, EditorWindowKind, EditorWindowRequest};
 
 // =============================================================================
 // PanelContext
@@ -95,6 +95,11 @@ pub struct PanelWork {
     /// A file the panel asked to open in the developer's editor, from a
     /// Problems row (Stage 19).
     pub open_file: Option<crate::EditorOpenRequest>,
+    /// Free-standing windows the panel asked for (Stage 24): tool windows
+    /// and modal dialogs, opened by the shell, which owns their lifetime.
+    pub windows: Vec<EditorWindowRequest>,
+    /// A window the panel asks the shell to close (Stage 24), by its id.
+    pub close_window: Option<String>,
 }
 
 impl PanelWork {
@@ -159,6 +164,59 @@ impl PanelWork {
     pub fn open_file(&mut self, request: crate::EditorOpenRequest) {
         self.open_file = Some(request);
     }
+
+    /// Ask the shell for a free-standing tool window (Stage 24) showing a
+    /// registered panel. A window with this id already open is left alone,
+    /// so a button that asks every time it is pressed opens it once.
+    pub fn open_tool_window(
+        &mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        width: f32,
+        height: f32,
+        panel: impl Into<String>,
+    ) {
+        self.windows.push(EditorWindowRequest {
+            id: id.into(),
+            kind: EditorWindowKind::Tool,
+            title: title.into(),
+            width,
+            height,
+            panel: panel.into(),
+            buttons: Vec::new(),
+            draw: pill_ui::DrawList::default(),
+        });
+    }
+
+    /// Ask the shell for a modal dialog (Stage 24) showing a registered
+    /// panel above its buttons. The first button is the default: Enter
+    /// answers it, Escape dismisses the modal without a command.
+    pub fn open_modal(
+        &mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        width: f32,
+        height: f32,
+        panel: impl Into<String>,
+        buttons: Vec<EditorWindowButton>,
+    ) {
+        self.windows.push(EditorWindowRequest {
+            id: id.into(),
+            kind: EditorWindowKind::Modal,
+            title: title.into(),
+            width,
+            height,
+            panel: panel.into(),
+            buttons,
+            draw: pill_ui::DrawList::default(),
+        });
+    }
+
+    /// Ask the shell to close a window this panel opened (Stage 24), by
+    /// its id.
+    pub fn close_window(&mut self, id: impl Into<String>) {
+        self.close_window = Some(id.into());
+    }
 }
 
 /// The function an editor panel is built from.
@@ -166,6 +224,28 @@ impl PanelWork {
 /// A plain `fn` pointer, so the body live-patches and the pointer never
 /// carries captured state.
 pub type PanelBuildFn = fn(&mut PanelBuilder<'_>, &mut PanelContext<'_>);
+
+/// One panel a module registers (Stage 16): its id, the title the dock and
+/// the Window menu show, and the build function its binary holds.
+///
+/// A generation registers its whole set through
+/// [`EditorPanelRegistry::register`], one call per load - see there for why
+/// the set travels together.
+pub struct EditorPanelSpec<'a> {
+    /// The panel's stable id, what a `Module(id)` tab and the registry name.
+    pub id: &'a str,
+    /// The title shown on the tab and in the Window menu.
+    pub title: &'a str,
+    /// The build function, inside the registering binary.
+    pub build: PanelBuildFn,
+}
+
+impl<'a> EditorPanelSpec<'a> {
+    /// One panel's registration data.
+    pub fn new(id: &'a str, title: &'a str, build: PanelBuildFn) -> EditorPanelSpec<'a> {
+        EditorPanelSpec { id, title, build }
+    }
+}
 
 // =============================================================================
 // EditorPanelRegistry
@@ -183,6 +263,11 @@ struct EditorPanel {
     build: PanelBuildFn,
     /// Alive exactly while its owner's current generation marker is.
     alive: Weak<()>,
+    /// The registration number this entry was stamped with. It changes
+    /// exactly when a reload replaces the entry, which is how a window
+    /// keyed to a panel tells the old generation's code from the new
+    /// one's ([`EditorPanelRegistry::panel_epoch`]).
+    epoch: u64,
 }
 
 /// A listing of one live panel, for menus and logs.
@@ -203,6 +288,10 @@ pub struct EditorPanelRegistry {
     /// The strong half of each owner's current generation marker. Replacing
     /// one drops the previous strong count, killing its registrations.
     generations: BTreeMap<String, Arc<()>>,
+    /// The number the next registration is stamped with; every registration
+    /// takes one, so an entry's epoch names exactly one generation's build
+    /// of one panel.
+    next_epoch: u64,
 }
 
 impl EditorPanelRegistry {
@@ -214,23 +303,30 @@ impl EditorPanelRegistry {
         }
     }
 
-    /// Register one panel for `owner`, replacing that owner's generation.
+    /// Register one generation's panels for `owner`, replacing that owner's
+    /// previous set.
     ///
-    /// Replacing the owner's marker is what retires the owner's previous
-    /// registrations: their `Weak` handles lose their last strong count
-    /// here, and [`Self::panel`] never returns a dead one.
-    pub fn register(&mut self, owner: &str, id: &str, title: &str, build: PanelBuildFn) {
+    /// The owner's whole set arrives in one call, like the command
+    /// registry's, so the generation marker is replaced exactly once per
+    /// load: every panel of the previous generation retires here - the ones
+    /// the new generation still has, and the ones it dropped - and nothing
+    /// of the old code stays reachable through the registry.
+    pub fn register(&mut self, owner: &str, panels: &[EditorPanelSpec<'_>]) {
         self.prune();
         let marker = Arc::new(());
         self.generations
             .insert(owner.to_string(), Arc::clone(&marker));
-        self.entries.push(EditorPanel {
-            owner: owner.to_string(),
-            id: id.to_string(),
-            title: title.to_string(),
-            build,
-            alive: Arc::downgrade(&marker),
-        });
+        for panel in panels {
+            self.next_epoch += 1;
+            self.entries.push(EditorPanel {
+                owner: owner.to_string(),
+                id: panel.id.to_string(),
+                title: panel.title.to_string(),
+                build: panel.build,
+                alive: Arc::downgrade(&marker),
+                epoch: self.next_epoch,
+            });
+        }
     }
 
     /// The newest live registration of `id`.
@@ -240,6 +336,22 @@ impl EditorPanelRegistry {
             .rev()
             .find(|entry| entry.id == id && entry.alive.strong_count() > 0)
             .map(|entry| entry.build)
+    }
+
+    /// The registration number of the newest live registration of `id`,
+    /// `None` when the panel is not registered right now (Stage 24).
+    ///
+    /// A window keyed to a panel stores this; a value that changed while
+    /// the window stayed open means a reload replaced the code that draws
+    /// it, and `None` means the registration died (its module unloaded, or
+    /// dropped the panel) - in both cases the old window must not draw
+    /// through the stale pointer.
+    pub fn panel_epoch(&self, id: &str) -> Option<u64> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.id == id && entry.alive.strong_count() > 0)
+            .map(|entry| entry.epoch)
     }
 
     /// Every live panel, newest registration per id first.
@@ -280,25 +392,22 @@ impl EditorPanelRegistry {
 impl Resource for EditorPanelRegistry {}
 
 // =============================================================================
-// register_editor_panel
+// register_editor_panels
 // =============================================================================
 
-/// Register one panel for `owner`, claiming the registry if needed.
+/// Register one generation's panels for `owner`, claiming the registry if
+/// needed (Stage 16).
 ///
 /// The helper an editor crate calls from its registration; it also inserts
 /// the registry resource when the calling module registers before the shell
-/// has (load order is not fixed).
-pub fn register_editor_panel(
-    engine: &mut Engine,
-    owner: &str,
-    id: &str,
-    title: &str,
-    build: PanelBuildFn,
-) {
+/// has (load order is not fixed). The whole set goes in one call:
+/// registering twice would replace the owner's generation marker twice, and
+/// the second call would retire the first call's panels.
+pub fn register_editor_panels(engine: &mut Engine, owner: &str, panels: &[EditorPanelSpec<'_>]) {
     let world = engine.world_mut();
     EditorPanelRegistry::ensure(world);
     if let Some(registry) = world.get_resource_mut::<EditorPanelRegistry>() {
-        registry.register(owner, id, title, build);
+        registry.register(owner, panels);
     }
 }
 
@@ -319,14 +428,18 @@ mod tests {
         builder.label("other");
     }
 
+    fn spec<'a>(id: &'a str, title: &'a str, build: PanelBuildFn) -> EditorPanelSpec<'a> {
+        EditorPanelSpec::new(id, title, build)
+    }
+
     #[test]
     fn re_registering_an_owner_retires_its_previous_generation() {
         let mut registry = EditorPanelRegistry::default();
-        registry.register("module_a", "tool", "Tool", paint_marker);
+        registry.register("module_a", &[spec("tool", "Tool", paint_marker)]);
         let first = registry.panel("tool").expect("first registration");
         assert_eq!(first as usize, paint_marker as usize);
 
-        registry.register("module_a", "tool", "Tool", paint_other);
+        registry.register("module_a", &[spec("tool", "Tool", paint_other)]);
         let second = registry.panel("tool").expect("second registration");
         assert_eq!(second as usize, paint_other as usize);
         // The old generation is dead, even though its entry still sits in
@@ -336,11 +449,36 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_registers_its_whole_set_at_once() {
+        let mut registry = EditorPanelRegistry::default();
+        registry.register(
+            "module_a",
+            &[
+                spec("tool", "Tool", paint_marker),
+                spec("body", "Body", paint_other),
+            ],
+        );
+        assert!(registry.panel("tool").is_some());
+        assert!(registry.panel("body").is_some());
+
+        // The next generation keeps one panel and drops the other: the
+        // kept one is the new build function, the dropped one resolves to
+        // nothing instead of lingering with its old pointer.
+        registry.register("module_a", &[spec("tool", "Tool", paint_other)]);
+        assert_eq!(
+            registry.panel("tool").expect("kept registration") as usize,
+            paint_other as usize
+        );
+        assert!(registry.panel("body").is_none());
+        assert_eq!(registry.list().len(), 1);
+    }
+
+    #[test]
     fn another_owners_registration_stays_alive() {
         let mut registry = EditorPanelRegistry::default();
-        registry.register("module_a", "a_tool", "A", paint_marker);
-        registry.register("module_b", "b_tool", "B", paint_other);
-        registry.register("module_a", "a_tool", "A", paint_other);
+        registry.register("module_a", &[spec("a_tool", "A", paint_marker)]);
+        registry.register("module_b", &[spec("b_tool", "B", paint_other)]);
+        registry.register("module_a", &[spec("a_tool", "A", paint_other)]);
         let listings = registry.list();
         assert_eq!(listings.len(), 2);
         assert!(registry.panel("b_tool").is_some());
@@ -364,5 +502,47 @@ mod tests {
         assert!(work.batches[0].record);
         assert_eq!(work.batches[0].label, "noop");
         assert_eq!(work.commands, vec!["editor.pause_toggle".to_string()]);
+    }
+
+    #[test]
+    fn panel_epoch_tracks_re_registration_and_death() {
+        let mut registry = EditorPanelRegistry::default();
+        registry.register("module_a", &[spec("tool", "Tool", paint_marker)]);
+        let first = registry.panel_epoch("tool").expect("first registration");
+        registry.register("module_a", &[spec("tool", "Tool", paint_other)]);
+        let second = registry.panel_epoch("tool").expect("second registration");
+        assert_ne!(first, second, "a re-registration takes a new epoch");
+
+        // The owner's next registration replaces its marker, which retires
+        // every earlier entry: a window keyed to the old id must find None
+        // and close, not draw through the old pointer.
+        registry.register("module_a", &[spec("other", "Other", paint_marker)]);
+        assert!(registry.panel_epoch("tool").is_none());
+        assert!(registry.panel_epoch("other").is_some());
+    }
+
+    #[test]
+    fn work_queues_window_requests() {
+        let mut work = PanelWork::default();
+        work.open_tool_window("window_one", "Detached Tool", 320.0, 240.0, "panel_one");
+        work.open_modal(
+            "modal_one",
+            "Confirm",
+            380.0,
+            170.0,
+            "panel_two",
+            vec![EditorWindowButton {
+                label: "Re-seed".to_string(),
+                command: "spline_editor.reseed".to_string(),
+            }],
+        );
+        work.close_window("window_gone");
+        assert_eq!(work.windows.len(), 2);
+        assert_eq!(work.windows[0].kind, EditorWindowKind::Tool);
+        assert_eq!(work.windows[0].panel, "panel_one");
+        assert_eq!(work.windows[0].width, 320.0);
+        assert_eq!(work.windows[1].kind, EditorWindowKind::Modal);
+        assert_eq!(work.windows[1].buttons[0].command, "spline_editor.reseed");
+        assert_eq!(work.close_window.as_deref(), Some("window_gone"));
     }
 }

@@ -37,7 +37,8 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_api::{
     EditorNoticeEvent, EditorNotices, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
-    EditorProblem, EditorProblemLevel,
+    EditorProblem, EditorProblemLevel, EditorWindowKeyKind, EditorWindowPointerKind,
+    EditorWindowRequest,
 };
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::editor_state::EditorCommand;
@@ -72,6 +73,7 @@ use crate::frontend::EditorError;
 use crate::overlay::{self, OverlaySurface};
 use crate::popup::{PopupGpu, PopupHost};
 use crate::test_channel::{self, TestChannel, TestCommand};
+use crate::windows::WindowHost;
 
 // =============================================================================
 // Constants
@@ -368,6 +370,13 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
             editor.popup_window_event(window_id, &event);
             return;
         }
+        // The free-standing windows (Stage 24) are windows of their own
+        // too: their pointers, their button edges and the Enter/Escape a
+        // modal answers arrive here, never as the main window's input.
+        if editor.is_free_window(window_id) {
+            editor.free_window_event(window_id, &event);
+            return;
+        }
         // The game and scene surfaces are their own windows: the game
         // window's events are the game's input, the scene window's drive the
         // editor camera, the main window's the editor UI's.
@@ -388,6 +397,7 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
                 // The popups are owned windows and would die with it anyway;
                 // closing them first keeps the shutdown ordered.
                 editor.popups.close_all();
+                editor.windows.close_all();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -457,6 +467,7 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
             return;
         };
         editor.sync_popups(event_loop);
+        editor.sync_free_windows(event_loop);
         editor.schedule_frame(event_loop);
     }
 }
@@ -660,6 +671,22 @@ struct EditorWindow {
     /// The popups the platform closed since the shell's last frame (an
     /// outside click, a lost focus, Escape), by id.
     popup_closed: Vec<String>,
+    /// The free-standing windows the shell has open (Stage 24): tool
+    /// windows and modal dialogs, each a real decorated window of its own.
+    windows: WindowHost,
+    /// The shell's windows from its last frame, with their content: the set
+    /// `sync_free_windows` opens, closes and holds, and what `render` draws.
+    /// Applied at every frame boundary, `sync` being idempotent.
+    window_frame: Vec<EditorWindowRequest>,
+    /// The ids of the windows the platform closed since the shell's last
+    /// frame (the title bar's close button).
+    window_closed: Vec<String>,
+    /// The open modal's id from the shell's last frame, while one is: the
+    /// editor's own input is dropped until it is answered (Stage 24).
+    modal_open: Option<String>,
+    /// The modal whose input-block has been logged, so the "modal blocks
+    /// editor input" line shows once per modal instead of once per event.
+    modal_blocked_logged: Option<String>,
     /// The overlay list's vertex count at the last heartbeat log, so the
     /// overlay's path and content log on a change rather than every frame.
     overlay_vertices_logged: usize,
@@ -946,12 +973,26 @@ impl EditorWindow {
         // Registered only while the scripted channel is active; its name
         // avoids the word the native suite's no-crash assertion scans for.
         if std::env::var_os("PILL_EDITOR_TEST_COMMANDS").is_some() {
-            pill_editor_api::panels::register_editor_panel(
+            // The suite's fixtures, as one set (Stage 16/24): a panel that
+            // panics, so the shell's containment is exercised end to end,
+            // and one that burns past the budget on every build, so the
+            // over-budget transition and its toast are observable without a
+            // genuinely slow panel.
+            pill_editor_api::panels::register_editor_panels(
                 host.host_mut().engine_mut(),
                 "editor_test",
-                "containment_test",
-                "Containment Test",
-                containment_test_panel,
+                &[
+                    pill_editor_api::panels::EditorPanelSpec::new(
+                        "containment_test",
+                        "Containment Test",
+                        containment_test_panel,
+                    ),
+                    pill_editor_api::panels::EditorPanelSpec::new(
+                        "budget_test",
+                        "Budget Test",
+                        budget_test_panel,
+                    ),
+                ],
             );
         }
         info!(
@@ -1027,6 +1068,11 @@ impl EditorWindow {
             popups: PopupHost::new(),
             requested_popups: None,
             popup_closed: Vec::new(),
+            windows: WindowHost::new(),
+            window_frame: Vec::new(),
+            window_closed: Vec::new(),
+            modal_open: None,
+            modal_blocked_logged: None,
             overlay_vertices_logged: usize::MAX,
             shell_frames: 0,
             shell_still_frames: 0,
@@ -1063,9 +1109,35 @@ impl EditorWindow {
         self.window.request_redraw();
     }
 
+    /// Whether a modal is open, blocking the editor's own input (Stage 24).
+    ///
+    /// Logs once per modal, so a suite can see the gate bite instead of
+    /// inferring it from an effect that did not happen.
+    fn modal_blocks_ui(&mut self) -> bool {
+        let Some(id) = self.modal_open.clone() else {
+            return false;
+        };
+        if self.modal_blocked_logged.as_deref() != Some(id.as_str()) {
+            // NOTE: asserted on by the editor's end-to-end suite.
+            info!(
+                target: telemetry_target::ENGINE,
+                id = id.as_str(),
+                "[editor] modal blocks editor input"
+            );
+            self.modal_blocked_logged = Some(id);
+        }
+        true
+    }
+
     /// Queue one `winit` event's engine form into the UI input, in logical
     /// pixels.
     fn push_ui_input(&mut self, event: &WindowEvent) {
+        // A modal blocks the editor's own input while it is open (Stage 24);
+        // the game's and the scene's streams arrive through the view
+        // surfaces' own windows and keep flowing.
+        if self.modal_blocks_ui() {
+            return;
+        }
         // Any input redraws the UI (Stage 22, D25).
         self.ui_dirty = true;
         // The real button state, for the drag-out trigger: `CursorLeft`
@@ -1188,6 +1260,8 @@ impl EditorWindow {
             overlay: DrawList::default(),
             overlay_opaque: Vec::new(),
             popups: Vec::new(),
+            windows: Vec::new(),
+            modal: None,
             frames: 0,
         }
     }
@@ -1271,6 +1345,46 @@ impl EditorWindow {
         self.popups.is_popup(id)
     }
 
+    /// Whether `id` is one of the shell's free-standing windows (Stage 24).
+    fn is_free_window(&self, id: WindowId) -> bool {
+        self.windows.is_window(id)
+    }
+
+    /// Handle one event of one free-standing window (Stage 24): its pointer
+    /// and button edges, the keys a modal answers, and the close request of
+    /// its title bar. Everything lands in the window host's own queues; the
+    /// shell reads them on the next frame.
+    fn free_window_event(&mut self, id: WindowId, event: &WindowEvent) {
+        if !self.windows.window_event(id, event) {
+            return;
+        }
+        // Any window input means the window shows something new; the frame
+        // that draws it follows.
+        self.window.request_redraw();
+    }
+
+    /// Turn the shell's window requests into real windows, at the frame
+    /// boundary (Stage 24): opening the ones it asked for, closing the ones
+    /// it left out, and recording the ids the platform closed on its own.
+    ///
+    /// Unlike the popup requests this is not gated on an `Option`: `sync`
+    /// leaves existing windows alone, so running it on every boundary pass
+    /// over the same frame is harmless.
+    fn sync_free_windows(&mut self, event_loop: &ActiveEventLoop) {
+        let gpu = PopupGpu {
+            instance: &self.instance,
+            adapter: &self.adapter,
+            device: &self.device,
+            format: self.configuration.format,
+        };
+        let closed = self
+            .windows
+            .sync(event_loop, &gpu, &self.window, &self.window_frame);
+        // A window the user closed is dropped by `sync`; its id tells the
+        // shell to drop its state next frame.
+        self.window_closed.extend(closed);
+    }
+
     /// Handle one event of one popup window: dismissal, and the pointers the
     /// shell's menus read.
     fn popup_window_event(&mut self, id: WindowId, event: &WindowEvent) {
@@ -1336,6 +1450,7 @@ impl EditorWindow {
             || self.ui_dirty
             || self.safe_mode.is_some()
             || !self.popups.is_empty()
+            || !self.windows.is_empty()
             || self.quit_requested
             || self.frame_count < self.quiet_keep_frames;
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -1420,6 +1535,65 @@ impl EditorWindow {
                                 target: telemetry_target::ENGINE,
                                 id = %id,
                                 "[editor] test popup dismiss: no such popup"
+                            );
+                        }
+                    }
+                    TestCommand::WindowPointer { id, x, y, kind } => {
+                        let position = Vector2f::new(x, y);
+                        let pointer_kind = match kind.as_str() {
+                            "press" => EditorWindowPointerKind::Pressed,
+                            "release" => EditorWindowPointerKind::Released,
+                            _ => EditorWindowPointerKind::Moved,
+                        };
+                        if self.windows.push_pointer(&id, position, pointer_kind) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                x,
+                                y,
+                                kind = %kind,
+                                "[editor] test window pointer"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window pointer: no such window"
+                            );
+                        }
+                    }
+                    TestCommand::WindowKey { id, key } => {
+                        let key_kind = match key.as_str() {
+                            "escape" => EditorWindowKeyKind::Escape,
+                            _ => EditorWindowKeyKind::Enter,
+                        };
+                        if self.windows.push_key(&id, key_kind) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                key = %key,
+                                "[editor] test window key"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window key: no such window"
+                            );
+                        }
+                    }
+                    TestCommand::WindowDismiss { id } => {
+                        if self.windows.dismiss(&id) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window dismiss"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window dismiss: no such window"
                             );
                         }
                     }
@@ -1861,6 +2035,12 @@ impl EditorWindow {
         });
         let game_target = !overlay_target && in_rect(self.last_game_rect);
         let scene_target = !overlay_target && !game_target && in_rect(self.last_scene_rect);
+        // A modal blocks what would reach the editor's own UI (Stage 24); a
+        // click over the scene or the game view is not the editor's and
+        // keeps flowing.
+        if !game_target && !scene_target && self.modal_blocks_ui() {
+            return;
+        }
         // A click on the editor's own window is a click outside every popup,
         // so the platform takes their focus away and closes them; the shell
         // hears about it through the ids the next sync reports.
@@ -1927,6 +2107,11 @@ impl EditorWindow {
     /// Inject a bare pointer move at a logical position (Stage 22): the
     /// suite's idle check hovers a button and expects the UI to redraw.
     fn inject_move(&mut self, x: f32, y: f32) {
+        // A pointer move is the editor UI's unless it is not: with a modal
+        // open it is blocked exactly like a real move over the window.
+        if self.modal_blocks_ui() {
+            return;
+        }
         info!(
             target: telemetry_target::ENGINE,
             x,
@@ -1945,6 +2130,10 @@ impl EditorWindow {
     /// (Stage 21). The view surfaces are windows of their own, so the event
     /// goes to the UI's stream, exactly as a real right click here would.
     fn inject_right_click(&mut self, x: f32, y: f32) {
+        // A modal blocks the editor's own input, a right click included.
+        if self.modal_blocks_ui() {
+            return;
+        }
         info!(
             target: telemetry_target::ENGINE,
             x,
@@ -2012,8 +2201,12 @@ impl EditorWindow {
                     });
                 }
             }
-            // Everything else is the editor UI's, as before.
+            // Everything else is the editor UI's, as before. With a modal
+            // open even that is blocked (Stage 24).
             _ => {
+                if self.modal_blocks_ui() {
+                    return;
+                }
                 for state in [ButtonState::Pressed, ButtonState::Released] {
                     let event = InputEvent::Key {
                         key: key_code,
@@ -3400,6 +3593,14 @@ impl EditorWindow {
                     .popup_pointers
                     .append(&mut self.popups.take_pointers());
                 input.popup_closed.append(&mut self.popup_closed);
+                // Stage 24: the free-standing windows' own input - their
+                // pointers, the keys a modal answers and the windows the
+                // platform closed under them.
+                input
+                    .window_pointers
+                    .append(&mut self.windows.take_pointers());
+                input.window_keys.append(&mut self.windows.take_keys());
+                input.window_closed.append(&mut self.window_closed);
                 input.overlay_labels.clone_from(&self.overlay_labels);
                 // A shell that never drains (the fallback UI, or a module
                 // that failed to load) must not accumulate forever.
@@ -3412,6 +3613,10 @@ impl EditorWindow {
                 // accumulate across frames.
                 self.popups.take_pointers();
                 self.popup_closed.clear();
+                // The windows' queues get the same treatment (Stage 24).
+                self.windows.take_pointers();
+                self.windows.take_keys();
+                self.window_closed.clear();
             }
         }
         // Step 3a: a changed editor camera is published before the frame
@@ -3461,6 +3666,8 @@ impl EditorWindow {
                     overlay: std::mem::take(&mut frame.overlay),
                     overlay_opaque: std::mem::take(&mut frame.overlay_opaque),
                     popups: std::mem::take(&mut frame.popups),
+                    windows: std::mem::take(&mut frame.windows),
+                    modal: frame.modal.take(),
                     frames: frame.frames,
                 })
         };
@@ -3524,6 +3731,8 @@ impl EditorWindow {
                     overlay: DrawList::default(),
                     overlay_opaque: Vec::new(),
                     popups: Vec::new(),
+                    windows: Vec::new(),
+                    modal: None,
                     frames: 0,
                 }
             }
@@ -3680,6 +3889,15 @@ impl EditorWindow {
         // an opaque rectangle is the UI's, not the scene's.
         self.overlay_opaque = output.overlay_opaque;
         self.requested_popups = Some(output.popups);
+        // The free-standing windows (Stage 24): this frame's set and content
+        // replace the last one; the boundary pass opens and closes the real
+        // windows from it, and the render below draws it. A modal blocks the
+        // editor's own input until it is answered.
+        self.window_frame = output.windows;
+        if self.modal_open != output.modal {
+            self.modal_open = output.modal;
+            self.modal_blocked_logged = None;
+        }
         let overlay_list = output.overlay;
         let overlay_vertices = overlay_list.vertices.len();
         if self.overlay.is_some() {
@@ -3722,6 +3940,9 @@ impl EditorWindow {
                 opaque = self.overlay_opaque.len(),
                 popups = self.popups.len(),
                 opened = self.popups.opened(),
+                windows = self.windows.len(),
+                opened_windows = self.windows.opened(),
+                modal = self.modal_open.is_some(),
                 labels = self.overlay_labels.len(),
                 "[editor] overlay content"
             );
@@ -3901,6 +4122,15 @@ impl EditorWindow {
         }
         self.popups
             .render(&self.device, &self.queue, &mut self.ui, self.theme.window);
+        // The free-standing windows present their own surfaces too (Stage
+        // 24), from the shell's current frame of content.
+        self.windows.render(
+            &self.device,
+            &self.queue,
+            &mut self.ui,
+            &self.window_frame,
+            self.theme.window,
+        );
         // Step 9: the frame boundary schedules the next frame; this one only
         // returns the pacing to the loop (Stage 22, D25).
         Ok(())
@@ -4062,6 +4292,12 @@ struct ShellOutput {
     overlay_opaque: Vec<EditorRect>,
     /// The popups the shell wants open (Stage 21, D23).
     popups: Vec<EditorPopup>,
+    /// The free-standing windows the shell wants open, with their content
+    /// (Stage 24).
+    windows: Vec<EditorWindowRequest>,
+    /// The open modal's id, while one is (Stage 24): the editor's own input
+    /// is dropped behind it.
+    modal: Option<String>,
     /// The shell's frame stamp when this output was read (Stage 22): a
     /// stamp that never moves while the world runs is a stopped generation.
     frames: u64,
@@ -4734,6 +4970,21 @@ fn containment_test_panel(
     _context: &mut pill_editor_api::panels::PanelContext<'_>,
 ) {
     panic!("containment test panel");
+}
+
+/// The suite's over-budget fixture panel: its build burns a busy six
+/// milliseconds, well past the four-millisecond budget, on every frame -
+/// so 120 consecutive builds trip the badge and the toast (Stage 24).
+fn budget_test_panel(
+    builder: &mut pill_ui::PanelBuilder<'_>,
+    _context: &mut pill_editor_api::panels::PanelContext<'_>,
+) {
+    let started = Instant::now();
+    // A busy wait, not a sleep: what the shell measures is the build's own
+    // wall time, and a sleep would yield the thread instead.
+    while started.elapsed().as_secs_f32() < 0.006 {}
+    builder.heading("Budget Test");
+    builder.label("This panel always builds over budget.");
 }
 
 /// Parse a scripted field value: `true`/`false`, a float (one with a `.`

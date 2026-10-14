@@ -40,13 +40,14 @@ use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // Current crate
 use pill_editor_shell_editor::shell::{
-    activate_widget, collect_panel_placements, console_channel, execute_command,
+    activate_widget, collect_panel_placements, console_channel, drain_panel_work, execute_command,
     focus_module_panel, handle_command_shortcuts, handle_file_drops, handle_menu_pointer,
-    handle_popup_closed, handle_popup_pointer, paint_context_menu, paint_dock_chrome,
-    paint_drop_preview, paint_menu, paint_overlay_badge, paint_overlay_labels, paint_palette,
-    paint_panels, paint_toasts, run_clipboard_action, scroll_last_widget, select_tab_by_title,
-    sync_command_files, sync_panel_commands, ClipboardAction, ConsoleLine, EditorShellState, Toast,
-    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, PREFERENCES_FILE, TOAST_FRAMES,
+    handle_popup_closed, handle_popup_pointer, handle_window_closed, handle_window_key,
+    handle_window_pointer, paint_context_menu, paint_dock_chrome, paint_drop_preview, paint_menu,
+    paint_overlay_badge, paint_overlay_labels, paint_palette, paint_panels, paint_toasts,
+    paint_windows, run_clipboard_action, scroll_last_widget, select_tab_by_title,
+    sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState, Toast,
+    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -97,7 +98,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     }
     // Step 3c: the module-panel registry (Stage 16). The update below reads
     // it every frame; module panels claim it through
-    // `register_editor_panel` when they load before the shell does, but a
+    // `register_editor_panels` when they load before the shell does, but a
     // run with no module panel and no test channel has no other writer, and
     // a missing registry would silence the whole shell.
     EditorPanelRegistry::ensure(world);
@@ -265,6 +266,26 @@ pub fn editor_shell_update(
     }
     for id in input.popup_closed.drain(..) {
         handle_popup_closed(&mut state, &id);
+    }
+    // Step 1a-bis: the free-standing windows' own input (Stage 24): their
+    // pointers, the keys a modal answers and the ids of the windows the
+    // platform closed under them. A window's pointer never arrives as an
+    // `InputEvent` any more than a popup's does.
+    for pointer in input.window_pointers.drain(..) {
+        handle_window_pointer(&mut state, &pointer);
+    }
+    for key in input.window_keys.drain(..) {
+        handle_window_key(
+            &mut state,
+            &registry,
+            &mut inbox,
+            &mut pending,
+            &mut history,
+            &key,
+        );
+    }
+    for id in input.window_closed.drain(..) {
+        handle_window_closed(&mut state, &id);
     }
     if let Some(title) = input.requested_tab.take() {
         select_tab_by_title(&mut state.layout, &title);
@@ -453,7 +474,7 @@ pub fn editor_shell_update(
     };
     paint_dock_chrome(&mut state, &snapshot, &mut frame, &previous_hits);
     let panels_started = pill_core::platform::Instant::now();
-    let work = paint_panels(
+    let mut work = paint_panels(
         &mut state,
         &placements,
         &mut frame,
@@ -464,13 +485,49 @@ pub fn editor_shell_update(
     state.last_panels_us = panels_started.elapsed().as_micros() as u64;
     // The drop preview paints over the panel content while a drag hovers.
     paint_drop_preview(&mut state, &mut frame, &placements);
-    for batch in work.batches {
-        pending.batches.push(batch);
-    }
-    for command in work.commands {
-        inbox.executed.push(command);
-    }
-    if let Some(entity) = work.select_entity {
+    // The selection requests travel with the caller: the frame's shared
+    // view still borrows the selection for the window pass below.
+    let selected = (
+        std::mem::take(&mut work.select_entity),
+        std::mem::take(&mut work.select_asset),
+    );
+    drain_panel_work(
+        &mut state,
+        work,
+        &mut frame,
+        &panels,
+        &mut pending,
+        &mut inbox,
+    );
+    // The free-standing windows (Stage 24): the panels drained just above
+    // may have asked for tool windows or modals; each open one now draws its
+    // panel with its own widget state, and its own work drains through the
+    // same path a docked panel's did.
+    let mut window_work = paint_windows(
+        &mut state,
+        &view,
+        &panels,
+        &mut frame,
+        &registry,
+        &mut inbox,
+        &mut pending,
+        &mut history,
+    );
+    let window_selected = (
+        std::mem::take(&mut window_work.select_entity),
+        std::mem::take(&mut window_work.select_asset),
+    );
+    drain_panel_work(
+        &mut state,
+        window_work,
+        &mut frame,
+        &panels,
+        &mut pending,
+        &mut inbox,
+    );
+    // The selection a panel asked for, from either layer, applies once the
+    // frame's shared view is done with it (Stage 17).
+    if let Some(entity) = selected.0.or(window_selected.0) {
         if selection.entity != Some(entity) {
             selection.entity = Some(entity);
             // NOTE: asserted on by the editor's end-to-end suite.
@@ -481,7 +538,7 @@ pub fn editor_shell_update(
             );
         }
     }
-    if let Some(path) = work.select_asset {
+    if let Some(path) = selected.1.or(window_selected.1) {
         if selection.asset.as_deref() != Some(path.as_str()) {
             selection.asset = Some(path.clone());
             pill_core::info!(
@@ -490,56 +547,6 @@ pub fn editor_shell_update(
                 "[editor] asset selected"
             );
         }
-    }
-    // The Inspector's per-component Copy button (Stage 18): the panel layer
-    // cannot reach the frame, so the request joins the clipboard actions.
-    if let Some(type_name) = work.copy_component {
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
-            type_name = type_name.as_str(),
-            "[editor] clipboard component requested"
-        );
-        state.clipboard_action = Some(ClipboardAction::CopyComponent { type_name });
-    }
-    // An asset row held down goes to the executable (Stage 18): a drag that
-    // leaves the window becomes an OS drag of that file. The frame clears
-    // every frame, so a row that is no longer held drops out here.
-    if let Some(source) = work.drag_candidate {
-        frame.drag_candidate = Some(source);
-    }
-    // A Problems row's click (Stage 19) goes to the executable, which hands
-    // the file to the developer's editor.
-    if let Some(request) = work.open_file {
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
-            file = request.file.as_str(),
-            line = request.line,
-            "[editor] problems row activated"
-        );
-        frame.requested_open = Some(request);
-    }
-    if let Some(level) = work.console_level {
-        state.console_level = level;
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
-            level,
-            "[editor] console filter level"
-        );
-    }
-    if let Some(channel) = work.console_channel {
-        state.console_channel = channel;
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
-            channel,
-            "[editor] console filter channel"
-        );
-    }
-    if let Some(search) = work.console_search {
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ECS,
-            search = search.as_str(),
-            "[editor] console search"
-        );
     }
     // The asset listing came in (or grew): one line for the suite and for
     // anyone reading the log.
@@ -550,23 +557,6 @@ pub fn editor_shell_update(
             count = state.assets_listed,
             "[editor] assets listed"
         );
-    }
-    if let Some(preferences) = work.preferences {
-        // The Preferences panel's save (D31): write the file; the
-        // live-reload reader applies it next frame and logs that it did.
-        let path = pill_editor_core::layout::layout_directory().join(PREFERENCES_FILE);
-        match std::fs::write(&path, preferences) {
-            Ok(()) => pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ECS,
-                path = %path.display(),
-                "[editor] preferences written"
-            ),
-            Err(error) => pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
-                error = %error,
-                "[editor] preferences write failed"
-            ),
-        }
     }
     let focus = state.ui.focus();
     if state.frame_index % 210 == 0 {

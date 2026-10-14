@@ -80,6 +80,32 @@ pub enum TestCommand {
         /// The popup's id, as the shell named it.
         id: String,
     },
+    /// Deliver one pointer event to a free-standing window (Stage 24), in
+    /// the window's own logical pixels.
+    WindowPointer {
+        /// The window's id, as the shell named it.
+        id: String,
+        /// Distance from the window's left edge.
+        x: f32,
+        /// Distance from the window's top edge.
+        y: f32,
+        /// What happened: `press`, `release`, or a bare move.
+        kind: String,
+    },
+    /// Press Enter or Escape in a free-standing window (Stage 24): the keys
+    /// a modal answers.
+    WindowKey {
+        /// The window's id, as the shell named it.
+        id: String,
+        /// `enter` or `escape`.
+        key: String,
+    },
+    /// Close a window the way its title bar's close button does (Stage 24);
+    /// a scripted run cannot click it, so this is the platform's half.
+    WindowDismiss {
+        /// The window's id, as the shell named it.
+        id: String,
+    },
     /// Move the editor window's outer position, in physical pixels
     /// (Stage 21: a popup flips at the monitor's work area, which the suite
     /// reaches by moving the window to a monitor edge).
@@ -422,6 +448,39 @@ fn parse_command(line: &str) -> TestCommand {
                 line: line.to_string(),
             },
         },
+        Some("window-pointer") => {
+            let (Some(id), Some(x), Some(y)) = (parts.next(), parts.next(), parts.next()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            TestCommand::WindowPointer {
+                id: id.to_string(),
+                x,
+                y,
+                kind: parts.next().unwrap_or("move").to_string(),
+            }
+        }
+        Some("window-key") => match (parts.next(), parts.next()) {
+            (Some(id), Some(key)) => TestCommand::WindowKey {
+                id: id.to_string(),
+                key: key.to_lowercase(),
+            },
+            _ => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("window-dismiss") => match parts.next() {
+            Some(id) => TestCommand::WindowDismiss { id: id.to_string() },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
         Some("window-move") => {
             let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
                 return TestCommand::Unknown {
@@ -458,14 +517,23 @@ fn parse_command(line: &str) -> TestCommand {
                 line: line.to_string(),
             },
         },
-        Some("activate") => match parts.next() {
-            Some(name) => TestCommand::Activate {
-                name: name.to_string(),
-            },
-            None => TestCommand::Unknown {
-                line: line.to_string(),
-            },
-        },
+        Some("activate") => {
+            // The rest of the line is the widget's name: a widget's name is
+            // its label, spaces included (Stage 24 made window widgets
+            // addressable too, and a modal button is named through its
+            // window).
+            let rest = line.trim_start();
+            let rest = rest.strip_prefix("activate").unwrap_or(rest).trim_start();
+            if rest.is_empty() {
+                TestCommand::Unknown {
+                    line: line.to_string(),
+                }
+            } else {
+                TestCommand::Activate {
+                    name: rest.trim_end().to_string(),
+                }
+            }
+        }
         Some("select") => match parts.next() {
             Some(entity) => TestCommand::Select {
                 entity: entity.to_string(),

@@ -137,6 +137,18 @@ pub struct EditorShellInput {
     /// lost focus or an Escape the operating system took. The shell clears
     /// the matching state, exactly as it would have on its own dismissal.
     pub popup_closed: Vec<String>,
+    /// The pointers and button edges the free-standing windows collected
+    /// since the shell's last frame (Stage 24), in the window's own logical
+    /// pixels: a tool window's content is a panel, and its widgets answer
+    /// the same input a docked panel's do, only through this channel.
+    pub window_pointers: Vec<EditorWindowPointer>,
+    /// Enter and Escape presses from a window's own keyboard stream
+    /// (Stage 24); a modal answers them, anything else ignores them.
+    pub window_keys: Vec<EditorWindowKey>,
+    /// Windows the platform closed this frame (Stage 24): the user pressed
+    /// the close button. The shell drops the window's state, exactly as it
+    /// would have on its own close.
+    pub window_closed: Vec<String>,
     /// Screen-space labels the overlay draws over the scene (Stage 21), in
     /// logical client pixels. The executable publishes them because it is
     /// the side that projects world positions; the shell only paints them.
@@ -193,6 +205,122 @@ pub struct EditorPopup {
     /// What to draw, in the popup's own logical pixels (its top-left is the
     /// origin), premultiplied over whatever is behind it.
     pub draw: DrawList,
+}
+
+/// The kind of free-standing window the shell asks for (Stage 24).
+///
+/// A **tool window** is an ordinary decorated top-level window the user
+/// closes; a **modal dialog** additionally blocks input to the rest of the
+/// editor while it is open, answers Enter and Escape, and answers each of
+/// its buttons with the button's command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorWindowKind {
+    /// A free-standing tool window, shown until closed.
+    #[default]
+    Tool,
+    /// A modal dialog: it blocks the editor's input while it is open.
+    Modal,
+}
+
+impl EditorWindowKind {
+    /// The kind's name for logs.
+    pub fn title(&self) -> &'static str {
+        match self {
+            EditorWindowKind::Tool => "tool",
+            EditorWindowKind::Modal => "modal",
+        }
+    }
+}
+
+/// One button of a modal (Stage 24): the label drawn in the button row and
+/// the command its activation runs. An empty command is a plain dismissal
+/// (Cancel): the modal closes and nothing else happens.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorWindowButton {
+    /// The button's label.
+    pub label: String,
+    /// The command its activation executes, empty for a dismissal.
+    pub command: String,
+}
+
+/// One free-standing window the shell asks the executable for (Stage 24).
+///
+/// The request names a registered panel, never a function pointer or a
+/// closure: the shell resolves it through the registry each frame, so the
+/// window always draws the current generation's code and dies with it. A
+/// window's kind, title, size and buttons are fixed while it is open; the
+/// draw list is rebuilt every frame like a popup's.
+#[derive(Clone, Debug, Default)]
+pub struct EditorWindowRequest {
+    /// The window's identity, stable while it stays open; the shell and the
+    /// executable name it in [`EditorWindowPointer`], [`EditorWindowKey`]
+    /// and [`EditorShellInput::window_closed`].
+    pub id: String,
+    /// Tool window or modal dialog.
+    pub kind: EditorWindowKind,
+    /// The window's title, drawn by the platform in its title bar.
+    pub title: String,
+    /// The window's width in logical pixels.
+    pub width: f32,
+    /// The window's height in logical pixels.
+    pub height: f32,
+    /// The registered panel the window shows.
+    pub panel: String,
+    /// The modal's buttons, in draw order, left to right; empty for a tool
+    /// window. The first button is the modal's default: Enter answers it.
+    pub buttons: Vec<EditorWindowButton>,
+    /// What to draw, in the window's own logical pixels (its top-left is
+    /// the origin): the panel, and for a modal the button row.
+    pub draw: DrawList,
+}
+
+/// One pointer event of one free-standing window (Stage 24), in the
+/// window's own logical pixels.
+///
+/// A tool window is a window of its own, so its pointer never arrives as an
+/// [`InputEvent`]; this is that channel, and the press and release edges
+/// come through it so the panel's widgets answer exactly as they do in a
+/// dock.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorWindowPointer {
+    /// Which window, by [`EditorWindowRequest::id`].
+    pub id: String,
+    /// The pointer's position in the window's own logical pixels.
+    pub position: Vector2f,
+    /// What happened: a move, the left button going down, or coming up.
+    pub kind: EditorWindowPointerKind,
+}
+
+/// The kind of pointer event a window collected (Stage 24).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorWindowPointerKind {
+    /// The pointer moved.
+    #[default]
+    Moved,
+    /// The left button went down.
+    Pressed,
+    /// The left button came up.
+    Released,
+}
+
+/// One key press of one free-standing window (Stage 24).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EditorWindowKey {
+    /// Which window, by [`EditorWindowRequest::id`].
+    pub id: String,
+    /// Which key: the two a modal answers.
+    pub key: EditorWindowKeyKind,
+}
+
+/// The keys a modal answers (Stage 24): Enter activates its default button,
+/// Escape dismisses it without a command.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorWindowKeyKind {
+    /// The default button's command runs.
+    #[default]
+    Enter,
+    /// The modal closes, nothing runs.
+    Escape,
 }
 
 /// One structured clipboard write the shell requests (Stage 18): the payload
@@ -326,6 +454,19 @@ pub struct EditorShellFrame {
     /// and tooltips that may extend past the editor window. A popup the
     /// shell leaves out is closed.
     pub popups: Vec<EditorPopup>,
+    /// The free-standing windows the shell wants open (Stage 24): tool
+    /// windows and modal dialogs, with their content for this frame. A
+    /// window the shell leaves out is closed; one it keeps is created at
+    /// its requested size and drawn from `draw`. Which windows stay open -
+    /// and which reopen after their module reloads - is the shell's own
+    /// decision, published through this list.
+    pub windows: Vec<EditorWindowRequest>,
+    /// The open modal's id (Stage 24), while one is: the executable drops
+    /// the editor's own input until it is answered or dismissed, so a modal
+    /// dialog blocks the editor the way one should - and leaves the running
+    /// game's input alone, which arrives through the view surfaces' own
+    /// windows.
+    pub modal: Option<String>,
     /// This frame's atlas update, uploaded once by the executable's
     /// renderer.
     pub atlas: Option<AtlasUpdate>,
@@ -365,6 +506,8 @@ impl EditorShellFrame {
         self.overlay.clear();
         self.overlay_opaque.clear();
         self.popups.clear();
+        self.windows.clear();
+        self.modal = None;
         self.atlas = None;
         self.clipboard.clear();
         self.objects.clear();
