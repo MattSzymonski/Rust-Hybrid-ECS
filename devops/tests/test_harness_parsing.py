@@ -50,6 +50,7 @@ DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
 from core.suite_common import run_suite_with_timing  # noqa: E402
+from core.test_report import summarize_test_results  # noqa: E402
 
 
 def load_module(relative_path: str, name: str):
@@ -67,7 +68,6 @@ def load_module(relative_path: str, name: str):
 
 harness = load_module("benchmarks/hot_reload_harness.py", "hot_reload_harness")
 coverage = load_module("tests/test_hot_patch_coverage.py", "test_hot_patch_coverage")
-basic = load_module("tests/test_basic.py", "test_basic")
 
 
 # =============================================================================
@@ -207,8 +207,8 @@ def check_provable_routes_match_the_engine() -> None:
 
 
 def check_cargo_test_totals_are_summed() -> None:
-    """`rust_tests` must total every binary's line, including failures."""
-    summary = basic.summarize_test_results(REAL_CARGO_TEST_OUTPUT)
+    """The cargo summary must total every binary's line, including failures."""
+    summary = summarize_test_results(REAL_CARGO_TEST_OUTPUT)
     assert "244 passed" in summary, f"expected 14+160+70=244, got: {summary}"
     assert "2 failed" in summary, f"a failing binary must be counted: {summary}"
     assert "3 ignored" in summary, f"ignored must be totalled: {summary}"

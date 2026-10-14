@@ -58,9 +58,8 @@ from core.suite_common import WORKSPACE_ROOT, print  # noqa: E402
 SUITES_DIR = WORKSPACE_ROOT / "devops" / "tests"
 
 # Documented run order: host-free and fast suites first, then the host-driving
-# suites, then the build-heavy ones. `test_basic.py` is last because it runs
-# the whole workspace test matrix - everything cheaper has already failed out
-# by then if it was going to.
+# suites, then the build-heavy ones. The CI gate itself (fmt, clippy, cargo
+# test, the posture checks) is `devops/ci_cd/verify.py`, run on its own.
 SUITE_ORDER: Sequence[str] = (
     "test_harness_parsing.py",
     "test_coding_standards.py",
@@ -93,7 +92,6 @@ SUITE_ORDER: Sequence[str] = (
     "test_examples.py",
     "test_shipping_smoke.py",
     "test_web_smoke.py",
-    "test_basic.py",
 )
 
 

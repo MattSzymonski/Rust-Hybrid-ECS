@@ -72,12 +72,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=../core/common.sh
-source "$SCRIPT_DIR/../core/common.sh"
+# The repository root is two levels above devops/ci_cd/.
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Shortcuts for colored section headers
+# Shortcuts for colored section headers and failure lines
 BOLD='\033[1m'
 CYAN='\033[0;36m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 # All paths in this script are relative to the project root.

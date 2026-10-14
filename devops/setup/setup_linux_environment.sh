@@ -33,9 +33,9 @@
 #   3. Shader compiler (Slang). The renderer-data crate's build script cooks
 #      every `.hlsl` through `slangc`, and the dev host's shader watcher
 #      re-cooks edits the same way; nothing builds without it on PATH. Debian
-#      has no Slang package, so the official release zip - at the version the
-#      CI image pins (devops/ci_cd/Dockerfile) - is installed into ~/.local
-#      and added to PATH in ~/.bashrc.
+#      has no Slang package, so the official release zip - at the version
+#      pinned below (keep it equal to the Windows script's) - is installed into
+#      ~/.local and added to PATH in ~/.bashrc.
 #
 #   4. .NET 8 SDK. This is the Linux stand-in for the Windows script's MSVC
 #      step: the managed (`PROJECT_PATH=.../*.csproj`) backend builds the
@@ -260,7 +260,7 @@ install_rust() {
 
 # --- 3. Shader compiler (Slang) ----------------------------------------------
 
-# The release the CI image pins (devops/ci_cd/Dockerfile). The renderer-data
+# The pinned release; keep it equal to setup_windows_environment.ps1. The renderer-data
 # crate's build script and the host's shader watcher both shell out to
 # `slangc`; the zip is relocatable (its rpath is `$ORIGIN/../lib`), so an
 # install that keeps bin/ and lib/ together works from ~/.local without root.

@@ -255,8 +255,8 @@ function Install-VisualStudioCppBuildTools {
 
 # The renderer-data crate cooks every .hlsl through `slangc` at build time,
 # and the dev host's shader watcher re-cooks edits the same way. The release
-# installed below matches the version the CI image pins
-# (devops/ci_cd/Dockerfile), from the official release zip.
+# installed below is pinned here and in setup_linux_environment.sh (keep the
+# two equal), from the official release zip.
 $script:SlangVersion = '2025.21.2'
 
 function Test-SlangCompiler {

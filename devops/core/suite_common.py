@@ -43,6 +43,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from .paths import HOST_EXECUTABLE, MODULES_ROOT, REPOSITORY_ROOT
+
 # The host's output is UTF-8 (its renderer prints a box-drawing frame
 # dashboard), while CPython encodes redirected output with the locale code
 # page. Echoing one of those lines then raises UnicodeEncodeError inside the
@@ -59,10 +61,9 @@ for _stream in (sys.stdout, sys.stderr):
 # Paths
 # =============================================================================
 
-# devops/core/suite_common.py -> devops -> repository root.
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-MODULES_ROOT = WORKSPACE_ROOT / "modules"
-HOST_EXE = MODULES_ROOT / "target" / "debug" / "pill_standalone.exe"
+# The roots come from `core.paths`; the suites know them by these names.
+WORKSPACE_ROOT = REPOSITORY_ROOT
+HOST_EXE = HOST_EXECUTABLE
 
 # Known project roots. Each declares its own `project_settings.yaml`, the only
 # source of the extension list; the project itself is selected by
@@ -136,13 +137,12 @@ RELOAD_TIMEOUT = 60
 PROBE_TIMEOUT = 25
 COUNTER_TICK_TIMEOUT = 15
 SETTLE_TIMEOUT = 30
-# Fixed settling pauses after a reload token lands. These are NOT pure
-# overhead: they give the host's reload transaction time to fully unwind
+# A fixed settling pause after a reload token lands. It is NOT pure
+# overhead: it gives the host's reload transaction time to fully unwind
 # (re-seeding, watcher re-arm) before the next edit lands, so a rapid second
-# edit to the same crate cannot be coalesced or missed. Trimming them made
-# `module_double_reload` flaky, so they stay conservative.
+# edit to the same crate cannot be coalesced or missed. Trimming it made
+# `module_double_reload` flaky, so it stays conservative.
 STABILITY_SLEEP = 2
-SETTLE_SLEEP = 1
 PROCESS_KILL_TIMEOUT = 5
 BUILD_TIMEOUT = 180
 MAX_BUFFERED_LINES = 8000
@@ -734,7 +734,6 @@ __all__ = [
     "COUNTER_TICK_TIMEOUT",
     "SETTLE_TIMEOUT",
     "STABILITY_SLEEP",
-    "SETTLE_SLEEP",
     "PROCESS_KILL_TIMEOUT",
     "BUILD_TIMEOUT",
     "MAX_BUFFERED_LINES",
