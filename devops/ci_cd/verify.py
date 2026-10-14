@@ -6,12 +6,21 @@ REQUIREMENTS
   - Python 3.8+ (standard library only).
   - Rust stable with rustfmt and clippy, and the `wasm32-unknown-unknown`
     target for the `wasm-clippy` step.
+  - Optional: `cargo-nextest`, used by the two unit-test steps when it is
+    installed, and skipped in favour of `cargo test` when it is not.
 
 DESCRIPTION
     Steps run in the order below. Cargo steps run from `modules/`, Python steps
     from the repository root, and every Python step uses this interpreter. The
     run stops at the first failure unless `--keep-going` is given, and always
     ends with a PASS/FAIL table.
+
+    The unit-test steps run through `cargo nextest run` when nextest is
+    installed: every test gets its own process and its own line with its
+    duration, and `modules/.config/nextest.toml` holds the settings (no
+    retries, every failure reported). nextest does not run doctests, so the
+    same step runs `cargo test --doc` beside it. Without nextest the step is a
+    plain `cargo test`, which runs both, and says so.
 
     `--quick` keeps only the inner-loop steps (formatting, clippy and the
     lints): about a minute on a warm cache, and enough to catch most mistakes
@@ -45,6 +54,7 @@ EXAMPLE USAGE
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -69,6 +79,15 @@ HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
 # fails if a new member brings hot_patch back.
 DEFAULT_LANE = ["--workspace", "--exclude", "pill_standalone", "--exclude", "editor", "--exclude", "pill_editor_native"]
 
+# The unit-test steps run through nextest when it is installed, and through
+# `cargo test` when it is not, so the gate still runs on a machine that never
+# installed it. `cargo-nextest` is the binary `cargo nextest` dispatches to.
+NEXTEST = shutil.which("cargo-nextest")
+# The nextest profile the test steps select. It is the `ci` profile of
+# `modules/.config/nextest.toml`, so a local run of this gate and a CI run
+# execute the tests with the same settings.
+NEXTEST_PROFILE = "ci"
+
 
 @dataclass
 class Step:
@@ -81,6 +100,33 @@ class Step:
     quick: bool = False
     # Variables set for this step only, on top of the inherited environment.
     environment: Dict[str, str] = field(default_factory=dict)
+    # Printed above the step when its commands had to adapt to this machine.
+    note: str = ""
+
+
+def unit_test_step(name: str, title: str, lane: List[str]) -> Step:
+    """The unit-test step for `lane`, on nextest when it is installed.
+
+    nextest gives every test its own process and prints a duration per test,
+    which `cargo test` cannot. It does not run doctests, so they keep their own
+    command; without nextest a plain `cargo test` runs the unit tests and the
+    doctests together.
+    """
+    if NEXTEST is None:
+        return Step(
+            name,
+            title,
+            [["cargo", "test", *lane]],
+            note="cargo-nextest is not installed; falling back to `cargo test`",
+        )
+    return Step(
+        name,
+        title,
+        [
+            ["cargo", "nextest", "run", "--profile", NEXTEST_PROFILE, *lane],
+            ["cargo", "test", "--doc", *lane],
+        ],
+    )
 
 
 STEPS: List[Step] = [
@@ -112,12 +158,8 @@ STEPS: List[Step] = [
         [[PYTHON, "devops/ci_cd/verify.py", "--assert-default-lane-features"]],
         working_directory=REPOSITORY_ROOT,
     ),
-    Step("test", "Unit tests (default lane, no hot_patch)", [["cargo", "test", *DEFAULT_LANE]]),
-    Step(
-        "test-hot-patch",
-        "Unit tests (hot_patch lane)",
-        [["cargo", "test", "--workspace", "--features", HOT_PATCH_FEATURES]],
-    ),
+    unit_test_step("test", "Unit tests (default lane, no hot_patch)", DEFAULT_LANE),
+    unit_test_step("test-hot-patch", "Unit tests (hot_patch lane)", ["--workspace", "--features", HOT_PATCH_FEATURES]),
     Step(
         "coding-standards",
         "Coding standards lint",
@@ -268,6 +310,8 @@ def format_command(command: Sequence[str]) -> str:
 def run_step(step: Step) -> bool:
     """Run every command of `step` in order; True when all of them exit 0."""
     environment = dict(os.environ, **step.environment)
+    if step.note:
+        print(f"note: {step.note}", flush=True)
     for command in step.commands:
         print(f"$ {format_command(command)}", flush=True)
         # A missing tool (no cargo on PATH) is a failed step, not a crash.

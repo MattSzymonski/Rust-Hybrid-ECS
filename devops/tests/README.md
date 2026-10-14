@@ -65,7 +65,7 @@ When an agent runs a suite, it goes through `.agents/site/agent_run.py`
 
 | Workflow | Runs |
 | --- | --- |
-| `ci.yml` (manual dispatch for now) | `verify.py`, every step. From this directory that includes the static guards (coding standards, renderer boundaries, engine layout, asset metadata, engine exports, feature drift, wrapper entry points). |
+| `ci.yml` (manual dispatch for now) | `verify.py`, every step. From this directory that includes the static guards (coding standards, renderer boundaries, engine layout, asset metadata, engine exports, feature drift, wrapper entry points). CI installs `cargo-nextest` first, so the two Rust test lanes run each test in its own process with per-test timings. |
 | `nightly.yml`, 04:00 UTC | Builds the windowed host, then the suites tagged `SETS: nightly` (failures fail the nightly) and `SETS: nightly-allowed-to-fail` (known drift, logged only), and the hot-reload benchmark. Logs are uploaded as an artifact. |
 
 Every other end-to-end suite is local only. Run the ones that cover the area

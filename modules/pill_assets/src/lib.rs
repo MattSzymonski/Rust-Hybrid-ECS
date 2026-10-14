@@ -821,8 +821,17 @@ mod tests {
         assert_eq!(second.skipped.len(), 1);
 
         // The header the rule reads is newer than the output, so the next run
-        // re-cooks even though the matched input never moved.
+        // re-cooks even though the matched input never moved. The timestamp is
+        // set by hand: a file written a moment later can still carry the same
+        // mtime as the output (file timestamps are quantized), and the
+        // staleness check is strict.
         fs::write(&header, b"header v2").expect("header edit");
+        let newer = std::time::SystemTime::now() + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&header)
+            .and_then(|file| file.set_modified(newer))
+            .expect("age the header");
         let third = pipeline.run().expect("third run");
         assert_eq!(third.rebuilt.len(), 1);
     }
