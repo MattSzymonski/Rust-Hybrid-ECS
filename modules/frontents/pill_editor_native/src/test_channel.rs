@@ -45,6 +45,42 @@ pub enum TestCommand {
         /// Distance from the client area's top edge.
         y: f32,
     },
+    /// Right-click at a point in logical client-area pixels: the gesture
+    /// that asks the shell for a context menu (Stage 21).
+    RightClick {
+        /// Distance from the client area's left edge.
+        x: f32,
+        /// Distance from the client area's top edge.
+        y: f32,
+    },
+    /// Deliver a pointer to an open popup, in the popup's own logical
+    /// pixels, with `release` for the left button coming up (Stage 21).
+    PopupPointer {
+        /// The popup's id, as the shell named it.
+        id: String,
+        /// Distance from the popup's left edge.
+        x: f32,
+        /// Distance from the popup's top edge.
+        y: f32,
+        /// Whether the left button came up there.
+        released: bool,
+    },
+    /// Dismiss a popup the way the platform does (Stage 21): the state an
+    /// outside click, a lost focus or an Escape leaves behind. A scripted
+    /// run cannot move the real focus, so this is the platform's half.
+    PopupDismiss {
+        /// The popup's id, as the shell named it.
+        id: String,
+    },
+    /// Move the editor window's outer position, in physical pixels
+    /// (Stage 21: a popup flips at the monitor's work area, which the suite
+    /// reaches by moving the window to a monitor edge).
+    WindowMove {
+        /// Physical x of the window's outer top-left.
+        x: i32,
+        /// Physical y of the window's outer top-left.
+        y: i32,
+    },
     /// Press and release a named key (`escape`, `space`, or one letter),
     /// optionally with a delivery target: `ui` (the default), `scene` (the
     /// editor camera) or `game` (the project).
@@ -325,6 +361,56 @@ fn parse_command(line: &str) -> TestCommand {
                 },
             }
         }
+        Some("rightclick") => {
+            let point = (|| {
+                let x: f32 = parts.next()?.parse().ok()?;
+                let y: f32 = parts.next()?.parse().ok()?;
+                Some((x, y))
+            })();
+            match point {
+                Some((x, y)) => TestCommand::RightClick { x, y },
+                None => TestCommand::Unknown {
+                    line: line.to_string(),
+                },
+            }
+        }
+        Some("popup-pointer") => {
+            let (Some(id), Some(x), Some(y)) = (parts.next(), parts.next(), parts.next()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            TestCommand::PopupPointer {
+                id: id.to_string(),
+                x,
+                y,
+                released: parts.next() == Some("release"),
+            }
+        }
+        Some("popup-dismiss") => match parts.next() {
+            Some(id) => TestCommand::PopupDismiss { id: id.to_string() },
+            None => TestCommand::Unknown {
+                line: line.to_string(),
+            },
+        },
+        Some("window-move") => {
+            let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            TestCommand::WindowMove { x, y }
+        }
         Some("key") => match parts.next() {
             Some(key) => TestCommand::Key {
                 key: key.to_lowercase(),
@@ -591,6 +677,32 @@ mod tests {
             }
         );
         assert_eq!(parse_command("quit"), TestCommand::Quit);
+        assert_eq!(
+            parse_command("rightclick 1240 300"),
+            TestCommand::RightClick {
+                x: 1240.0,
+                y: 300.0
+            }
+        );
+        assert_eq!(
+            parse_command("popup-pointer menu 10 34 release"),
+            TestCommand::PopupPointer {
+                id: "menu".to_string(),
+                x: 10.0,
+                y: 34.0,
+                released: true,
+            }
+        );
+        assert_eq!(
+            parse_command("popup-dismiss context"),
+            TestCommand::PopupDismiss {
+                id: "context".to_string()
+            }
+        );
+        assert_eq!(
+            parse_command("window-move 1900 40"),
+            TestCommand::WindowMove { x: 1900, y: 40 }
+        );
         assert!(matches!(
             parse_command("click nope"),
             TestCommand::Unknown { .. }

@@ -8,8 +8,10 @@
 //!   the project's stylesheet.
 //! - [`UiContext::begin_frame`] routes the engine's [`Input`] into the UI and
 //!   starts the frame; [`UiContext::draw`] builds a panel and appends its
-//!   draw list for a surface; [`UiContext::take_frame`] hands everything
-//!   built, plus the atlas changes, to the renderer's frame builder.
+//!   draw list for a surface; [`UiContext::inject`] appends a list built
+//!   outside the widget state (the editor's overlay); [`UiContext::take_frame`]
+//!   hands everything built, plus the atlas changes, to the renderer's frame
+//!   builder.
 //! - [`UiContext::sync_stylesheet`]: load a `.css` source through the engine's
 //!   asset store and re-parse it whenever the store reports it changed, so a
 //!   project's UI restyles live when the stylesheet is edited.
@@ -49,7 +51,7 @@ use pill_engine_core::{
 
 // Current crate
 use crate::asset::StylesheetAsset;
-use crate::atlas::Atlas;
+use crate::atlas::{Atlas, AtlasUpdate};
 use crate::css::Stylesheet;
 use crate::draw::DrawList;
 use crate::frame::{UiDraw, UiFrame};
@@ -173,6 +175,26 @@ impl UiContext {
         });
     }
 
+    /// Append an already-built draw list for `surface` to this frame (Stage
+    /// 21, D24).
+    ///
+    /// The executable uses this to fold the editor's overlay list into the
+    /// renderer's UI pass when no composition overlay could be created: the
+    /// list is built by the shell, outside the project's widget state, so it
+    /// cannot go through [`Self::draw`]. `scale_factor` is the monitor scale
+    /// the list's logical pixels are in, exactly as a built panel records.
+    pub fn inject(&mut self, surface: u32, scale_factor: f32, list: DrawList) {
+        self.frame.draws.push(UiDraw {
+            surface,
+            scale_factor: if scale_factor > 0.0 {
+                scale_factor
+            } else {
+                1.0
+            },
+            list,
+        });
+    }
+
     /// Everything built since the frame began, plus the atlas changes the
     /// text and icons produced; drains both.
     ///
@@ -182,6 +204,19 @@ impl UiContext {
         let mut frame = std::mem::take(&mut self.frame);
         frame.atlas = self.atlas.take_update();
         frame
+    }
+
+    /// Fold another atlas's additions into this context's (Stage 21, D24).
+    ///
+    /// The editor's overlay list is built against the shell's atlas while the
+    /// renderer's UI pass uploads the atlas of the world's context; copying
+    /// the written regions keeps the list's texture coordinates pointing at
+    /// the same glyphs, so the fallback draws the same content the overlay
+    /// would have.
+    pub fn adopt_atlas(&mut self, update: &AtlasUpdate) {
+        for region in &update.regions {
+            self.atlas.write_region(region.region, &region.pixels);
+        }
     }
 
     /// Parse `source` as the project's stylesheet; an empty source goes back

@@ -36,7 +36,8 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_api::{
-    EditorNoticeEvent, EditorNotices, EditorOpenRequest, EditorProblem, EditorProblemLevel,
+    EditorNoticeEvent, EditorNotices, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
+    EditorProblem, EditorProblemLevel,
 };
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::editor_state::EditorCommand;
@@ -68,6 +69,8 @@ use winit::window::{Window, WindowId};
 
 // Current crate
 use crate::frontend::EditorError;
+use crate::overlay::{self, OverlaySurface};
+use crate::popup::{PopupGpu, PopupHost};
 use crate::test_channel::{self, TestChannel, TestCommand};
 
 // =============================================================================
@@ -107,6 +110,14 @@ const GIZMO_PRESS_FRACTION: f32 = 0.92;
 
 /// Frames between gizmo anchor heartbeats.
 const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
+
+/// How far above its anchor the overlay's entity label is drawn, in logical
+/// pixels (Stage 21).
+const OVERLAY_LABEL_LIFT: f32 = 18.0;
+
+/// Frames between overlay content heartbeats, for a suite that watches the
+/// overlay path without a log line per frame (Stage 21).
+const OVERLAY_HEARTBEAT_FRAMES: u64 = 120;
 
 #[cfg(test)]
 mod gizmo_tests {
@@ -288,6 +299,13 @@ impl ApplicationHandler for EditorApplication {
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
+        // The popup windows (Stage 21, D23) are their own windows: a close
+        // request, a lost focus or Escape dismisses one, and a click inside
+        // one is a pointer for the menu drawn in it.
+        if editor.is_popup_window(window_id) {
+            editor.popup_window_event(window_id, &event);
+            return;
+        }
         // The game and scene surfaces are their own windows: the game
         // window's events are the game's input, the scene window's drive the
         // editor camera, the main window's the editor UI's.
@@ -305,6 +323,9 @@ impl ApplicationHandler for EditorApplication {
                     target: telemetry_target::ENGINE,
                     "[editor] window closed, shutting down"
                 );
+                // The popups are owned windows and would die with it anyway;
+                // closing them first keeps the shutdown ordered.
+                editor.popups.close_all();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -354,6 +375,19 @@ impl ApplicationHandler for EditorApplication {
             event => editor.push_ui_input(&event),
         }
     }
+
+    /// The frame boundary between event batches: where the popups the
+    /// shell's last frame asked for become real windows (Stage 21, D23).
+    ///
+    /// Creating a window re-enters winit's dispatch, so it never happens
+    /// inside an event callback; the shell's request is applied here, one
+    /// step ahead of the frame that draws it.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        editor.sync_popups(event_loop);
+    }
 }
 
 // =============================================================================
@@ -394,6 +428,10 @@ struct EditorWindow {
     /// its own.
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// The instance and adapter the device came from: a popup window's
+    /// surface is created and checked against them (Stage 21, D23).
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     /// The surface's configuration; `width`/`height` are physical pixels.
     configuration: wgpu::SurfaceConfiguration,
     /// The `pill_ui` renderer: one pipeline and the atlas texture.
@@ -518,6 +556,35 @@ struct EditorWindow {
     /// Counter naming each drag's coalesce key, so one drag is one undo step
     /// and the next drag is a new one.
     gizmo_drag_seq: u64,
+    /// The composition overlay over the window (Stage 21, D24), `None` when
+    /// it could not be created: the shell's overlay list then draws through
+    /// the renderer's UI pass into the scene instead.
+    overlay: Option<OverlaySurface>,
+    /// Whether the overlay was refused on purpose (`PILL_EDITOR_NO_OVERLAY`),
+    /// so the fallback path stays exercised.
+    overlay_forced_failure: bool,
+    /// The overlay list the shell built last frame, waiting for its draw:
+    /// the composition overlay takes it at the end of the frame, and without
+    /// one the world's UI context takes it at the start of the next.
+    pending_overlay: Option<DrawList>,
+    /// The overlay's opaque rectangles, from the shell's last frame: input
+    /// over one of them belongs to the UI, not to the scene beneath it.
+    overlay_opaque: Vec<EditorRect>,
+    /// The gizmo labels the overlay shows this frame, published by the
+    /// executable because only it knows where the scene projects.
+    overlay_labels: Vec<EditorOverlayLabel>,
+    /// The shell's open menus, combos and context menus as platform popups
+    /// (Stage 21, D23).
+    popups: PopupHost,
+    /// The popups the shell asked for in its last frame; applied to real
+    /// windows at the start of the next one.
+    requested_popups: Vec<EditorPopup>,
+    /// The popups the platform closed since the shell's last frame (an
+    /// outside click, a lost focus, Escape), by id.
+    popup_closed: Vec<String>,
+    /// The overlay list's vertex count at the last heartbeat log, so the
+    /// overlay's path and content log on a change rather than every frame.
+    overlay_vertices_logged: usize,
 }
 
 impl EditorWindow {
@@ -593,6 +660,60 @@ impl EditorWindow {
         surface.configure(&device, &configuration);
         // Step 4: the UI's renderer and state.
         let ui = UiRenderer::new(&device, &queue, format, ATLAS_SIZE);
+        // Step 4b: the composition overlay over the window (Stage 21, D24).
+        // Its list floats above the scene surfaces with per-pixel alpha;
+        // when the platform refuses it, or the scripted suite forces that
+        // refusal, the same list draws through the renderer's UI pass into
+        // the scene instead.
+        let overlay_forced_failure = std::env::var_os("PILL_EDITOR_NO_OVERLAY").is_some();
+        let overlay = if overlay_forced_failure {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] overlay disabled by PILL_EDITOR_NO_OVERLAY; the UI falls back to the scene pass"
+            );
+            None
+        } else {
+            match OverlaySurface::new(
+                &instance,
+                &adapter,
+                &device,
+                Arc::clone(&window),
+                format,
+                (width, height),
+                window.scale_factor() as f32,
+            ) {
+                Ok(surface) => {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        width, height, "[editor] overlay created"
+                    );
+                    Some(surface)
+                }
+                Err(error) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        error = %error,
+                        "[editor] overlay refused; the UI falls back to the scene pass"
+                    );
+                    None
+                }
+            }
+        };
+        // The monitor's work area, in physical pixels: what the popup
+        // placement flips and slides inside (Stage 21). Logged once because
+        // the platform is the only thing that knows it, and the D26 suite
+        // places a popup at an edge to observe the flip.
+        if let Some(work) = overlay::work_area(&window) {
+            info!(
+                target: telemetry_target::ENGINE,
+                x = work.x,
+                y = work.y,
+                width = work.width,
+                height = work.height,
+                scale = window.scale_factor(),
+                "[editor] monitor work area"
+            );
+        }
         // Step 5: the two view surfaces and the project host. The game
         // window is the renderer's primary surface, attached exactly as a
         // game frontend attaches one; the scene window is a second surface
@@ -716,6 +837,8 @@ impl EditorWindow {
             surface,
             device,
             queue,
+            instance,
+            adapter,
             configuration,
             ui,
             state: UiState::new(),
@@ -763,6 +886,15 @@ impl EditorWindow {
             synthetic_gizmo_pending: None,
             synthetic_press_ids: Vec::new(),
             gizmo_drag_seq: 0,
+            overlay,
+            overlay_forced_failure,
+            pending_overlay: None,
+            overlay_opaque: Vec::new(),
+            overlay_labels: Vec::new(),
+            popups: PopupHost::new(),
+            requested_popups: Vec::new(),
+            popup_closed: Vec::new(),
+            overlay_vertices_logged: usize::MAX,
         })
     }
 
@@ -774,8 +906,13 @@ impl EditorWindow {
         self.configuration.width = width;
         self.configuration.height = height;
         self.surface.configure(&self.device, &self.configuration);
-        // A resize redraws immediately; the overlay and the scene surfaces
-        // follow in later milestones.
+        // The overlay's visual covers the client area (D24): its swapchain
+        // follows the window in physical pixels.
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.resize(&self.device, (width, height));
+        }
+        // A resize redraws immediately; the scene surfaces follow through
+        // the host's own resize path.
         self.window.request_redraw();
     }
 
@@ -859,6 +996,55 @@ impl EditorWindow {
         id == self.game.window.id()
     }
 
+    /// Whether `id` is one of the shell's popup windows (Stage 21, D23).
+    fn is_popup_window(&self, id: WindowId) -> bool {
+        self.popups.is_popup(id)
+    }
+
+    /// Handle one event of one popup window: dismissal, and the pointers the
+    /// shell's menus read.
+    fn popup_window_event(&mut self, id: WindowId, event: &WindowEvent) {
+        // A popup is a window of its own, so its keyboard input never
+        // reaches the main window's stream: translate it here, into the
+        // same queue the shell's text fields read from, and let the popup
+        // host decide what dismisses it.
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+        ) {
+            self.pending_ui_events.extend(translate_window_event(event));
+        }
+        if !self.popups.window_event(id, event) {
+            return;
+        }
+        // Any popup input means the popups are on screen; the next frame
+        // draws them and the shell's menu state follows.
+        self.window.request_redraw();
+    }
+
+    /// Turn the shell's popup requests into real windows, at the frame
+    /// boundary (Stage 21, D23): opening, moving and closing them, and
+    /// recording the ids the platform closed on its own.
+    fn sync_popups(&mut self, event_loop: &ActiveEventLoop) {
+        if self.requested_popups.is_empty() && self.popups.is_empty() {
+            return;
+        }
+        let requested = std::mem::take(&mut self.requested_popups);
+        let gpu = PopupGpu {
+            instance: &self.instance,
+            adapter: &self.adapter,
+            device: &self.device,
+            format: self.configuration.format,
+        };
+        let closed = self.popups.sync(event_loop, &gpu, &self.window, &requested);
+        // A popup the platform closed is dropped by `sync`; its id tells the
+        // shell to clear the state behind it next frame.
+        self.popup_closed.extend(closed);
+        if !self.popups.is_empty() {
+            self.window.request_redraw();
+        }
+    }
+
     /// Whether a graceful quit was requested (the test channel, or the
     /// scripted seconds deadline); the event handler exits the loop after
     /// the frame that raised it.
@@ -873,6 +1059,51 @@ impl EditorWindow {
             for command in channel.poll() {
                 match command {
                     TestCommand::Click { x, y } => self.inject_click(x, y),
+                    TestCommand::RightClick { x, y } => self.inject_right_click(x, y),
+                    TestCommand::PopupPointer { id, x, y, released } => {
+                        let position = Vector2f::new(x, y);
+                        if self.popups.push_pointer(&id, position, released) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                x,
+                                y,
+                                released,
+                                "[editor] test popup pointer"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test popup pointer: no such popup"
+                            );
+                        }
+                    }
+                    TestCommand::PopupDismiss { id } => {
+                        if self.popups.dismiss(&id) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test popup dismiss"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test popup dismiss: no such popup"
+                            );
+                        }
+                    }
+                    TestCommand::WindowMove { x, y } => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            x,
+                            y,
+                            "[editor] test window move"
+                        );
+                        self.window
+                            .set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                    }
                     TestCommand::Key { key, target } => self.inject_key(&key, target.as_deref()),
                     TestCommand::Tab { title } => {
                         info!(
@@ -1279,19 +1510,32 @@ impl EditorWindow {
                 x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
             })
         };
-        let game_target = in_rect(self.last_game_rect);
-        let scene_target = !game_target && in_rect(self.last_scene_rect);
+        // The overlay's opaque regions are the UI's even where they sit over
+        // the scene view (Stage 21, D24): a click on the FPS badge reaches
+        // `pill_ui`, one beside it reaches the scene.
+        let overlay_target = self.overlay_opaque.iter().any(|rect| {
+            x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+        });
+        let game_target = !overlay_target && in_rect(self.last_game_rect);
+        let scene_target = !overlay_target && !game_target && in_rect(self.last_scene_rect);
+        // A click on the editor's own window is a click outside every popup,
+        // so the platform takes their focus away and closes them; the shell
+        // hears about it through the ids the next sync reports.
+        self.popups.dismiss_all();
         info!(
             target: telemetry_target::ENGINE,
             x,
             y,
-            target = if game_target {
+            target = if overlay_target {
+                "ui"
+            } else if game_target {
                 "game"
             } else if scene_target {
                 "scene"
             } else {
                 "ui"
             },
+            overlay = overlay_target,
             "[editor] test click"
         );
         // A press and a release in the same frame: widgets activate on the
@@ -1334,6 +1578,35 @@ impl EditorWindow {
                 self.state.input.apply(&event);
                 self.pending_ui_events.push(event);
             }
+        }
+    }
+
+    /// A scripted right-click: press and release the right button over the
+    /// client area, which is how the shell is asked for a context menu
+    /// (Stage 21). The view surfaces are windows of their own, so the event
+    /// goes to the UI's stream, exactly as a real right click here would.
+    fn inject_right_click(&mut self, x: f32, y: f32) {
+        info!(
+            target: telemetry_target::ENGINE,
+            x,
+            y,
+            "[editor] test right click"
+        );
+        let position = Vector2f::new(x, y);
+        let events = [
+            InputEvent::CursorMoved { position },
+            InputEvent::MouseButton {
+                button: MouseButton::Right,
+                state: ButtonState::Pressed,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Right,
+                state: ButtonState::Released,
+            },
+        ];
+        for event in events {
+            self.state.input.apply(&event);
+            self.pending_ui_events.push(event);
         }
     }
 
@@ -1998,6 +2271,50 @@ impl EditorWindow {
         }
     }
 
+    /// Publish the labels the overlay draws over the scene (Stage 21).
+    ///
+    /// The executable is the side that can project a world position into the
+    /// scene view, so it hands the shell a client-area position and the text;
+    /// the shell paints it in the overlay layer, which is the only layer that
+    /// can sit above the scene view's own window.
+    fn publish_overlay_labels(&mut self) {
+        self.overlay_labels.clear();
+        let entity = self
+            .host
+            .host_mut()
+            .engine_mut()
+            .world()
+            .get_resource::<pill_editor_core::editor_state::EditorSelection>()
+            .and_then(|selection| selection.entity);
+        let Some(entity) = entity else {
+            return;
+        };
+        let origin = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            match read_transform(world, entity) {
+                Some(transform) => transform.translation,
+                None => return,
+            }
+        };
+        let Some((x, y)) = self.project_to_screen(origin) else {
+            return;
+        };
+        // The projected point is in the scene surface's own physical pixels;
+        // the overlay is drawn in the client area's logical ones.
+        let scale_factor = self.window.scale_factor() as f32;
+        let (scene_x, scene_y) = self
+            .last_scene_rect
+            .map(|rect| (rect.x, rect.y))
+            .unwrap_or((0.0, 0.0));
+        self.overlay_labels.push(EditorOverlayLabel {
+            text: format!("entity {entity}"),
+            position: Vector2f::new(
+                scene_x + x / scale_factor,
+                scene_y + y / scale_factor - OVERLAY_LABEL_LIFT,
+            ),
+        });
+    }
+
     /// Write a changed gizmo choice to the project's preferences entry.
     ///
     /// The executable owns this write because it is the side that knows the
@@ -2556,6 +2873,9 @@ impl EditorWindow {
         if let Some((axis, dx, dy)) = self.synthetic_gizmo_drag.take() {
             self.start_synthetic_gizmo_drag(axis, dx, dy);
         }
+        // Step 2g: the labels the overlay draws over the scene (Stage 21):
+        // the executable projects them, the shell paints them.
+        self.publish_overlay_labels();
         // Step 3: this frame's size, and the input queued since the last
         // frame, delivered to the shell module's input resource; the
         // executable's own state keeps its copy for the fallback.
@@ -2564,6 +2884,28 @@ impl EditorWindow {
             self.configuration.width as f32 / scale_factor,
             self.configuration.height as f32 / scale_factor,
         );
+        // A monitor change (D30) keeps the shell's logical pixels and moves
+        // the overlay's physical ones; the resize path does the same for the
+        // client area itself.
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.set_scale_factor(scale_factor);
+        }
+        // With no composition overlay, the list the last frame's shell built
+        // is injected into the world's UI context here, the moment before the
+        // renderer's frame builder drains it (Stage 21). The list is the same
+        // one the overlay would have drawn, so the fallback shows the same
+        // content.
+        if self.overlay.is_none() {
+            if let Some(list) = self.pending_overlay.take() {
+                let world = self.host.host_mut().engine_mut().world_mut();
+                if world.get_resource::<pill_ui::UiContext>().is_none() {
+                    world.insert_resource(pill_ui::UiContext::new());
+                }
+                if let Some(ui) = world.get_resource_mut::<pill_ui::UiContext>() {
+                    ui.inject(SCENE_SURFACE.0, scale_factor, list);
+                }
+            }
+        }
         {
             // The Assets panel's rows come from the host's asset browser;
             // gathered before the engine borrow below. The tree walk touches
@@ -2679,6 +3021,15 @@ impl EditorWindow {
                 input.notices.revision = self.notices.revision;
                 input.notices.next_event_seq = self.notices.next_event_seq;
                 input.notices.events.append(&mut self.notices.events);
+                // Stage 21: the popups' own input - a pointer inside a popup
+                // window never arrives as an `InputEvent` - and the popups
+                // the platform closed since the last frame, which the shell
+                // clears its state from.
+                input
+                    .popup_pointers
+                    .append(&mut self.popups.take_pointers());
+                input.popup_closed.append(&mut self.popup_closed);
+                input.overlay_labels.clone_from(&self.overlay_labels);
                 // A shell that never drains (the fallback UI, or a module
                 // that failed to load) must not accumulate forever.
                 let excess = input.notices.events.len().saturating_sub(TOAST_QUEUE_MAX);
@@ -2686,6 +3037,10 @@ impl EditorWindow {
             } else {
                 // No shell module: the fallback already consumed the events.
                 self.pending_ui_events.clear();
+                // Nothing reads the popups' pointers either, so they must not
+                // accumulate across frames.
+                self.popups.take_pointers();
+                self.popup_closed.clear();
             }
         }
         // Step 3a: a changed editor camera is published before the frame
@@ -2723,6 +3078,9 @@ impl EditorWindow {
                     requested_open: frame.requested_open.take(),
                     scene_rect: frame.scene_rect,
                     game_rect: frame.game_rect,
+                    overlay: std::mem::take(&mut frame.overlay),
+                    overlay_opaque: std::mem::take(&mut frame.overlay_opaque),
+                    popups: std::mem::take(&mut frame.popups),
                 })
         };
         let output = match shell_output {
@@ -2740,6 +3098,9 @@ impl EditorWindow {
                     requested_open: None,
                     scene_rect: self.last_scene_rect,
                     game_rect: self.last_game_rect,
+                    overlay: DrawList::default(),
+                    overlay_opaque: Vec::new(),
+                    popups: Vec::new(),
                 }
             }
         };
@@ -2875,6 +3236,59 @@ impl EditorWindow {
         self.last_game_rect = output.game_rect;
         self.last_assets_rect = output.assets_rect;
         self.drag_candidate = output.drag_candidate;
+        // Stage 21: what floats over the scene, and where it is opaque. The
+        // overlay list goes to the composition surface at the end of this
+        // frame, or into the renderer's UI pass when there is none; the
+        // popups become windows at the next frame boundary; and a click over
+        // an opaque rectangle is the UI's, not the scene's.
+        self.overlay_opaque = output.overlay_opaque;
+        self.requested_popups = output.popups;
+        let overlay_list = output.overlay;
+        let overlay_vertices = overlay_list.vertices.len();
+        if self.overlay.is_some() {
+            // Drawn below, after the scene has presented.
+            self.pending_overlay = Some(overlay_list);
+        } else if !overlay_list.is_empty() {
+            // No composition overlay: the same list is folded into the
+            // renderer's UI pass. It goes to the world's UI context, which
+            // the renderer's frame builder drains at the start of the next
+            // frame, and the shell's atlas additions go with it, so the
+            // list's texture coordinates find the same glyphs.
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if world.get_resource::<pill_ui::UiContext>().is_none() {
+                world.insert_resource(pill_ui::UiContext::new());
+            }
+            if let Some(update) = output.atlas.as_ref() {
+                if let Some(ui) = world.get_resource_mut::<pill_ui::UiContext>() {
+                    ui.adopt_atlas(update);
+                }
+            }
+            self.pending_overlay = Some(overlay_list);
+        }
+        // The overlay's own heartbeat: which path the UI floats on, and how
+        // much it carries. Logged when the content changes or on the periodic
+        // cadence, so a suite can tell the two paths apart from the log.
+        if overlay_vertices != self.overlay_vertices_logged
+            || self.frame_count.is_multiple_of(OVERLAY_HEARTBEAT_FRAMES)
+        {
+            self.overlay_vertices_logged = overlay_vertices;
+            info!(
+                target: telemetry_target::ENGINE,
+                path = if self.overlay.is_some() {
+                    "composition"
+                } else {
+                    "scene-pass"
+                },
+                forced = self.overlay_forced_failure,
+                frames = self.overlay.as_ref().map(OverlaySurface::frames).unwrap_or(0),
+                vertices = overlay_vertices,
+                opaque = self.overlay_opaque.len(),
+                popups = self.popups.len(),
+                opened = self.popups.opened(),
+                labels = self.overlay_labels.len(),
+                "[editor] overlay content"
+            );
+        }
         let scene_rect = if self.scene_attached {
             self.last_scene_rect
         } else {
@@ -3012,6 +3426,23 @@ impl EditorWindow {
         );
         self.queue.submit([encoder.finish()]);
         frame.present();
+        // Step 8b: the overlay and the popups present their own surfaces
+        // (Stage 21). The overlay draws after the scene has presented, so its
+        // content lands on the newest scene image; the popups are separate
+        // windows entirely.
+        if let Some(overlay) = self.overlay.as_mut() {
+            if let Some(list) = self.pending_overlay.take() {
+                if let Err(error) = overlay.render(&self.device, &self.queue, &mut self.ui, &list) {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        error = error.as_str(),
+                        "[editor] overlay frame skipped"
+                    );
+                }
+            }
+        }
+        self.popups
+            .render(&self.device, &self.queue, &mut self.ui, self.theme.window);
         // Step 9: the loop is the pacing; the next frame starts when this
         // one finished.
         self.window.request_redraw();
@@ -3048,6 +3479,16 @@ struct ShellOutput {
     scene_rect: Option<EditorRect>,
     /// Where the game surface goes, in logical pixels.
     game_rect: Option<EditorRect>,
+    /// The UI that floats above the scene surfaces (Stage 21, D24): the FPS
+    /// badge, the toasts, the docking and file-drop previews, the entity
+    /// labels. Drawn through the composition overlay when there is one, and
+    /// through the renderer's UI pass when there is not.
+    overlay: DrawList,
+    /// The overlay's opaque rectangles, in logical client pixels: input over
+    /// one of them belongs to the UI, everywhere else to the scene beneath.
+    overlay_opaque: Vec<EditorRect>,
+    /// The popups the shell wants open (Stage 21, D23).
+    popups: Vec<EditorPopup>,
 }
 
 // =============================================================================

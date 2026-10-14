@@ -80,6 +80,38 @@ def wait_for_token(
     )
 
 
+def wait_for_occurrence(
+    path: Path,
+    pattern: str,
+    occurrence: int,
+    process: subprocess.Popen,
+    timeout: float,
+    label: str,
+) -> str:
+    """Waits until `pattern` has appeared at least `occurrence` times.
+
+    A token a run repeats - a window move, a popup dismissal - must be
+    waited for by count: the earlier occurrence is already in the log and
+    would satisfy a plain search before the new one has happened.
+    """
+    deadline = time.monotonic() + timeout
+    expression = re.compile(pattern)
+    while time.monotonic() < deadline:
+        matches = [match.group(0) for match in expression.finditer(read_log(path))]
+        if len(matches) >= occurrence:
+            return matches[occurrence - 1]
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"{label}: the editor exited {process.returncode} before "
+                f"occurrence {occurrence} of {pattern}\n" + read_log(path)[-4000:]
+            )
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"{label}: timeout waiting for occurrence {occurrence} of {pattern}\n"
+        + read_log(path)[-4000:]
+    )
+
+
 def start_editor(
     binary: Path,
     project: str,
@@ -456,6 +488,320 @@ def main() -> int:
         if game_process.poll() is None:
             game_process.kill()
             game_process.wait(timeout=30)
+
+    # Step 4c: the overlay layer and the platform popups (Stage 21, D23/D24).
+    # The FPS badge and the docking drop preview float over the scene's own
+    # child window on a DirectComposition surface, and the menus, the
+    # command palette and the context menu open as windows of their own,
+    # placed and flipped against the monitor's work area. The overlay
+    # publishes the rectangles it covers, so a click on the badge belongs to
+    # the UI and one beside it to the scene underneath.
+    overlay_commands = logs / "commands-overlay.txt"
+    overlay_commands.write_text("", encoding="utf-8")
+    overlay_log = logs / "editor-native-overlay.log"
+    overlay_process = start_editor(
+        binary,
+        arguments.project,
+        working_directory,
+        overlay_log,
+        {
+            "LOCALAPPDATA": str(appdata),
+            "PILL_EDITOR_TEST_COMMANDS": str(overlay_commands),
+            "PILL_EDITOR_TEST_SECONDS": "180",
+        },
+    )
+    try:
+        wait_for_token(
+            overlay_log, r"\[editor\] overlay created\s+width=(\d+)\s+height=(\d+)",
+            overlay_process, 180, "overlay created",
+        )
+        # The monitor's work area, which the popup placement flips and slides
+        # inside; the platform is the only thing that knows it.
+        work = wait_for_token(
+            overlay_log,
+            r"\[editor\] monitor work area\s+x=(-?\d+)\s+y=(-?\d+)\s+"
+            r"width=(\d+)\s+height=(\d+)\s+scale=([\d.]+)",
+            overlay_process,
+            60,
+            "work area",
+        )
+        work_x, work_y, work_width, work_height, scale = [
+            float(entry) for entry in re.findall(r"=(-?[\d.]+)", work)
+        ]
+        window = wait_for_token(
+            overlay_log, r"\[editor\] window created\s+width=(\d+)\s+height=(\d+)",
+            overlay_process, 60, "window size",
+        )
+        window_width = float(re.search(r"width=(\d+)", window).group(1))
+        # The overlay carries the UI the panels cannot: the badge and the
+        # drop preview, drawn through the composition path, with the opaque
+        # rectangles the input routing uses.
+        content = wait_for_token(
+            overlay_log,
+            r"\[editor\] overlay content\s+path=composition\s+forced=false\s+"
+            r"frames=\d+\s+vertices=([1-9]\d*)\s+opaque=([1-9]\d*)",
+            overlay_process,
+            120,
+            "overlay content",
+        )
+        vertices = int(re.search(r"vertices=(\d+)", content).group(1))
+        opaque = int(re.search(r"opaque=(\d+)", content).group(1))
+        assert vertices > 0, f"the composition overlay drew nothing: {content}"
+        assert opaque > 0, f"the overlay published no opaque region: {content}"
+        print(f"  [OK] composition overlay carries {vertices} vertices, {opaque} opaque regions")
+
+        # A click on the badge reaches the UI; one beside it, inside the same
+        # scene view, reaches the scene. The badge is the view's top-right
+        # corner (its size is the shell's, in logical pixels).
+        view = wait_for_token(
+            overlay_log,
+            r'\[editor\] view shown\s+view="scene"\s+x=([\d.]+)\s+y=([\d.]+)\s+'
+            r"width=([\d.]+)\s+height=([\d.]+)",
+            overlay_process,
+            120,
+            "scene view",
+        )
+        view_x, view_y, view_width, view_height = [
+            float(entry) for entry in re.findall(r"=([\d.]+)", view)
+        ]
+        badge_x = view_x + view_width - 76.0 - 8.0
+        badge_y = view_y + 8.0
+        append_command(overlay_commands, f"click {badge_x + 38:.0f} {badge_y + 10:.0f}")
+        wait_for_token(
+            overlay_log,
+            rf"\[editor\] test click\s+x={badge_x + 38:.0f}(?:\.0)?\s+"
+            rf"y={badge_y + 10:.0f}(?:\.0)?\s+target=\"?ui\"?\s+overlay=true",
+            overlay_process,
+            30,
+            "badge click",
+        )
+        append_command(
+            overlay_commands, f"click {view_x + 40:.0f} {view_y + view_height - 40:.0f}"
+        )
+        wait_for_token(
+            overlay_log,
+            rf"\[editor\] test click\s+x={view_x + 40:.0f}(?:\.0)?\s+"
+            rf"y={view_y + view_height - 40:.0f}(?:\.0)?\s+target=\"?scene\"?\s+overlay=false",
+            overlay_process,
+            30,
+            "scene click beside the badge",
+        )
+        wait_for_token(
+            overlay_log, r"\[editor\] scene view click", overlay_process, 30,
+            "scene click routed",
+        )
+        print("  [OK] badge click reached the UI, the scene beside it the view")
+
+        # A menu title opens its dropdown as a popup window of its own; a
+        # click outside dismisses it the way the platform does.
+        append_command(overlay_commands, "click 40 13")
+        wait_for_token(
+            overlay_log, r"\[editor\] menu opened\s+path=", overlay_process, 30,
+            "menu opened",
+        )
+        wait_for_token(
+            overlay_log,
+            r"\[editor\] popup opened id=menu size=\((\d+), (\d+)\)\s+"
+            r"requested=\((-?\d+), (-?\d+)\)\s+placed=\((-?\d+), (-?\d+)\)\s+"
+            r"flipped=false slid=false",
+            overlay_process,
+            30,
+            "menu popup",
+        )
+        append_command(overlay_commands, f"click {view_x + 40:.0f} {view_y + 40:.0f}")
+        wait_for_token(
+            overlay_log, r"\[editor\] popup dismissed\s+popup=menu", overlay_process,
+            30, "menu dismissed",
+        )
+        print("  [OK] menu dropdown is a popup window, dismissed by an outside click")
+
+        # The command palette is the second popup, with its own text field.
+        append_command(overlay_commands, "command editor.command_palette")
+        wait_for_token(
+            overlay_log, r"\[editor\] command palette opened", overlay_process, 30,
+            "palette opened",
+        )
+        wait_for_token(
+            overlay_log, r"\[editor\] popup opened id=palette\s+size=",
+            overlay_process, 30, "palette popup",
+        )
+        append_command(overlay_commands, "popup-dismiss palette")
+        wait_for_token(
+            overlay_log, r"\[editor\] test popup dismiss\s+id=palette", overlay_process,
+            30, "palette dismiss",
+        )
+        wait_for_token(
+            overlay_log, r"\[editor\] popup dismissed\s+popup=palette", overlay_process,
+            30, "palette dismissed",
+        )
+        print("  [OK] palette popup opened and dismissed through the platform channel")
+
+        # A right-click asks for a context menu: a window of its own, placed
+        # at the click, and its rows activated through the popup's pointer.
+        append_command(overlay_commands, "rightclick 400 300")
+        wait_for_token(
+            overlay_log, r"\[editor\] context menu opened\s+x=400(?:\.0)?", overlay_process,
+            30, "context menu asked",
+        )
+        wait_for_token(
+            overlay_log,
+            r"\[editor\] popup opened id=context size=\((\d+), (\d+)\)\s+"
+            r"requested=\(400(?:\.0)?, 300(?:\.0)?\)\s+placed=\((-?\d+), (-?\d+)\)\s+"
+            r"flipped=false slid=false",
+            overlay_process,
+            30,
+            "context popup",
+        )
+        append_command(overlay_commands, "popup-pointer context 110 16 release")
+        wait_for_token(
+            overlay_log, r"\[editor\] test popup pointer\s+id=context", overlay_process,
+            30, "popup pointer",
+        )
+        # The first row is Undo: with an empty history that is its own log.
+        wait_for_token(
+            overlay_log, r"\[editor\] history undo", overlay_process, 30,
+            "popup row command",
+        )
+        wait_for_occurrence(
+            overlay_log, r"\[editor\] popup dismissed\s+popup=context", 1,
+            overlay_process, 30, "context dismissed",
+        )
+        print("  [OK] context menu popup: rows run their commands, then it closes")
+
+        # A menu near the window's right edge extends past the window - it is
+        # a window of its own, so the client area no longer clips it - and it
+        # flips to the other side of the click when the monitor's edge is
+        # reached. The window is moved so its right edge sits inside the work
+        # area, then at it, and the click lands on the client's right edge.
+        client_width = window_width / scale
+        click_x = round(client_width - 20.0)
+        window_right = work_x + work_width - 300.0 * scale
+        append_command(
+            overlay_commands, f"window-move {round(window_right - window_width)} {round(work_y) + 40}"
+        )
+        wait_for_occurrence(
+            overlay_log, r"\[editor\] test window move", 1, overlay_process, 30,
+            "window moved",
+        )
+        append_command(overlay_commands, f"rightclick {click_x} 300")
+        opened = wait_for_token(
+            overlay_log,
+            r"\[editor\] popup opened id=context size=\((\d+), (\d+)\)\s+"
+            rf"requested=\({click_x}(?:\.0)?, 300(?:\.0)?\)\s+"
+            r"placed=\((-?\d+), (-?\d+)\)\s+flipped=false slid=false",
+            overlay_process,
+            30,
+            "context popup at the edge",
+        )
+        numbers = re.search(r"placed=\((-?\d+), (-?\d+)\)", opened)
+        placed_x = int(numbers.group(1))
+        size_x = int(re.search(r"size=\((\d+),", opened).group(1))
+        assert placed_x + size_x > window_right, (
+            f"the menu did not extend past the window: {opened}, "
+            f"window right edge {window_right}"
+        )
+        assert placed_x + size_x <= work_x + work_width, (
+            f"the menu left the monitor's work area: {opened}"
+        )
+        print(
+            f"  [OK] menu at the window's right edge extends past it "
+            f"({placed_x + size_x:.0f} > {window_right:.0f}), inside the work area"
+        )
+        # Now with the window's right edge at the monitor's edge, the same
+        # click must flip the menu to the other side of the anchor.
+        append_command(overlay_commands, f"click {view_x + 40:.0f} {view_y + 40:.0f}")
+        wait_for_occurrence(
+            overlay_log, r"\[editor\] popup dismissed\s+popup=context", 2,
+            overlay_process, 30, "context dismissed before the flip",
+        )
+        append_command(
+            overlay_commands,
+            f"window-move {round(work_x + work_width - window_width)} {round(work_y) + 40}",
+        )
+        wait_for_occurrence(
+            overlay_log, r"\[editor\] test window move", 2, overlay_process, 30,
+            "window moved to the edge",
+        )
+        append_command(overlay_commands, f"rightclick {click_x} 300")
+        flipped = wait_for_token(
+            overlay_log,
+            r"\[editor\] popup opened id=context size=\((\d+), (\d+)\)\s+"
+            rf"requested=\({click_x}(?:\.0)?, 300(?:\.0)?\)\s+"
+            r"placed=\((-?\d+), (-?\d+)\)\s+flipped=true slid=false",
+            overlay_process,
+            30,
+            "context popup flipped",
+        )
+        flipped_x = int(re.findall(r"placed=\((-?\d+),", flipped)[0])
+        assert flipped_x >= work_x, f"the flipped menu left the work area: {flipped}"
+        assert flipped_x + size_x <= work_x + work_width, (
+            f"the flipped menu left the work area: {flipped}"
+        )
+        print(f"  [OK] menu flipped at the monitor's edge, placed at x={flipped_x}")
+
+        append_command(overlay_commands, "quit")
+        wait_for_token(
+            overlay_log, r"\[editor\] test channel: quit requested", overlay_process, 30,
+            "overlay run quit",
+        )
+        status = overlay_process.wait(timeout=60)
+        assert status == 0, f"the overlay run exited {status}"
+        assert "panic" not in read_log(overlay_log), "a panic was logged"
+        print("  [OK] overlay and popup run exited 0")
+    finally:
+        if overlay_process.poll() is None:
+            overlay_process.kill()
+            overlay_process.wait(timeout=30)
+
+    # Step 4d: with the composition overlay forced to fail, the same content
+    # must reach the scene through the renderer's UI pass (the Stage 12
+    # fallback), with one warning and no loss.
+    fallback_log = logs / "editor-native-overlay-fallback.log"
+    fallback_process = start_editor(
+        binary,
+        arguments.project,
+        working_directory,
+        fallback_log,
+        {
+            "LOCALAPPDATA": str(appdata),
+            "PILL_EDITOR_NO_OVERLAY": "1",
+            "PILL_EDITOR_TEST_SECONDS": "20",
+        },
+    )
+    try:
+        wait_for_token(
+            fallback_log,
+            r"\[editor\] overlay disabled by PILL_EDITOR_NO_OVERLAY; "
+            r"the UI falls back to the scene pass",
+            fallback_process,
+            180,
+            "overlay forced failure",
+        )
+        fallback = wait_for_token(
+            fallback_log,
+            r"\[editor\] overlay content\s+path=scene-pass\s+forced=true\s+"
+            r"frames=0\s+vertices=([1-9]\d*)\s+opaque=([1-9]\d*)",
+            fallback_process,
+            120,
+            "fallback content",
+        )
+        vertices = int(re.search(r"vertices=(\d+)", fallback).group(1))
+        opaque = int(re.search(r"opaque=(\d+)", fallback).group(1))
+        assert vertices > 0, f"the fallback UI pass got nothing to draw: {fallback}"
+        assert opaque > 0, f"the fallback published no opaque region: {fallback}"
+        assert "overlay created" not in read_log(fallback_log), (
+            "the composition overlay was created despite the forced failure"
+        )
+        status = fallback_process.wait(timeout=120)
+        assert status == 0, f"the fallback run exited {status}"
+        print(
+            f"  [OK] forced overlay failure: the same {vertices} vertices went "
+            "through the scene pass"
+        )
+    finally:
+        if fallback_process.poll() is None:
+            fallback_process.kill()
+            fallback_process.wait(timeout=30)
 
     # Step 5: the clean exit code again, on further runs, quitting by the
     # scripted seconds deadline instead of the command file.
