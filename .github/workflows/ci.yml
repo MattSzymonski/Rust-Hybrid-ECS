@@ -32,6 +32,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: modules
+      - name: Install cargo-nextest
+        # verify.py runs the Rust test lanes through nextest when it is
+        # installed (per-test processes and per-test times) and falls back to
+        # `cargo test` when it is not, so CI installs it rather than letting
+        # the fallback quietly become the CI lane.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: verify.py (every step)
         # One step runs the whole gate, so CI cannot drift from the list.
         # verify.py prints each check as a collapsible log group and writes

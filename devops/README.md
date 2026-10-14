@@ -63,7 +63,10 @@ python devops/ci_cd/verify.py --quick           # the CI gate's inner loop
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
 layout rules, and `test_examples.py` builds each example in release and reports
 artifact sizes. Formatting, clippy and the cargo test lanes are `verify.py`
-steps. See `tests/README.md` for what each suite pins down.
+steps; those two lanes run through `cargo-nextest` (`modules/.config/nextest.toml`)
+when it is installed and through `cargo test` when it is not, and always run
+the doctests with `cargo test --doc`. See `tests/README.md` for what each suite
+pins down.
 
 `tools/build_web.py` builds a Rust project for the browser (bundle and web app
 generation, `wasm-pack`, the page from `tools/web/index.html`); the web smoke
