@@ -576,9 +576,12 @@ struct EditorWindow {
     /// The shell's open menus, combos and context menus as platform popups
     /// (Stage 21, D23).
     popups: PopupHost,
-    /// The popups the shell asked for in its last frame; applied to real
-    /// windows at the start of the next one.
-    requested_popups: Vec<EditorPopup>,
+    /// The popups the shell asked for in its last frame, awaiting the frame
+    /// boundary: `Some` until `sync_popups` has applied them, `None` after.
+    /// An empty list and `None` mean different things - the list closes the
+    /// open popups, `None` leaves them alone - so a boundary pass over a
+    /// frame whose requests are already applied never tears them down.
+    requested_popups: Option<Vec<EditorPopup>>,
     /// The popups the platform closed since the shell's last frame (an
     /// outside click, a lost focus, Escape), by id.
     popup_closed: Vec<String>,
@@ -608,11 +611,20 @@ impl EditorWindow {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
+        // The editor's device draws the composition overlay, whose surface
+        // wgpu implements on DX12 alone (Stage 21, D24): Windows defaults to
+        // DX12 so the overlay exists without an override, WGPU_BACKEND still
+        // wins, and a backend set without DX12 refuses the overlay into the
+        // scene-pass fallback. Elsewhere the primary backends stay - never a
+        // hidden GL helper window that outlives the code that created it
+        // (Stage 31 gives the Linux overlay its own surfaces, not this one).
+        let default_backends = if cfg!(windows) {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::PRIMARY
+        };
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            // The same choice the renderer module makes: the primary
-            // backends, never a hidden GL helper window that outlives the
-            // code that created it.
-            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+            backends: wgpu::Backends::from_env().unwrap_or(default_backends),
             ..Default::default()
         });
         let surface = instance
@@ -892,7 +904,7 @@ impl EditorWindow {
             overlay_opaque: Vec::new(),
             overlay_labels: Vec::new(),
             popups: PopupHost::new(),
-            requested_popups: Vec::new(),
+            requested_popups: None,
             popup_closed: Vec::new(),
             overlay_vertices_logged: usize::MAX,
         })
@@ -1026,10 +1038,12 @@ impl EditorWindow {
     /// boundary (Stage 21, D23): opening, moving and closing them, and
     /// recording the ids the platform closed on its own.
     fn sync_popups(&mut self, event_loop: &ActiveEventLoop) {
-        if self.requested_popups.is_empty() && self.popups.is_empty() {
+        // The boundary runs once per event batch, several times a frame; a
+        // request list is applied exactly once, so the passes after it see
+        // `None` and leave the windows alone.
+        let Some(requested) = self.requested_popups.take() else {
             return;
-        }
-        let requested = std::mem::take(&mut self.requested_popups);
+        };
         let gpu = PopupGpu {
             instance: &self.instance,
             adapter: &self.adapter,
@@ -3242,7 +3256,7 @@ impl EditorWindow {
         // popups become windows at the next frame boundary; and a click over
         // an opaque rectangle is the UI's, not the scene's.
         self.overlay_opaque = output.overlay_opaque;
-        self.requested_popups = output.popups;
+        self.requested_popups = Some(output.popups);
         let overlay_list = output.overlay;
         let overlay_vertices = overlay_list.vertices.len();
         if self.overlay.is_some() {
@@ -3807,6 +3821,10 @@ struct SurfaceWindow {
     /// Whether the window is currently shown; a view whose tab is not
     /// selected is hidden rather than left covering the other one.
     visible: bool,
+    /// Whether a placement has been logged yet. The first one always
+    /// reports, so a view the layout starts shown does not go unlogged -
+    /// the suite reads the view's rectangle from that line.
+    reported: bool,
     /// Whether the scene navigation is orbiting (right drag held).
     orbiting: bool,
     /// Whether the scene navigation is panning (middle drag held).
@@ -3860,6 +3878,7 @@ impl SurfaceWindow {
                         detached: false,
                         placed: None,
                         visible: true,
+                        reported: false,
                         orbiting: false,
                         panning: false,
                         last_cursor: None,
@@ -3887,25 +3906,30 @@ impl SurfaceWindow {
             detached: true,
             placed: None,
             visible: true,
+            reported: false,
             orbiting: false,
             panning: false,
             last_cursor: None,
         })
     }
 
-    /// Show or hide the window; returns whether this was a change.
+    /// Show or hide the window; returns whether the log should record the
+    /// placement: on a real change, and on the first call so every view's
+    /// starting state is logged once.
     fn set_shown(&mut self, visible: bool) -> bool {
-        if self.visible == visible {
-            return false;
+        let changed = self.visible != visible;
+        if changed {
+            self.visible = visible;
+            self.window.set_visible(visible);
+            if !visible {
+                self.orbiting = false;
+                self.panning = false;
+                self.last_cursor = None;
+            }
         }
-        self.visible = visible;
-        self.window.set_visible(visible);
-        if !visible {
-            self.orbiting = false;
-            self.panning = false;
-            self.last_cursor = None;
-        }
-        true
+        let first = !self.reported;
+        self.reported = true;
+        changed || first
     }
 
     /// Place the window at the layout rectangle, in physical pixels,

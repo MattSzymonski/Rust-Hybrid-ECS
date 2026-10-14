@@ -95,6 +95,12 @@ pub fn register(engine: &mut Engine) -> u32 {
     {
         world.insert_resource(pill_editor_core::editor_state::EditorSelection::default());
     }
+    // Step 3c: the module-panel registry (Stage 16). The update below reads
+    // it every frame; module panels claim it through
+    // `register_editor_panel` when they load before the shell does, but a
+    // run with no module panel and no test channel has no other writer, and
+    // a missing registry would silence the whole shell.
+    EditorPanelRegistry::ensure(world);
     // Step 4: the per-frame system that builds the editor UI. Post-update,
     // like the renderer's frame build: it keeps running while the engine is
     // paused - which is what lets the pause command be its own undo, and
