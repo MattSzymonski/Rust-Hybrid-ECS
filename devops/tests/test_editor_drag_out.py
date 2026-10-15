@@ -37,6 +37,9 @@ DESCRIPTION
 USAGE
   python devops/tests/test_editor_drag_out.py
 
+  The run's log and command file land in their own folder under
+  `local/editor-validation/drag-out-<run id>/`.
+
 --- SCRIPT ---
 """
 
@@ -45,20 +48,30 @@ import ctypes
 import ctypes.wintypes
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-MODULES = ROOT / "modules"
-BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
-VALIDATION = ROOT / "local" / "editor-validation"
-LOG = VALIDATION / "editor-drag-out.log"
-COMMANDS = VALIDATION / "commands-drag-out.txt"
-APPDATA = VALIDATION / "drag_out_appdata"
-ASSET_ROOT = ROOT / "examples" / "project_rs" / "res"
+DEVOPS_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(DEVOPS_ROOT))
+
+from core.editor_session import (  # noqa: E402
+    EditorSession,
+    EDITOR_COMMAND_EXECUTED_TOKEN,
+    EDITOR_DRAG_OUT_BEGAN_TOKEN,
+    EDITOR_DRAG_OUT_ENDED_TOKEN,
+    EDITOR_PANEL_PLACEMENT_TOKEN,
+    EDITOR_PANEL_REGISTRY_TOKEN,
+    EDITOR_TAB_SELECTED_TOKEN,
+)
+from core.paths import REPOSITORY_ROOT  # noqa: E402
+
+# Suite tokens: the stable halves of the lines this suite asserts on, so
+# `test_log_contract.py` checks each against the Rust sources.
+ASSET_SELECTED_TOKEN = "[editor] asset selected"
+FILE_DROPPED_TOKEN = "[editor] file dropped"
+
+ASSET_ROOT = REPOSITORY_ROOT / "examples" / "project_rs" / "res"
 DRAG_NAME = "s18_drag.png"
 DRAG_COPY = ASSET_ROOT / DRAG_NAME
 # The same 1x1 PNG the clipboard suite uses; the desktop copy needs bytes
@@ -101,35 +114,6 @@ GA_ROOT = 2
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-
-def read_log() -> str:
-    """The editor log so far, tolerant of a file the writer holds open."""
-    try:
-        return LOG.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def wait_token(process, pattern: str, timeout: float, label: str, start: int = 0) -> int:
-    """Wait for `pattern` after byte offset `start`; returns the new length."""
-    deadline = time.monotonic() + timeout
-    expression = re.compile(pattern)
-    while time.monotonic() < deadline:
-        text = read_log()
-        if expression.search(text[start:]):
-            print(f"  [OK] {label}")
-            return len(text)
-        if process.poll() is not None:
-            raise RuntimeError(f"{label}: the editor exited {process.returncode}\n" + text[-4000:])
-        time.sleep(0.2)
-    raise TimeoutError(f"{label}: timeout waiting for {pattern}\n" + read_log()[-4000:])
-
-
-def append(line: str) -> None:
-    """Appends one scripted command, flushed, so the editor sees it whole."""
-    with COMMANDS.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
 
 
 def window_class(hwnd: int) -> str:
@@ -176,23 +160,9 @@ def desktop_directories() -> list:
 
 
 def main() -> int:
-    if os.name != "nt":
+    if not EditorSession.supported():
         print("SKIP: the native editor suites need Windows")
         return 0
-    if not BINARY.is_file():
-        raise SystemExit(
-            f"editor binary not found at {BINARY}; build it with "
-            "`cargo build -p pill_editor_native` in modules/ first"
-        )
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "pill_editor_native.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    VALIDATION.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(APPDATA, ignore_errors=True)
-    COMMANDS.write_text("# drag-out script\n", encoding="utf-8")
     # A leftover from an interrupted run would make the desktop rename the
     # new copy on the name collision.
     for directory in desktop_directories():
@@ -202,39 +172,38 @@ def main() -> int:
     # resource directory, copied in before launch and removed after.
     ASSET_ROOT.mkdir(parents=True, exist_ok=True)
     DRAG_COPY.write_bytes(PNG_BYTES)
-    environment = dict(os.environ)
-    environment["PROJECT_PATH"] = "../examples/project_rs"
-    environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
-    environment["PILL_EDITOR_TEST_SECONDS"] = "300"
-    environment["LOCALAPPDATA"] = str(APPDATA)
-    log = LOG.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        [str(BINARY)], cwd=str(MODULES), env=environment, stdout=log, stderr=subprocess.STDOUT
-    )
-    log.close()
+    session = EditorSession("drag-out")
+    session.start()
+    process = session.process
     original_cursor = POINT()
     user32.GetCursorPos(ctypes.byref(original_cursor))
     try:
-        wait_token(process, r"\[editor\] panel registry ready\s+panels=\d+", 300, "editor ready")
-        begin = len(read_log())
-        append("command editor.pause_toggle")
-        wait_token(
-            process,
-            r'command executed\s+id="?editor\.pause_toggle"?',
+        session.wait(
+            re.escape(EDITOR_PANEL_REGISTRY_TOKEN) + r"\s+panels=\d+",
+            300,
+            "editor ready",
+        )
+        begin = len(session.read_log())
+        session.send("command editor.pause_toggle")
+        session.wait(
+            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
             30,
             "engine paused",
             begin,
         )
-        begin = len(read_log())
-        append("tab Assets")
-        wait_token(process, r'tab selected\s+title="?Assets"?', 30, "Assets tab", begin)
+        begin = len(session.read_log())
+        session.send("tab Assets")
+        session.wait(
+            re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Assets"?', 30, "Assets tab", begin
+        )
         # The placements are logged with the shell's periodic heartbeat.
         match = None
         deadline = time.monotonic() + 60
         while match is None and time.monotonic() < deadline:
             found = re.findall(
-                r'panel placement\s+kind="Assets" x=([\d.]+) y=([\d.]+) width=([\d.]+) height=([\d.]+)',
-                read_log(),
+                re.escape(EDITOR_PANEL_PLACEMENT_TOKEN)
+                + r'\s+kind="Assets" x=([\d.]+) y=([\d.]+) width=([\d.]+) height=([\d.]+)',
+                session.read_log(),
             )
             match = found[-1] if found else None
             if match is None:
@@ -271,7 +240,7 @@ def main() -> int:
         # the row's offset (the panel's heading and labels take the top).
         row_y = None
         for offset in (69, 64, 74, 59, 79, 54, 84):
-            probe_begin = len(read_log())
+            probe_begin = len(session.read_log())
             candidate_y = int(origin.y + (panel_y + offset) * scale)
             user32.SetCursorPos(row_x, candidate_y)
             time.sleep(0.25)
@@ -279,7 +248,7 @@ def main() -> int:
             time.sleep(0.15)
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             time.sleep(0.6)
-            if "asset selected" in read_log()[probe_begin:]:
+            if ASSET_SELECTED_TOKEN in session.read_log()[probe_begin:]:
                 row_y = candidate_y
                 print(f"  [OK] the first asset row answers {offset} logical pixels below the panel's top")
                 break
@@ -296,9 +265,9 @@ def main() -> int:
         time.sleep(0.5)
         # The offset is taken before the move that may start the drag: the
         # line can land while the injected move is still in flight.
-        begin = len(read_log())
+        begin = len(session.read_log())
         user32.SetCursorPos(origin.x - 200, row_y)
-        wait_token(process, r"\[editor\] drag out began", 15, "drag out began", begin)
+        session.wait_token(EDITOR_DRAG_OUT_BEGAN_TOKEN, 15, "drag out began", begin)
         print("  [OK] the held row started a real OS drag")
 
         # Step 2: drop back on the editor's own Assets panel and release.
@@ -307,25 +276,22 @@ def main() -> int:
         # Explorer window would read - the copy into Explorer itself is the
         # human's checklist step (D26).
         print(f"  [..] dropping on the editor at screen ({row_x}, {row_y})")
-        begin = len(read_log())
+        begin = len(session.read_log())
         user32.SetCursorPos(row_x, row_y)
         time.sleep(0.6)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        wait_token(process, r"\[editor\] drag out ended", 30, "drag out ended", begin)
-        assert 'outcome="dropped"' in read_log()[begin:], "the editor must accept the drop"
-        wait_token(
-            process,
-            r'\[editor\] file dropped\s+path="[^"]*s18_drag\.png"',
+        session.wait_token(EDITOR_DRAG_OUT_ENDED_TOKEN, 30, "drag out ended", begin)
+        assert 'outcome="dropped"' in session.read_log()[begin:], "the editor must accept the drop"
+        session.wait(
+            re.escape(FILE_DROPPED_TOKEN) + r'\s+path="[^"]*s18_drag\.png"',
             15,
             "payload parsed by the drop target",
             begin,
         )
         print("  [OK] the drop target read the file list and named the project's file")
 
-        append("quit")
-        wait_token(process, r"\[editor\] test channel: quit requested", 30, "quit command")
-        process.wait(timeout=120)
-        assert process.returncode == 0, f"editor exited {process.returncode}"
+        status = session.quit_and_wait()
+        assert status == 0, f"editor exited {status}"
         print("PASS: a real drag out carried the file to a drop target")
         return 0
     finally:
@@ -335,9 +301,7 @@ def main() -> int:
         except NameError:
             pass  # the window was never reached
         user32.SetCursorPos(original_cursor.x, original_cursor.y)
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=30)
+        session.close()
         for leftover in (DRAG_COPY, DRAG_COPY.with_name(DRAG_COPY.name + ".meta")):
             leftover.unlink(missing_ok=True)
         for directory in desktop_directories():

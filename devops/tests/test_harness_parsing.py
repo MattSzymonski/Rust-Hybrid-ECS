@@ -453,6 +453,94 @@ def check_snapshot_restores_files_exactly() -> None:
             fail("the lockfile was not restored")
 
 
+def check_editor_runs_get_their_own_folders() -> None:
+    """Every suite's run lands in a folder of its own, cached per process."""
+    import os
+
+    from core.editor_session import (
+        EDITOR_VALIDATION_ROOT,
+        EditorSession,
+        run_directory,
+    )
+
+    first = run_directory("probe-folders")
+    if run_directory("probe-folders") != first:
+        fail("run_directory must stay stable for one suite")
+    if run_directory("probe-folders-other") == first:
+        fail("two suites must never share a run folder")
+    if first.parent != EDITOR_VALIDATION_ROOT:
+        fail(f"run folders live under {EDITOR_VALIDATION_ROOT}, not {first.parent}")
+    if not first.name.startswith("probe-folders-"):
+        fail(f"the run folder is named suite + start time, got {first.name}")
+    session = EditorSession("probe-folders")
+    if session.run_directory != first:
+        fail("a session must use its suite's run folder")
+    for artifact in (session.log_path, session.commands_path, session.sandbox):
+        if artifact.parent != first:
+            fail(f"{artifact.name} must live inside the run folder")
+    if EditorSession.supported() != (os.name == "nt"):
+        fail("only Windows runs the native editor")
+
+
+def check_editor_waits_read_from_an_offset() -> None:
+    """`wait` searches from its offset; `wait_token` escapes the token."""
+    import re as regex
+
+    from core.editor_session import EditorSession
+
+    session = EditorSession("probe-waits")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    session.log_path.write_text("boot line\n", encoding="utf-8")
+    length = session.wait(r"boot line", 5.0, "boot line")
+    if length != len("boot line\n"):
+        fail("wait must return the log length it read")
+    if session.find(r"boot line") is None:
+        fail("find must search the whole log")
+    with session.log_path.open("a", encoding="utf-8") as log:
+        log.write("[editor] second token\n")
+    if session.wait(regex.escape("[editor] second token"), 5.0, "second", length) != len(
+        session.read_log()
+    ):
+        fail("wait after an offset must find the line written later")
+    if session.wait_token("[editor] second token", 5.0, "escaped", length) <= length:
+        fail("wait_token must find the token after the offset")
+
+
+def check_editor_waits_time_out_loudly() -> None:
+    """A pattern that never appears raises `TimeoutError`, not a pass."""
+    from core.editor_session import EditorSession
+
+    session = EditorSession("probe-timeout")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    session.log_path.write_text("nothing to see\n", encoding="utf-8")
+    try:
+        session.wait(r"never printed", 1.0, "never printed")
+    except TimeoutError:
+        return
+    fail("wait must raise TimeoutError when the pattern never appears")
+
+
+def check_editor_edits_keep_lf_and_restore() -> None:
+    """`edit_source` keeps LF; `restore_sources` puts the original back."""
+    import tempfile
+
+    from core.editor_session import EditorSession
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "edited.rs"
+        original = b"fn a() {}\n"
+        path.write_bytes(original)
+        session = EditorSession("probe-edits")
+        session.edit_source(path, "fn a() {}\n// probe\n")
+        if path.read_bytes() != b"fn a() {}\n// probe\n":
+            fail("edit_source must keep the file's LF endings")
+        # A second edit keeps the FIRST capture as the restore target.
+        session.edit_source(path, "fn a() {}\n// probe again\n")
+        session.restore_sources()
+        if path.read_bytes() != original:
+            fail("restore_sources must put the original bytes back")
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every real analytics line parses", check_every_real_analytics_line_parses),
     ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
@@ -467,6 +555,10 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("shared-slot rule matches the engine", check_shared_slot_detection_matches_cargo_naming),
     ("source edits keep line endings", check_source_edits_keep_line_endings),
     ("snapshot restores files exactly", check_snapshot_restores_files_exactly),
+    ("editor runs get their own folders", check_editor_runs_get_their_own_folders),
+    ("editor waits read from an offset", check_editor_waits_read_from_an_offset),
+    ("editor waits time out loudly", check_editor_waits_time_out_loudly),
+    ("editor edits keep LF and restore", check_editor_edits_keep_lf_and_restore),
 ]
 
 
