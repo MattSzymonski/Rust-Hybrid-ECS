@@ -694,6 +694,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
         // mean "local" anywhere else either.
         CommandSpec::new("editor.tool_space_toggle", "Toggle Local / World Space")
             .menu(&["Tools", "Toggle Local / World Space"]),
+        // The Hierarchy's entity actions (Stage 34, parity with the Dioxus
+        // editor's New/Delete entity buttons): creation makes one empty
+        // entity, deletion clears the selection in the same step. No
+        // chords: the menu, the palette and the panel's toolbar carry them.
+        CommandSpec::new("editor.entity_create", "New Entity").menu(&["Entity", "New Entity"]),
+        CommandSpec::new("editor.entity_delete", "Delete Entity")
+            .menu(&["Entity", "Delete Entity"]),
         // The Assets dialogs' buttons (Stage 25). They are registered like
         // any other command - the button row runs them by id - with no menu
         // entry of their own: they answer through the dialog they were
