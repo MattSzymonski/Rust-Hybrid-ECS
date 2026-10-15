@@ -33,15 +33,19 @@ DESCRIPTION
     the scanner looks for a numeric literal inside a function body, preferring
     an annotated function when the crate has one.
 
-    Each crate is reported in one of four states:
+    Each crate is reported in one of five states:
 
       PATCHED      an edit was delivered by the fast path (the expected result)
       FELL BACK    the fast path refused or failed - the failure this test hunts
+      TIMED OUT    the edit was made and no outcome ever came back, which is what
+                   a watcher that stopped delivering looks like
       NO FAST PATH the crate has neither annotations nor a build script, so no
                    fast path exists for it (reported, not a failure)
       SKIPPED      no editable literal was found to drive the test with
 
-    Exits non-zero when any crate with a fast path fell back.
+    Exits non-zero when a crate with a fast path fell back or timed out, when the
+    flag cache holds a split argument, or when not one crate was patched - a run
+    in which no edit reached the fast path proves nothing about it.
 
 USAGE
   python devops/tests/test_hot_patch_coverage.py [--timeout-scale S]
@@ -62,7 +66,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -91,6 +94,18 @@ RELOAD_TRIGGERED_TOKEN = "hot reload triggered"
 # a fallback runs a real cargo build.
 OUTCOME_TIMEOUT = 90
 BUILD_TIMEOUT_SECONDS = 600
+
+# Where the host keeps the compiler-flag caches this test also reads
+# (`flags_cache_path` in `hot_patch/compile.rs`): inside the workspace's private
+# build tree, not the system temporary directory. Two checkouts share `/tmp`, so
+# a cache written by one was replayed by the other - which is why the host moved
+# them here, and why reading `/tmp` would inspect a foreign run's file or none.
+FLAGS_CACHE_DIRECTORY = MODULES_ROOT / "target" / "hot" / "build" / "hotpatch-flags"
+
+# The tokenizer version stamped into the first line of every cache. A cache
+# written by a different tokenizer holds tokens split a different way, so it is
+# reported rather than read.
+FLAGS_CACHE_FORMAT_VERSION = "pill-hotpatch-flags-v3"
 
 # Functions never worth editing: load-time plumbing, and anything a patch is
 # expected to refuse for reasons that are not a defect.
@@ -437,10 +452,16 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
             break
         time.sleep(0.2)
     else:
-        crate.outcome = "SKIPPED"
+        # Not `SKIPPED`: this crate has a fast path and the edit was written, so
+        # the host had a chance to answer and did not. Reported separately
+        # because a run of these is what a watcher that stopped delivering looks
+        # like, and it must not read as "nothing to test here".
+        crate.outcome = "TIMED OUT"
         crate.detail = f"no outcome within {OUTCOME_TIMEOUT}s"
 
-    marker = {"PATCHED": "[OK]", "FELL BACK": "[FAIL]"}.get(crate.outcome, "[SKIP]")
+    marker = {"PATCHED": "[OK]", "FELL BACK": "[FAIL]", "TIMED OUT": "[FAIL]"}.get(
+        crate.outcome, "[SKIP]"
+    )
     summary = (
         f"{crate.route}, {crate.milliseconds} ms" if crate.outcome == "PATCHED" else crate.detail
     )
@@ -464,7 +485,7 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
     time.sleep(1.0)
 
 
-def inspect_flag_caches() -> List[str]:
+def inspect_flag_caches(since: float) -> Tuple[List[str], List[str], int]:
     """Look for split arguments in the compiler-flag caches the host wrote.
 
     A second, narrower net than the outcome check above, and the only one that
@@ -478,22 +499,36 @@ def inspect_flag_caches() -> List[str]:
     A cache holds one token per line. A token that begins with a quote, or ends
     with an unbalanced one, is a fragment of a value that should have stayed
     whole.
+
+    Only caches this run wrote are read: an older file describes a build that
+    happened before the run, and reporting its tokens as this run's would be a
+    failure nobody can act on. Returns (problems, notes, caches read).
     """
     problems: List[str] = []
-    cache_directory = Path(tempfile.gettempdir())
-    for cache in sorted(cache_directory.glob("pill_hotpatch_*.flags")):
+    notes: List[str] = []
+    inspected = 0
+    for cache in sorted(FLAGS_CACHE_DIRECTORY.glob("*.flags")):
         try:
+            if cache.stat().st_mtime < since:
+                continue
             lines = cache.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
         # Line 0 is the tokenizer version, line 1 the build command, line 2 the
         # compiler; the arguments follow.
+        if not lines or lines[0] != FLAGS_CACHE_FORMAT_VERSION:
+            notes.append(
+                f"{cache.name}: written by a different tokenizer "
+                f"({lines[0][:40] if lines else 'empty'!r}), not inspected"
+            )
+            continue
+        inspected += 1
         for token in lines[3:]:
             if token.startswith(('"', "'")) or token.count('"') % 2 == 1:
                 problems.append(
                     f"{cache.name}: token {token[:60]!r} looks like half an argument"
                 )
-    return problems
+    return problems, notes, inspected
 
 
 # =============================================================================
@@ -501,7 +536,7 @@ def inspect_flag_caches() -> List[str]:
 # =============================================================================
 
 
-def print_report(crates: List[Crate], strict: bool) -> bool:
+def print_report(crates: List[Crate], strict: bool, run_started_at: float) -> bool:
     """Print the coverage matrix and decide the exit status."""
     print("\n" + "=" * 78)
     print("  HOT-PATCH COVERAGE")
@@ -520,7 +555,7 @@ def print_report(crates: List[Crate], strict: bool) -> bool:
         print(f"  {crate.name:24s} {crate.kind:8s} {capability:11s} "
               f"{crate.outcome:11s} {detail}")
 
-    fragments = inspect_flag_caches()
+    fragments, cache_notes, caches_read = inspect_flag_caches(run_started_at)
     if fragments:
         print("\n  [FAIL] The compiler-flag cache holds split arguments, so the")
         print("         replayed rustc line is malformed for at least one crate:")
@@ -528,17 +563,29 @@ def print_report(crates: List[Crate], strict: bool) -> bool:
             print(f"         {problem}")
 
     fell_back = [crate for crate in crates if crate.outcome == "FELL BACK"]
+    timed_out = [crate for crate in crates if crate.outcome == "TIMED OUT"]
     no_fast_path = [crate for crate in crates if not crate.has_fast_path]
     skipped = [crate for crate in crates if crate.outcome == "SKIPPED"]
     patched = [crate for crate in crates if crate.outcome == "PATCHED"]
     print()
     print(f"  {len(patched)} patched, {len(fell_back)} fell back, "
-          f"{len(no_fast_path)} without a fast path, {len(skipped)} not exercised")
+          f"{len(timed_out)} timed out, {len(no_fast_path)} without a fast path, "
+          f"{len(skipped)} not exercised")
+    print(f"  {caches_read} compiler-flag cache(s) written by this run inspected")
 
     print()
+    if not patched:
+        print("  [FAIL] No crate was patched, so this run says nothing about the")
+        print("         fast path: either no edit reached the host or every edit")
+        print("         was delivered some other way.")
     if fell_back:
         print(f"  [FAIL] {len(fell_back)} crate(s) lost the fast path:")
         for crate in fell_back:
+            print(f"         {crate.name}: {crate.detail}")
+    if timed_out:
+        print(f"  [FAIL] {len(timed_out)} crate(s) with a fast path reported no")
+        print("         outcome at all - the watcher is not delivering edits:")
+        for crate in timed_out:
             print(f"         {crate.name}: {crate.detail}")
     if no_fast_path:
         print(f"  [NOTE] {len(no_fast_path)} crate(s) have no fast path at all "
@@ -550,8 +597,16 @@ def print_report(crates: List[Crate], strict: bool) -> bool:
         print(f"  [NOTE] {len(skipped)} crate(s) could not be exercised:")
         for crate in skipped:
             print(f"         {crate.name}: {crate.detail}")
+    for note in cache_notes:
+        print(f"  [NOTE] {note}")
 
-    failed = bool(fell_back) or bool(fragments) or (strict and bool(no_fast_path))
+    failed = (
+        bool(fell_back)
+        or bool(fragments)
+        or bool(timed_out)
+        or not patched
+        or (strict and bool(no_fast_path))
+    )
     return not failed
 
 
@@ -576,6 +631,9 @@ def main() -> None:
     global OUTCOME_TIMEOUT
     OUTCOME_TIMEOUT = int(OUTCOME_TIMEOUT * args.timeout_scale)
     startup_timeout = int(STARTUP_TIMEOUT * args.timeout_scale)
+    # Every flag cache this run writes is newer than this, so an older file - a
+    # previous run's, or another checkout's - is not read as this run's output.
+    run_started_at = time.time()
 
     print("=" * 78)
     print("  Hot-Patch Coverage Test")
@@ -631,7 +689,7 @@ def main() -> None:
         for crate in crates:
             if crate.edit_file:
                 exercise(crate, monitor, backups)
-        passed = print_report(crates, args.strict)
+        passed = print_report(crates, args.strict, run_started_at)
     finally:
         print("\n  [CLEANUP] Restoring sources and stopping the host...")
         backups.restore_all()

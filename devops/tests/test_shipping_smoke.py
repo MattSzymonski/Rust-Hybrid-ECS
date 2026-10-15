@@ -25,7 +25,9 @@ DESCRIPTION
          linked them but never called their entry points would still start.
       3. It never invokes cargo. The reloading host shells out to cargo before
          the first frame; a shipping build must not, and the surest way to know
-         is to watch for a cargo child process rather than to trust a grep.
+         is to watch for a cargo child process rather than to trust a grep. The
+         watch polls from launch and fails when the process query itself cannot
+         be run, rather than reporting a clean bill of health it did not earn.
 
     Nothing is edited, so this suite is safe to run against a dirty tree and
     leaves nothing to restore.
@@ -43,6 +45,7 @@ EXAMPLE USAGE
 # Standard library
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -172,6 +175,31 @@ def build_shipping_binary(timeout: int) -> str:
     return ""
 
 
+# How often to look for a cargo/rustc child of the shipping process. A reload
+# build lives for seconds, so a single sample can miss it - the check polls from
+# launch instead.
+CHILD_CHECK_INTERVAL = 0.5
+
+
+class ProcessToolUnavailable(Exception):
+    """The platform's process listing tool could not be run at all.
+
+    A check that silently passes when its tool is missing is worse than no check:
+    the suite used to report `[OK] no cargo or rustc child process` on a machine
+    whose `wmic` had been removed, proving nothing. The caller turns this into a
+    failure.
+    """
+
+
+def parse_windows_process_listing(listing: str) -> int:
+    """Counts cargo/rustc process names in `Get-CimInstance` output."""
+    return sum(
+        1
+        for line in listing.splitlines()
+        if "cargo" in line.lower() or "rustc" in line.lower()
+    )
+
+
 def cargo_child_processes(parent_id: int) -> int:
     """Counts cargo or rustc processes started underneath `parent_id`.
 
@@ -179,8 +207,9 @@ def cargo_child_processes(parent_id: int) -> int:
     nothing spawned one anyway, which is the behaviour the shipping build is
     actually promising.
 
-    Returns 0 when the platform's process tools are unavailable, so the check
-    degrades to the token assertions rather than failing for the wrong reason.
+    `Get-CimInstance Win32_Process` is the query that survives on current
+    Windows: `wmic` was removed, and its absence used to be swallowed as "zero
+    children". Raises [`ProcessToolUnavailable`] when the query cannot be run.
     """
     if os.name != "nt":
         try:
@@ -190,8 +219,8 @@ def cargo_child_processes(parent_id: int) -> int:
                 text=True,
                 timeout=30,
             ).stdout
-        except (OSError, subprocess.SubprocessError):
-            return 0
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ProcessToolUnavailable(f"`ps` could not be run: {error}") from error
         return sum(
             1
             for line in listed.splitlines()
@@ -199,26 +228,30 @@ def cargo_child_processes(parent_id: int) -> int:
             and any(name in line for name in ("cargo", "rustc"))
         )
 
-    try:
-        listed = subprocess.run(
-            [
-                "wmic",
-                "process",
-                "where",
-                f"ParentProcessId={parent_id}",
-                "get",
-                "Name",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=30,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    return sum(
-        1 for line in listed.splitlines() if "cargo" in line.lower() or "rustc" in line.lower()
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if not shell:
+        raise ProcessToolUnavailable("neither powershell nor pwsh is on PATH")
+    query = (
+        f"Get-CimInstance Win32_Process -Filter \"ParentProcessId={parent_id}\""
+        " | Select-Object -ExpandProperty Name"
     )
+    try:
+        completed = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", query],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProcessToolUnavailable(f"the process query could not be run: {error}") from error
+    if completed.returncode != 0:
+        raise ProcessToolUnavailable(
+            f"the process query failed: {(completed.stderr or '').strip()[:200]}"
+        )
+    return parse_windows_process_listing(completed.stdout or "")
 
 
 def run_and_observe(timeout_scale: float) -> int:
@@ -265,6 +298,9 @@ def run_and_observe(timeout_scale: float) -> int:
 
     collected = []
     spawned_cargo = 0
+    child_checks = 0
+    process_tool_error = ""
+    next_child_check = 0.0
     deadline = time.monotonic() + STARTUP_TIMEOUT * timeout_scale
     observe_until = None
     try:
@@ -274,15 +310,23 @@ def run_and_observe(timeout_scale: float) -> int:
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 break
+            # Polled from launch, not sampled once when the first frame appears:
+            # a build the shipping path started would be gone long before then.
+            if time.monotonic() >= next_child_check:
+                next_child_check = time.monotonic() + CHILD_CHECK_INTERVAL
+                try:
+                    spawned_cargo = max(spawned_cargo, cargo_child_processes(process.pid))
+                    child_checks += 1
+                except ProcessToolUnavailable as error:
+                    process_tool_error = str(error)
+                    break
             line = process.stdout.readline()
             if not line:
                 break
             collected.append(line)
             if observe_until is None and FRAME_TOKEN in line:
-                # Frames are running; watch a little longer so a probe lands,
-                # and check for a cargo child while it is definitely alive.
+                # Frames are running; watch a little longer so a probe lands.
                 observe_until = time.monotonic() + OBSERVE_SECONDS * timeout_scale
-                spawned_cargo = cargo_child_processes(process.pid)
             if observe_until is not None and time.monotonic() > observe_until:
                 break
     finally:
@@ -306,6 +350,11 @@ def run_and_observe(timeout_scale: float) -> int:
             failures.append(f"reload machinery ran: {token!r}")
     if spawned_cargo:
         failures.append(f"it spawned {spawned_cargo} cargo/rustc child process(es)")
+    if process_tool_error:
+        failures.append(
+            f"the child-process check could not run ({process_tool_error}), so "
+            f"nothing here shows that no cargo was spawned"
+        )
 
     if failures:
         print("\n  [FAIL] " + "\n  [FAIL] ".join(failures))
@@ -317,7 +366,8 @@ def run_and_observe(timeout_scale: float) -> int:
     print(f"  [OK] reached the project loop, {frames} frame report(s)")
     print(f"  [OK] {modules} extension(s) linked and initialized")
     print("  [OK] the project's systems produced output")
-    print("  [OK] no cargo or rustc child process, and no reload machinery ran")
+    print(f"  [OK] no cargo or rustc child in {child_checks} process queries, "
+          f"and no reload machinery ran")
     print("-" * 70)
     print("  TEST PASSED")
     print("=" * 70)
