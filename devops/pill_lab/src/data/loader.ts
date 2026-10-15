@@ -23,7 +23,7 @@ const MEASUREMENTS_BASE = 'measurements';
 /** Loaded measurements are cached by path; files are immutable once written. */
 const measurementCache = new Map<string, Measurement>();
 
-export class MeasurementLoadError extends Error {}
+export class MeasurementLoadError extends Error { }
 
 function emptyManifest(): Manifest {
   return {
@@ -43,7 +43,7 @@ export async function loadManifest(): Promise<Manifest> {
   if (!response.ok) {
     throw new MeasurementLoadError(
       `Could not read measurements/index.json (HTTP ${response.status}). ` +
-        `Run "python devops/pill_lab/pill_lab.py reindex" to create it.`,
+      `Run "python devops/pill_lab/pill_lab.py reindex" to create it.`,
     );
   }
   const manifest = (await response.json()) as Manifest;
@@ -69,14 +69,14 @@ export async function loadMeasurement(entry: ManifestEntry): Promise<Measurement
   if (!response.ok) {
     throw new MeasurementLoadError(
       `Could not load ${entry.file} (HTTP ${response.status}). The manifest may be stale; ` +
-        `run "python devops/pill_lab/pill_lab.py reindex".`,
+      `run "python devops/pill_lab/pill_lab.py reindex".`,
     );
   }
   const measurement = (await response.json()) as Measurement;
   if (measurement.schema_version > SUPPORTED_SCHEMA_VERSION) {
     throw new MeasurementLoadError(
       `${entry.file} uses measurement schema v${measurement.schema_version}, but this ` +
-        `frontend understands v${SUPPORTED_SCHEMA_VERSION}. Update the Pill Lab frontend.`,
+      `frontend understands v${SUPPORTED_SCHEMA_VERSION}. Update the Pill Lab frontend.`,
     );
   }
   measurementCache.set(entry.file, measurement);
