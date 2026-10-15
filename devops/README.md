@@ -117,9 +117,26 @@ The CI gate, the release build and the shell entry points.
 | File | What it is |
 | --- | --- |
 | `verify.py` | the CI gate: every check CI runs, as named steps (`--list`, `--only`, `--quick`) |
+| `check_relevant.py` | runs only the checks a change set needs, by repository area |
 | `build_release.py` / `.sh` | release builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails) |
 | `run_hot_reload_tests.sh` | the hot-reload regression net: a fixed set of suites in `tests/` |
 | `generate_documentation.sh` | `docs/generate_documentation_markdown.py` |
+
+`check_relevant.py` is the loop to use after a change: it reads the working
+tree's change set (or `--paths`), matches every file against a per-area rule
+table, and runs just that area's checks - formatting and the coding-standards
+lint for Rust changes, the crate's unit tests, the named `tests/` suites and
+the few `verify.py` steps that guard the area. An editor suite gets the
+editor build (the uplift) prepended; a file no rule recognizes falls back to
+`verify.py --quick`, so nothing passes unchecked by accident. The full gate
+and the tier runs stay for stage boundaries and milestones.
+
+```powershell
+python devops/ci_cd/check_relevant.py --dry-run   # what would run, and why
+python devops/ci_cd/check_relevant.py             # run only that
+python devops/ci_cd/check_relevant.py --list-rules
+python devops/ci_cd/check_relevant.py --base origin/main
+```
 
 ```powershell
 python devops/ci_cd/verify.py --list

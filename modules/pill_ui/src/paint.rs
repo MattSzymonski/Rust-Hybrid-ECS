@@ -28,6 +28,7 @@ use crate::css::ComputedStyle;
 use crate::draw::{Color, DrawList, Rect};
 use crate::layout::{text_style, PanelLayout};
 use crate::panel::{node_enabled, PanelNode, PanelTree};
+use crate::scrollbar::{self, Axis};
 use crate::state::UiState;
 use crate::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -81,6 +82,42 @@ pub fn paint(
     }
     if active_clip.is_some() {
         list.pop_clip();
+    }
+    draw_scrollbars(&nodes, layout, theme, list);
+}
+
+/// Draw every overflowing scroll area's bars over its content.
+///
+/// The bars paint after the whole tree so nothing a child drew can end up
+/// on top of them; each one pushes its area's clip while it draws, and its
+/// colours come from the area's computed style with the theme as fallback.
+fn draw_scrollbars(nodes: &[&PanelNode], layout: &PanelLayout, theme: &Theme, list: &mut DrawList) {
+    for (index, node) in nodes.iter().enumerate() {
+        let PanelNode::ScrollArea { id, .. } = node else {
+            continue;
+        };
+        let Some(metrics) = layout.scrolls.get(id) else {
+            continue;
+        };
+        let css = &layout.styles[index];
+        let width = css.scrollbar_width.unwrap_or(theme.scrollbar_width);
+        let track_color = css.scrollbar_track.unwrap_or(theme.scrollbar_track);
+        let thumb_color = css.scrollbar_thumb.unwrap_or(theme.scrollbar_thumb);
+        let look = Look::of(css);
+        let clip = layout.clips[index];
+        for axis in Axis::BOTH {
+            let Some(bar) = scrollbar::geometry(metrics, axis, width) else {
+                continue;
+            };
+            if let Some(clip) = clip {
+                list.push_clip(clip);
+            }
+            list.push_rounded_fill(bar.track, look.fade(track_color), theme.radius_tiny);
+            list.push_rounded_fill(bar.thumb, look.fade(thumb_color), theme.radius_tiny);
+            if clip.is_some() {
+                list.pop_clip();
+            }
+        }
     }
 }
 

@@ -1123,6 +1123,9 @@ fn build_panel(
 
 /// The Hierarchy: every live entity, the selection highlighted, a click
 /// selects (the shared selection the Inspector and Stage 20 follow).
+///
+/// Rows are [`PanelBuilder::list_row`]s: the whole panel-width strip is the
+/// hit area, so a click on the empty space beside a name selects too.
 fn hierarchy_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
     builder.heading("Hierarchy");
     builder.label(&format!("{} entities", view.snapshot.entities.len()));
@@ -1130,16 +1133,12 @@ fn hierarchy_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &
     let mut selected: Option<pill_engine::Entity> = None;
     let shown = view.snapshot.entities.len().min(PANEL_ROWS);
     for entry in view.snapshot.entities.iter().take(shown) {
-        let label = if view.selection.entity == Some(entry.entity) {
-            format!("> {} ({})", entry.display, entry.archetype_label)
-        } else {
-            format!("  {} ({})", entry.display, entry.archetype_label)
-        };
-        builder.row(|row| {
-            if row.button(&label) {
-                selected = Some(entry.entity);
-            }
-        });
+        let is_selected = view.selection.entity == Some(entry.entity);
+        let label = format!("{} ({})", entry.display, entry.archetype_label);
+        let name = format!("entity {}", entry.entity);
+        if builder.list_row(&name, &label, is_selected) {
+            selected = Some(entry.entity);
+        }
     }
     if view.snapshot.entities.len() > shown {
         builder.label(&format!(

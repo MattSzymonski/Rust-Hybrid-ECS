@@ -34,8 +34,8 @@ use std::path::Path;
 use pill_core::math::Vector2f;
 use pill_core::platform::futures::block_on;
 use pill_ui::{
-    paint, run_frame, Atlas, Color, DrawList, PanelBuilder, Rect, Stylesheet, TextSystem, Theme,
-    TreeNode, UiState,
+    paint, run_frame, Atlas, Color, DrawList, PanelBuilder, Rect, Stylesheet, TextSystem,
+    TextureId, Theme, TreeNode, UiState,
 };
 use pill_ui_wgpu::{offscreen, UiRenderer};
 
@@ -54,12 +54,14 @@ const MAX_DIFFERING_FRACTION: f64 = 0.001;
 // Scenes
 // =============================================================================
 
-/// One golden-image scene: a name, a size in logical pixels, and the panel
-/// builder that draws it.
+/// One golden-image scene: a name, a size in logical pixels, the starting
+/// atlas side length (growth is part of what a scene may exercise), and the
+/// panel builder that draws it.
 struct Scene {
     name: &'static str,
     width: u32,
     height: u32,
+    atlas_length: u32,
     build: fn(&mut PanelBuilder<'_>),
 }
 
@@ -70,13 +72,29 @@ fn scenes() -> Vec<Scene> {
             name: "widgets",
             width: 440,
             height: 640,
+            atlas_length: 2048,
             build: golden_widgets,
         },
         Scene {
             name: "panel",
             width: 360,
             height: 300,
+            atlas_length: 2048,
             build: golden_panel,
+        },
+        Scene {
+            name: "scrollbars",
+            width: 260,
+            height: 220,
+            atlas_length: 2048,
+            build: golden_scrollbars,
+        },
+        Scene {
+            name: "atlas_growth",
+            width: 260,
+            height: 180,
+            atlas_length: 64,
+            build: golden_atlas_growth,
         },
     ]
 }
@@ -121,6 +139,31 @@ fn golden_panel(ui: &mut PanelBuilder<'_>) {
     let mut name = String::from("Player");
     ui.text_field("panel name", &mut name);
     ui.combo_box("Shading", 0, &["Lit", "Unlit", "Wireframe"]);
+}
+
+/// A scroll area whose content overflows both ways: the bars show, with the
+/// vertical thumb at the top and the horizontal one at the left.
+fn golden_scrollbars(ui: &mut PanelBuilder<'_>) {
+    ui.heading("Scrollbars");
+    ui.scroll_area("golden scroll", 96.0, |ui| {
+        for index in 0..14 {
+            ui.label(&format!("row {index}"));
+        }
+        // Wider than the viewport: the horizontal bar appears too. The
+        // external texture is never registered, so the quad is skipped and
+        // the image stays deterministic.
+        ui.image("wide", TextureId::External(1), Vector2f::new(320.0, 24.0));
+    });
+    ui.label("below the area");
+}
+
+/// Sixty-two distinct glyphs in a 64-texel atlas: the frame grows it in
+/// pages, and the text must come out clean through the new UVs.
+fn golden_atlas_growth(ui: &mut PanelBuilder<'_>) {
+    ui.heading("Atlas growth");
+    ui.label("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    ui.label("abcdefghijklmnopqrstuvwxyz");
+    ui.label("0123456789");
 }
 
 // =============================================================================
@@ -177,40 +220,50 @@ fn render_scene(device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene) -> Ve
     let mut text = TextSystem::new();
     let theme = Theme::default();
     let mut sheet = Stylesheet::parse(pill_ui::DEFAULT_SHEET);
-    let mut atlas = Atlas::new(2048, 2048);
+    let mut atlas = Atlas::with_limit(
+        scene.atlas_length,
+        scene.atlas_length,
+        scene.atlas_length.max(512),
+    );
     let mut renderer = UiRenderer::new(
         device,
         queue,
         wgpu::TextureFormat::Rgba8UnormSrgb,
-        (2048, 2048),
+        (scene.atlas_length, scene.atlas_length),
     );
 
     state.input.begin_frame();
     let available = Vector2f::new(scene.width as f32, scene.height as f32);
-    let (output, layout) = run_frame(
-        &mut state,
-        &mut text,
-        &theme,
-        &mut sheet,
-        available,
-        scene.build,
-    );
-    state.end_frame();
+    // Two frames: a page growth re-scales every UV, so the frame that grows
+    // the atlas can carry quads placed against the old scale; the second
+    // frame draws against the settled size, which is what is stored. The
+    // window fill an embedder paints behind the panel (the theme's window
+    // colour, the same value as `--bg-window` in the stylesheet).
     let mut list = DrawList::new();
-    // The window fill an embedder paints behind the panel (the theme's
-    // window colour, the same value as `--bg-window` in the stylesheet), so
-    // the image shows the approved whole-surface look.
-    list.push_fill(Rect::from_min_size(Vector2f::ZERO, available), theme.window);
-    paint(
-        &output.tree,
-        &layout,
-        &theme,
-        &mut state,
-        &mut text,
-        &mut atlas,
-        &mut list,
-    );
-    renderer.upload_atlas(queue, &mut atlas);
+    for _frame in 0..2 {
+        let (output, layout) = run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            available,
+            scene.build,
+        );
+        state.end_frame();
+        list.clear();
+        list.push_fill(Rect::from_min_size(Vector2f::ZERO, available), theme.window);
+        paint(
+            &output.tree,
+            &layout,
+            &theme,
+            &mut state,
+            &mut text,
+            &mut atlas,
+            &mut list,
+        );
+        atlas.ensure_headroom();
+    }
+    renderer.upload_atlas(device, queue, &mut atlas);
     block_on(offscreen::render_rgba(
         device,
         queue,

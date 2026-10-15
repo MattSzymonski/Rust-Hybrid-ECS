@@ -145,7 +145,7 @@ fn renders_text_clipped_rectangles_and_external_textures() {
         (128, 128),
     );
     renderer.set_external(&device, &queue, 7, (8, 8), &texture);
-    renderer.upload_atlas(&queue, &mut atlas);
+    renderer.upload_atlas(&device, &queue, &mut atlas);
     let rows = block_on(offscreen::render_rgba(
         &device,
         &queue,

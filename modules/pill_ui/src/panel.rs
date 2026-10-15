@@ -42,12 +42,13 @@ use pill_engine_core::{KeyCode, Modifiers, MouseButton};
 // Current crate
 use crate::draw::{Color, Rect, TextureId};
 use crate::input::UiInput;
+use crate::scrollbar::{self, Axis, ScrollMetrics};
 use crate::state::{Interaction, UiState};
 use crate::theme::Theme;
-use crate::widget::{TextEditState, WidgetId, WidgetMemory};
+use crate::widget::{ScrollGrab, TextEditState, WidgetId, WidgetMemory};
 
 /// How many logical pixels one wheel line scrolls.
-const SCROLL_LINE_HEIGHT: f32 = 24.0;
+pub(crate) const SCROLL_LINE_HEIGHT: f32 = 24.0;
 
 // =============================================================================
 // Frame results
@@ -416,6 +417,8 @@ pub struct PanelBuilder<'a> {
     interaction: &'a mut Interaction,
     /// Per-widget memory.
     memory: &'a mut BTreeMap<WidgetId, WidgetMemory>,
+    /// Each scroll area's geometry as the last layout measured it.
+    scrolls: &'a BTreeMap<WidgetId, ScrollMetrics>,
     /// The metrics and colours the panel is built for.
     theme: &'a Theme,
     /// The naming path of the container being built.
@@ -451,6 +454,7 @@ impl<'a> PanelBuilder<'a> {
             hit_rects: &state.hit_rects,
             interaction: &mut state.interaction,
             memory: &mut state.memory,
+            scrolls: &state.scrolls,
             theme,
             path: Vec::new(),
             level_counters: HashMap::new(),
@@ -1103,10 +1107,12 @@ impl<'a> PanelBuilder<'a> {
         open
     }
 
-    /// A clipped, vertically scrollable group `height` pixels tall.
+    /// A clipped, scrollable group `height` pixels tall.
     ///
-    /// The content is laid out naturally; the wheel over the area adjusts
-    /// the stored offset, which layout clamps to the content height.
+    /// The content is laid out naturally; the wheel over the area, a drag on
+    /// a scrollbar thumb, a click on its track, and Page Up/Down, Home and
+    /// End while the area holds focus adjust the stored offsets, which
+    /// layout clamps to the content's real extent.
     pub fn scroll_area(&mut self, name: &str, height: f32, add: impl FnOnce(&mut Self)) {
         let id = self.id_of(name);
         let node = PanelNode::ScrollArea {
@@ -1127,13 +1133,118 @@ impl<'a> PanelBuilder<'a> {
             if under_pointer {
                 let lines = self.input.scroll_lines();
                 let pixels = self.input.scroll_pixels();
-                let delta = lines.y * SCROLL_LINE_HEIGHT + pixels.y;
-                if delta != 0.0 {
+                let delta = lines * SCROLL_LINE_HEIGHT + pixels;
+                if delta.x != 0.0 || delta.y != 0.0 {
                     let memory = self.memory.entry(id).or_default();
-                    memory.scroll = (memory.scroll - delta).max(0.0);
+                    // Positive wheel lines point up (content moves down the
+                    // viewport) and right (content moves left), so the y
+                    // offset falls and the x offset grows.
+                    let vertical = scroll_field(memory, Axis::Vertical);
+                    *vertical = (*vertical - delta.y).max(0.0);
+                    let horizontal = scroll_field(memory, Axis::Horizontal);
+                    *horizontal = (*horizontal + delta.x).max(0.0);
                     self.scroll_claimed = true;
                 }
             }
+        }
+
+        self.scrollbar_interaction(id);
+    }
+
+    /// The scrollbars of the area `id`: dragging a thumb, pressing a track,
+    /// and the keyboard while the area holds focus.
+    ///
+    /// The bar rectangles came from last frame's layout (they only exist
+    /// while the axis overflows); dragging maps the pointer's motion along
+    /// the bar onto the scroll range proportionally, so a drag never runs
+    /// ahead of the pointer.
+    fn scrollbar_interaction(&mut self, id: WidgetId) {
+        let Some(metrics) = self.scrolls.get(&id).copied() else {
+            return;
+        };
+        let pointer = self.input.pointer();
+        for axis in Axis::BOTH {
+            if !metrics.overflows(axis) {
+                continue;
+            }
+            let thumb_id = WidgetId::named(id, &format!("scrollbar-thumb-{}", axis.suffix()));
+            let track_id = WidgetId::named(id, &format!("scrollbar-track-{}", axis.suffix()));
+            // The thumb sits inside the track, so the track is only treated
+            // as a jump target when the press missed the thumb; the thumb
+            // interacts second, so a press on it wins the drag state.
+            let on_thumb = self
+                .rect(thumb_id)
+                .zip(pointer)
+                .map(|(rect, pointer)| rect.contains(pointer))
+                .unwrap_or(false);
+            let track = self.interact_as(track_id, id, true);
+            let thumb = self.interact_as(thumb_id, id, true);
+            let pointer = pointer.map(|point| axis.position(point));
+            {
+                let memory = self.memory.entry(id).or_default();
+                if thumb.pressed {
+                    if let Some(pointer) = pointer {
+                        memory.scroll_grab = Some(ScrollGrab {
+                            axis,
+                            pointer,
+                            scroll: metrics.offset(axis),
+                        });
+                    }
+                }
+                match memory.scroll_grab {
+                    Some(grab) if grab.axis == axis => {
+                        if thumb.held {
+                            if let Some(pointer) = pointer {
+                                let offset = scrollbar::thumb_offset(
+                                    &metrics,
+                                    axis,
+                                    pointer,
+                                    grab.pointer,
+                                    grab.scroll,
+                                );
+                                *scroll_field(memory, axis) = offset;
+                            }
+                        } else {
+                            memory.scroll_grab = None;
+                        }
+                    }
+                    _ => {}
+                }
+                if track.pressed && !on_thumb {
+                    if let Some(pointer) = pointer {
+                        let offset = scrollbar::track_offset(&metrics, axis, pointer);
+                        *scroll_field(memory, axis) = offset;
+                    }
+                }
+            }
+        }
+
+        // Keyboard scrolling follows the axis that overflows vertically
+        // first: Page Up/Down and Home/End move the reading position.
+        let axis = if metrics.overflows(Axis::Vertical) {
+            Axis::Vertical
+        } else {
+            Axis::Horizontal
+        };
+        if !metrics.overflows(axis) || self.interaction.focus != Some(id) {
+            return;
+        }
+        let step = scrollbar::scroll_step(&metrics, axis);
+        let current = metrics.offset(axis);
+        let target = if self.input.key_pressed(KeyCode::PageDown) {
+            Some(current + step)
+        } else if self.input.key_pressed(KeyCode::PageUp) {
+            Some(current - step)
+        } else if self.input.key_pressed(KeyCode::Home) {
+            Some(0.0)
+        } else if self.input.key_pressed(KeyCode::End) {
+            Some(metrics.max(axis))
+        } else {
+            None
+        };
+        if let Some(target) = target {
+            let memory = self.memory.entry(id).or_default();
+            *scroll_field(memory, axis) = target.clamp(0.0, metrics.max(axis));
         }
     }
 
@@ -1186,6 +1297,26 @@ impl<'a> PanelBuilder<'a> {
             selected: selection,
         });
         selection
+    }
+
+    /// One row of a flat list (the Hierarchy): the whole panel-width strip
+    /// is the hit area, not just the label, and the row paints like a
+    /// selected or hovered tree row. Returns whether it was clicked.
+    ///
+    /// `name` must be unique per row (an entity's display handle works);
+    /// `selected` marks the list's current row.
+    pub fn list_row(&mut self, name: &str, label: &str, selected: bool) -> bool {
+        let id = self.id_of(name);
+        let frame = self.interact(id, true);
+        self.add(PanelNode::TreeRow {
+            id,
+            depth: 0,
+            label: label.to_string(),
+            open: false,
+            has_children: false,
+            selected,
+        });
+        frame.clicked
     }
 
     /// A tree view over `nodes`; the selected row's widget id, if any.
@@ -1586,6 +1717,14 @@ fn arrow_step_y(input: &UiInput) -> i32 {
         presses += 1;
     }
     presses
+}
+
+/// The stored offset field a scrollbar axis writes.
+fn scroll_field(memory: &mut WidgetMemory, axis: Axis) -> &mut f32 {
+    match axis {
+        Axis::Vertical => &mut memory.scroll,
+        Axis::Horizontal => &mut memory.scroll_x,
+    }
 }
 
 // =============================================================================

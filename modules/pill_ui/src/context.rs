@@ -199,8 +199,11 @@ impl UiContext {
     /// text and icons produced; drains both.
     ///
     /// The renderer's frame builder calls this once per update; without it
-    /// the atlas keeps accumulating its dirty list.
+    /// the atlas keeps accumulating its dirty list. A nearly full atlas is
+    /// grown a page here, between frames, so the size change never lands
+    /// under a quad that was already pushed against the old UV scale.
     pub fn take_frame(&mut self) -> UiFrame {
+        self.atlas.ensure_headroom();
         let mut frame = std::mem::take(&mut self.frame);
         frame.atlas = self.atlas.take_update();
         frame

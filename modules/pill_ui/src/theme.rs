@@ -80,6 +80,12 @@ pub struct Theme {
     pub track_fill: Color,
     /// A slider's knob.
     pub knob: Color,
+    /// A scrollbar's thumb.
+    pub scrollbar_thumb: Color,
+    /// The strip a scrollbar's thumb slides in.
+    pub scrollbar_track: Color,
+    /// The scrollbar strip's thickness in logical pixels.
+    pub scrollbar_width: f32,
     /// Border width for focused and outlined widgets.
     pub border_width: f32,
 
@@ -131,6 +137,9 @@ impl Default for Theme {
             track: Color::rgba(51.0 / 255.0, 51.0 / 255.0, 51.0 / 255.0, 1.0),
             track_fill: Color::rgba(143.0 / 255.0, 143.0 / 255.0, 143.0 / 255.0, 1.0),
             knob: Color::rgba(196.0 / 255.0, 196.0 / 255.0, 196.0 / 255.0, 1.0),
+            scrollbar_thumb: Color::rgba(94.0 / 255.0, 94.0 / 255.0, 94.0 / 255.0, 1.0),
+            scrollbar_track: Color::rgba(25.0 / 255.0, 25.0 / 255.0, 25.0 / 255.0, 1.0),
+            scrollbar_width: 9.0,
             border_width: 1.0,
             radius_tiny: 2.0,
             radius_small: 3.0,
@@ -165,6 +174,8 @@ impl Theme {
             ("track", self.track),
             ("track_fill", self.track_fill),
             ("knob", self.knob),
+            ("scrollbar_thumb", self.scrollbar_thumb),
+            ("scrollbar_track", self.scrollbar_track),
         ]
     }
 }
@@ -182,7 +193,7 @@ mod tests {
         let theme = Theme::default();
         assert!(theme.item_height >= theme.line_height);
         assert!(theme.padding > 0.0 && theme.spacing > 0.0);
-        assert_eq!(theme.color_tokens().len(), 21);
+        assert_eq!(theme.color_tokens().len(), 23);
         // Every colour is visible against the background it sits on.
         assert!(theme.text.a > 0.9);
         assert!(theme.highlight.a > 0.9);

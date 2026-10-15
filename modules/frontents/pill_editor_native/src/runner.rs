@@ -1209,8 +1209,10 @@ impl EditorWindow {
             &mut self.atlas,
             &mut list,
         );
+        self.atlas.ensure_headroom();
         if let Some(update) = self.atlas.take_update() {
-            self.ui.apply_atlas_update(&self.queue, &update);
+            self.ui
+                .apply_atlas_update(&self.device, &self.queue, &update);
         }
         (list, output.clipboard)
     }
@@ -1320,8 +1322,10 @@ impl EditorWindow {
             &mut self.atlas,
             &mut list,
         );
+        self.atlas.ensure_headroom();
         if let Some(update) = self.atlas.take_update() {
-            self.ui.apply_atlas_update(&self.queue, &update);
+            self.ui
+                .apply_atlas_update(&self.device, &self.queue, &update);
         }
         let retry_rect = output
             .named
@@ -4256,7 +4260,8 @@ impl EditorWindow {
         place_view(&mut self.game, self.last_game_rect, scale_factor, "game");
         // Step 6: the atlas additions of whichever UI built this frame.
         if let Some(update) = output.atlas {
-            self.ui.apply_atlas_update(&self.queue, &update);
+            self.ui
+                .apply_atlas_update(&self.device, &self.queue, &update);
         }
         // Step 7: clipboard traffic (D28). Widget requests and the shell's
         // structured objects are written through the platform layer; a

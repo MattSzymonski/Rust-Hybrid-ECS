@@ -778,7 +778,7 @@ impl State {
         }
         let ui_renderer = self.ui_renderer.as_mut().expect("built above");
         if let Some(update) = &frame.ui.atlas {
-            ui_renderer.apply_atlas_update(&self.queue, update);
+            ui_renderer.apply_atlas_update(&self.device, &self.queue, update);
         }
         let mut vertices = 0usize;
         let mut draws = 0usize;

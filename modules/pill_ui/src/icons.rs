@@ -22,7 +22,8 @@
 //! output).
 
 // Standard library
-use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -46,7 +47,7 @@ pub struct IconId(pub u64);
 // =============================================================================
 
 /// One cached icon: which icon revision at which pixel length.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct IconKey {
     /// The caller's icon identity.
     id: IconId,
@@ -57,10 +58,27 @@ struct IconKey {
 }
 
 /// The icon half of the shared atlas: rasterize once, draw many times.
+///
+/// The atlas holds the registry: an icon asks for its entry by key and
+/// rasterizes again when the lookup misses, so a full atlas evicting an
+/// icon costs one re-render, never a missing picture.
 #[derive(Clone, Debug, Default)]
 pub struct IconCache {
-    /// Where every rasterized icon lives.
-    entries: BTreeMap<IconKey, Region>,
+    /// Whether the one allowed "the atlas is full" warning was logged.
+    atlas_full_warned: bool,
+}
+
+/// The tag icons carry in the atlas; scale eviction never collects them
+/// (a glyph's tag is its small rasterization scale, far below this).
+const ICON_TAG: u64 = u64::MAX;
+
+/// The atlas key of one icon rasterization; the leading zero byte keeps it
+/// apart from a glyph's key, which hashes its cache key directly.
+fn entry_key(key: &IconKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    0u8.hash(&mut hasher);
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl IconCache {
@@ -89,8 +107,9 @@ impl IconCache {
             revision,
             length,
         };
-        if let Some(region) = self.entries.get(&key) {
-            return Some(*region);
+        let entry = entry_key(&key);
+        if let Some(region) = atlas.touch(entry) {
+            return Some(region);
         }
 
         let options = usvg::Options::default();
@@ -131,20 +150,18 @@ impl IconCache {
             }
         }
 
-        let region = atlas.allocate(length, length)?;
+        let Some(region) = atlas.reserve(entry, length, length, ICON_TAG) else {
+            if !self.atlas_full_warned {
+                self.atlas_full_warned = true;
+                pill_core::warn!(
+                    target: telemetry_target::UI,
+                    "[pill_ui] the icon atlas is full; icons are not rasterized"
+                );
+            }
+            return None;
+        };
         atlas.write_region(region, &rgba);
-        self.entries.insert(key, region);
         Some(region)
-    }
-
-    /// How many icons are cached.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether no icon is cached.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -331,7 +348,7 @@ mod tests {
             atlas.take_updated_regions().is_empty(),
             "no second rasterization"
         );
-        assert_eq!(cache.len(), 1);
+        assert_eq!(atlas.entry_count(), 1);
     }
 
     #[test]
@@ -345,7 +362,7 @@ mod tests {
             .icon(&mut atlas, IconId(1), 1, RED_SQUARE, 8.0, 1.0)
             .expect("the new revision rasterizes");
         assert!(!atlas.take_updated_regions().is_empty());
-        assert_eq!(cache.len(), 2, "both revisions stay cached");
+        assert_eq!(atlas.entry_count(), 2, "both revisions stay cached");
         assert_eq!(corner_pixel(&atlas, region)[3], 255);
     }
 
@@ -378,19 +395,19 @@ mod tests {
             cache.icon(&mut atlas, IconId(2), 0, b"not an svg", 8.0, 1.0),
             None
         );
-        assert!(cache.is_empty());
+        assert_eq!(atlas.entry_count(), 0);
         assert!(atlas.take_updated_regions().is_empty());
     }
 
     #[test]
-    fn an_atlas_too_small_for_the_icon_refuses_it() {
-        let mut atlas = Atlas::new(4, 4);
+    fn an_icon_bigger_than_the_atlas_cap_is_refused() {
+        let mut atlas = Atlas::with_limit(4, 4, 4);
         let mut cache = IconCache::new();
         assert_eq!(
             cache.icon(&mut atlas, IconId(1), 0, RED_SQUARE, 8.0, 1.0),
             None
         );
-        assert!(cache.is_empty());
+        assert_eq!(atlas.entry_count(), 0);
     }
 
     #[test]

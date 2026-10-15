@@ -46,12 +46,23 @@
     /* radii */
     --r-tiny: 2px;
     --r-sm: 3px;
+    /* scrollbars */
+    --scrollbar-width: 9px;
+    --scrollbar-thumb: rgb(94, 94, 94);
+    --scrollbar-track: rgb(25, 25, 25);
 }
 
 row,
 column,
 scroll-area {
     gap: var(--spacing);
+}
+
+/* Bars show only while an axis overflows; the values mirror `Theme`. */
+scroll-area {
+    scrollbar-width: var(--scrollbar-width);
+    scrollbar-thumb: var(--scrollbar-thumb);
+    scrollbar-track: var(--scrollbar-track);
 }
 
 label {
