@@ -249,6 +249,12 @@ CSHARP_REJECT_STARTUP_REASON = "C# startup methods changed"
 # `ModuleSplineBridgeDemo`).
 BRIDGE_PROBE_PREFIX = "cs spline bridge: sees"
 BRIDGE_PROBE_V2_PREFIX = "cs spline bridge v2: sees"
+# The two probe lines this suite waits for, spelled out rather than written
+# inline at each `wait_for` call: `test_log_contract.py` only sees a `*_TOKEN`
+# constant, so an inline literal could be reworded with nothing to catch it.
+# Both carry BRIDGE_PROBE_PREFIX and must move with it.
+BRIDGE_PROBE_RUST_TO_CS_TOKEN = "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4"
+BRIDGE_PROBE_CS_TO_RUST_TOKEN = "cs spline bridge: sees 2 spline(s)"
 # dotnet build's summary line; a clean managed build reports exactly these.
 DOTNET_CLEAN_WARNING_SUMMARY = "0 Warning(s)"
 WARNING_CS_TOKEN = "warning CS"
@@ -543,7 +549,7 @@ def verify_startup(
     #   Rust -> C#: C# reads the spline the module seeded with the correct
     #   layout (first P0.X=0, count=4).
     if not monitor.wait_for(
-        f"{BRIDGE_PROBE_PREFIX} 1 spline(s), first P0.X=0, count=4",
+        BRIDGE_PROBE_RUST_TO_CS_TOKEN,
         PROBE_TIMEOUT,
         0,
     ):
@@ -556,7 +562,7 @@ def verify_startup(
     #   project's own path system rewrites the live curve every frame, so the
     #   first control point and the point count move from the second report on.
     if not monitor.wait_for(
-        f"{BRIDGE_PROBE_PREFIX} 2 spline(s)",
+        BRIDGE_PROBE_CS_TO_RUST_TOKEN,
         PROBE_TIMEOUT,
         0,
     ):
@@ -1261,7 +1267,7 @@ def verify_codegen_rebuild() -> bool:
         print("  [OK] Regenerated mirror matches the committed bootstrap.")
         # And the bridge must be live again (Rust -> C# direction).
         if not monitor.wait_for(
-            f"{BRIDGE_PROBE_PREFIX} 1 spline(s), first P0.X=0, count=4",
+            BRIDGE_PROBE_RUST_TO_CS_TOKEN,
             PROBE_TIMEOUT,
         ):
             print("  [FAIL] Bridge probe missing after codegen rebuild.")
