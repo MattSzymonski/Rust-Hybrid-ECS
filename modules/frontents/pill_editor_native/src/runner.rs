@@ -37,8 +37,8 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_api::{
     EditorNoticeEvent, EditorNotices, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
-    EditorProblem, EditorProblemLevel, EditorWindowKeyKind, EditorWindowPointerKind,
-    EditorWindowRequest,
+    EditorProblem, EditorProblemLevel, EditorViewKind, EditorViewRect, EditorWindowKeyKind,
+    EditorWindowPointerKind, EditorWindowRequest,
 };
 use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
 use pill_editor_core::editor_state::EditorCommand;
@@ -378,10 +378,11 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
             return;
         }
         // The game and scene surfaces are their own windows: the game
-        // window's events are the game's input, the scene window's drive the
-        // editor camera, the main window's the editor UI's.
-        if editor.is_scene_window(window_id) {
-            editor.scene_view_event(&event);
+        // window's events are the game's input, a scene window's drive its
+        // own view's editor camera (Stage 29), the main window's the editor
+        // UI's.
+        if let Some(index) = editor.scene_view_index(window_id) {
+            editor.scene_view_event(index, &event);
             return;
         }
         if editor.is_game_window(window_id) {
@@ -405,6 +406,18 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
             }
             WindowEvent::Resized(size) => {
                 editor.resize(size.width, size.height);
+            }
+            // A monitor change under the editor window (D30, Stage 29): the
+            // UI re-lays out from the new logical size on the next frame,
+            // and the log names the new scale.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    window = "main",
+                    scale = scale_factor,
+                    "[editor] scale factor changed"
+                );
+                editor.window.request_redraw();
             }
             // The OS drag-and-drop events (Stage 18): hover state feeds the
             // shell's drop preview; a dropped file becomes an import.
@@ -474,6 +487,7 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
         };
         editor.sync_popups(event_loop);
         editor.sync_free_windows(event_loop);
+        editor.sync_view_windows(event_loop);
         editor.schedule_frame(event_loop);
     }
 }
@@ -495,19 +509,25 @@ struct EditorWindow {
     /// (D29). Declared before the main window: the child is destroyed before
     /// its parent.
     game: SurfaceWindow,
-    /// The scene surface, attached as [`SCENE_SURFACE`] and bound to the
-    /// editor camera; the editor's navigation never reaches the game.
-    scene: SurfaceWindow,
-    /// Whether the scene surface was accepted by the project's renderer; a
-    /// single-surface renderer refuses it and the Scene tab then stays
-    /// empty.
-    scene_attached: bool,
-    /// The editor camera the scene surface draws through, as plain data:
-    /// it is never an entity in the world (D29).
-    camera: EditorCamera,
-    /// Whether the renderer needs the camera re-bound this frame; set by
-    /// camera changes only, so a still camera costs nothing.
-    camera_dirty: bool,
+    /// Every scene view surface (Stage 29), in the order the shell asked
+    /// for them: each draws through its own editor camera, and each is
+    /// placed at its own layout rectangle. The view with the smallest tab
+    /// node keeps the boot-time [`SCENE_SURFACE`] and is the one the
+    /// scripted channel names.
+    views: Vec<ViewSurface>,
+    /// The next surface id to hand a later view; [`SCENE_SURFACE`] is
+    /// taken by the first scene view.
+    next_surface_id: u32,
+    /// Whether the extra-game-view note was logged (one game view draws;
+    /// more than one selected tab is refused once, not per frame).
+    game_view_note_logged: bool,
+    /// The scene views the shell asked for that have no window yet (Stage
+    /// 29): the frame stages them and the next boundary creates them,
+    /// because creating a window re-enters winit's dispatch.
+    pending_view_creates: Vec<PendingViewCreate>,
+    /// The placement signature of the last synced frame, so a moved, shown
+    /// or hidden view dirties the scene (Stage 23, D32).
+    last_view_placements: Vec<(String, EditorRect, Option<String>)>,
     /// The winit window; redraws are requested through it.
     window: Arc<Window>,
     /// The editor's presentation surface.
@@ -622,7 +642,7 @@ struct EditorWindow {
     /// Where the left mouse button went down on the scene window, in
     /// physical pixels, so its release can ask what is under it. A real
     /// click only; the scripted channel requests its pick directly.
-    scene_press: Option<(f32, f32)>,
+    scene_press: Option<(usize, f32, f32)>,
     /// The entity the outlines currently name, so the world resource is
     /// rewritten only on a change.
     outlined_entity: Option<pill_engine_core::Entity>,
@@ -643,6 +663,9 @@ struct EditorWindow {
     /// The pixel delta of the scripted drag whose pick is in flight; `None`
     /// for a press the real mouse issued.
     synthetic_gizmo_pending: Option<(f32, f32)>,
+    /// The scene view the scripted drag works on (Stage 29): the tab node
+    /// the command named, or the primary view when it named none.
+    synthetic_gizmo_view: Option<u64>,
     /// The scripted press's pixel neighbourhood: the request ids still in
     /// flight, so the first pixel that names a handle starts the drag and a
     /// full miss refuses it.
@@ -885,14 +908,12 @@ impl EditorWindow {
                 "[editor] monitor work area"
             );
         }
-        // Step 5: the two view surfaces and the project host. The game
-        // window is the renderer's primary surface, attached exactly as a
-        // game frontend attaches one; the scene window is a second surface
-        // bound to the editor camera (D29).
+        // Step 5: the game surface and the project host. The game window is
+        // the renderer's primary surface, attached exactly as a game
+        // frontend attaches one; the scene views (Stage 29) attach as the
+        // shell names them, on the first frame that reports one.
         let game = SurfaceWindow::open(event_loop, &window, "Pill Editor Game", "game")?;
-        let scene = SurfaceWindow::open(event_loop, &window, "Pill Editor Scene", "scene")?;
         let (game_width, game_height) = game.size();
-        let (scene_width, scene_height) = scene.size();
         let config =
             HostConfig::from_environment_for_editor().map_err(pill_core::error::HostError::from)?;
         let mut host =
@@ -948,38 +969,9 @@ impl EditorWindow {
             detached = game.detached,
             "[editor] game surface attached"
         );
-        // The scene surface is the renderer's choice: one that draws a
-        // single surface refuses it, and the Scene tab then stays empty
-        // while the editor carries on.
-        let scene_attached = match host.attach_surface(
-            SCENE_SURFACE,
-            Arc::clone(&scene.window),
-            scene_width,
-            scene_height,
-            SurfaceOptions::default(),
-        ) {
-            Ok(()) => {
-                info!(
-                    target: telemetry_target::ENGINE,
-                    detached = scene.detached,
-                    "[editor] scene surface attached"
-                );
-                true
-            }
-            Err(error) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    error = %error,
-                    "[editor] scene surface refused; the scene view stays empty"
-                );
-                false
-            }
-        };
-        // The editor camera is plain data bound to the scene surface; the
-        // game surface keeps the frame's own choice among the world's
-        // cameras.
-        let camera = EditorCamera::default();
-        host.set_surface_camera(SCENE_SURFACE, Some(camera.binding()));
+        // The shell's first frame names the scene views (Stage 29): each is
+        // attached as its own surface there, so a single-surface renderer
+        // refusing one leaves only that view empty.
         // The scripted suite's panel fixtures: a panel that panics, so the
         // shell's containment can be exercised end to end (Stage 16).
         // Registered only while the scripted channel is active; its name
@@ -1014,10 +1006,11 @@ impl EditorWindow {
         Ok(EditorWindow {
             host,
             game,
-            scene,
-            scene_attached,
-            camera,
-            camera_dirty: false,
+            views: Vec::new(),
+            next_surface_id: 2,
+            game_view_note_logged: false,
+            pending_view_creates: Vec::new(),
+            last_view_placements: Vec::new(),
             window,
             surface,
             device,
@@ -1071,6 +1064,7 @@ impl EditorWindow {
             gizmo_logged: None,
             synthetic_gizmo_drag: None,
             synthetic_gizmo_pending: None,
+            synthetic_gizmo_view: None,
             synthetic_press_ids: Vec::new(),
             gizmo_drag_seq: 0,
             overlay,
@@ -1271,8 +1265,13 @@ impl EditorWindow {
             assets_rect: self.last_assets_rect,
             drag_candidate: None,
             requested_open: None,
-            scene_rect: Some(safe_mode_scene_rect(available)),
-            game_rect: None,
+            views: vec![EditorViewRect {
+                id: String::from("view:safe"),
+                node: 0,
+                kind: EditorViewKind::Scene,
+                rect: safe_mode_scene_rect(available),
+                window: None,
+            }],
             overlay: DrawList::default(),
             overlay_opaque: Vec::new(),
             popups: Vec::new(),
@@ -1348,9 +1347,44 @@ impl EditorWindow {
         (list, retry_rect, retry_clicked)
     }
 
-    /// Whether a window id is the scene surface's.
-    fn is_scene_window(&self, id: WindowId) -> bool {
-        id == self.scene.window.id()
+    /// The index of the scene view that owns `id`, when one does (Stage
+    /// 29): every scene window routes into its own view's camera.
+    fn scene_view_index(&self, id: WindowId) -> Option<usize> {
+        self.views
+            .iter()
+            .position(|view| view.window.window.id() == id)
+    }
+
+    /// The primary scene view's index: the smallest tab node, which is the
+    /// workspace's own Scene tab and keeps the boot-time surface id.
+    fn primary_scene_index(&self) -> Option<usize> {
+        self.views
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, view)| view.node)
+            .map(|(index, _)| index)
+    }
+
+    /// The primary scene view: the smallest tab node, which is the
+    /// workspace's own Scene tab.
+    fn primary_scene(&self) -> Option<&ViewSurface> {
+        self.primary_scene_index().map(|index| &self.views[index])
+    }
+
+    /// The primary scene view's camera.
+    fn primary_camera(&self) -> Option<&EditorCamera> {
+        self.primary_scene().map(|view| &view.camera)
+    }
+
+    /// The primary scene view's camera, mutably.
+    fn primary_camera_mut(&mut self) -> Option<&mut EditorCamera> {
+        let index = self.primary_scene_index()?;
+        Some(&mut self.views[index].camera)
+    }
+
+    /// Whether any scene surface is attached right now.
+    fn any_scene_attached(&self) -> bool {
+        self.views.iter().any(|view| view.surface_id.is_some())
     }
 
     /// Whether a window id is the game surface's.
@@ -1401,6 +1435,206 @@ impl EditorWindow {
         // A window the user closed is dropped by `sync`; its id tells the
         // shell to drop its state next frame.
         self.window_closed.extend(closed);
+    }
+
+    /// Create the scene view windows the shell asked for at this frame
+    /// boundary (Stage 29): a child of the main window, or of the popped-out
+    /// window that holds the view, then its surface attached and its camera
+    /// bound. A renderer that refuses a surface leaves only that view empty.
+    fn sync_view_windows(&mut self, event_loop: &ActiveEventLoop) {
+        for request in std::mem::take(&mut self.pending_view_creates) {
+            let parent = request
+                .owner
+                .as_deref()
+                .and_then(|owner| self.windows.parent_window(owner))
+                .unwrap_or_else(|| Arc::clone(&self.window));
+            let title = match request.owner {
+                Some(_) => format!("Pill Editor Scene {}", request.node),
+                None => String::from("Pill Editor Scene"),
+            };
+            let surface = match SurfaceWindow::open(event_loop, &parent, &title, "scene") {
+                Ok(surface) => surface,
+                Err(error) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        error = %error,
+                        "[editor] scene view window refused"
+                    );
+                    continue;
+                }
+            };
+            let (width, height) = surface.size();
+            let surface_id = if self.views.is_empty() {
+                SCENE_SURFACE
+            } else {
+                SurfaceId(self.next_surface_id)
+            };
+            let mut view = ViewSurface {
+                id: request.id,
+                node: request.node,
+                surface_id: None,
+                window: surface,
+                camera: EditorCamera::default(),
+                owner: request.owner,
+                logical: None,
+            };
+            match self.host.attach_surface(
+                surface_id,
+                Arc::clone(&view.window.window),
+                width,
+                height,
+                SurfaceOptions::default(),
+            ) {
+                Ok(()) => {
+                    view.surface_id = Some(surface_id);
+                    self.host
+                        .set_surface_camera(surface_id, Some(view.camera.binding()));
+                    if surface_id == SCENE_SURFACE {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            detached = view.window.detached,
+                            "[editor] scene surface attached"
+                        );
+                    } else {
+                        // NOTE: asserted on by the editor's end-to-end suite.
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            id = view.id.as_str(),
+                            owner = view.owner.as_deref().unwrap_or("main"),
+                            detached = view.window.detached,
+                            "[editor] view surface attached"
+                        );
+                        self.next_surface_id += 1;
+                    }
+                }
+                Err(error) => warn!(
+                    target: telemetry_target::ENGINE,
+                    id = view.id.as_str(),
+                    error = %error,
+                    "[editor] scene surface refused; the scene view stays empty"
+                ),
+            }
+            self.views.push(view);
+        }
+    }
+
+    /// Follow the shell's view rectangles (Stage 29): stage the windows new
+    /// views need, place every live scene view at its rectangle in the
+    /// window that owns it, and keep the game rectangle for the renderer's
+    /// primary surface. A view the shell no longer names hides rather than
+    /// dying, so a reopened tab costs no re-attach.
+    fn sync_view_requests(&mut self, requested: &[EditorViewRect], scale_factor: f32) {
+        let game_views: Vec<&EditorViewRect> = requested
+            .iter()
+            .filter(|view| view.kind == EditorViewKind::Game)
+            .collect();
+        if game_views.len() > 1 && !self.game_view_note_logged {
+            self.game_view_note_logged = true;
+            // NOTE: asserted on by the editor's end-to-end suite.
+            info!(
+                target: telemetry_target::ENGINE,
+                count = game_views.len(),
+                "[editor] only one game view draws; the rest stay empty"
+            );
+        }
+        self.last_game_rect = game_views.first().map(|view| view.rect);
+        let scene_views: Vec<&EditorViewRect> = requested
+            .iter()
+            .filter(|view| view.kind == EditorViewKind::Scene)
+            .collect();
+        let primary_node = scene_views.iter().map(|view| view.node).min();
+        self.last_scene_rect = scene_views
+            .iter()
+            .min_by_key(|view| view.node)
+            .map(|view| view.rect);
+        for view in &scene_views {
+            if self.views.iter().any(|existing| existing.id == view.id)
+                || self
+                    .pending_view_creates
+                    .iter()
+                    .any(|pending| pending.id == view.id)
+            {
+                continue;
+            }
+            self.pending_view_creates.push(PendingViewCreate {
+                id: view.id.clone(),
+                node: view.node,
+                owner: view.window.clone(),
+            });
+        }
+        for index in 0..self.views.len() {
+            let requested_view = scene_views
+                .iter()
+                .find(|view| view.id == self.views[index].id);
+            let view = &mut self.views[index];
+            match requested_view {
+                Some(requested_view) => {
+                    view.owner = requested_view.window.clone();
+                    view.logical = Some(requested_view.rect);
+                    let owner_scale = view
+                        .owner
+                        .as_deref()
+                        .and_then(|owner| self.windows.scale_factor(owner))
+                        .unwrap_or(scale_factor);
+                    let primary = Some(view.node) == primary_node;
+                    let label = if primary { "scene" } else { view.id.as_str() };
+                    place_view(
+                        &mut view.window,
+                        Some(requested_view.rect),
+                        owner_scale,
+                        label,
+                    );
+                }
+                None => {
+                    view.logical = None;
+                    if view.window.set_shown(false) {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            view = view.id.as_str(),
+                            "[editor] view hidden"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The views a shell-less frame keeps alive (Stage 29): the views the
+    /// shell last named, or a default scene view filling the editor when no
+    /// shell has ever named one - which is what a safe-mode boot shows.
+    fn fallback_views(&self, available: Vector2f) -> Vec<EditorViewRect> {
+        if self.views.is_empty() {
+            return vec![EditorViewRect {
+                id: String::from("view:fallback"),
+                node: 0,
+                kind: EditorViewKind::Scene,
+                rect: EditorRect::new(0.0, 0.0, available.x.max(1.0), available.y.max(1.0)),
+                window: None,
+            }];
+        }
+        let mut views: Vec<EditorViewRect> = self
+            .views
+            .iter()
+            .filter_map(|view| {
+                view.logical.map(|rect| EditorViewRect {
+                    id: view.id.clone(),
+                    node: view.node,
+                    kind: EditorViewKind::Scene,
+                    rect,
+                    window: view.owner.clone(),
+                })
+            })
+            .collect();
+        if let Some(rect) = self.last_game_rect {
+            views.push(EditorViewRect {
+                id: String::from("view:game"),
+                node: 0,
+                kind: EditorViewKind::Game,
+                rect,
+                window: None,
+            });
+        }
+        views
     }
 
     /// Handle one event of one popup window: dismissal, and the pointers the
@@ -1462,7 +1696,7 @@ impl EditorWindow {
     /// the wait through their own events. The forced continuous redraw
     /// keeps the old always-on pacing.
     fn schedule_frame(&mut self, event_loop: &ActiveEventLoop) {
-        let scene_active = self.scene_attached && !self.scene_quiet_now();
+        let scene_active = self.any_scene_attached() && !self.scene_quiet_now();
         let need_frames = self.continuous_redraw
             || scene_active
             || self.ui_dirty
@@ -1648,6 +1882,40 @@ impl EditorWindow {
                         self.window
                             .set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
                     }
+                    TestCommand::WindowPlace { id, x, y } => {
+                        if self.windows.place(&id, x, y) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                x,
+                                y,
+                                "[editor] test window place"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window place: no such window"
+                            );
+                        }
+                    }
+                    TestCommand::WindowResize { id, width, height } => {
+                        if self.windows.resize(&id, width, height) {
+                            info!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                width,
+                                height,
+                                "[editor] test window resize"
+                            );
+                        } else {
+                            warn!(
+                                target: telemetry_target::ENGINE,
+                                id = %id,
+                                "[editor] test window resize: no such window"
+                            );
+                        }
+                    }
                     TestCommand::Key { key, target } => self.inject_key(&key, target.as_deref()),
                     TestCommand::Tab { title } => {
                         info!(
@@ -1726,14 +1994,16 @@ impl EditorWindow {
                         );
                         self.start_drag_out(&path);
                     }
-                    TestCommand::GizmoDrag { axis, dx, dy } => {
+                    TestCommand::GizmoDrag { axis, dx, dy, view } => {
                         info!(
                             target: telemetry_target::ENGINE,
                             axis,
                             dx,
                             dy,
+                            view = view.map(|node| node as i64).unwrap_or(-1),
                             "[editor] test channel: gizmo drag request"
                         );
+                        self.synthetic_gizmo_view = view;
                         self.synthetic_gizmo_drag = Some((axis, dx, dy));
                     }
                     TestCommand::Edit(edit) => self.apply_edit(edit),
@@ -2223,11 +2493,24 @@ impl EditorWindow {
             x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
         });
         let game_target = !overlay_target && in_rect(self.last_game_rect);
-        let scene_target = !overlay_target && !game_target && in_rect(self.last_scene_rect);
+        // Several scene views may be visible at once (Stage 29): the click
+        // belongs to the one whose rectangle holds it.
+        let scene_target = if overlay_target || game_target {
+            None
+        } else {
+            self.views.iter().position(|view| {
+                view.logical.is_some_and(|rect| {
+                    x >= rect.x
+                        && x <= rect.x + rect.width
+                        && y >= rect.y
+                        && y <= rect.y + rect.height
+                })
+            })
+        };
         // A modal blocks what would reach the editor's own UI (Stage 24); a
         // click over the scene or the game view is not the editor's and
         // keeps flowing.
-        if !game_target && !scene_target && self.modal_blocks_ui() {
+        if !game_target && scene_target.is_none() && self.modal_blocks_ui() {
             return;
         }
         // A click on the editor's own window is a click outside every popup,
@@ -2242,7 +2525,7 @@ impl EditorWindow {
                 "ui"
             } else if game_target {
                 "game"
-            } else if scene_target {
+            } else if scene_target.is_some() {
                 "scene"
             } else {
                 "ui"
@@ -2270,20 +2553,21 @@ impl EditorWindow {
             for event in presses(Vector2f::new(x * scale_factor, y * scale_factor)) {
                 self.host.push_input(event);
             }
-        } else if scene_target {
+        } else if let Some(scene_index) = scene_target {
             // The scene view's click asks the renderer what is under the
             // pixel (Stage 20); the answer selects, frames later.
             info!(
                 target: telemetry_target::ENGINE,
                 x,
                 y,
+                view = self.views[scene_index].id.as_str(),
                 "[editor] scene view click"
             );
             let scale_factor = self.window.scale_factor() as f32;
-            if let Some(rect) = self.last_scene_rect {
+            if let Some(rect) = self.views[scene_index].logical {
                 let physical_x = ((x - rect.x) * scale_factor).max(0.0).round() as u32;
                 let physical_y = ((y - rect.y) * scale_factor).max(0.0).round() as u32;
-                self.request_scene_pick(physical_x, physical_y);
+                self.request_scene_pick(scene_index, physical_x, physical_y);
             }
         } else {
             for event in presses(Vector2f::new(x, y)) {
@@ -2366,6 +2650,35 @@ impl EditorWindow {
             }
         };
         let target = target.unwrap_or("ui");
+        // A later scene view's own keys (Stage 29): `view:<node>` names the
+        // view whose camera they drive.
+        if let Some(node) = target
+            .strip_prefix("view:")
+            .and_then(|node| node.parse::<u64>().ok())
+        {
+            let Some(index) = self.views.iter().position(|view| view.node == node) else {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    node,
+                    "[editor] test key: no such view"
+                );
+                return;
+            };
+            match key_code {
+                KeyCode::KeyW => self.views[index].camera.fly(1.0),
+                KeyCode::KeyA => self.views[index].camera.strafe(-1.0),
+                _ => {}
+            }
+            let position = self.views[index].camera.eye();
+            // NOTE: asserted on by the editor's end-to-end suite.
+            info!(
+                target: telemetry_target::ENGINE,
+                view = self.views[index].id.as_str(),
+                position = ?position,
+                "[editor] view camera moved"
+            );
+            return;
+        }
         info!(
             target: telemetry_target::ENGINE,
             key = %key,
@@ -2373,13 +2686,17 @@ impl EditorWindow {
             "[editor] test key"
         );
         match target {
-            // The scene view's keys drive the editor camera; they never
-            // reach the game.
-            "scene" => match key_code {
-                KeyCode::KeyW => self.camera.fly(1.0),
-                KeyCode::KeyA => self.camera.strafe(-1.0),
-                _ => {}
-            },
+            // The scene view's keys drive its editor camera (the primary
+            // view, for the scripted target); they never reach the game.
+            "scene" => {
+                if let Some(camera) = self.primary_camera_mut() {
+                    match key_code {
+                        KeyCode::KeyW => camera.fly(1.0),
+                        KeyCode::KeyA => camera.strafe(-1.0),
+                        _ => {}
+                    }
+                }
+            }
             // The game's keys go to the project exactly as the game
             // window's real keys do.
             "game" => {
@@ -2405,9 +2722,6 @@ impl EditorWindow {
                     self.pending_ui_events.push(event);
                 }
             }
-        }
-        if self.camera.take_dirty() {
-            self.camera_dirty = true;
         }
     }
 
@@ -2484,34 +2798,37 @@ impl EditorWindow {
         }
     }
 
-    /// Route one scene-window event into the editor camera (D29): the scene
-    /// view never forwards input to the game. Orbit on right drag, pan on
-    /// middle drag, dolly on the wheel, and WASD moves the focus point.
-    fn scene_view_event(&mut self, event: &WindowEvent) {
+    /// Route one scene-window event into that view's editor camera (D29):
+    /// the scene view never forwards input to the game. Orbit on right
+    /// drag, pan on middle drag, dolly on the wheel, and WASD moves the
+    /// focus point. Every scene view owns its camera (Stage 29).
+    fn scene_view_event(&mut self, index: usize, event: &WindowEvent) {
         // Anything the scene window sends can change what it shows.
         self.scene_dirty = true;
         if let WindowEvent::Resized(size) = event {
             // The scene surface reconfigures with its window: the render
             // target is what pick pixels are counted in, and a stale target
             // sends every pick to the wrong texel (Stage 20).
-            self.scene.placed = None;
-            if self.scene_attached {
+            let view = &mut self.views[index];
+            view.window.placed = None;
+            if let Some(surface_id) = view.surface_id {
                 self.host
-                    .resize_surface(SCENE_SURFACE, size.width.max(1), size.height.max(1));
+                    .resize_surface(surface_id, size.width.max(1), size.height.max(1));
             }
         }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some((last_x, last_y)) = self.scene.last_cursor {
+                let view = &mut self.views[index];
+                if let Some((last_x, last_y)) = view.window.last_cursor {
                     let delta_x = position.x as f32 - last_x;
                     let delta_y = position.y as f32 - last_y;
-                    if self.scene.orbiting {
-                        self.camera.orbit(delta_x, delta_y);
-                    } else if self.scene.panning {
-                        self.camera.pan(delta_x, delta_y);
+                    if view.window.orbiting {
+                        view.camera.orbit(delta_x, delta_y);
+                    } else if view.window.panning {
+                        view.camera.pan(delta_x, delta_y);
                     }
                 }
-                self.scene.last_cursor = Some((position.x as f32, position.y as f32));
+                view.window.last_cursor = Some((position.x as f32, position.y as f32));
                 // A gizmo drag follows the cursor (Stage 20); the move is a
                 // re-read of the ray, not an accumulation of deltas.
                 if self.gizmo_drag.is_some() {
@@ -2520,10 +2837,12 @@ impl EditorWindow {
             }
             WindowEvent::MouseInput { state, button, .. } => match button {
                 winit::event::MouseButton::Right => {
-                    self.scene.orbiting = *state == winit::event::ElementState::Pressed;
+                    self.views[index].window.orbiting =
+                        *state == winit::event::ElementState::Pressed;
                 }
                 winit::event::MouseButton::Middle => {
-                    self.scene.panning = *state == winit::event::ElementState::Pressed;
+                    self.views[index].window.panning =
+                        *state == winit::event::ElementState::Pressed;
                 }
                 // A left click asks what is under the pixel (Stage 20). The
                 // release does the asking, so a press that turned into a
@@ -2532,15 +2851,18 @@ impl EditorWindow {
                 // wants.
                 winit::event::MouseButton::Left => match *state {
                     winit::event::ElementState::Pressed => {
-                        self.scene_press = self.scene.last_cursor;
+                        let cursor = self.views[index].window.last_cursor;
+                        self.scene_press = cursor.map(|(x, y)| (index, x, y));
                     }
                     winit::event::ElementState::Released => {
                         // A release while a gizmo drag runs ends the drag; the
                         // press that started it already asked its pick.
                         if self.gizmo_drag.is_some() {
                             self.end_gizmo_drag();
-                        } else if let Some((x, y)) = self.scene_press.take() {
-                            self.request_scene_pick(x as u32, y as u32);
+                        } else if let Some((pressed, x, y)) = self.scene_press.take() {
+                            if pressed == index {
+                                self.request_scene_pick(index, x as u32, y as u32);
+                            }
                         }
                     }
                 },
@@ -2551,7 +2873,7 @@ impl EditorWindow {
                     winit::event::MouseScrollDelta::LineDelta(_, lines) => *lines,
                     winit::event::MouseScrollDelta::PixelDelta(position) => position.y as f32,
                 };
-                self.camera.dolly(amount);
+                self.views[index].camera.dolly(amount);
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == winit::event::ElementState::Pressed =>
@@ -2560,26 +2882,22 @@ impl EditorWindow {
                     winit::keyboard::PhysicalKey::Code(code) => code,
                     _ => return,
                 };
+                let camera = &mut self.views[index].camera;
                 let direction = match key {
                     winit::keyboard::KeyCode::KeyW => Some(1.0),
                     winit::keyboard::KeyCode::KeyS => Some(-1.0),
                     _ => None,
                 };
                 if let Some(direction) = direction {
-                    self.camera.fly(direction);
+                    camera.fly(direction);
                 }
                 match key {
-                    winit::keyboard::KeyCode::KeyA => self.camera.strafe(-1.0),
-                    winit::keyboard::KeyCode::KeyD => self.camera.strafe(1.0),
+                    winit::keyboard::KeyCode::KeyA => camera.strafe(-1.0),
+                    winit::keyboard::KeyCode::KeyD => camera.strafe(1.0),
                     _ => {}
                 }
             }
             _ => {}
-        }
-        // Any camera change is published before the next frame renders
-        // through it.
-        if self.camera.take_dirty() {
-            self.camera_dirty = true;
         }
     }
 
@@ -2754,30 +3072,33 @@ impl EditorWindow {
         }
     }
 
-    /// Ask the renderer what is under one physical pixel of the scene
-    /// surface (Stage 20).
+    /// Ask the renderer what is under one physical pixel of one scene
+    /// view's surface (Stage 20).
     ///
     /// The answer never stalls a frame: the request rides the world
     /// resource into the next render, and [`Self::drain_scene_picks`] applies
     /// whatever comes back, matched by request id.
-    fn request_scene_pick(&mut self, physical_x: u32, physical_y: u32) {
+    fn request_scene_pick(&mut self, index: usize, physical_x: u32, physical_y: u32) {
         // The answer rides the next render, so the scene cannot sleep
         // through it (Stage 23, D32).
         self.scene_dirty = true;
-        self.pending_pick = self.queue_scene_pick(physical_x, physical_y);
+        self.pending_pick = self.queue_scene_pick(index, physical_x, physical_y);
     }
 
     /// Queue one scene pick and return its id, leaving the answer to
-    /// [`Self::drain_scene_picks`].
-    fn queue_scene_pick(&mut self, physical_x: u32, physical_y: u32) -> Option<u64> {
+    /// [`Self::drain_scene_picks`]. A view with no attached surface has
+    /// nothing to pick from.
+    fn queue_scene_pick(&mut self, index: usize, physical_x: u32, physical_y: u32) -> Option<u64> {
+        let surface = self.views.get(index)?.surface_id?;
         let world = self.host.host_mut().engine_mut().world_mut();
         if world.get_resource::<PickRequests>().is_none() {
             world.insert_resource(PickRequests::default());
         }
         let requests = world.get_resource_mut::<PickRequests>()?;
-        let id = requests.request(SCENE_SURFACE, physical_x, physical_y);
+        let id = requests.request(surface, physical_x, physical_y);
         info!(
             target: telemetry_target::ENGINE,
+            view = self.views[index].id.as_str(),
             x = physical_x,
             y = physical_y,
             id,
@@ -3151,32 +3472,39 @@ impl EditorWindow {
     /// fraction of the camera distance, so the gizmo neither shrinks away
     /// nor swallows the scene.
     fn gizmo_length(&self, origin: [f32; 3]) -> f32 {
-        (gizmo::distance(self.camera.eye(), origin) * GIZMO_SCREEN_FRACTION).clamp(0.05, 50.0)
+        let eye = self
+            .primary_camera()
+            .map(|camera| camera.eye())
+            .unwrap_or([0.0, 0.0, 0.0]);
+        (gizmo::distance(eye, origin) * GIZMO_SCREEN_FRACTION).clamp(0.05, 50.0)
     }
 
     /// The scene surface's size in physical pixels: the live window size,
     /// which the surface was attached and resized with. The last placed
     /// rectangle is only a fallback for a window that reports none yet.
-    fn scene_pixel_size(&self) -> Option<(f32, f32)> {
-        let size = self.scene.window.inner_size();
+    fn scene_pixel_size(&self, index: usize) -> Option<(f32, f32)> {
+        let view = self.views.get(index)?;
+        let size = view.window.window.inner_size();
         if size.width > 0 && size.height > 0 {
             return Some((size.width as f32, size.height as f32));
         }
-        let (_, _, width, height) = self.scene.placed?;
+        let (_, _, width, height) = view.window.placed?;
         Some((width as f32, height as f32))
     }
 
-    /// The cursor ray through one physical pixel of the scene surface.
+    /// The cursor ray through one physical pixel of one scene view's
+    /// surface.
     ///
-    /// Built from the editor camera's basis and the contract camera's
-    /// vertical field of view - the same numbers the renderer projects with,
-    /// so a pick and a drag agree about what a pixel looks at. `None` when
-    /// the surface has no usable size yet.
-    fn scene_ray(&self, x: f32, y: f32) -> Option<([f32; 3], [f32; 3])> {
-        let (width, height) = self.scene_pixel_size()?;
+    /// Built from that view's camera basis and the contract camera's
+    /// vertical field of view - the same numbers the renderer projects
+    /// with, so a pick and a drag agree about what a pixel looks at. `None`
+    /// when the surface has no usable size yet.
+    fn scene_ray(&self, index: usize, x: f32, y: f32) -> Option<([f32; 3], [f32; 3])> {
+        let (width, height) = self.scene_pixel_size(index)?;
+        let camera = &self.views.get(index)?.camera;
         let (tan, aspect) = self.projection_terms(width, height);
-        let forward = self.camera.forward();
-        let right = self.camera.right();
+        let forward = camera.forward();
+        let right = camera.right();
         let up = gizmo::cross(right, forward);
         let ndc_x = x / width * 2.0 - 1.0;
         let ndc_y = 1.0 - y / height * 2.0;
@@ -3187,16 +3515,25 @@ impl EditorWindow {
                 gizmo::scale(up, ndc_y * tan),
             ),
         );
-        gizmo::normalize(direction).map(|direction| (self.camera.eye(), direction))
+        gizmo::normalize(direction).map(|direction| (camera.eye(), direction))
     }
 
-    /// Where a world point lands on the scene surface, in physical pixels.
+    /// Where a world point lands on the primary scene surface, in physical
+    /// pixels.
     fn project_to_screen(&self, point: [f32; 3]) -> Option<(f32, f32)> {
-        let (width, height) = self.scene_pixel_size()?;
+        let index = self.primary_scene_index()?;
+        self.project_to_screen_in(index, point)
+    }
+
+    /// Where a world point lands on one scene view's surface, in physical
+    /// pixels.
+    fn project_to_screen_in(&self, index: usize, point: [f32; 3]) -> Option<(f32, f32)> {
+        let (width, height) = self.scene_pixel_size(index)?;
+        let camera = &self.views.get(index)?.camera;
         let (tan, aspect) = self.projection_terms(width, height);
-        let eye = self.camera.eye();
-        let forward = self.camera.forward();
-        let right = self.camera.right();
+        let eye = camera.eye();
+        let forward = camera.forward();
+        let right = camera.right();
         let up = gizmo::cross(right, forward);
         let relative = gizmo::sub(point, eye);
         let depth = gizmo::dot(relative, forward);
@@ -3226,6 +3563,31 @@ impl EditorWindow {
             );
             return;
         }
+        // The scripted drag works on the view the command named, or the
+        // primary scene view.
+        let view_index = match self.synthetic_gizmo_view {
+            Some(node) => match self.views.iter().position(|view| view.node == node) {
+                Some(index) => index,
+                None => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        node,
+                        "[editor] gizmo drag refused: no such view"
+                    );
+                    return;
+                }
+            },
+            None => match self.primary_scene_index() {
+                Some(index) => index,
+                None => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] gizmo drag refused: no scene view exists"
+                    );
+                    return;
+                }
+            },
+        };
         let world = self.host.host_mut().engine_mut().world_mut();
         let settings = world
             .get_resource::<GizmoState>()
@@ -3271,7 +3633,7 @@ impl EditorWindow {
             transform.translation,
             gizmo::scale(grab_direction, grab_distance),
         );
-        let Some((x, y)) = self.project_to_screen(tip) else {
+        let Some((x, y)) = self.project_to_screen_in(view_index, tip) else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] gizmo drag refused: the handle is behind the camera"
@@ -3279,6 +3641,7 @@ impl EditorWindow {
             return;
         };
         self.synthetic_gizmo_pending = Some((delta_x, delta_y));
+        self.synthetic_gizmo_view = Some(self.views[view_index].node);
         info!(
             target: telemetry_target::ENGINE,
             axis = gizmo_axis_name(axis),
@@ -3299,7 +3662,9 @@ impl EditorWindow {
             (centre_x, centre_y - 1),
             (centre_x, centre_y + 1),
         ] {
-            if let Some(id) = self.queue_scene_pick(pixel_x.max(0) as u32, pixel_y.max(0) as u32) {
+            if let Some(id) =
+                self.queue_scene_pick(view_index, pixel_x.max(0) as u32, pixel_y.max(0) as u32)
+            {
                 self.synthetic_press_ids.push(id);
             }
         }
@@ -3316,6 +3681,9 @@ impl EditorWindow {
             );
             return;
         };
+        let Some(view_index) = self.primary_scene_index() else {
+            return;
+        };
         let world = self.host.host_mut().engine_mut().world_mut();
         let settings = world
             .get_resource::<GizmoState>()
@@ -3330,7 +3698,7 @@ impl EditorWindow {
         let Some(original) = read_transform(world, entity) else {
             return;
         };
-        let Some((ray_origin, ray_direction)) = self.scene_ray(press_x, press_y) else {
+        let Some((ray_origin, ray_direction)) = self.scene_ray(view_index, press_x, press_y) else {
             return;
         };
         let basis = self.gizmo_basis(settings.space, &original);
@@ -3364,6 +3732,7 @@ impl EditorWindow {
         self.gizmo_drag_seq += 1;
         let reference = self.gizmo_length(origin);
         self.gizmo_drag = Some(GizmoDrag {
+            view: view_index,
             mode,
             axis,
             entity,
@@ -3390,13 +3759,15 @@ impl EditorWindow {
         let Some(drag) = self.gizmo_drag.as_ref() else {
             return;
         };
+        let view_index = drag.view;
         let (mode, axis) = (drag.mode, drag.axis);
         let entity = drag.entity;
         let reference = drag.reference;
         let start_value = drag.start_value;
         let original = drag.original;
         let coalesce_key = drag.coalesce_key.clone();
-        let Some((ray_origin, ray_direction)) = self.scene_ray(cursor_x, cursor_y) else {
+        let Some((ray_origin, ray_direction)) = self.scene_ray(view_index, cursor_x, cursor_y)
+        else {
             return;
         };
         // The settings and the basis come first: both borrow `self`, and the
@@ -3837,6 +4208,10 @@ impl EditorWindow {
                     .append(&mut self.windows.take_pointers());
                 input.window_keys.append(&mut self.windows.take_keys());
                 input.window_text.append(&mut self.windows.take_texts());
+                // Stage 29: every open window's arrangement, so the shell
+                // can fold a move or a resize back into the layout and the
+                // recovery document.
+                input.window_bounds = self.windows.bounds();
                 input.window_closed.append(&mut self.window_closed);
                 input.overlay_labels.clone_from(&self.overlay_labels);
                 // A shell that never drains (the fallback UI, or a module
@@ -3859,10 +4234,22 @@ impl EditorWindow {
         }
         // Step 3a: a changed editor camera is published before the frame
         // renders through it, so a gesture shows up in the very next frame.
-        if self.camera_dirty {
-            self.camera_dirty = false;
-            self.host
-                .set_surface_camera(SCENE_SURFACE, Some(self.camera.binding()));
+        // Every scene view owns its camera (Stage 29).
+        for index in 0..self.views.len() {
+            let Some(surface_id) = self.views[index].surface_id else {
+                continue;
+            };
+            if !self.views[index].camera.take_dirty() {
+                continue;
+            }
+            let binding = self.views[index].camera.binding();
+            self.host.set_surface_camera(surface_id, Some(binding));
+            let id = self.views[index].id.clone();
+            info!(
+                target: telemetry_target::ENGINE,
+                view = id.as_str(),
+                "[editor] view camera published"
+            );
         }
         // Step 3: run the project's frame. The shell's system runs inside
         // it, between the input just delivered and the output read next.
@@ -3899,8 +4286,7 @@ impl EditorWindow {
                     assets_rect: frame.assets_rect,
                     drag_candidate: frame.drag_candidate.take(),
                     requested_open: frame.requested_open.take(),
-                    scene_rect: frame.scene_rect,
-                    game_rect: frame.game_rect,
+                    views: std::mem::take(&mut frame.views),
                     overlay: std::mem::take(&mut frame.overlay),
                     overlay_opaque: std::mem::take(&mut frame.overlay_opaque),
                     popups: std::mem::take(&mut frame.popups),
@@ -3950,7 +4336,11 @@ impl EditorWindow {
             }
         }
         let output = match shell_output {
-            Some(output) if self.safe_mode.is_none() => output,
+            // A generation that has never stamped a frame has produced no
+            // usable output yet: a shell that panics before its first stamp
+            // would otherwise leave the frame with an empty view list and
+            // the editor with no surface to keep its pacing on (Stage 29).
+            Some(output) if self.safe_mode.is_none() && output.frames != 0 => output,
             _ if self.safe_mode.is_some() => self.safe_mode_output(available),
             _ => {
                 // The grace before safe mode engages: the plain fallback.
@@ -3964,8 +4354,7 @@ impl EditorWindow {
                     assets_rect: self.last_assets_rect,
                     drag_candidate: None,
                     requested_open: None,
-                    scene_rect: self.last_scene_rect,
-                    game_rect: self.last_game_rect,
+                    views: self.fallback_views(available),
                     overlay: DrawList::default(),
                     overlay_opaque: Vec::new(),
                     popups: Vec::new(),
@@ -4178,18 +4567,23 @@ impl EditorWindow {
                 }
             }
         }
-        // Step 5: both view surfaces go where the shell's layout put them.
-        // The shell reports a rectangle only for the selected view tab, so
-        // the other view hides instead of sitting under it; a shell-less
-        // frame carries the previous frame's rectangles through the fallback
-        // output, which keeps the placement stable.
-        // A moved, shown or hidden view changes what the surfaces show
-        // (Stage 23, D32): the scene is dirty for the next frame.
-        if output.scene_rect != self.last_scene_rect || output.game_rect != self.last_game_rect {
+        // Step 5: the view surfaces go where the shell's layout put them
+        // (Stage 29): every scene view follows its own rectangle - in the
+        // main window or in the popped-out window that holds it - and the
+        // game rectangle holds for the one game view the renderer's
+        // primary surface shows. A changed placement makes the scene dirty
+        // for the next frame (Stage 23, D32).
+        let placement_signature: Vec<(String, EditorRect, Option<String>)> = output
+            .views
+            .iter()
+            .map(|view| (view.id.clone(), view.rect, view.window.clone()))
+            .collect();
+        if placement_signature != self.last_view_placements {
             self.scene_dirty = true;
+            self.last_view_placements = placement_signature;
         }
-        self.last_scene_rect = output.scene_rect;
-        self.last_game_rect = output.game_rect;
+        self.sync_view_requests(&output.views, scale_factor);
+        place_view(&mut self.game, self.last_game_rect, scale_factor, "game");
         self.last_assets_rect = output.assets_rect;
         self.drag_candidate = output.drag_candidate;
         // Stage 21: what floats over the scene, and where it is opaque. The
@@ -4257,12 +4651,22 @@ impl EditorWindow {
                 "[editor] overlay content"
             );
         }
-        let scene_rect = if self.scene_attached {
-            self.last_scene_rect
-        } else {
-            None
-        };
-        place_view(&mut self.scene, scene_rect, scale_factor, "scene");
+        // Step 5: the view surfaces go where the shell's layout put them
+        // (Stage 29): every scene view follows its own rectangle - in the
+        // main window or in the popped-out window that holds it - and the
+        // game rectangle holds for the one game view the renderer's
+        // primary surface shows. A changed placement makes the scene dirty
+        // for the next frame (Stage 23, D32).
+        let placement_signature: Vec<(String, EditorRect, Option<String>)> = output
+            .views
+            .iter()
+            .map(|view| (view.id.clone(), view.rect, view.window.clone()))
+            .collect();
+        if placement_signature != self.last_view_placements {
+            self.scene_dirty = true;
+            self.last_view_placements = placement_signature;
+        }
+        self.sync_view_requests(&output.views, scale_factor);
         place_view(&mut self.game, self.last_game_rect, scale_factor, "game");
         // Step 6: the atlas additions of whichever UI built this frame.
         if let Some(update) = output.atlas {
@@ -4589,10 +4993,9 @@ struct ShellOutput {
     /// A file the shell asked the executable to open, from a Problems row
     /// (Stage 19).
     requested_open: Option<EditorOpenRequest>,
-    /// Where the scene surface goes, in logical pixels.
-    scene_rect: Option<EditorRect>,
-    /// Where the game surface goes, in logical pixels.
-    game_rect: Option<EditorRect>,
+    /// The scene and game views to draw this frame (Stage 29), each with
+    /// its own rectangle and surface.
+    views: Vec<EditorViewRect>,
     /// The UI that floats above the scene surfaces (Stage 21, D24): the FPS
     /// badge, the toasts, the docking and file-drop previews, the entity
     /// labels. Drawn through the composition overlay when there is one, and
@@ -4854,6 +5257,9 @@ fn gizmo_drag_commands(
 /// angle the cursor ray named, plus the transform it started from - so every
 /// move applies a delta against it and nothing jumps on the first pixel.
 struct GizmoDrag {
+    /// The scene view the drag belongs to (Stage 29): every move re-reads
+    /// that view's ray.
+    view: usize,
     /// The tool mode the grabbed handle belongs to.
     mode: GizmoMode,
     /// The axis index the handle belongs to.
@@ -5062,6 +5468,40 @@ impl SurfaceWindow {
         let size = self.window.inner_size();
         (size.width.max(1), size.height.max(1))
     }
+}
+
+/// One scene view surface (Stage 29): the child window, the renderer's
+/// surface id, and the editor camera it draws through.
+struct ViewSurface {
+    /// The shell's view id (`view:<node>`), stable while the tab lives.
+    id: String,
+    /// The tab's numeric node; the smallest one is the primary view.
+    node: u64,
+    /// The renderer surface, once the project's renderer accepted it; a
+    /// single-surface renderer refuses and the view stays empty.
+    surface_id: Option<SurfaceId>,
+    /// The child window the renderer presents into.
+    window: SurfaceWindow,
+    /// The editor camera the view draws through (D29), plain data.
+    camera: EditorCamera,
+    /// The popped-out window that holds the view (Stage 29), by window
+    /// request id; `None` for a view docked in the main window.
+    owner: Option<String>,
+    /// The placement the shell last asked for, in its owner's logical
+    /// client pixels.
+    logical: Option<EditorRect>,
+}
+
+/// A scene view the shell asked for that has no window yet (Stage 29): the
+/// frame stages it and the next frame boundary creates its window, because
+/// creating a window re-enters winit's dispatch.
+struct PendingViewCreate {
+    /// The shell's view id (`view:<node>`).
+    id: String,
+    /// The tab's numeric node.
+    node: u64,
+    /// The popped-out window that will hold the view, when one does.
+    owner: Option<String>,
 }
 
 // =============================================================================

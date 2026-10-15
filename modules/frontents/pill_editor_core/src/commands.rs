@@ -613,6 +613,15 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "alt+r")
             .bind(Godot, "ctrl+alt+r")
             .bind(Unreal, "alt+r"),
+        // The pop-out pair (Stage 29): the tab in the active tabset moves
+        // into its own window, and every floating tab comes home.
+        CommandSpec::new("editor.popout_tab", "Pop Out Panel").menu(&["Layout", "Pop Out Panel"]),
+        CommandSpec::new("editor.redock_tab", "Redock Popped Panels")
+            .menu(&["Layout", "Redock Popped Panels"]),
+        // A second scene view (Stage 29): another scene tab, another
+        // surface, its own editor camera.
+        CommandSpec::new("editor.scene_view_new", "New Scene View")
+            .menu(&["Layout", "New Scene View"]),
         CommandSpec::new("editor.command_palette", "Command Palette")
             .bind(Blender, "f3")
             .bind(Unity, "ctrl+shift+p")

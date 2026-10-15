@@ -103,6 +103,29 @@ pub struct TabNode {
     pub closeable: bool,
 }
 
+/// A tab popped out of the dock into a free-standing window (Stage 29).
+///
+/// The tab node stays in [`LayoutModel::nodes`] (so its identity, title and
+/// panel survive a redock and a restart); only its dock membership is gone.
+/// The size travels with it; the position is what the platform reports and
+/// may be `None` where it does not (Wayland gives clients no global window
+/// positions, D23).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloatingTab {
+    /// The tab node this floating window shows.
+    pub tab: NodeId,
+    /// The window's width in logical pixels.
+    pub width: f32,
+    /// The window's height in logical pixels.
+    pub height: f32,
+    /// The window's last known position in logical pixels of the virtual
+    /// desktop, when the platform reports one.
+    pub position: Option<(f32, f32)>,
+}
+
+/// The default size a popped-out tab's window opens at, in logical pixels.
+pub const FLOATING_TAB_DEFAULT_SIZE: (f32, f32) = (480.0, 360.0);
+
 /// Node variants accepted by the dock tree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -119,6 +142,11 @@ pub struct LayoutModel {
     pub root: NodeId,
     pub nodes: BTreeMap<NodeId, LayoutNode>,
     pub active_tabset: Option<NodeId>,
+    /// The tabs popped out into free-standing windows (Stage 29), in pop-out
+    /// order. Missing in documents written before the field existed, which
+    /// reads as none floating.
+    #[serde(default)]
+    pub floating: Vec<FloatingTab>,
     pub(crate) next_id: u64,
 }
 
@@ -130,6 +158,7 @@ impl LayoutModel {
             root: NodeId(0),
             nodes: BTreeMap::new(),
             active_tabset: None,
+            floating: Vec::new(),
             next_id: 1,
         };
 
@@ -231,12 +260,25 @@ impl LayoutModel {
     }
 
     /// Insert one panel as a tab and return its id.
+    ///
+    /// A panel that may repeat (the Scene and Game views, Stage 29) gets a
+    /// numbered title instead of a second copy of the plain name.
     pub(crate) fn add_tab(&mut self, panel: PanelKind, closeable: bool) -> NodeId {
         let id = self.allocate_id();
+        let existing = self
+            .nodes
+            .values()
+            .filter(|node| matches!(node, LayoutNode::Tab(tab) if tab.panel == panel))
+            .count();
+        let title = if existing == 0 {
+            panel.title().to_string()
+        } else {
+            format!("{} {}", panel.title(), existing + 1)
+        };
         self.nodes.insert(
             id,
             LayoutNode::Tab(TabNode {
-                title: panel.title().to_string(),
+                title,
                 panel,
                 closeable,
             }),
@@ -293,7 +335,31 @@ impl LayoutModel {
         let mut visited = BTreeSet::new();
         self.validate_node(self.root, &mut visiting, &mut visited)?;
 
-        if let Some(id) = self.nodes.keys().find(|id| !visited.contains(id)) {
+        // A floating tab's node is alive but not in the dock tree (Stage
+        // 29), so it is reachable exactly once and through the floating
+        // list.
+        let mut floating = BTreeSet::new();
+        for entry in &self.floating {
+            if !matches!(self.node(entry.tab), Some(LayoutNode::Tab(_))) {
+                return Err(LayoutError::MissingNode(entry.tab));
+            }
+            if !floating.insert(entry.tab) || visited.contains(&entry.tab) {
+                return Err(LayoutError::MultipleParents(entry.tab));
+            }
+            if !entry.width.is_finite()
+                || !entry.height.is_finite()
+                || entry.width <= 0.0
+                || entry.height <= 0.0
+            {
+                return Err(LayoutError::InvalidWeight(entry.tab));
+            }
+        }
+
+        if let Some(id) = self
+            .nodes
+            .keys()
+            .find(|id| !visited.contains(id) && !floating.contains(id))
+        {
             return Err(LayoutError::UnreachableNode(*id));
         }
         if self.next_id <= self.nodes.keys().map(|id| id.0).max().unwrap_or(0) {
@@ -303,15 +369,6 @@ impl LayoutModel {
             if self.tabset(active).is_none() {
                 return Err(LayoutError::InvalidActiveTabSet(active));
             }
-        }
-
-        let scene_count = visited
-            .iter()
-            .filter_map(|id| self.tab(*id))
-            .filter(|tab| tab.panel == PanelKind::Scene)
-            .count();
-        if scene_count > 1 {
-            return Err(LayoutError::DuplicateScene);
         }
         Ok(())
     }

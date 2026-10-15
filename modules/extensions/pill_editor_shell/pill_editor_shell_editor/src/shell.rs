@@ -33,8 +33,9 @@ use pill_editor_api::panels::{EditorPanelRegistry, PanelBuildFn, PanelContext, P
 use pill_editor_api::{
     ClipboardObject, EditorClipboardAnswer, EditorOpenRequest, EditorOverlayLabel, EditorPopup,
     EditorPopupPointer, EditorProblem, EditorProblemLevel, EditorRect, EditorShellFrame,
-    EditorShellInput, EditorWindowButton, EditorWindowKey, EditorWindowKeyKind, EditorWindowKind,
-    EditorWindowPointer, EditorWindowPointerKind, EditorWindowRequest, EditorWindowText,
+    EditorShellInput, EditorViewKind, EditorWindowButton, EditorWindowKey, EditorWindowKeyKind,
+    EditorWindowKind, EditorWindowPointer, EditorWindowPointerKind, EditorWindowRequest,
+    EditorWindowText,
 };
 use pill_editor_core::clipboard::{self, Payload, SeededComponent};
 use pill_editor_core::commands::{
@@ -300,6 +301,10 @@ pub struct OpenWindow {
     /// The epoch of the panel generation [Self::names] was built from; a
     /// mismatch logs one "window panel built" line per generation.
     pub built_epoch: u64,
+    /// The popped-out tab this window keeps alive (Stage 29), when it is
+    /// one: a floating tab's window loses its window when the tab redocks,
+    /// and a window the user closes redocks the tab.
+    pub floating: Option<pill_editor_core::layout::NodeId>,
 }
 
 /// One toast: a short-lived line about something the host did (Stage 19).
@@ -665,9 +670,14 @@ fn load_editor_layout() -> (LayoutModel, Option<RecoveryState>) {
 /// recovered window not reopened yet counts as open here - that is what
 /// keeps the document stable while the panel it names loads.
 fn recovery_snapshot(state: &EditorShellState, selection: &EditorSelection) -> RecoveryState {
+    // A popped-out tab's window is the layout's (its `floating` entry is
+    // the single source of truth for its panel, size and position, Stage
+    // 29); the window list here holds the panel-asked windows and modals,
+    // which the layout does not know.
     let mut windows: Vec<RecoveryWindow> = state
         .windows
         .iter()
+        .filter(|window| window.floating.is_none())
         .map(|window| recovery_window(&window.request))
         .collect();
     for (request, _) in &state.recovered_windows {
@@ -710,6 +720,7 @@ fn recovery_window(request: &EditorWindowRequest) -> RecoveryWindow {
                 command: button.command.clone(),
             })
             .collect(),
+        position: request.position,
     }
 }
 
@@ -735,8 +746,69 @@ fn window_request(window: &RecoveryWindow) -> EditorWindowRequest {
                 command: button.command.clone(),
             })
             .collect(),
+        position: window.position,
         draw: DrawList::default(),
     }
+}
+
+/// Fold the platform's window arrangement back into the session (Stage 29):
+/// a popped-out tab's window records its size and position in the layout
+/// (which the autosave writes), and a tool window's request keeps them for
+/// the recovery document. Called every frame; only a changed value reaches
+/// the layout, so an unchanged report costs one comparison.
+pub fn apply_window_bounds(
+    state: &mut EditorShellState,
+    bounds: &[pill_editor_api::EditorWindowBounds],
+) {
+    for bounds in bounds {
+        let Some(index) = state
+            .windows
+            .iter()
+            .position(|window| window.request.id == bounds.id)
+        else {
+            continue;
+        };
+        if let Some(tab) = state.windows[index].floating {
+            let unchanged = state
+                .layout
+                .floating
+                .iter()
+                .find(|entry| entry.tab == tab)
+                .is_some_and(|entry| floating_bounds_match(entry, bounds));
+            if !unchanged {
+                let _ = state.layout.apply(LayoutAction::SetFloatingBounds {
+                    tab,
+                    width: bounds.width,
+                    height: bounds.height,
+                    position: bounds.position,
+                });
+            }
+        } else if state.windows[index].request.kind == EditorWindowKind::Tool {
+            // A tool window follows its own size: the content is drawn in
+            // the window's logical pixels, and the recovery document stores
+            // what the user left behind.
+            state.windows[index].request.width = bounds.width;
+            state.windows[index].request.height = bounds.height;
+            state.windows[index].request.position = bounds.position;
+        }
+    }
+}
+
+/// Whether a floating tab already records exactly this arrangement.
+fn floating_bounds_match(
+    entry: &pill_editor_core::layout::FloatingTab,
+    bounds: &pill_editor_api::EditorWindowBounds,
+) -> bool {
+    let size_matches =
+        (entry.width - bounds.width).abs() < 0.5 && (entry.height - bounds.height).abs() < 0.5;
+    let position_matches = match (entry.position, bounds.position) {
+        (Some(entry), Some(bounds)) => {
+            (entry.0 - bounds.0).abs() < 0.5 && (entry.1 - bounds.1).abs() < 0.5
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    size_matches && position_matches
 }
 
 /// Take the recovered selection, once: the first frame that runs folds it
@@ -2735,6 +2807,75 @@ pub fn execute_command(
                 "[editor] layout reset"
             );
         }
+        // The pop-out pair (Stage 29): the selected tab of the active
+        // tabset moves into its own window; every floating tab comes home.
+        "editor.popout_tab" => {
+            let selected = state
+                .layout
+                .resolved_active_tabset()
+                .and_then(|tabset| state.layout.tabset(tabset))
+                .and_then(|tabset| tabset.selected);
+            let Some(tab) = selected else {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] pop out has no selected tab"
+                );
+                return true;
+            };
+            let title = state
+                .layout
+                .tab(tab)
+                .map(|tab| tab.title.clone())
+                .unwrap_or_default();
+            match state.layout.apply(LayoutAction::PopOutTab { tab }) {
+                Ok(_) => pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    // NOTE: asserted on by the editor's end-to-end suite.
+                    title = title.as_str(),
+                    "[editor] panel popped out"
+                ),
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    error = %error,
+                    "[editor] panel pop out failed"
+                ),
+            }
+        }
+        "editor.redock_tab" => {
+            let floating: Vec<pill_editor_core::layout::NodeId> = state
+                .layout
+                .floating
+                .iter()
+                .map(|entry| entry.tab)
+                .collect();
+            for tab in floating {
+                redock_tab(state, tab);
+            }
+        }
+        "editor.scene_view_new" => {
+            let Some(target) = state.layout.resolved_active_tabset() else {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] scene view has no tabset to open into"
+                );
+                return true;
+            };
+            match state.layout.apply(LayoutAction::OpenTab {
+                panel: PanelKind::Scene,
+                target_tabset: target,
+            }) {
+                Ok(_) => pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    // NOTE: asserted on by the editor's end-to-end suite.
+                    "[editor] scene view opened"
+                ),
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    error = %error,
+                    "[editor] scene view failed to open"
+                ),
+            }
+        }
         "editor.command_palette" => {
             state.palette_query = match state.palette_query.take() {
                 Some(_) => {
@@ -3431,7 +3572,13 @@ pub fn paint_overlay_badge(
     frame: &mut EditorShellFrame,
     editor_frames_per_second: f32,
 ) {
-    let Some(view) = frame.game_rect.or(frame.scene_rect) else {
+    let view = frame
+        .views
+        .iter()
+        .find(|view| view.kind == EditorViewKind::Game)
+        .or_else(|| frame.views.first())
+        .map(|view| view.rect);
+    let Some(view) = view else {
         return;
     };
     let rect = Rect::from_min_size(
@@ -4120,14 +4267,63 @@ const RENAME_PATH_KEY: &str = "rename.path";
 const RENAME_NAME_KEY: &str = "rename.name";
 
 /// The epoch a window's panel reports: a registry epoch for module panels,
-/// and the shell's own stable one for the built-in dialogs, which no reload
-/// ever replaces.
+/// and the shell's own stable one for the built-in dialogs and the built-in
+/// dock panels (Stage 29 pop-outs), which no reload ever replaces.
 fn window_panel_epoch(panels: &EditorPanelRegistry, panel: &str) -> Option<u64> {
-    if panel == DIALOG_CREATE_PANEL || panel == DIALOG_RENAME_PANEL {
+    if panel == DIALOG_CREATE_PANEL
+        || panel == DIALOG_RENAME_PANEL
+        || dock_panel_kind(panel).is_some()
+    {
         Some(u64::MAX)
     } else {
         panels.panel_epoch(panel)
     }
+}
+
+/// The reserved window-panel id a popped-out view's window carries (Stage
+/// 29): the window shows a surface, so it draws no panel content of its
+/// own.
+pub const SURFACE_VIEW_PANEL: &str = "view:surface";
+
+/// The view id a dock tab's surface is named by (Stage 29): stable while
+/// the tab exists, across frames and restarts.
+pub fn view_id(tab: pill_editor_core::layout::NodeId) -> String {
+    format!("view:{}", tab.0)
+}
+
+/// The reserved window-panel id of a built-in dock panel: how a floating
+/// tab's window names what it draws without colliding with a module panel's
+/// id. The Scene and Game views draw into their own surfaces, through
+/// [`SURFACE_VIEW_PANEL`].
+fn dock_panel_id(panel: &PanelKind) -> Option<&'static str> {
+    Some(match panel {
+        PanelKind::Hierarchy => "dock:hierarchy",
+        PanelKind::Inspector => "dock:inspector",
+        PanelKind::Console => "dock:console",
+        PanelKind::Statistics => "dock:statistics",
+        PanelKind::Gallery => "dock:gallery",
+        PanelKind::Systems => "dock:systems",
+        PanelKind::Assets => "dock:assets",
+        PanelKind::Preferences => "dock:preferences",
+        PanelKind::Problems => "dock:problems",
+        PanelKind::Scene | PanelKind::Game | PanelKind::Module(_) => return None,
+    })
+}
+
+/// The built-in dock panel a reserved window-panel id names.
+fn dock_panel_kind(id: &str) -> Option<PanelKind> {
+    Some(match id {
+        "dock:hierarchy" => PanelKind::Hierarchy,
+        "dock:inspector" => PanelKind::Inspector,
+        "dock:console" => PanelKind::Console,
+        "dock:statistics" => PanelKind::Statistics,
+        "dock:gallery" => PanelKind::Gallery,
+        "dock:systems" => PanelKind::Systems,
+        "dock:assets" => PanelKind::Assets,
+        "dock:preferences" => PanelKind::Preferences,
+        "dock:problems" => PanelKind::Problems,
+        _ => return None,
+    })
 }
 
 /// The build function of one of the shell's dialog panels, when the id
@@ -4204,6 +4400,128 @@ pub fn apply_window_requests(
             previous_hits: BTreeMap::new(),
             names: BTreeMap::new(),
             built_epoch: 0,
+            floating: None,
+        });
+    }
+}
+
+/// The id a popped-out tab's window carries; stable while the layout lives,
+/// so the platform, the recovery document and the suite all name the same
+/// window.
+pub fn floating_window_id(tab: pill_editor_core::layout::NodeId) -> String {
+    format!("popout:{}", tab.0)
+}
+
+/// The window request a popped-out tab's window carries (Stage 29).
+fn floating_window_request(
+    entry: &pill_editor_core::layout::FloatingTab,
+    tab: &pill_editor_core::layout::LayoutNode,
+) -> Option<EditorWindowRequest> {
+    let pill_editor_core::layout::LayoutNode::Tab(tab) = tab else {
+        return None;
+    };
+    let panel = match dock_panel_id(&tab.panel) {
+        Some(id) => id.to_string(),
+        None => match &tab.panel {
+            PanelKind::Module(id) => id.clone(),
+            // The Scene and Game views draw into their own surfaces: their
+            // window is real, its content is drawn by the view system.
+            PanelKind::Scene | PanelKind::Game => SURFACE_VIEW_PANEL.to_string(),
+            _ => return None,
+        },
+    };
+    Some(EditorWindowRequest {
+        id: floating_window_id(entry.tab),
+        kind: EditorWindowKind::Tool,
+        title: tab.title.clone(),
+        width: entry.width,
+        height: entry.height,
+        panel,
+        buttons: Vec::new(),
+        position: entry.position,
+        draw: DrawList::default(),
+    })
+}
+
+/// Keep one window alive per popped-out tab (Stage 29): a tab that redocked
+/// loses its window here, and a floating tab's panel that is not registered
+/// yet opens its window the frame it registers.
+fn sync_floating_windows(state: &mut EditorShellState, panels: &EditorPanelRegistry) {
+    let mut index = 0;
+    while index < state.windows.len() {
+        let still_floating = match state.windows[index].floating {
+            Some(tab) => state.layout.floating.iter().any(|entry| entry.tab == tab),
+            None => true,
+        };
+        if still_floating {
+            index += 1;
+            continue;
+        }
+        let closed = state.windows.remove(index);
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = closed.request.id.as_str(),
+            reason = "redocked",
+            "[editor] window closed"
+        );
+    }
+    let floating: Vec<pill_editor_core::layout::FloatingTab> = state.layout.floating.clone();
+    for entry in floating {
+        let Some(tab) = state.layout.node(entry.tab).cloned() else {
+            continue;
+        };
+        let Some(request) = floating_window_request(&entry, &tab) else {
+            continue;
+        };
+        if state
+            .windows
+            .iter()
+            .any(|window| window.request.id == request.id)
+        {
+            continue;
+        }
+        let Some(epoch) = window_panel_epoch(panels, &request.panel) else {
+            // The panel's module is not loaded (a restored layout can hold
+            // such a tab): the tab stays floating and its window opens the
+            // frame the panel registers. The warning is per panel, not per
+            // frame.
+            let key = format!("floating-unregistered:{}", request.panel);
+            if state.reported.insert(key) {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = request.id.as_str(),
+                    panel = request.panel.as_str(),
+                    "[editor] window request for an unregistered panel"
+                );
+            }
+            continue;
+        };
+        let owner = panels
+            .list()
+            .into_iter()
+            .find(|info| info.id == request.panel)
+            .map(|info| info.owner)
+            .unwrap_or_default();
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            id = request.id.as_str(),
+            kind = request.kind.title(),
+            panel = request.panel.as_str(),
+            owner = owner.as_str(),
+            width = request.width,
+            height = request.height,
+            "[editor] window opened"
+        );
+        state.windows.push(OpenWindow {
+            request,
+            owner,
+            epoch,
+            ui: UiState::new(),
+            text: BTreeMap::new(),
+            previous_hits: BTreeMap::new(),
+            names: BTreeMap::new(),
+            built_epoch: 0,
+            floating: Some(entry.tab),
         });
     }
 }
@@ -4274,9 +4592,55 @@ pub fn handle_window_text(state: &mut EditorShellState, text: &EditorWindowText)
 
 /// Clears the state behind a window the platform closed (Stage 24): the
 /// user pressed the title bar's close button, so the window stays gone and
-/// a later reload of its module does not bring it back.
+/// a later reload of its module does not bring it back. Closing a popped-out
+/// tab's window redocks the tab instead (Stage 29): the window is the tab's
+/// home while it floats, so closing it brings the panel back to the dock.
 pub fn handle_window_closed(state: &mut EditorShellState, id: &str) {
+    let floating = state
+        .windows
+        .iter()
+        .find(|window| window.request.id == id)
+        .and_then(|window| window.floating);
     close_window(state, id, "platform");
+    if let Some(tab) = floating {
+        redock_tab(state, tab);
+    }
+}
+
+/// Redock one floating tab into the active tabset (Stage 29), logging the
+/// transition; a tab the layout no longer carries is ignored.
+pub fn redock_tab(state: &mut EditorShellState, tab: pill_editor_core::layout::NodeId) {
+    if !state.layout.floating.iter().any(|entry| entry.tab == tab) {
+        return;
+    }
+    let Some(target) = state.layout.resolved_active_tabset() else {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] panel redock has no tabset to return to"
+        );
+        return;
+    };
+    let title = state
+        .layout
+        .tab(tab)
+        .map(|tab| tab.title.clone())
+        .unwrap_or_default();
+    match state.layout.apply(LayoutAction::RedockTab {
+        tab,
+        target_tabset: target,
+    }) {
+        Ok(_) => pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            // NOTE: asserted on by the editor's end-to-end suite.
+            title = title.as_str(),
+            "[editor] panel redocked"
+        ),
+        Err(error) => pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            error = %error,
+            "[editor] panel redock failed"
+        ),
+    }
 }
 
 /// Answers one key of one window (Stage 24). Only modals answer: Enter
@@ -4387,14 +4751,9 @@ pub fn paint_windows(
     pending: &mut PendingEditorCommands,
     history: &mut CommandHistory,
 ) -> PanelWork {
-    let EditorShellState {
-        windows,
-        text,
-        theme,
-        sheet,
-        atlas,
-        ..
-    } = state;
+    // Step 0: the popped-out tabs (Stage 29) keep one window each while
+    // they float; a redocked tab loses its window here.
+    sync_floating_windows(state, panels);
     let mut collected = PanelWork::default();
     let mut answers: Vec<(String, usize)> = Vec::new();
     // Step 1: the ownership pass. A registration that changed reopens a
@@ -4402,11 +4761,11 @@ pub fn paint_windows(
     // belonged to the code that asked the question; a registration that
     // died closes both.
     let mut index = 0;
-    while index < windows.len() {
-        let window = &mut windows[index];
+    while index < state.windows.len() {
+        let window = &mut state.windows[index];
         match window_panel_epoch(panels, &window.request.panel) {
             None => {
-                let closed = windows.remove(index);
+                let closed = state.windows.remove(index);
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     id = closed.request.id.as_str(),
@@ -4427,7 +4786,7 @@ pub fn paint_windows(
                     );
                     index += 1;
                 } else {
-                    let closed = windows.remove(index);
+                    let closed = state.windows.remove(index);
                     pill_core::info!(
                         target: pill_core::telemetry::telemetry_target::ECS,
                         id = closed.request.id.as_str(),
@@ -4441,8 +4800,12 @@ pub fn paint_windows(
     }
     // Step 2: each window's content. The request is cloned because the
     // output takes it whole and the draw is the only piece that changes
-    // while a window is open.
-    for window in windows.iter_mut() {
+    // while a window is open. The window is taken out of the list while it
+    // builds and put back where it was: a popped-out built-in draws through
+    // the dock's own `build_panel`, which reads the shell's state.
+    let mut index = 0;
+    while index < state.windows.len() {
+        let mut window = state.windows.remove(index);
         let request = window.request.clone();
         let width = request.width.max(0.0);
         let height = request.height.max(0.0);
@@ -4456,54 +4819,95 @@ pub fn paint_windows(
             (width - 2.0 * WINDOW_CONTENT_PADDING).max(0.0),
             (body_height - 2.0 * WINDOW_CONTENT_PADDING).max(0.0),
         );
+        // A floating tab's built-in panel draws through the dock's own
+        // build (Stage 29); the window keeps its own widget state either
+        // way.
+        let floating_kind = window
+            .floating
+            .and_then(|tab| state.layout.tab(tab).map(|tab| tab.panel.clone()));
+        let editor_frames_per_second = state.readout_frames_per_second;
         let mut draw = DrawList::default();
         draw.push_fill(
             Rect::from_min_size(Vector2f::ZERO, Vector2f::new(width, height)),
-            theme.window,
+            state.theme.window,
         );
         // The window's own widget state, one frame's worth: it hit-tests
         // against last frame's rectangles, in the same window coordinates
         // the window's pointer arrives in.
         window.ui.input.begin_frame();
         window.ui.set_hit_rects(window.previous_hits.clone());
+        // A popped-out view's window (Stage 29) draws no panel content:
+        // its surface fills the window, so the background is all the draw
+        // list carries and the view system places the surface over it.
+        let surface_only = request.panel == SURFACE_VIEW_PANEL;
         let mut work = PanelWork::default();
         let started = Instant::now();
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut context = PanelContext {
-                snapshot: view.snapshot,
-                logs: view.logs,
-                selection: view.selection,
-                rect: EditorRect::new(
-                    WINDOW_CONTENT_PADDING,
-                    WINDOW_CONTENT_PADDING,
-                    content_size.x,
-                    content_size.y,
-                ),
-                text_buffers: &mut window.text,
-                work: &mut work,
-            };
-            subframe(
-                &mut window.ui,
-                text,
-                theme,
-                sheet,
-                atlas,
-                Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
-                content_size,
-                |builder| {
-                    let build =
-                        dialog_panel_build(&request.panel).or_else(|| panels.panel(&request.panel));
-                    match build {
-                        Some(build) => build(builder, &mut context),
-                        None => {
-                            builder.heading(&request.title);
-                            builder.separator();
-                            builder.label("This panel is not registered; see the log.");
+        let built = if surface_only {
+            Ok((DrawList::default(), Vec::new(), BTreeMap::new()))
+        } else {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                subframe(
+                    &mut window.ui,
+                    &mut state.text,
+                    &state.theme,
+                    &mut state.sheet,
+                    &mut state.atlas,
+                    Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
+                    content_size,
+                    |builder| match &floating_kind {
+                        Some(kind) => {
+                            let mut extras = PanelExtras {
+                                panel_millis: &state.panel_millis,
+                                text: &mut window.text,
+                                console_lines: &state.console_lines,
+                                console_level: state.console_level,
+                                console_channel: state.console_channel,
+                                preferences_text: state.preferences_text.as_deref(),
+                            };
+                            build_panel(
+                                builder,
+                                kind,
+                                editor_frames_per_second,
+                                view,
+                                &mut extras,
+                                &LayoutRect::new(
+                                    WINDOW_CONTENT_PADDING as f64,
+                                    WINDOW_CONTENT_PADDING as f64,
+                                    content_size.x as f64,
+                                    content_size.y as f64,
+                                ),
+                                &mut work,
+                            );
                         }
-                    }
-                },
-            )
-        }));
+                        None => {
+                            let mut context = PanelContext {
+                                snapshot: view.snapshot,
+                                logs: view.logs,
+                                selection: view.selection,
+                                rect: EditorRect::new(
+                                    WINDOW_CONTENT_PADDING,
+                                    WINDOW_CONTENT_PADDING,
+                                    content_size.x,
+                                    content_size.y,
+                                ),
+                                text_buffers: &mut window.text,
+                                work: &mut work,
+                            };
+                            let build = dialog_panel_build(&request.panel)
+                                .or_else(|| panels.panel(&request.panel));
+                            match build {
+                                Some(build) => build(builder, &mut context),
+                                None => {
+                                    builder.heading(&request.title);
+                                    builder.separator();
+                                    builder.label("This panel is not registered; see the log.");
+                                }
+                            }
+                        }
+                    },
+                )
+            }))
+        };
         let millis = started.elapsed().as_secs_f32() * 1000.0;
         let (mut list, clipboard, named) = match built {
             Ok(built) => built,
@@ -4518,10 +4922,10 @@ pub fn paint_windows(
                 );
                 subframe(
                     &mut window.ui,
-                    text,
-                    theme,
-                    sheet,
-                    atlas,
+                    &mut state.text,
+                    &state.theme,
+                    &mut state.sheet,
+                    &mut state.atlas,
                     Vector2f::new(WINDOW_CONTENT_PADDING, WINDOW_CONTENT_PADDING),
                     content_size,
                     |builder| {
@@ -4571,16 +4975,16 @@ pub fn paint_windows(
                     Vector2f::new(0.0, height - MODAL_BUTTON_ROW_HEIGHT),
                     Vector2f::new(width, 1.0),
                 ),
-                theme.border,
+                state.theme.border,
             );
             window.ui.set_hit_rects(window.previous_hits.clone());
             let mut pressed: Option<usize> = None;
             let (mut button_list, button_clipboard, button_named) = subframe(
                 &mut window.ui,
-                text,
-                theme,
-                sheet,
-                atlas,
+                &mut state.text,
+                &state.theme,
+                &mut state.sheet,
+                &mut state.atlas,
                 row_origin,
                 Vector2f::new(row_width, 22.0),
                 |builder| {
@@ -4622,10 +5026,13 @@ pub fn paint_windows(
         }
         collected.windows.extend(work.windows);
         frame.windows.push(EditorWindowRequest { draw, ..request });
+        state.windows.insert(index, window);
+        index += 1;
     }
     // Step 3: the modal the executable blocks the editor's input behind
     // (the newest one, should more than one ever be open).
-    frame.modal = windows
+    frame.modal = state
+        .windows
         .iter()
         .rev()
         .find(|window| window.request.kind == EditorWindowKind::Modal)

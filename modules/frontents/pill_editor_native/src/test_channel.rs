@@ -128,6 +128,26 @@ pub enum TestCommand {
         /// Physical y of the window's outer top-left.
         y: i32,
     },
+    /// Move one free-standing window's outer top-left, in logical pixels
+    /// (Stage 29: the arrangement a restart has to remember).
+    WindowPlace {
+        /// The window's id, as the shell named it.
+        id: String,
+        /// Logical x of the window's outer top-left.
+        x: f32,
+        /// Logical y of the window's outer top-left.
+        y: f32,
+    },
+    /// Resize one free-standing window's client area, in logical pixels
+    /// (Stage 29).
+    WindowResize {
+        /// The window's id, as the shell named it.
+        id: String,
+        /// Logical width.
+        width: f32,
+        /// Logical height.
+        height: f32,
+    },
     /// Press and release a named key (`escape`, `space`, or one letter),
     /// optionally with a delivery target: `ui` (the default), `scene` (the
     /// editor camera) or `game` (the project).
@@ -212,7 +232,8 @@ pub enum TestCommand {
     Dump(DumpQuery),
     /// Drive one gizmo drag (Stage 20): press on the named axis handle of
     /// the active tool, move by a pixel delta, release - the same pick, drag
-    /// and command path the mouse takes.
+    /// and command path the mouse takes. `view` names the scene view the
+    /// drag works on (Stage 29; the primary view when absent).
     GizmoDrag {
         /// The axis index (0 X, 1 Y, 2 Z).
         axis: usize,
@@ -220,6 +241,8 @@ pub enum TestCommand {
         dx: f32,
         /// Vertical drag delta, in physical scene pixels.
         dy: f32,
+        /// The scene view's tab node, when the drag targets a later view.
+        view: Option<u64>,
     },
     /// Quit gracefully, so the process exit code is the clean-shutdown one.
     Quit,
@@ -581,6 +604,41 @@ fn parse_command(line: &str) -> TestCommand {
             };
             TestCommand::WindowMove { x, y }
         }
+        Some("window-place") => {
+            let (Some(id), Some(x), Some(y)) = (parts.next(), parts.next(), parts.next()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            TestCommand::WindowPlace {
+                id: id.to_string(),
+                x,
+                y,
+            }
+        }
+        Some("window-resize") => {
+            let (Some(id), Some(width), Some(height)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            let (Ok(width), Ok(height)) = (width.parse::<f32>(), height.parse::<f32>()) else {
+                return TestCommand::Unknown {
+                    line: line.to_string(),
+                };
+            };
+            TestCommand::WindowResize {
+                id: id.to_string(),
+                width,
+                height,
+            }
+        }
         Some("key") => match parts.next() {
             Some(key) => TestCommand::Key {
                 key: key.to_lowercase(),
@@ -662,7 +720,7 @@ fn parse_command(line: &str) -> TestCommand {
     }
 }
 
-/// Parse `gizmo drag <axis> <dx> <dy>`.
+/// Parse `gizmo drag <axis> <dx> <dy> [view:<node>]`.
 fn parse_gizmo(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestCommand {
     let unknown = || TestCommand::Unknown {
         line: line.to_string(),
@@ -680,7 +738,17 @@ fn parse_gizmo(parts: &mut std::str::SplitWhitespace<'_>, line: &str) -> TestCom
     else {
         return unknown();
     };
-    TestCommand::GizmoDrag { axis, dx, dy }
+    let view = match parts.next() {
+        Some(token) => match token
+            .strip_prefix("view:")
+            .and_then(|node| node.parse::<u64>().ok())
+        {
+            Some(node) => Some(node),
+            None => return unknown(),
+        },
+        None => None,
+    };
+    TestCommand::GizmoDrag { axis, dx, dy, view }
 }
 
 /// Parse `edit <verb> ...`.

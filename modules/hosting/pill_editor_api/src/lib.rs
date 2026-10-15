@@ -154,6 +154,11 @@ pub struct EditorShellInput {
     /// the close button. The shell drops the window's state, exactly as it
     /// would have on its own close.
     pub window_closed: Vec<String>,
+    /// Every open window's arrangement, as the platform reports it (Stage
+    /// 29): where it sits and how large it is. The shell folds it into the
+    /// layout (a popped-out tab's size and position) and the recovery
+    /// document (every window), which is what a restart reopens from.
+    pub window_bounds: Vec<EditorWindowBounds>,
     /// Screen-space labels the overlay draws over the scene (Stage 21), in
     /// logical client pixels. The executable publishes them because it is
     /// the side that projects world positions; the shell only paints them.
@@ -274,9 +279,30 @@ pub struct EditorWindowRequest {
     /// The modal's buttons, in draw order, left to right; empty for a tool
     /// window. The first button is the modal's default: Enter answers it.
     pub buttons: Vec<EditorWindowButton>,
+    /// Where the window's outer top-left sits on the desktop, in logical
+    /// pixels, when a remembered arrangement is being restored (Stage 29);
+    /// `None` lets the host place the window (a modal centers over its
+    /// owner, a tool window opens near its corner).
+    pub position: Option<(f32, f32)>,
     /// What to draw, in the window's own logical pixels (its top-left is
     /// the origin): the panel, and for a modal the button row.
     pub draw: DrawList,
+}
+
+/// One open window's arrangement, as the platform reports it (Stage 29):
+/// the shell folds it back into the layout and the recovery document, so a
+/// restart reopens the windows where the user left them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorWindowBounds {
+    /// The window's id, as its request named it.
+    pub id: String,
+    /// The window's outer top-left on the desktop, in logical pixels; `None`
+    /// where the platform reports no global position (Wayland, D23).
+    pub position: Option<(f32, f32)>,
+    /// The window's client width in logical pixels.
+    pub width: f32,
+    /// The window's client height in logical pixels.
+    pub height: f32,
 }
 
 /// One pointer event of one free-standing window (Stage 24), in the
@@ -442,6 +468,42 @@ pub struct EditorOpenRequest {
 }
 
 // =============================================================================
+// EditorViewRect
+// =============================================================================
+
+/// Which camera a view surface draws through (Stage 29).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorViewKind {
+    /// The editor's own camera (D29); several scene views may render at
+    /// once, each owning its camera.
+    #[default]
+    Scene,
+    /// The project's own camera; the selected Game view shows it.
+    Game,
+}
+
+/// One view surface's placement for this frame (Stage 29).
+///
+/// The id names the dock tab that owns the view, so a view keeps its
+/// surface, its camera and its placement across frames and restarts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EditorViewRect {
+    /// Stable identity, from the tab's node (`view:7`).
+    pub id: String,
+    /// The tab's numeric node: the smallest scene node is the primary
+    /// view, which keeps the boot-time surface id.
+    pub node: u64,
+    /// The camera the view draws through.
+    pub kind: EditorViewKind,
+    /// Where the view goes, in logical pixels of the window named below
+    /// (or of the main window's client area).
+    pub rect: EditorRect,
+    /// The popped-out window that holds the view (Stage 29), by its window
+    /// request id; `None` for a view docked in the main window.
+    pub window: Option<String>,
+}
+
+// =============================================================================
 // EditorShellFrame
 // =============================================================================
 
@@ -506,12 +568,11 @@ pub struct EditorShellFrame {
     /// A file the shell asks the executable to open in the developer's
     /// editor, from a Problems row (Stage 19).
     pub requested_open: Option<EditorOpenRequest>,
-    /// Where the scene surface goes, in logical pixels of the client area;
-    /// `None` while no Scene tab is selected.
-    pub scene_rect: Option<EditorRect>,
-    /// Where the game surface goes, in logical pixels of the client area;
-    /// `None` while no Game tab is selected (D29).
-    pub game_rect: Option<EditorRect>,
+    /// The scene and game views to draw this frame (Stage 29): one entry
+    /// per selected Scene or Game tab, each into its own surface. A view
+    /// whose `window` names a popped-out tab's window draws inside that
+    /// window's client area instead of the main window's.
+    pub views: Vec<EditorViewRect>,
 }
 
 impl EditorShellFrame {
@@ -530,8 +591,7 @@ impl EditorShellFrame {
         self.assets_rect = None;
         self.drag_candidate = None;
         self.requested_open = None;
-        self.scene_rect = None;
-        self.game_rect = None;
+        self.views.clear();
     }
 }
 
@@ -549,8 +609,13 @@ mod tests {
     fn clear_empties_every_output() {
         let mut frame = EditorShellFrame {
             atlas: None,
-            scene_rect: Some(EditorRect::new(1.0, 2.0, 3.0, 4.0)),
-            game_rect: Some(EditorRect::new(5.0, 6.0, 7.0, 8.0)),
+            views: vec![EditorViewRect {
+                id: "view:1".to_string(),
+                node: 1,
+                kind: EditorViewKind::Scene,
+                rect: EditorRect::new(1.0, 2.0, 3.0, 4.0),
+                window: None,
+            }],
             ..Default::default()
         };
         frame.panels.push_fill(
@@ -587,8 +652,7 @@ mod tests {
         assert!(frame.requested_clipboard.is_none());
         assert!(frame.drag_candidate.is_none());
         assert!(frame.requested_open.is_none());
-        assert!(frame.scene_rect.is_none());
-        assert!(frame.game_rect.is_none());
+        assert!(frame.views.is_empty());
         assert!(frame.atlas.is_none());
     }
 }
