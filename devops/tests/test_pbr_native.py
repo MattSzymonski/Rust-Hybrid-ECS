@@ -5,6 +5,13 @@ PROTECTS: The windowed frontend presents frames and shuts down cleanly.
 TIER: host
 RUN: manual - needs the windowed frontend binary as an argument
 
+WHAT IS ASSERTED
+    The first frame token, the window's size after a resize request, that the
+    frame loop is still presenting after the resize/minimize/restore, that the
+    window came back from the minimize, and a zero exit code. The renderer logs
+    a resize it could not honour but nothing when it succeeds, so the window's
+    own geometry is the only evidence a resize reached it.
+
 """
 import argparse
 import ctypes
@@ -38,13 +45,39 @@ def main():
     user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
     user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+
+    def window_rect(window):
+        rect = wintypes.RECT()
+        user32.GetWindowRect(window, ctypes.byref(rect))
+        return rect
+
+    def read_log():
+        return log_path.read_text(encoding="utf-8", errors="replace")
+
+    def wait_for_frame_statistic(seen: int, timeout: float) -> bool:
+        """True once the frontend logs a frame-statistic line past `seen`.
+
+        `FPS |` is printed every few seconds while the loop presents, and the
+        shipping smoke test waits for it too. It is the only success-side token
+        the renderer emits, so it is what shows the resize did not kill it.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if read_log().count(" FPS | ") > seen:
+                return True
+            if process.poll() is not None:
+                return False
+            time.sleep(0.5)
+        return False
+
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen([str(binary)], cwd=args.cwd or root / "modules", env=environment,
                                    stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
         try:
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
-                text = log_path.read_text(encoding="utf-8", errors="replace")
+                text = read_log()
                 if "[render] First frame: Presented; camera=true" in text:
                     break
                 if process.poll() is not None:
@@ -65,23 +98,38 @@ def main():
             if not windows:
                 raise RuntimeError("frontend presented without a visible native window")
             def area(window):
-                rect = wintypes.RECT()
-                user32.GetWindowRect(window, ctypes.byref(rect))
+                rect = window_rect(window)
                 return (rect.right - rect.left) * (rect.bottom - rect.top)
             window = max(windows, key=area)
-            print("native scene presented; checking resize", flush=True)
+            before = window_rect(window)
+            print("native scene presented; requesting a resize", flush=True)
             user32.SetWindowPos(window, None, 40, 40, 960, 720, 0x4004)
             time.sleep(1)
+            resized = window_rect(window)
+            width = resized.right - resized.left
+            height = resized.bottom - resized.top
+            if (width, height) == (before.right - before.left, before.bottom - before.top):
+                raise RuntimeError("the window kept its original size: the resize never reached it")
+            if abs(width - 960) > 32 or abs(height - 720) > 32:
+                raise RuntimeError(f"resize requested 960x720, the window is {width}x{height}")
+            print(f"resize applied: {width}x{height}", flush=True)
             user32.ShowWindowAsync(window, 6)
             time.sleep(1)
             user32.ShowWindowAsync(window, 9)
             time.sleep(2)
-            print("resize/minimize/restore requested; checking shutdown", flush=True)
+            if user32.IsIconic(window):
+                raise RuntimeError("the window stayed minimized: the restore never reached it")
+            if not user32.IsWindowVisible(window):
+                raise RuntimeError("the window is not visible after the restore")
+            print("minimize/restore left the window restored; checking the frame loop", flush=True)
+            if not wait_for_frame_statistic(read_log().count(" FPS | "), 30):
+                raise RuntimeError(f"the frame loop stopped after the window calls; see {log_path}")
+            print("still presenting; checking shutdown", flush=True)
             user32.PostMessageW(window, 0x0010, 0, 0)
             result = process.wait(timeout=30)
             if result != 0:
                 raise RuntimeError(f"frontend shutdown failed: {result}; see {log_path}")
-            print(f"PASS: present, resize, minimize/restore, clean shutdown: {binary.name}; {log_path}")
+            print(f"PASS: present, resize applied, still presenting, clean shutdown: {binary.name}; {log_path}")
         finally:
             if process.poll() is None:
                 subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True)

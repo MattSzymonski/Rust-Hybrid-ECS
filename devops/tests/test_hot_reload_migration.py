@@ -379,6 +379,8 @@ class Scenario:
 
     name: str
     replacements: Sequence[Tuple[str, str]]
+    # Proof of life for the generation the reload produced: the counter must
+    # tick after the reload settles, not merely have ticked before it.
     expect_counter_tick: bool
     required_tokens: Sequence[str]
     forbidden_tokens: Sequence[str]
@@ -540,8 +542,15 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
         return False
 
     if scenario.expect_counter_tick:
-        if not monitor.wait_for(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT, start_index):
+        # From an index taken after the reload settled, not from the scenario's
+        # start: the counter ticks continuously while the reload is building, so
+        # a start-indexed wait was satisfied by the OLD generation's ticks and
+        # proved nothing about the new one. A stopped counter is exactly what
+        # this wait exists to catch.
+        alive_index = monitor.line_count
+        if not monitor.wait_for(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT, alive_index):
             print(f"  [FAIL] Counter did not tick after scenario: {scenario.name}")
+            print(f"  Output tail:\n{monitor.output_since(alive_index)[-1600:]}")
             return False
 
     output = monitor.output_since(start_index)

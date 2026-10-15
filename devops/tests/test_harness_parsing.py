@@ -36,6 +36,16 @@ DESCRIPTION
     because the bug was in the gap between what the host prints and what the
     harness expected.
 
+    Two of these checks used to compare a copy of an engine rule against
+    another copy of the same rule, both written here: the provable-route set
+    was asserted against a literal that restated it, and the shared-slot rule
+    was reimplemented in the test and then asserted against itself. Neither
+    could fail when the engine changed - the failure mode this whole file
+    exists to catch. Both now read the rule out of the engine's own source
+    (`pill_host/src/analytics.rs`, `pill_host/src/build_runner.rs`) and compare
+    it with what the harness and this file believe, so a route relabelled or
+    reclassified in Rust fails here.
+
 USAGE
   python devops/tests/test_harness_parsing.py
 
@@ -46,6 +56,7 @@ EXAMPLE USAGE
 """
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import Callable, List, Tuple
@@ -53,6 +64,7 @@ from typing import Callable, List, Tuple
 DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
+from core.paths import MODULES_ROOT  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
     restore_paths,
@@ -77,6 +89,17 @@ def load_module(relative_path: str, name: str):
 
 harness = load_module("benchmarks/hot_reload_harness.py", "hot_reload_harness")
 coverage = load_module("tests/test_hot_patch_coverage.py", "test_hot_patch_coverage")
+
+# The engine sources the two rules under test are defined in. Read as text: a
+# rule that moved, was renamed or was reworded fails the check that reads it.
+PILL_HOST_SOURCE = MODULES_ROOT / "hosting" / "pill_host" / "src"
+ANALYTICS_SOURCE = PILL_HOST_SOURCE / "analytics.rs"
+BUILD_RUNNER_SOURCE = PILL_HOST_SOURCE / "build_runner.rs"
+
+# Cargo's configuration hash: `-<16 hex digits>` appended to a crate's filename
+# when the artifact belongs to one resolved configuration. A name without it is
+# the shared slot every build of that crate name overwrites.
+CONFIGURATION_HASH_HEX_DIGITS = 16
 
 
 # =============================================================================
@@ -155,12 +178,41 @@ mod tests {
 # =============================================================================
 
 
+def fail(message: str) -> None:
+    """Fail the running check.
+
+    Explicit rather than `assert`: `python -O` compiles an `assert` away, which
+    would turn every check in this file into a silent pass.
+    """
+    raise AssertionError(message)
+
+
+def rust_block(source: str, marker: str) -> str:
+    """The inside of the first `{ ... }` block at or after `marker`.
+
+    Rustfmt puts a top-level item's closing brace in column 0, so the first
+    column-0 `}` after the opening brace ends it.
+    """
+    start = source.find(marker)
+    if start < 0:
+        fail(f"{marker!r} is gone from {ANALYTICS_SOURCE.name} / {BUILD_RUNNER_SOURCE.name}")
+    opening = source.find("{", start)
+    if opening < 0:
+        fail(f"{marker!r} has no body")
+    end = source.find("\n}", opening)
+    if end < 0:
+        fail(f"{marker!r} has no closing brace")
+    return source[opening + 1 : end]
+
+
 def check_every_real_analytics_line_parses() -> None:
     """Each fixture line must match, and expose its phase numbers."""
     for line in REAL_ANALYTICS_LINES:
         match = harness.RELOAD_LINE_RE.search(line)
-        assert match is not None, f"unparsed analytics line: {line[:90]}"
-        assert float(match.group(3)) >= 0, "stage must parse as a number"
+        if match is None:
+            fail(f"unparsed analytics line: {line[:90]}")
+        if float(match.group(3)) < 0:
+            fail(f"stage did not parse as a number: {match.group(3)!r}")
 
 
 def check_function_names_with_spaces_and_commas_survive() -> None:
@@ -170,16 +222,14 @@ def check_function_names_with_spaces_and_commas_survive() -> None:
     and patching several bodies from one save - so neither is exotic.
     """
     trait_line = next(line for line in REAL_ANALYTICS_LINES if "ColorTweak" in line)
-    assert (
-        harness.RELOAD_LINE_RE.search(trait_line).group(1)
-        == "pill_spline::<Spline as ColorTweak>::tweak"
-    ), "a trait-method name must be captured whole, spaces included"
+    trait_name = harness.RELOAD_LINE_RE.search(trait_line).group(1)
+    if trait_name != "pill_spline::<Spline as ColorTweak>::tweak":
+        fail(f"a trait-method name must be captured whole, spaces included: {trait_name!r}")
 
     multi_line = next(line for line in REAL_ANALYTICS_LINES if "Tint::mix" in line)
-    assert (
-        harness.RELOAD_LINE_RE.search(multi_line).group(1)
-        == "pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix"
-    ), "a multi-function name must be captured whole, comma included"
+    multi_name = harness.RELOAD_LINE_RE.search(multi_line).group(1)
+    if multi_name != "pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix":
+        fail(f"a multi-function name must be captured whole, comma included: {multi_name!r}")
 
 
 def check_optional_fields_are_really_optional() -> None:
@@ -190,37 +240,73 @@ def check_optional_fields_are_really_optional() -> None:
     """
     old_line = next(line for line in REAL_ANALYTICS_LINES if "kind=" not in line)
     match = harness.RELOAD_LINE_RE.search(old_line)
-    assert match is not None, "a line without the optional fields must still match"
-    assert match.group(8) is None, "kind must be absent, not defaulted"
-    assert match.group(9) is None, "route must be absent, not defaulted"
+    if match is None:
+        fail("a line without the optional fields must still match")
+    if match.group(8) is not None:
+        fail("kind must be absent, not defaulted")
+    if match.group(9) is not None:
+        fail("route must be absent, not defaulted")
 
 
 def check_route_is_read_only_when_present() -> None:
     """`route` and `copies` parse together, or not at all."""
     with_route = next(line for line in REAL_ANALYTICS_LINES if "route=" in line)
     match = harness.RELOAD_LINE_RE.search(with_route)
-    assert match.group(9) == "artifact-slot", f"route was {match.group(9)!r}"
-    assert match.group(10) == "3", f"copies was {match.group(10)!r}"
+    if match.group(9) != "artifact-slot":
+        fail(f"route was {match.group(9)!r}")
+    if match.group(10) != "3":
+        fail(f"copies was {match.group(10)!r}")
 
 
 def check_provable_routes_match_the_engine() -> None:
     """The harness's idea of a provable route must match the engine's.
 
     `PatchRoute::is_provable` in `pill_host/src/analytics.rs` is the definition;
-    this set mirrors it. If they drift, the benchmark silently reclassifies a
-    best-effort patch as a guaranteed one.
+    the harness's `PROVABLE_ROUTES` mirrors it. If they drift, the benchmark
+    silently reclassifies a best-effort patch as a guaranteed one - so both
+    sides are read here, and the labels the engine actually prints are the ones
+    compared.
     """
-    assert harness.PROVABLE_ROUTES == {"engine-slot", "artifact-slot"}, (
-        "PROVABLE_ROUTES drifted from PatchRoute::is_provable in analytics.rs"
-    )
+    source = ANALYTICS_SOURCE.read_text(encoding="utf-8")
+    variants = {
+        line.strip().rstrip(",")
+        for line in rust_block(source, "enum PatchRoute").splitlines()
+        if re.fullmatch(r"[A-Z]\w*,?", line.strip())
+    }
+    if not variants:
+        fail("no PatchRoute variants parsed: the enum's shape changed")
+
+    implementation = rust_block(source, "impl PatchRoute")
+    labels = dict(re.findall(r'Self::(\w+)\s*=>\s*"([\w+-]+)"', implementation))
+    if set(labels) != variants:
+        fail(
+            "PatchRoute::label does not name every variant: "
+            f"{sorted(variants ^ set(labels))} is on one side only"
+        )
+
+    match = re.search(r"matches!\(\s*self\s*,\s*(.+?)\)", implementation, re.DOTALL)
+    if match is None:
+        fail("PatchRoute::is_provable no longer states its routes as a matches! arm")
+    provable = {
+        labels[name] for name in re.findall(r"Self::(\w+)", match.group(1)) if name in labels
+    }
+
+    if provable != set(harness.PROVABLE_ROUTES):
+        fail(
+            "PROVABLE_ROUTES drifted from PatchRoute::is_provable in analytics.rs: "
+            f"engine says {sorted(provable)}, harness says {sorted(harness.PROVABLE_ROUTES)}"
+        )
 
 
 def check_cargo_test_totals_are_summed() -> None:
     """The cargo summary must total every binary's line, including failures."""
     summary = summarize_test_results(REAL_CARGO_TEST_OUTPUT)
-    assert "244 passed" in summary, f"expected 14+160+70=244, got: {summary}"
-    assert "2 failed" in summary, f"a failing binary must be counted: {summary}"
-    assert "3 ignored" in summary, f"ignored must be totalled: {summary}"
+    if "244 passed" not in summary:
+        fail(f"expected 14+160+70=244, got: {summary}")
+    if "2 failed" not in summary:
+        fail(f"a failing binary must be counted: {summary}")
+    if "3 ignored" not in summary:
+        fail(f"ignored must be totalled: {summary}")
 
 
 def check_function_body_scan_handles_braces_in_strings_and_comments() -> None:
@@ -231,15 +317,17 @@ def check_function_body_scan_handles_braces_in_strings_and_comments() -> None:
     """
     bodies = coverage.find_function_bodies(REAL_RUST_SOURCE)
     names = [name for name, _, _ in bodies]
-    assert "get_color_a" in names, f"missed an inherent method: {names}"
-    assert "default" in names, f"missed a trait method: {names}"
-    assert "helper" in names, f"missed a free function: {names}"
+    for expected in ("get_color_a", "default", "helper"):
+        if expected not in names:
+            fail(f"missed {expected}: {names}")
 
     # The body of `helper` must end at its own closing brace, not run on.
-    _, start, end = next(b for b in bodies if b[0] == "helper")
+    _, start, end = next(body for body in bodies if body[0] == "helper")
     body = REAL_RUST_SOURCE[start:end]
-    assert "0.5" in body, "helper's body must contain its literal"
-    assert "mod tests" not in body, "helper's body ran past its closing brace"
+    if "0.5" not in body:
+        fail("helper's body must contain its literal")
+    if "mod tests" in body:
+        fail("helper's body ran past its closing brace")
 
 
 def check_test_module_is_excluded_from_runtime_code() -> None:
@@ -249,8 +337,10 @@ def check_test_module_is_excluded_from_runtime_code() -> None:
     suite would report a healthy crate as broken.
     """
     end = coverage.runtime_code_end(REAL_RUST_SOURCE)
-    assert "mod tests" in REAL_RUST_SOURCE[end:], "the test module must be excluded"
-    assert "get_color_a" in REAL_RUST_SOURCE[:end], "runtime code must be included"
+    if "mod tests" not in REAL_RUST_SOURCE[end:]:
+        fail("the test module must be excluded")
+    if "get_color_a" not in REAL_RUST_SOURCE[:end]:
+        fail("runtime code must be included")
 
 
 def check_unique_snippet_anchors_to_one_place() -> None:
@@ -258,29 +348,62 @@ def check_unique_snippet_anchors_to_one_place() -> None:
     source = "fn a() { x * 2.0 }\nfn b() { y * 2.0 }\n"
     literal_start = source.index("2.0")
     snippet = coverage.unique_snippet(source, literal_start, "2.0")
-    assert snippet is not None, "a unique anchor exists here"
-    assert source.count(snippet) == 1, f"anchor {snippet!r} is not unique"
-    assert "2.0" in snippet
+    if snippet is None:
+        fail("a unique anchor exists here")
+    if source.count(snippet) != 1:
+        fail(f"anchor {snippet!r} is not unique")
+    if "2.0" not in snippet:
+        fail(f"anchor {snippet!r} does not contain the edited literal")
 
 
 def check_shared_slot_detection_matches_cargo_naming() -> None:
     """Which artifacts another build can overwrite in place.
 
-    Mirrors `is_shared_slot_rlib` in `pill_host/src/hot_patch/compile.rs`; the
-    two must agree or a file is staged and never linked, or linked and never
-    staged.
+    The rule lives in `is_shared_slot_rlib` (`pill_host/src/build_runner.rs`):
+    a `.rlib` whose stem carries no `-<16 hex digits>` suffix is the shared
+    per-crate slot, and the only kind another build silently replaces. The patch
+    linker and the dependency staging both call it, so a change there has to be
+    noticed here; this reads the rule out of the function instead of restating
+    it.
     """
-    for name in ("libpill_dummy_color.rlib", "libpill_core.rlib"):
-        assert coverage is not None and name.endswith(".rlib")
-    # Kept as a naming-convention check rather than importing Rust: a 16-hex
-    # suffix marks one exact configuration, anything else is a shared slot.
-    def is_shared(file_name: str) -> bool:
-        stem = file_name[: -len(".rlib")]
-        _, _, suffix = stem.rpartition("-")
-        return not (len(suffix) == 16 and all(c in "0123456789abcdef" for c in suffix))
+    body = rust_block(BUILD_RUNNER_SOURCE.read_text(encoding="utf-8"), "fn is_shared_slot_rlib(")
+    if 'strip_suffix(".rlib")' not in body:
+        fail("is_shared_slot_rlib no longer keys on the .rlib suffix")
+    if "is_ascii_hexdigit" not in body:
+        fail("is_shared_slot_rlib no longer checks the suffix for hex digits")
+    suffix_length = re.search(r"suffix\.len\(\)\s*==\s*(\d+)", body)
+    if suffix_length is None:
+        fail("is_shared_slot_rlib no longer compares the suffix length")
+    if int(suffix_length.group(1)) != CONFIGURATION_HASH_HEX_DIGITS:
+        fail(
+            "the configuration hash is no longer "
+            f"{CONFIGURATION_HASH_HEX_DIGITS} hex digits but {suffix_length.group(1)}, "
+            "so every name below is classified against the wrong rule"
+        )
 
-    assert is_shared("libpill_dummy_color.rlib")
-    assert not is_shared("libpill_engine-190d6c0e2d2eaf24.rlib")
+    def is_shared(file_name: str) -> bool:
+        """`is_shared_slot_rlib`'s rule, with its length read from its source."""
+        stem = file_name[: -len(".rlib")]
+        _, separator, suffix = stem.rpartition("-")
+        if not separator:
+            return True
+        return not (
+            len(suffix) == CONFIGURATION_HASH_HEX_DIGITS
+            and all(character in "0123456789abcdef" for character in suffix)
+        )
+
+    # Cargo's own names: the shared slot a patch can be linked against, one
+    # configuration's artifact, a short suffix and a non-hex one.
+    cases = {
+        "libpill_dummy_color.rlib": True,
+        "libpill_engine-190d6c0e2d2eaf24.rlib": False,
+        "libpill_engine-190d6c0e2d2eaf2.rlib": True,
+        "libpill_engine-190d6c0e2d2eaf2Z.rlib": True,
+    }
+    for name, expected in cases.items():
+        if is_shared(name) != expected:
+            wanted = "the shared slot" if expected else "configuration-specific"
+            fail(f"{name} must be {wanted}")
 
 
 def check_source_edits_keep_line_endings() -> None:
@@ -296,9 +419,11 @@ def check_source_edits_keep_line_endings() -> None:
             path = Path(directory) / "edited.rs"
             original = newline.join(["fn a() {}", "fn b() { 1 }", "fn c() {}", ""]).encode("utf-8")
             path.write_bytes(original)
-            assert apply_replacements(path, [("{ 1 }", "{ 2 }")]), "the edit anchor must be found"
+            if not apply_replacements(path, [("{ 1 }", "{ 2 }")]):
+                fail("the edit anchor must be found")
             expected = original.replace(b"{ 1 }", b"{ 2 }")
-            assert path.read_bytes() == expected, f"line endings changed for {newline!r}"
+            if path.read_bytes() != expected:
+                fail(f"line endings changed for {newline!r}")
 
 
 def check_snapshot_restores_files_exactly() -> None:
@@ -320,9 +445,12 @@ def check_snapshot_restores_files_exactly() -> None:
         lockfile.write_bytes(b"changed\n")
         restore_paths(paths, snapshot)
 
-        assert (tracked / "src" / "lib.rs").read_bytes() == b"original\n"
-        assert not (tracked / "src" / "extra.rs").exists(), "a new file must be removed"
-        assert lockfile.read_bytes() == b"lock\n"
+        if (tracked / "src" / "lib.rs").read_bytes() != b"original\n":
+            fail("a changed file was not restored")
+        if (tracked / "src" / "extra.rs").exists():
+            fail("a new file must be removed")
+        if lockfile.read_bytes() != b"lock\n":
+            fail("the lockfile was not restored")
 
 
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
@@ -336,7 +464,7 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
      check_function_body_scan_handles_braces_in_strings_and_comments),
     ("cfg(test) code is excluded", check_test_module_is_excluded_from_runtime_code),
     ("edit anchors are unique", check_unique_snippet_anchors_to_one_place),
-    ("shared-slot detection matches cargo", check_shared_slot_detection_matches_cargo_naming),
+    ("shared-slot rule matches the engine", check_shared_slot_detection_matches_cargo_naming),
     ("source edits keep line endings", check_source_edits_keep_line_endings),
     ("snapshot restores files exactly", check_snapshot_restores_files_exactly),
 ]

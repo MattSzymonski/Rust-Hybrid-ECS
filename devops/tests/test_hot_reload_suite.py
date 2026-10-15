@@ -169,15 +169,18 @@ def launch_host(project_path: str):
 class ScenarioPhase:
     """One edit+wait step inside a scenario.
 
-    A scenario runs its phases in order; each phase applies its edits, waits
-    for ``wait_token``, then (after all phases) the whole scenario window is
-    checked for required / forbidden tokens and secondary wait tokens.
+    A scenario runs its phases in order; each phase applies its edits, waits for
+    ``wait_token``, then waits its own ``wait_after`` tokens from an index taken
+    after that reload. Once every phase is done the whole scenario window is
+    checked for required / forbidden tokens.
     """
 
     edits: Sequence[Tuple[Path, Sequence[Tuple[str, str]]]]
     wait_token: str
     required_tokens: Sequence[str] = ()
     forbidden_tokens: Sequence[str] = ()
+    # Proof-of-life tokens (a counter tick, a probe value), waited for from an
+    # index taken after `wait_token` appears, never from the scenario start.
     wait_after: Sequence[Tuple[str, float]] = ()
 
 
@@ -228,11 +231,19 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
             print(f"  [FAIL] Process died after scenario: {scenario.name}")
             return False
 
+        # Proof-of-life tokens are waited for from an index taken HERE, after the
+        # reload token, not from the scenario's start. A counter that kept
+        # printing while the reload was building satisfies a start-indexed wait
+        # instantly, so that wait passed whether or not the new generation ever
+        # ran; indexing after the reload token makes it prove the reloaded code
+        # is alive. The C# bridge suite captures its index the same way.
+        alive_index = monitor.line_count
+
         # Wait for any secondary tokens (counter ticks, probe values, ...).
         for token, timeout in phase.wait_after:
-            if not monitor.wait_for(token, timeout, start_index):
+            if not monitor.wait_for(token, timeout, alive_index):
                 print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
-                print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
+                print(f"  Output tail:\n{monitor.output_since(alive_index)[-1600:]}")
                 return False
 
     output = monitor.output_since(start_index)

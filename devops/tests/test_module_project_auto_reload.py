@@ -72,6 +72,9 @@ ORIGINAL_HOST_CONFIG = None
 PROBE_PREFIX = "midpoint ("
 MODULE_RELOAD_TOKEN = "extension reload processed"
 QUEUED_PROJECT_RELOAD_TOKEN = "queuing a project reload"
+# The project's own completion line. Note that this literal is a substring of
+# the module's ("extension hot reload complete"), which the log holds by the
+# time this is waited for - hence the fresh index taken before the wait below.
 PROJECT_RELOAD_TOKEN = "hot reload complete"
 
 STARTUP_TIMEOUT = 90
@@ -318,7 +321,12 @@ def run_suite(expected_midpoint: str) -> bool:
             return False
         print("  [OK] Project reload queued because the project links the module.")
 
-        if not monitor.wait_for(PROJECT_RELOAD_TOKEN, PROJECT_RELOAD_TIMEOUT):
+        # `PROJECT_RELOAD_TOKEN` is a substring of the module reload's own
+        # completion line ("extension hot reload complete"), which is already in
+        # the log by now. Waiting from an index taken after the queueing line is
+        # what makes this the project's reload rather than the module's.
+        project_reload_start = monitor.line_count
+        if not monitor.wait_for(PROJECT_RELOAD_TOKEN, PROJECT_RELOAD_TIMEOUT, project_reload_start):
             print("  [FAIL] Project did not complete its reload.")
             return False
         print("  [OK] Project reloaded.")
