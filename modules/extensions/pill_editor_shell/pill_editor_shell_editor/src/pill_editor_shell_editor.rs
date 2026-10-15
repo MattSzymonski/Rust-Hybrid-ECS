@@ -29,7 +29,9 @@ extern crate self as pill_editor_shell_editor;
 
 // External crates
 use pill_editor_api::panels::EditorPanelRegistry;
-use pill_editor_api::{EditorRect, EditorShellFrame, EditorShellInput};
+use pill_editor_api::{
+    EditorRect, EditorShellFrame, EditorShellInput, EditorViewKind, EditorViewRect,
+};
 use pill_editor_core::commands::{
     ensure_command_resources, CommandInbox, CommandRegistry, PendingEditorCommands,
 };
@@ -40,14 +42,15 @@ use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // Current crate
 use pill_editor_shell_editor::shell::{
-    activate_widget, collect_panel_placements, console_channel, drain_panel_work, execute_command,
-    focus_module_panel, handle_command_shortcuts, handle_file_drops, handle_menu_pointer,
-    handle_popup_closed, handle_popup_pointer, handle_window_closed, handle_window_key,
-    handle_window_pointer, handle_window_text, paint_context_menu, paint_dock_chrome,
-    paint_drop_preview, paint_menu, paint_overlay_badge, paint_overlay_labels, paint_palette,
-    paint_panels, paint_toasts, paint_windows, run_clipboard_action, scroll_last_widget,
-    select_tab_by_title, sync_command_files, sync_panel_commands, ConsoleLine, EditorShellState,
-    Toast, CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
+    activate_widget, apply_window_bounds, collect_panel_placements, console_channel,
+    drain_panel_work, execute_command, floating_window_id, focus_module_panel,
+    handle_command_shortcuts, handle_file_drops, handle_menu_pointer, handle_popup_closed,
+    handle_popup_pointer, handle_window_closed, handle_window_key, handle_window_pointer,
+    handle_window_text, paint_context_menu, paint_dock_chrome, paint_drop_preview, paint_menu,
+    paint_overlay_badge, paint_overlay_labels, paint_palette, paint_panels, paint_toasts,
+    paint_windows, run_clipboard_action, scroll_last_widget, select_tab_by_title,
+    sync_command_files, sync_panel_commands, view_id, ConsoleLine, EditorShellState, Toast,
+    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -224,6 +227,9 @@ pub fn editor_shell_update(
     // it - and key presses are collected with the modifiers current at
     // their moment, for the shortcut pass once the files are current.
     state.paused = input.systems_paused;
+    // Step 1a: the platform's window arrangement (Stage 29) joins the
+    // session before the windows are drawn from it this frame.
+    apply_window_bounds(&mut state, &input.window_bounds);
     // The live readouts refresh at their own cadence, and hold while the
     // project is paused (Stage 22, D25); both the badge and the Statistics
     // panel read the sampled value.
@@ -360,25 +366,50 @@ pub fn editor_shell_update(
         ),
         LayoutMetrics::default(),
     );
-    // Step 3: rebuild the frame. The scene rectangle goes to the executable
-    // first: it places the child surface there before this frame presents.
+    // Step 3: rebuild the frame. The view rectangles go to the executable
+    // first: it places the child surfaces there before this frame presents.
+    // One entry per selected Scene or Game tab (Stage 29), plus one per
+    // popped-out view, which draws inside its own window's client area.
     frame.clear();
-    frame.scene_rect = snapshot.scene_rect.map(|rect| {
-        EditorRect::new(
-            rect.x as f32,
-            rect.y as f32,
-            rect.width as f32,
-            rect.height as f32,
-        )
-    });
-    frame.game_rect = snapshot.game_rect.map(|rect| {
-        EditorRect::new(
-            rect.x as f32,
-            rect.y as f32,
-            rect.width as f32,
-            rect.height as f32,
-        )
-    });
+    frame.views = snapshot
+        .views
+        .iter()
+        .map(|view| EditorViewRect {
+            id: view_id(view.tab),
+            node: view.tab.0,
+            kind: match view.panel {
+                pill_editor_core::layout::PanelKind::Game => EditorViewKind::Game,
+                _ => EditorViewKind::Scene,
+            },
+            rect: EditorRect::new(
+                view.rect.x as f32,
+                view.rect.y as f32,
+                view.rect.width as f32,
+                view.rect.height as f32,
+            ),
+            window: None,
+        })
+        .collect();
+    for entry in &state.layout.floating {
+        let kind = match state.layout.node(entry.tab) {
+            Some(pill_editor_core::layout::LayoutNode::Tab(tab)) => match tab.panel {
+                pill_editor_core::layout::PanelKind::Scene => Some(EditorViewKind::Scene),
+                pill_editor_core::layout::PanelKind::Game => Some(EditorViewKind::Game),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            continue;
+        };
+        frame.views.push(EditorViewRect {
+            id: view_id(entry.tab),
+            node: entry.tab.0,
+            kind,
+            rect: EditorRect::new(0.0, 0.0, entry.width, entry.height),
+            window: Some(floating_window_id(entry.tab)),
+        });
+    }
     // The badge and the Statistics panel show the sampled readout, not the
     // executable's live feed (Stage 22, D25).
     let editor_frames_per_second = state.readout_frames_per_second;

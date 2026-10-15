@@ -13,9 +13,9 @@ mod persistence;
 mod reducer;
 
 pub use action::{DockLocation, LayoutAction};
-pub use geometry::{compute_layout, DropTarget, LayoutMetrics, LayoutSnapshot, Rect};
+pub use geometry::{compute_layout, DropTarget, LayoutMetrics, LayoutSnapshot, Rect, ViewRect};
 pub use id::NodeId;
-pub use model::{Axis, LayoutModel, LayoutNode, PanelKind};
+pub use model::{Axis, FloatingTab, LayoutModel, LayoutNode, PanelKind, FLOATING_TAB_DEFAULT_SIZE};
 pub use persistence::{
     discard_recovery, load_recovery, recovery_path, save_recovery, RecoveryEntity,
     RecoverySelection, RecoveryState, RecoveryWindow, RecoveryWindowButton, RECOVERY_FILE,

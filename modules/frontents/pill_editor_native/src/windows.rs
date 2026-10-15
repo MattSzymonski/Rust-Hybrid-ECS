@@ -207,6 +207,7 @@ impl WindowHost {
                         kind = request.kind.title(),
                         width = request.width,
                         height = request.height,
+                        position = ?request.position,
                         "[editor] window created"
                     );
                     self.windows.push(window);
@@ -231,6 +232,82 @@ impl WindowHost {
             }
         }
         closed
+    }
+
+    /// The tool window's platform window, for parenting a child surface
+    /// into it (Stage 29).
+    pub fn parent_window(&self, id: &str) -> Option<Arc<Window>> {
+        self.windows
+            .iter()
+            .find(|window| window.id == id)
+            .map(|window| Arc::clone(&window.window))
+    }
+
+    /// The window's current scale factor (D30), for a surface placed in it
+    /// (Stage 29).
+    pub fn scale_factor(&self, id: &str) -> Option<f32> {
+        self.windows
+            .iter()
+            .find(|window| window.id == id)
+            .map(|window| window.window.scale_factor() as f32)
+    }
+
+    /// Move one open window's outer top-left to a logical desktop position
+    /// (the scripted channel, Stage 29); `false` when no window with that
+    /// id is open.
+    pub fn place(&mut self, id: &str, x: f32, y: f32) -> bool {
+        let Some(window) = self.windows.iter().find(|window| window.id == id) else {
+            return false;
+        };
+        let scale = window.window.scale_factor().max(0.01);
+        window
+            .window
+            .set_outer_position(winit::dpi::PhysicalPosition::new(
+                (x as f64 * scale).round() as i32,
+                (y as f64 * scale).round() as i32,
+            ));
+        true
+    }
+
+    /// Resize one open window's client area, in logical pixels (the
+    /// scripted channel, Stage 29); `false` when no window with that id is
+    /// open. A tool window is not user-resizable, so this is the only way
+    /// its size ever changes.
+    pub fn resize(&mut self, id: &str, width: f32, height: f32) -> bool {
+        let Some(window) = self.windows.iter().find(|window| window.id == id) else {
+            return false;
+        };
+        let scale = window.window.scale_factor().max(0.01);
+        let _ = window
+            .window
+            .request_inner_size(winit::dpi::PhysicalSize::new(
+                (width as f64 * scale).round().max(1.0) as u32,
+                (height as f64 * scale).round().max(1.0) as u32,
+            ));
+        true
+    }
+
+    /// Every open window's arrangement in logical pixels (Stage 29): its
+    /// outer position where the platform reports one, and its client size.
+    pub fn bounds(&self) -> Vec<pill_editor_api::EditorWindowBounds> {
+        self.windows
+            .iter()
+            .map(|window| {
+                let scale = window.window.scale_factor().max(0.01) as f32;
+                let position = window
+                    .window
+                    .outer_position()
+                    .ok()
+                    .map(|position| (position.x as f32 / scale, position.y as f32 / scale));
+                let size = window.window.inner_size();
+                pill_editor_api::EditorWindowBounds {
+                    id: window.id.clone(),
+                    position,
+                    width: (size.width as f32 / scale).max(1.0),
+                    height: (size.height as f32 / scale).max(1.0),
+                }
+            })
+            .collect()
     }
 
     /// Drop every window the shell no longer asks for.
@@ -286,6 +363,17 @@ impl WindowHost {
         };
         match event {
             WindowEvent::CloseRequested => window.closed = true,
+            // A monitor change (D30, Stage 29): the window's UI is drawn
+            // in logical pixels, so the swapchain follows the new size on
+            // the next draw; the log names the window and its new scale.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    id = window.id.as_str(),
+                    scale = *scale_factor,
+                    "[editor] scale factor changed"
+                );
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale_factor = window.window.scale_factor().max(0.01) as f32;
                 window.cursor = Vector2f::new(
@@ -500,6 +588,14 @@ fn window_origin(
     size: (u32, u32),
     scale_factor: f64,
 ) -> (i32, i32) {
+    // A remembered arrangement (Stage 29) wins over the default placement;
+    // the platform that cannot report positions never persists one (D23).
+    if let Some((x, y)) = request.position {
+        return (
+            (x as f64 * scale_factor).round() as i32,
+            (y as f64 * scale_factor).round() as i32,
+        );
+    }
     let origin = parent
         .inner_position()
         .map(|position| (position.x, position.y))

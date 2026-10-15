@@ -190,6 +190,7 @@ impl PanelWork {
             height,
             panel: panel.into(),
             buttons: Vec::new(),
+            position: None,
             draw: pill_ui::DrawList::default(),
         });
     }
@@ -214,6 +215,7 @@ impl PanelWork {
             height,
             panel: panel.into(),
             buttons,
+            position: None,
             draw: pill_ui::DrawList::default(),
         });
     }

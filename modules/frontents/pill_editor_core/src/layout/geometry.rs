@@ -86,6 +86,16 @@ pub struct DropTarget {
     pub preview: Rect,
 }
 
+/// One visible view a surface must be placed at (Stage 29): a selected
+/// Scene or Game tab, named by its own node so several views of the same
+/// kind stay distinct across frames and restarts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewRect {
+    pub tab: NodeId,
+    pub panel: PanelKind,
+    pub rect: Rect,
+}
+
 /// Immutable result of one complete layout calculation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LayoutSnapshot {
@@ -96,6 +106,9 @@ pub struct LayoutSnapshot {
     pub tab_buttons: Vec<TabButtonRect>,
     pub splitters: Vec<Splitter>,
     pub drop_targets: Vec<DropTarget>,
+    /// Every selected Scene or Game tab, in node order (Stage 29): one view
+    /// per entry, each its own surface bound to its own camera.
+    pub views: Vec<ViewRect>,
     pub scene_rect: Option<Rect>,
     pub game_rect: Option<Rect>,
 }
@@ -214,8 +227,26 @@ fn layout_node(
             if let Some(selected) = tabset.selected {
                 snapshot.selected_panel_rects.insert(selected, content);
                 match model.tab(selected).map(|tab| &tab.panel) {
-                    Some(PanelKind::Scene) => snapshot.scene_rect = Some(content),
-                    Some(PanelKind::Game) => snapshot.game_rect = Some(content),
+                    Some(PanelKind::Scene) => {
+                        snapshot.views.push(ViewRect {
+                            tab: selected,
+                            panel: PanelKind::Scene,
+                            rect: content,
+                        });
+                        if snapshot.scene_rect.is_none() {
+                            snapshot.scene_rect = Some(content);
+                        }
+                    }
+                    Some(PanelKind::Game) => {
+                        snapshot.views.push(ViewRect {
+                            tab: selected,
+                            panel: PanelKind::Game,
+                            rect: content,
+                        });
+                        if snapshot.game_rect.is_none() {
+                            snapshot.game_rect = Some(content);
+                        }
+                    }
                     _ => {}
                 }
             }

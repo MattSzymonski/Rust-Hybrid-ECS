@@ -179,13 +179,19 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_editor_builtin_panels.py", "editor shell changed"))
         selected.append(suite_check("test_editor_panels.py", "editor shell panel API changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor shell state recovery changed"))
+        selected.append(suite_check("test_editor_viewports.py", "editor shell windows changed"))
     if has("modules/frontents/pill_editor_native/**"):
         selected.append(suite_check("test_editor_native.py", "editor frontend changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor frontend exit path changed"))
+        selected.append(suite_check("test_editor_viewports.py", "editor frontend views changed"))
     if has("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**"):
+        selected.append(cargo_check("test pill_editor_core",
+                                    ("test", "-p", "pill_editor_core", "-p", "pill_editor_api", "--offline"),
+                                    "editor state changed"))
         selected.append(suite_check("test_editor_commands.py", "editor command layer changed"))
         selected.append(suite_check("test_editor_undo.py", "editor history changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor state persistence changed"))
+        selected.append(suite_check("test_editor_viewports.py", "editor view model changed"))
 
     # Engine core and the shared crates below it: unit tests plus the
     # hot-reload regression net that runs a host against real projects.

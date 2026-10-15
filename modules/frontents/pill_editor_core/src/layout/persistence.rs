@@ -207,6 +207,12 @@ pub struct RecoveryWindow {
     pub panel: String,
     /// A modal's buttons, in draw order.
     pub buttons: Vec<RecoveryWindowButton>,
+    /// The window's outer top-left on the desktop, in logical pixels, when
+    /// the platform reported one (Stage 29); missing in documents written
+    /// before the field existed, and where no position exists (Wayland,
+    /// D23).
+    #[serde(default)]
+    pub position: Option<(f32, f32)>,
 }
 
 /// One button of a recovered modal dialog.
@@ -426,6 +432,7 @@ mod tests {
                     label: String::from("OK"),
                     command: String::from("spline.confirm"),
                 }],
+                position: Some((120.0, 80.0)),
             }],
         };
         save_recovery_to(&state, &path).unwrap();

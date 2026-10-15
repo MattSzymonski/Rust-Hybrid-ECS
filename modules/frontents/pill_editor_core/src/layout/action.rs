@@ -49,6 +49,26 @@ pub enum LayoutAction {
     DetachTab {
         tab: NodeId,
     },
+    /// Move a tab out of the dock into a free-standing window (Stage 29);
+    /// the tab node stays alive and a [`LayoutAction::RedockTab`] brings it
+    /// back. Refused when it would leave the dock empty.
+    PopOutTab {
+        tab: NodeId,
+    },
+    /// Return a floated tab to the dock, selected, in `target_tabset`.
+    RedockTab {
+        tab: NodeId,
+        target_tabset: NodeId,
+    },
+    /// Record a floating window's size and last known position (Stage 29);
+    /// the platform is the only one that knows a position, and it may be
+    /// `None` where it does not.
+    SetFloatingBounds {
+        tab: NodeId,
+        width: f32,
+        height: f32,
+        position: Option<(f32, f32)>,
+    },
     OpenTab {
         panel: PanelKind,
         target_tabset: NodeId,

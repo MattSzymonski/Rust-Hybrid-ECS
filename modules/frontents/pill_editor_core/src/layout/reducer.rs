@@ -8,7 +8,9 @@
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 
-use super::model::{LayoutNode, RowNode, TabSetNode, WeightedChild};
+use super::model::{
+    FloatingTab, LayoutNode, RowNode, TabSetNode, WeightedChild, FLOATING_TAB_DEFAULT_SIZE,
+};
 use super::{Axis, DockLocation, LayoutAction, LayoutModel, NodeId, PanelKind};
 
 /// Summary returned after one committed mutation.
@@ -33,7 +35,6 @@ pub enum LayoutError {
     UnreachableNode(NodeId),
     InvalidNextId,
     InvalidActiveTabSet(NodeId),
-    DuplicateScene,
     DuplicatePanel(PanelKind),
     NotCloseable(NodeId),
     WouldEmptyLayout,
@@ -132,6 +133,13 @@ fn apply_in_place(model: &mut LayoutModel, action: LayoutAction) -> Result<bool,
             if !tab_node.closeable {
                 return Err(LayoutError::NotCloseable(tab));
             }
+            // A floating tab has no dock parent (Stage 29); closing it is
+            // dropping its window and its node together.
+            if let Some(index) = model.floating.iter().position(|entry| entry.tab == tab) {
+                model.floating.remove(index);
+                model.nodes.remove(&tab);
+                return Ok(true);
+            }
             remove_tab(model, tab)?;
             model.nodes.remove(&tab);
             Ok(true)
@@ -153,21 +161,85 @@ fn apply_in_place(model: &mut LayoutModel, action: LayoutAction) -> Result<bool,
             model.nodes.remove(&tab);
             Ok(true)
         }
+        LayoutAction::PopOutTab { tab } => {
+            if model.tab(tab).is_none() {
+                return Err(LayoutError::WrongNodeKind(tab));
+            }
+            if model.floating.iter().any(|entry| entry.tab == tab) {
+                return Err(LayoutError::InvalidChild(tab));
+            }
+            // The dock must keep at least one tab; a pop-out that would
+            // leave it empty is refused outright, like a detach.
+            let docked = model
+                .nodes
+                .values()
+                .filter(|node| matches!(node, LayoutNode::Tab(_)))
+                .count();
+            if docked <= model.floating.len() + 1 {
+                return Err(LayoutError::WouldEmptyLayout);
+            }
+            remove_tab(model, tab)?;
+            let (width, height) = FLOATING_TAB_DEFAULT_SIZE;
+            model.floating.push(FloatingTab {
+                tab,
+                width,
+                height,
+                position: None,
+            });
+            Ok(true)
+        }
+        LayoutAction::RedockTab { tab, target_tabset } => {
+            if model.tab(tab).is_none() {
+                return Err(LayoutError::WrongNodeKind(tab));
+            }
+            if model.tabset(target_tabset).is_none() {
+                return Err(LayoutError::WrongNodeKind(target_tabset));
+            }
+            let Some(index) = model.floating.iter().position(|entry| entry.tab == tab) else {
+                return Err(LayoutError::InvalidChild(tab));
+            };
+            model.floating.remove(index);
+            let tabset = tabset_mut(model, target_tabset)?;
+            tabset.tabs.push(tab);
+            tabset.selected = Some(tab);
+            model.active_tabset = Some(target_tabset);
+            Ok(true)
+        }
+        LayoutAction::SetFloatingBounds {
+            tab,
+            width,
+            height,
+            position,
+        } => {
+            let Some(entry) = model.floating.iter_mut().find(|entry| entry.tab == tab) else {
+                return Err(LayoutError::InvalidChild(tab));
+            };
+            entry.width = width;
+            entry.height = height;
+            entry.position = position;
+            Ok(false)
+        }
         LayoutAction::OpenTab {
             panel,
             target_tabset,
         } => {
-            if model
+            // The Scene and Game views may repeat (Stage 29): several scene
+            // views, each its own surface and camera, are the stage's
+            // point. Every other panel is one instance.
+            let repeatable = matches!(panel, PanelKind::Scene | PanelKind::Game);
+            let existing = model
                 .nodes
                 .values()
-                .any(|node| matches!(node, LayoutNode::Tab(tab) if tab.panel == panel))
-            {
+                .any(|node| matches!(node, LayoutNode::Tab(tab) if tab.panel == panel));
+            if existing && !repeatable {
                 return Err(LayoutError::DuplicatePanel(panel));
             }
             if model.tabset(target_tabset).is_none() {
                 return Err(LayoutError::WrongNodeKind(target_tabset));
             }
-            let closeable = panel != PanelKind::Scene;
+            // The workspace's own Scene tab is its permanent view; every
+            // further view closes like an ordinary tab.
+            let closeable = !matches!(panel, PanelKind::Scene) || existing;
             let tab = model.add_tab(panel, closeable);
             let tabset = tabset_mut(model, target_tabset)?;
             tabset.tabs.push(tab);
@@ -321,6 +393,18 @@ fn normalize(model: &mut LayoutModel) -> Result<(), LayoutError> {
 
     let mut reachable = BTreeSet::new();
     collect_reachable(model, root, &mut reachable);
+    // A floating tab's node is alive outside the dock tree (Stage 29): an
+    // entry whose node is gone is dropped, and every live one keeps its
+    // node.
+    let mut floating = std::mem::take(&mut model.floating);
+    floating.retain(|entry| {
+        let alive = model.tab(entry.tab).is_some();
+        if alive {
+            reachable.insert(entry.tab);
+        }
+        alive
+    });
+    model.floating = floating;
     model.nodes.retain(|id, _| reachable.contains(id));
     model.next_id = model
         .nodes
@@ -622,5 +706,130 @@ mod tests {
             .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id));
         assert_eq!(model.active_tabset, first_tabset);
         assert_eq!(model.active_tabset, model.resolved_active_tabset());
+    }
+
+    /// Popping a tab out keeps its node, hands it the default window size
+    /// and survives validation and a JSON round trip; a redock puts it back
+    /// selected (Stage 29).
+    #[test]
+    fn popping_out_and_redocking_a_tab_round_trips() {
+        let mut model = LayoutModel::default_editor();
+        let console = tab_for(&model, PanelKind::Console);
+        let home = model.parent_of(console).unwrap();
+
+        model
+            .apply(LayoutAction::PopOutTab { tab: console })
+            .unwrap();
+        assert!(model.tab(console).is_some(), "the node stays alive");
+        assert_eq!(model.floating.len(), 1);
+        assert_eq!(model.floating[0].tab, console);
+        assert_eq!(
+            (model.floating[0].width, model.floating[0].height),
+            super::super::model::FLOATING_TAB_DEFAULT_SIZE
+        );
+        assert!(model.parent_of(console).is_none(), "it left the dock");
+        model.validate().unwrap();
+        let json = serde_json::to_string_pretty(&model).unwrap();
+        let restored: LayoutModel = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, model, "the floating list is on disk");
+        restored.validate().unwrap();
+
+        model
+            .apply(LayoutAction::RedockTab {
+                tab: console,
+                target_tabset: home,
+            })
+            .unwrap();
+        assert!(model.floating.is_empty());
+        assert_eq!(model.parent_of(console), Some(home));
+        assert_eq!(model.tabset(home).unwrap().selected, Some(console));
+        model.validate().unwrap();
+    }
+
+    /// A pop-out that would leave the dock with nothing to draw is refused
+    /// atomically, and bounds changes land exactly once.
+    #[test]
+    fn a_pop_out_never_empties_the_dock_and_bounds_stick() {
+        let mut model = LayoutModel::default_editor();
+        for panel in [
+            PanelKind::Hierarchy,
+            PanelKind::Inspector,
+            PanelKind::Systems,
+            PanelKind::Console,
+            PanelKind::Problems,
+            PanelKind::Statistics,
+            PanelKind::Preferences,
+            PanelKind::Gallery,
+            PanelKind::Assets,
+            PanelKind::Game,
+            PanelKind::Scene,
+        ] {
+            let tab = tab_for(&model, panel);
+            let _ = model.apply(LayoutAction::PopOutTab { tab });
+        }
+        // Whatever remains docked, one more pop-out cannot empty it.
+        let before = model.clone();
+        let docked = model.nodes.iter().find_map(|(id, node)| match node {
+            LayoutNode::Tab(_) if model.floating.iter().all(|entry| entry.tab != *id) => Some(*id),
+            _ => None,
+        });
+        if let Some(tab) = docked {
+            assert_eq!(
+                model.apply(LayoutAction::PopOutTab { tab }),
+                Err(LayoutError::WouldEmptyLayout)
+            );
+            assert_eq!(model, before, "the refusal is atomic");
+        }
+
+        let console = tab_for(&model, PanelKind::Console);
+        if model.floating.iter().any(|entry| entry.tab == console) {
+            model
+                .apply(LayoutAction::SetFloatingBounds {
+                    tab: console,
+                    width: 640.0,
+                    height: 480.0,
+                    position: Some((120.0, 80.0)),
+                })
+                .unwrap();
+            let entry = model
+                .floating
+                .iter()
+                .find(|entry| entry.tab == console)
+                .unwrap();
+            assert_eq!((entry.width, entry.height), (640.0, 480.0));
+            assert_eq!(entry.position, Some((120.0, 80.0)));
+            model.validate().unwrap();
+        }
+    }
+
+    /// Several Scene views are the stage's point: each opens with a numbered
+    /// title, stays closeable (only the workspace's own Scene tab does not)
+    /// and validates together with the first.
+    #[test]
+    fn a_second_scene_view_opens_numbered_and_valid() {
+        let mut model = LayoutModel::default_editor();
+        let scene = tab_for(&model, PanelKind::Scene);
+        assert!(!model.tab(scene).unwrap().closeable);
+        let target = model.parent_of(scene).unwrap();
+
+        model
+            .apply(LayoutAction::OpenTab {
+                panel: PanelKind::Scene,
+                target_tabset: target,
+            })
+            .unwrap();
+        let scenes: Vec<&super::super::model::TabNode> = model
+            .nodes
+            .values()
+            .filter_map(|node| match node {
+                LayoutNode::Tab(tab) if tab.panel == PanelKind::Scene => Some(tab),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scenes.len(), 2);
+        assert!(scenes
+            .iter()
+            .any(|tab| tab.title == "Scene 2" && tab.closeable));
+        model.validate().unwrap();
     }
 }
