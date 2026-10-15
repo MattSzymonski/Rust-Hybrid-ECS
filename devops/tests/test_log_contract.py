@@ -686,6 +686,20 @@ def main() -> None:
     print("=" * 70)
     print("  Host Log Contract Tests")
     print("=" * 70)
+    # Report what the scan sees before checking it: the count must include the
+    # native-editor suites' patterns, which the editor-session driver collects
+    # with everything else (SA-0051's acceptance evidence).
+    declared = collect_declared_tokens()
+    driver_tokens = sum(
+        1
+        for origins in declared.values()
+        if any(origin.startswith("devops/core/editor_session.py") for origin in origins)
+    )
+    print(
+        f"  tokens: {len(declared)} declared across "
+        f"{', '.join(TOKEN_SOURCE_DIRECTORIES)} ({driver_tokens} from the "
+        "native-editor driver)"
+    )
     failed = 0
     for name, check in CHECKS:
         try:

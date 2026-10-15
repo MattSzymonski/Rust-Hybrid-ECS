@@ -116,14 +116,30 @@ class EditorSession:
         session: str = "main",
         project: str = "../examples/project_rs",
         test_seconds: int = 300,
+        sandbox: Optional[Path] = None,
+        binary: Optional[Path] = None,
     ) -> None:
-        """Names the run: `suite` owns the folder, `session` the file set."""
+        """Names the run: `suite` owns the folder, `session` the file set.
+
+        `sandbox` overrides the session-local LOCALAPPDATA: a suite whose runs
+        share one editor state (the native suite's layout migration) passes
+        one path and every session of the suite reads and writes it. `binary`
+        overrides the editor executable, for the native suite's `--binary`
+        flag.
+        """
         self.suite = suite
         self.session = session
         self.project = project
         self.test_seconds = test_seconds
+        self._sandbox_override = Path(sandbox) if sandbox is not None else None
+        self._binary = Path(binary) if binary is not None else EDITOR_BINARY
         self._process: Optional[subprocess.Popen] = None
         self._sources: Dict[Path, str] = {}
+
+    @property
+    def binary(self) -> Path:
+        """The editor executable this session launches."""
+        return self._binary
 
     @classmethod
     def supported(cls) -> bool:
@@ -148,6 +164,8 @@ class EditorSession:
     @property
     def sandbox(self) -> Path:
         """The session's LOCALAPPDATA sandbox (layout, preferences, keymap)."""
+        if self._sandbox_override is not None:
+            return self._sandbox_override
         return self.run_directory / "{}-appdata".format(self.session)
 
     @property
@@ -164,18 +182,23 @@ class EditorSession:
         project: Optional[str] = None,
         test_seconds: Optional[int] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        scripted: bool = True,
     ) -> None:
         """Locks the host, clears strays, and launches the editor.
+
+        `scripted=False` launches without the test channel: no command file is
+        written and its environment variables are left unset, for the runs that
+        only prove startup and exit.
 
         Raises `SystemExit` with the build hint when the binary is missing -
         the suites surface that as their usage error.
         """
         if self._process is not None:
             raise RuntimeError("this session already started an editor")
-        if not EDITOR_BINARY.is_file():
+        if not self._binary.is_file():
             raise SystemExit(
                 "editor binary not found at {}; build it with "
-                "`cargo build -p pill_editor_native` in modules/ first".format(EDITOR_BINARY)
+                "`cargo build -p pill_editor_native` in modules/ first".format(self._binary)
             )
         # The lock first, then the kills: a concurrent suite's editor is only
         # ever killed by the holder, never by a queued waiter.
@@ -183,18 +206,19 @@ class EditorSession:
         kill_stale_hosts()
         self.run_directory.mkdir(parents=True, exist_ok=True)
         self.sandbox.mkdir(parents=True, exist_ok=True)
-        self.commands_path.write_text(
-            "# {} suite: {}\n".format(self.suite, self.session), encoding="utf-8"
-        )
         environment = dict(os.environ)
         environment["PROJECT_PATH"] = project or self.project
-        environment["PILL_EDITOR_TEST_COMMANDS"] = str(self.commands_path)
-        environment["PILL_EDITOR_TEST_SECONDS"] = str(test_seconds or self.test_seconds)
         environment["LOCALAPPDATA"] = str(self.sandbox)
+        if scripted:
+            self.commands_path.write_text(
+                "# {} suite: {}\n".format(self.suite, self.session), encoding="utf-8"
+            )
+            environment["PILL_EDITOR_TEST_COMMANDS"] = str(self.commands_path)
+            environment["PILL_EDITOR_TEST_SECONDS"] = str(test_seconds or self.test_seconds)
         environment.update(extra_env or {})
         log = self.log_path.open("w", encoding="utf-8")
         self._process = subprocess.Popen(
-            [str(EDITOR_BINARY)],
+            [str(self._binary)],
             cwd=str(MODULES_ROOT),
             env=environment,
             stdout=log,
@@ -266,6 +290,37 @@ class EditorSession:
     def wait_token(self, token: str, timeout: float, label: str, start: int = 0) -> int:
         """Waits for a plain token (escaped before the regex search)."""
         return self.wait(re.escape(token), timeout, label, start)
+
+    def wait_occurrence(
+        self, pattern: str, occurrence: int, timeout: float, label: str
+    ) -> str:
+        """Waits until `pattern` has appeared at least `occurrence` times.
+
+        A token a run repeats - a window move, a popup dismissal - must be
+        waited for by count: the earlier occurrence is already in the log and
+        would satisfy a plain search before the new one has happened. Returns
+        the matched text, which suites compare (a frame count, a placement).
+        """
+        deadline = time.monotonic() + timeout
+        expression = re.compile(pattern)
+        process = self._process
+        while time.monotonic() < deadline:
+            matches = [match.group(0) for match in expression.finditer(self.read_log())]
+            if len(matches) >= occurrence:
+                print("  [OK] {}".format(label))
+                return matches[occurrence - 1]
+            if process is not None and process.poll() is not None:
+                raise RuntimeError(
+                    "{}: the editor exited {} before occurrence {} of {}\n".format(
+                        label, process.returncode, occurrence, pattern
+                    )
+                    + self.read_log()[-4000:]
+                )
+            time.sleep(0.5)
+        raise TimeoutError(
+            "{}: timeout waiting for occurrence {} of {}\n".format(label, occurrence, pattern)
+            + self.read_log()[-4000:]
+        )
 
     def wait_either(self, patterns: List[str], timeout: float, start: int = 0) -> Tuple[str, int]:
         """Waits for the first of `patterns`; returns the one seen and the length.

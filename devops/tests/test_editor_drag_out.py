@@ -184,21 +184,16 @@ def main() -> int:
             "editor ready",
         )
         begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused",
-            begin,
-        )
-        begin = len(session.read_log())
         session.send("tab Assets")
         session.wait(
             re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Assets"?', 30, "Assets tab", begin
         )
-        # The placements are logged with the shell's periodic heartbeat.
+        # The placements are logged with the shell's periodic heartbeat (every
+        # 210 shell frames). The editor draws fast while the project runs, so
+        # the placement is taken before the engine is paused below; paused, the
+        # frame cadence would stretch the wait past any sane deadline.
         match = None
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 180
         while match is None and time.monotonic() < deadline:
             found = re.findall(
                 re.escape(EDITOR_PANEL_PLACEMENT_TOKEN)
@@ -209,6 +204,16 @@ def main() -> int:
             if match is None:
                 time.sleep(0.5)
         assert match, "no Assets placement in the log"
+        # Pause the engine before the gesture, so the project's systems
+        # cannot rewrite anything mid-drag.
+        begin = len(session.read_log())
+        session.send("command editor.pause_toggle")
+        session.wait(
+            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+            30,
+            "engine paused",
+            begin,
+        )
         panel_x, panel_y, panel_width = (float(value) for value in match[:3])
         hwnd = editor_main_window(process.pid)
         scale = scale_factor(hwnd)
@@ -237,9 +242,12 @@ def main() -> int:
         print("  [OK] the editor is in front for the gesture")
         # Probe where the first asset row sits: a real click on it makes the
         # editor report the selection, which is the one reliable way to learn
-        # the row's offset (the panel's heading and labels take the top).
+        # the row's offset (the panel's heading and its toolbar take the top).
+        # A stray press on a toolbar button opens a dialog; the probe knows
+        # its ids and dismisses one before the next try, because a modal
+        # would otherwise swallow every later click.
         row_y = None
-        for offset in (69, 64, 74, 59, 79, 54, 84):
+        for offset in range(40, 240, 6):
             probe_begin = len(session.read_log())
             candidate_y = int(origin.y + (panel_y + offset) * scale)
             user32.SetCursorPos(row_x, candidate_y)
@@ -248,10 +256,25 @@ def main() -> int:
             time.sleep(0.15)
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             time.sleep(0.6)
-            if ASSET_SELECTED_TOKEN in session.read_log()[probe_begin:]:
+            text = session.read_log()[probe_begin:]
+            if ASSET_SELECTED_TOKEN in text:
                 row_y = candidate_y
                 print(f"  [OK] the first asset row answers {offset} logical pixels below the panel's top")
                 break
+            opened = re.search(r'\[editor\] window opened\s+id="?([a-z_]+)"?', text)
+            if opened:
+                dialog_id = opened.group(1)
+                session.send(f"window-dismiss {dialog_id}")
+                try:
+                    session.wait(
+                        re.escape("[editor] window closed")
+                        + rf'\s+id="?{re.escape(dialog_id)}"?',
+                        30,
+                        "stray dialog dismissed",
+                        probe_begin,
+                    )
+                except TimeoutError:
+                    pass  # the sweep continues; a stuck dialog shows up in the failure tail
         assert row_y is not None, "no probe offset reached the asset row"
 
         # Step 1: press the row with the real button, stay in the window
