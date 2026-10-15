@@ -6,6 +6,7 @@ panel's arrangement outlives an unclean exit; several scene views draw at
 once, each through its own camera, and picking and gizmos work in a later
 view.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

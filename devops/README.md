@@ -131,6 +131,15 @@ editor build (the uplift) prepended; a file no rule recognizes falls back to
 `verify.py --quick`, so nothing passes unchecked by accident. The full gate
 and the tier runs stay for stage boundaries and milestones.
 
+The gate itself carries the editor end to end: its `editor` step runs the
+two host-tier editor suites, builds `pill_editor_native` (the uplift), and
+then runs every suite tagged `SETS: editor` (`run_all.py --set editor`),
+serially and with the manual drag-out session reported as skipped - that
+order is required, because the host suites' narrowed build re-splits the
+shared DLLs and the desktop suites launch a pre-built binary. It is the
+slowest step - about fifteen minutes on a warm cache - and it never runs
+under `--quick`.
+
 ```powershell
 python devops/ci_cd/check_relevant.py --dry-run   # what would run, and why
 python devops/ci_cd/check_relevant.py             # run only that

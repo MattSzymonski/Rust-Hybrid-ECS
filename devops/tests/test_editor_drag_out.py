@@ -2,6 +2,7 @@
 
 PROTECTS: A real OS drag out of the editor carries the dragged asset's file path.
 TIER: editor
+SETS: editor
 RUN: manual - moves the real mouse; needs an unattended screen
 
 REQUIREMENTS
@@ -19,8 +20,10 @@ DESCRIPTION
   `CursorLeft`, OLE's drag loop, and the CF_HDROP payload a foreign
   drop target renders.
 
-  It is NOT in run_all.py: real input and a real drop onto the desktop
-  belong in a deliberate session, not in CI-style runs.
+  `RUN: manual` keeps it out of every default batch (`run_all.py` reports it
+  as skipped): real input and a real drop onto the desktop belong in a
+  deliberate session, not in CI-style runs. Run it by name
+  (`run_all.py --only test_editor_drag_out.py`) or with `--include-manual`.
 
     1. a PNG is placed in `examples/project_rs/res/` so the Assets panel
        has a row to press;

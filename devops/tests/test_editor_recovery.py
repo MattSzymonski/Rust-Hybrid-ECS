@@ -5,6 +5,7 @@ PROTECTS: An unclean exit leaves a recovery document; the next start restores
 the layout, the open windows and a still-valid selection; a clean exit
 discards the document.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

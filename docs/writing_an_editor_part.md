@@ -367,6 +367,10 @@ and the project. The rules that keep that safe are not optional:
   `devops/tests/test_editor_*.py` are the reference for scripting a run.
 - Add a `// NOTE: asserted on by ...` comment above a log line a suite
   depends on; that convention keeps intent visible when the line moves.
+- An end-to-end suite of your own joins the editor group by carrying
+  `SETS: editor` in its docstring: `run_all.py --set editor` runs the whole
+  set, and the gate's `editor` step (`verify.py --only editor`) runs it
+  right after building `pill_editor_native`, the order the suites need.
 
 ## 10. Checklist for a new editor part
 

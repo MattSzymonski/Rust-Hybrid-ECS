@@ -2,6 +2,7 @@
 
 PROTECTS: Clipboard and drag-and-drop: field copy and paste, entity round-trips and file drops.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

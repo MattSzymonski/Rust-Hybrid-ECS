@@ -2,6 +2,7 @@
 
 PROTECTS: Reload feedback: failed reloads become Problems rows and toasts, and bad patches roll back.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

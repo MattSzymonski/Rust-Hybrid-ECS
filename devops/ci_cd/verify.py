@@ -26,6 +26,16 @@ DESCRIPTION
     lints): about a minute on a warm cache, and enough to catch most mistakes
     before the full run.
 
+    The `editor` step is the end-to-end lane. It first runs the two host-tier
+    editor suites (`test_editor_crates.py`, `test_editor_revision.py`), which
+    build a narrowed `pill_standalone` and would re-split the shared DLLs if
+    they ran later; then it builds `pill_editor_native` (the uplift), and
+    then runs the suites tagged `SETS: editor` through
+    `devops/tests/run_all.py --set editor` - serially, each with its own
+    timeout, and with `RUN: manual` suites (the real-mouse drag-out session)
+    reported as skipped. It is the slowest step, about fifteen minutes on a
+    warm cache, and it never runs in `--quick`.
+
     Under GitHub Actions (`GITHUB_ACTIONS=true`) each step's output is a
     collapsible log group and the summary table is also written to the job
     summary, so CI runs this script as one step and still shows every check.
@@ -263,6 +273,25 @@ STEPS: List[Step] = [
             ]
         ],
         environment={"RUSTFLAGS": "", "RUSTC_WRAPPER": ""},
+    ),
+    # The end-to-end editor lane: the real executable, driven through its
+    # scripted channel. Order is the whole point. The two host-tier suites
+    # build their own narrowed `pill_standalone`, which re-splits the shared
+    # DLLs, so they run first; the uplift (`pill_editor_native` on the
+    # current dylibs) must then be the last build before any launch, or the
+    # editor dies on 0xC0000139 (`check_relevant.py` encodes the same rule
+    # for the change-scoped runs). The desktop suites launch the pre-built
+    # binary and carry `SETS: editor`, so a new one joins by its header; a
+    # new host-tier suite that builds a narrowed standalone goes into the
+    # `--only` list above the uplift.
+    Step(
+        "editor",
+        "Editor suites (the real executable, scripted)",
+        [
+            [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_crates.py", "test_editor_revision.py"],
+            ["cargo", "build", "-p", "pill_editor_native"],
+            [PYTHON, "../devops/tests/run_all.py", "--set", "editor"],
+        ],
     ),
 ]
 
