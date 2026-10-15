@@ -40,6 +40,7 @@ use crate::css::value::Length;
 use crate::css::{ComputedStyle, NodeFacts, Stylesheet};
 use crate::draw::Rect;
 use crate::panel::{node_enabled, PanelBuilder, PanelNode, PanelOutput, PanelTree};
+use crate::scrollbar::{self, Axis, ScrollMetrics};
 use crate::state::UiState;
 use crate::text::{TextStyle, TextSystem};
 use crate::theme::Theme;
@@ -69,15 +70,18 @@ pub struct PanelLayout {
     /// `opacity_effective` and `hidden` filled in while walking.
     pub styles: Vec<ComputedStyle>,
     /// Where each interactive widget can be hit, already clipped away from
-    /// scrolled-out positions.
+    /// scrolled-out positions; scrollbar thumbs and tracks are in here too.
     pub interactive: BTreeMap<WidgetId, Rect>,
+    /// Each scroll area's viewport, content extent and applied offset.
+    pub scrolls: BTreeMap<WidgetId, ScrollMetrics>,
 }
 
 impl PanelLayout {
-    /// Store this layout's hit rectangles as the state's, so the next frame
-    /// interacts against them.
+    /// Store this layout's hit rectangles and scroll geometry as the
+    /// state's, so the next frame interacts against them.
     pub fn store_interaction(&self, state: &mut UiState) {
         state.hit_rects = self.interactive.clone();
+        state.scrolls = self.scrolls.clone();
     }
 }
 
@@ -128,7 +132,14 @@ pub fn compute(
     available: Vector2f,
     state: &UiState,
 ) -> PanelLayout {
-    let styles = resolve_styles(tree, sheet, state);
+    let mut styles = resolve_styles(tree, sheet, state);
+    // Every scroll area's bar width is settled here, so layout's hit strips,
+    // the builder's drag math and painting all agree even with no CSS rule.
+    for style in &mut styles {
+        if style.scrollbar_width.is_none() {
+            style.scrollbar_width = Some(theme.scrollbar_width);
+        }
+    }
     let mut taffy: TaffyTree<TextMeasure> = TaffyTree::new();
     let mut order = Vec::new();
     let mut cursor = 0usize;
@@ -286,36 +297,94 @@ fn walk(
                     layout,
                 );
             }
-            let mut content_bottom = rect.min.y;
+            let mut content_max = rect.min;
             for child_rect in &layout.rects[start..] {
-                content_bottom = content_bottom.max(child_rect.max.y);
+                content_max.x = content_max.x.max(child_rect.max.x);
+                content_max.y = content_max.y.max(child_rect.max.y);
             }
-            let max_offset = (content_bottom - rect.min.y - rect.height()).max(0.0);
-            let offset = state
-                .memory
-                .get(id)
-                .map(|memory| memory.scroll)
-                .unwrap_or(0.0)
-                .clamp(0.0, max_offset);
-            if offset != 0.0 {
-                for index in start..layout.rects.len() {
-                    layout.rects[index].min.y -= offset;
-                    layout.rects[index].max.y -= offset;
+            let max_offset = Vector2f::new(
+                (content_max.x - rect.max.x).max(0.0),
+                (content_max.y - rect.max.y).max(0.0),
+            );
+            let memory = state.memory.get(id);
+            let offset = Vector2f::new(
+                memory
+                    .map(|memory| memory.scroll_x)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, max_offset.x),
+                memory
+                    .map(|memory| memory.scroll)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, max_offset.y),
+            );
+            if offset != Vector2f::ZERO {
+                for scrolled in start..layout.rects.len() {
+                    layout.rects[scrolled].min -= offset;
+                    layout.rects[scrolled].max -= offset;
                     // Hit rectangles were stored at natural positions;
                     // store them again where the shift left the widget.
-                    if let Some(id) = layout.ids[index] {
-                        let moved = layout.rects[index];
-                        let hit = match layout.clips[index] {
+                    if let Some(child_id) = layout.ids[scrolled] {
+                        let moved = layout.rects[scrolled];
+                        let hit = match layout.clips[scrolled] {
                             Some(clip) => moved.intersection(&clip),
                             None => Some(moved),
                         };
                         match hit {
-                            Some(hit) => layout.interactive.insert(id, hit),
-                            None => layout.interactive.remove(&id),
+                            Some(hit) => layout.interactive.insert(child_id, hit),
+                            None => layout.interactive.remove(&child_id),
                         };
                     }
                 }
             }
+            let metrics = ScrollMetrics {
+                viewport: rect,
+                content: Vector2f::new(content_max.x - rect.min.x, content_max.y - rect.min.y),
+                offset,
+                max_offset,
+            };
+            // The bars hug the viewport's edges; their thumbs and tracks are
+            // hit targets the builder reads next frame, so a click on an
+            // overflowing area's bar never falls through to widgets under it.
+            let bar_width = layout.styles[index]
+                .scrollbar_width
+                .unwrap_or(scrollbar::DEFAULT_WIDTH);
+            // Content under a visible bar takes no pointer either: a press
+            // on the strip belongs to the bar alone.
+            let mut content_viewport = rect;
+            if metrics.overflows(Axis::Vertical) {
+                content_viewport.max.x -= bar_width;
+            }
+            if metrics.overflows(Axis::Horizontal) {
+                content_viewport.max.y -= bar_width;
+            }
+            for scrolled in start..layout.rects.len() {
+                if let Some(child_id) = layout.ids[scrolled] {
+                    if let Some(hit) = layout.interactive.get(&child_id).copied() {
+                        match hit.intersection(&content_viewport) {
+                            Some(hit) => layout.interactive.insert(child_id, hit),
+                            None => layout.interactive.remove(&child_id),
+                        };
+                    }
+                }
+            }
+            for axis in Axis::BOTH {
+                let Some(bar) = scrollbar::geometry(&metrics, axis, bar_width) else {
+                    continue;
+                };
+                for (part, bar_rect) in [("thumb", bar.thumb), ("track", bar.track)] {
+                    let bar_id =
+                        WidgetId::named(*id, &format!("scrollbar-{}-{}", part, axis.suffix()));
+                    let hit = match scroll_clip {
+                        Some(clip) => bar_rect.intersection(&clip),
+                        None => Some(bar_rect),
+                    };
+                    match hit {
+                        Some(hit) => layout.interactive.insert(bar_id, hit),
+                        None => layout.interactive.remove(&bar_id),
+                    };
+                }
+            }
+            layout.scrolls.insert(*id, metrics);
         }
         _ => {
             for child in node.children() {
@@ -786,7 +855,7 @@ mod tests {
     use crate::draw::TextureId;
     use crate::panel::TreeNode;
     use crate::widget::WidgetId;
-    use pill_engine_core::{ButtonState, InputEvent, MouseButton};
+    use pill_engine_core::{ButtonState, InputEvent, KeyCode, MouseButton, ScrollDelta};
 
     fn text_system() -> TextSystem {
         TextSystem::new()
@@ -807,6 +876,16 @@ mod tests {
             button: MouseButton::Left,
             state,
         }
+    }
+
+    fn wheel(lines: Vector2f) -> InputEvent {
+        InputEvent::MouseWheel {
+            delta: ScrollDelta::Lines(lines),
+        }
+    }
+
+    fn key(key: pill_engine_core::KeyCode, state: ButtonState) -> InputEvent {
+        InputEvent::Key { key, state }
     }
 
     /// Run one frame with real layout and store the hit rectangles, the way
@@ -1036,6 +1115,191 @@ mod tests {
         let (_, layout) = frame(&mut state, &mut text, &[], build);
         assert!(!layout.interactive.contains_key(&first));
         assert!(layout.interactive.contains_key(&last));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_scroll_area_on_both_axes() {
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let scroller = WidgetId::from_name("scroller");
+        let build = |ui: &mut PanelBuilder<'_>| {
+            ui.scroll_area("scroller", 40.0, |ui| {
+                ui.label("one");
+                ui.label("two");
+            });
+        };
+        let (_, layout) = frame(&mut state, &mut text, &[], build);
+        let area = layout.interactive[&scroller];
+        let (x, y) = (area.min.x + 4.0, area.min.y + 4.0);
+
+        // Wheel lines count positive upwards, so scrolling down the page
+        // sends negative lines; the horizontal lines move the x offset.
+        frame(
+            &mut state,
+            &mut text,
+            &[pointer(x, y), wheel(ctrl(2.0, -3.0))],
+            build,
+        );
+        let line = crate::panel::SCROLL_LINE_HEIGHT;
+        assert_eq!(state.memory[&scroller].scroll, 3.0 * line);
+        assert_eq!(state.memory[&scroller].scroll_x, 2.0 * line);
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_thumb_scrolls_proportionally() {
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let scroller = WidgetId::from_name("scroller");
+        let build = |ui: &mut PanelBuilder<'_>| {
+            ui.scroll_area("scroller", 60.0, |ui| {
+                for index in 0..12 {
+                    ui.label(&format!("row {index}"));
+                }
+            });
+        };
+        let (_, layout) = frame(&mut state, &mut text, &[], build);
+        let metrics = layout.scrolls[&scroller];
+        assert!(metrics.max_offset.y > 0.0, "the rows overflow the viewport");
+        let thumb_id = WidgetId::named(scroller, "scrollbar-thumb-y");
+        let thumb = layout.interactive[&thumb_id];
+        let (x, y) = (thumb.min.x + 2.0, thumb.min.y + 2.0);
+
+        // Frame 2: press the thumb and take hold of it.
+        frame(
+            &mut state,
+            &mut text,
+            &[pointer(x, y), click(ButtonState::Pressed)],
+            build,
+        );
+        assert!(state.memory[&scroller].scroll_grab.is_some());
+
+        // Frame 3: drag down; the offset follows the drag's share of the
+        // track, the thumb never outrunning the pointer.
+        let drag = y + 30.0;
+        frame(&mut state, &mut text, &[pointer(x, drag)], build);
+        let expected = crate::scrollbar::thumb_offset(
+            &metrics,
+            crate::scrollbar::Axis::Vertical,
+            drag,
+            y,
+            0.0,
+        );
+        assert!(expected > 0.0);
+        assert!((state.memory[&scroller].scroll - expected).abs() < 0.01);
+
+        // Frame 4: the release ends the drag; later motion does nothing.
+        frame(
+            &mut state,
+            &mut text,
+            &[click(ButtonState::Released)],
+            build,
+        );
+        assert!(state.memory[&scroller].scroll_grab.is_none());
+        let settled = state.memory[&scroller].scroll;
+        frame(&mut state, &mut text, &[pointer(x, drag + 400.0)], build);
+        assert_eq!(state.memory[&scroller].scroll, settled);
+    }
+
+    #[test]
+    fn clicking_the_track_and_paging_move_the_scroll_offset() {
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let scroller = WidgetId::from_name("scroller");
+        let build = |ui: &mut PanelBuilder<'_>| {
+            ui.scroll_area("scroller", 60.0, |ui| {
+                for index in 0..12 {
+                    ui.label(&format!("row {index}"));
+                }
+            });
+        };
+        let (_, layout) = frame(&mut state, &mut text, &[], build);
+        let metrics = layout.scrolls[&scroller];
+        let track = layout.interactive[&WidgetId::named(scroller, "scrollbar-track-y")];
+        let (x, y) = (track.min.x + 2.0, track.max.y - 2.0);
+
+        // A press at the track's bottom jumps to the end of the content
+        // and focuses the area for the keyboard.
+        frame(
+            &mut state,
+            &mut text,
+            &[pointer(x, y), click(ButtonState::Pressed)],
+            build,
+        );
+        assert_eq!(state.memory[&scroller].scroll, metrics.max_offset.y);
+        frame(
+            &mut state,
+            &mut text,
+            &[click(ButtonState::Released)],
+            build,
+        );
+        assert_eq!(state.focus(), Some(scroller));
+
+        // Home returns to the top; Page Down steps a viewport, less one
+        // line of overlap; End goes to the bottom again.
+        frame(
+            &mut state,
+            &mut text,
+            &[key(KeyCode::Home, ButtonState::Pressed)],
+            build,
+        );
+        assert_eq!(state.memory[&scroller].scroll, 0.0);
+        frame(
+            &mut state,
+            &mut text,
+            &[key(KeyCode::PageDown, ButtonState::Pressed)],
+            build,
+        );
+        assert_eq!(
+            state.memory[&scroller].scroll,
+            60.0 - crate::panel::SCROLL_LINE_HEIGHT
+        );
+        frame(
+            &mut state,
+            &mut text,
+            &[key(KeyCode::End, ButtonState::Pressed)],
+            build,
+        );
+        assert_eq!(state.memory[&scroller].scroll, metrics.max_offset.y);
+    }
+
+    #[test]
+    fn a_list_row_is_clickable_across_its_whole_width() {
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let row = WidgetId::from_name("entity 3");
+        let mut clicked = false;
+        let (_, layout) = frame(&mut state, &mut text, &[], |ui| {
+            ui.list_row("entity 3", "Player (mesh)", false);
+        });
+        let rect = layout.interactive[&row];
+        assert!(
+            (rect.width() - 400.0).abs() < 0.01,
+            "the row's hit area spans the panel, got {}",
+            rect.width()
+        );
+
+        // The press and release land on the empty right side, far from the
+        // label's texels; the row still activates.
+        let far_right = rect.max.x - 2.0;
+        let middle = rect.min.y + rect.height() * 0.5;
+        frame(
+            &mut state,
+            &mut text,
+            &[pointer(far_right, middle), click(ButtonState::Pressed)],
+            |ui| {
+                clicked = ui.list_row("entity 3", "Player (mesh)", false);
+            },
+        );
+        assert!(!clicked, "the press alone does not activate");
+        frame(
+            &mut state,
+            &mut text,
+            &[click(ButtonState::Released)],
+            |ui| {
+                clicked = ui.list_row("entity 3", "Player (mesh)", false);
+            },
+        );
+        assert!(clicked, "the empty right side selects the row");
     }
 
     #[test]

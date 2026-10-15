@@ -189,8 +189,9 @@ pub struct UiRenderer {
 impl UiRenderer {
     /// Build the pipeline and the atlas texture for `target_format`.
     ///
-    /// `atlas_size` must be the size of the [`Atlas`] the caller will upload
-    /// (`Atlas::new` with the same numbers). Pass an sRGB target format
+    /// `atlas_size` is the [`Atlas`]'s starting size (`Atlas::new` with the
+    /// same numbers); a later page growth recreates the texture inside
+    /// [`Self::upload_atlas`]. Pass an sRGB target format
     /// (`Rgba8UnormSrgb`, or a surface format's sRGB variant); the shader
     /// assumes the target encodes linear light. `queue` initializes the
     /// white texel solid quads sample.
@@ -315,22 +316,8 @@ impl UiRenderer {
             cache: None,
         });
 
-        let atlas_texture = create_srgb_texture(device, "pill_ui atlas", atlas_size);
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_ui atlas bind group"),
-            layout: &texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let (atlas_texture, atlas_bind_group) =
+            atlas_resources(device, &texture_layout, &sampler, atlas_size);
 
         // The `Solid` texture: one white texel, so a solid quad is the vertex
         // colour times 1. The shader needs no branch for it, and all draws
@@ -386,7 +373,7 @@ impl UiRenderer {
         }
     }
 
-    /// The atlas size this renderer was built for.
+    /// The atlas texture's current size; a page growth changes it.
     pub fn atlas_size(&self) -> (u32, u32) {
         self.atlas_size
     }
@@ -394,18 +381,19 @@ impl UiRenderer {
     /// Upload what the atlas changed since the last upload.
     ///
     /// The first call uploads the whole image; later calls upload only the
-    /// regions [`Atlas::take_updated_regions`] reports. `atlas` must be the
-    /// size this renderer was built for.
-    pub fn upload_atlas(&mut self, queue: &wgpu::Queue, atlas: &mut Atlas) {
-        assert_eq!(
-            (atlas.width(), atlas.height()),
-            self.atlas_size,
-            "the atlas is {}x{} but this renderer was built for {}x{}",
-            atlas.width(),
-            atlas.height(),
-            self.atlas_size.0,
-            self.atlas_size.1
-        );
+    /// regions [`Atlas::take_updated_regions`] reports. When the atlas has
+    /// grown a page, the texture is recreated for the new size here and the
+    /// grown image arrives as one whole-image region.
+    pub fn upload_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &mut Atlas) {
+        let size = (atlas.width(), atlas.height());
+        if size != self.atlas_size {
+            let (texture, bind_group) =
+                atlas_resources(device, &self.texture_layout, &self.sampler, size);
+            self.atlas_texture = texture;
+            self.atlas_bind_group = bind_group;
+            self.atlas_size = size;
+            self.atlas_uploaded = false;
+        }
         let regions = atlas.take_updated_regions();
         if !self.atlas_uploaded {
             self.atlas_uploaded = true;
@@ -437,17 +425,23 @@ impl UiRenderer {
 
     /// Upload the regions of an [`AtlasUpdate`] - the same texture
     /// [`Self::upload_atlas`] feeds, for a caller that received the atlas's
-    /// changes as owned data across an artifact boundary.
-    pub fn apply_atlas_update(&mut self, queue: &wgpu::Queue, update: &AtlasUpdate) {
-        assert_eq!(
-            (update.width, update.height),
-            self.atlas_size,
-            "the atlas update is {}x{} but this renderer was built for {}x{}",
-            update.width,
-            update.height,
-            self.atlas_size.0,
-            self.atlas_size.1
-        );
+    /// changes as owned data across an artifact boundary. An update whose
+    /// size differs recreates the texture first, like a growth in
+    /// [`Self::upload_atlas`].
+    pub fn apply_atlas_update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        update: &AtlasUpdate,
+    ) {
+        let size = (update.width, update.height);
+        if size != self.atlas_size {
+            let (texture, bind_group) =
+                atlas_resources(device, &self.texture_layout, &self.sampler, size);
+            self.atlas_texture = texture;
+            self.atlas_bind_group = bind_group;
+            self.atlas_size = size;
+        }
         self.atlas_uploaded = true;
         for entry in &update.regions {
             upload_region_pixels(queue, &self.atlas_texture, entry.region, &entry.pixels);
@@ -663,6 +657,36 @@ fn create_srgb_texture(device: &wgpu::Device, label: &str, size: (u32, u32)) -> 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
+}
+
+/// The atlas texture at `size` and the bind group sampling it.
+///
+/// The atlas grows in pages, so the pair is rebuilt when its size changes;
+/// both the constructor and the upload path make it through here, keeping
+/// the bind group's layout and sampler in one place.
+fn atlas_resources(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    size: (u32, u32),
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let texture = create_srgb_texture(device, "pill_ui atlas", size);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("pill_ui atlas bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    (texture, bind_group)
 }
 
 /// Upload one dirtied atlas region from the atlas image to the texture.

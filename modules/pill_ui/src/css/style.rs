@@ -108,6 +108,14 @@ pub struct ComputedStyle {
     pub pointer_events: Option<bool>,
     /// Whether the node's text is selectable.
     pub user_select: Option<bool>,
+    /// A scroll area's bar strip thickness in pixels; layout fills the
+    /// theme's default in when nothing set it, so measuring, the drag math
+    /// and painting all use one number.
+    pub scrollbar_width: Option<f32>,
+    /// A scrollbar's thumb colour.
+    pub scrollbar_thumb: Option<Color>,
+    /// The strip a scrollbar's thumb slides in.
+    pub scrollbar_track: Option<Color>,
 
     /// The opacity after ancestors multiplied in; filled in while walking.
     pub opacity_effective: f32,
@@ -158,6 +166,9 @@ impl Default for ComputedStyle {
             cursor: None,
             pointer_events: None,
             user_select: None,
+            scrollbar_width: None,
+            scrollbar_thumb: None,
+            scrollbar_track: None,
             opacity_effective: 1.0,
             hidden: false,
         }
@@ -228,6 +239,9 @@ pub fn apply(style: &mut ComputedStyle, declaration: &Declaration) {
         Declaration::Cursor(cursor) => style.cursor = Some(cursor.clone()),
         Declaration::PointerEvents(events) => style.pointer_events = Some(*events),
         Declaration::UserSelect(select) => style.user_select = Some(*select),
+        Declaration::ScrollbarWidth(width) => style.scrollbar_width = Some(*width),
+        Declaration::ScrollbarThumb(color) => style.scrollbar_thumb = Some(*color),
+        Declaration::ScrollbarTrack(color) => style.scrollbar_track = Some(*color),
     }
 }
 

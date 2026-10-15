@@ -49,6 +49,8 @@ pub mod layout;
 pub mod paint;
 /// Immediate-mode widget building: the panel tree and the events it reports.
 pub mod panel;
+/// Scrollbar geometry and hit math for scroll areas.
+pub mod scrollbar;
 /// The UI's persistent state, as plain data.
 pub mod state;
 /// Fonts, shaping, line breaking and glyph rasterization.

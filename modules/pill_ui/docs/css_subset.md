@@ -99,6 +99,10 @@ Paint (honoured today):
   not drawn.
 - `pointer-events` - `none` removes the node (and, being inherited, its
   subtree) from hit-testing, same as `display: none` removing it entirely.
+- `scrollbar-width` - a scroll area's bar strip thickness in pixels.
+- `scrollbar-thumb` / `scrollbar-track` - the colours of a scroll area's
+  bar; the theme's tokens apply where a rule does not set them. Bars show
+  only while an axis overflows.
 
 Parsed and stored, visible once their layer lands:
 

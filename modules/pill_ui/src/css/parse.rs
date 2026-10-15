@@ -342,6 +342,12 @@ pub enum Declaration {
     PointerEvents(bool),
     /// `user-select`, kept (text fields are the only selectable text).
     UserSelect(bool),
+    /// `scrollbar-width`: a scroll area's bar strip thickness in pixels.
+    ScrollbarWidth(f32),
+    /// `scrollbar-thumb`: the draggable part's colour.
+    ScrollbarThumb(Color),
+    /// `scrollbar-track`: the strip the thumb slides in.
+    ScrollbarTrack(Color),
 }
 
 /// One declaration entry: the typed declaration, or an explicit keyword.
@@ -927,6 +933,9 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "position",
     "right",
     "row-gap",
+    "scrollbar-thumb",
+    "scrollbar-track",
+    "scrollbar-width",
     "text-align",
     "text-overflow",
     "top",
@@ -1289,6 +1298,13 @@ fn type_declarations(name: &str, raw: &str) -> Result<Vec<Declaration>, String> 
             row: None,
             column: Some(length(single(&words)?)?),
         },
+        "scrollbar-width" => Declaration::ScrollbarWidth(length(single(&words)?)?),
+        "scrollbar-thumb" => Declaration::ScrollbarThumb(
+            parse_color(single(&words)?).ok_or_else(|| format!("`{raw}` is not a colour"))?,
+        ),
+        "scrollbar-track" => Declaration::ScrollbarTrack(
+            parse_color(single(&words)?).ok_or_else(|| format!("`{raw}` is not a colour"))?,
+        ),
         "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => {
             let size =
                 parse_size(single(&words)?).ok_or_else(|| format!("`{raw}` is not a size"))?;
@@ -1637,5 +1653,37 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].declarations.len(), 2);
         assert!(rules[0].declarations[0].declaration.is_some());
+    }
+
+    #[test]
+    fn the_scrollbar_properties_load_without_reports() {
+        let (rules, _variables, reports) = load(
+            "scroll-area { scrollbar-width: 12px; scrollbar-thumb: rgb(90, 90, 90); scrollbar-track: #191919; }",
+        );
+        assert!(reports.is_empty(), "{reports:?}");
+        assert_eq!(rules.len(), 1);
+        let declarations: Vec<&Declaration> = rules[0]
+            .declarations
+            .iter()
+            .filter_map(|entry| entry.declaration.as_ref())
+            .collect();
+        assert_eq!(
+            declarations,
+            [
+                &Declaration::ScrollbarWidth(12.0),
+                &Declaration::ScrollbarThumb(Color::rgba(
+                    90.0 / 255.0,
+                    90.0 / 255.0,
+                    90.0 / 255.0,
+                    1.0
+                )),
+                &Declaration::ScrollbarTrack(Color::rgba(
+                    25.0 / 255.0,
+                    25.0 / 255.0,
+                    25.0 / 255.0,
+                    1.0
+                )),
+            ]
+        );
     }
 }

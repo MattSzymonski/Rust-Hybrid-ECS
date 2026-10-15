@@ -79,12 +79,31 @@ impl WidgetId {
 pub struct WidgetMemory {
     /// Text editing state, for text fields.
     pub text: Option<TextEditState>,
-    /// Scroll offset in logical pixels, for scroll areas.
+    /// Vertical scroll offset in logical pixels, for scroll areas.
     pub scroll: f32,
+    /// Horizontal scroll offset in logical pixels, for scroll areas.
+    pub scroll_x: f32,
+    /// The scrollbar drag in progress, if any.
+    pub scroll_grab: Option<ScrollGrab>,
     /// Whether a collapsing section - or one tree row - is open.
     pub open: Option<bool>,
     /// The selected row, for tables and trees.
     pub selection: Option<usize>,
+}
+
+/// A scrollbar thumb drag in progress on a scroll area.
+///
+/// Plain data: the drag is just where the pointer grabbed the thumb and what
+/// the offset was then, so the pointer's later positions map onto the scroll
+/// range without the thumb having to remember pixel distances.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScrollGrab {
+    /// The bar being dragged.
+    pub axis: crate::scrollbar::Axis,
+    /// The pointer coordinate along the bar when the drag began.
+    pub pointer: f32,
+    /// The scroll offset of that axis when the drag began.
+    pub scroll: f32,
 }
 
 // =============================================================================

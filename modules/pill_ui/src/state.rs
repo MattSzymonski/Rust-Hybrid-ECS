@@ -27,6 +27,7 @@ use pill_engine_core::Resource;
 // Current crate
 use crate::draw::Rect;
 use crate::input::UiInput;
+use crate::scrollbar::ScrollMetrics;
 use crate::widget::{WidgetId, WidgetMemory};
 
 /// Everything the UI remembers between frames.
@@ -36,6 +37,9 @@ pub struct UiState {
     pub input: UiInput,
     /// Where each widget was laid out last frame, for hit-testing.
     pub(crate) hit_rects: BTreeMap<WidgetId, Rect>,
+    /// Each scroll area's viewport and extents as last layout measured
+    /// them; the builder's scrollbar drags and wheel clamping read these.
+    pub(crate) scrolls: BTreeMap<WidgetId, ScrollMetrics>,
     /// Which widget the pointer holds and which holds the keyboard.
     pub(crate) interaction: Interaction,
     /// Per-widget memory keyed by id.
@@ -100,6 +104,21 @@ impl UiState {
     /// panels' fresh rectangles after the last one.
     pub fn set_hit_rects(&mut self, hit_rects: BTreeMap<WidgetId, Rect>) {
         self.hit_rects = hit_rects;
+    }
+
+    /// Each scroll area's measured geometry, as the last layout stored it.
+    pub fn scrolls(&self) -> &BTreeMap<WidgetId, ScrollMetrics> {
+        &self.scrolls
+    }
+
+    /// Replace the stored scroll geometry with a merged map.
+    ///
+    /// Paired with [`Self::scrolls`] exactly like [`Self::hit_rects`] and
+    /// [`Self::set_hit_rects`]: an embedder that lays several panels out in
+    /// one frame restores the previous map around each build and stores the
+    /// union after the last panel.
+    pub fn set_scrolls(&mut self, scrolls: BTreeMap<WidgetId, ScrollMetrics>) {
+        self.scrolls = scrolls;
     }
 }
 

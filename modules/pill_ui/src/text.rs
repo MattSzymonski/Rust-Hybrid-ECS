@@ -21,7 +21,9 @@
 //! once and reused for every later frame.
 
 // Standard library
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 // External crates
@@ -98,13 +100,31 @@ pub struct ShapedText {
 /// A glyph's home in the atlas and how to place it.
 #[derive(Clone, Copy, Debug)]
 struct GlyphSprite {
-    /// The glyph image's region.
-    region: Region,
+    /// The atlas entry the glyph lives in. The region is looked up by key
+    /// on every draw, so an entry the atlas evicted - or a page growth moved
+    /// - never leaves a stale place behind here.
+    key: u64,
+    /// The rasterization scale the glyph belongs to, for
+    /// [`TextSystem::evict_scale`].
+    scale: u64,
     /// Offset from the glyph's pen origin to the image's top-left corner, in
     /// logical pixels.
     bearing: Vector2f,
     /// The image's size in logical pixels.
     size: Vector2f,
+}
+
+/// The atlas key of one rasterization: the cache key's bits, hashed.
+fn entry_key(cache_key: &CacheKey) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The tag grouping glyphs rasterized at `font_size` (quantized to quarter
+/// pixels, the step a monitor change produces; plan decision D30).
+fn scale_tag(font_size: f32) -> u64 {
+    (font_size.max(0.0) * 4.0).round() as u64
 }
 
 /// Fonts, shaping and the glyph atlas, one instance per process (shared
@@ -126,6 +146,8 @@ pub struct TextSystem {
     /// Monotonic tick so the cache can evict the least recently used
     /// entry without a linked list.
     shape_tick: u64,
+    /// Whether the one allowed "the atlas is full" warning was logged.
+    atlas_full_warned: bool,
 }
 
 /// One memoized shaping: everything [`TextSystem::shape`] reads, with the
@@ -179,6 +201,7 @@ impl TextSystem {
             sprites: BTreeMap::new(),
             shape_cache: HashMap::new(),
             shape_tick: 0,
+            atlas_full_warned: false,
         }
     }
 
@@ -286,25 +309,63 @@ impl TextSystem {
         color: Color,
     ) -> Vector2f {
         let shaped = self.shape(text, style, max_width);
+        let scale = scale_tag(style.font_size);
+        // Reserve every glyph before pushing anything: growing the atlas
+        // re-scales every UV and eviction reuses slots, so no quad may go
+        // out until all the placements this text needs have settled.
+        let mut placed = Vec::with_capacity(shaped.glyphs.len());
         for glyph in &shaped.glyphs {
-            let Some(sprite) = self.glyph_sprite(atlas, glyph.cache_key) else {
-                continue;
-            };
-            let rect = Rect::from_min_size(position + glyph.origin + sprite.bearing, sprite.size);
-            let (uv_min, uv_max) = atlas.uv_rect(sprite.region);
+            if let Some((region, sprite)) = self.glyph(atlas, glyph.cache_key, scale) {
+                placed.push((glyph.origin, region, sprite));
+            }
+        }
+        for (origin, region, sprite) in placed {
+            let rect = Rect::from_min_size(position + origin + sprite.bearing, sprite.size);
+            let (uv_min, uv_max) = atlas.uv_rect(region);
             list.push_quad(TextureId::Atlas, rect, uv_min, uv_max, color);
         }
         shaped.size
     }
 
-    /// The atlas sprite for `key`, rasterizing and caching it on first use.
+    /// Evict every glyph rasterized for `font_size`, returning how many
+    /// atlas entries went; glyphs still on screen rasterize again next
+    /// frame. Nodes use this when a window leaves the monitor whose scale
+    /// factor produced that size (plan decision D30).
+    pub fn evict_scale(&mut self, atlas: &mut Atlas, font_size: f32) -> usize {
+        let tag = scale_tag(font_size);
+        self.sprites.retain(|_, sprite| sprite.scale != tag);
+        atlas.evict_tag(tag)
+    }
+
+    /// The live atlas region for `cache_key` and its sprite, rasterizing and
+    /// caching the glyph on first use.
     ///
-    /// `None` for an empty image (a space) or a full atlas; the caller then
-    /// draws nothing for that glyph.
-    fn glyph_sprite(&mut self, atlas: &mut Atlas, key: CacheKey) -> Option<GlyphSprite> {
-        if let Some(sprite) = self.sprites.get(&key) {
-            return Some(*sprite);
+    /// The atlas may have evicted a cached sprite (a full atlas under its
+    /// cap); the region lookup notices and the glyph rasterizes again, so a
+    /// glyph that is still on screen never goes missing.
+    fn glyph(
+        &mut self,
+        atlas: &mut Atlas,
+        cache_key: CacheKey,
+        scale: u64,
+    ) -> Option<(Region, GlyphSprite)> {
+        if let Some(sprite) = self.sprites.get(&cache_key).copied() {
+            if let Some(region) = atlas.touch(sprite.key) {
+                return Some((region, sprite));
+            }
+            self.sprites.remove(&cache_key);
         }
+        let sprite = self.rasterize(atlas, cache_key, scale)?;
+        let region = atlas.touch(sprite.key)?;
+        Some((region, sprite))
+    }
+
+    /// Rasterize `key` into the atlas and cache its sprite.
+    ///
+    /// `None` for an empty image (a space) or an atlas that cannot fit the
+    /// glyph even after growth and eviction; the caller then draws nothing
+    /// for that glyph, and the atlas's refusal is logged once.
+    fn rasterize(&mut self, atlas: &mut Atlas, key: CacheKey, scale: u64) -> Option<GlyphSprite> {
         let image = self
             .swash_cache
             .get_image_uncached(&mut self.font_system, key)?;
@@ -313,7 +374,17 @@ impl TextSystem {
         if width == 0 || height == 0 {
             return None;
         }
-        let region = atlas.allocate(width, height)?;
+        let entry = entry_key(&key);
+        let Some(region) = atlas.reserve(entry, width, height, scale) else {
+            if !self.atlas_full_warned {
+                self.atlas_full_warned = true;
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::UI,
+                    "[pill_ui] the glyph atlas is full; glyphs are not rasterized"
+                );
+            }
+            return None;
+        };
 
         // Every glyph becomes straight-alpha RGBA: white where the atlas
         // carries coverage, the bitmap's own colours where swash produced a
@@ -342,7 +413,8 @@ impl TextSystem {
         atlas.write_region(region, &rgba);
 
         let sprite = GlyphSprite {
-            region,
+            key: entry,
+            scale,
             bearing: Vector2f::new(image.placement.left as f32, -(image.placement.top as f32)),
             size: Vector2f::new(width as f32, height as f32),
         };
@@ -430,6 +502,144 @@ mod tests {
             assert!(region.x + region.width <= atlas.width());
             assert!(region.y + region.height <= atlas.height());
         }
+    }
+
+    #[test]
+    fn a_text_larger_than_the_initial_atlas_grows_it_and_draws_every_glyph() {
+        // Sixty-two distinct glyphs: more than a 64x64 image can hold, so
+        // the first frame has to grow the atlas in pages. Every glyph must
+        // still come out as a quad, with UVs valid for the grown image.
+        let mut text = TextSystem::new();
+        let mut atlas = Atlas::with_limit(64, 64, 512);
+        let mut list = DrawList::new();
+        let style = TextStyle::default();
+        let sample = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let glyphs = text.shape(sample, &style, None).glyphs.len();
+        assert!(glyphs >= 62);
+
+        for frame in 0..2 {
+            list.clear();
+            text.draw_text(
+                &mut list,
+                &mut atlas,
+                sample,
+                Vector2f::ZERO,
+                &style,
+                None,
+                Color::WHITE,
+            );
+            assert_eq!(
+                list.vertices.len() / 4,
+                glyphs,
+                "every glyph draws, grown atlas or not"
+            );
+            // The second frame is all cache hits: nothing rasterized again.
+            let dirty = atlas.take_updated_regions();
+            if frame == 1 {
+                assert!(dirty.is_empty());
+            }
+        }
+        assert!(atlas.width() > 64, "the atlas grew a page");
+    }
+
+    #[test]
+    fn a_glyph_survives_its_atlas_entry_being_evicted() {
+        // Twenty-six glyphs against a 64-texel atlas: every frame evicts
+        // and re-rasterizes, and every glyph still comes out as a quad.
+        let mut text = TextSystem::new();
+        let mut atlas = Atlas::with_limit(64, 64, 64);
+        let mut list = DrawList::new();
+        let style = TextStyle::default();
+        let sample = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for _frame in 0..2 {
+            list.clear();
+            text.draw_text(
+                &mut list,
+                &mut atlas,
+                sample,
+                Vector2f::ZERO,
+                &style,
+                None,
+                Color::WHITE,
+            );
+            assert_eq!(list.vertices.len() / 4, 26, "no glyph is lost");
+            atlas.take_updated_regions();
+        }
+    }
+
+    #[test]
+    fn evicting_a_scale_drops_exactly_its_glyphs() {
+        let mut text = TextSystem::new();
+        let mut atlas = Atlas::new(256, 256);
+        let mut list = DrawList::new();
+        let small = TextStyle {
+            font_size: 13.0,
+            line_height: 17.0,
+            family: None,
+        };
+        let large = TextStyle {
+            font_size: 26.0,
+            line_height: 32.0,
+            family: None,
+        };
+        text.draw_text(
+            &mut list,
+            &mut atlas,
+            "scale",
+            Vector2f::ZERO,
+            &small,
+            None,
+            Color::WHITE,
+        );
+        text.draw_text(
+            &mut list,
+            &mut atlas,
+            "scale",
+            Vector2f::ZERO,
+            &large,
+            None,
+            Color::WHITE,
+        );
+        assert!(atlas.entry_count() >= 10, "both scales are cached");
+
+        let removed = text.evict_scale(&mut atlas, 13.0);
+        assert!(
+            removed >= 5,
+            "the small scale's entries went, got {removed}"
+        );
+
+        // The other scale survives: drawing it rasterizes nothing again.
+        atlas.take_updated_regions();
+        list.clear();
+        text.draw_text(
+            &mut list,
+            &mut atlas,
+            "scale",
+            Vector2f::ZERO,
+            &large,
+            None,
+            Color::WHITE,
+        );
+        assert!(
+            atlas.take_updated_regions().is_empty(),
+            "the large scale stayed cached"
+        );
+
+        // The evicted scale comes back on demand.
+        list.clear();
+        text.draw_text(
+            &mut list,
+            &mut atlas,
+            "scale",
+            Vector2f::ZERO,
+            &small,
+            None,
+            Color::WHITE,
+        );
+        assert!(
+            !atlas.take_updated_regions().is_empty(),
+            "the evicted scale rasterized again"
+        );
     }
 
     #[test]
