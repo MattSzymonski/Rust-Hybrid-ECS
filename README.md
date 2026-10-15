@@ -116,15 +116,22 @@ The workspace manifest globs `extensions/*/pill_*`, so a module is discovered
 by existing; nothing lists it by name.
 
 1. Create `modules/extensions/<name>/<name>/` with a `Cargo.toml` declaring
-   `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
-2. Export `pill_module_abi_version` and `pill_module_init`.
+   `crate-type = ["rlib"]` and depending on `pill_engine`. The crate root is
+   `src/<name>.rs`, not `src/lib.rs`, so debuggers and the hot scanner can
+   tell crate roots apart.
+2. Mark the registration entry point with the `#[pill_module]` attribute
+   (or `#[pill_project]` for a project); it exports the module ABI entry
+   points for you.
 3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from
-the directory name, so the host needs no changes. See
-`modules/extensions/pill_test/pill_test` for the reference implementation and
-`local/documents/modularity_implementation_plan.md` for the design and its
-constraints.
+the directory name, so the host needs no changes. The host **generates** the
+`cdylib` wrapper it actually loads under
+`modules/extensions/<name>/generated/host_module_<name>/` on startup: it is a
+build artifact, never written by hand. See
+`modules/extensions/pill_spline/` for the reference implementation, its
+`pill_spline_editor/` for an editor part, and
+`docs/writing_an_editor_part.md` for the guide to writing one.
 
 Modules must live in this directory rather than anywhere on disk: sharing the  
 workspace lockfile is what makes a module resolve the same dependency graph as  
