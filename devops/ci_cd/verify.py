@@ -201,6 +201,13 @@ STEPS: List[Step] = [
         quick=True,
     ),
     Step(
+        "log-contract",
+        "Host log contract (the tokens the suites wait for)",
+        [[PYTHON, "devops/tests/test_log_contract.py"]],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
+    Step(
         "engine-exports",
         "Engine dylib export counts (Windows limit 65,535)",
         # Builds the two engine dylibs, then reads their export directories.

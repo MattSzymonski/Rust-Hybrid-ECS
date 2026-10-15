@@ -7,7 +7,8 @@ SETS: hot-reload
 
 REQUIREMENTS
   - Python 3.8+
-  - No Rust toolchain, no host process, no .NET. Runs in well under a second.
+  - No Rust toolchain, no host process, no .NET. Reads the Rust sources, so a
+    run takes a few seconds.
 
 DESCRIPTION
     Every end-to-end suite in this directory decides pass or fail by searching
@@ -29,9 +30,25 @@ DESCRIPTION
     detected".
 
     This test closes that gap statically. It collects every `*_TOKEN` literal
-    the suites define and requires each one to appear verbatim in the Rust
-    sources - or to be listed in EXTERNALLY_PRODUCED below with the reason it
-    cannot be, so that exemptions are stated rather than assumed.
+    the suites define and requires each one to be printable by a Rust string
+    literal: verbatim, or through the `{...}` placeholders a format string
+    carries, since most host lines are built at runtime:
+
+        "[analytics] reload pill_spline "  <-  "{} reload {} {} | build={} ..."
+
+    A placeholder stands for one or more non-whitespace characters, and a token
+    may stop in the middle of the literal, because a suite normally waits for
+    the prefix it cares about and the host appends fields it does not. A match
+    must carry MINIMUM_ANCHOR_CHARACTERS of static text, so that a template the
+    log layer applies to every line - a formatter's `[{level}] {location}
+    {message}` - cannot vacuously cover a token it has nothing to do with.
+
+    A token no literal can print must be listed in EXTERNALLY_PRODUCED below
+    with the reason it cannot be, so that exemptions are stated rather than
+    assumed; a token another language prints whose shape a Rust format string
+    fits by coincidence goes in SHAPE_ONLY_FITS, so that the coincidence does
+    not read as coverage. The same scan rejects a log line written inline in a
+    `wait_for(...)` call, where no constant makes it visible here.
 
 USAGE
   python devops/tests/test_log_contract.py
@@ -43,10 +60,13 @@ EXAMPLE USAGE
 """
 
 # Standard library
+import io
 import re
 import sys
+import tokenize
+from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -63,15 +83,53 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 # Directories whose Python modules declare host-output tokens.
 TOKEN_SOURCE_DIRECTORIES = ("devops/tests", "devops/core", "devops/benchmarks")
 
+# The workspace build tree. The Rust under it is generated - a dependency's
+# `out/` code, the hot patch wrappers - so it is not the host's own source, and
+# a token that only a build artifact can print would be a false pass.
+MODULES_BUILD_ROOT = REPOSITORY_ROOT / "modules" / "target"
+
 # Matches `SOME_TOKEN = "literal"` at module level, capturing name and literal.
 TOKEN_DEFINITION_RE = re.compile(
     r"^([A-Z][A-Z0-9_]*TOKEN[A-Z0-9_]*)\s*=\s*(\"|')(?P<literal>.*?)\2\s*$",
     re.MULTILINE,
 )
 
+# A `{...}` placeholder in a Rust format string: `{id}`, `{:?}`, `{value:.1}`.
+PLACEHOLDER_RE = re.compile(r"\{[^{}]*\}")
+
+# The fewest non-whitespace characters of static text a match must carry. A
+# template the log layer applies to every line (`[{level}] {location}
+# {message}`) or to every structured field (`{} {} {}`) would otherwise
+# "cover" any token that happened to fit its shape.
+MINIMUM_ANCHOR_CHARACTERS = 4
+
+# The token kinds that open an inline literal argument (`"..."`, `f"..."`): a
+# wait written with one of these hides its text from `collect_declared_tokens`.
+# Python before 3.12 tokenises an f-string as one STRING, with no FSTRING_START.
+INLINE_LITERAL_TOKENS = frozenset(
+    {tokenize.STRING, getattr(tokenize, "FSTRING_START", -1)}
+)
+
+# Escapes rustc resolves in a normal string literal, so that a token carrying a
+# quote or a backslash still matches the source text that prints it.
+STRING_ESCAPES: Dict[str, str] = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "0": "\0",
+    '"': '"',
+    "'": "'",
+    "\\": "\\",
+}
+
 # Tokens that legitimately never appear in Rust source, each with the reason.
-# Anything not listed here must be greppable in `modules/**/*.rs`, so that a
+# Anything not listed here must be printable by a Rust literal, so that a
 # reworded log line fails this test instead of an end-to-end suite.
+#
+# The wildcard match is an approximation: a token whose shape an unrelated
+# format string happens to fit counts as printable. A token that really is
+# printed by another language belongs in SHAPE_ONLY_FITS below instead, where
+# the coincidence is stated rather than read as coverage.
 EXTERNALLY_PRODUCED: Dict[str, str] = {
     "STATUS_ACCESS_VIOLATION": "Windows prints this exit status, not the host.",
     "panicked at": "Emitted by the Rust panic runtime, not by our code.",
@@ -84,17 +142,6 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
         "whose source is C# rather than Rust.",
     "[csharp_runtime] reloaded project_cs.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",
-    "[csharp_runtime] reload failed:":
-        "Emitted by the .NET bridge, whose source is C# rather than Rust.",
-    "[analytics] reload project":
-        "Composed at runtime: the '[analytics] reload' prefix is followed by "
-        "the subject name held in a variable.",
-    "[analytics] reload pill_spline":
-        "Composed at runtime: the '[analytics] reload' prefix is followed by "
-        "the subject name held in a variable.",
-    "[render] First frame: Presented; camera=true":
-        "Composed at runtime: `pill_runtime/rendering.rs` formats the frame "
-        "outcome, camera state and instance counts into one line.",
     "'project::FrameCounter' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
     "'project::SpatialPosition' -> migrating":
@@ -121,6 +168,12 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "[project_cs] sample extra=7.5":
         "Printed by C# that test_csharp_bridge.py injects into "
         "examples/project_cs during the run, to witness a field default.",
+    "cs spline bridge: sees 1 spline(s), first P0.X=0, count=4":
+        "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
+        "into examples/project_cs during the run.",
+    "cs spline bridge: sees 2 spline(s)":
+        "Printed by the C# BridgeProbe fixture test_csharp_bridge.py injects "
+        "into examples/project_cs during the run.",
     "probe retirement markers seeded":
         "Printed by C# that test_csharp_bridge.py injects into "
         "examples/project_cs during the run, to witness declaration "
@@ -137,6 +190,20 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "TIME SURVIVAL PROBE":
         "Printed by Rust that test_shared_component_identity.py injects into "
         "the project during the run.",
+}
+
+# Tokens whose text another language prints and whose shape a Rust format string
+# fits by coincidence. `{} reload {} {}` fits any `[subject] reload detail`
+# token, so the managed loader's `[csharp_runtime] reload failed:` line reads as
+# printable by `pill_host`'s analytics line although no Rust literal really
+# prints it. An entry here is checked for still being declared and for really
+# being such a coincidence; nothing can require its presence, because the fit it
+# describes is indistinguishable from coverage.
+SHAPE_ONLY_FITS: Dict[str, str] = {
+    "[csharp_runtime] reload failed:":
+        "Printed by the managed loader (pill_csharp_runtime, C#); the "
+        "`[analytics] reload {} {}` line in pill_host fits its shape by "
+        "coincidence.",
 }
 
 # Tokens whose whole point is to distinguish one reload subject from another.
@@ -172,30 +239,311 @@ def collect_declared_tokens() -> Dict[str, List[str]]:
     return tokens
 
 
+def iter_inline_wait_lines(module_path: Path) -> Iterator[int]:
+    """
+    Yields the line of every `wait_for(<inline literal>, ...)` call in a module.
+
+    Tokenising rather than matching text keeps a `wait_for(` mentioned in a
+    docstring, a comment or the `def wait_for(...)` signature itself from
+    counting as a call site. Any argument counts, not only the first: the suites
+    carry both helper shapes - `wait_for(token, ...)` and
+    `wait_for(log_path, token, ...)` - and a literal in either hides its text
+    from `collect_declared_tokens`.
+    """
+    tokens = list(
+        tokenize.generate_tokens(
+            io.StringIO(module_path.read_text(encoding="utf-8")).readline
+        )
+    )
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.NAME or token.string != "wait_for":
+            continue
+        if index and tokens[index - 1].string == "def":
+            continue
+        call = tokens[index + 1:]
+        if not call or call[0].string != "(":
+            continue
+        depth = 0
+        for following in call:
+            if depth == 1 and following.type in INLINE_LITERAL_TOKENS:
+                yield token.start[0]
+                break
+            if following.type != tokenize.OP:
+                continue
+            if following.string in "([{":
+                depth += 1
+            elif following.string in ")]}":
+                depth -= 1
+                if depth == 0:
+                    break
+
+
 def read_rust_sources() -> str:
     """
-    Concatenates every Rust source file under `modules/` into one haystack.
+    Concatenates every first-party Rust source under `modules/` into one haystack.
 
     Decoding errors are replaced rather than raised so that a stray non-UTF-8
     byte in an unrelated file cannot mask a genuine contract break.
     """
-    parts = []
-    for source_path in sorted((REPOSITORY_ROOT / "modules").rglob("*.rs")):
-        parts.append(source_path.read_text(encoding="utf-8", errors="replace"))
-    return "\n".join(parts)
+    return "\n".join(text for _, text in rust_source_files())
+
+
+@lru_cache(maxsize=1)
+def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
+    """
+    Every first-party Rust source under `modules/`, with its text, once a run.
+
+    The checks below scan the same tree several times, and reading it is the
+    bulk of this suite's runtime.
+    """
+    return tuple(
+        (source_path, source_path.read_text(encoding="utf-8", errors="replace"))
+        for source_path in sorted((REPOSITORY_ROOT / "modules").rglob("*.rs"))
+        if MODULES_BUILD_ROOT not in source_path.parents
+    )
+
+
+def iter_rust_string_literals(source: str) -> Iterator[Tuple[str, int]]:
+    """
+    Yields each `"..."` literal in one Rust source, with the line it opens on.
+
+    Comments, character literals and lifetimes are skipped, so a quoted word in
+    a comment cannot pass for a log line; a raw string (`r#"..."#`) is read to
+    its own closing delimiter; and a backslash-newline continuation is joined
+    the way rustc joins it, so a wrapped format string stays one literal.
+    """
+    index = 0
+    line = 1
+    length = len(source)
+    while index < length:
+        if source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = length if newline < 0 else newline
+        elif source.startswith("/*", index):
+            closing = source.find("*/", index + 2)
+            end = length if closing < 0 else closing + 2
+            line += source.count("\n", index, end)
+            index = end
+        elif source[index] == "\n":
+            line += 1
+            index += 1
+        elif source[index] == "'":
+            index = _skip_character_literal(source, index)
+        elif source[index] == '"':
+            opening = index
+            body, index = _read_string_body(source, index + 1)
+            yield body, line
+            line += source.count("\n", opening, index)
+        else:
+            hashes = _raw_string_hashes(source, index)
+            if hashes is None:
+                index += 1
+                continue
+            start = index
+            opening = index + hashes + 2
+            delimiter = '"' + "#" * hashes
+            closing = source.find(delimiter, opening)
+            if closing < 0:
+                yield source[opening:], line
+                return
+            yield source[opening:closing], line
+            index = closing + len(delimiter)
+            line += source.count("\n", start, index)
+
+
+def _skip_character_literal(source: str, index: int) -> int:
+    """Steps over a character literal, or over the quote of a lifetime."""
+    cursor = index + 1
+    if source[cursor:cursor + 1] == "\\":
+        cursor += 2
+        while cursor < len(source) and source[cursor] != "'":
+            cursor += 1
+        return min(cursor + 1, len(source))
+    if source[cursor + 1:cursor + 2] == "'":
+        return cursor + 2
+    return cursor
+
+
+def _read_string_body(source: str, cursor: int) -> Tuple[str, int]:
+    """
+    Reads a normal string literal body from just past its opening quote.
+
+    Returns the body, with escapes resolved and line continuations joined, and
+    the index just past the closing quote.
+    """
+    pieces: List[str] = []
+    while cursor < len(source):
+        character = source[cursor]
+        if character == "\\":
+            following = source[cursor + 1:cursor + 2]
+            if following in ("\n", "\r"):
+                # A line continuation: rustc drops the backslash, the newline
+                # and the indentation of the next line.
+                cursor += 2
+                if source[cursor - 1] == "\r" and source[cursor:cursor + 1] == "\n":
+                    cursor += 1
+                while cursor < len(source) and source[cursor] in " \t":
+                    cursor += 1
+                continue
+            pieces.append(STRING_ESCAPES.get(following, following))
+            cursor += 2
+            continue
+        if character == '"':
+            break
+        pieces.append(character)
+        cursor += 1
+    return "".join(pieces), cursor + 1
+
+
+def _raw_string_hashes(source: str, index: int) -> Optional[int]:
+    """
+    Returns the `#` count when a raw string opens at `index`, else `None`.
+
+    `index` holds the `r`; the `b` or `c` of a `br#"..."#` byte or C string is
+    allowed in front, and an identifier that merely ends in `r` is not a raw
+    string opener. A plain `"` is not one either - the caller reaches it as an
+    ordinary string literal, with its escapes resolved.
+    """
+    if source[index:index + 1] != "r":
+        return None
+    preceding = source[index - 1:index]
+    if preceding in ("b", "c"):
+        preceding = source[index - 2:index - 1]
+    if preceding.isalnum() or preceding == "_":
+        return None
+    cursor = index + 1
+    hashes = 0
+    while source[cursor:cursor + 1] == "#":
+        hashes += 1
+        cursor += 1
+    return hashes if source[cursor:cursor + 1] == '"' else None
+
+
+class RustLiteral(NamedTuple):
+    """One Rust string literal, indexed for matching a suite token against it."""
+
+    literal: str
+    parts: Tuple[str, ...]
+    anchor: str
+    location: str
+
+
+@lru_cache(maxsize=1)
+def rust_literals() -> Tuple[RustLiteral, ...]:
+    """
+    Every Rust string literal that can print something other than itself.
+
+    Literals without a `{...}` placeholder are skipped: a suite token that
+    appears in one verbatim is already a substring of the haystack. So are
+    literals with no static segment of `MINIMUM_ANCHOR_CHARACTERS`, because no
+    cut of them can anchor a match.
+    """
+    entries: List[RustLiteral] = []
+    for source_path, text in rust_source_files():
+        relative = source_path.relative_to(REPOSITORY_ROOT).as_posix()
+        for literal, line in iter_rust_string_literals(text):
+            parts = tuple(PLACEHOLDER_RE.split(literal))
+            if len(parts) < 2:
+                continue
+            anchor = next(
+                (
+                    part
+                    for part in parts
+                    if anchor_length(part) >= MINIMUM_ANCHOR_CHARACTERS
+                ),
+                None,
+            )
+            if anchor is None:
+                continue
+            entries.append(RustLiteral(literal, parts, anchor, f"{relative}:{line}"))
+    return tuple(entries)
+
+
+def anchor_length(text: str) -> int:
+    """Counts the non-whitespace characters that make a segment a real anchor."""
+    return sum(1 for character in text if not character.isspace())
+
+
+def token_is_covered(token: str) -> bool:
+    """
+    True when some Rust string literal can print `token`.
+
+    Verbatim first, which is how almost every token is found, then through the
+    `{...}` placeholders of a format string.
+    """
+    if token in read_rust_sources():
+        return True
+    for entry in rust_literals():
+        if entry.anchor not in token:
+            continue
+        if literal_prints(entry.parts, token):
+            return True
+    return False
+
+
+def literal_prints(parts: Tuple[str, ...], token: str) -> bool:
+    """
+    True when the format string `parts` can print `token`.
+
+    `parts` holds the static text between the `{...}` placeholders, so the
+    placeholders are the gaps between consecutive entries (and one before the
+    first and after the last only if the literal opens or closes with one).
+    A placeholder stands for one or more non-whitespace characters, and the
+    token may stop anywhere - including inside a static segment, because the
+    host goes on printing fields the suite does not wait for.
+    """
+    # (segment, characters of the token consumed, anchored yet) has one answer,
+    # and a placeholder may consume any run length, so memoise to keep a token
+    # full of placeholders from branching exponentially.
+    answers: Dict[Tuple[int, int, bool], bool] = {}
+
+    def walk(index: int, consumed: int, anchored: bool) -> bool:
+        segment = parts[index]
+        available = token[consumed:consumed + len(segment)]
+        if not segment.startswith(available):
+            return False
+        if len(available) < len(segment):
+            # The token stops inside this segment: still a prefix of the line,
+            # anchored only if it carries enough of the segment.
+            return anchored or anchor_length(available) >= MINIMUM_ANCHOR_CHARACTERS
+        consumed += len(segment)
+        anchored = anchored or anchor_length(segment) >= MINIMUM_ANCHOR_CHARACTERS
+        if consumed == len(token):
+            return anchored
+        if index + 1 >= len(parts):
+            return False
+        key = (index, consumed, anchored)
+        if key in answers:
+            return answers[key]
+        result = False
+        for end in range(consumed + 1, len(token) + 1):
+            if token[end - 1].isspace():
+                break
+            if walk(index + 1, end, anchored):
+                result = True
+                break
+        answers[key] = result
+        return result
+
+    return walk(0, 0, False)
+
+
+def is_exempt(token: str) -> bool:
+    """True when the token is documented as not coming from a Rust literal."""
+    return token in EXTERNALLY_PRODUCED or token in SHAPE_ONLY_FITS
 
 
 def check_every_declared_token_exists_in_rust() -> None:
     """Fails if a suite matches on a string the host no longer prints."""
-    rust_sources = read_rust_sources()
     missing = []
     for literal, origins in sorted(collect_declared_tokens().items()):
-        if literal in EXTERNALLY_PRODUCED or literal in rust_sources:
+        if is_exempt(literal) or token_is_covered(literal):
             continue
         missing.append(f"{literal!r} required by {', '.join(origins)}")
     assert not missing, (
-        "these tokens appear in no Rust source, so the suites that match on "
-        "them can only fail at runtime:\n    " + "\n    ".join(missing)
+        "no Rust string literal can print these tokens, verbatim or through "
+        "the `{...}` placeholders a format string carries, so the suites that "
+        "match on them can only fail at runtime:\n    " + "\n    ".join(missing)
     )
 
 
@@ -203,29 +551,72 @@ def check_exemptions_are_still_needed() -> None:
     """
     Fails if an entry in EXTERNALLY_PRODUCED is stale.
 
-    An exemption whose token is now findable in Rust is a hole: it would let a
+    An exemption whose token a Rust literal can print is a hole: it would let a
     real regression through. An exemption no suite declares any more is dead
-    weight that makes the list harder to trust.
+    weight that makes the list harder to trust. Only the second test applies to
+    SHAPE_ONLY_FITS: its tokens are printed by another language, so a Rust
+    literal that happens to fit their shape proves nothing.
     """
-    rust_sources = read_rust_sources()
     declared = collect_declared_tokens()
     stale = [
         f"{literal!r} ({reason})"
         for literal, reason in sorted(EXTERNALLY_PRODUCED.items())
-        if literal in rust_sources
+        if token_is_covered(literal)
     ]
     assert not stale, (
-        "these exemptions are no longer needed - the token is now in Rust "
-        "source, so remove the entry:\n    " + "\n    ".join(stale)
+        "these exemptions are no longer needed - a Rust literal can print the "
+        "token now, so remove the entry:\n    " + "\n    ".join(stale)
     )
     unused = [
         repr(literal)
-        for literal in sorted(EXTERNALLY_PRODUCED)
+        for literal in sorted((*EXTERNALLY_PRODUCED, *SHAPE_ONLY_FITS))
         if literal not in declared
     ]
     assert not unused, (
         "these exemptions name tokens no suite declares any more:\n    "
         + "\n    ".join(unused)
+    )
+
+
+def check_shape_only_fits_are_real_coincidences() -> None:
+    """
+    Fails if a SHAPE_ONLY_FITS entry is not a shape coincidence.
+
+    The two tables are told apart by that property: an EXTERNALLY_PRODUCED token
+    no literal can print, a SHAPE_ONLY_FITS token one can only by fitting an
+    unrelated line. An entry in the wrong table would state the wrong reason.
+    """
+    misplaced = [
+        f"{literal!r} ({reason})"
+        for literal, reason in sorted(SHAPE_ONLY_FITS.items())
+        if not token_is_covered(literal)
+    ]
+    assert not misplaced, (
+        "these tokens are listed as a Rust literal fitting their shape by "
+        "coincidence, but no Rust format string fits them at all; they belong "
+        "in EXTERNALLY_PRODUCED:\n    " + "\n    ".join(misplaced)
+    )
+
+
+def check_wait_for_literals_are_named_constants() -> None:
+    """
+    Fails if a host suite waits on a log line written inline.
+
+    A literal written into a `wait_for(...)` argument hides that text from
+    `collect_declared_tokens`, so the line it pins can be reworded with nothing
+    here to catch it. Naming it as a `*_TOKEN` constant puts it under the
+    contract; a token Rust does not print belongs in EXTERNALLY_PRODUCED.
+    """
+    offenders = [
+        f"{directory}/{module_path.name}:{line}"
+        for directory in TOKEN_SOURCE_DIRECTORIES
+        for module_path in sorted((REPOSITORY_ROOT / directory).glob("*.py"))
+        for line in iter_inline_wait_lines(module_path)
+    ]
+    assert not offenders, (
+        "these suites wait on an inline log line, which no constant and no "
+        "check here can see; name it as a `*_TOKEN` constant instead:\n    "
+        + "\n    ".join(offenders)
     )
 
 
@@ -277,6 +668,14 @@ def check_migration_banners_are_printed() -> None:
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every declared token exists in Rust", check_every_declared_token_exists_in_rust),
     ("exemptions are still needed", check_exemptions_are_still_needed),
+    (
+        "shape-only exemptions are coincidences",
+        check_shape_only_fits_are_real_coincidences,
+    ),
+    (
+        "waits use named tokens",
+        check_wait_for_literals_are_named_constants,
+    ),
     ("project and module tokens stay distinct", check_subject_tokens_stay_distinguishable),
     ("migration banners are printed", check_migration_banners_are_printed),
 ]
