@@ -92,6 +92,10 @@ RELOAD_TRIGGERED_TOKEN = "hot reload triggered"
 # because the first patch of a session re-derives compiler flags (~1.2 s) and
 # a fallback runs a real cargo build.
 OUTCOME_TIMEOUT = 90
+# How long a retry waits, after restoring the refused edit, for the fallback
+# reload to finish before it edits the next candidate: a retry that lands
+# mid-build is cancelled again, and again.
+RETRY_SETTLE_TIMEOUT = 120
 BUILD_TIMEOUT_SECONDS = 600
 
 # Where the host keeps the compiler-flag caches this test also reads
@@ -138,10 +142,23 @@ class Crate:
         self.edit_from = ""
         self.edit_to = ""
         self.function = ""
+        # The planned edits after the current one, in preference order: the
+        # driver moves on through them when the host's verdict says the
+        # chosen function can never be patched (see `exercise`).
+        self.candidates: List[Tuple[Path, str, str, str]] = []
         self.outcome = "SKIPPED"
         self.detail = ""
         self.route = ""
         self.milliseconds = 0
+
+    def use_next_candidate(self) -> bool:
+        """Moves to the next planned candidate; False when none remain."""
+        if not self.candidates:
+            return False
+        path, name, edit_from, edit_to = self.candidates.pop(0)
+        self.edit_file, self.function = path, name
+        self.edit_from, self.edit_to = edit_from, edit_to
+        return True
 
     @property
     def has_fast_path(self) -> bool:
@@ -269,21 +286,35 @@ def unique_snippet(source: str, literal_start: int, literal: str) -> Optional[st
     A bare literal is rarely unique - `2.0` occurs all over a physics module -
     and replacing the first occurrence would edit a different function than the
     one being reported, turning a healthy crate into a false failure. Growing
-    leftwards until the text is unique keeps the edit anchored to the intended
-    line while staying inside the body.
+    the window leftwards until the text is unique keeps the edit anchored to
+    the intended line.
+
+    A literal opening or closing an array ends its line before any text tells
+    it apart from its fellows, so the fallback grows rightwards across the
+    following lines instead. That is what lets a body whose only literals are
+    uniform (`0.0`) stay usable; without it such a function is dropped even
+    though its edit is as safe as any other.
 
     Returns `None` when no window up to `MAX_SNIPPET_LENGTH` is unique, which
     leaves the function as an unusable candidate rather than an unsafe edit.
     """
+    literal_end = literal_start + len(literal)
     for reach in range(0, MAX_SNIPPET_LENGTH, 4):
         start = literal_start - reach
         if start < 0:
             break
-        snippet = source[start : literal_start + len(literal)]
+        snippet = source[start:literal_end]
         # A snippet spanning a newline would still be anchored correctly, but
         # keeping it on one line makes the reported edit readable.
         if "\n" in snippet:
             break
+        if source.count(snippet) == 1:
+            return snippet
+    for reach in range(4, MAX_SNIPPET_LENGTH, 4):
+        end = literal_end + reach
+        if end > len(source):
+            break
+        snippet = source[literal_start:end]
         if source.count(snippet) == 1:
             return snippet
     return None
@@ -339,9 +370,14 @@ def plan_edit(crate: Crate) -> bool:
     if not candidates:
         return False
     candidates.sort(key=lambda entry: (not entry[0], str(entry[1]), entry[2]))
-    _, path, name, original, changed = candidates[0]
-    crate.edit_file, crate.function = path, name
-    crate.edit_from, crate.edit_to = original, changed
+    # A patch refusal can say the chosen function is unpatchable by
+    # construction (`associated-without-receiver`); keeping a few candidates
+    # lets the run move on to the next one without guessing which functions
+    # the host can carry.
+    crate.candidates = [
+        (path, name, snippet, changed) for _, path, name, snippet, changed in candidates[:6]
+    ]
+    crate.use_next_candidate()
     return True
 
 
@@ -390,41 +426,99 @@ def classify_outcome(output: str, crate: Crate) -> Tuple[str, str, str, int]:
 
 
 def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> None:
-    """Make one body-only edit and record how the host delivered it."""
-    print(f"\n  [EDIT] {crate.name}: {crate.edit_file.name} "
-          f"fn {crate.function}  {crate.edit_from} -> {crate.edit_to}")
-    backups.capture(crate.edit_file)
-    # The shared helpers keep line endings as stored, so only the edited line
-    # changes and the host sees a body-only edit.
-    original = read_source(crate.edit_file)
-    edited = original.replace(crate.edit_from, crate.edit_to, 1)
-    if edited == original:
-        crate.outcome = "SKIPPED"
-        crate.detail = f"edit text {crate.edit_from!r} not found as written"
-        print(f"  [SKIP] {crate.name}: {crate.detail}")
-        return
-    atomic_write(crate.edit_file, edited)
+    """Make body-only edits and record how the host delivered the last one.
 
-    start_index = monitor.line_count
-    deadline = time.time() + OUTCOME_TIMEOUT
-    while time.time() < deadline:
-        output = monitor.output_since(start_index)
-        outcome, detail, route, milliseconds = classify_outcome(output, crate)
-        if outcome != "SKIPPED":
-            crate.outcome, crate.detail = outcome, detail
-            crate.route, crate.milliseconds = route, milliseconds
-            break
-        if not monitor.process_alive():
-            crate.outcome, crate.detail = "FELL BACK", "the host exited during this edit"
-            break
-        time.sleep(0.2)
-    else:
-        # Not `SKIPPED`: this crate has a fast path and the edit was written, so
-        # the host had a chance to answer and did not. Reported separately
-        # because a run of these is what a watcher that stopped delivering looks
-        # like, and it must not read as "nothing to test here".
-        crate.outcome = "TIMED OUT"
-        crate.detail = f"no outcome within {OUTCOME_TIMEOUT}s"
+    An attempt decides more than the picker can tell up front: a chosen
+    function can be unpatchable by construction - an associated function with
+    no `Self` to carry the body (`associated-without-receiver`), or a body
+    reaching crate-private state that the generated patch, compiled as its own
+    crate, cannot name - and only asking reveals which. A fallback therefore
+    moves the run on to the crate's next candidate; the last candidate's
+    verdict is the crate's.
+    """
+    while True:
+        previous = crate.function
+        print(f"\n  [EDIT] {crate.name}: {crate.edit_file.name} "
+              f"fn {crate.function}  {crate.edit_from} -> {crate.edit_to}")
+        backups.capture(crate.edit_file)
+        # The shared helpers keep line endings as stored, so only the edited
+        # line changes and the host sees a body-only edit.
+        original = read_source(crate.edit_file)
+        edited = original.replace(crate.edit_from, crate.edit_to, 1)
+        if edited == original:
+            crate.outcome = "SKIPPED"
+            crate.detail = f"edit text {crate.edit_from!r} not found as written"
+            print(f"  [SKIP] {crate.name}: {crate.detail}")
+            return
+        atomic_write(crate.edit_file, edited)
+
+        start_index = monitor.line_count
+        deadline = time.time() + OUTCOME_TIMEOUT
+        while time.time() < deadline:
+            output = monitor.output_since(start_index)
+            outcome, detail, route, milliseconds = classify_outcome(output, crate)
+            if outcome != "SKIPPED":
+                crate.outcome, crate.detail = outcome, detail
+                crate.route, crate.milliseconds = route, milliseconds
+                break
+            if not monitor.process_alive():
+                crate.outcome, crate.detail = "FELL BACK", "the host exited during this edit"
+                break
+            time.sleep(0.2)
+        else:
+            # Not `SKIPPED`: this crate has a fast path and the edit was
+            # written, so the host had a chance to answer and did not.
+            # Reported separately because a run of these is what a watcher
+            # that stopped delivering looks like, and it must not read as
+            # "nothing to test here".
+            crate.outcome = "TIMED OUT"
+            crate.detail = f"no outcome within {OUTCOME_TIMEOUT}s"
+
+        # Restoring is itself a source change: the watcher fires again and the
+        # host patches or reloads its way back. Waiting for that to finish is
+        # what keeps the next measurement clean - without it the following
+        # edit is classified against a snapshot the host has not caught up
+        # with, and a healthy crate is reported as `outside-hot-body`.
+        restore_index = monitor.line_count
+        backups.restore_one(crate.edit_file)
+        settle_deadline = time.time() + OUTCOME_TIMEOUT
+        while time.time() < settle_deadline:
+            output = monitor.output_since(restore_index)
+            if classify_outcome(output, crate)[0] != "SKIPPED":
+                break
+            if not monitor.process_alive():
+                break
+            time.sleep(0.2)
+        time.sleep(1.0)
+
+        if crate.outcome == "FELL BACK" and monitor.process_alive() and crate.candidates:
+            if "associated-without-receiver" in crate.detail:
+                reason = "an associated function with no receiver, which no patch can carry"
+            else:
+                reason = f"not patchable as written ({crate.detail})"
+            crate.use_next_candidate()
+            print(
+                f"  [..] {crate.name}: `{previous}` is {reason}; trying "
+                f"`{crate.function}` instead"
+            )
+            # The refused edit's fallback reload may still be building, and the
+            # watcher cancels overlapping builds: a retry that lands mid-build
+            # is cancelled again and again. Wait for the restored sources to
+            # settle - the module reloading, or the restore patching back -
+            # before the next candidate.
+            retry_settle = time.time() + RETRY_SETTLE_TIMEOUT
+            while time.time() < retry_settle:
+                output = monitor.output_since(restore_index)
+                if "module DLL loaded successfully" in output:
+                    break
+                if classify_outcome(output, crate)[0] == "PATCHED":
+                    break  # the restore patched instantly; nothing to rebuild
+                if not monitor.process_alive():
+                    break
+                time.sleep(0.2)
+            time.sleep(1.0)
+            continue
+        break
 
     marker = {"PATCHED": "[OK]", "FELL BACK": "[FAIL]", "TIMED OUT": "[FAIL]"}.get(
         crate.outcome, "[SKIP]"
@@ -433,23 +527,6 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
         f"{crate.route}, {crate.milliseconds} ms" if crate.outcome == "PATCHED" else crate.detail
     )
     print(f"  {marker} {crate.name}: {crate.outcome} - {summary}")
-
-    # Restoring is itself a source change: the watcher fires again and the host
-    # patches or reloads its way back. Waiting for that to finish is what keeps
-    # the next crate's measurement clean - without it the following edit is
-    # classified against a snapshot the host has not caught up with, and a
-    # healthy crate is reported as `outside-hot-body`.
-    restore_index = monitor.line_count
-    backups.restore_one(crate.edit_file)
-    settle_deadline = time.time() + OUTCOME_TIMEOUT
-    while time.time() < settle_deadline:
-        output = monitor.output_since(restore_index)
-        if classify_outcome(output, crate)[0] != "SKIPPED":
-            break
-        if not monitor.process_alive():
-            break
-        time.sleep(0.2)
-    time.sleep(1.0)
 
 
 def inspect_flag_caches(since: float) -> Tuple[List[str], List[str], int]:
