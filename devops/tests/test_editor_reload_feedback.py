@@ -31,12 +31,15 @@ DESCRIPTION
     5. the editor exits cleanly.
 
   Everything is asserted on the editor's log tokens and the recorder file; the
-  edited sources are restored in a `finally`. The suite runs under its own
-  LOCALAPPDATA sandbox, so the default workspace (with the Problems tab) is
-  the one that loads.
+  edited sources are restored when the session closes. The suite runs under
+  its own LOCALAPPDATA sandbox, so the default workspace (with the Problems
+  tab) is the one that loads.
 
 USAGE
   python devops/tests/test_editor_reload_feedback.py
+
+  The run's log, command file and open recorder land in their own folder
+  under `local/editor-validation/reload-feedback-<run id>/`.
 
 EXAMPLE USAGE
   python devops/tests/test_editor_reload_feedback.py
@@ -44,25 +47,38 @@ EXAMPLE USAGE
 --- SCRIPT ---
 """
 
-import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-MODULES = ROOT / "modules"
-BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
-VALIDATION = ROOT / "local" / "editor-validation"
-LOG = VALIDATION / "editor-reload-feedback.log"
-COMMANDS = VALIDATION / "commands-reload-feedback.txt"
-APPDATA = VALIDATION / "reload_feedback_appdata"
-OPEN_RECORD = VALIDATION / "reload_feedback_open_record.txt"
-OPEN_BAT = VALIDATION / "reload_feedback_open.bat"
+DEVOPS_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(DEVOPS_ROOT))
+
+from core.editor_session import (  # noqa: E402
+    EditorSession,
+    EDITOR_COMMAND_REGISTRY_TOKEN,
+    EDITOR_SHELL_LOADED_TOKEN,
+    EDITOR_TAB_SELECTED_TOKEN,
+    EDITOR_WINDOW_CREATED_TOKEN,
+)
+from core.paths import MODULES_ROOT  # noqa: E402
+
+# Suite tokens: the stable halves of the lines this suite asserts on, so
+# `test_log_contract.py` checks each against the Rust sources.
+SHELL_FRAME_TOKEN = "[editor] shell frame"
+PROBLEMS_UPDATED_TOKEN = "[editor] problems updated"
+PROBLEM_ROW_TOKEN = "[editor] problem"
+TOAST_SHOWN_TOKEN = "[editor] toast shown"
+PROBLEMS_PANEL_TOKEN = "[editor] problems panel updated"
+PROBLEMS_ROW_ACTIVATED_TOKEN = "[editor] problems row activated"
+OPEN_FILE_TOKEN = "[editor] open file"
+HOT_PREFIX_TOKEN = "[hot] "
+ROLLBACK_TOKEN = "patch rolled back automatically after repeated panics"
+EXTENSION_RELOADED_TOKEN = "extension hot reload complete"
+
 EXTENSION_SOURCE = (
-    MODULES
+    MODULES_ROOT
     / "extensions"
     / "pill_dummy_color"
     / "pill_dummy_color"
@@ -75,7 +91,7 @@ EXTENSION_NAME = "pill_dummy_color"
 # expects the host to roll the patch back. The shell is covered like any module
 # (D33), and the editor must survive its own UI system panicking every frame.
 SHELL_SOURCE = (
-    MODULES
+    MODULES_ROOT
     / "extensions"
     / "pill_editor_shell"
     / "pill_editor_shell_editor"
@@ -92,88 +108,37 @@ SHELL_PANIC_LINE = '    panic!("reload feedback rollback probe");'
 BROKEN_LINE = 'pub fn reload_feedback_broken() -> u32 { "not a number" }'
 
 
-def read_log() -> str:
-    """The editor log so far, tolerant of a file the writer holds open."""
-    try:
-        return LOG.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def wait_token(
-    process: subprocess.Popen, pattern: str, timeout: float, label: str, start: int = 0
-) -> int:
-    """Wait for `pattern` after byte offset `start`; returns the new length."""
-    deadline = time.monotonic() + timeout
-    expression = re.compile(pattern)
-    while time.monotonic() < deadline:
-        text = read_log()
-        if expression.search(text[start:]):
-            print(f"  [OK] {label}")
-            return len(text)
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"{label}: the editor exited {process.returncode}\n" + text[-4000:]
-            )
-        time.sleep(0.5)
-    raise TimeoutError(f"{label}: timeout waiting for {pattern}\n" + read_log()[-4000:])
-
-
-def append(line: str) -> None:
-    """Appends one scripted command, flushed, so the editor sees it whole."""
-    with COMMANDS.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
-
-
 def main() -> int:
-    if os.name != "nt":
+    if not EditorSession.supported():
         print("SKIP: the native editor suites need Windows")
         return 0
-    if not BINARY.is_file():
-        raise SystemExit(
-            f"editor binary not found at {BINARY}; build it with "
-            "`cargo build -p pill_editor_native` in modules/ first"
-        )
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "pill_editor_native.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    VALIDATION.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(APPDATA, ignore_errors=True)
-    original_source = EXTENSION_SOURCE.read_text(encoding="utf-8")
-    original_shell = SHELL_SOURCE.read_text(encoding="utf-8")
+    session = EditorSession("reload-feedback")
+    session.run_directory.mkdir(parents=True, exist_ok=True)
+    open_record = session.run_directory / "open-record.txt"
+    open_bat = session.run_directory / "open.bat"
     # The recorder the editor's open request reaches: it appends its arguments
     # (the `-g` switch and the file:line) to a file the suite reads back.
-    OPEN_BAT.write_text(
-        f'@echo %* >> "{OPEN_RECORD}"\n', encoding="utf-8"
+    open_bat.write_text(f'@echo %* >> "{open_record}"\n', encoding="utf-8")
+    open_record.unlink(missing_ok=True)
+    session.start(
+        project="../examples/italian_brainrot",
+        test_seconds=900,
+        extra_env={"PILL_EDITOR_OPEN_COMMAND": f"cmd /C {open_bat}"},
     )
-    OPEN_RECORD.unlink(missing_ok=True)
-    COMMANDS.write_text("# reload feedback suite\n", encoding="utf-8")
-    environment = dict(os.environ)
-    environment["PROJECT_PATH"] = "../examples/italian_brainrot"
-    environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
-    environment["PILL_EDITOR_TEST_SECONDS"] = "900"
-    environment["LOCALAPPDATA"] = str(APPDATA)
-    environment["PILL_EDITOR_OPEN_COMMAND"] = f"cmd /C {OPEN_BAT}"
-    log = LOG.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        [str(BINARY)],
-        cwd=str(MODULES),
-        env=environment,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    log.close()
+    with EXTENSION_SOURCE.open("r", encoding="utf-8", newline="") as file:
+        original_source = file.read()
+    with SHELL_SOURCE.open("r", encoding="utf-8", newline="") as file:
+        original_shell = file.read()
     try:
-        wait_token(process, r"\[editor\] pill_editor_shell_editor loaded", 300, "shell loaded")
-        wait_token(process, r"\[editor\] window created", 300, "editor started")
-        wait_token(process, r"\[editor\] command registry ready", 120, "registry ready")
-        wait_token(process, r"\[editor\] shell frame", 120, "frames running")
+        session.wait_token(EDITOR_SHELL_LOADED_TOKEN, 300, "shell loaded")
+        session.wait_token(EDITOR_WINDOW_CREATED_TOKEN, 300, "editor started")
+        session.wait_token(EDITOR_COMMAND_REGISTRY_TOKEN, 120, "registry ready")
+        session.wait_token(SHELL_FRAME_TOKEN, 120, "frames running")
 
         # Step 0: nothing is broken yet, so no problem was ever reported.
-        assert "problems updated" not in read_log(), "problems reported before any edit"
+        assert PROBLEMS_UPDATED_TOKEN not in session.read_log(), (
+            "problems reported before any edit"
+        )
 
         # Step 1: break the extension's source. The error lands on the file's
         # new last line, which is what the panel row must point at.
@@ -181,28 +146,28 @@ def main() -> int:
         if not text.endswith("\n"):
             text += "\n"
         broken_line_number = text.count("\n") + 1
-        EXTENSION_SOURCE.write_text(text + BROKEN_LINE + "\n", encoding="utf-8", newline="")
+        session.edit_source(EXTENSION_SOURCE, text + BROKEN_LINE + "\n")
         print(f"  [OK] injected a type error at {EXTENSION_SOURCE.name}:{broken_line_number}")
 
-        begin = len(read_log())
-        wait_token(
-            process,
-            rf"\[editor\] problems updated\s+module=\"?{EXTENSION_NAME}\"?\s+count=[1-9]",
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(PROBLEMS_UPDATED_TOKEN)
+            + rf'\s+module="?{re.escape(EXTENSION_NAME)}"?\s+count=[1-9]',
             300,
             "failed reload reported as problems",
             begin,
         )
-        wait_token(
-            process,
-            r"\[editor\] problem\s+[^\n]*file=\"[^\"]*pill_dummy_color\.rs\"",
+        session.wait(
+            re.escape(PROBLEM_ROW_TOKEN) + r'\s+[^\n]*file="[^"]*pill_dummy_color\.rs"',
             60,
             "problem carries its file",
             begin,
         )
         match = re.search(
-            r'\[editor\] problem\s+module="?([^"\s]+)"?\s+level="?(\w+)"?\s+'
+            re.escape(PROBLEM_ROW_TOKEN)
+            + r'\s+module="?([^"\s]+)"?\s+level="?(\w+)"?\s+'
             r'file="([^"]*)"\s+line=(\d+)\s+text="(.*)"\s*$',
-            read_log()[begin:],
+            session.read_log()[begin:],
             re.MULTILINE,
         )
         assert match, "the parsed problem line did not carry module/level/file/line/message"
@@ -218,44 +183,45 @@ def main() -> int:
         assert file_seen.endswith("pill_dummy_color.rs"), file_seen
         print(f"  [OK] problem {module_seen}:{file_seen}:{line_seen} {level_seen}")
 
-        wait_token(
-            process,
-            r"\[editor\] toast shown\s+[^\n]*text=\"[^\"]*reload failed",
+        session.wait(
+            re.escape(TOAST_SHOWN_TOKEN) + r'\s+[^\n]*text="[^"]*reload failed',
             60,
             "failure toast reached the shell",
             begin,
         )
-        wait_token(
-            process,
-            r"\[editor\] problems panel updated\s+[^\n]*count=[1-9]",
+        session.wait(
+            re.escape(PROBLEMS_PANEL_TOKEN) + r"\s+[^\n]*count=[1-9]",
             60,
             "the Problems panel took the revision",
             begin,
         )
         # The failed generation must keep running: the editor is still alive
         # and still drawing frames.
-        assert process.poll() is None, "the editor exited on a failed reload"
+        assert session.process.poll() is None, "the editor exited on a failed reload"
 
         # Step 2: the Problems tab, then the row's click. The click asks the
         # executable to open the file at the error's line; the recorder proves
         # what arrived.
-        begin = len(read_log())
-        append("tab Problems")
-        wait_token(
-            process, r'tab selected\s+title="?Problems', 30, "Problems tab selected", begin
+        begin = len(session.read_log())
+        session.send("tab Problems")
+        session.wait(
+            re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Problems',
+            30,
+            "Problems tab selected",
+            begin,
         )
-        begin = len(read_log())
-        append("activate problems.open.0")
-        wait_token(
-            process,
-            rf'\[editor\] problems row activated\s+file="[^"]*pill_dummy_color\.rs"\s+line={broken_line_number}',
+        begin = len(session.read_log())
+        session.send("activate problems.open.0")
+        session.wait(
+            re.escape(PROBLEMS_ROW_ACTIVATED_TOKEN)
+            + rf'\s+file="[^"]*pill_dummy_color\.rs"\s+line={broken_line_number}',
             60,
             "the row's click asked to open the file",
             begin,
         )
-        wait_token(
-            process,
-            rf'\[editor\] open file\s+file="[^"]*pill_dummy_color\.rs"\s+line={broken_line_number}',
+        session.wait(
+            re.escape(OPEN_FILE_TOKEN)
+            + rf'\s+file="[^"]*pill_dummy_color\.rs"\s+line={broken_line_number}',
             60,
             "the executable handed the file to the configured command",
             begin,
@@ -263,8 +229,8 @@ def main() -> int:
         deadline = time.monotonic() + 30
         recorded = ""
         while time.monotonic() < deadline:
-            if OPEN_RECORD.is_file():
-                recorded = OPEN_RECORD.read_text(encoding="utf-8", errors="replace")
+            if open_record.is_file():
+                recorded = open_record.read_text(encoding="utf-8", errors="replace")
                 if "pill_dummy_color.rs" in recorded:
                     break
             time.sleep(0.5)
@@ -284,29 +250,27 @@ def main() -> int:
         print(f"  [OK] open recorder saw {recorded.strip()}")
 
         # Step 3: fix the source; the reload succeeds and the panel clears.
-        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8", newline="")
-        begin = len(read_log())
-        wait_token(
-            process, r"extension hot reload complete", 300, "the fixed extension reloaded", begin
+        session.edit_source(EXTENSION_SOURCE, original_source)
+        begin = len(session.read_log())
+        session.wait_token(
+            EXTENSION_RELOADED_TOKEN, 300, "the fixed extension reloaded", begin
         )
-        wait_token(
-            process,
-            rf"\[editor\] problems updated\s+module=\"?{EXTENSION_NAME}\"?\s+count=0",
+        session.wait(
+            re.escape(PROBLEMS_UPDATED_TOKEN)
+            + rf'\s+module="?{re.escape(EXTENSION_NAME)}"?\s+count=0',
             60,
             "the problem list for the module cleared",
             begin,
         )
-        wait_token(
-            process,
-            r'\[editor\] toast shown\s+[^\n]*text="[^"]*reloaded in \d+ ms',
+        session.wait(
+            re.escape(TOAST_SHOWN_TOKEN) + r'\s+[^\n]*text="[^"]*reloaded in \d+ ms',
             60,
             "the reload toast carries its build time",
             begin,
         )
         # And the panel's revision moved for the clearing too.
-        wait_token(
-            process,
-            r"\[editor\] problems panel updated\s+[^\n]*count=0",
+        session.wait(
+            re.escape(PROBLEMS_PANEL_TOKEN) + r"\s+[^\n]*count=0",
             60,
             "the Problems panel saw the clear",
             begin,
@@ -315,81 +279,67 @@ def main() -> int:
         # Step 4: a patched body that panics every frame is rolled back
         # automatically, reported, and the editor keeps running on the
         # previous code (D22/D33).
-        begin = len(read_log())
+        begin = len(session.read_log())
         assert SHELL_BODY_ANCHOR in original_shell, "the shell body anchor moved"
-        SHELL_SOURCE.write_text(
+        session.edit_source(
+            SHELL_SOURCE,
             original_shell.replace(
                 SHELL_BODY_ANCHOR, SHELL_PANIC_LINE + "\n" + SHELL_BODY_ANCHOR, 1
             ),
-            encoding="utf-8",
-            newline="",
         )
-        wait_token(
-            process,
-            r"\[hot\] \S*editor_shell_update\S* LIVE",
+        session.wait(
+            re.escape(HOT_PREFIX_TOKEN) + r"\S*editor_shell_update\S* LIVE",
             300,
             "the panicking shell body patched in",
             begin,
         )
-        wait_token(
-            process,
+        # Kept inline on purpose: the line embeds the injected panic message,
+        # so no stable token can pin it.
+        session.wait(
             r'frame error: system "?editor_shell"? failed: panicked: reload feedback rollback probe',
             120,
             "the panic is contained and reported once",
             begin,
         )
-        wait_token(
-            process,
-            r"patch rolled back automatically after repeated panics",
-            120,
-            "the host rolled the panicking patch back",
-            begin,
-        )
-        rolled_back = wait_token(
-            process,
-            r'\[editor\] toast shown\s+[^\n]*text="[^"]*rolled back to generation 0 after repeated panics',
+        session.wait_token(ROLLBACK_TOKEN, 120, "the host rolled the panicking patch back", begin)
+        rolled_back = session.wait(
+            re.escape(TOAST_SHOWN_TOKEN)
+            + r'\s+[^\n]*text="[^"]*rolled back to generation 0 after repeated panics',
             120,
             "the rollback toast reached the shell",
             begin,
         )
-        wait_token(
-            process,
-            r'\[editor\] problems updated\s+module="[^"]*editor_shell_update"\s+count=1',
+        session.wait(
+            re.escape(PROBLEMS_UPDATED_TOKEN)
+            + r'\s+module="[^"]*editor_shell_update"\s+count=1',
             60,
             "the rollback is a Problems row",
             begin,
         )
         # Frames keep arriving after that point: the editor survived on the
         # previous code.
-        wait_token(process, r"\[editor\] shell frame", 60, "frames continue after the rollback", rolled_back)
+        session.wait_token(
+            SHELL_FRAME_TOKEN, 60, "frames continue after the rollback", rolled_back
+        )
 
         # Step 5: restoring the body is a new edit, so a new patch applies (the
         # rollback suppressed only the rejected one).
-        begin = len(read_log())
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
-        wait_token(
-            process,
-            r"\[hot\] \S*editor_shell_update\S* LIVE",
+        begin = len(session.read_log())
+        session.edit_source(SHELL_SOURCE, original_shell)
+        session.wait(
+            re.escape(HOT_PREFIX_TOKEN) + r"\S*editor_shell_update\S* LIVE",
             300,
             "the restored shell body patched in",
             begin,
         )
 
         # Step 6: a clean exit.
-        begin = len(read_log())
-        append("quit")
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and process.poll() is None:
-            time.sleep(0.5)
-        assert process.poll() == 0, f"the editor exited {process.poll()}"
+        status = session.quit_and_wait(timeout=60)
+        assert status == 0, f"the editor exited {status}"
         print("  [OK] the editor exited cleanly")
         return 0
     finally:
-        EXTENSION_SOURCE.write_text(original_source, encoding="utf-8", newline="")
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=30)
+        session.close()
 
 
 if __name__ == "__main__":

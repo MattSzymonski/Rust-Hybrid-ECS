@@ -32,7 +32,8 @@ DESCRIPTION
     8. the editor exits cleanly.
 
   Everything is asserted on the editor's log tokens; the edited sources are
-  restored in a `finally`. The suite runs under its own LOCALAPPDATA sandbox.
+  restored when the session closes. The suite runs under its own LOCALAPPDATA
+  sandbox, and its run lands in `local/editor-validation/builtin-panels-<run id>/`.
 
 USAGE
   python devops/tests/test_editor_builtin_panels.py
@@ -45,24 +46,64 @@ EXAMPLE USAGE
 
 import base64
 import json
-import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-MODULES = ROOT / "modules"
-BINARY = MODULES / "target" / "debug" / "pill_editor_native.exe"
-VALIDATION = ROOT / "local" / "editor-validation"
-LOG = VALIDATION / "editor-builtin-panels.log"
-COMMANDS = VALIDATION / "commands-builtin-panels.txt"
-APPDATA = VALIDATION / "builtin_panels_appdata"
-PREFERENCES = APPDATA / "RustHybridEcs" / "preferences.json"
+DEVOPS_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(DEVOPS_ROOT))
+
+from core.editor_session import (  # noqa: E402
+    EditorSession,
+    EDITOR_COMMAND_EXECUTED_TOKEN,
+    EDITOR_COMMAND_REGISTRY_TOKEN,
+    EDITOR_HISTORY_PUSH_TOKEN,
+    EDITOR_HISTORY_REDO_TOKEN,
+    EDITOR_HISTORY_UNDO_TOKEN,
+    EDITOR_PANEL_REGISTRY_TOKEN,
+    EDITOR_SHELL_LOADED_TOKEN,
+    EDITOR_TAB_SELECTED_TOKEN,
+    EDITOR_WINDOW_CREATED_TOKEN,
+)
+from core.paths import MODULES_ROOT, REPOSITORY_ROOT  # noqa: E402
+
+# Suite tokens: the stable halves of the lines this suite asserts on, so
+# `test_log_contract.py` checks each against the Rust sources.
+SHELL_FRAME_REPORT_TOKEN = "scene frame report"
+WIDGET_ACTIVATED_TOKEN = "widget activated"
+WINDOW_WIDGET_ACTIVATED_TOKEN = "window widget activated"
+WIDGET_WHEELED_TOKEN = "widget wheeled"
+WIDGET_NOT_FOUND_TOKEN = "widget not found"
+SELECTION_CHANGED_TOKEN = "selection changed"
+ENTITY_LIST_TOKEN = "[test] entity"
+COMPONENT_LIST_TOKEN = "[test] component"
+FIELD_VALUE_TOKEN = "[test] field"
+STANDALONE_TYPE_TOKEN = "[test] standalone type"
+RESEEDED_TOKEN = "[spline_editor] reseeded"
+CONSOLE_STATE_TOKEN = "console state"
+CONSOLE_FILTER_LEVEL_TOKEN = "console filter level"
+CONSOLE_FILTER_CHANNEL_TOKEN = "console filter channel"
+CONSOLE_SEARCH_TOKEN = "console search"
+PREFERENCES_WRITTEN_TOKEN = "preferences written"
+PREFERENCES_APPLIED_TOKEN = "preferences applied"
+ASSET_LISTING_TOKEN = "asset listing refreshed"
+ASSETS_REFRESH_TOKEN = "test assets refresh"
+ASSET_SELECTED_TOKEN = "asset selected"
+ASSET_CREATE_QUEUED_TOKEN = "asset create queued"
+ASSET_RENAME_QUEUED_TOKEN = "asset rename queued"
+ASSET_DELETE_QUEUED_TOKEN = "asset delete queued"
+ASSET_META_QUEUED_TOKEN = "asset meta queued"
+TEST_WINDOW_TYPE_TOKEN = "test window type"
+MODAL_ANSWERED_TOKEN = "modal answered"
+WINDOW_OPENED_TOKEN = "window opened"
+WINDOW_PANEL_BUILT_TOKEN = "window panel built"
+EXTENSION_RELOAD_TOKEN = "extension reload processed"
+LIVE_TOKEN = "LIVE "
+QUIT_REQUESTED_TOKEN = "[editor] test channel: quit requested"
+
 SHELL_SOURCE = (
-    MODULES
+    MODULES_ROOT
     / "extensions"
     / "pill_editor_shell"
     / "pill_editor_shell_editor"
@@ -70,7 +111,7 @@ SHELL_SOURCE = (
     / "shell.rs"
 )
 HOTROOT_SOURCE = (
-    MODULES
+    MODULES_ROOT
     / "extensions"
     / "pill_editor_shell"
     / "pill_editor_shell_editor"
@@ -79,88 +120,22 @@ HOTROOT_SOURCE = (
 )
 
 
-def read_log() -> str:
-    """The editor log so far, tolerant of a file the writer holds open."""
-    try:
-        return LOG.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def wait_token(
-    process: subprocess.Popen, pattern: str, timeout: float, label: str, start: int = 0
-) -> int:
-    """Wait for `pattern` after byte offset `start`; returns the new length."""
-    deadline = time.monotonic() + timeout
-    expression = re.compile(pattern)
-    while time.monotonic() < deadline:
-        text = read_log()
-        if expression.search(text[start:]):
-            print(f"  [OK] {label}")
-            return len(text)
-        if process.poll() is not None:
-            raise RuntimeError(
-                f"{label}: the editor exited {process.returncode}\n" + text[-4000:]
-            )
-        time.sleep(0.5)
-    raise TimeoutError(f"{label}: timeout waiting for {pattern}\n" + read_log()[-4000:])
-
-
-def find_in_log(pattern: str, start: int = 0) -> re.Match:
-    """The first match of `pattern` in the log from `start`, now."""
-    match = re.compile(pattern).search(read_log()[start:])
-    if not match:
-        raise RuntimeError(f"no match for {pattern}\n" + read_log()[-3000:])
-    return match
-
-
-def append(line: str) -> None:
-    """Appends one scripted command, flushed, so the editor sees it whole."""
-    with COMMANDS.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
-
-
 def main() -> int:
-    if os.name != "nt":
+    if not EditorSession.supported():
         print("SKIP: the native editor suites need Windows")
         return 0
-    if not BINARY.is_file():
-        raise SystemExit(
-            f"editor binary not found at {BINARY}; build it with "
-            "`cargo build -p pill_editor_native` in modules/ first"
-        )
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "pill_editor_native.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    VALIDATION.mkdir(parents=True, exist_ok=True)
-    shutil.rmtree(APPDATA, ignore_errors=True)
-    original_shell = SHELL_SOURCE.read_text(encoding="utf-8")
-    original_hotroot = HOTROOT_SOURCE.read_text(encoding="utf-8")
-    COMMANDS.write_text("# built-in panels suite\n", encoding="utf-8")
-    environment = dict(os.environ)
-    environment["PROJECT_PATH"] = "../examples/project_rs"
-    environment["PILL_EDITOR_TEST_COMMANDS"] = str(COMMANDS)
-    environment["PILL_EDITOR_TEST_SECONDS"] = "1200"
-    environment["LOCALAPPDATA"] = str(APPDATA)
-    log = LOG.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        [str(BINARY)],
-        cwd=str(MODULES),
-        env=environment,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    log.close()
+    session = EditorSession("builtin-panels", test_seconds=1200)
+    with SHELL_SOURCE.open("r", encoding="utf-8", newline="") as file:
+        original_shell = file.read()
+    with HOTROOT_SOURCE.open("r", encoding="utf-8", newline="") as file:
+        original_hotroot = file.read()
     # The Assets step stages its own files: project_rs's res/
     # tree may not exist yet, so it is made here and removed in the end when
     # this step left it empty. The probe is a real 1x1 PNG - the import
     # decodes it, so its sidecar behaves the way a sourced file's does - and
     # emptying that sidecar later is what the Write Asset Meta button
     # answers to.
-    res_directory = ROOT / "examples" / "project_rs" / "res"
+    res_directory = REPOSITORY_ROOT / "examples" / "project_rs" / "res"
     probe_source = res_directory / "w25_probe_source.png"
     probe_meta = res_directory / "w25_probe_source.png.meta"
     res_directory.mkdir(parents=True, exist_ok=True)
@@ -170,22 +145,26 @@ def main() -> int:
         )
     )
     staged: list[Path] = [probe_source, probe_meta]
+    session.start()
     try:
         # Startup lines land within one poll interval of each other, so these
         # waits search the whole log.
-        wait_token(process, r"\[editor\] pill_editor_shell_editor loaded", 300, "shell loaded")
-        wait_token(process, r"\[editor\] window created", 300, "editor started")
-        wait_token(process, r"\[editor\] command registry ready", 120, "registry ready")
-        wait_token(process, r"\[editor\] panel registry ready\s+panels=\d+", 120, "panels ready")
+        session.wait_token(EDITOR_SHELL_LOADED_TOKEN, 300, "shell loaded")
+        session.wait_token(EDITOR_WINDOW_CREATED_TOKEN, 300, "editor started")
+        session.wait_token(EDITOR_COMMAND_REGISTRY_TOKEN, 120, "registry ready")
+        session.wait(
+            re.escape(EDITOR_PANEL_REGISTRY_TOKEN) + r"\s+panels=\d+",
+            120,
+            "panels ready",
+        )
 
         # The project rewrites component fields every tick, so every value
         # proof pauses the engine first (the shell still runs when paused);
         # the console phase resumes it because module systems must tick.
-        begin = len(read_log())
-        append("command editor.pause_toggle")
-        wait_token(
-            process,
-            r'command executed\s+id="?editor\.pause_toggle"?',
+        begin = len(session.read_log())
+        session.send("command editor.pause_toggle")
+        session.wait(
+            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
             30,
             "engine paused",
             begin,
@@ -195,10 +174,12 @@ def main() -> int:
         # entity. The Inspector clips to its dock (a scroll area), so the
         # suite asks for widgets until one answers, and it needs a field
         # whose dump carries a plain F/I/U value to edit.
-        begin = len(read_log())
-        append("dump components")
-        wait_token(process, r"\[test\] component\s+name=", 60, "components dumped", begin)
-        block = read_log()[begin:]
+        begin = len(session.read_log())
+        session.send("dump components")
+        session.wait(
+            re.escape(COMPONENT_LIST_TOKEN) + r'\s+name=', 60, "components dumped", begin
+        )
+        block = session.read_log()[begin:]
         catalog: dict = {}
         for match in re.finditer(
             r'\[test\] component\s+name=("?)([^\s"]+)\1\s+fields=("?)([^"\n]*)\3', block
@@ -208,18 +189,19 @@ def main() -> int:
             ]
         print(f"  [OK] {len(catalog)} components catalogued")
 
-        begin = len(read_log())
-        append("dump entities")
-        wait_token(
-            process,
-            r'\[test\] entity\s+entity=\S+[^\n]*PhysicsState',
+        begin = len(session.read_log())
+        session.send("dump entities")
+        session.wait(
+            re.escape(ENTITY_LIST_TOKEN) + r"\s+entity=\S+[^\n]*PhysicsState",
             60,
             "entity discovered",
             begin,
         )
         entity = None
         line_text = ""
-        for match in re.finditer(r'\[test\] entity\s+entity=(\S+)[^\n]*', read_log()[begin:]):
+        for match in re.finditer(
+            re.escape(ENTITY_LIST_TOKEN) + r"\s+entity=(\S+)[^\n]*", session.read_log()[begin:]
+        ):
             if "PhysicsState" in match.group(0):
                 entity = match.group(1)
                 line_text = match.group(0)
@@ -242,40 +224,54 @@ def main() -> int:
 
         # The Inspector shows the selection, so select first (and switch its
         # tab) before probing which field widgets answer.
-        begin = len(read_log())
-        append(f"select {entity}")
-        wait_token(process, rf"selection changed.*entity={re.escape(entity)}", 30, "selected", begin)
+        begin = len(session.read_log())
+        session.send(f"select {entity}")
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + rf".*entity={re.escape(entity)}",
+            30,
+            "selected",
+            begin,
+        )
 
-        begin = len(read_log())
-        append("tab Inspector")
-        wait_token(process, r'tab selected\s+title="?Inspector"?', 30, "Inspector tab", begin)
+        begin = len(session.read_log())
+        session.send("tab Inspector")
+        session.wait(
+            re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Inspector"?',
+            30,
+            "Inspector tab",
+            begin,
+        )
 
         chosen = None
         for candidate_component, candidate_field in candidates:
-            begin = len(read_log())
-            append(f"activate inspector.{entity}.{candidate_component}.{candidate_field}")
+            begin = len(session.read_log())
+            session.send(
+                f"activate inspector.{entity}.{candidate_component}.{candidate_field}"
+            )
             activated = False
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
-                text = read_log()[begin:]
-                if "widget not found" in text:
+                text = session.read_log()[begin:]
+                if WIDGET_NOT_FOUND_TOKEN in text:
                     break
-                if re.search(r"widget activated\s+name=\"?inspector\.", text):
+                if re.search(
+                    re.escape(WIDGET_ACTIVATED_TOKEN) + r'\s+name="?inspector\.', text
+                ):
                     activated = True
                     break
                 time.sleep(0.5)
             if not activated:
                 continue
-            probe = len(read_log())
-            append(
+            probe = len(session.read_log())
+            session.send(
                 f"dump field {entity} {candidate_component.rsplit('::', 1)[-1]} "
                 f"{candidate_field}"
             )
             try:
-                wait_token(process, r"value=[A-Za-z0-9]+\(", 20, "", probe)
+                session.wait(r"value=[A-Za-z0-9]+\(", 20, "", probe)
             except TimeoutError:
                 continue
-            value = find_in_log(r"value=([A-Za-z0-9]+)\(([^)]+)\)", probe)
+            value = session.find(r"value=([A-Za-z0-9]+)\(([^)]+)\)", probe)
             kind, original = value.group(1), value.group(2)
             if kind[0] in "FIU":
                 short = candidate_component.rsplit("::", 1)[-1]
@@ -284,7 +280,8 @@ def main() -> int:
                 break
         if chosen is None:
             raise RuntimeError(
-                "no visible, value-editable Inspector field answered\n" + read_log()[-3000:]
+                "no visible, value-editable Inspector field answered\n"
+                + session.read_log()[-3000:]
             )
         component, field, short, kind, original = chosen
         if kind.startswith("F"):
@@ -301,63 +298,67 @@ def main() -> int:
         dump_field = f"dump field {entity} {short} {field}"
 
         widget = f"inspector.{entity}.{component}.{field}"
-        begin = len(read_log())
-        append(f"activate {widget}")
-        wait_token(process, rf"widget activated\s+name=\"?{re.escape(widget)}\"?", 30, "field focused", begin)
+        begin = len(session.read_log())
+        session.send(f"activate {widget}")
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + rf'\s+name="?{re.escape(widget)}"?',
+            30,
+            "field focused",
+            begin,
+        )
 
-        append("chord ctrl+a")
-        begin = len(read_log())
-        append(f"type {edited}")
-        wait_token(
-            process,
-            rf'history push\s+label="{re.escape(label)}"',
+        session.send("chord ctrl+a")
+        begin = len(session.read_log())
+        session.send(f"type {edited}")
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + rf'\s+label="{re.escape(label)}"',
             60,
             "inspector edit recorded",
             begin,
         )
-        begin = len(read_log())
-        append(dump_field)
-        wait_token(process, rf"value={kind}\({re.escape(edited)}\)", 30, "edit applied", begin)
+        begin = len(session.read_log())
+        session.send(dump_field)
+        session.wait(
+            rf"value={kind}\({re.escape(edited)}\)", 30, "edit applied", begin
+        )
 
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(
-            process,
-            rf'history undo\s+label="{re.escape(label)}"',
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN) + rf'\s+label="{re.escape(label)}"',
             30,
             "inspector edit undone",
             begin,
         )
-        begin = len(read_log())
-        append(dump_field)
-        wait_token(process, rf"value={kind}\({re.escape(original)}\)", 30, "value restored", begin)
+        begin = len(session.read_log())
+        session.send(dump_field)
+        session.wait(
+            rf"value={kind}\({re.escape(original)}\)", 30, "value restored", begin
+        )
 
         # Step 2: a system toggle is one undoable step, and undo restores it.
-        begin = len(read_log())
-        append("edit system 0 off")
-        wait_token(
-            process,
-            r'history push\s+label="system 0 off"',
+        begin = len(session.read_log())
+        session.send("edit system 0 off")
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + r'\s+label="system 0 off"',
             30,
             "system toggle recorded",
             begin,
         )
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(
-            process,
-            r'history undo\s+label="system 0 off"',
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN) + r'\s+label="system 0 off"',
             30,
             "system toggle undone",
             begin,
         )
 
         # Resume so module systems tick again for the console phase.
-        begin = len(read_log())
-        append("command editor.pause_toggle")
-        wait_token(
-            process,
-            r'command executed\s+id="?editor\.pause_toggle"?',
+        begin = len(session.read_log())
+        session.send("command editor.pause_toggle")
+        session.wait(
+            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
             30,
             "engine resumed",
             begin,
@@ -366,87 +367,120 @@ def main() -> int:
         # Step 3: the Console. A module command makes a game-channel line;
         # the heartbeat reports both channels; the filter buttons and the
         # search field respond through their named widgets.
-        begin = len(read_log())
-        append("command spline_editor.reseed")
-        wait_token(process, r"\[spline_editor\] reseeded", 60, "game channel line", begin)
+        begin = len(session.read_log())
+        session.send("command spline_editor.reseed")
+        session.wait_token(RESEEDED_TOKEN, 60, "game channel line", begin)
 
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             heartbeats = re.findall(
-                r"console state\s+lines=(\d+)\s+engine=(\d+)\s+game=(\d+)", read_log()
+                re.escape(CONSOLE_STATE_TOKEN)
+                + r"\s+lines=(\d+)\s+engine=(\d+)\s+game=(\d+)",
+                session.read_log(),
             )
             if any(int(engine) >= 1 and int(game) >= 1 for _, engine, game in heartbeats):
                 print(f"  [OK] console heartbeat with both channels: {heartbeats[-1]}")
                 break
             time.sleep(0.5)
         else:
-            raise TimeoutError("no console heartbeat carried both channels\n" + read_log()[-3000:])
+            raise TimeoutError(
+                "no console heartbeat carried both channels\n" + session.read_log()[-3000:]
+            )
 
-        begin = len(read_log())
-        append("activate Errors")
-        wait_token(process, r"console filter level\s+level=5", 30, "level filter: errors", begin)
-        begin = len(read_log())
-        append("activate Game")
-        wait_token(process, r"console filter channel\s+channel=2", 30, "channel filter: game", begin)
-        begin = len(read_log())
-        append("activate Info+")
-        wait_token(process, r"console filter level\s+level=3", 30, "level filter: info", begin)
-        begin = len(read_log())
-        append("activate All channels")
-        wait_token(process, r"console filter channel\s+channel=0", 30, "channel filter: all", begin)
-        begin = len(read_log())
-        append("activate console_search_field")
-        wait_token(process, r"widget activated\s+name=\"?console_search_field\"?", 30, "search focused", begin)
-        begin = len(read_log())
-        append("type reseed")
-        wait_token(process, r'console search\s+search="reseed"', 30, "search text applied", begin)
+        begin = len(session.read_log())
+        session.send("activate Errors")
+        session.wait(
+            re.escape(CONSOLE_FILTER_LEVEL_TOKEN) + r"\s+level=5",
+            30,
+            "level filter: errors",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("activate Game")
+        session.wait(
+            re.escape(CONSOLE_FILTER_CHANNEL_TOKEN) + r"\s+channel=2",
+            30,
+            "channel filter: game",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("activate Info+")
+        session.wait(
+            re.escape(CONSOLE_FILTER_LEVEL_TOKEN) + r"\s+level=3",
+            30,
+            "level filter: info",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("activate All channels")
+        session.wait(
+            re.escape(CONSOLE_FILTER_CHANNEL_TOKEN) + r"\s+channel=0",
+            30,
+            "channel filter: all",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("activate console_search_field")
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + r'\s+name="?console_search_field"?',
+            30,
+            "search focused",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("type reseed")
+        session.wait(
+            re.escape(CONSOLE_SEARCH_TOKEN) + r'\s+search="reseed"',
+            30,
+            "search text applied",
+            begin,
+        )
 
         # Step 4: preferences, both directions. The suite writes the file;
         # the shell applies it and sets the history limits. Then the panel's
         # fields write it back through the Save button.
-        PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
-        PREFERENCES.write_text(
-            json.dumps(
-                {
-                    "keymap_preset": "godot",
-                    "code_editor_command": "code",
-                    "autosave_interval_seconds": 7,
-                    "history_step_cap": 250,
-                    "history_memory_budget_mb": 128,
-                }
-            ),
-            encoding="utf-8",
+        preferences_path = session.write_appdata_json(
+            "preferences.json",
+            {
+                "keymap_preset": "godot",
+                "code_editor_command": "code",
+                "autosave_interval_seconds": 7,
+                "history_step_cap": 250,
+                "history_memory_budget_mb": 128,
+            },
         )
-        wait_token(
-            process,
-            r"preferences applied\s+step_cap=250\s+memory_mb=128",
+        session.wait(
+            re.escape(PREFERENCES_APPLIED_TOKEN) + r"\s+step_cap=250\s+memory_mb=128",
             60,
             "preferences file applied",
         )
 
-        begin = len(read_log())
-        append("tab Preferences")
-        wait_token(process, r'tab selected\s+title="?Preferences"?', 30, "Preferences tab", begin)
+        begin = len(session.read_log())
+        session.send("tab Preferences")
+        session.wait(
+            re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Preferences"?',
+            30,
+            "Preferences tab",
+            begin,
+        )
         # The panel clips to its dock: scroll from a field that is certainly
         # visible (the first row) so the step-cap row and the Save button
         # come into view, then use them.
-        begin = len(read_log())
-        append("activate preferences_field_preset")
-        wait_token(
-            process,
-            r"widget activated\s+name=\"?preferences_field_preset\"?",
+        begin = len(session.read_log())
+        session.send("activate preferences_field_preset")
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + r'\s+name="?preferences_field_preset"?',
             30,
             "first preferences row focused",
             begin,
         )
-        begin = len(read_log())
-        append("wheel -12")
-        wait_token(process, r"\[editor\] widget wheeled", 30, "panel scrolled", begin)
-        begin = len(read_log())
-        append("activate preferences_field_step_cap")
-        wait_token(
-            process,
-            r"widget activated\s+name=\"?preferences_field_step_cap\"?",
+        begin = len(session.read_log())
+        session.send("wheel -12")
+        session.wait_token(WIDGET_WHEELED_TOKEN, 30, "panel scrolled", begin)
+        begin = len(session.read_log())
+        session.send("activate preferences_field_step_cap")
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + r'\s+name="?preferences_field_step_cap"?',
             30,
             "step cap field focused",
             begin,
@@ -454,22 +488,21 @@ def main() -> int:
         # The scripted channel drains several lines per frame, so key and
         # text commands are paced by a frame each: ctrl+a must settle before
         # the replacement text arrives, and both before the Save click.
-        append("chord ctrl+a")
-        begin = len(read_log())
-        wait_token(process, r"scene frame report", 30, "chord settled", begin)
-        append("type 300")
-        begin = len(read_log())
-        wait_token(process, r"scene frame report", 30, "typing settled", begin)
-        begin = len(read_log())
-        append("activate Save preferences")
-        wait_token(process, r"\[editor\] preferences written", 30, "preferences saved", begin)
-        wait_token(
-            process,
-            r"preferences applied\s+step_cap=300",
+        session.send("chord ctrl+a")
+        begin = len(session.read_log())
+        session.wait_token(SHELL_FRAME_REPORT_TOKEN, 30, "chord settled", begin)
+        session.send("type 300")
+        begin = len(session.read_log())
+        session.wait_token(SHELL_FRAME_REPORT_TOKEN, 30, "typing settled", begin)
+        begin = len(session.read_log())
+        session.send("activate Save preferences")
+        session.wait_token(PREFERENCES_WRITTEN_TOKEN, 30, "preferences saved", begin)
+        session.wait(
+            re.escape(PREFERENCES_APPLIED_TOKEN) + r"\s+step_cap=300",
             60,
             "panel-written preferences applied",
         )
-        saved = json.loads(PREFERENCES.read_text(encoding="utf-8"))
+        saved = json.loads(preferences_path.read_text(encoding="utf-8"))
         assert saved.get("history_step_cap") == 300, f"file carries {saved}"
         assert saved.get("keymap_preset") == "godot", f"file carries {saved}"
         print(f"  [OK] preferences file round-trip: {saved}")
@@ -479,8 +512,10 @@ def main() -> int:
         # project_rs keeps its sources under the asset system's `assets/`
         # instead, so the listing is empty here and the refresh token is the
         # assertion.
-        wait_token(
-            process, r"asset listing refreshed\s+count=\d+", 120, "asset listing refreshed"
+        session.wait(
+            re.escape(ASSET_LISTING_TOKEN) + r"\s+count=\d+",
+            120,
+            "asset listing refreshed",
         )
 
         # Step 6: the shell live-patches on a body edit, and a structural
@@ -489,7 +524,9 @@ def main() -> int:
         # it doubles as the frame clock here.
         before_counts = [
             int(entry)
-            for entry in re.findall(r"console state\s+lines=(\d+)", read_log())
+            for entry in re.findall(
+                re.escape(CONSOLE_STATE_TOKEN) + r"\s+lines=(\d+)", session.read_log()
+            )
         ]
         assert before_counts, "no console heartbeat before the reload"
         lines_before = before_counts[-1]
@@ -498,19 +535,22 @@ def main() -> int:
         patched = original_hotroot.replace(
             cadence.group(0), f"% {int(cadence.group(1)) + 2} == 0", 1
         )
-        begin = len(read_log())
-        HOTROOT_SOURCE.write_text(patched, encoding="utf-8", newline="")
-        wait_token(process, r"LIVE \d+ ms|extension reload processed", 180, "shell body live-patched", begin)
-
-        begin = len(read_log())
-        SHELL_SOURCE.write_text(
-            original_shell + "\n// built-in panels suite: structural reload marker\n",
-            encoding="utf-8",
-            newline="",
+        begin = len(session.read_log())
+        session.edit_source(HOTROOT_SOURCE, patched)
+        session.wait(
+            re.escape(LIVE_TOKEN) + r"\d+ ms|" + re.escape(EXTENSION_RELOAD_TOKEN),
+            180,
+            "shell body live-patched",
+            begin,
         )
-        wait_token(
-            process,
-            r'extension reload processed\s+module="?pill_editor_shell_editor"?',
+
+        begin = len(session.read_log())
+        session.edit_source(
+            SHELL_SOURCE, original_shell + "\n// built-in panels suite: structural reload marker\n"
+        )
+        session.wait(
+            re.escape(EXTENSION_RELOAD_TOKEN)
+            + r'\s+module="?pill_editor_shell_editor"?',
             180,
             "shell crate reloaded",
             begin,
@@ -523,7 +563,9 @@ def main() -> int:
         while time.monotonic() < deadline:
             counts = [
                 int(entry)
-                for entry in re.findall(r"console state\s+lines=(\d+)", read_log())
+                for entry in re.findall(
+                    re.escape(CONSOLE_STATE_TOKEN) + r"\s+lines=(\d+)", session.read_log()
+                )
             ]
             if counts and counts[-1] > lines_before:
                 print(f"  [OK] console grew past {lines_before} after reload: {counts[-1]}")
@@ -532,43 +574,39 @@ def main() -> int:
         else:
             raise TimeoutError(
                 f"no console heartbeat grew past {lines_before} after the reload\n"
-                + read_log()[-3000:]
+                + session.read_log()[-3000:]
             )
 
         # Editing without re-selecting proves the shared selection survived.
         # Pause first: the project rewrites fields every tick while running.
-        begin = len(read_log())
-        append("command editor.pause_toggle")
-        wait_token(
-            process,
-            r'command executed\s+id="?editor\.pause_toggle"?',
+        begin = len(session.read_log())
+        session.send("command editor.pause_toggle")
+        session.wait(
+            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
             30,
             "engine paused for the reload edit",
             begin,
         )
-        begin = len(read_log())
-        append(f"activate {widget}")
-        wait_token(
-            process,
-            rf"widget activated\s+name=\"?{re.escape(widget)}\"?",
+        begin = len(session.read_log())
+        session.send(f"activate {widget}")
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + rf'\s+name="?{re.escape(widget)}"?',
             30,
             "selection survived the reload",
             begin,
         )
-        append("chord ctrl+a")
-        begin = len(read_log())
-        append(f"type {after_reload}")
-        wait_token(
-            process,
-            rf'history push\s+label="{re.escape(label)}"',
+        session.send("chord ctrl+a")
+        begin = len(session.read_log())
+        session.send(f"type {after_reload}")
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + rf'\s+label="{re.escape(label)}"',
             60,
             "post-reload edit recorded",
             begin,
         )
-        begin = len(read_log())
-        append(dump_field)
-        wait_token(
-            process,
+        begin = len(session.read_log())
+        session.send(dump_field)
+        session.wait(
             rf"value={kind}\({re.escape(after_reload)}\)",
             30,
             "post-reload edit applied",
@@ -581,15 +619,22 @@ def main() -> int:
         # toolbar's other buttons act on, and every queued command is
         # recorded and walks back through undo. The probe png the meta
         # button answers to was staged before the run.
-        begin = len(read_log())
-        append("tab Assets")
-        wait_token(process, r'tab selected\s+title="?Assets"?', 30, "Assets tab", begin)
-        begin = len(read_log())
-        append("dump standalone-types")
-        wait_token(process, r"\[test\] standalone type\s", 30, "standalone types dumped", begin)
-        found = find_in_log(
-            r'\[test\] standalone type\s+type_name="([^"]+)"\s+display="([^"]+)"'
-            r'\s+extension="([^"]+)"',
+        begin = len(session.read_log())
+        session.send("tab Assets")
+        session.wait(
+            re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Assets"?',
+            30,
+            "Assets tab",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump standalone-types")
+        session.wait(
+            re.escape(STANDALONE_TYPE_TOKEN) + r"\s", 30, "standalone types dumped", begin
+        )
+        found = session.find(
+            re.escape(STANDALONE_TYPE_TOKEN)
+            + r'\s+type_name="([^"]+)"\s+display="([^"]+)"\s+extension="([^"]+)"',
             begin,
         )
         type_name, display, extension = found.groups()
@@ -598,43 +643,55 @@ def main() -> int:
 
         # Create through the dialog: open it from the toolbar, pick the first
         # type row, type a name into the field, press Create.
-        begin = len(read_log())
-        append("activate Create Asset...")
-        wait_token(
-            process, r'window opened\s+id="?create_asset_dialog"?', 60, "create dialog opened", begin
+        begin = len(session.read_log())
+        session.send("activate Create Asset...")
+        session.wait(
+            re.escape(WINDOW_OPENED_TOKEN) + r'\s+id="?create_asset_dialog"?',
+            60,
+            "create dialog opened",
+            begin,
         )
-        wait_token(
-            process, r'window panel built\s+id="?create_asset_dialog"?', 60, "create dialog built", begin
+        session.wait(
+            re.escape(WINDOW_PANEL_BUILT_TOKEN) + r'\s+id="?create_asset_dialog"?',
+            60,
+            "create dialog built",
+            begin,
         )
-        begin = len(read_log())
-        append("activate window.create_asset_dialog.create.type.0")
-        wait_token(
-            process,
-            r'window widget activated\s+name="?window\.create_asset_dialog\.create\.type\.0"?',
+        begin = len(session.read_log())
+        session.send("activate window.create_asset_dialog.create.type.0")
+        session.wait(
+            re.escape(WINDOW_WIDGET_ACTIVATED_TOKEN)
+            + r'\s+name="?window\.create_asset_dialog\.create\.type\.0"?',
             30,
             "type row chosen",
             begin,
         )
-        begin = len(read_log())
-        append("activate window.create_asset_dialog.create.name")
-        wait_token(
-            process,
-            r'window widget activated\s+name="?window\.create_asset_dialog\.create\.name"?',
+        begin = len(session.read_log())
+        session.send("activate window.create_asset_dialog.create.name")
+        session.wait(
+            re.escape(WINDOW_WIDGET_ACTIVATED_TOKEN)
+            + r'\s+name="?window\.create_asset_dialog\.create\.name"?',
             30,
             "name field focused",
             begin,
         )
-        begin = len(read_log())
-        append("window-type create_asset_dialog w25_panel")
-        wait_token(process, r"\[editor\] test window type", 30, "name typed", begin)
-        begin = len(read_log())
-        append("activate window.create_asset_dialog.button.0")
-        wait_token(process, r"\[editor\] asset create queued", 30, "create queued", begin)
-        wait_token(
-            process, r'history push\s+label="create asset w25_panel"', 30, "create recorded", begin
+        begin = len(session.read_log())
+        session.send("window-type create_asset_dialog w25_panel")
+        session.wait_token(TEST_WINDOW_TYPE_TOKEN, 30, "name typed", begin)
+        begin = len(session.read_log())
+        session.send("activate window.create_asset_dialog.button.0")
+        session.wait_token(ASSET_CREATE_QUEUED_TOKEN, 30, "create queued", begin)
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + r'\s+label="create asset w25_panel"',
+            30,
+            "create recorded",
+            begin,
         )
-        wait_token(
-            process, r'modal answered\s+id="?create_asset_dialog"?', 30, "create dialog answered", begin
+        session.wait(
+            re.escape(MODAL_ANSWERED_TOKEN) + r'\s+id="?create_asset_dialog"?',
+            30,
+            "create dialog answered",
+            begin,
         )
         assert (res_directory / created_name).is_file(), "the dialog created no file"
         staged.append(res_directory / created_name)
@@ -642,51 +699,64 @@ def main() -> int:
 
         # The creation undoes (the file goes) and redoes (it comes back),
         # and the listing picks the row up for the toolbar.
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(
-            process, r'history undo\s+label="create asset w25_panel"', 30, "create undone", begin
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN) + r'\s+label="create asset w25_panel"',
+            30,
+            "create undone",
+            begin,
         )
         assert not (res_directory / created_name).exists(), "the creation survived its undo"
-        begin = len(read_log())
-        append("command editor.redo")
-        wait_token(
-            process, r'history redo\s+label="create asset w25_panel"', 30, "create redone", begin
+        begin = len(session.read_log())
+        session.send("command editor.redo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_REDO_TOKEN) + r'\s+label="create asset w25_panel"',
+            30,
+            "create redone",
+            begin,
         )
         assert (res_directory / created_name).is_file(), "the redo restored no file"
-        wait_token(process, r"asset listing refreshed", 60, "listing sees the created file", begin)
+        session.wait_token(ASSET_LISTING_TOKEN, 60, "listing sees the created file", begin)
 
         # Rename through the dialog: the field arrives with the stem in it,
         # the typed suffix lands after it, and the queued paths are read back
         # rather than assumed.
-        begin = len(read_log())
-        append(f"select-asset {created_name}")
-        wait_token(process, r"\[editor\] asset selected", 30, "created row selected", begin)
-        begin = len(read_log())
-        append("activate Rename Asset...")
-        wait_token(
-            process, r'window opened\s+id="?rename_asset_dialog"?', 60, "rename dialog opened", begin
+        begin = len(session.read_log())
+        session.send(f"select-asset {created_name}")
+        session.wait_token(ASSET_SELECTED_TOKEN, 30, "created row selected", begin)
+        begin = len(session.read_log())
+        session.send("activate Rename Asset...")
+        session.wait(
+            re.escape(WINDOW_OPENED_TOKEN) + r'\s+id="?rename_asset_dialog"?',
+            60,
+            "rename dialog opened",
+            begin,
         )
-        wait_token(
-            process, r'window panel built\s+id="?rename_asset_dialog"?', 60, "rename dialog built", begin
+        session.wait(
+            re.escape(WINDOW_PANEL_BUILT_TOKEN) + r'\s+id="?rename_asset_dialog"?',
+            60,
+            "rename dialog built",
+            begin,
         )
-        begin = len(read_log())
-        append("activate window.rename_asset_dialog.rename.name")
-        wait_token(
-            process,
-            r'window widget activated\s+name="?window\.rename_asset_dialog\.rename\.name"?',
+        begin = len(session.read_log())
+        session.send("activate window.rename_asset_dialog.rename.name")
+        session.wait(
+            re.escape(WINDOW_WIDGET_ACTIVATED_TOKEN)
+            + r'\s+name="?window\.rename_asset_dialog\.rename\.name"?',
             30,
             "rename field focused",
             begin,
         )
-        begin = len(read_log())
-        append("window-type rename_asset_dialog 2")
-        wait_token(process, r"\[editor\] test window type", 30, "suffix typed", begin)
-        begin = len(read_log())
-        append("activate window.rename_asset_dialog.button.0")
-        wait_token(process, r"\[editor\] asset rename queued", 30, "rename queued", begin)
-        queued = find_in_log(
-            r'\[editor\] asset rename queued\s+from="?([^"\s]+)"?\s+to="?([^"\s]+)"?',
+        begin = len(session.read_log())
+        session.send("window-type rename_asset_dialog 2")
+        session.wait_token(TEST_WINDOW_TYPE_TOKEN, 30, "suffix typed", begin)
+        begin = len(session.read_log())
+        session.send("activate window.rename_asset_dialog.button.0")
+        session.wait_token(ASSET_RENAME_QUEUED_TOKEN, 30, "rename queued", begin)
+        queued = session.find(
+            re.escape(ASSET_RENAME_QUEUED_TOKEN)
+            + r'\s+from="?([^"\s]+)"?\s+to="?([^"\s]+)"?',
             begin,
         )
         renamed_from = queued.group(1)
@@ -694,37 +764,49 @@ def main() -> int:
         assert renamed_from == created_name, f"the rename read {renamed_from}"
         assert renamed_to != created_name, "the rename kept the old name"
         assert renamed_to.endswith(extension), f"the rename lost the extension: {renamed_to}"
-        wait_token(process, r'history push\s+label="rename asset ', 30, "rename recorded", begin)
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + r'\s+label="rename asset ', 30, "rename recorded", begin
+        )
         assert not (res_directory / renamed_from).exists(), "the old name survived the rename"
         assert (res_directory / renamed_to).is_file(), "the new name is missing"
         staged.append(res_directory / renamed_to)
         print(f"  [OK] renamed to {renamed_to} through the dialog")
 
         # Undo restores the old name; redo renames again.
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(process, r'history undo\s+label="rename asset ', 30, "rename undone", begin)
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN) + r'\s+label="rename asset ', 30, "rename undone", begin
+        )
         assert (res_directory / renamed_from).is_file(), "the undo did not restore the name"
         assert not (res_directory / renamed_to).exists(), "the new name survived the undo"
-        begin = len(read_log())
-        append("command editor.redo")
-        wait_token(process, r'history redo\s+label="rename asset ', 30, "rename redone", begin)
+        begin = len(session.read_log())
+        session.send("command editor.redo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_REDO_TOKEN) + r'\s+label="rename asset ', 30, "rename redone", begin
+        )
         assert (res_directory / renamed_to).is_file(), "the redo renamed nothing"
 
         # Delete through the toolbar; undo brings the bytes back.
-        begin = len(read_log())
-        append("activate Delete Asset")
-        wait_token(process, r"\[editor\] asset delete queued", 30, "delete queued", begin)
-        wait_token(process, r'history push\s+label="delete asset ', 30, "delete recorded", begin)
+        begin = len(session.read_log())
+        session.send("activate Delete Asset")
+        session.wait_token(ASSET_DELETE_QUEUED_TOKEN, 30, "delete queued", begin)
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN) + r'\s+label="delete asset ', 30, "delete recorded", begin
+        )
         assert not (res_directory / renamed_to).exists(), "the delete left the file"
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(process, r'history undo\s+label="delete asset ', 30, "delete undone", begin)
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN) + r'\s+label="delete asset ', 30, "delete undone", begin
+        )
         assert (res_directory / renamed_to).is_file(), "the undo restored no file"
         assert (res_directory / renamed_to).stat().st_size > 0, "the restored file is empty"
-        begin = len(read_log())
-        append("command editor.redo")
-        wait_token(process, r'history redo\s+label="delete asset ', 30, "delete redone", begin)
+        begin = len(session.read_log())
+        session.send("command editor.redo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_REDO_TOKEN) + r'\s+label="delete asset ', 30, "delete redone", begin
+        )
         assert not (res_directory / renamed_to).exists(), "the redo left the file"
 
         # Write Asset Meta through the toolbar. The host keeps every importable
@@ -734,19 +816,19 @@ def main() -> int:
         # the listing so the rows catch up at once; the write records and its
         # undo removes the replacement.
         probe_meta.write_bytes(b"")
-        begin = len(read_log())
-        append("refresh-assets")
-        wait_token(process, r"\[editor\] test assets refresh", 30, "listing nudged", begin)
-        wait_token(process, r"asset listing refreshed", 60, "listing sees the empty sidecar", begin)
-        begin = len(read_log())
-        append("select-asset w25_probe_source.png")
-        wait_token(process, r"\[editor\] asset selected", 30, "sourced row selected", begin)
-        begin = len(read_log())
-        append("activate Write Asset Meta")
-        wait_token(process, r"\[editor\] asset meta queued", 30, "write meta queued", begin)
-        wait_token(
-            process,
-            r'history push\s+label="write meta w25_probe_source\.png"',
+        begin = len(session.read_log())
+        session.send("refresh-assets")
+        session.wait_token(ASSETS_REFRESH_TOKEN, 30, "listing nudged", begin)
+        session.wait_token(ASSET_LISTING_TOKEN, 60, "listing sees the empty sidecar", begin)
+        begin = len(session.read_log())
+        session.send("select-asset w25_probe_source.png")
+        session.wait_token(ASSET_SELECTED_TOKEN, 30, "sourced row selected", begin)
+        begin = len(session.read_log())
+        session.send("activate Write Asset Meta")
+        session.wait_token(ASSET_META_QUEUED_TOKEN, 30, "write meta queued", begin)
+        session.wait(
+            re.escape(EDITOR_HISTORY_PUSH_TOKEN)
+            + r'\s+label="write meta w25_probe_source\.png"',
             30,
             "write meta recorded",
             begin,
@@ -754,11 +836,11 @@ def main() -> int:
         assert probe_meta.is_file() and probe_meta.stat().st_size > 0, "no sidecar was written"
         written_meta = probe_meta.read_text(encoding="utf-8")
         written_stamp = probe_meta.stat().st_mtime_ns
-        begin = len(read_log())
-        append("command editor.undo")
-        wait_token(
-            process,
-            r'history undo\s+label="write meta w25_probe_source\.png"',
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(EDITOR_HISTORY_UNDO_TOKEN)
+            + r'\s+label="write meta w25_probe_source\.png"',
             30,
             "write meta undone",
             begin,
@@ -781,18 +863,12 @@ def main() -> int:
         print("  [OK] empty sidecar replaced through the toolbar and walked back")
 
         # Step 7: a graceful quit, with the clean exit code.
-        append("quit")
-        wait_token(process, r"\[editor\] test channel: quit requested", 30, "quit command")
-        status = process.wait(timeout=60)
+        status = session.quit_and_wait(timeout=60)
         assert status == 0, f"editor exited {status} on the test quit"
-        assert "panic" not in read_log(), "a panic was logged"
+        assert "panic" not in session.read_log(), "a panic was logged"
         print("  [OK] clean exit, code 0")
     finally:
-        SHELL_SOURCE.write_text(original_shell, encoding="utf-8", newline="")
-        HOTROOT_SOURCE.write_text(original_hotroot, encoding="utf-8", newline="")
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=30)
+        session.close()
         for path in staged:
             try:
                 path.unlink(missing_ok=True)

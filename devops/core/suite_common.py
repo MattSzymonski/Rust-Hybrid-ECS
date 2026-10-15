@@ -1082,20 +1082,24 @@ def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None
 
 
 def kill_stale_hosts() -> None:
-    """Best-effort cleanup of leftover host processes that lock shared DLLs.
+    """Best-effort cleanup of leftover host and editor processes that lock shared DLLs.
 
-    Takes the host lock first: killing without it would kill the host a
-    concurrent suite is driving - the exact interference this lock exists to
-    stop - while killing under it can only hit a leak from an earlier run.
+    Both images lock the shared DLLs: host suites drive `pill_standalone` and
+    the native-editor suites drive `pill_editor_native`, so both are cleared
+    the same way. Takes the host lock first: killing without it would kill
+    the process a concurrent suite is driving - the exact interference this
+    lock exists to stop - while killing under it can only hit a leak from an
+    earlier run.
     """
     ensure_host_lock()
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/IM", "pill_standalone.exe", "/F"],
-            capture_output=True,
-        )
-    else:
-        subprocess.run(["pkill", "-f", "pill_standalone"], capture_output=True)
+    for image in ("pill_standalone", "pill_editor_native"):
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/IM", "{}.exe".format(image), "/F"],
+                capture_output=True,
+            )
+        else:
+            subprocess.run(["pkill", "-f", image], capture_output=True)
 
 
 def write_project_settings(project_root: Path, content: str) -> None:
