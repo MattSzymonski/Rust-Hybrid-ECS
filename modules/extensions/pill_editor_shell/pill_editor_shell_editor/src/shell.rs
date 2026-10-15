@@ -46,7 +46,8 @@ use pill_editor_core::editor_state::{
 };
 use pill_editor_core::history::{CommandHistory, HistoryEntryKind};
 use pill_editor_core::layout::{
-    LayoutAction, LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, Rect as LayoutRect,
+    LayoutAction, LayoutModel, LayoutNode, LayoutSnapshot, PanelKind, RecoveryEntity,
+    RecoverySelection, RecoveryState, RecoveryWindow, RecoveryWindowButton, Rect as LayoutRect,
 };
 use pill_engine::Resource;
 use pill_ui::panel::ClipboardRequest;
@@ -254,6 +255,19 @@ pub struct EditorShellState {
     /// The free-standing windows the shell owns (Stage 24), in open order:
     /// tool windows and modal dialogs, each drawing one registered panel.
     pub windows: Vec<OpenWindow>,
+    /// The selection an unclean exit left behind (Stage 28), consumed on the
+    /// first frame that runs.
+    pub recovered_selection: Option<RecoverySelection>,
+    /// The windows an unclean exit left behind (Stage 28) that are still to
+    /// reopen, each with the frames it has waited for its panel to
+    /// register; dropped after [`RECOVERY_WINDOW_WAIT_FRAMES`].
+    pub recovered_windows: Vec<(EditorWindowRequest, u32)>,
+    /// The recovery document as last written, so a change is the difference
+    /// between the session and this.
+    pub recovery_written: Option<RecoveryState>,
+    /// The first frame index at which the recovery document is due a write
+    /// even when nothing changed (the periodic cadence).
+    pub recovery_next_write_frame: u64,
 }
 
 /// One free-standing window the shell owns (Stage 24).
@@ -391,12 +405,26 @@ impl EditorShellState {
         self.readout_frames_per_second = frames_per_second;
     }
 
-    /// The state's first value: the native layout file when one exists,
+    /// The state's first value: the layout a crash's recovery document
+    /// holds (Stage 28), the native layout file when no recovery is due,
     /// the classic editor's file migrated once when only that exists, the
-    /// default workspace otherwise.
+    /// default workspace otherwise. A recovery also schedules its selection
+    /// and windows for the first frames and announces itself in a toast.
     pub fn new() -> EditorShellState {
-        EditorShellState {
-            layout: load_native_layout(),
+        let (layout, recovered) = load_editor_layout();
+        let recovered_selection = recovered.as_ref().map(|state| state.selection.clone());
+        let recovered_windows: Vec<(EditorWindowRequest, u32)> = recovered
+            .as_ref()
+            .map(|state| {
+                state
+                    .windows
+                    .iter()
+                    .map(|window| (window_request(window), 0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut state = EditorShellState {
+            layout,
             ui: UiState::new(),
             text: TextSystem::new(),
             theme: Theme::default(),
@@ -445,7 +473,19 @@ impl EditorShellState {
             notices_revision_seen: 0,
             gizmo: pill_editor_core::commands::GizmoProjectPreferences::default(),
             windows: Vec::new(),
+            recovered_selection,
+            recovered_windows,
+            recovery_written: recovered,
+            recovery_next_write_frame: RECOVERY_SAVE_FRAMES,
+        };
+        if state.recovery_written.is_some() {
+            state.toasts.push_back(Toast {
+                level: EditorProblemLevel::Warning,
+                text: String::from("Recovered the editor state after an unclean exit"),
+                expires_at_frame: TOAST_FRAMES,
+            });
         }
+        state
     }
 }
 
@@ -583,6 +623,174 @@ fn save_native_layout(model: &LayoutModel) {
             target: pill_core::telemetry::telemetry_target::ECS,
             error = %error,
             "[editor] layout could not be serialized"
+        ),
+    }
+}
+
+// =============================================================================
+// Recovery (Stage 28)
+// =============================================================================
+
+/// Frames between unconditional recovery writes: the document is also
+/// written whenever the session changes, this is the backstop cadence (five
+/// seconds at 60 fps).
+pub const RECOVERY_SAVE_FRAMES: u64 = 300;
+
+/// Frames a recovered window waits for its panel to register before it is
+/// dropped, the same refusal [`apply_window_requests`] gives a live request
+/// for an unregistered panel, spread over the first seconds after a crash.
+pub const RECOVERY_WINDOW_WAIT_FRAMES: u32 = 900;
+
+/// The layout the shell starts from (Stage 28): a crash's recovery document
+/// wins, and its selection and windows are handed back alongside; without
+/// one the native file, the one-time migration and the default workspace
+/// follow the order [`load_native_layout`] alone uses.
+fn load_editor_layout() -> (LayoutModel, Option<RecoveryState>) {
+    if let Some(recovered) = pill_editor_core::layout::load_recovery() {
+        // NOTE: asserted on by the editor's recovery suite.
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            has_entity = recovered.selection.entity.is_some(),
+            asset = recovered.selection.asset.as_deref().unwrap_or("-"),
+            windows = recovered.windows.len(),
+            "[editor] recovered editor state after an unclean exit"
+        );
+        return (recovered.layout.clone(), Some(recovered));
+    }
+    (load_native_layout(), None)
+}
+
+/// The recovery document's value for the session's current state: the
+/// layout, the selection by stable identity and the open windows. A
+/// recovered window not reopened yet counts as open here - that is what
+/// keeps the document stable while the panel it names loads.
+fn recovery_snapshot(state: &EditorShellState, selection: &EditorSelection) -> RecoveryState {
+    let mut windows: Vec<RecoveryWindow> = state
+        .windows
+        .iter()
+        .map(|window| recovery_window(&window.request))
+        .collect();
+    for (request, _) in &state.recovered_windows {
+        if !state
+            .windows
+            .iter()
+            .any(|window| window.request.id == request.id)
+        {
+            windows.push(recovery_window(request));
+        }
+    }
+    RecoveryState {
+        schema_version: pill_editor_core::layout::RECOVERY_SCHEMA_VERSION,
+        layout: state.layout.clone(),
+        selection: RecoverySelection {
+            entity: selection.entity.map(|entity| RecoveryEntity {
+                id: entity.id(),
+                generation: entity.generation(),
+            }),
+            asset: selection.asset.clone(),
+        },
+        windows,
+    }
+}
+
+/// One open window as the recovery document stores it.
+fn recovery_window(request: &EditorWindowRequest) -> RecoveryWindow {
+    RecoveryWindow {
+        id: request.id.clone(),
+        kind: request.kind.title().to_string(),
+        title: request.title.clone(),
+        width: request.width,
+        height: request.height,
+        panel: request.panel.clone(),
+        buttons: request
+            .buttons
+            .iter()
+            .map(|button| RecoveryWindowButton {
+                label: button.label.clone(),
+                command: button.command.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// One stored window rebuilt as a request: every field a window keeps while
+/// it is open; the draw list is rebuilt by the panel every frame.
+fn window_request(window: &RecoveryWindow) -> EditorWindowRequest {
+    EditorWindowRequest {
+        id: window.id.clone(),
+        kind: if window.kind == "modal" {
+            EditorWindowKind::Modal
+        } else {
+            EditorWindowKind::Tool
+        },
+        title: window.title.clone(),
+        width: window.width,
+        height: window.height,
+        panel: window.panel.clone(),
+        buttons: window
+            .buttons
+            .iter()
+            .map(|button| EditorWindowButton {
+                label: button.label.clone(),
+                command: button.command.clone(),
+            })
+            .collect(),
+        draw: DrawList::default(),
+    }
+}
+
+/// Take the recovered selection, once: the first frame that runs folds it
+/// into the recorded selection path, where the frame boundary applies it.
+pub fn take_recovered_selection(state: &mut EditorShellState) -> Option<RecoverySelection> {
+    state.recovered_selection.take()
+}
+
+/// Reopen the recovered windows whose panels are registered; one that waits
+/// past [`RECOVERY_WINDOW_WAIT_FRAMES`] is dropped with a warning.
+pub fn replay_recovered_windows(state: &mut EditorShellState, panels: &EditorPanelRegistry) {
+    if state.recovered_windows.is_empty() {
+        return;
+    }
+    let mut still_waiting = Vec::new();
+    for (request, waited) in std::mem::take(&mut state.recovered_windows) {
+        if window_panel_epoch(panels, &request.panel).is_some() {
+            apply_window_requests(state, vec![request], panels);
+            continue;
+        }
+        let waited = waited + 1;
+        if waited >= RECOVERY_WINDOW_WAIT_FRAMES {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                id = request.id.as_str(),
+                panel = request.panel.as_str(),
+                "[editor] recovered window dropped; its panel never registered"
+            );
+            continue;
+        }
+        still_waiting.push((request, waited));
+    }
+    state.recovered_windows = still_waiting;
+}
+
+/// Keep the recovery document (Stage 28) in step with the session: any
+/// layout, window or selection change writes it, and it is rewritten on the
+/// [`RECOVERY_SAVE_FRAMES`] cadence even when nothing moved. A failed write
+/// warns once; recovery is a courtesy, never a reason to fail a frame.
+pub fn sync_recovery_state(state: &mut EditorShellState, selection: &EditorSelection) {
+    let snapshot = recovery_snapshot(state, selection);
+    let changed = state.recovery_written.as_ref() != Some(&snapshot);
+    let periodic = state.frame_index >= state.recovery_next_write_frame;
+    if !changed && !periodic {
+        return;
+    }
+    match pill_editor_core::layout::save_recovery(&snapshot) {
+        Ok(()) => {
+            state.recovery_written = Some(snapshot);
+            state.recovery_next_write_frame = state.frame_index + RECOVERY_SAVE_FRAMES;
+        }
+        Err(error) => report_once(
+            state,
+            &format!("the recovery document could not be written ({error})"),
         ),
     }
 }

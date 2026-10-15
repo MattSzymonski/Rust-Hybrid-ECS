@@ -178,11 +178,14 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     if debug_panel:
         selected.append(suite_check("test_editor_builtin_panels.py", "editor shell changed"))
         selected.append(suite_check("test_editor_panels.py", "editor shell panel API changed"))
+        selected.append(suite_check("test_editor_recovery.py", "editor shell state recovery changed"))
     if has("modules/frontents/pill_editor_native/**"):
         selected.append(suite_check("test_editor_native.py", "editor frontend changed"))
+        selected.append(suite_check("test_editor_recovery.py", "editor frontend exit path changed"))
     if has("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**"):
         selected.append(suite_check("test_editor_commands.py", "editor command layer changed"))
         selected.append(suite_check("test_editor_undo.py", "editor history changed"))
+        selected.append(suite_check("test_editor_recovery.py", "editor state persistence changed"))
 
     # Engine core and the shared crates below it: unit tests plus the
     # hot-reload regression net that runs a host against real projects.
@@ -234,8 +237,11 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # The suites and the gate are code too: their own rules plus the suite
     # that was touched (a manual-tier suite is only suggested, never run).
+    # A changed suite's tokens are checked against the Rust sources that
+    # must print them, which is what test_log_contract.py exists for.
     if has("devops/tests/**"):
         selected.append(verify_check("suite-standards", "devops suites changed"))
+        selected.append(suite_check("test_log_contract.py", "suite log tokens changed"))
         for path in has("devops/tests/test_*.py"):
             name = path.rsplit("/", 1)[-1]
             selected.append(suite_check(name, f"{name} changed"))

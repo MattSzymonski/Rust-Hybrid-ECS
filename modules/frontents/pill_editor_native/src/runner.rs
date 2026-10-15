@@ -396,6 +396,9 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
                 );
                 // The popups are owned windows and would die with it anyway;
                 // closing them first keeps the shutdown ordered.
+                // A clean shutdown makes the recovery document unnecessary
+                // (Stage 28); only an unclean exit leaves one to recover.
+                pill_editor_core::layout::discard_recovery();
                 editor.popups.close_all();
                 editor.windows.close_all();
                 event_loop.exit();
@@ -435,6 +438,9 @@ impl ApplicationHandler<UserEvent> for EditorApplication {
                             target: telemetry_target::ENGINE,
                             "[editor] quitting on request"
                         );
+                        // Stage 28: a requested quit is a clean exit, so no
+                        // recovery document may survive it.
+                        pill_editor_core::layout::discard_recovery();
                         event_loop.exit();
                     }
                 }

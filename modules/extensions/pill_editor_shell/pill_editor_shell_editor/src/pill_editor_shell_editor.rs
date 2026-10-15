@@ -521,6 +521,10 @@ pub fn editor_shell_update(
     // may have asked for tool windows or modals; each open one now draws its
     // panel with its own widget state, and its own work drains through the
     // same path a docked panel's did.
+    // Stage 28: the windows an unclean exit left behind reopen as soon as
+    // their panels are registered; a request whose panel never arrives is
+    // dropped after a bounded wait.
+    pill_editor_shell_editor::shell::replay_recovered_windows(&mut state, &panels);
     let mut window_work = paint_windows(
         &mut state,
         &view,
@@ -582,6 +586,44 @@ pub fn editor_shell_update(
             );
         }
     }
+    // Stage 28: the selection an unclean exit left behind enters through
+    // the same recorded path, once; the panels' own requests above win if
+    // the user is already acting. A recovered entity that the world no
+    // longer carries is dropped where the batch applies.
+    if let Some(recovered) = pill_editor_shell_editor::shell::take_recovered_selection(&mut state) {
+        let recovered_entity = recovered
+            .entity
+            .map(|saved| pill_engine::Entity::from_raw(saved.id, saved.generation));
+        let entity_changed = recovered_entity.is_some() && selection.entity != recovered_entity;
+        let asset_changed =
+            recovered.asset.is_some() && selection.asset.as_deref() != recovered.asset.as_deref();
+        if entity_changed || asset_changed {
+            let entity = recovered_entity.or(selection.entity);
+            let asset = if asset_changed {
+                recovered.asset.clone()
+            } else {
+                selection.asset.clone()
+            };
+            let entity_text = entity
+                .map(|entity| entity.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            pending.push_recorded(
+                vec![EditorCommand::SetSelection { entity, asset }],
+                "restore selection",
+                Some("editor.selection".to_string()),
+            );
+            // NOTE: asserted on by the editor's recovery suite.
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                entity = entity_text.as_str(),
+                "[editor] recovered selection restored"
+            );
+        }
+    }
+    // Stage 28: the recovery document follows the session: a layout, window
+    // or selection change writes it, and a periodic tick refreshes it even
+    // when nothing moved.
+    pill_editor_shell_editor::shell::sync_recovery_state(&mut state, &selection);
     // The asset listing came in (or grew): one line for the suite and for
     // anyone reading the log.
     if state.assets_listed != editor_snapshot.assets.len() {

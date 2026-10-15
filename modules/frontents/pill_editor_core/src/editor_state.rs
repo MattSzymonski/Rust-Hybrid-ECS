@@ -1306,6 +1306,23 @@ impl EditorCommand {
                 if world.get_resource::<EditorSelection>().is_none() {
                     world.insert_resource(EditorSelection::default());
                 }
+                // A selection that names an entity the world no longer
+                // carries lands on no entity (Stage 28: a recovered
+                // selection from before a crash is checked here exactly
+                // like one the history trapped across a destroy); the
+                // asset half still applies.
+                let entity = match entity {
+                    Some(entity) if !world.is_entity_valid(*entity) => {
+                        // NOTE: asserted on by the editor's recovery suite.
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ENGINE,
+                            entity = %entity,
+                            "[editor] selection command dropped; the entity no longer exists"
+                        );
+                        None
+                    }
+                    other => *other,
+                };
                 let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
                     return Err(format!("{command:?}: the selection could not be claimed"));
                 };
@@ -1313,7 +1330,7 @@ impl EditorCommand {
                     entity: selection.entity,
                     asset: selection.asset.clone(),
                 };
-                selection.entity = *entity;
+                selection.entity = entity;
                 selection.asset = asset.clone();
                 Ok(CommandOutcome::inverse(previous))
             }
