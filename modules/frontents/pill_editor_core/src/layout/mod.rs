@@ -16,5 +16,10 @@ pub use action::{DockLocation, LayoutAction};
 pub use geometry::{compute_layout, DropTarget, LayoutMetrics, LayoutSnapshot, Rect};
 pub use id::NodeId;
 pub use model::{Axis, LayoutModel, LayoutNode, PanelKind};
+pub use persistence::{
+    discard_recovery, load_recovery, recovery_path, save_recovery, RecoveryEntity,
+    RecoverySelection, RecoveryState, RecoveryWindow, RecoveryWindowButton, RECOVERY_FILE,
+    RECOVERY_SCHEMA_VERSION,
+};
 pub use persistence::{layout_directory, load_or_default, save};
 pub use reducer::{LayoutChange, LayoutError};

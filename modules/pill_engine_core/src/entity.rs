@@ -77,6 +77,16 @@ impl Entity {
         Self { id, generation }
     }
 
+    /// Rebuilds a handle from its parts, for callers that persist handles
+    /// across process restarts and check them against the world themselves
+    /// (the editor's state recovery): the world answers `false` from
+    /// [`World::is_entity_valid`] until a live entity carries both numbers
+    /// again.
+    #[inline]
+    pub const fn from_raw(id: u64, generation: u32) -> Self {
+        Self { id, generation }
+    }
+
     // -------------------------------------------------------------------------
     // Property accessors
     // -------------------------------------------------------------------------
