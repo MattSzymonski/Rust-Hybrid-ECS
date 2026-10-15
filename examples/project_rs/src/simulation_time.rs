@@ -1,4 +1,11 @@
 //! Updates the shared frame delta.
+//!
+//! # Responsibilities
+//!
+//! - Stamp the time elapsed since the previous frame into [`SimulationTime`]
+//!   every frame, taken from the engine clock.
+//! - Report a missing resource as the module/host initialization mismatch it
+//!   is, rather than defaulting the delta.
 
 use crate::SimulationTime;
 use pill_core::platform::Instant;

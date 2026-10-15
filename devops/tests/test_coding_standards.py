@@ -35,14 +35,17 @@ DESCRIPTION
 
 USAGE
   python devops/tests/test_coding_standards.py [--root <path>] [--list]
+                                              [--report <path>]
                                               [--exclude <path>]...
-  python devops/tests/test_coding_standards.py <path/to/file.rs | path/to/dir>
+  python devops/tests/test_coding_standards.py <path/to/file.rs | path/to/dir> ...
 
 EXAMPLE USAGE
   python devops/tests/test_coding_standards.py
   python devops/tests/test_coding_standards.py --list
   python devops/tests/test_coding_standards.py --root modules/pill_engine/src
   python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs
+  python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs \
+      examples/project_rs/src/lib.rs --report local/lint.json
   python devops/tests/test_coding_standards.py --root modules \
       --exclude modules/extensions/pill_master_renderer
 
@@ -53,6 +56,7 @@ EXAMPLE USAGE
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -84,13 +88,21 @@ DOC_WINDOW_LINES = int(os.environ.get("DOC_WINDOW_LINES", "12"))
 
 # Directories whose contents are build output or vendored code, never sources.
 # `build` covers cargo OUT_DIR staging under `examples/*/build/` and the
-# generated shipping bundle under the repo-root `build/`.
+# generated shipping bundle scratch under the repo-root `build/` - with one
+# exception, the tracked stub crate `build/pill_shipping_bundle` (see
+# `is_linted`).
 EXCLUDED_DIRECTORY_NAMES = {
     "target",
     "node_modules",
     ".git",
     "pill_standalone_temp",
     "build",
+    # The host writes `host_module_*` wrappers and `host_project_*` members at
+    # runtime; both are gitignored, the guard hook refuses edits to them, and
+    # a git-ignored file can never reach the changed-files hook - so linting
+    # them in CI would gate on files nobody can fix there.
+    "generated",
+    "projects_generated",
     # `local/` is gitignored scratch - experiment labs, notes, one-off probes.
     # It is not engine source and is not tracked, so holding it to the engine's
     # comment and layout rules only ever produced noise. Excluding it here
@@ -99,6 +111,12 @@ EXCLUDED_DIRECTORY_NAMES = {
     # documented gate was green.
     "local",
 }
+
+# The repository's own `build/` holds generated scratch - and one tracked
+# crate whose `.gitignore` negations keep its source in the tree: the shipping
+# bundle stub the generator overwrites. A `.rs` in there is source and is
+# linted; everything else under a `build/`, everywhere, is not.
+BUILD_SOURCE_CRATES = ("pill_shipping_bundle",)
 
 # =============================================================================
 # Patterns
@@ -144,11 +162,13 @@ class ViolationCollector:
     def __init__(self) -> None:
         self.violation_count = 0
         self.files_with_violations: List[str] = []
+        self.entries: List[Tuple[str, str, str]] = []
         self._seen_files: Dict[str, bool] = {}
 
     def record(self, display_path: str, check: str, detail: str) -> None:
         """Records one violation against a file."""
         self.violation_count += 1
+        self.entries.append((display_path, check, detail))
         if display_path not in self._seen_files:
             self._seen_files[display_path] = True
             self.files_with_violations.append(display_path)
@@ -159,6 +179,41 @@ class ViolationCollector:
 # =============================================================================
 # File discovery
 # =============================================================================
+
+
+def is_linted(path: Path) -> bool:
+    """Whether the lint checks this path: a `.rs` source outside every excluded
+tree.
+
+    One predicate for every caller. CI scans with it (through
+    `find_rust_files`), the changed-files hook imports it to select what it
+    passes in - and an explicitly named file is subject to it too, so a hook
+    run and a CI run can never disagree about a file again. Before this was
+    shared, the hook linted single files before any exclusions applied while CI
+    scanned `modules/` only, so a file could pass one and fail the other.
+    """
+    if path.suffix != ".rs":
+        return False
+    try:
+        relative = path.relative_to(REPOSITORY_ROOT)
+    except ValueError:
+        relative = path
+    for index, part in enumerate(relative.parts):
+        if part not in EXCLUDED_DIRECTORY_NAMES:
+            continue
+        # The repository's own `build/` keeps one tracked crate's sources: the
+        # shipping bundle stub's `src/`. Everything else under a `build/` -
+        # a stray `build.rs` in that crate included - is generated scratch.
+        if (
+            part == "build"
+            and index == 0
+            and relative.parts[1:2]
+            and relative.parts[1] in BUILD_SOURCE_CRATES
+            and relative.parts[2:3] == ("src",)
+        ):
+            continue
+        return False
+    return True
 
 
 def find_rust_files(root: Path, excludes: Optional[List[Path]] = None) -> List[Path]:
@@ -174,12 +229,12 @@ def find_rust_files(root: Path, excludes: Optional[List[Path]] = None) -> List[P
     rules still gate every other crate).
     """
     if root.is_file():
-        return [root] if root.suffix == ".rs" else []
+        return [root] if is_linted(root) else []
 
     resolved_excludes = [path.resolve() for path in (excludes or [])]
     discovered: List[Path] = []
     for path in root.rglob("*.rs"):
-        if EXCLUDED_DIRECTORY_NAMES.intersection(path.parts):
+        if not is_linted(path):
             continue
         resolved = path.resolve()
         if any(
@@ -464,50 +519,92 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print every .rs file that would be checked, then exit",
     )
     parser.add_argument(
+        "--report",
+        metavar="PATH",
+        help="Write a JSON report of the checked files and violations to PATH",
+    )
+    parser.add_argument(
         "target",
         nargs="*",
         metavar="PATH",
-        help="A single file or directory to scan, instead of --root",
+        help="Files or directories to scan, instead of --root (any number)",
     )
     return parser
 
 
-def resolve_root(arguments: argparse.Namespace) -> Path:
-    """Resolves the scan target from `--root` or a positional path.
+def collect_files(targets: List[Path], excludes: List[Path]) -> List[Path]:
+    """Every linted file under the targets, deduplicated, in path order.
+
+    More than one target arrives from callers that already know their file
+    list - the changed-files hook passes the files it may have touched - so a
+    directory, a file and a mixture all work in one call.
+    """
+    found: List[Path] = []
+    seen = set()
+    for target in targets:
+        for path in find_rust_files(target, excludes):
+            key = path.resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(path)
+    return sorted(found, key=lambda path: path.as_posix())
+
+
+def write_report(path: Path, files: List[Path], collector: ViolationCollector) -> None:
+    """Writes the machine-readable report `--report` promises.
+
+    The human output stays exactly as it was - CI and `run_all.py` read it -
+    and this gives callers a stable shape to attribute violations by file
+    instead of scraping coloured text.
+    """
+    document = {
+        "files_checked": [display_path_for(file) for file in files],
+        "violations": [
+            {"file": display_path, "check": check, "detail": detail}
+            for display_path, check, detail in collector.entries
+        ],
+    }
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def resolve_targets(arguments: argparse.Namespace) -> List[Path]:
+    """Resolves the scan targets from `--root` or the positional paths.
 
     Raises `SystemExit(2)` on a usage error, matching the shell version's
     exit-status contract.
     """
-    if len(arguments.target) > 1:
-        print("ERROR: only one scan target is accepted", file=sys.stderr)
-        raise SystemExit(2)
     if arguments.target:
-        root = Path(arguments.target[0])
+        targets = [Path(entry) for entry in arguments.target]
     elif arguments.root:
-        root = Path(arguments.root)
+        targets = [Path(arguments.root)]
     else:
-        root = REPOSITORY_ROOT
-    if not root.exists():
-        print(f"ERROR: scan target '{root}' does not exist", file=sys.stderr)
-        raise SystemExit(2)
-    return root
+        targets = [REPOSITORY_ROOT]
+    for target in targets:
+        if not target.exists():
+            print(f"ERROR: scan target '{target}' does not exist", file=sys.stderr)
+            raise SystemExit(2)
+    return targets
 
 
 def main() -> int:
-    """Scans the target and reports every violation found."""
+    """Scans the targets and reports every violation found."""
     arguments = build_parser().parse_args()
-    root = resolve_root(arguments)
-    files = find_rust_files(root, [Path(entry) for entry in arguments.exclude])
+    targets = resolve_targets(arguments)
+    files = collect_files(targets, [Path(entry) for entry in arguments.exclude])
 
     if arguments.list:
         for path in files:
             print(display_path_for(path))
         print()
-        print(f"Total: {len(files)} .rs file(s) under {display_path_for(root)}")
+        print(f"Total: {len(files)} .rs file(s) under {display_path_for(targets[0])}" + (
+            f" and {len(targets) - 1} more target(s)" if len(targets) > 1 else ""
+        ))
         return 0
 
+    under = ", ".join(display_path_for(target) for target in targets)
     print(colorize("Pill comment & layout lint", ANSI_BOLD))
-    print(f"Scanning {len(files)} .rs file(s) under {display_path_for(root)}")
+    print(f"Scanning {len(files)} .rs file(s) under {under}")
     if not files:
         print("No Rust source files found.")
         return 0
@@ -536,6 +633,9 @@ def main() -> int:
     section("(5/5) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
+
+    if arguments.report:
+        write_report(Path(arguments.report), files, collector)
 
     print()
     if collector.violation_count == 0:

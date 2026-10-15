@@ -57,6 +57,7 @@ EXAMPLE USAGE
 
 import importlib.util
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -643,6 +644,77 @@ def check_example_projects_come_from_manifests() -> None:
         fail("an example project was constructed without a manifest")
 
 
+def check_hook_and_ci_lint_the_same_files() -> None:
+    """Stage 16's acceptance check (SA-0070): one scope predicate.
+
+    CI scans the repository through the lint's `is_linted`, and the
+    changed-files hook imports that same predicate, so a file can no longer
+    pass one and fail the other. The CI step must also stop overriding its
+    root - the `--root modules` scan is how 27 tracked files outside
+    `modules/` went unlinted while the hook still flagged them.
+    """
+    verify_steps = load_module("ci_cd/verify.py", "verify_steps")
+    step = next((step for step in verify_steps.STEPS if step.name == "coding-standards"), None)
+    if step is None:
+        fail("verify.py no longer has a coding-standards step")
+    command = [token for tokens in step.commands for token in tokens]
+    if "--root" in command:
+        fail("the coding-standards step scans a subtree; it must scan the repository root")
+    if "devops/tests/test_coding_standards.py" not in command:
+        fail(f"the coding-standards step runs {command}, not the lint")
+
+    lint = load_module("tests/test_coding_standards.py", "test_coding_standards_scope")
+    scanned = {path.resolve() for path in lint.find_rust_files(REPOSITORY_ROOT)}
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "*.rs"], cwd=REPOSITORY_ROOT, capture_output=True, text=True
+    ).stdout.splitlines()
+    if not tracked:
+        fail("git ls-files returned no Rust files")
+    for name in tracked:
+        path = REPOSITORY_ROOT / name
+        if not lint.is_linted(path):
+            fail(f"a tracked Rust file is outside the lint's scope: {name}")
+        if path.resolve() not in scanned:
+            fail(f"a tracked Rust file is not in the CI scan: {name}")
+
+    # A git-ignored file can never reach the hook's candidate list, so the
+    # lint must not check it either: CI may not gate on what nobody can fix
+    # through the hook.
+    ignored = subprocess.run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--", "*.rs"],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    for name in ignored:
+        if lint.is_linted(REPOSITORY_ROOT / name):
+            fail(f"an ignored Rust file would be linted: {name}")
+
+    # The hook imports the lint's predicate; load the hook the way its
+    # harnesses do and make the two answer together, on the shapes that used
+    # to disagree plus paths that only ever exist locally.
+    hooks_directory = REPOSITORY_ROOT / ".agents" / "hooks"
+    sys.path.insert(0, str(hooks_directory))
+    spec = importlib.util.spec_from_file_location(
+        "check_changed_hook", hooks_directory / "check_changed.py"
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    hook_lint = hook.load_lint()
+    probes = [REPOSITORY_ROOT / name for name in tracked[:3] + tracked[-3:] + ignored]
+    probes += [
+        REPOSITORY_ROOT / "local" / "temp" / "probe.rs",
+        REPOSITORY_ROOT / "examples" / "project_rs" / "src" / "lib.rs",
+    ]
+    for probe in probes:
+        if lint.is_linted(probe) != hook_lint.is_linted(probe):
+            fail(f"the hook and the lint disagree about {probe}")
+    skipped = [probe for probe in probes if not lint.is_linted(probe)]
+    if hook.lint_problems(skipped, hook_lint):
+        fail("the hook must skip every non-lintable path without running the lint")
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every real analytics line parses", check_every_real_analytics_line_parses),
     ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
@@ -665,6 +737,7 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("dependency records carry kind and directory",
      check_dependency_records_carry_kind_and_directory),
     ("example projects come from manifests", check_example_projects_come_from_manifests),
+    ("hook and CI lint the same files", check_hook_and_ci_lint_the_same_files),
 ]
 
 

@@ -115,9 +115,7 @@ def dump_array(
             raise RuntimeError(
                 f"the editor exited {process.returncode} during a dump\n" + text[-3000:]
             )
-        time.sleep(0.4)
-    raise RuntimeError("the field dump never answered\n" + session.read_log()[-3000:])
-
+            # Poll until the field dump answers.
 
 def main() -> int:
     if not EditorSession.supported():

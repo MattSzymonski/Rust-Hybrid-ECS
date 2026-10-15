@@ -950,6 +950,7 @@ def scenario_a_conflicting_resource_claim_fails_setup() -> bool:
                 break
             if not monitor.process_alive():
                 break
+            # Poll until the host exits.
             time.sleep(0.2)
 
         output = monitor.output_since(0)
@@ -1067,6 +1068,7 @@ def scenario_a_failing_module_start_releases_its_resource() -> bool:
                 break
             if not monitor.process_alive():
                 break
+            # Poll until the host exits with the module's failure.
             time.sleep(0.2)
 
         output = monitor.output_since(0)

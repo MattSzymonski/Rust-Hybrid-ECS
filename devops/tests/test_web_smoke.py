@@ -293,9 +293,11 @@ def observe_page(browser: str, url: str, seconds: float, send_input: bool, captu
             port_file = Path(profile) / "DevToolsActivePort"
             deadline = time.monotonic() + BROWSER_START_TIMEOUT
             while not port_file.is_file() and time.monotonic() < deadline:
+                # Poll until the browser writes its DevTools port file.
                 time.sleep(0.2)
             if not port_file.is_file():
                 return console_lines, ["the browser did not open its DevTools port"], variations
+            # Let the port file finish being written before reading it.
             time.sleep(0.5)
             port = port_file.read_text().split()[0]
             targets = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/json").read())

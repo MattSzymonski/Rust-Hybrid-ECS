@@ -1,6 +1,12 @@
 //! Creates the camera and the helmet.
+//!
+//! # Responsibilities
+//!
+//! - Add the camera when the world has none.
+//! - Add the helmet when it has none, so a re-run after a reload leaves the
+//!   live scene alone.
 
-use crate::{TagHelmet, asset_loading::SceneAssets};
+use crate::{asset_loading::SceneAssets, TagHelmet};
 use pill_engine::{Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 

@@ -146,6 +146,7 @@ def run_edit_during_build_scenario(
         if not monitor.process_alive():
             print("  [FAIL] The host exited during the scenario.")
             return False
+        # Poll for the scenario's outcome line.
         time.sleep(0.2)
 
     output = monitor.output_since(start_index)

@@ -52,9 +52,6 @@ def main():
         user32.GetWindowRect(window, ctypes.byref(rect))
         return rect
 
-    def read_log():
-        return log_path.read_text(encoding="utf-8", errors="replace")
-
     def wait_for_frame_statistic(seen: int, timeout: float) -> bool:
         """True once the frontend logs a frame-statistic line past `seen`.
 
@@ -64,10 +61,11 @@ def main():
         """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if read_log().count(" FPS | ") > seen:
+            if log_path.read_text(encoding="utf-8", errors="replace").count(" FPS | ") > seen:
                 return True
             if process.poll() is not None:
                 return False
+            # Poll until another frame-statistic line appears.
             time.sleep(0.5)
         return False
 
@@ -77,11 +75,12 @@ def main():
         try:
             deadline = time.monotonic() + args.timeout
             while time.monotonic() < deadline:
-                text = read_log()
+                text = log_path.read_text(encoding="utf-8", errors="replace")
                 if "[render] First frame: Presented; camera=true" in text:
                     break
                 if process.poll() is not None:
                     raise RuntimeError(f"frontend exited {process.returncode} before presenting\n{text[-6000:]}")
+                # Poll until the frontend presents its first frame.
                 time.sleep(0.5)
             else:
                 raise TimeoutError(f"first-frame timeout; see {log_path}")
@@ -104,6 +103,7 @@ def main():
             before = window_rect(window)
             print("native scene presented; requesting a resize", flush=True)
             user32.SetWindowPos(window, None, 40, 40, 960, 720, 0x4004)
+            # Give the window a moment to apply the requested size.
             time.sleep(1)
             resized = window_rect(window)
             width = resized.right - resized.left
@@ -114,15 +114,19 @@ def main():
                 raise RuntimeError(f"resize requested 960x720, the window is {width}x{height}")
             print(f"resize applied: {width}x{height}", flush=True)
             user32.ShowWindowAsync(window, 6)
+            # Let the minimize land before the restore is sent.
             time.sleep(1)
             user32.ShowWindowAsync(window, 9)
+            # Give the restore time to finish before checking the window.
             time.sleep(2)
             if user32.IsIconic(window):
                 raise RuntimeError("the window stayed minimized: the restore never reached it")
             if not user32.IsWindowVisible(window):
                 raise RuntimeError("the window is not visible after the restore")
             print("minimize/restore left the window restored; checking the frame loop", flush=True)
-            if not wait_for_frame_statistic(read_log().count(" FPS | "), 30):
+            if not wait_for_frame_statistic(
+                log_path.read_text(encoding="utf-8", errors="replace").count(" FPS | "), 30
+            ):
                 raise RuntimeError(f"the frame loop stopped after the window calls; see {log_path}")
             print("still presenting; checking shutdown", flush=True)
             user32.PostMessageW(window, 0x0010, 0, 0)

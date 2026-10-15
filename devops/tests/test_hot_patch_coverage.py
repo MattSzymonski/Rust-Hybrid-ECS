@@ -464,6 +464,7 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
             if not monitor.process_alive():
                 crate.outcome, crate.detail = "FELL BACK", "the host exited during this edit"
                 break
+            # Poll until the host reports this edit's outcome.
             time.sleep(0.2)
         else:
             # Not `SKIPPED`: this crate has a fast path and the edit was
@@ -488,7 +489,9 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
                 break
             if not monitor.process_alive():
                 break
+            # Poll until the restore's own outcome arrives.
             time.sleep(0.2)
+        # Then let the watcher go quiet before the next edit.
         time.sleep(1.0)
 
         if crate.outcome == "FELL BACK" and monitor.process_alive() and crate.candidates:
@@ -515,7 +518,9 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
                     break  # the restore patched instantly; nothing to rebuild
                 if not monitor.process_alive():
                     break
+                # Poll until the module reloads or the restore patched back.
                 time.sleep(0.2)
+            # Let the cancelled-build churn settle before the retry.
             time.sleep(1.0)
             continue
         break
