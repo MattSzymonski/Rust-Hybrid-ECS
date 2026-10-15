@@ -58,13 +58,14 @@ EXAMPLE USAGE
 import importlib.util
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, List, Tuple
 
 DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
-from core.paths import MODULES_ROOT  # noqa: E402
+from core.paths import MODULES_ROOT, REPOSITORY_ROOT  # noqa: E402
 from core.suite_common import (  # noqa: E402
     apply_replacements,
     restore_paths,
@@ -72,6 +73,13 @@ from core.suite_common import (  # noqa: E402
     snapshot_paths,
 )
 from core.test_report import summarize_test_results  # noqa: E402
+from core.workspace_graph import (  # noqa: E402
+    Crate,
+    ManifestError,
+    example_projects,
+    read_manifest,
+    workspace_members,
+)
 
 
 def load_module(relative_path: str, name: str):
@@ -541,6 +549,100 @@ def check_editor_edits_keep_lf_and_restore() -> None:
             fail("restore_sources must put the original bytes back")
 
 
+def check_workspace_members_expand_globs_and_excludes() -> None:
+    """The member globs expand as cargo's do: the explicit crates, the
+    `frontents/*` and `extensions/*/*` globs - and nothing under the excluded
+    `extensions/rendering`, whose old renderers no build uses."""
+    members = workspace_members(MODULES_ROOT)
+    names = [member.name for member in members]
+    for expected in ("pill_engine_core", "pill_engine", "pill_standalone", "pill_spline"):
+        if expected not in names:
+            fail(f"{expected} is missing from the expanded workspace members")
+    if any("extensions/rendering" in member.directory.as_posix() for member in members):
+        fail("a member under the excluded extensions/rendering was kept")
+    if any(not name or name.startswith("_") for name in names):
+        fail(f"a workspace anchor leaked in as a member: {names}")
+    if len(names) != len(set(names)):
+        fail("a member directory is double-counted")
+
+
+def check_dependency_records_carry_kind_and_directory() -> None:
+    """Kinds, renamed packages and resolved path directories, from a small
+    tree that exercises every table shape plus the reader's error path."""
+    with tempfile.TemporaryDirectory() as temporary:
+        modules = Path(temporary) / "modules"
+        (modules / "a" / "src").mkdir(parents=True)
+        (modules / "b" / "src").mkdir(parents=True)
+        (modules / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["a", "b"]\nexclude = ["b"]\n', encoding="utf-8"
+        )
+        (modules / "a" / "Cargo.toml").write_text(
+            '[package]\nname = "a"\n'
+            '[dependencies]\n'
+            'b = { path = "../b" }\n'
+            'renamed = { package = "b", path = "../b" }\n'
+            'serde = "1"\n'
+            '[dev-dependencies]\n'
+            'dev_only = { package = "b", path = "../b" }\n'
+            '[build-dependencies]\n'
+            'build_only = { package = "b", path = "../b" }\n'
+            "[target.'cfg(windows)'.dependencies]\n"
+            'target_only = { package = "b", path = "../b" }\n',
+            encoding="utf-8",
+        )
+        (modules / "b" / "Cargo.toml").write_text('[package]\nname = "b"\n', encoding="utf-8")
+        crate = Crate(modules / "a" / "Cargo.toml")
+        by_key = {dependency.key: dependency for dependency in crate.dependencies()}
+        expected = {
+            "b": ("b", "normal"),
+            "renamed": ("b", "normal"),
+            "serde": ("serde", "normal"),
+            "dev_only": ("b", "dev"),
+            "build_only": ("b", "build"),
+            "target_only": ("b", "normal"),
+        }
+        if set(by_key) != set(expected):
+            fail(f"dependency keys read as {sorted(by_key)}, expected {sorted(expected)}")
+        for key, (package, kind) in expected.items():
+            if (by_key[key].package, by_key[key].kind) != (package, kind):
+                fail(
+                    f"{key}: read as {by_key[key].package!r}/{by_key[key].kind!r}, "
+                    f"expected {package!r}/{kind!r}"
+                )
+        if by_key["b"].directory != (modules / "b").resolve():
+            fail(f"the path dependency resolved to {by_key['b'].directory}")
+        if by_key["serde"].directory is not None:
+            fail("a registry dependency must have no directory")
+        linked_kinds = {dependency.kind for dependency in crate.linked()}
+        if linked_kinds != {"normal", "build"}:
+            fail(f"linked() must keep normal and build, not dev: {sorted(linked_kinds)}")
+        if [member.name for member in workspace_members(modules)] != ["a"]:
+            fail("the excluded member was kept by the expansion")
+        broken = modules / "broken" / "Cargo.toml"
+        broken.parent.mkdir()
+        broken.write_text("[package\nname = 'x'\n", encoding="utf-8")
+        try:
+            read_manifest(broken)
+        except ManifestError:
+            pass
+        else:
+            fail("a broken manifest must raise ManifestError")
+
+
+def check_example_projects_come_from_manifests() -> None:
+    """The example projects are the manifests under `examples/`, with their
+    package names read from them - one directory, one crate."""
+    projects = example_projects(REPOSITORY_ROOT)
+    directories = {crate.directory.name for crate in projects}
+    for directory in ("project_rs", "master_renderer_test"):
+        if directory not in directories:
+            fail(f"examples/{directory} is missing from the example projects")
+    if "project" not in {crate.name for crate in projects}:
+        fail("examples/project_rs must read as package `project`")
+    if any(not crate.manifest_path.is_file() for crate in projects):
+        fail("an example project was constructed without a manifest")
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every real analytics line parses", check_every_real_analytics_line_parses),
     ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
@@ -559,6 +661,10 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("editor waits read from an offset", check_editor_waits_read_from_an_offset),
     ("editor waits time out loudly", check_editor_waits_time_out_loudly),
     ("editor edits keep LF and restore", check_editor_edits_keep_lf_and_restore),
+    ("workspace members expand like cargo", check_workspace_members_expand_globs_and_excludes),
+    ("dependency records carry kind and directory",
+     check_dependency_records_carry_kind_and_directory),
+    ("example projects come from manifests", check_example_projects_come_from_manifests),
 ]
 
 

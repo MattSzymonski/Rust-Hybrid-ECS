@@ -7,7 +7,7 @@ sources.
 PROTECTS: The engine core never links the facade or reads a registry; shared dylibs stay UI-free.
 TIER: static
 
-REQUIREMENTS: Python 3.11+ (standard library only: `tomllib`).
+REQUIREMENTS: Python 3.11+ (standard library only).
 
 DESCRIPTION
     The engine is two crates. `pill_engine_core` holds the engine; `pill_engine`
@@ -55,8 +55,12 @@ EXAMPLE USAGE
 import argparse
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.workspace_graph import Crate, ManifestError  # noqa: E402
 
 # The engine core, and the facade it must never link (rule 1).
 CORE_CRATE = "pill_engine_core"
@@ -75,47 +79,6 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
-# Dependency tables that are linked into the crate itself. Dev-dependencies
-# are left out: they build tests, never the library.
-LINKED_TABLES = ("dependencies", "build-dependencies")
-
-
-class ManifestError(Exception):
-    """A manifest that could not be read or parsed."""
-
-
-# Reads one Cargo.toml into a dictionary.
-def read_manifest(path):
-    try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise ManifestError(f"{path}: {error}") from error
-
-
-# Every linked dependency table of a manifest: the top-level ones and each
-# `[target.'cfg(...)'.*]` one.
-def linked_dependency_tables(manifest):
-    tables = [manifest.get(name, {}) for name in LINKED_TABLES]
-    for target in manifest.get("target", {}).values():
-        tables.extend(target.get(name, {}) for name in LINKED_TABLES)
-    return tables
-
-
-# The package names a manifest links, with the directory of each path
-# dependency (None for a registry or git dependency).
-def linked_dependencies(manifest, manifest_directory):
-    found = []
-    for table in linked_dependency_tables(manifest):
-        for key, specification in table.items():
-            if isinstance(specification, dict):
-                package = specification.get("package", key)
-                path = specification.get("path")
-                directory = (manifest_directory / path).resolve() if path else None
-            else:
-                package, directory = key, None
-            found.append((package, directory))
-    return found
-
 
 # Walks every path dependency reachable from `start_directory`; returns the
 # chains (lists of package names) that end at the facade.
@@ -128,12 +91,11 @@ def chains_to_facade(start_directory):
         if directory in visited:
             continue
         visited.add(directory)
-        manifest = read_manifest(directory / "Cargo.toml")
-        for package, dependency_directory in linked_dependencies(manifest, directory):
-            if package == FACADE_CRATE:
-                broken.append(chain + [package])
-            elif dependency_directory is not None:
-                pending.append((dependency_directory, chain + [package]))
+        for dependency in Crate(directory / "Cargo.toml").linked():
+            if dependency.package == FACADE_CRATE:
+                broken.append(chain + [dependency.package])
+            elif dependency.directory is not None:
+                pending.append((dependency.directory, chain + [dependency.package]))
     return broken
 
 
@@ -141,8 +103,8 @@ def chains_to_facade(start_directory):
 # manifest, and each non-comment source line naming `inventory::`.
 def registry_uses(core_directory):
     found = []
-    manifest = read_manifest(core_directory / "Cargo.toml")
-    if any(package == REGISTRY_CRATE for package, _ in linked_dependencies(manifest, core_directory)):
+    core = Crate(core_directory / "Cargo.toml")
+    if any(dependency.package == REGISTRY_CRATE for dependency in core.linked()):
         found.append(f"{CORE_CRATE}/Cargo.toml depends on `{REGISTRY_CRATE}`")
     for source in sorted((core_directory / "src").rglob("*.rs")):
         lines = source.read_text(encoding="utf-8").splitlines()
@@ -189,7 +151,7 @@ def shared_dylib_failures(root):
         directory = root / "modules" / relative
         if not (directory / "Cargo.toml").is_file():
             continue
-        manifest = read_manifest(directory / "Cargo.toml")
+        manifest = Crate(directory / "Cargo.toml").manifest
         crate_types = manifest.get("lib", {}).get("crate-type", [])
         if "dylib" not in crate_types:
             found.append(f"{name} is not built as a `dylib` (crate-type {crate_types})")
@@ -200,13 +162,11 @@ def shared_dylib_failures(root):
             if current in visited:
                 continue
             visited.add(current)
-            for package, dependency_directory in linked_dependencies(
-                read_manifest(current / "Cargo.toml"), current
-            ):
-                if package in UI_FRAMEWORK_CRATES:
-                    found.append(f"{' -> '.join(chain + [package])}")
-                elif dependency_directory is not None:
-                    pending.append((dependency_directory, chain + [package]))
+            for dependency in Crate(current / "Cargo.toml").linked():
+                if dependency.package in UI_FRAMEWORK_CRATES:
+                    found.append(f"{' -> '.join(chain + [dependency.package])}")
+                elif dependency.directory is not None:
+                    pending.append((dependency.directory, chain + [dependency.package]))
     return found
 
 

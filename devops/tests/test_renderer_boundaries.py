@@ -6,7 +6,7 @@ read from the Cargo manifests.
 PROTECTS: Only GPU modules link wgpu, the renderer API stays renderer-free, data crates GPU-free.
 TIER: static
 
-REQUIREMENTS: Python 3.11+ (standard library only: `tomllib`).
+REQUIREMENTS: Python 3.11+ (standard library only).
 
 DESCRIPTION
     Each renderer comes as two crates: a GPU module (`<renderer>`) and its
@@ -55,8 +55,17 @@ EXAMPLE USAGE
 import argparse
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.workspace_graph import (  # noqa: E402
+    Crate,
+    ManifestError,
+    example_projects,
+    workspace_members,
+)
 
 # The contract crate and what it may depend on (rule 2).
 API_CRATE = "pill_renderer_api"
@@ -89,61 +98,6 @@ GRAPHICS_CRATE = "wgpu"
 WGPU_EXCEPTION_CRATES = {"pill_ui_wgpu", "pill_editor_native"}
 
 
-class Crate:
-    """One manifest: its package name, directory and dependencies."""
-
-    def __init__(self, manifest_path: Path):
-        self.manifest_path = manifest_path
-        self.directory = manifest_path.parent
-        with manifest_path.open("rb") as manifest_file:
-            self.manifest = tomllib.load(manifest_file)
-        self.name = self.manifest.get("package", {}).get("name", self.directory.name)
-
-    # Every dependency as (key, package name, kind), from every table:
-    # `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and their
-    # `[target.<cfg>.*]` forms. `kind` is "normal", "dev" or "build".
-    def dependencies(self):
-        tables = [self.manifest]
-        for target in self.manifest.get("target", {}).values():
-            tables.append(target)
-        found = []
-        for table in tables:
-            for section, kind in (("dependencies", "normal"), ("dev-dependencies", "dev"),
-                                  ("build-dependencies", "build")):
-                for key, value in table.get(section, {}).items():
-                    package = value.get("package", key) if isinstance(value, dict) else key
-                    found.append((key, package, kind))
-        return found
-
-
-# The workspace members under `modules/`, expanding glob members as cargo does
-# and skipping paths under an `exclude`d one.
-def workspace_members(modules: Path):
-    with (modules / "Cargo.toml").open("rb") as manifest_file:
-        workspace = tomllib.load(manifest_file)["workspace"]
-    excluded = [(modules / path).resolve() for path in workspace.get("exclude", [])]
-    members = []
-    seen = set()
-    for member in workspace.get("members", []):
-        is_glob = any(character in member for character in "*?[")
-        directories = sorted(modules.glob(member)) if is_glob else [modules / member]
-        for directory in directories:
-            manifest = directory / "Cargo.toml"
-            resolved = directory.resolve()
-            if any(resolved == path or path in resolved.parents for path in excluded):
-                continue
-            if not manifest.is_file() or resolved in seen:
-                continue
-            seen.add(resolved)
-            members.append(Crate(manifest))
-    return members
-
-
-# The example projects: every `examples/*/Cargo.toml`.
-def example_projects(repository: Path):
-    return [Crate(manifest) for manifest in sorted((repository / "examples").glob("*/Cargo.toml"))]
-
-
 # Every broken rule under `repository`, as (rule number, message) pairs.
 def check(repository: Path):
     modules = repository / "modules"
@@ -157,7 +111,7 @@ def check(repository: Path):
     # Rule 1: wgpu only in GPU modules (or a named exception), and in at
     # least one GPU module.
     linking_graphics = sorted(crate.name for crate in members
-                              if any(package == GRAPHICS_CRATE for _, package, _ in crate.dependencies()))
+                              if any(dependency.package == GRAPHICS_CRATE for dependency in crate.dependencies()))
     for name in linking_graphics:
         if name not in gpu_modules and name not in WGPU_EXCEPTION_CRATES:
             problems.append((1, f"{name} depends on {GRAPHICS_CRATE}; only a GPU module "
@@ -170,30 +124,33 @@ def check(repository: Path):
     if api is None:
         problems.append((2, f"{API_CRATE} is not a workspace member"))
     else:
-        for key, package, kind in api.dependencies():
-            if kind == "build":
-                problems.append((2, f"{API_CRATE} has a build dependency ({package}); it needs no build script"))
-            elif kind == "normal" and package not in API_ALLOWED_DEPENDENCIES:
-                problems.append((2, f"{API_CRATE} depends on {package}, which the contract does not need"))
+        for dependency in api.dependencies():
+            if dependency.kind == "build":
+                problems.append((2, f"{API_CRATE} has a build dependency ({dependency.package}); "
+                                    "it needs no build script"))
+            elif dependency.kind == "normal" and dependency.package not in API_ALLOWED_DEPENDENCIES:
+                problems.append((2, f"{API_CRATE} depends on {dependency.package}, which the contract "
+                                    "does not need"))
 
     # Rule 3: the host names no renderer data or GPU code.
     for host_name in HOST_CRATES:
         host = by_name.get(host_name)
         if host is None:
             continue
-        for key, package, kind in host.dependencies():
-            if kind == "dev" or package not in renderer_crates:
+        for dependency in host.dependencies():
+            if dependency.kind == "dev" or dependency.package not in renderer_crates:
                 continue
-            if not key.endswith(GRAPH_ONLY_SUFFIX):
-                problems.append((3, f"{host_name} depends on {package} as `{key}`; only a graph-only "
-                                    f"`*{GRAPH_ONLY_SUFFIX}` dependency is allowed"))
+            if not dependency.key.endswith(GRAPH_ONLY_SUFFIX):
+                problems.append((3, f"{host_name} depends on {dependency.package} as `{dependency.key}`; "
+                                    f"only a graph-only `*{GRAPH_ONLY_SUFFIX}` dependency is allowed"))
                 continue
             for source in sorted((host.directory / "src").rglob("*.rs")):
                 if source.name == "tests.rs" or "tests" in source.relative_to(host.directory).parts[:-1]:
                     continue
-                if key in source.read_text(encoding="utf-8", errors="replace"):
+                if dependency.key in source.read_text(encoding="utf-8", errors="replace"):
                     relative = source.relative_to(repository).as_posix()
-                    problems.append((3, f"{relative} names the graph-only dependency `{key}` ({package})"))
+                    problems.append((3, f"{relative} names the graph-only dependency "
+                                        f"`{dependency.key}` ({dependency.package})"))
 
     # Rule 4: no project depends on a GPU module. The one generated crate
     # allowed to is the renderer's own wrapper (host_module_<renderer>), whose
@@ -205,19 +162,19 @@ def check(repository: Path):
     ]
     for project in projects:
         directory_name = project.directory.name
-        for _, package, _ in project.dependencies():
-            if package not in gpu_modules:
+        for dependency in project.dependencies():
+            if dependency.package not in gpu_modules:
                 continue
-            if directory_name == f"host_module_{package}":
+            if directory_name == f"host_module_{dependency.package}":
                 continue
             relative = project.manifest_path.relative_to(repository).as_posix()
-            problems.append((4, f"{relative} depends on the GPU module {package}"))
+            problems.append((4, f"{relative} depends on the GPU module {dependency.package}"))
 
     # Rule 5: no data crate depends on a GPU module.
     for name in sorted(data_crates):
-        for _, package, _ in by_name[name].dependencies():
-            if package in gpu_modules:
-                problems.append((5, f"{name} depends on the GPU module {package}"))
+        for dependency in by_name[name].dependencies():
+            if dependency.package in gpu_modules:
+                problems.append((5, f"{name} depends on the GPU module {dependency.package}"))
 
     return problems
 
@@ -321,7 +278,7 @@ def main() -> int:
         return self_test()
     try:
         return report(arguments.root.resolve())
-    except (OSError, KeyError, tomllib.TOMLDecodeError) as error:
+    except (OSError, KeyError, ManifestError) as error:
         print(f"error: cannot read the manifests: {error}", file=sys.stderr)
         return 2
 

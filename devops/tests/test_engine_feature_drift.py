@@ -18,13 +18,21 @@ DESCRIPTION
 
     For each host posture (headless `pill_standalone` with and without
     `hot_patch`, windowed `pill_standalone`, the editor), this resolves each
-    engine dylib's subtree for the host alone, then for every extension's
-    module build and every generated project build as the host runs them: the
-    extension - through its generated `host_module_<name>` wrapper when that
-    exists, and otherwise selected directly with the feature set the wrapper
-    would enable - or the project, plus the engine features
-    `build_runner::host_engine_features` mirrors from the running host. Any
-    crate whose features differ from the host's own resolution is reported.
+    engine dylib's subtree for the host alone, then for every build a host
+    spawns for a project: each extension's module build - the crate selected
+    directly with the feature set its generated `host_module_<name>` wrapper
+    would enable - the project's own build, and the project's startup batch,
+    each plus the engine features `build_runner::host_engine_features` mirrors
+    from the running host. Any crate whose features differ from the host's own
+    resolution is reported.
+
+    What is measured comes from tracked sources only - the extension crates by
+    their `extensions/<folder>/<crate>` convention, the projects from their
+    `project_settings.yaml` and manifests - never from the generated
+    `host_module_*` / `host_project_*` crates the host leaves behind, which are
+    gitignored and pruned between runs. A fresh clone and a used checkout
+    therefore measure the same builds, and the count is printed so a drop is
+    visible.
 
     The editor adds one thing to every spawned build: the cargo anchor
     `build_runner::apply_cargo_host_overrides` keeps for dioxus hosts, which
@@ -32,9 +40,9 @@ DESCRIPTION
     `--no-default-features` and the host's `hot_patch`/`rendering`) so the
     editor's host-side macro-graph unions are reproduced exactly.
 
-    Extensions are found by convention (every `extensions/<folder>/<crate>` crate;
-    their wrappers sit in the folder's `generated/`), and generated projects are the `host_project_*`
-    crates present at the time.
+    Extensions are found by convention (every `extensions/<folder>/<crate>`
+    crate); the projects are every example with both a `project_settings.yaml`
+    and a `Cargo.toml`.
 
 USAGE
   python devops/tests/test_engine_feature_drift.py [--verbose]
@@ -53,7 +61,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-MODULES = Path(__file__).resolve().parents[2] / "modules"
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.workspace_graph import Crate, example_projects  # noqa: E402
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+MODULES = REPOSITORY / "modules"
 
 # The shared engine libraries whose subtrees must resolve identically.
 # The shared dylibs whose resolved features must agree in every build: the
@@ -139,85 +153,144 @@ def module_names():
     return sorted(module_folders())
 
 
-# The generated wrapper directory of extension crate `name`.
-def wrapper_directory(name):
-    return MODULES / "extensions" / module_folders()[name] / "generated" / f"host_module_{name}"
+# The extension's manifest, read through the shared reader.
+def module_crate(name):
+    return Crate(MODULES / "extensions" / module_folders()[name] / name / "Cargo.toml")
 
 
 # The feature names an extension declares, minus the `default` key: the set a
-# generated wrapper enables on its dependency edge.
+# generated wrapper enables on its dependency edge. The wrapper file is never
+# read - only what it would carry.
 def wrapper_features(name):
-    manifest = MODULES / "extensions" / module_folders()[name] / name / "Cargo.toml"
-    text = manifest.read_text(encoding="utf-8")
-    section = re.search(r"^\[features\]\s*$(.*?)(^\[|\Z)", text, re.MULTILINE | re.DOTALL)
-    if not section:
+    return [feature for feature in module_crate(name).declared_features() if feature != "default"]
+
+
+# Every Rust example project the host can run, in directory order: an example
+# with a settings file and a manifest. A managed project (a `.csproj`) has the
+# settings but no manifest, and no cargo build to measure.
+def rust_projects():
+    return [
+        crate
+        for crate in example_projects(REPOSITORY)
+        if (crate.directory / "project_settings.yaml").is_file()
+    ]
+
+
+# The modules a project's settings declare, in order.
+#
+# The file is flat and hand-written; a YAML parser would be a dependency for
+# one list of names. Both forms are read: the block one (`modules:` followed by
+# `- "name"` lines) and the inline one (`modules: ["name"]`, `modules: []`).
+def project_modules(crate):
+    modules = []
+    inside = False
+    settings = crate.directory / "project_settings.yaml"
+    for line in settings.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("modules:"):
+            rest = stripped[len("modules:") :].strip()
+            modules.extend(re.findall(r'"([^"]+)"', rest))
+            inside = rest == ""
+            continue
+        if not inside or not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("-"):
+            modules.append(stripped[1:].strip().strip('"'))
+        else:
+            inside = False
+    return modules
+
+
+# The engine-feature flags a spawned build carries.
+def engine_selection(engine_features):
+    return ["--features", ",".join(engine_features)] if engine_features else []
+
+
+# The extra `--package`/`--features` editor hosts append to every build: the
+# cargo anchor `build_runner::apply_cargo_host_overrides` keeps for dioxus
+# hosts, without its defaults and with the features the running host was built
+# with. One helper, so the build shapes below cannot drift apart on it.
+def anchor_selection(anchor):
+    if not anchor:
         return []
-    declared = re.findall(r"^([A-Za-z0-9_-]+)\s*=", section.group(1), re.MULTILINE)
-    return [feature for feature in declared if feature != "default"]
+    anchor_package, anchor_features = anchor
+    return [
+        "--package",
+        anchor_package,
+        "--no-default-features",
+        "--features",
+        ",".join(f"{anchor_package}/{feature}" for feature in anchor_features),
+    ]
 
 
-# Every generated project crate currently present.
-def project_names():
-    return [path.parent.name for path in sorted(MODULES.glob("projects_generated/host_project_*/Cargo.toml"))]
+# The module build of `name`: the crate selected directly, with the features
+# its generated wrapper would enable and the engine features the host passes.
+# Measured through the crate, not the wrapper: the wrapper is gitignored and
+# exists only after the host's first start, the two resolve the same graph, and
+# only this shape exists on every checkout.
+def module_selection(name, engine_features, anchor):
+    features = [f"{name}/{feature}" for feature in wrapper_features(name)]
+    features += engine_features
+    selection = ["--package", name]
+    if features:
+        selection += ["--features", ",".join(features)]
+    return selection + anchor_selection(anchor)
+
+
+# The project build as the host runs it: `cargo build --package
+# host_project_<package>`. The member's own resolution is taken from the
+# example's manifest - the crates under `modules/extensions/` it names
+# directly, each with the features it asks of them - which is the same graph
+# the generated member carries, minus the member package itself, and with the
+# manifest's per-edge `default-features = false` not applied: no module
+# declares defaults today, so the two agree; a module that gains them would
+# surface here as drift, which is what this guard exists to report.
+def project_selection(crate, engine_features, anchor):
+    selection = []
+    features = []
+    for key, value in crate.manifest.get("dependencies", {}).items():
+        if not isinstance(value, dict) or "modules/extensions/" not in value.get("path", ""):
+            continue
+        selection += ["--package", key]
+        features += [f"{key}/{feature}" for feature in value.get("features", [])]
+    features += engine_features
+    if features:
+        selection += ["--features", ",".join(features)]
+    return selection + anchor_selection(anchor)
 
 
 # The builds a host running `frontend` spawns, as {label: cargo selection}.
 #
-# An extension is measured through its generated wrapper when one exists (the
-# host writes those on startup, so a checkout that ran the host covers this
-# path), and otherwise through the extension selected directly with the same
-# feature set the wrapper would enable.
+# Every one is derived from tracked sources: the extension crates by the
+# `extensions/<folder>/<crate>` convention, the projects and their startup
+# batches from the project settings. Nothing reads a generated `host_module_*`
+# / `host_project_*` crate, so a fresh clone measures exactly what a used
+# checkout measures.
+#
+# The startup batch invocation selects, in one cargo call, every module the
+# host will load plus the project member (see `build_runner::build_extension_batch`),
+# so its incremental content over the per-module builds is the feature
+# unification across that whole selection. Measured per project, from its
+# settings, as the union of that project's modules; the member's own graph is
+# the project build above.
 def spawned_builds(frontend):
     _, engine_features, anchor = FRONTENDS[frontend]
     builds = {}
     for module in module_names():
-        wrapper = f"host_module_{module}"
-        if wrapper_directory(module).is_dir():
-            selection = ["--package", wrapper]
-            features = list(engine_features)
-        else:
-            selection = ["--package", module]
-            features = [f"{module}/{feature}" for feature in wrapper_features(module)]
+        builds[f"module {module}"] = module_selection(module, engine_features, anchor)
+    for crate in rust_projects():
+        builds[f"project {crate.directory.name}"] = project_selection(crate, engine_features, anchor)
+        modules = project_modules(crate)
+        if modules:
+            selection = []
+            features = []
+            for module in modules:
+                selection += ["--package", module]
+                features += [f"{module}/{feature}" for feature in wrapper_features(module)]
             features += engine_features
-        if features:
-            selection += ["--features", ",".join(features)]
-        if anchor:
-            anchor_package, anchor_features = anchor
-            selection += ["--package", anchor_package, "--no-default-features", "--features"]
-            selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
-        builds[f"module {module}"] = selection
-    # The startup batch invocation selects, in one cargo call, every wrapper
-    # the host will load plus its native project member (and, in a windowed
-    # host, the renderer's wrapper - among the wrappers below). See
-    # `build_runner::build_extension_batch`; its engine resolution must match
-    # the host just like the per-module builds'. Only generated members can be
-    # selected: a host batches exactly the modules it loads, whose members it
-    # wrote on startup.
-    batch_packages = [
-        f"host_module_{module}"
-        for module in module_names()
-        if wrapper_directory(module).is_dir()
-    ]
-    batch_packages += project_names()
-    if len(batch_packages) > 1:
-        batch = []
-        for package in batch_packages:
-            batch += ["--package", package]
-        if engine_features:
-            batch += ["--features", ",".join(engine_features)]
-        if anchor:
-            anchor_package, anchor_features = anchor
-            batch += ["--package", anchor_package, "--no-default-features", "--features"]
-            batch += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
-        builds["startup batch"] = batch
-    for project in project_names():
-        project_features = ["--features", ",".join(engine_features)] if engine_features else []
-        selection = ["--package", project, *project_features]
-        if anchor:
-            anchor_package, anchor_features = anchor
-            selection += ["--package", anchor_package, "--no-default-features", "--features"]
-            selection += [",".join(f"{anchor_package}/{feature}" for feature in anchor_features)]
-        builds[f"project {project}"] = selection
+            if features:
+                selection += ["--features", ",".join(features)]
+            builds[f"batch {crate.directory.name}"] = selection + anchor_selection(anchor)
     return builds
 
 
@@ -254,7 +327,7 @@ def main():
         print(f"error: {error}", file=sys.stderr)
         return 2
     print(f"modules: {', '.join(module_names())}")
-    print(f"generated projects: {', '.join(project_names()) or 'none present'}")
+    print(f"projects: {', '.join(crate.directory.name for crate in rust_projects()) or 'none'}")
     print(f"builds measured: {measured_count}")
     for (dylib, package, description), builds in sorted(drift.items()):
         print(f"  FAIL  {dylib}: {package} {description} ({len(builds)} build(s))")
