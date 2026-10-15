@@ -15,10 +15,15 @@ and re-renders it whenever the file's bytes change. The suite:
 4. waits for a `restyled revision=1` token with the new rule count;
 5. checks the probe exits cleanly.
 
+The probe runs from `modules/`, so the host binary is the one `cargo build -p
+pill_standalone` writes there; with no path argument the suite builds that
+posture itself (or reuses it under `--skip-build`) through the shared host
+helper, and takes the host lock before it starts anything.
+
 REQUIREMENTS: the dev `pill_standalone` built.
 
 USAGE:
-  python devops/tests/test_pill_ui_style.py [path/to/pill_standalone.exe]
+  python devops/tests/test_pill_ui_style.py [path/to/pill_standalone.exe] [--skip-build]
 
 EXAMPLE USAGE:
   python devops/tests/test_pill_ui_style.py modules/target/debug/pill_standalone.exe
@@ -28,10 +33,21 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import time
 
-SUITE_ROOT = Path(__file__).resolve().parents[2]
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core import suite_common as common  # noqa: E402
+from core.suite_common import *  # noqa: E402,F401,F403
+
+SUITE_ROOT = common.WORKSPACE_ROOT
+
+# The probe renders through `pill_ui` alone, so it needs no renderer and no
+# window: the default dev host, hot patch included, is the posture.
+HOST_POSTURE = HOST_DEV_HOT_PATCH
 
 # The probe's tokens, in order.
 STYLED_TOKEN = "[ui probe] styled"
@@ -81,15 +97,24 @@ def main():
         "binary",
         type=Path,
         nargs="?",
-        default=Path("modules/target/debug/pill_standalone.exe"),
+        default=None,
+        help="A prebuilt pill_standalone.exe; built for the suite's posture when omitted",
     )
     parser.add_argument("--timeout", type=int, default=120)
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
-    binary = args.binary if args.binary.is_absolute() else SUITE_ROOT / args.binary
-    binary = binary.resolve()
-    if not binary.is_file():
-        raise SystemExit(f"missing {binary}; build it first: cargo build -p pill_standalone")
+    ensure_host_lock()
+    binary = args.binary
+    if binary is None:
+        if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT):
+            raise SystemExit("no usable host; see the failure above")
+        binary = HOST_EXE
+    else:
+        binary = binary if binary.is_absolute() else SUITE_ROOT / binary
+        binary = binary.resolve()
+        if not binary.is_file():
+            raise SystemExit(f"missing {binary}; build it first: cargo build -p pill_standalone")
 
     logs = SUITE_ROOT / "local" / "renderer-validation"
     logs.mkdir(parents=True, exist_ok=True)
@@ -142,6 +167,7 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait(timeout=10)
+                kill_stale_hosts()
 
 
 if __name__ == "__main__":

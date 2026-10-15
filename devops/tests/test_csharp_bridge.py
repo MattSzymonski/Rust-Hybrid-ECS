@@ -58,7 +58,6 @@ EXAMPLE USAGE
 import argparse
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -957,45 +956,15 @@ SESSION_SCENARIOS = [
 # =============================================================================
 
 
-def build_host() -> bool:
-    """Builds the standalone host once before the suite runs."""
-    print("\n  [PREP] Building pill_standalone (offline)...")
-    try:
-        # `hot_patch` is a default feature now; this suite exercises the C#
-        # assembly-swap reload, so pin the reload-only posture to keep the
-        # Rust patch fast path out of the host it drives.
-        #
-        # `rendering` is on because `project_cs` queries the renderer's own
-        # components: the managed manifest marks every type the runtime
-        # assembly declares as shared, and a shared component with no native
-        # binding is refused at startup. A headless host has no binding for
-        # `TracyLive.MeshRendererComponent` and dies there, which is what this suite used to
-        # do before the feature was pinned.
-        result = subprocess.run(
-            [
-                "cargo",
-                "build",
-                "--package",
-                "pill_standalone",
-                "--no-default-features",
-                "--features",
-                "dev,rendering",
-                "--offline",
-            ],
-            cwd=str(MODULES_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=BUILD_TIMEOUT,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as error:
-        print(f"  [FAIL] Could not build the host: {error}")
-        return False
-    if result.returncode != 0:
-        print("  [FAIL] Host build failed:")
-        print(result.stderr[-2000:])
-        return False
-    print("  [OK] Host built.")
-    return True
+# This suite exercises the C# assembly-swap reload, so it pins the reload-only
+# posture to keep the Rust patch fast path out of the host it drives.
+#
+# `rendering` is on because `project_cs` queries the renderer's own components:
+# the managed manifest marks every type the runtime assembly declares as
+# shared, and a shared component with no native binding is refused at startup.
+# A headless host has no binding for `TracyLive.MeshRendererComponent` and dies
+# there, which is what this suite used to do before the feature was pinned.
+HOST_POSTURE = HOST_DEV_RENDERING
 
 
 def write_bridge_probe() -> None:
@@ -1187,17 +1156,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="C# <-> Rust bridge integration suite for Rust-Hybrid-ECS"
     )
-    parser.add_argument(
-        "--timeout-scale",
-        type=float,
-        default=1.0,
-        help="Multiply all timeouts for slow machines (default: 1.0)",
-    )
-    parser.add_argument(
-        "--skip-build",
-        action="store_true",
-        help="Skip the initial host build (assume it is already built)",
-    )
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     if args.timeout_scale <= 0:
@@ -1214,6 +1173,9 @@ def main() -> None:
     SETTLE_TIMEOUT = int(SETTLE_TIMEOUT * scale)
     STABILITY_SLEEP = max(1, int(STABILITY_SLEEP * scale))
     BUILD_TIMEOUT = int(BUILD_TIMEOUT * scale)
+
+    ensure_host_lock()
+    kill_stale_hosts()
 
     # Capture originals for every file the suite may touch, including the
     # committed bootstrap mirror that the codegen-rebuild check deletes. The
@@ -1235,13 +1197,10 @@ def main() -> None:
     if SPLINE_GENERATED_FILE.exists():
         COMMITTED_MIRROR_BYTES = SPLINE_GENERATED_FILE.read_bytes()
 
-    kill_stale_hosts()
-
     passed = True
     try:
-        if not args.skip_build:
-            if not build_host():
-                sys.exit(1)
+        if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT):
+            sys.exit(1)
         if not run_csharp_session():
             passed = False
         if passed:
@@ -1252,7 +1211,7 @@ def main() -> None:
         BACKUP.restore_all()
         # Restore the C# project's settings file last.
         csharp_settings_path = project_settings_yaml(CSHARP_PROJECT_ROOT)
-        if csharp_settings_path in BACKUP._originals:
+        if BACKUP.captured(csharp_settings_path):
             BACKUP.restore_one(csharp_settings_path)
         # The probe file belongs to the suite, so it is removed rather than
         # restored: `restore_all` put its captured content back a moment ago.

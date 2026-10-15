@@ -283,12 +283,6 @@ ROLLBACK_RESOURCE_INSERT_AND_FAIL = """\
     return 1;
 """
 
-# The module's sample-offset constant, edited to trigger a body-only reload.
-# A plain `f32` literal, so exactly one line matches.
-SAMPLE_OFFSET_PATTERN = re.compile(
-    r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
-)
-
 # `pill_spline::register` counts the splines already in the world before topping
 # up to its demo count, and logs the number. After a reload it must be 1: the
 # rows the retiring generation created survived into the new one.
@@ -302,8 +296,6 @@ REPORT_SAMPLE_TIMEOUT = 20
 COLLISION_TIMEOUT = 150
 RELOAD_TIMEOUT_SECONDS = 180
 
-ORIGINAL_PROJECT_SETTINGS: Optional[str] = None
-
 # A report line naming one stored column, e.g.
 #   "│    bit   0  pill_spline::Spline    1 x 200 B │"
 COLUMN_LINE_PATTERN = re.compile(r"^\W*bit\s+(\d+)\s+(\S+)")
@@ -312,30 +304,6 @@ COLUMN_LINE_PATTERN = re.compile(r"^\W*bit\s+(\d+)\s+(\S+)")
 # =============================================================================
 # Host configuration
 # =============================================================================
-
-
-def install_test_project_settings() -> None:
-    """Backs up the example project's settings and installs this suite's own.
-
-    The extension list is read only from this file, so the suite writes a
-    minimal one loading just `pill_spline`, keeping the scenario independent of
-    whatever modules the project happens to list.
-    """
-    global ORIGINAL_PROJECT_SETTINGS
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    ORIGINAL_PROJECT_SETTINGS = (
-        settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    )
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
-
-
-def restore_project_settings() -> None:
-    """Restores the project's settings file, or removes this suite's own."""
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    if ORIGINAL_PROJECT_SETTINGS is None:
-        settings_path.unlink(missing_ok=True)
-    else:
-        settings_path.write_text(ORIGINAL_PROJECT_SETTINGS, encoding="utf-8", newline="")
 
 
 def set_shared_identity(enabled: bool) -> None:
@@ -373,16 +341,8 @@ def edit_sample_offset() -> None:
     rather than a schema migration - which is what this scenario wants to
     observe the shared column surviving.
     """
-    content = read_source(SPLINE_LIB_RS)
-    matches = list(SAMPLE_OFFSET_PATTERN.finditer(content))
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"Expected exactly one SAMPLE_VERTICAL_OFFSET line, found {len(matches)}"
-        )
-    match = matches[0]
-    new_offset = (float(match.group(2)) + 1.0) % 10.0
-    new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset:.1f};"
-    atomic_write(SPLINE_LIB_RS, content.replace(match.group(0), new_line, 1))
+    edit = edit_spline_sample_offset(read_source(SPLINE_LIB_RS))
+    apply_replacements(SPLINE_LIB_RS, edit.replacements)
 
 
 def restore_then_install(*paths: Path) -> None:
@@ -511,48 +471,19 @@ def install_failing_reload_with_resource() -> None:
 # Process helpers
 # =============================================================================
 
+# `rendering` is required, not a preference. `examples/project_rs` links
+# `pill_master_renderer` directly, so the project build resolves the wgpu
+# graph, and the host's engine dylibs must match the resolution every spawned
+# build gets (`apply_cargo_host_overrides` in
+# `pill_host/src/build_runner.rs` mirrors the host's engine features).
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
+
 
 def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the headless host against `examples/project_rs`."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
-    # `rendering` is required, not a preference. `examples/project_rs` links
-    # `pill_master_renderer` directly, so the project build resolves the wgpu
-    # graph, and the host's engine dylibs must match the resolution every
-    # spawned build gets (`apply_cargo_host_overrides` in
-    # `pill_host/src/build_runner.rs` mirrors the host's engine features).
-    return launch_process(
-        ["cargo", "run", "--package", "pill_standalone", "--features", "rendering"],
-        MODULES_ROOT,
-        process_environment,
-    )
-
-
-def build_host() -> bool:
-    """Builds the standalone host once so a launch does not pay for it."""
-    print("\n  [PREP] Building pill_standalone...")
-    try:
-        result = subprocess.run(
-            ["cargo", "build", "-p", "pill_standalone", "--features", "rendering"],
-            cwd=str(MODULES_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=PREBUILD_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  [FAIL] Pre-build timed out after {PREBUILD_TIMEOUT} seconds.")
-        return False
-    except FileNotFoundError:
-        print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
-        return False
-
-    if result.returncode != 0:
-        print("  [FAIL] Pre-build failed:")
-        print(result.stderr[-2000:])
-        return False
-
-    print("  [OK] Host built.")
-    return True
+    return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, process_environment)
 
 
 # =============================================================================
@@ -1199,16 +1130,11 @@ def main() -> None:
         description="Shared component identity integration test for Rust-Hybrid-ECS"
     )
     parser.add_argument(
-        "--timeout-scale",
-        type=float,
-        default=1.0,
-        help="Multiply all timeouts for slow machines (default: 1.0)",
-    )
-    parser.add_argument(
         "--scenario",
         choices=sorted(SCENARIOS),
         help="Run one scenario instead of all of them",
     )
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     if args.timeout_scale <= 0:
@@ -1242,16 +1168,20 @@ def main() -> None:
     print(f"  Time scale: {args.timeout_scale}x")
     print("=" * 66)
 
+    ensure_host_lock()
+    kill_stale_hosts()
+
     # The suite edits the module source and the project's settings; both are
     # captured now and restored whatever happens below.
     BACKUP.capture(SPLINE_LIB_RS)
     BACKUP.capture(PROJECT_LIB_RS)
-    kill_stale_hosts()
-    install_test_project_settings()
+    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
+    BACKUP.capture(settings_path)
+    write_project_settings(NATIVE_PROJECT_ROOT, TEST_PROJECT_SETTINGS)
 
     results = []
     try:
-        if not build_host():
+        if not prepare_host(HOST_POSTURE, args, PREBUILD_TIMEOUT):
             sys.exit(1)
         for name, scenario in selected:
             try:
@@ -1267,7 +1197,9 @@ def main() -> None:
         # judge the stale DLL fresh and load a module whose identity does not
         # match the source on disk.
         BACKUP.restore_all(reset_mtime=False)
-        restore_project_settings()
+        # A project that had no settings file must not be left with this one.
+        if not BACKUP.captured(settings_path):
+            settings_path.unlink(missing_ok=True)
         kill_stale_hosts()
         print("  [OK] Restored.")
 

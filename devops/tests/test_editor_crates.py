@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
 # Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -77,13 +77,7 @@ GENERATIONS_PATTERN = re.compile(r"\[editor\] pill_spline_editor loaded.*loaded_
 STARTUP_TIMEOUT = 300
 RELOAD_TIMEOUT = 120
 QUIET_SECONDS = 8
-
-SAMPLE_OFFSET_PATTERN = re.compile(
-    r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
-)
-
-ORIGINALS: Dict[Path, str] = {}
-ORIGINAL_SETTINGS = None
+PREBUILD_TIMEOUT = 420
 
 
 # =============================================================================
@@ -91,52 +85,24 @@ ORIGINAL_SETTINGS = None
 # =============================================================================
 
 
-def backup(path: Path) -> None:
-    """Remembers a file's content so it can be restored at the end."""
-    ORIGINALS[path] = path.read_text(encoding="utf-8")
-
-
-def restore_all() -> None:
-    """Restores every backed-up source and the project's settings file."""
-    for path, content in ORIGINALS.items():
-        if path.read_text(encoding="utf-8") != content:
-            common.atomic_write(path, content)
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    if ORIGINAL_SETTINGS is None:
-        settings_path.unlink(missing_ok=True)
-    else:
-        settings_path.write_text(ORIGINAL_SETTINGS, encoding="utf-8", newline="")
-
-
-def install_test_project_settings() -> None:
-    """Backs up the example project's settings and installs a `pill_spline`-only list."""
-    global ORIGINAL_SETTINGS
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    ORIGINAL_SETTINGS = settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
-
-
 def edit_spline_offset() -> None:
     """Moves `pill_spline`'s sample offset by one, a code change that rebuilds the crate."""
-    content = ORIGINALS[SPLINE_SOURCE]
-    match = SAMPLE_OFFSET_PATTERN.search(content)
-    if match is None:
-        raise RuntimeError("SAMPLE_VERTICAL_OFFSET not found in pill_spline")
-    new_offset = (float(match.group(2)) + 1.0) % 10.0
-    new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset:.1f};"
-    common.atomic_write(SPLINE_SOURCE, content.replace(match.group(0), new_line, 1))
+    content = read_source(SPLINE_SOURCE)
+    apply_replacements(SPLINE_SOURCE, edit_spline_sample_offset(content).replacements)
 
 
 def edit_editor_crate() -> None:
     """Adds a trailing comment to the editor crate, which rebuilds only it."""
-    common.atomic_write(
-        EDITOR_SOURCE, ORIGINALS[EDITOR_SOURCE] + "\n// test_editor_crates.py edit\n"
-    )
+    atomic_write(EDITOR_SOURCE, read_source(EDITOR_SOURCE) + "\n// test_editor_crates.py edit\n")
 
 
 # =============================================================================
 # Host helpers
 # =============================================================================
+
+# `rendering` because `examples/project_rs` links the renderer's data crate; no
+# `hot_patch`, so every edit takes the plain reload path this suite measures.
+HOST_POSTURE = HOST_DEV_RENDERING
 
 
 def launch_host(editor_posture: bool) -> Tuple[subprocess.Popen, OutputMonitor]:
@@ -152,12 +118,7 @@ def launch_host(editor_posture: bool) -> Tuple[subprocess.Popen, OutputMonitor]:
         environment["PILL_EDITOR_POSTURE"] = "1"
     else:
         environment.pop("PILL_EDITOR_POSTURE", None)
-    return launch_process(
-        ["cargo", "run", "--package", "pill_standalone", "--no-default-features",
-         "--features", "dev,rendering"],
-        MODULES_ROOT,
-        environment,
-    )
+    return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
 
 
 def stop_host(process: subprocess.Popen, monitor: OutputMonitor) -> None:
@@ -267,31 +228,41 @@ def editor_posture_loads_and_cascades() -> bool:
 
 def main() -> None:
     """Parses arguments, runs both postures, restores every edited file."""
-    global STARTUP_TIMEOUT, RELOAD_TIMEOUT
+    global STARTUP_TIMEOUT, RELOAD_TIMEOUT, PREBUILD_TIMEOUT
     parser = argparse.ArgumentParser(description="Extension editor crates integration test")
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply all timeouts for slow machines (default: 1.0)")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
     if args.timeout_scale <= 0:
         print("ERROR: --timeout-scale must be > 0")
         sys.exit(1)
     STARTUP_TIMEOUT = int(STARTUP_TIMEOUT * args.timeout_scale)
     RELOAD_TIMEOUT = int(RELOAD_TIMEOUT * args.timeout_scale)
+    PREBUILD_TIMEOUT = int(PREBUILD_TIMEOUT * args.timeout_scale)
 
     print("=" * 60)
     print("  Extension Editor Crates Integration Test")
     print("=" * 60)
 
+    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
+    ensure_host_lock()
     kill_stale_hosts()
-    backup(SPLINE_SOURCE)
-    backup(EDITOR_SOURCE)
-    install_test_project_settings()
+    BACKUP.capture(SPLINE_SOURCE)
+    BACKUP.capture(EDITOR_SOURCE)
+    BACKUP.capture(settings_path)
+    write_project_settings(NATIVE_PROJECT_ROOT, TEST_PROJECT_SETTINGS)
+    if not prepare_host(HOST_POSTURE, args, PREBUILD_TIMEOUT):
+        sys.exit(1)
     passed = False
     try:
         passed = standalone_posture_ignores_editor_crates() and editor_posture_loads_and_cascades()
     finally:
         print("\n  [CLEANUP] Restoring sources and project settings...")
-        restore_all()
+        # `reset_mtime=False`: the last host build was of the EDITED module, and
+        # nothing reloaded the restored bytes, so the restored source must look
+        # newer than that artifact or the next host start trusts a stale DLL.
+        BACKUP.restore_all(reset_mtime=False)
+        if not BACKUP.captured(settings_path):
+            settings_path.unlink(missing_ok=True)
     print("\n" + "=" * 60)
     print("  TEST PASSED" if passed else "  TEST FAILED")
     print("=" * 60)

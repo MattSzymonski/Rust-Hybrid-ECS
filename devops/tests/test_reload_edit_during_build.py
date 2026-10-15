@@ -44,7 +44,6 @@ EXAMPLE USAGE
 import argparse
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -74,10 +73,8 @@ MODULE_NAME = "pill_spline"
 # keeps one module of a given name per process, so the project DLL loads
 # against the host's copy and fails with "The specified procedure could not be
 # found" (os error 127), naming nothing. The sibling hot-patch suites pass the
-# same pair. See `test_shared_component_identity.py` for the same note.
-HOST_LAUNCH_COMMAND = [
-    "cargo", "run", "-p", "pill_standalone", "--features", "pill_host/hot_patch,rendering",
-]
+# same posture. See `test_shared_component_identity.py` for the same note.
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 # The structured logger puts two spaces between the message and its fields.
 BUILD_STARTED = f'building extension  module="{MODULE_NAME}"'
@@ -101,22 +98,6 @@ ANCHOR = "cubic_term) * 0.5"
 def count_occurrences(output: str, token: str) -> int:
     """How many times a token appears, for before/after comparisons."""
     return output.count(token)
-
-
-def build_host() -> bool:
-    """Build the standalone host with the hot-patch feature enabled."""
-    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch,rendering")
-    completed = subprocess.run(
-        ["cargo", "build", "-p", "pill_standalone", "--features", "pill_host/hot_patch,rendering"],
-        cwd=str(MODULES_ROOT), capture_output=True, text=True,
-        timeout=BUILD_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        print("  [FAIL] Host build failed:")
-        print(completed.stderr[-2000:])
-        return False
-    print("  [OK] Host built.")
-    return True
 
 
 def run_edit_during_build_scenario(
@@ -183,12 +164,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Assert a save made during a rebuild is not lost"
     )
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply every timeout (slow machines)")
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Assume pill_standalone is already built")
     parser.add_argument("--second-edit-delay", type=float, default=SECOND_EDIT_DELAY,
                         help="Seconds to wait before the second save")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     global REBUILD_TIMEOUT
@@ -201,14 +179,15 @@ def main() -> None:
     print(f"  Second save after: {args.second_edit_delay}s")
     print("=" * 70)
 
+    ensure_host_lock()
     kill_stale_hosts()
-    if not args.skip_build and not build_host():
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT_SECONDS):
         sys.exit(1)
 
     environment = os.environ.copy()
     environment["PROJECT_PATH"] = "../examples/project_rs"
-    process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
-    backups = BackupRegistry()
+    process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
+    backups = BACKUP
     passed = False
     try:
         if not monitor.wait_for(STARTUP_TOKEN, startup_timeout):
@@ -223,7 +202,7 @@ def main() -> None:
         # edit's build, not the original. Rewinding the mtime here would make the
         # next host start trust that stale artifact as up to date; leave the
         # file stamped "now" so the next build regenerates the original.
-        backups.restore_all(reset_mtime=False)
+        BACKUP.restore_all(reset_mtime=False)
         terminate_process(process, monitor)
         print("  [OK] Restored.")
 

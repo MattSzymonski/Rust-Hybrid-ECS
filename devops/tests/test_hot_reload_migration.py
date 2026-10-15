@@ -96,6 +96,10 @@ CYCLE_PAUSE = 2
 
 ORIGINAL_CONTENT: str = ""
 
+# `hot_patch` is a default feature now; this suite measures migration through
+# the plain reload transaction, so it drives the reload-only host posture.
+HOST_POSTURE = HOST_DEV
+
 # =============================================================================
 # Source edit patterns
 # =============================================================================
@@ -514,24 +518,10 @@ def validate_witness_tokens(
 
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Starts the standalone host via cargo and returns process + monitor."""
+    """Starts the standalone host and returns process + monitor."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../devops/tests/project"
-    # `hot_patch` is a default feature now; this suite measures migration via
-    # the plain reload transaction, so pin the reload-only posture.
-    return launch_process(
-        [
-            "cargo",
-            "run",
-            "--package",
-            "pill_standalone",
-            "--no-default-features",
-            "--features",
-            "dev",
-        ],
-        WORKSPACE_ROOT / "modules",
-        process_environment,
-    )
+    return launch_process(host_command(HOST_POSTURE), WORKSPACE_ROOT / "modules", process_environment)
 
 
 # =============================================================================
@@ -882,44 +872,12 @@ def run_suite(cycles: int) -> bool:
 # =============================================================================
 
 
-def build_workspace() -> bool:
-    """Builds the standalone host before the integration suite starts."""
-    print("\n  [PREP] Building standalone host...")
-    try:
-        result = subprocess.run(
-            # `--package pill_standalone`, not `--workspace`: the host is all
-            # this suite needs built, and it keeps the suite independent of
-            # whatever else a full workspace build would pull in.
-            # `hot_patch` is a default feature now; pin the reload-only posture
-            # so this suite measures migration, not patching.
-            [
-                "cargo",
-                "build",
-                "--package",
-                "pill_standalone",
-                "--no-default-features",
-                "--features",
-                "dev",
-            ],
-            cwd=str(WORKSPACE_ROOT / "modules"),
-            capture_output=True,
-            text=True,
-            timeout=BUILD_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  [FAIL] Build timed out after {BUILD_TIMEOUT} seconds.")
-        return False
-    except FileNotFoundError:
-        print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
-        return False
+def build_fixture_project() -> bool:
+    """Builds the `devops/tests/project` fixture this suite drives.
 
-    if result.returncode != 0:
-        print("  [FAIL] Build failed:")
-        print(result.stderr[-2000:])
-        return False
-
-    print("  [OK] Workspace built.")
-
+    The host itself comes from the shared `prepare_host`; this is the one
+    build that is not a host posture, so it stays local.
+    """
     print("  [PREP] Building devops/tests/project crate...")
     try:
         tests_project_result = subprocess.run(
@@ -970,12 +928,7 @@ def main() -> None:
         default=1,
         help="Number of full scenario-suite cycles (default: 1)",
     )
-    parser.add_argument(
-        "--timeout-scale",
-        type=float,
-        default=1.0,
-        help="Multiply all timeouts for slow machines (default: 1.0)",
-    )
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     if args.cycles < 1:
@@ -989,6 +942,8 @@ def main() -> None:
         print(f"ERROR: Missing source file: {PROJECT_LIB_RS}")
         sys.exit(1)
 
+    ensure_host_lock()
+
     apply_timeout_scale(args.timeout_scale)
     ORIGINAL_CONTENT = read_source(PROJECT_LIB_RS)
 
@@ -999,7 +954,7 @@ def main() -> None:
     print(f"  Time scale: {args.timeout_scale}x")
     print("=" * 60)
 
-    if not build_workspace():
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT) or not build_fixture_project():
         restore_original()
         sys.exit(1)
 

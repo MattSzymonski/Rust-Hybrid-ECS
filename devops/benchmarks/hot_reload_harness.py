@@ -990,7 +990,7 @@ def main() -> None:
             project_settings_yaml(NATIVE_PROJECT_ROOT),
             project_settings_yaml(CSHARP_PROJECT_ROOT),
         ):
-            if path in BACKUP._originals:
+            if BACKUP.captured(path):
                 BACKUP.restore_one(path)
 
     if startup_results:

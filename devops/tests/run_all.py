@@ -132,8 +132,14 @@ def discover_suites() -> Tuple[List[Suite], List[str]]:
         sets = [name.strip() for name in header_field(docstring, "SETS").split(",") if name.strip()]
         run = header_field(docstring, "RUN")
         manual = run.split("-", 1)[1].strip() if run.startswith("manual") and "-" in run else run
-        # A suite accepts a pass-through flag when its parser declares it.
-        accepts = [flag for flag in ("--timeout-scale", "--skip-build") if f'"{flag}"' in source]
+        # A suite accepts a pass-through flag when it declares it itself or
+        # takes the shared argument helper that declares both.
+        shared_arguments = "add_common_suite_arguments" in source
+        accepts = [
+            flag
+            for flag in ("--timeout-scale", "--skip-build")
+            if shared_arguments or f'"{flag}"' in source
+        ]
         suites.append(Suite(path.name, tier, protects, sets, manual, accepts))
     suites.sort(key=lambda suite: (TIER_ORDER.index(suite.tier), suite.name))
     return suites, errors

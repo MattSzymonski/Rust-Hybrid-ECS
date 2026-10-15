@@ -24,11 +24,12 @@ DESCRIPTION
     covers the asynchronous readback.
 
 USAGE
-  python devops/tests/test_picking.py [--timeout-scale S]
+  python devops/tests/test_picking.py [--timeout-scale S] [--skip-build]
 
 EXAMPLE USAGE
   python devops/tests/test_picking.py
   python devops/tests/test_picking.py --timeout-scale 1.5
+  python devops/tests/test_picking.py --skip-build
 
 --- SCRIPT ---
 """
@@ -63,6 +64,13 @@ GPU_ERROR_TOKEN = "GPU error"
 STARTUP_TIMEOUT = 600
 ANSWER_TIMEOUT = 60
 
+# `rendering` is required, not a preference: the project links
+# `pill_master_renderer`, so the project build resolves the wgpu graph, and the
+# host's engine dylibs must match the resolution every spawned build gets. The
+# suite picks the entity the renderer's pick buffer answers with, so it is also
+# the posture that carries the renderer at all.
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
+
 
 # =============================================================================
 # Helpers
@@ -74,11 +82,7 @@ def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
     environment = os.environ.copy()
     environment["PROJECT_PATH"] = PROJECT_PATH
     environment["PILL_PICK_TEST"] = "1"
-    return launch_process(
-        ["cargo", "run", "--package", "pill_standalone", "--features", "rendering"],
-        MODULES_ROOT,
-        environment,
-    )
+    return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
 
 
 def require(monitor: OutputMonitor, token: str, timeout: float, start: int, what: str) -> bool:
@@ -135,8 +139,7 @@ def main() -> None:
     """Parses arguments and runs the suite."""
     global STARTUP_TIMEOUT, ANSWER_TIMEOUT
     parser = argparse.ArgumentParser(description="Picking and selection outline integration test")
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply all timeouts for slow machines (default: 1.0)")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
     if args.timeout_scale <= 0:
         print("ERROR: --timeout-scale must be > 0")
@@ -144,10 +147,13 @@ def main() -> None:
     STARTUP_TIMEOUT = int(STARTUP_TIMEOUT * args.timeout_scale)
     ANSWER_TIMEOUT = int(ANSWER_TIMEOUT * args.timeout_scale)
 
+    ensure_host_lock()
     print("=" * 60)
     print("  Picking And Outline Integration Test")
     print("=" * 60)
     kill_stale_hosts()
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT):
+        sys.exit(1)
     passed = run_suite()
     print("\n" + "=" * 60)
     print("  TEST PASSED" if passed else "  TEST FAILED")
