@@ -2,6 +2,7 @@
 
 PROTECTS: The command layer: built-in commands by id, menus, the palette and live keymap presets.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

@@ -2,6 +2,7 @@
 
 PROTECTS: Scene selection: clicks pick entities through the pick contract; gizmo drags are undoable.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

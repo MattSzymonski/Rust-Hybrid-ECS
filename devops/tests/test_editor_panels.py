@@ -2,6 +2,7 @@
 
 PROTECTS: The panel registration API: an extension panel opens, records undo steps and live-patches.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

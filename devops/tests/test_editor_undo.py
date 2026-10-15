@@ -2,6 +2,7 @@
 
 PROTECTS: Undo and redo: field edits, drags, component, entity and asset commands round-trip.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+

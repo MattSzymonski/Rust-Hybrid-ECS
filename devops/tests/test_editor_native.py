@@ -2,6 +2,7 @@
 
 PROTECTS: The native editor: startup, shell module, input routing, live patch, overlays, safe mode.
 TIER: editor
+SETS: editor
 
 Builds against an already-built `pill_editor_native` binary, starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the

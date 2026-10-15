@@ -24,7 +24,8 @@ DESCRIPTION
     without a valid `TIER:` is a usage error, so a new suite cannot silently
     drop out of the run. `RUN: manual` suites (they need an argument or an
     unattended screen) run only when named with `--only` or with
-    `--include-manual`.
+    `--include-manual`; a batch that leaves them out reports them as
+    `SKIPPED (manual)` in the summary, so it never drops one quietly.
 
     `--timeout-scale` and `--skip-build` are passed to each suite whose own
     argument parser declares them, and to no other.
@@ -163,8 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def select_suites(suites: List[Suite], arguments: argparse.Namespace) -> Optional[List[Suite]]:
-    """The suites to run, in run order; None on a usage error."""
+def select_suites(suites: List[Suite], arguments: argparse.Namespace) -> Optional[Tuple[List[Suite], List[Suite]]]:
+    """The suites to run and the manual ones the filters matched, in run order.
+
+    Returns `None` on a usage error. Named suites (`--only`) run even when
+    manual, as documented; every other path returns its `RUN: manual` matches
+    in the second list for the summary to report as skipped.
+    """
     if arguments.only:
         known = {suite.name for suite in suites}
         unknown = [name for name in arguments.only if name not in known]
@@ -173,18 +179,20 @@ def select_suites(suites: List[Suite], arguments: argparse.Namespace) -> Optiona
             print("Use --list to see the available suites.")
             return None
         # Named suites run even when manual; order stays canonical.
-        return [suite for suite in suites if suite.name in arguments.only]
-    selected = [suite for suite in suites if arguments.include_manual or not suite.manual]
+        return [suite for suite in suites if suite.name in arguments.only], []
+    matching = list(suites)
     if arguments.tier:
-        selected = [suite for suite in selected if suite.tier in arguments.tier]
+        matching = [suite for suite in matching if suite.tier in arguments.tier]
     if arguments.set:
         known_sets = {name for suite in suites for name in suite.sets}
         unknown_sets = [name for name in arguments.set if name not in known_sets]
         if unknown_sets:
             print(f"Unknown set(s): {', '.join(unknown_sets)}; known: {', '.join(sorted(known_sets))}")
             return None
-        selected = [suite for suite in selected if set(suite.sets) & set(arguments.set)]
-    return selected
+        matching = [suite for suite in matching if set(suite.sets) & set(arguments.set)]
+    if arguments.include_manual:
+        return matching, []
+    return [suite for suite in matching if not suite.manual], [suite for suite in matching if suite.manual]
 
 
 def last_results() -> Dict[str, str]:
@@ -271,6 +279,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     selected = select_suites(suites, arguments)
     if selected is None:
         return 2
+    selected, manual_skipped = selected
     if arguments.list:
         for suite in selected:
             marker = " (manual)" if suite.manual else ""
@@ -297,6 +306,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             verdict = f"FAIL (exit {code})"
         print(f"  {name:<40} {verdict:<24} {seconds:6.1f}s")
+    for suite in manual_skipped:
+        # Not a failure: the summary says why it did not run, so a batch
+        # cannot quietly stop covering a suite (`--include-manual` runs it).
+        reason = suite.manual if len(suite.manual) <= 48 else suite.manual[:45] + "..."
+        print(f"  {suite.name:<40} {'SKIPPED (manual)':<24} {'':>6}  {reason}")
 
     total = sum(seconds for _, _, seconds in results)
     if failed:

@@ -2,6 +2,7 @@
 
 PROTECTS: The built-in panels: Inspector edits, system toggles, Console and Assets toolbar, undoable.
 TIER: editor
+SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
