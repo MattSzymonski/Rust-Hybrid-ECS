@@ -67,6 +67,9 @@ MENU_OPENED_TOKEN = "[editor] menu opened"
 PALETTE_OPENED_TOKEN = "[editor] command palette opened"
 KEYMAP_APPLIED_TOKEN = "[editor] keymap applied"
 HISTORY_UNDO_EMPTY_TOKEN = "[editor] history undo empty"
+HISTORY_UNDO_TOKEN = "[editor] history undo"
+NEW_ENTITY_QUEUED_TOKEN = "[editor] new entity queued"
+DELETE_ENTITY_SKIPPED_TOKEN = "[editor] delete entity skipped nothing selected"
 KEYBINDING_CONFLICT_TOKEN = "[editor] keybinding conflict"
 SPLINE_COMMAND_RAN_TOKEN = "[spline_editor] command ran"
 
@@ -131,6 +134,25 @@ def main() -> int:
         )
         session.send("popup-pointer menu 110 16 release")
         session.wait_token(HISTORY_UNDO_EMPTY_TOKEN, 30, "menu item ran undo", position)
+
+        # Step 2b: the Hierarchy's entity commands (Stage 34). Create queues
+        # one recorded empty entity; delete with nothing selected logs its
+        # refusal; the created entity then undoes like any other edit.
+        before = len(session.read_log())
+        session.send("command editor.entity_create")
+        after_create = session.wait_token(
+            NEW_ENTITY_QUEUED_TOKEN, 30, "new entity queued", before
+        )
+        session.send("command editor.entity_delete")
+        session.wait_token(
+            DELETE_ENTITY_SKIPPED_TOKEN, 30, "delete refusal logged", after_create
+        )
+        before = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="?new entity"?', 30,
+            "the created entity was undone", before,
+        )
 
         # Step 3: the palette, opened by its command and clicked in its
         # rows; it is a popup window too. The first row is Pause / Resume

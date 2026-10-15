@@ -371,7 +371,8 @@ pub struct ConsoleLine {
     pub channel: u8,
 }
 
-/// The clipboard work a copy, cut or paste command queued (Stage 18, D28).
+/// The editing action a copy, cut, paste or entity-delete command queued
+/// (Stage 18, D28; entity delete Stage 34).
 ///
 /// The commands run inside [`execute_command`], which has neither the frame
 /// to answer through nor the snapshot to copy from; they record the intent
@@ -391,6 +392,9 @@ pub enum ClipboardAction {
     },
     /// Read the clipboard through the executable and apply what it carries.
     Paste,
+    /// Remove the selected entity as one recorded step, without touching
+    /// the clipboard (`editor.entity_delete`; Stage 34's Hierarchy action).
+    Delete,
 }
 
 impl EditorShellState {
@@ -1409,6 +1413,23 @@ fn build_panel(
 fn hierarchy_panel(builder: &mut PanelBuilder<'_>, view: &PanelView<'_>, work: &mut PanelWork) {
     builder.heading("Hierarchy");
     builder.label(&format!("{} entities", view.snapshot.entities.len()));
+    // The entity toolbar (Stage 34, parity with the Dioxus Hierarchy): both
+    // actions are recorded, so an entity created or deleted here undoes
+    // like any other edit.
+    let mut create = false;
+    let mut delete = false;
+    builder.row(|row| {
+        create = row.button("New Entity");
+        if view.selection.entity.is_some() {
+            delete = row.button("Delete Entity");
+        }
+    });
+    if create {
+        work.command("editor.entity_create");
+    }
+    if delete {
+        work.command("editor.entity_delete");
+    }
     builder.separator();
     let mut selected: Option<pill_engine::Entity> = None;
     let shown = view.snapshot.entities.len().min(PANEL_ROWS);
@@ -2735,6 +2756,25 @@ pub fn execute_command(
         // the state their dialog wrote while it was open.
         "editor.asset.create" => create_asset_dialog_submit(state, pending),
         "editor.asset.rename" => rename_asset_dialog_submit(state, pending),
+        // The Hierarchy's entity actions (Stage 34): the Dioxus editor's
+        // New/Delete entity buttons as recorded commands. Creation queues
+        // one empty entity; deletion runs where the selection is in scope,
+        // like the clipboard commands.
+        "editor.entity_create" => {
+            pending.push_recorded(
+                vec![EditorCommand::CreateEntity {
+                    components: Vec::new(),
+                }],
+                "new entity",
+                None,
+            );
+            // NOTE: asserted on by the editor's end-to-end suite.
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] new entity queued"
+            );
+        }
+        "editor.entity_delete" => state.clipboard_action = Some(ClipboardAction::Delete),
         // The clipboard commands queue their intent; the hot root runs it
         // where the frame and the snapshot are in scope (Stage 18, D28).
         "editor.copy" => state.clipboard_action = Some(ClipboardAction::Copy),
@@ -3020,6 +3060,28 @@ pub fn run_clipboard_action(
                 }
             }
         }
+        // Entity delete (Stage 34): the Dioxus Hierarchy's delete action as
+        // a recorded step, without the clipboard write Cut also does.
+        ClipboardAction::Delete => match selection.entity {
+            Some(entity) => {
+                let mut commands = vec![EditorCommand::DestroyEntity { entity }];
+                commands.push(EditorCommand::SetSelection {
+                    entity: None,
+                    asset: selection.asset.clone(),
+                });
+                pending.push_recorded(commands, "delete entity", None);
+                // NOTE: asserted on by the editor's end-to-end suite.
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    entity = %entity,
+                    "[editor] delete entity queued"
+                );
+            }
+            None => pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "[editor] delete entity skipped nothing selected"
+            ),
+        },
         ClipboardAction::CopyComponent { type_name } => {
             let component = snapshot.detail.as_ref().and_then(|detail| {
                 detail
