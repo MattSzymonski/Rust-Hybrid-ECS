@@ -1,4 +1,10 @@
 //! Decodes the bundled OBJ and PNG into the current renderer asset types.
+//!
+//! # Responsibilities
+//!
+//! - Load the bundled mesh, texture, shaders and materials once per world.
+//! - Hand the three ready materials back as handles, so the scene never
+//!   looks an asset up by name.
 
 use pill_engine::{AssetManager, Handle, World};
 use pill_master_renderer_data::{
@@ -7,6 +13,7 @@ use pill_master_renderer_data::{
 };
 use std::path::PathBuf;
 
+/// The handles [`load`] returns: one mesh and one material per shading style.
 #[derive(Clone, Copy)]
 pub(crate) struct SceneAssets {
     pub mesh: Handle<Mesh>,

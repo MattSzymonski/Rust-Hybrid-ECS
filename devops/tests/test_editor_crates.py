@@ -125,6 +125,7 @@ def stop_host(process: subprocess.Popen, monitor: OutputMonitor) -> None:
     """Stops the host and any stray copy of it."""
     common.terminate_process(process, monitor)
     kill_stale_hosts()
+    # Give Windows a moment to release the executable the kill just closed.
     time.sleep(2)
 
 
@@ -147,6 +148,7 @@ def standalone_posture_ignores_editor_crates() -> bool:
         if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
             print("  [FAIL] The host did not start.")
             return False
+        # Settle: a reload line, if one is coming, arrives within this quiet window.
         time.sleep(QUIET_SECONDS)
         output = monitor.output_since(0)
         if EDITOR_LOADED_TOKEN in output:
@@ -196,6 +198,7 @@ def editor_posture_loads_and_cascades() -> bool:
         if not monitor.wait_for(PROJECT_RELOAD_TOKEN, RELOAD_TIMEOUT, mark):
             print("  [FAIL] The project did not reload after pill_spline.")
             return False
+        # Settle: anything the reload triggers after its line arrives within this window.
         time.sleep(QUIET_SECONDS)
 
         # Scenario 4: an editor-crate edit reloads only the editor crate.
@@ -204,6 +207,7 @@ def editor_posture_loads_and_cascades() -> bool:
         if not monitor.wait_for(EDITOR_RELOAD_TOKEN, RELOAD_TIMEOUT, mark):
             print("  [FAIL] Editing the editor crate did not reload it.")
             return False
+        # Settle: a stray spline line would arrive within this window.
         time.sleep(QUIET_SECONDS)
         after = monitor.output_since(mark)
         if SPLINE_RELOAD_TOKEN in after or PROJECT_RELOAD_TOKEN in after:

@@ -136,6 +136,7 @@ def wait_for_patch(monitor: OutputMonitor, start_index: int) -> Optional[str]:
         if not monitor.process_alive():
             print("  [FAIL] The host exited before reporting the patch.")
             return None
+        # Poll until the patch outcome arrives.
         time.sleep(0.2)
     print(f"  [FAIL] No fast-path patch within {PATCH_TIMEOUT}s.")
     return None
@@ -172,6 +173,7 @@ def wait_for_rollback(monitor: OutputMonitor, start_index: int) -> bool:
         if not monitor.process_alive():
             print("  [FAIL] The host exited during the rollback.")
             return False
+        # Poll until the rollback outcome arrives.
         time.sleep(0.2)
     print(f"  [FAIL] No rollback outcome within {ROLLBACK_TIMEOUT}s.")
     return False
@@ -200,6 +202,7 @@ def run_bookkeeping_scenario(monitor: OutputMonitor, backups: BackupRegistry) ->
     qualified = wait_for_patch(monitor, patch_index)
     if qualified is None:
         return False
+    # Let the patch land and go quiet before the failing save.
     time.sleep(0.5)
 
     # Save 2: break the build, so the reload this triggers fails and the image
@@ -209,6 +212,7 @@ def run_bookkeeping_scenario(monitor: OutputMonitor, backups: BackupRegistry) ->
     print("  [EDIT 2] appended an unparseable tail; the project build must now fail")
     if not wait_for_failed_reload(monitor, reload_index):
         return False
+    # Let the failed build finish unwinding before the rollback.
     time.sleep(0.5)
 
     # The rollback: the patch is still installed in the unreplaced image, so

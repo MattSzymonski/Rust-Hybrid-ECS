@@ -823,6 +823,7 @@ def run_suite(cycles: int) -> bool:
         print(f"{'=' * 60}")
 
         restore_original()
+        # Let the restored sources land before the next launch reads them.
         time.sleep(0.3)
 
         print("\n  [TEST] Launching standalone...")
@@ -862,6 +863,7 @@ def run_suite(cycles: int) -> bool:
             return False
 
         if cycle_index < cycles:
+            # Pause between cycles so each reload starts from a settled tree.
             time.sleep(CYCLE_PAUSE)
 
     return True

@@ -163,7 +163,24 @@ STEPS: List[Step] = [
     Step(
         "coding-standards",
         "Coding standards lint",
-        [[PYTHON, "devops/tests/test_coding_standards.py", "--root", "modules"]],
+        # Repository-root scope, through the lint's own `is_linted`: the
+        # changed-files hook imports the same predicate, so the two select the
+        # same file set (SA-0070; this step used to scan `--root modules`
+        # only, which left every example, the test project and the shipping
+        # bundle unlinted in CI while the hook still flagged them).
+        [[PYTHON, "devops/tests/test_coding_standards.py"]],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
+    Step(
+        "suite-standards",
+        "Test suite lint (headers, shared helpers, sleeps)",
+        # The self test first proves each rule still fails its planted
+        # violation; the run then holds every devops/tests suite to them.
+        [
+            [PYTHON, "devops/tests/test_suite_standards.py", "--self-test"],
+            [PYTHON, "devops/tests/test_suite_standards.py"],
+        ],
         working_directory=REPOSITORY_ROOT,
         quick=True,
     ),

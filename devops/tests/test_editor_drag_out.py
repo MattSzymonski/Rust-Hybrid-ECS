@@ -202,6 +202,7 @@ def main() -> int:
             )
             match = found[-1] if found else None
             if match is None:
+                # Poll until the log carries an Assets placement.
                 time.sleep(0.5)
         assert match, "no Assets placement in the log"
         # Pause the engine before the gesture, so the project's systems
@@ -234,6 +235,7 @@ def main() -> int:
             at_root = user32.GetAncestor(user32.WindowFromPoint(POINT(row_x, 400)), GA_ROOT)
             if at_root == hwnd:
                 break
+            # Poll until the editor window reaches the foreground.
             time.sleep(0.25)
         assert at_root == hwnd, (
             "the editor window did not come to the front; another window covers "
@@ -251,10 +253,13 @@ def main() -> int:
             probe_begin = len(session.read_log())
             candidate_y = int(origin.y + (panel_y + offset) * scale)
             user32.SetCursorPos(row_x, candidate_y)
+            # Let the hover land on the row before the press is sent.
             time.sleep(0.25)
             user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            # A click needs the press to last a frame.
             time.sleep(0.15)
             user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            # Give the frames time to record the selection.
             time.sleep(0.6)
             text = session.read_log()[probe_begin:]
             if ASSET_SELECTED_TOKEN in text:
@@ -281,10 +286,13 @@ def main() -> int:
         # while the frames record the held row, then leave the window; that
         # is what starts the OS drag.
         user32.SetCursorPos(row_x, row_y)
+        # Let the hover land before the press; the frames must record the held row.
         time.sleep(0.4)
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        # Hold the press while the frames record it.
         time.sleep(0.5)
         user32.SetCursorPos(row_x, row_y + 4 * int(scale))
+        # Give the injected move time to land before the next step.
         time.sleep(0.5)
         # The offset is taken before the move that may start the drag: the
         # line can land while the injected move is still in flight.
@@ -301,6 +309,7 @@ def main() -> int:
         print(f"  [..] dropping on the editor at screen ({row_x}, {row_y})")
         begin = len(session.read_log())
         user32.SetCursorPos(row_x, row_y)
+        # Let the hover land on the drop target before the release.
         time.sleep(0.6)
         user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         session.wait_token(EDITOR_DRAG_OUT_ENDED_TOKEN, 30, "drag out ended", begin)

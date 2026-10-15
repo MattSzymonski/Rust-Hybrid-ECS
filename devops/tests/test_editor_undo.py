@@ -119,6 +119,7 @@ def run_asset_phase(suite: str, session_name: str, project: str, label: str) -> 
             if path.exists() == exists:
                 print(f"  [OK] {label}: {description}")
                 return
+            # Poll until the file state flips.
             time.sleep(0.25)
         state = "exists" if exists else "is missing"
         raise RuntimeError(f"{label}: {description}: {path} {state}")
@@ -219,6 +220,7 @@ def run_asset_phase(suite: str, session_name: str, project: str, label: str) -> 
         meta = res / "w25_source.png.meta"
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not meta.is_file():
+            # Poll until the import writes its sidecar.
             time.sleep(0.5)
         assert meta.is_file(), f"{label}: the import wrote no sidecar for the probe"
         meta.write_bytes(b"")
@@ -252,6 +254,7 @@ def run_asset_phase(suite: str, session_name: str, project: str, label: str) -> 
                 break
             if meta.read_text(encoding="utf-8") != written_meta:
                 break
+            # Poll until the undo rewrites the sidecar.
             time.sleep(0.25)
         else:
             raise RuntimeError(f"{label}: the written sidecar survived its undo")

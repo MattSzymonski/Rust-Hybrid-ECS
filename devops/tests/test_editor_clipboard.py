@@ -118,6 +118,7 @@ def entity_ids(session: EditorSession) -> "set[str]":
                 f"the editor exited {process.returncode} during a dump\n"
                 + session.read_log()[-3000:]
             )
+        # Poll until the entity dump request answers.
         time.sleep(0.35)
     raise RuntimeError("the entity dump never answered\n" + session.read_log()[-3000:])
 
@@ -131,6 +132,7 @@ def dump_field(session: EditorSession, entity: str, component: str, field: str) 
         match = re.search(r"value=([A-Za-z0-9]+)\(([^)]+)\)", session.read_log()[begin:])
         if match:
             return f"{match.group(1)}({match.group(2)})"
+        # Poll until the field dump answers with a value.
         time.sleep(0.35)
     raise RuntimeError("the field dump never answered\n" + session.read_log()[-3000:])
 
@@ -458,6 +460,7 @@ def main() -> int:
         session.wait(
             re.escape(ENTITIES_COUNT_TOKEN) + r"\s+count=\d+", 30, "paced", begin
         )
+        # One beat after the paced count, so the focus settles before the hover.
         time.sleep(1.0)
         begin = len(session.read_log())
         session.send(f"hover-file {DROP_SOURCE}")
@@ -473,12 +476,14 @@ def main() -> int:
         )
         deadline = time.monotonic() + 30
         while not DROP_COPY.exists() and time.monotonic() < deadline:
+            # Poll until the drop's copy lands in the asset root.
             time.sleep(0.25)
         assert DROP_COPY.exists(), f"the drop must copy into {ASSET_ROOT}"
         session.wait_token(IMPORTED_ASSET_TOKEN, 60, "asset imported", begin)
         metadata = DROP_COPY.with_name(DROP_COPY.name + ".meta")
         deadline = time.monotonic() + 30
         while not metadata.exists() and time.monotonic() < deadline:
+            # Poll until the import writes its metadata sidecar.
             time.sleep(0.25)
         assert metadata.exists(), "the import must write metadata"
         print("  [OK] dropped file imported with metadata")
@@ -492,6 +497,7 @@ def main() -> int:
         )
         deadline = time.monotonic() + 30
         while DROP_COPY.exists() and time.monotonic() < deadline:
+            # Poll until the undo removes the copied file.
             time.sleep(0.25)
         assert not DROP_COPY.exists(), "undo must remove the copied file"
         print("  [OK] undo removed the imported file")
@@ -521,6 +527,7 @@ def main() -> int:
         for copy in multi_copies:
             deadline = time.monotonic() + 60
             while not copy.exists() and time.monotonic() < deadline:
+                # Poll until each multi-drop copy lands.
                 time.sleep(0.25)
             assert copy.exists(), f"the multi drop must copy {copy.name}"
         session.wait(
@@ -547,6 +554,7 @@ def main() -> int:
         for copy in multi_copies:
             deadline = time.monotonic() + 30
             while copy.exists() and time.monotonic() < deadline:
+                # Poll until the undo removes each copy.
                 time.sleep(0.25)
             assert not copy.exists(), f"undo must remove {copy.name}"
         text_source = REPOSITORY_ROOT / "local" / "temp" / "s18_note.txt"
@@ -560,6 +568,7 @@ def main() -> int:
         )
         deadline = time.monotonic() + 30
         while not text_copy.exists() and time.monotonic() < deadline:
+            # Poll until the unsupported type's copy lands.
             time.sleep(0.25)
         assert text_copy.exists(), "an unsupported type still copies into the asset root"
         # No imported type claims .txt, so no metadata may appear. The pause
@@ -578,6 +587,7 @@ def main() -> int:
         )
         deadline = time.monotonic() + 30
         while text_copy.exists() and time.monotonic() < deadline:
+            # Poll until the undo removes the unsupported copy.
             time.sleep(0.25)
         assert not text_copy.exists(), "undo must remove the unsupported type's copy"
         print("  [OK] unsupported type copied without metadata, undone")

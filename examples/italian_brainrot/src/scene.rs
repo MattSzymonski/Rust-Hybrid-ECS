@@ -1,9 +1,20 @@
 //! Creates the camera and the original three model variants.
+//!
+//! # Responsibilities
+//!
+//! - Add the camera when the world has none.
+//! - Spawn one model variant per tagged shape, each guarded by its tag so a
+//!   reload re-runs the system without stacking duplicates.
 
 use crate::{asset_loading::SceneAssets, TagAlphaComponent};
 use pill_engine::{Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
+/// Creates the camera and the three model variants in `world`.
+///
+/// # Errors
+///
+/// Returns the engine's entity-creation error as text.
 pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), String> {
     if Query::<&CameraComponent>::new(world)
         .iter_mut()

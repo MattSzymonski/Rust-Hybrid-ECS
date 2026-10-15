@@ -1,4 +1,12 @@
 //! Ball integration, collisions, and spawn states.
+//!
+//! # Responsibilities
+//!
+//! - Step every ball by the frame delta under [`GRAVITY`].
+//! - Resolve floor, ceiling and wall contacts with [`RESTITUTION`], keeping
+//!   weak floor bounces alive via [`MINIMUM_BOUNCE_VELOCITY_Y`].
+//! - Seed each ball's spawn state and copy the result into the mesh
+//!   transform.
 
 use crate::settings::*;
 use crate::{PhysicsState, SimulationTime};

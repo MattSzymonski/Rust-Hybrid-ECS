@@ -297,6 +297,7 @@ def main() -> int:
                 seen_after[int(entry)] = True
             if any(frame > highest for frame in seen_after):
                 break
+            # Poll until a frame past the reload shows up.
             time.sleep(0.5)
         else:
             raise TimeoutError(
@@ -992,6 +993,7 @@ def main() -> int:
         stopped_session.wait_occurrence(
             LIVE_OR_RELOAD_PATTERN, live_seen + 1, 240, "retry reload"
         )
+        # Give a stray safe-mode exit two seconds to show itself before asserting.
         time.sleep(2.0)
         assert SAFE_LEFT_TOKEN not in stopped_session.read_log(), (
             "safe mode left while the shell's code still panics"
@@ -1063,6 +1065,7 @@ def main() -> int:
         wait_for_token(
             idle_session, re.escape(TEST_COMMAND_REQUEST_TOKEN), 30, "pause request"
         )
+        # Let the pause take effect before counting UI frames.
         time.sleep(2.0)
 
         def ui_frames_so_far() -> int:
@@ -1074,6 +1077,7 @@ def main() -> int:
             return int(re.findall(pattern, idle_session.read_log())[-1])
 
         first = ui_frames_so_far()
+        # A five-second window for the paused frames to prove they do not advance.
         time.sleep(5.0)
         second = ui_frames_so_far()
         assert second - first <= 2, (

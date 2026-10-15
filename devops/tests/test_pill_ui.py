@@ -118,6 +118,7 @@ def run_shaping_probe(binary: Path, timeout: float) -> str:
             names = loaded_pill_dlls(process.pid)
             if names:
                 break
+            # Poll until the probe process has its module list readable.
             time.sleep(0.2)
         if not names:
             raise RuntimeError("could not read the probe's module list")

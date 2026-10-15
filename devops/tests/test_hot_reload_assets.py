@@ -114,6 +114,7 @@ def wait_for_asset_line(monitor: OutputMonitor, token: str, start_index: int, ti
             return line
         if not monitor.process_alive():
             return None
+        # Poll until the expected line shows up.
         time.sleep(0.1)
     return None
 
@@ -268,6 +269,7 @@ def material_edit(monitor: OutputMonitor) -> bool:
     if not monitor.wait_for(REIMPORTED_TOKEN, ASSET_TIMEOUT, start_index):
         print(f"  [FAIL] material edit: nothing was reimported within {ASSET_TIMEOUT}s.")
         return False
+    # Let the reimport finish printing both lines before reading them.
     time.sleep(1.0)
     lines = [line for line in monitor.output_since(start_index).splitlines()
              if REIMPORTED_TOKEN in line and MATERIAL_NAME in line]

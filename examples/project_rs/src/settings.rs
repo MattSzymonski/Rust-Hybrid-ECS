@@ -1,11 +1,25 @@
 //! Scene counts, appearance, and physics tuning.
+//!
+//! # Responsibilities
+//!
+//! - Hold every tuning constant the project's systems read: the physics step,
+//!   gravity, bounce speeds and restitution, and the scene's floor and wall
+//!   extents.
 
 use pill_engine::common_components::Color;
 
+/// The step a fresh [`PhysicsState`](crate::PhysicsState) starts with, in
+/// seconds; the per-frame system replaces it with the frame's real delta.
 pub const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
+/// Downward acceleration applied to every ball, in world units per second
+/// squared.
 pub const GRAVITY: f32 = 800.0;
+/// Upward launch speed of a freshly spawned ball.
 pub const BOUNCE_VELOCITY_Y: f32 = -800.0;
+/// Horizontal travel speed of a freshly spawned ball; the direction
+/// alternates with the ball's index.
 pub const BOUNCE_VELOCITY_X: f32 = 350.0;
+/// Share of the impact speed a wall or floor contact gives back.
 pub const RESTITUTION: f32 = 0.6;
 
 /// Upward speed restored when a floor bounce would otherwise decay to rest.

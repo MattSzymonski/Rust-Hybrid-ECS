@@ -259,6 +259,7 @@ def main() -> int:
                 ):
                     activated = True
                     break
+                # Poll again; the activation lands a beat after the popup opens.
                 time.sleep(0.5)
             if not activated:
                 continue
@@ -381,6 +382,7 @@ def main() -> int:
             if any(int(engine) >= 1 and int(game) >= 1 for _, engine, game in heartbeats):
                 print(f"  [OK] console heartbeat with both channels: {heartbeats[-1]}")
                 break
+            # Poll until one heartbeat batch carries both channels.
             time.sleep(0.5)
         else:
             raise TimeoutError(
@@ -570,6 +572,7 @@ def main() -> int:
             if counts and counts[-1] > lines_before:
                 print(f"  [OK] console grew past {lines_before} after reload: {counts[-1]}")
                 break
+            # Poll until the reload's output reaches the console panel.
             time.sleep(0.5)
         else:
             raise TimeoutError(
@@ -857,6 +860,7 @@ def main() -> int:
                 break
             if probe_meta.read_text(encoding="utf-8") != written_meta:
                 break
+            # Poll until the undo rewrites the sidecar back to its first text.
             time.sleep(0.25)
         else:
             raise RuntimeError("the written sidecar survived its undo")

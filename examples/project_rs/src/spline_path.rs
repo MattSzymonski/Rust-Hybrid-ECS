@@ -1,4 +1,11 @@
 //! Keeps the spline and its sample meshs aligned with the balls.
+//!
+//! # Responsibilities
+//!
+//! - Rebuild the spline's control points from the ball centres every frame.
+//! - Walk the sample dots along the curve that results.
+//! - Tolerate centres that are one frame old, because the physics system may
+//!   run either side of this one within a frame.
 
 use crate::settings::*;
 use crate::{PhysicsState, SplineSample};

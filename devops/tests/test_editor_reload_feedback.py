@@ -233,6 +233,7 @@ def main() -> int:
                 recorded = open_record.read_text(encoding="utf-8", errors="replace")
                 if "pill_dummy_color.rs" in recorded:
                     break
+            # Poll until the open recorder names the edited file.
             time.sleep(0.5)
         assert "pill_dummy_color.rs" in recorded, (
             f"the open recorder never saw the file: {recorded!r}"

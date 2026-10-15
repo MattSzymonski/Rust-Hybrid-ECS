@@ -226,6 +226,7 @@ with each suite's last recorded result from `.construction_site/runs/`.
 | `test_harness_parsing.py` | static | hot-reload | The parsing the end-to-end suites decide pass or fail with, on real host output. |
 | `test_log_contract.py` | static | hot-reload | Every host log token a suite waits for still exists in the Rust sources. |
 | `test_renderer_boundaries.py` | static |  | Only GPU modules link wgpu, the renderer API stays renderer-free, data crates GPU-free. |
+| `test_suite_standards.py` | static |  | Suites keep their run_all header and stop re-forking the core helpers. |
 | `test_csharp_bridge.py` | host | hot-reload | C# hot reload: mirror layout, calls both ways, assembly swaps keeping state, layout migration. |
 | `test_editor_crates.py` | host |  | Extension editor crates load only in the editor posture and reload with their runtime crate. |
 | `test_editor_revision.py` | host |  | A module reload bumps the editor revision counter, so the editor drops its caches. |
@@ -237,7 +238,7 @@ with each suite's last recorded result from `.construction_site/runs/`.
 | `test_patch_bookkeeping.py` | host |  | A failed reload keeps the live patch records, so rolling the patch back still works. |
 | `test_pbr_native.py` | host (manual) |  | The windowed frontend presents frames and shuts down cleanly. |
 | `test_picking.py` | host |  | Picking returns the entity under the cursor, or nothing, and outlines the hit entity. |
-| `test_pill_ui.py` | host |  | The pill_ui dylib: one copy loads in a dev host and shapes and draws text; a stylesheet edit restyles it live. |
+| `test_pill_ui.py` | host |  | Exactly one pill_ui dylib loads in a dev host and it shapes and draws text; editing a stylesheet restyles the running UI without a compile. |
 | `test_reload_edit_during_build.py` | host | hot-reload | A save made during a build wins: the newer edit is the one built and loaded. |
 | `test_shared_component_identity.py` | host |  | Types linked by two DLLs share one registration with #[pill(shared)], else startup fails. |
 | `test_editor_builtin_panels.py` | editor |  | The built-in panels: Inspector edits, system toggles, Console and Assets toolbar, undoable. |
