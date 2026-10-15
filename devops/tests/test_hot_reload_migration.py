@@ -37,7 +37,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
@@ -49,6 +49,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
+
+# The shared scenario runner: one definition for every hot-reload suite
+# (audit SA-0057). This suite adds only its tokens, its validators and the
+# scenario table below.
+from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
 
 # =============================================================================
 # Configuration
@@ -373,99 +378,92 @@ THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
 # =============================================================================
 
 
-@dataclass(frozen=True)
-class Scenario:
-    """Defines one hot-reload scenario with expected output assertions."""
+# The scenario model and runner are shared: `core/scenario.py`. Every migration
+# scenario has the same shape - one edit to the fixture source, one reload (or
+# the rollback a refused one produces), a counter that must keep ticking, and
+# the migration assertions - so the table below builds them through
+# `migration_scenario` instead of repeating that shape thirteen times.
 
-    name: str
-    replacements: Sequence[Tuple[str, str]]
-    # Proof of life for the generation the reload produced: the counter must
-    # tick after the reload settles, not merely have ticked before it.
-    expect_counter_tick: bool
-    required_tokens: Sequence[str]
-    forbidden_tokens: Sequence[str]
-    expected_migration_entity_counts: Sequence[Tuple[str, int]] = ()
-    expected_witness_tokens: Sequence[str] = ()
 
-    # A rejected reload never reaches "hot reload complete": the engine
-    # refuses the generation with a diagnostic and the host rolls back to the
-    # running one. The scenario waits for the rollback marker instead, and the
-    # refusal must arrive without a panic - the crash this scenario used to
-    # end on was exactly the guard being missing.
-    expect_rejected_reload: bool = False
+def migration_scenario(
+    name: str,
+    replacements: Sequence[Tuple[str, str]],
+    required_tokens: Sequence[str],
+    forbidden_tokens: Sequence[str],
+    expected_migration_entity_counts: Sequence[Tuple[str, int]] = (),
+    expected_witness_tokens: Sequence[str] = (),
+    expect_rejected_reload: bool = False,
+) -> Scenario:
+    """Builds one migration scenario on the shared runner.
+
+    A refused reload never reaches "hot reload complete": the engine refuses the
+    generation with a diagnostic and the host rolls back to the running one, so
+    that scenario waits for the rollback marker instead. The counter-tick wait
+    runs from an index taken after the reload outcome, which is what makes it
+    proof of life for the generation the reload produced rather than a report
+    from the one it replaced.
+    """
+    return Scenario(
+        name=name,
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_LIB_RS, replacements)],
+                wait_token=(
+                    ROLLBACK_TOKEN if expect_rejected_reload else RELOAD_COMPLETE_TOKEN
+                ),
+                required_tokens=required_tokens,
+                forbidden_tokens=forbidden_tokens,
+                alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+            )
+        ],
+        validators=[
+            partial(
+                validate_migration_entity_counts,
+                expected_counts=expected_migration_entity_counts,
+            ),
+            partial(
+                validate_witness_tokens,
+                expected_tokens=expected_witness_tokens,
+            ),
+        ],
+    )
+
+
+def migration_runner() -> ScenarioRunner:
+    """The runner settings for this suite.
+
+    Built per cycle, and with the timeouts named explicitly rather than left to
+    the runner's defaults: those are bound when `core.scenario` is imported, so
+    they cannot follow the scaling `apply_timeout_scale` applies here. No
+    scenario restores a file between edits - the table is one cumulative chain
+    from the original source - so the settle timeout stays at its default.
+    """
+    return ScenarioRunner(
+        reload_timeout=RELOAD_TIMEOUT,
+        stability_sleep=STABILITY_SLEEP,
+    )
 
 
 # =============================================================================
-# Atomic file helpers
+# Source helpers
 # =============================================================================
-
-
-def read_source() -> str:
-    """Reads project/src/lib.rs as UTF-8 text."""
-    return PROJECT_LIB_RS.read_text(encoding="utf-8")
-
-
-def atomic_write(content: str) -> None:
-    """Writes source content atomically via temporary file + rename."""
-    if not content.endswith("\n"):
-        content += "\n"
-
-    temporary_path = PROJECT_LIB_RS.with_suffix(".rs.tmp")
-    temporary_path.write_text(content, encoding="utf-8", newline="")
-    os.replace(str(temporary_path), str(PROJECT_LIB_RS))
 
 
 def restore_original() -> None:
-    """Restores the original source captured at script startup."""
+    """Restores the fixture source captured at script startup."""
     if not ORIGINAL_CONTENT:
         print("  [WARN] No original content captured. Skipping restore.")
         return
 
-    if read_source() == ORIGINAL_CONTENT:
+    if read_source(PROJECT_LIB_RS) == ORIGINAL_CONTENT:
         return
 
-    atomic_write(ORIGINAL_CONTENT)
-
-
-def apply_replacements(replacements: Sequence[Tuple[str, str]]) -> bool:
-    """Applies replacements in order against current source content."""
-    content = read_source()
-
-    for old_text, new_text in replacements:
-        if old_text not in content:
-            print(f"  [FAIL] Edit pattern not found: {old_text[:80].strip()!r}...")
-            return False
-        content = content.replace(old_text, new_text, 1)
-
-    atomic_write(content)
-    return True
+    atomic_write(PROJECT_LIB_RS, ORIGINAL_CONTENT)
 
 
 # =============================================================================
 # Scenario execution helpers
 # =============================================================================
-
-
-def validate_tokens(
-    label: str,
-    output: str,
-    required_tokens: Sequence[str],
-    forbidden_tokens: Sequence[str],
-) -> bool:
-    """Validates required and forbidden token constraints."""
-    for token in required_tokens:
-        if token not in output:
-            print(f"  [FAIL] Missing token for {label}: {token!r}")
-            print(f"  Output tail:\n{output[-1600:]}")
-            return False
-
-    for token in forbidden_tokens:
-        if token in output:
-            print(f"  [FAIL] Forbidden token found for {label}: {token!r}")
-            print(f"  Output tail:\n{output[-1600:]}")
-            return False
-
-    return True
 
 
 def validate_migration_entity_counts(
@@ -515,88 +513,6 @@ def validate_witness_tokens(
     return True
 
 
-def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
-    """Runs one scenario edit and asserts reload/log behavior."""
-    print(f"\n  [TEST] {scenario.name}...")
-    start_index = monitor.line_count
-
-    if not apply_replacements(scenario.replacements):
-        return False
-
-    settle_token = (
-        ROLLBACK_TOKEN if scenario.expect_rejected_reload else RELOAD_COMPLETE_TOKEN
-    )
-    if not monitor.wait_for(settle_token, RELOAD_TIMEOUT, start_index):
-        output = monitor.output_since(start_index)
-        if has_crash_signals(output):
-            print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
-            print(f"  Output tail:\n{output[-1600:]}")
-        else:
-            print(f"  [FAIL] Reload timeout in scenario: {scenario.name}")
-        return False
-
-    time.sleep(STABILITY_SLEEP)
-
-    if not monitor.process_alive():
-        print(f"  [FAIL] Process died after scenario: {scenario.name}")
-        return False
-
-    if scenario.expect_counter_tick:
-        # From an index taken after the reload settled, not from the scenario's
-        # start: the counter ticks continuously while the reload is building, so
-        # a start-indexed wait was satisfied by the OLD generation's ticks and
-        # proved nothing about the new one. A stopped counter is exactly what
-        # this wait exists to catch.
-        alive_index = monitor.line_count
-        if not monitor.wait_for(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT, alive_index):
-            print(f"  [FAIL] Counter did not tick after scenario: {scenario.name}")
-            print(f"  Output tail:\n{monitor.output_since(alive_index)[-1600:]}")
-            return False
-
-    output = monitor.output_since(start_index)
-
-    crash_signals = has_crash_signals(output)
-    if scenario.expect_rejected_reload:
-        # A refused reload is a clean rejection: the engine records the refusal
-        # diagnostic (the required-token check below finds it), the host rolls
-        # the generation back (the settle token above), and the running
-        # generation keeps serving. Any panic in the window is a real crash -
-        # it is precisely what this scenario used to end on.
-        if crash_signals:
-            print(f"  [FAIL] Crash token observed in a rejected scenario: {scenario.name}")
-            print(f"  Output tail:\n{output[-1600:]}")
-            return False
-    elif crash_signals:
-        print(f"  [FAIL] Crash token observed in scenario output: {scenario.name}")
-        print(f"  Output tail:\n{output[-1600:]}")
-        return False
-
-    if not validate_tokens(
-        scenario.name,
-        output,
-        scenario.required_tokens,
-        scenario.forbidden_tokens,
-    ):
-        return False
-
-    if not validate_migration_entity_counts(
-        scenario.name,
-        output,
-        scenario.expected_migration_entity_counts,
-    ):
-        return False
-
-    if not validate_witness_tokens(
-        scenario.name,
-        output,
-        scenario.expected_witness_tokens,
-    ):
-        return False
-
-    print(f"  [OK] {scenario.name}")
-    return True
-
-
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the standalone host via cargo and returns process + monitor."""
     process_environment = os.environ.copy()
@@ -624,17 +540,24 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
 
 
 def build_scenarios() -> List[Scenario]:
-    """Builds ordered migration scenarios from current source state."""
+    """Builds ordered migration scenarios from the fixture's current source.
+
+    One edit per scenario, each applied to the source as the previous scenario
+    left it: the table is one cumulative chain from the original, which is why
+    no scenario restores the file. Every entry goes through
+    `migration_scenario`, so the thirteen share the shape - one edit, one
+    reload (or the rollback a refused one produces), a counter that must keep
+    ticking - and differ only in their tokens and expectations.
+    """
     return [
-        Scenario(
+        migration_scenario(
             name="Safe change: threshold 200 -> 150 (fast path)",
             replacements=[(THRESHOLD_200, THRESHOLD_150)],
-            expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[SELECTIVE_START_TOKEN],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
-        Scenario(
+        migration_scenario(
             name="Modify FrameCounter: add migrated bool",
             replacements=[
                 (FRAMECOUNTER_COUNT_ONLY, FRAMECOUNTER_WITH_BOOL),
@@ -642,7 +565,6 @@ def build_scenarios() -> List[Scenario]:
                 (FRAMECOUNTER_ENTITY_TWO_BASE, FRAMECOUNTER_ENTITY_TWO_WITH_BOOL),
                 (FRAMECOUNTER_ENTITY_THREE_BASE, FRAMECOUNTER_ENTITY_THREE_WITH_BOOL),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -655,7 +577,7 @@ def build_scenarios() -> List[Scenario]:
             expected_migration_entity_counts=[("project::FrameCounter", 6)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
-        Scenario(
+        migration_scenario(
             name="Revert FrameCounter: remove migrated bool",
             replacements=[
                 (FRAMECOUNTER_WITH_BOOL, FRAMECOUNTER_COUNT_ONLY),
@@ -663,7 +585,6 @@ def build_scenarios() -> List[Scenario]:
                 (FRAMECOUNTER_ENTITY_TWO_WITH_BOOL, FRAMECOUNTER_ENTITY_TWO_BASE),
                 (FRAMECOUNTER_ENTITY_THREE_WITH_BOOL, FRAMECOUNTER_ENTITY_THREE_BASE),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -676,7 +597,7 @@ def build_scenarios() -> List[Scenario]:
             expected_migration_entity_counts=[("project::FrameCounter", 9)],
             expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
-        Scenario(
+        migration_scenario(
             name="Modify SpatialPosition: add depth coordinate",
             replacements=[
                 (SPATIAL_POSITION_BASE, SPATIAL_POSITION_WITH_DEPTH),
@@ -685,7 +606,6 @@ def build_scenarios() -> List[Scenario]:
                 (SPATIAL_POSITION_ENTITY_THREE_BASE, SPATIAL_POSITION_ENTITY_THREE_WITH_DEPTH),
                 (WITNESS_POSITION_PRINT_BASE, WITNESS_POSITION_PRINT_WITH_DEPTH),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -704,14 +624,13 @@ def build_scenarios() -> List[Scenario]:
                 WITNESS_POSITION_3_C,
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="Modify LinearVelocity: rename vertical_speed field",
             replacements=[
                 (LINEAR_VELOCITY_BASE, LINEAR_VELOCITY_RENAMED_FIELD),
                 (LINEAR_VELOCITY_ENTITY_ONE_BASE, LINEAR_VELOCITY_ENTITY_ONE_RENAMED),
                 (LINEAR_VELOCITY_ENTITY_TWO_BASE, LINEAR_VELOCITY_ENTITY_TWO_RENAMED),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -728,7 +647,7 @@ def build_scenarios() -> List[Scenario]:
                 WITNESS_TRAIL_BETA,
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="Remove LinearVelocity from registered/seeded components",
             replacements=[
                 (
@@ -739,7 +658,6 @@ def build_scenarios() -> List[Scenario]:
                     "struct LinearVelocity {",
                 ),
             ],
-            expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[
                 SELECTIVE_START_TOKEN,
@@ -747,10 +665,9 @@ def build_scenarios() -> List[Scenario]:
             ],
             expected_witness_tokens=[WITNESS_POSITION_3_C, WITNESS_TRAIL_ALPHA],
         ),
-        Scenario(
+        migration_scenario(
             name="Reorder SpatialPosition fields: data follows names, not positions",
             replacements=[(SPATIAL_POSITION_WITH_DEPTH, SPATIAL_POSITION_REORDERED)],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -767,7 +684,7 @@ def build_scenarios() -> List[Scenario]:
                 WITNESS_POSITION_3_C,
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="MarkerTrail: add a Vec<u32> field (old entities get an empty one)",
             replacements=[
                 (MARKER_TRAIL_BASE, MARKER_TRAIL_WITH_STAMPS),
@@ -775,7 +692,6 @@ def build_scenarios() -> List[Scenario]:
                 (MARKER_TRAIL_SEED_BETA, MARKER_TRAIL_SEED_BETA_WITH_STAMPS),
                 (WITNESS_TRAIL_PRINT_BASE, WITNESS_TRAIL_PRINT_WITH_STAMPS),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -794,13 +710,12 @@ def build_scenarios() -> List[Scenario]:
                 '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="MarkerTrail: widen the Vec element type f32 -> f64",
             replacements=[
                 (MARKER_TRAIL_WITH_STAMPS, MARKER_TRAIL_POINTS_F64),
                 (WITNESS_TRAIL_PRINT_WITH_STAMPS, WITNESS_TRAIL_PRINT_WITH_STAMPS_F64),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -826,7 +741,7 @@ def build_scenarios() -> List[Scenario]:
                 '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="MarkerTrail: rename label -> name (renamed text resets, rest survives)",
             replacements=[
                 (MARKER_TRAIL_POINTS_F64, MARKER_TRAIL_RENAMED_LABEL),
@@ -834,7 +749,6 @@ def build_scenarios() -> List[Scenario]:
                 (MARKER_TRAIL_SEED_BETA_WITH_STAMPS, MARKER_TRAIL_SEED_BETA_NAMED),
                 (WITNESS_TRAIL_PRINT_WITH_STAMPS_F64, WITNESS_TRAIL_PRINT_NAMED),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -852,7 +766,7 @@ def build_scenarios() -> List[Scenario]:
                 '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="MarkerTrail: change the Vec element type f32 -> u32 (snapshot no longer parses)",
             replacements=[
                 (MARKER_TRAIL_RENAMED_LABEL, MARKER_TRAIL_INCOMPATIBLE),
@@ -860,7 +774,6 @@ def build_scenarios() -> List[Scenario]:
                 (MARKER_TRAIL_SEED_BETA_NAMED, MARKER_TRAIL_SEED_BETA_U32),
                 (WITNESS_TRAIL_PRINT_NAMED, WITNESS_TRAIL_PRINT_U32),
             ],
-            expect_counter_tick=True,
             required_tokens=[
                 SELECTIVE_START_TOKEN,
                 SELECTIVE_FINISHED_TOKEN,
@@ -883,17 +796,15 @@ def build_scenarios() -> List[Scenario]:
                 '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
             ],
         ),
-        Scenario(
+        migration_scenario(
             name="Revert threshold 150 -> 200 (fast path)",
             replacements=[(THRESHOLD_150, THRESHOLD_200)],
-            expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[SELECTIVE_START_TOKEN],
         ),
-        Scenario(
+        migration_scenario(
             name="Widen SpatialPosition.horizontal f32 -> f64 (refused: the old column cannot host the new alignment)",
             replacements=[(SPATIAL_POSITION_REORDERED, SPATIAL_POSITION_WIDENED)],
-            expect_counter_tick=True,
             expect_rejected_reload=True,
             required_tokens=[
                 "was re-registered with a different size",
@@ -947,7 +858,7 @@ def run_suite(cycles: int) -> bool:
                 return False
 
             for scenario in scenarios:
-                if not run_scenario(scenario, monitor):
+                if not run_scenario(scenario, monitor, migration_runner()):
                     cycle_passed = False
                     break
 
@@ -1079,7 +990,7 @@ def main() -> None:
         sys.exit(1)
 
     apply_timeout_scale(args.timeout_scale)
-    ORIGINAL_CONTENT = read_source()
+    ORIGINAL_CONTENT = read_source(PROJECT_LIB_RS)
 
     print("=" * 60)
     print("  Hot-Reload Migration Integration Suite")

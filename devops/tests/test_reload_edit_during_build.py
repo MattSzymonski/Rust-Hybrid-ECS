@@ -119,7 +119,9 @@ def build_host() -> bool:
     return True
 
 
-def run_scenario(monitor: OutputMonitor, backups: BackupRegistry, delay: float) -> bool:
+def run_edit_during_build_scenario(
+    monitor: OutputMonitor, backups: BackupRegistry, delay: float
+) -> bool:
     """Save twice, the second during the build, and check the second is built."""
     backups.capture(MODULE_LIB_RS)
     original = read_source(MODULE_LIB_RS)
@@ -213,7 +215,7 @@ def main() -> None:
             print(f"  [FAIL] Host did not start within {startup_timeout}s.")
             sys.exit(1)
         print("  [OK] Host running.\n")
-        passed = run_scenario(monitor, backups, args.second_edit_delay)
+        passed = run_edit_during_build_scenario(monitor, backups, args.second_edit_delay)
     finally:
         print("\n  [CLEANUP] Restoring source and stopping the host...")
         # The restored source is the ONLY restore of this edit, and the host is

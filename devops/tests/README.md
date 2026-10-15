@@ -139,7 +139,6 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | --- | --- | --- |
 | `test_hot_reload_suite.py` | `devops/tests/project/src/lib.rs`, `modules/extensions/pill_spline/pill_spline/src/pill_spline.rs`, and `project_settings.yaml` of both `devops/tests/project` and `examples/project_rs` | `BACKUP`, original bytes and timestamp. The two settings files are then written once more with a fresh timestamp. |
 | `test_hot_reload_migration.py` | `devops/tests/project/src/lib.rs` | Its own text copy, fresh timestamp |
-| `test_module_project_auto_reload.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
 | `test_editor_crates.py` | `pill_spline.rs`, `pill_spline_editor.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies |
 | `test_editor_revision.py` | `pill_spline.rs`, `examples/project_rs/project_settings.yaml` | Its own text copies, fresh timestamp |
 | `test_editor_native.py` | The shell module's source (`pill_editor_shell_editor.rs`, one cadence constant); writes `local/editor-validation/` | Its own text copy, in `finally` |
@@ -227,7 +226,6 @@ with each suite's last recorded result from `.construction_site/runs/`.
 | `test_hot_reload_assets.py` | host |  | Live asset reimport: .meta edits, broken and restored images, moved files, renderer reloads. |
 | `test_hot_reload_migration.py` | host | hot-reload, nightly | Component schema changes on reload migrate the data, or are refused and rolled back. |
 | `test_hot_reload_suite.py` | host | hot-reload, nightly-allowed-to-fail | Project and module hot reload keep data, migrate schemas, cascade and stay stable. |
-| `test_module_project_auto_reload.py` | host | hot-reload | Editing a module the project links reloads the module, then the project. |
 | `test_multi_surface.py` | host |  | One renderer drives two windows; a renderer reload reattaches the second surface. |
 | `test_patch_bookkeeping.py` | host |  | A failed reload keeps the live patch records, so rolling the patch back still works. |
 | `test_pbr_native.py` | host (manual) |  | The windowed frontend presents frames and shuts down cleanly. |
@@ -270,9 +268,8 @@ with each suite's last recorded result from `.construction_site/runs/`.
 
 | Suite | Covers |
 | --- | --- |
-| `test_hot_reload_suite.py` | The main suite, in two sessions. **A** (`devops/tests/project` + `pill_spline`): project reload with data surviving, schema migration, types removed from the project, module reload keeping its data (`existing=1`), repeated reloads staying stable, a removed module type dropped and re-seeded (`existing=0` after the restore), rollback when init fails. **B** (`examples/project_rs` + `pill_spline`): the module-to-project cascade and both sides seeing the same splines. Also checks a clean restart. |
+| `test_hot_reload_suite.py` | The main suite, in two sessions. **A** (`devops/tests/project` + `pill_spline`): project reload with data surviving, schema migration, types removed from the project, module reload keeping its data (`existing=1`), repeated reloads staying stable, a removed module type dropped and re-seeded (`existing=0` after the restore), rollback when init fails. **B** (`examples/project_rs` + `pill_spline`): the module-to-project cascade on its own - editing `pill_spline` reloads the module, the host queues a project reload, and the project's probe reports the new value, derived from the midpoint the running host printed (the check the folded `test_module_project_auto_reload.py` made alone). Also checks a clean restart. |
 | `test_hot_reload_migration.py` | Component schema changes on reload: unchanged shape (fast path), added, removed, renamed and reordered fields, persistable downgraded to plain, a widened `Vec` element type, a retyped one whose snapshot no longer parses (row reset), and an alignment change that must be refused and rolled back. Asserts migrated entity counts and values. `--cycles N` repeats it. |
-| `test_module_project_auto_reload.py` | The cascade on its own: editing `pill_spline` reloads the module, the host queues a project reload, and the project reports the new value. |
 | `test_multi_surface.py` | One renderer, two windows: the standalone dev host's test frontend (`PILL_SECOND_VIEW=1`) opens surface 1 with its own camera; both present, a renderer reload reattaches surface 1, and closing its window detaches only it. Backs up and restores `pill_master_renderer/src/lib.rs`. |
 | `test_picking.py` | Picking and outlines: the standalone dev host's test frontend (`PILL_PICK_TEST=1`) picks the center and the corner of `master_renderer_test`'s window in one frame; the center answers with the model's entity, the corner with nothing, and the hit entity is outlined while the host keeps drawing without a GPU error. |
 | `test_pill_ui.py <binary>` | The shared `pill_ui` dylib: the standalone dev host's UI probe (`PILL_UI_PROBE=1`) shapes and draws a sample with the bundled font without a project; exactly one `pill_ui.dll` - beside one `pill_core.dll` and one `pill_engine_core.dll` - is mapped in the running process, the probe reports glyph quads, atlas regions and vertices, and exits cleanly. |
@@ -362,7 +359,7 @@ the regenerated file.
   from the other project can be loaded before the fresh build replaces it
   ("Counter did not tick"). Delete `modules/target/debug/project.dll` and rerun.
 - **Text-mode restores.** `test_hot_reload_migration`,
-  `test_module_project_auto_reload`, `test_editor_revision` and the settings
+  `test_editor_revision` and the settings
   file in `test_shared_component_identity` restore through `read_text` and
   `write_text` rather than `BackupRegistry`. On Windows that writes CRLF line
   endings over files `.gitattributes` keeps as LF, and leaves a fresh

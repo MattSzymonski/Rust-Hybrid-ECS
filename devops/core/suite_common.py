@@ -11,15 +11,18 @@ DESCRIPTION
 
       * `devops/tests/test_hot_reload_suite.py`     - full suite (sessions A/B)
       * `devops/tests/test_hot_reload_migration.py` - schema-migration suite
-      * `devops/tests/test_module_project_auto_reload.py` - cascade
       * `devops/tests/test_csharp_bridge.py`        - C# bridge suite
       * `devops/benchmarks/hot_reload_harness.py`   - reload timing harness
       * `devops/benchmarks/cold_start.py`           - host startup timing
 
     Shared here: path resolution, the console-color `print` wrapper, the
     rolling output monitor with a dedicated counter-tick tail, atomic source
-    editing, host process lifecycle helpers, and the log tokens the suites
-    assert on.
+    editing, the edit that triggers a spline reload
+    (`edit_spline_sample_offset`), host process lifecycle helpers, and the log
+    tokens the suites assert on.
+
+    The scenario runner those suites run their tables on - edit, wait, assert,
+    restore - is one level up in `core/scenario.py`.
 
     Keeping this in one module means a reworded host log line is fixed in
     exactly one place (audit opportunity 5.14), and the OutputMonitor's
@@ -35,11 +38,13 @@ USAGE
 
 import builtins
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -71,6 +76,11 @@ HOST_EXE = HOST_EXECUTABLE
 NATIVE_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_rs"
 CSHARP_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_cs"
 FIXTURE_PROJECT_ROOT = WORKSPACE_ROOT / "devops" / "tests" / "project"
+
+# The fixture project's entry source: the file the native and migration
+# scenarios edit, and the one whose restore settles with a project reload
+# rather than a module reload.
+PROJECT_SANDBOX_LIB_RS = FIXTURE_PROJECT_ROOT / "src" / "lib.rs"
 
 
 def project_settings_yaml(project_root: Path) -> Path:
@@ -435,6 +445,72 @@ def apply_replacements(path: Path, replacements: Sequence[Tuple[str, str]]) -> b
     atomic_write(path, content)
     return True
 
+
+# `pill_spline`'s sample-offset constant, inside `get_location_at`. A plain
+# `f32` literal on one line, so exactly one line matches and the indent comes
+# back with it.
+SAMPLE_OFFSET_PATTERN = re.compile(
+    r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
+)
+
+
+@dataclass(frozen=True)
+class SplineSampleOffsetEdit:
+    """The edit that bumps `pill_spline`'s sample offset by one."""
+
+    old_line: str
+    new_line: str
+    current_offset: float
+    new_offset: float
+
+    @property
+    def delta(self) -> float:
+        """How far the sampled point moves vertically, in world units."""
+        return self.new_offset - self.current_offset
+
+    @property
+    def replacements(self) -> Sequence[Tuple[str, str]]:
+        """The pair `apply_replacements` takes."""
+        return ((self.old_line, self.new_line),)
+
+
+def edit_spline_sample_offset(content: str) -> SplineSampleOffsetEdit:
+    """Plans the one edit that bumps `pill_spline`'s sample offset by one.
+
+    The constant is the demo's behaviour-only knob: it moves the project
+    probe's midpoint without touching any component's shape, so the reload
+    takes the ordinary path rather than a schema migration. The native
+    hot-reload suite's cascade scenario and the benchmark harness trigger a
+    reload with it, which is why the edit is planned from the current source
+    instead of pinned to a literal pair. `test_editor_crates`,
+    `test_editor_revision` and `test_shared_component_identity` still carry
+    their own copy of the pattern; folding those in is the later stages' work.
+
+    A pinned pair ("= 0.0" -> "= 10.0") only applies to a source nobody has
+    edited yet, so the suites were order-dependent: a run that ended on a
+    bumped offset broke the next suite's first edit with a pattern-not-found
+    failure that read like a broken layout. The offset wraps at 10.0 so the
+    constant stays a single digit and the derived probe midpoint stays a
+    stable one-decimal value.
+
+    Raises RuntimeError when the constant is missing or ambiguous, which means
+    the source is not the one these suites edit.
+    """
+    matches = list(SAMPLE_OFFSET_PATTERN.finditer(content))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one SAMPLE_VERTICAL_OFFSET line, found {len(matches)}"
+        )
+    match = matches[0]
+    current_offset = float(match.group(2))
+    new_offset = (current_offset + 1.0) % 10.0
+    return SplineSampleOffsetEdit(
+        old_line=match.group(0),
+        new_line=f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset:.1f};",
+        current_offset=current_offset,
+        new_offset=new_offset,
+    )
+
 # =============================================================================
 # Output monitor
 # =============================================================================
@@ -757,6 +833,7 @@ __all__ = [
     "NATIVE_PROJECT_ROOT",
     "CSHARP_PROJECT_ROOT",
     "FIXTURE_PROJECT_ROOT",
+    "PROJECT_SANDBOX_LIB_RS",
     "project_settings_yaml",
     "write_project_settings",
     "STARTUP_TOKEN",
@@ -793,6 +870,8 @@ __all__ = [
     "read_source",
     "atomic_write",
     "apply_replacements",
+    "edit_spline_sample_offset",
+    "SplineSampleOffsetEdit",
     "SHIPPING_BUNDLE_PATHS",
     "snapshot_paths",
     "restore_paths",

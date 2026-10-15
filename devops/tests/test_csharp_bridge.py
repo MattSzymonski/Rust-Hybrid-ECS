@@ -61,9 +61,8 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Sequence
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
 # host's log tokens live in one place (audit opportunity 5.14).
@@ -73,6 +72,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
+
+# The shared scenario runner: one definition for every hot-reload suite
+# (audit SA-0057). This suite adds only its C# tokens and scenario table.
+from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
 
 # =============================================================================
 # Session configuration
@@ -274,133 +277,7 @@ CSHARP_MIRROR_REGEN_TOKEN = "module reload changed the C# mirror surface; queuin
 OMO_PROBE_SUM_A_B = "omo=(12,34) sum=47 a=1212 b=1234 alpha=1"
 OMO_PROBE_WITH_E = "omo=(12,34) sum=47 a=1212 b=1234 e=9012 alpha=1"
 
-# =============================================================================
-# Scenario model (same shape as the native hot-reload suite)
-# =============================================================================
-
-
-@dataclass
-class ScenarioPhase:
-    """One edit+wait step inside a scenario."""
-
-    edits: Sequence[Tuple[Path, Sequence[Tuple[str, str]]]]
-    wait_token: str
-    required_tokens: Sequence[str] = ()
-    forbidden_tokens: Sequence[str] = ()
-    wait_after: Sequence[Tuple[str, float]] = ()
-    # Tokens that must appear AFTER `wait_token` was observed, not merely
-    # somewhere in the scenario's output.
-    #
-    # `wait_after` searches from the start of the scenario, so it is satisfied by
-    # a line printed before the edit even happened - fine for a token whose text
-    # is new, useless for asking "is the previous assembly still running?", where
-    # the expected line was already streaming beforehand. These are waited for
-    # from a fresh index taken once `wait_token` lands, which is the only way to
-    # tell "still alive" from "was alive".
-    alive_tokens: Sequence[Tuple[str, float]] = ()
-
-
-@dataclass
-class Scenario:
-    """One C# bridge scenario: sequential phases, expected output, cleanup."""
-
-    name: str
-    phases: Sequence[ScenarioPhase]
-    restore_after: Sequence[Path] = field(default_factory=list)
-
-
-def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
-    """Runs one scenario and asserts the host's C# behaviour."""
-    print(f"\n  [TEST] {scenario.name}...")
-    start_index = monitor.line_count
-
-    for phase in scenario.phases:
-        # Captured per phase, not per scenario. Waiting from the scenario's start
-        # index makes every phase after the first match the PREVIOUS phase's line
-        # and return immediately, so a multi-phase scenario silently asserted
-        # nothing about phases 2..n.
-        phase_index = monitor.line_count
-
-        for path, replacements in phase.edits:
-            # Captured here rather than relying on the startup list. `restore_one`
-            # silently does nothing for a path it never captured, so a scenario
-            # touching a file the list did not name left that file modified - and
-            # every scenario after it then ran against the wrong sources and
-            # failed for reasons that had nothing to do with what it tested.
-            # Capturing at the point of edit makes that impossible to get wrong,
-            # and `capture` is idempotent so the startup list still stands.
-            BACKUP.capture(path)
-            if not apply_replacements(path, replacements):
-                return False
-
-        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, phase_index):
-            output = monitor.output_since(start_index)
-            if has_crash_signals(output):
-                print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
-                print(f"  Output tail:\n{output[-1600:]}")
-            else:
-                print(
-                    f"  [FAIL] Timeout waiting for {phase.wait_token!r} in scenario: "
-                    f"{scenario.name}"
-                )
-                print(f"  Output tail:\n{output[-1600:]}")
-            return False
-
-        time.sleep(STABILITY_SLEEP)
-
-        if not monitor.process_alive():
-            print(f"  [FAIL] Process died after scenario: {scenario.name}")
-            return False
-
-        for token, timeout in phase.wait_after:
-            if not monitor.wait_for(token, timeout, start_index):
-                print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
-                print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
-                return False
-
-        # Proof of life measured from after the phase's outcome, so a line
-        # that was already streaming before the edit cannot satisfy it.
-        alive_index = monitor.line_count
-        for token, timeout in phase.alive_tokens:
-            if not monitor.wait_for(token, timeout, alive_index):
-                print(f"  [FAIL] {token!r} did not appear AFTER the reload outcome "
-                      f"in scenario: {scenario.name}")
-                print("         The previously loaded assembly should still be running.")
-                print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
-                return False
-
-    output = monitor.output_since(start_index)
-    if has_crash_signals(output):
-        print(f"  [FAIL] Crash token observed in scenario: {scenario.name}")
-        print(f"  Output tail:\n{output[-1600:]}")
-        return False
-
-    for phase in scenario.phases:
-        for token in phase.required_tokens:
-            if token not in output:
-                print(f"  [FAIL] Missing required token in {scenario.name}: {token!r}")
-                print(f"  Output tail:\n{output[-1600:]}")
-                return False
-        for token in phase.forbidden_tokens:
-            if token in output:
-                print(f"  [FAIL] Forbidden token found in {scenario.name}: {token!r}")
-                print(f"  Output tail:\n{output[-1600:]}")
-                return False
-
-    print(f"  [OK] {scenario.name}")
-
-    # Restore edited sources so the next scenario starts from the originals.
-    # The restore rewrites the file, which the watcher turns into another C#
-    # reload; wait for that reload to finish so its output cannot pollute the
-    # next scenario's wait window.
-    settle_start = monitor.line_count
-    for path in scenario.restore_after:
-        BACKUP.restore_one(path)
-        if not monitor.wait_for(CSHARP_RELOADED_TOKEN, SETTLE_TIMEOUT, settle_start):
-            print(f"  [WARN] Restore of {path.name} did not settle with a C# reload")
-        time.sleep(STABILITY_SLEEP)
-
-    return True
+# The scenario model and runner are shared: `core/scenario.py`.
 
 # =============================================================================
 # Bridge-specific startup assertions
@@ -1174,6 +1051,21 @@ def verify_unload_ledger(session_output: str) -> bool:
     return True
 
 
+def csharp_runner() -> ScenarioRunner:
+    """The runner settings for this suite.
+
+    Built per session so it picks up the timeouts `main()` scaled from
+    `--timeout-scale`. A C# restore swaps an assembly and settles with the
+    runtime's own reload line, whichever file was put back.
+    """
+    return ScenarioRunner(
+        reload_timeout=RELOAD_TIMEOUT,
+        settle_timeout=SETTLE_TIMEOUT,
+        stability_sleep=STABILITY_SLEEP,
+        restore_settle_token=lambda _path: CSHARP_RELOADED_TOKEN,
+    )
+
+
 def run_csharp_session() -> bool:
     """Writes the C# project's settings, launches the host, and runs the scenarios."""
     print("\n  [TEST] Launching standalone host with project_cs...")
@@ -1194,7 +1086,7 @@ def run_csharp_session() -> bool:
             return False
 
         for scenario in SESSION_SCENARIOS:
-            if not run_scenario(scenario, monitor):
+            if not run_scenario(scenario, monitor, csharp_runner()):
                 session_passed = False
                 break
 

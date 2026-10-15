@@ -15,7 +15,7 @@ DESCRIPTION
     lives on the host and is bumped at each reload transaction; this suite
     proves a real module edit moves it.
 
-    The scenario mirrors test_module_project_auto_reload.py: load `pill_spline`
+    The scenario mirrors `test_hot_reload_suite.py`'s cascade: load `pill_spline`
     into `examples/project_rs`, edit the module's sample-offset constant, and
     wait for the reload transaction. The assertion is the host's own log line
     `editor revision bumped`, which the editor surfaces to integration suites
