@@ -184,9 +184,16 @@ pub fn compute(
                             None
                         };
                         let measured = text.measure(&context.text, &context.style, wrap);
+                        // Taffy rounds every box to whole pixels. A text
+                        // leaf must never round *down* below its own line
+                        // width: painting re-shapes with wrap at the box
+                        // width, so a rounded-down box wraps its last glyph
+                        // out onto a hidden second line (the stray tail
+                        // glyphs and clipped titles of the editor's chrome).
+                        // Ceil the measured size instead.
                         TaffySize {
-                            width: measured.x,
-                            height: measured.y,
+                            width: measured.x.ceil(),
+                            height: measured.y.ceil(),
                         }
                     },
                 )
@@ -947,6 +954,78 @@ mod tests {
         );
         assert!(activated, "the click activates on the next frame");
         assert_eq!(output.inputs, vec![crate::panel::PanelInput::Activated(id)]);
+    }
+
+    #[test]
+    fn menu_like_labels_fit_their_rects() {
+        // The shell's menu bar and dock tab strips build a row of labels in
+        // one strip; a label narrower than its text clips the last glyph.
+        // This is the stage 36 reproduction of the editor's clipped chrome.
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let theme = Theme::default();
+        let mut sheet = Stylesheet::parse(crate::DEFAULT_SHEET);
+        let titles = [
+            "Edit", "Entity", "Layout", "Spline", "Tools", "View", "Window",
+        ];
+        state.input.begin_frame();
+        let (output, layout) = run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            ctrl(1280.0, 26.0),
+            |ui| {
+                ui.row(|row| {
+                    for title in titles {
+                        row.label(title);
+                    }
+                });
+            },
+        );
+        fn walk(
+            node: &PanelNode,
+            index: &mut usize,
+            layout: &PanelLayout,
+            text: &mut TextSystem,
+            theme: &Theme,
+            previous_right: &mut f32,
+        ) {
+            let rect = layout.rects[*index];
+            if let PanelNode::Label { text: label } = node {
+                let style = text_style(node, theme, &layout.styles[*index]);
+                let measured = text.measure(label, &style, None);
+                assert!(
+                    rect.min.x + measured.x <= rect.max.x + 0.01,
+                    "label {label:?} clips: rect x={} width={} but the text measures {}",
+                    rect.min.x,
+                    rect.width(),
+                    measured.x
+                );
+                assert!(
+                    rect.min.x >= *previous_right - 0.01,
+                    "label {label:?} overlaps the previous one: x={} after {}",
+                    rect.min.x,
+                    *previous_right
+                );
+                *previous_right = rect.max.x;
+            }
+            *index += 1;
+            for child in node.children() {
+                walk(child, index, layout, text, theme, previous_right);
+            }
+        }
+        let mut index = 0usize;
+        let mut previous_right = f32::NEG_INFINITY;
+        walk(
+            &output.tree.root,
+            &mut index,
+            &layout,
+            &mut text,
+            &theme,
+            &mut previous_right,
+        );
+        assert_eq!(index, layout.rects.len(), "walk visited every node");
     }
 
     #[test]

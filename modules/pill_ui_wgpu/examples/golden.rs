@@ -96,6 +96,13 @@ fn scenes() -> Vec<Scene> {
             atlas_length: 64,
             build: golden_atlas_growth,
         },
+        Scene {
+            name: "chrome",
+            width: 900,
+            height: 64,
+            atlas_length: 2048,
+            build: golden_chrome,
+        },
     ]
 }
 
@@ -164,6 +171,32 @@ fn golden_atlas_growth(ui: &mut PanelBuilder<'_>) {
     ui.label("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
     ui.label("abcdefghijklmnopqrstuvwxyz");
     ui.label("0123456789");
+}
+
+/// The editor's chrome rows, as the shell builds them: a menu bar and a dock
+/// tab strip are plain rows of labels, and every label's box must fit its
+/// text (stage 36's repro scene for clipped chrome text).
+fn golden_chrome(ui: &mut PanelBuilder<'_>) {
+    ui.row(|row| {
+        for title in [
+            "Edit", "Entity", "Layout", "Spline", "Tools", "View", "Window",
+        ] {
+            row.label(title);
+        }
+    });
+    ui.row(|row| {
+        for title in [
+            "Hierarchy",
+            "Assets",
+            "Inspector",
+            "Systems",
+            "Console",
+            "Problems",
+            "Gallery",
+        ] {
+            row.label(title);
+        }
+    });
 }
 
 // =============================================================================
