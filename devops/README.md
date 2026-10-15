@@ -49,7 +49,6 @@ Pass/fail suites for the hot-reload and persistence architecture, plus the
 # Host-driving regression suites
 python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
-python devops/tests/test_module_project_auto_reload.py
 python devops/tests/test_csharp_bridge.py
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge

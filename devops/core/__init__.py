@@ -20,6 +20,8 @@ DESCRIPTION
       * `suite_common`  - host process plumbing: log tokens, the output
                           monitor, atomic source edits, backup/restore. Shared
                           by the functional suites and the benchmark harness.
+      * `scenario`      - the shared scenario runner those suites run their
+                          tables on: edit, wait, assert, restore.
 
     A standalone script reaches this package with:
 

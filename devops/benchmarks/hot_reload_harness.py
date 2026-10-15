@@ -54,7 +54,8 @@ DESCRIPTION
     flags Pill Lab does not surface (`--max-wall-ms`, `--csv`).
 
     It imports `core.suite_common` for the host process plumbing (paths, log
-    tokens, the OutputMonitor, backup/restore), the same module the functional
+    tokens, the OutputMonitor, backup/restore) and `core.scenario` for the
+    shared edit planner and restore-settle, the same modules the functional
     suites in `devops/tests/` use. The import path is bootstrapped below so
     this file works standalone and when imported by `hot_reload.py`.
 
@@ -91,6 +92,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
+
+# The shared settle: restoring a source and waiting for the reload it triggers
+# is the same step a suite scenario performs, so the harness uses that one
+# definition rather than its own copy (audit SA-0057).
+from core.scenario import settle_restored_source  # noqa: E402
 
 # =============================================================================
 # Session configuration
@@ -144,15 +150,27 @@ class EditHook:
 
 # `SAMPLE_VERTICAL_OFFSET` is behavior-only: it shifts the project probe's
 # midpoint, so the reload is observable and the edit is trivially reversible.
-# The wait token is the module-completion info line (printed right after the
-# module build/load/init, BEFORE the queued project reload), so the wall time
-# measures module-only latency; the analytics line is parsed afterwards for
-# the phase breakdown. Settling waits for the cascaded project reload so the
-# next measurement starts from a clean state.
+# The edit itself is planned from the current source (`edit_spline_sample_offset`)
+# rather than pinned to a literal pair: a pinned "= 0.0 -> = 10.0" only matches a
+# source nobody has bumped yet, so a run that ended on a bumped offset broke the
+# next one's first edit. The wait token is the module-completion info line
+# (printed right after the module build/load/init, BEFORE the queued project
+# reload), so the wall time measures module-only latency; the analytics line is
+# parsed afterwards for the phase breakdown. Settling waits for the cascaded
+# project reload so the next measurement starts from a clean state.
+SPLINE_OFFSET_EDIT = edit_spline_sample_offset(read_source(SPLINE_LIB_RS))
+
+# The constant `SPLINE_OFFSET_EDIT` rewrites. Named separately because the edit
+# is planned from the current source, so `SPLINE_EDIT.edit[0]` is always
+# present and can no longer stand in for the layout guard below; this literal
+# (the name in `core.suite_common.SAMPLE_OFFSET_PATTERN`) still catches a
+# rename with a diagnostic instead of a traceback.
+SPLINE_OFFSET_ANCHOR = "const SAMPLE_VERTICAL_OFFSET"
+
 SPLINE_EDIT = EditHook(
     label="module_reload",
     path=SPLINE_LIB_RS,
-    edit=("SAMPLE_VERTICAL_OFFSET: f32 = 0.0", "SAMPLE_VERTICAL_OFFSET: f32 = 10.0"),
+    edit=SPLINE_OFFSET_EDIT.replacements[0],
     wait_token=MODULE_RELOAD_COMPLETE_TOKEN,
     settle_token="[analytics] reload project ",
     analytics_name="pill_spline",
@@ -172,7 +190,7 @@ PROJECT_EDIT = EditHook(
 CASCADE_EDIT = EditHook(
     label="cascade_total",
     path=SPLINE_LIB_RS,
-    edit=("SAMPLE_VERTICAL_OFFSET: f32 = 0.0", "SAMPLE_VERTICAL_OFFSET: f32 = 10.0"),
+    edit=SPLINE_OFFSET_EDIT.replacements[0],
     wait_token="[analytics] reload project ",
     settle_token="[analytics] reload project ",
     analytics_name="project",
@@ -214,7 +232,7 @@ PREREQUISITE_FILES = [
 ]
 
 PREREQUISITE_ANCHORS = [
-    ("pill_spline constant", SPLINE_LIB_RS, SPLINE_EDIT.edit[0], "native"),
+    ("pill_spline constant", SPLINE_LIB_RS, SPLINE_OFFSET_ANCHOR, "native"),
     ("project_rs constant", PROJECT_RS_SETTINGS_RS, PROJECT_EDIT.edit[0], "native"),
     ("project_cs probe prefix", PROJECT_CS_SYSTEMS_CS, CSHARP_EDIT.edit[0], "csharp"),
 ]
@@ -534,13 +552,27 @@ def measure_one_reload(
 
 
 def restore_and_settle(monitor: OutputMonitor, hook: EditHook, label: str) -> bool:
-    """Restores the edited file and waits for the settle reload."""
-    settle_start = monitor.line_count
-    BACKUP.restore_one(hook.path)
-    if not wait_for_reload(monitor, hook.settle_token, SETTLE_TIMEOUT, settle_start, label):
-        return False
-    time.sleep(STABILITY_SLEEP)
-    return True
+    """Restores the edited file and waits for the settle reload.
+
+    The settle itself is the shared one (`core.scenario.settle_restored_source`),
+    so a benchmark iteration and a suite scenario agree on what "the sources are
+    back" means. Unlike a suite, which warns and carries on, the harness treats
+    a settle that never arrives as fatal: the next measurement would otherwise
+    time a host that is still reloading.
+    """
+    if settle_restored_source(
+        monitor,
+        hook.path,
+        hook.settle_token,
+        SETTLE_TIMEOUT,
+        STABILITY_SLEEP,
+    ):
+        return True
+    print(
+        f"  [FAIL] The restore of {hook.path.name} never settled with "
+        f"{hook.settle_token!r} during {label}."
+    )
+    return False
 
 # =============================================================================
 # Measurement runs

@@ -67,10 +67,8 @@ import os
 import re
 import subprocess
 import sys
-import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
 # host's log tokens live in one place (audit opportunity 5.14).
@@ -81,11 +79,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
 from core.suite_common import *  # noqa: E402,F401,F403
 
+# The shared scenario runner: one definition for every hot-reload suite
+# (audit SA-0057). This suite adds only its tokens and scenario tables.
+from core.scenario import Scenario, ScenarioPhase, ScenarioRunner, run_scenario  # noqa: E402
+
 # =============================================================================
 # Session configuration
 # =============================================================================
 
-PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "devops" / "tests" / "project" / "src" / "lib.rs"
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "pill_spline" / "src" / "pill_spline.rs"
 
 # Session settings: only the extension list lives in a file now; the
@@ -110,6 +111,24 @@ modules:
 
 PROJECT_FORGOTTEN_WARN_TOKEN = "no longer registered by the project"
 MODULE_FORGOTTEN_WARN_TOKEN = "no longer registered by this module"
+
+# The project probe's report line, e.g. "midpoint (390.0, 120.0)". Session B's
+# cascade scenario derives the value it expects from the reports the host
+# itself prints, so nothing here names a coordinate: the midpoint is the
+# module's math applied to the project's spawn geometry, and a literal would
+# need re-calibrating whenever either side is edited (this is the check the
+# folded `test_module_project_auto_reload.py` made on its own).
+PROBE_PREFIX = "midpoint ("
+PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
+
+
+def last_probe_midpoint(output: str) -> Tuple[float, float]:
+    """Returns the (x, y) of the newest probe report in the given output."""
+    matches = PROBE_MIDPOINT_PATTERN.findall(output)
+    if not matches:
+        raise RuntimeError("No spline probe midpoint found in the host output")
+    x_text, y_text = matches[-1]
+    return float(x_text), float(y_text)
 
 # =============================================================================
 # Host session
@@ -160,139 +179,7 @@ def launch_host(project_path: str):
     environment["PROJECT_PATH"] = project_path
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
-# =============================================================================
-# Scenario model
-# =============================================================================
-
-
-@dataclass
-class ScenarioPhase:
-    """One edit+wait step inside a scenario.
-
-    A scenario runs its phases in order; each phase applies its edits, waits for
-    ``wait_token``, then waits its own ``wait_after`` tokens from an index taken
-    after that reload. Once every phase is done the whole scenario window is
-    checked for required / forbidden tokens.
-    """
-
-    edits: Sequence[Tuple[Path, Sequence[Tuple[str, str]]]]
-    wait_token: str
-    required_tokens: Sequence[str] = ()
-    forbidden_tokens: Sequence[str] = ()
-    # Proof-of-life tokens (a counter tick, a probe value), waited for from an
-    # index taken after `wait_token` appears, never from the scenario start.
-    wait_after: Sequence[Tuple[str, float]] = ()
-
-
-@dataclass
-class Scenario:
-    """One hot-reload scenario: sequential phases, expected output, cleanup."""
-
-    name: str
-    phases: Sequence[ScenarioPhase]
-    restore_after: Sequence[Path] = field(default_factory=list)
-    restore_required_tokens: Sequence[str] = ()
-
-
-def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
-    """Runs one scenario and asserts the host's reload behaviour."""
-    print(f"\n  [TEST] {scenario.name}...")
-    start_index = monitor.line_count
-
-    for phase in scenario.phases:
-        # Captured per phase, not per scenario. Waiting from the scenario's
-        # start index lets phase 1's reload line satisfy phase 2's wait, which
-        # returns immediately and then checks phase 2's required tokens while
-        # its build is still running - reported as a missing token with the
-        # reload finishing moments later. The C# bridge suite carries the same
-        # per-phase capture for the same reason.
-        phase_index = monitor.line_count
-
-        for path, replacements in phase.edits:
-            if not apply_replacements(path, replacements):
-                return False
-
-        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, phase_index):
-            output = monitor.output_since(start_index)
-            if has_crash_signals(output):
-                print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
-                print(f"  Output tail:\n{output[-1600:]}")
-            else:
-                print(
-                    f"  [FAIL] Timeout waiting for {phase.wait_token!r} in scenario: "
-                    f"{scenario.name}"
-                )
-                print(f"  Output tail:\n{output[-1600:]}")
-            return False
-
-        time.sleep(STABILITY_SLEEP)
-
-        if not monitor.process_alive():
-            print(f"  [FAIL] Process died after scenario: {scenario.name}")
-            return False
-
-        # Proof-of-life tokens are waited for from an index taken HERE, after the
-        # reload token, not from the scenario's start. A counter that kept
-        # printing while the reload was building satisfies a start-indexed wait
-        # instantly, so that wait passed whether or not the new generation ever
-        # ran; indexing after the reload token makes it prove the reloaded code
-        # is alive. The C# bridge suite captures its index the same way.
-        alive_index = monitor.line_count
-
-        # Wait for any secondary tokens (counter ticks, probe values, ...).
-        for token, timeout in phase.wait_after:
-            if not monitor.wait_for(token, timeout, alive_index):
-                print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
-                print(f"  Output tail:\n{monitor.output_since(alive_index)[-1600:]}")
-                return False
-
-    output = monitor.output_since(start_index)
-    if has_crash_signals(output):
-        print(f"  [FAIL] Crash token observed in scenario: {scenario.name}")
-        print(f"  Output tail:\n{output[-1600:]}")
-        return False
-
-    for phase in scenario.phases:
-        for token in phase.required_tokens:
-            if token not in output:
-                print(f"  [FAIL] Missing required token in {scenario.name}: {token!r}")
-                print(f"  Output tail:\n{output[-1600:]}")
-                return False
-        for token in phase.forbidden_tokens:
-            if token in output:
-                print(f"  [FAIL] Forbidden token found in {scenario.name}: {token!r}")
-                print(f"  Output tail:\n{output[-1600:]}")
-                return False
-
-    print(f"  [OK] {scenario.name}")
-
-    # Restore edited sources so the next scenario starts from the originals.
-    # Each restore rewrites the file, which the watcher turns into another
-    # reload; wait for that reload to finish so its output cannot pollute the
-    # next scenario's wait window.
-    settle_start = monitor.line_count
-    for path in scenario.restore_after:
-        BACKUP.restore_one(path)
-        settle_token = (
-            RELOAD_PROJECT_TOKEN if path == PROJECT_SANDBOX_LIB_RS else RELOAD_MODULE_TOKEN
-        )
-        # Scan only lines that arrive after the restore: the scenario's own
-        # reload line is already in the buffer and must not satisfy the wait.
-        if not monitor.wait_for(settle_token, SETTLE_TIMEOUT, settle_start):
-            print(
-                f"  [WARN] Restore of {path.name} did not settle with {settle_token!r}"
-            )
-        time.sleep(STABILITY_SLEEP)
-
-    # Post-restore assertions (e.g. the module re-seeding fresh data after a
-    # forgotten-type drop: the restore-driven reload logs existing=0).
-    for token in scenario.restore_required_tokens:
-        if not monitor.wait_for(token, SETTLE_TIMEOUT, settle_start):
-            print(f"  [FAIL] Missing post-restore token in {scenario.name}: {token!r}")
-            print(f"  Output tail:\n{monitor.output_since(settle_start)[-1600:]}")
-            return False
-
-    return True
+# The scenario model and runner are shared: `core/scenario.py`.
 
 # =============================================================================
 # Scenario definitions
@@ -451,7 +338,7 @@ SESSION_A_SCENARIOS = [
                 wait_token=RELOAD_PROJECT_TOKEN,
                 required_tokens=[RELOAD_PROJECT_TOKEN, "crates rebuilt by cargo"],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+                alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
@@ -467,7 +354,7 @@ SESSION_A_SCENARIOS = [
                     "'project::FrameCounter' -> OK",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+                alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
@@ -483,7 +370,7 @@ SESSION_A_SCENARIOS = [
                     "LinearVelocity",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+                alive_tokens=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
@@ -616,63 +503,105 @@ SESSION_A_SCENARIOS = [
 
 # --- Session B scenario (project = examples/project_rs, module = pill_spline) -
 
-SESSION_B_SCENARIOS = [
-    Scenario(
-        name="cascade_reload",
-        phases=[
-            ScenarioPhase(
-                edits=[
-                    (
-                        SPLINE_LIB_RS,
-                        [
-                            (
-                                "SAMPLE_VERTICAL_OFFSET: f32 = 0.0",
-                                "SAMPLE_VERTICAL_OFFSET: f32 = 10.0",
-                            )
-                        ],
-                    )
-                ],
-                wait_token=RELOAD_MODULE_TOKEN,
-                # `1 spline(s)` pins module<->project coexistence: `Spline` is
-                # `#[pill(shared)]`, so the module DLL's copy and the project's
-                # are one component with one column, and both artifacts top up
-                # to a single spline rather than each seeding its own. After
-                # both reloads the probe therefore still sees exactly one -
-                # previously for the opposite reason, that the two copies were
-                # distinct types the project could not see across.
-                #
-                # The count alone carries that meaning; the surrounding probe
-                # wording in `examples/project_rs/src/lib.rs` is incidental and
-                # edited freely by the demos. Widened from the previous
-                # `xxsees 1 spline(s)` so a probe rewording no longer fails this
-                # scenario. If it regresses, read the analytics lines just above
-                # the failure: two reloads and a `1 spline(s)` in the output
-                # mean the behaviour is fine and only the wording moved.
-                required_tokens=[
-                    RELOAD_MODULE_TOKEN,
-                    MODULE_RELOAD_COMPLETE_TOKEN,
-                    CASCADE_TOKEN,
-                    RELOAD_PROJECT_TOKEN,
-                    "1 spline(s)",
-                ],
-                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                # The probe samples a reference spline over the project's ball
-                # spawn geometry, whose Catmull-Rom midpoint at t=0.5 is the
-                # middle spawn point, (390, 120), plus the module's vertical
-                # offset, which this phase moves from 0.0 to 10.0. The value is
-                # stable because the spawn geometry is source constants; the
-                # sameness is the point, since the token below has to name it
-                # in advance.
-                wait_after=[("midpoint (390.0, 130.0", PROBE_TIMEOUT)],
-            )
-        ],
-        restore_after=[SPLINE_LIB_RS],
-    ),
-]
+# The offset bump the cascade scenario makes, planned against the module source
+# as it is now. Its `delta` is what the probe check below is derived from.
+CASCADE_OFFSET_EDIT = edit_spline_sample_offset(read_source(SPLINE_LIB_RS))
+
+
+def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
+    """Session B's scenarios, with the cascade probe value derived from the host.
+
+    The cascade edit moves the module's sample offset, which moves the project
+    probe's reported midpoint by exactly that much - so the value to wait for is
+    the midpoint the host is reporting now, shifted by `CASCADE_OFFSET_EDIT`.
+    Reading the baseline from the running host rather than writing the
+    coordinate down is the check the folded `test_module_project_auto_reload.py`
+    made on its own, folded here so one host launch proves both the cascade and
+    that the new offset reached the project's view (audit SA-0067).
+
+    The table is built after the host is up for that reason; returns None when
+    the probe never reported, which fails the session.
+    """
+    if not monitor.wait_for(PROBE_PREFIX, PROBE_TIMEOUT):
+        print("  [FAIL] The project probe reported no spline midpoint before the cascade.")
+        print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
+        return None
+
+    baseline_x, baseline_y = last_probe_midpoint(monitor.output_since(0))
+    expected_midpoint = (
+        f"midpoint ({baseline_x:.1f}, {baseline_y + CASCADE_OFFSET_EDIT.delta:.1f})"
+    )
+    print(
+        f"  [OK] Project probe baseline ({baseline_x:.1f}, {baseline_y:.1f}); the "
+        f"cascade edit must report {expected_midpoint!r}."
+    )
+
+    return [
+        Scenario(
+            name="cascade_reload",
+            phases=[
+                ScenarioPhase(
+                    edits=[(SPLINE_LIB_RS, CASCADE_OFFSET_EDIT.replacements)],
+                    wait_token=RELOAD_MODULE_TOKEN,
+                    # `1 spline(s)` pins module<->project coexistence: `Spline` is
+                    # `#[pill(shared)]`, so the module DLL's copy and the project's
+                    # are one component with one column, and both artifacts top up
+                    # to a single spline rather than each seeding its own. After
+                    # both reloads the probe therefore still sees exactly one -
+                    # previously for the opposite reason, that the two copies were
+                    # distinct types the project could not see across.
+                    #
+                    # The count alone carries that meaning; the surrounding probe
+                    # wording in `examples/project_rs/src/lib.rs` is incidental and
+                    # edited freely by the demos. Widened from the previous
+                    # `xxsees 1 spline(s)` so a probe rewording no longer fails this
+                    # scenario. If it regresses, read the analytics lines just above
+                    # the failure: two reloads and a `1 spline(s)` in the output
+                    # mean the behaviour is fine and only the wording moved.
+                    required_tokens=[
+                        RELOAD_MODULE_TOKEN,
+                        MODULE_RELOAD_COMPLETE_TOKEN,
+                        CASCADE_TOKEN,
+                        RELOAD_PROJECT_TOKEN,
+                        "1 spline(s)",
+                    ],
+                    forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                    # Waited from the index taken after the reload outcome, not
+                    # from the scenario start: a report from before the edit
+                    # satisfies a start-indexed wait instantly, so only a report
+                    # that arrives after the module reload can carry the new
+                    # offset. The value is derived above, from the baseline the
+                    # host itself printed.
+                    alive_tokens=[(expected_midpoint, PROBE_TIMEOUT)],
+                )
+            ],
+            restore_after=[SPLINE_LIB_RS],
+        ),
+    ]
 
 # =============================================================================
 # Session runner
 # =============================================================================
+
+
+def session_runner() -> ScenarioRunner:
+    """The runner settings for this suite.
+
+    Built per session, and with the timeouts named explicitly rather than left
+    to the runner's defaults: those are bound when `core.scenario` is imported,
+    so they cannot follow the scaling `main()` applies to this module's
+    timeouts from `--timeout-scale`.
+    """
+    return ScenarioRunner(
+        reload_timeout=RELOAD_TIMEOUT,
+        settle_timeout=SETTLE_TIMEOUT,
+        stability_sleep=STABILITY_SLEEP,
+    )
+
+
+def session_a_scenarios(_monitor: OutputMonitor) -> Sequence[Scenario]:
+    """Session A's scenarios; nothing in them depends on the running host."""
+    return SESSION_A_SCENARIOS
 
 
 def verify_clean_restart(
@@ -712,9 +641,15 @@ def run_session(
     project_root: Path,
     project_path: str,
     settings_content: str,
-    scenarios: Sequence[Scenario],
+    build_scenarios: Callable[[OutputMonitor], Optional[Sequence[Scenario]]],
 ) -> bool:
-    """Writes the session's project settings, launches the host, and runs its scenarios."""
+    """Writes the session's project settings, launches the host, and runs its scenarios.
+
+    The scenario table is built after the host reaches its loop rather than
+    passed in as a constant: session B derives the probe value its cascade
+    scenario waits for from what the host is printing. A builder that returns
+    None fails the session.
+    """
     print(f"\n{'=' * 64}")
     print(f"  SESSION {name}")
     print(f"{'=' * 64}")
@@ -749,8 +684,12 @@ def run_session(
             return False
         print("  [OK] Startup complete: module loaded and analytics report printed.")
 
+        scenarios = build_scenarios(monitor)
+        if scenarios is None:
+            return False
+
         for scenario in scenarios:
-            if not run_scenario(scenario, monitor):
+            if not run_scenario(scenario, monitor, session_runner()):
                 session_passed = False
                 break
 
@@ -832,7 +771,7 @@ def main() -> None:
                     FIXTURE_PROJECT_ROOT,
                     "../devops/tests/project",
                     SESSION_A_SETTINGS,
-                    SESSION_A_SCENARIOS,
+                    session_a_scenarios,
                 ),
             )
         )
@@ -845,7 +784,7 @@ def main() -> None:
                         NATIVE_PROJECT_ROOT,
                         "../examples/project_rs",
                         SESSION_B_SETTINGS,
-                        SESSION_B_SCENARIOS,
+                        session_b_scenarios,
                     ),
                 )
             )

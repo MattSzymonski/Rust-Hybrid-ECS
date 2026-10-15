@@ -202,7 +202,7 @@ def wait_for_rollback(monitor: OutputMonitor, start_index: int) -> bool:
     return False
 
 
-def run_scenario(monitor: OutputMonitor, backups: BackupRegistry) -> bool:
+def run_bookkeeping_scenario(monitor: OutputMonitor, backups: BackupRegistry) -> bool:
     """Patch, break the build, and roll the patch back through the failure."""
     crate = Crate(NATIVE_PROJECT_ROOT.name, NATIVE_PROJECT_ROOT / "src", "project")
     if not plan_edit(crate):
@@ -281,7 +281,7 @@ def main() -> None:
             print(f"  [FAIL] Host did not start within {startup_timeout}s.")
             sys.exit(1)
         print("  [OK] Host running.\n")
-        passed = run_scenario(monitor, backups)
+        passed = run_bookkeeping_scenario(monitor, backups)
     finally:
         print("\n  [CLEANUP] Restoring source and stopping the host...")
         clear_rollback_request()
