@@ -25,7 +25,7 @@ DESCRIPTION
     The edited GPU module source is backed up and restored.
 
 USAGE
-  python devops/tests/test_multi_surface.py [--timeout-scale S]
+  python devops/tests/test_multi_surface.py [--timeout-scale S] [--skip-build]
 
 EXAMPLE USAGE
   python devops/tests/test_multi_surface.py
@@ -80,6 +80,10 @@ ORIGINAL_SOURCE = ""
 # Helpers
 # =============================================================================
 
+# `rendering` is what this suite measures; `hot_patch` stays on with it because
+# the two are one resolved graph here (the default feature forwards it).
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
+
 
 def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the windowed dev host with the second view open."""
@@ -87,11 +91,7 @@ def launch_host() -> Tuple[subprocess.Popen, OutputMonitor]:
     environment["PROJECT_PATH"] = PROJECT_PATH
     environment["PILL_SECOND_VIEW"] = "1"
     environment["PILL_SECOND_VIEW_SECONDS"] = str(SECOND_VIEW_SECONDS)
-    return launch_process(
-        ["cargo", "run", "--package", "pill_standalone", "--features", "rendering"],
-        MODULES_ROOT,
-        environment,
-    )
+    return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
 
 
 def restore_source() -> None:
@@ -164,8 +164,7 @@ def main() -> None:
     """Parses arguments and runs the suite."""
     global ORIGINAL_SOURCE, STARTUP_TIMEOUT, RELOAD_TIMEOUT
     parser = argparse.ArgumentParser(description="Multi-surface renderer integration test")
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply all timeouts for slow machines (default: 1.0)")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
     if args.timeout_scale <= 0:
         print("ERROR: --timeout-scale must be > 0")
@@ -176,7 +175,10 @@ def main() -> None:
     print("=" * 60)
     print("  Multi-Surface Renderer Integration Test")
     print("=" * 60)
+    ensure_host_lock()
     kill_stale_hosts()
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT):
+        sys.exit(1)
     ORIGINAL_SOURCE = GPU_MODULE_SOURCE.read_text(encoding="utf-8")
     passed = False
     try:

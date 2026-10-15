@@ -64,7 +64,6 @@ EXAMPLE USAGE
 import argparse
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -355,7 +354,7 @@ def plan_edit(crate: Crate) -> bool:
 # `-C prefer-dynamic` means the binary needs the toolchain's `std-*.dll` and the
 # workspace's `pill_core.dll` on the loader path, and `cargo run` is what sets
 # that up - executed directly, the process dies in the loader before it can
-# print anything. Building through the same command also guarantees the binary
+# print anything. Building through the same posture also guarantees the binary
 # carries the `hot_patch` feature, which is the whole subject of this test.
 #
 # `rendering` is required rather than optional: examples/project_rs links
@@ -363,39 +362,7 @@ def plan_edit(crate: Crate) -> bool:
 # from the project and the project DLL fails to load with "The specified
 # procedure could not be found" (os error 127), the same reason the cascade
 # suite pins it.
-HOST_LAUNCH_COMMAND = [
-    "cargo",
-    "run",
-    "-p",
-    "pill_standalone",
-    "--features",
-    "pill_host/hot_patch,rendering",
-]
-
-
-def build_host() -> bool:
-    """Build the standalone host with the hot-patch feature enabled."""
-    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch,rendering")
-    completed = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "-p",
-            "pill_standalone",
-            "--features",
-            "pill_host/hot_patch,rendering",
-        ],
-        cwd=str(MODULES_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=BUILD_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        print("  [FAIL] Host build failed:")
-        print(completed.stderr[-2000:])
-        return False
-    print("  [OK] Host built.")
-    return True
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 
 def classify_outcome(output: str, crate: Crate) -> Tuple[str, str, str, int]:
@@ -620,12 +587,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Detect crates whose live-patch fast path stopped working"
     )
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply every timeout (slow machines)")
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Assume pill_standalone is already built")
     parser.add_argument("--strict", action="store_true",
                         help="Also fail when a crate has no fast path at all")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     global OUTCOME_TIMEOUT
@@ -640,8 +604,9 @@ def main() -> None:
     print(f"  Workspace: {WORKSPACE_ROOT}")
     print("=" * 78)
 
+    ensure_host_lock()
     kill_stale_hosts()
-    if not args.skip_build and not build_host():
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT_SECONDS):
         sys.exit(1)
 
     crates = discover_crates()
@@ -667,8 +632,8 @@ def main() -> None:
 
     environment = os.environ.copy()
     environment["PROJECT_PATH"] = "../examples/project_rs"
-    process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
-    backups = BackupRegistry()
+    process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
+    backups = BACKUP
     passed = False
     try:
         if not monitor.wait_for(STARTUP_TOKEN, startup_timeout):

@@ -51,7 +51,6 @@ EXAMPLE USAGE
 
 import argparse
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -79,14 +78,7 @@ ROLLBACK_REQUEST = MODULES_ROOT / "target" / "hot" / "rollback.request"
 # Launched through cargo for the same reason the coverage suite does: the
 # binary needs the toolchain's dynamic runtime on the loader path, and
 # `rendering` is required because examples/project_rs links the renderer.
-HOST_LAUNCH_COMMAND = [
-    "cargo",
-    "run",
-    "-p",
-    "pill_standalone",
-    "--features",
-    "pill_host/hot_patch,rendering",
-]
+HOST_POSTURE = HOST_DEV_HOT_PATCH_RENDERING
 
 # Reported by the native project reload when the build produced nothing usable
 # and the current image was kept. This is the outcome the bookkeeping must be
@@ -111,23 +103,6 @@ PATCH_TIMEOUT = 120
 RELOAD_TIMEOUT = 120
 ROLLBACK_TIMEOUT = 60
 BUILD_TIMEOUT_SECONDS = 600
-
-
-def build_host() -> bool:
-    """Build the standalone host with the hot-patch feature enabled."""
-    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch,rendering")
-    completed = subprocess.run(
-        ["cargo", "build", "-p", "pill_standalone",
-         "--features", "pill_host/hot_patch,rendering"],
-        cwd=str(MODULES_ROOT), capture_output=True, text=True,
-        timeout=BUILD_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        print("  [FAIL] Host build failed:")
-        print(completed.stderr[-2000:])
-        return False
-    print("  [OK] Host built.")
-    return True
 
 
 def write_rollback_request(request: str) -> None:
@@ -249,10 +224,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Assert patch bookkeeping survives a failed project reload"
     )
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply every timeout (slow machines)")
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Assume pill_standalone is already built")
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     global PATCH_TIMEOUT, RELOAD_TIMEOUT, ROLLBACK_TIMEOUT
@@ -266,15 +238,16 @@ def main() -> None:
     print(f"  Workspace: {WORKSPACE_ROOT}")
     print("=" * 70)
 
+    ensure_host_lock()
     kill_stale_hosts()
     clear_rollback_request()
-    if not args.skip_build and not build_host():
+    if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT_SECONDS):
         sys.exit(1)
 
     environment = os.environ.copy()
     environment["PROJECT_PATH"] = "../examples/project_rs"
-    process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
-    backups = BackupRegistry()
+    process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
+    backups = BACKUP
     passed = False
     try:
         if not monitor.wait_for(STARTUP_TOKEN, startup_timeout):
@@ -290,7 +263,7 @@ def main() -> None:
         # broken save's failed build. Rewinding the mtime would make the next
         # host start trust a stale artifact as up to date; leave the file
         # stamped "now" so the next build regenerates the original.
-        backups.restore_all(reset_mtime=False)
+        BACKUP.restore_all(reset_mtime=False)
         terminate_process(process, monitor)
         print("  [OK] Restored.")
 

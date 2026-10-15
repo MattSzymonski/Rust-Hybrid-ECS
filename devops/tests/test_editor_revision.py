@@ -33,10 +33,8 @@ EXAMPLE USAGE
 
 import argparse
 import os
-import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Tuple
 
@@ -64,8 +62,6 @@ modules:
   - "pill_spline"
 """
 
-ORIGINAL_HOST_CONFIG = None
-
 PROBE_PREFIX = "midpoint ("
 REVISION_BUMP_TOKEN = "editor revision bumped"
 PROJECT_RELOAD_TOKEN = "hot reload complete"
@@ -76,11 +72,6 @@ BASELINE_PROBE_TIMEOUT = 60
 MODULE_RELOAD_TIMEOUT = 90
 PROBE_UPDATE_TIMEOUT = 60
 REVISION_BUMP_TIMEOUT = 60
-
-# Matches the module's sample-offset constant used inside `get_location_at`.
-SAMPLE_OFFSET_PATTERN = re.compile(
-    r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
-)
 
 # The probe's baseline midpoint at t = 0.5 (one decimal): the project's
 # reference spline spans the ball spawn points, and the middle spawn point
@@ -97,151 +88,49 @@ ORIGINAL_CONTENT: str = ""
 # =============================================================================
 
 
-def read_source() -> str:
-    """Reads the current module source as text."""
-    return MODULE_LIB_RS.read_text(encoding="utf-8")
-
-
-def atomic_write(content: str) -> None:
-    """Writes source through a temporary file then renames it, so the watcher
-    sees one atomic change instead of a half-written file."""
-    temporary_path = MODULE_LIB_RS.with_suffix(".rs.tmp")
-    temporary_path.write_text(content, encoding="utf-8", newline="")
-    temporary_path.replace(MODULE_LIB_RS)
-
-
 def restore_original() -> None:
     """Restores the module source captured at script startup."""
     if not ORIGINAL_CONTENT:
         return
-    if read_source() == ORIGINAL_CONTENT:
+    if read_source(MODULE_LIB_RS) == ORIGINAL_CONTENT:
         return
-    atomic_write(ORIGINAL_CONTENT)
+    atomic_write(MODULE_LIB_RS, ORIGINAL_CONTENT)
 
 
 def plan_value_edit(content: str) -> Tuple[str, str, str]:
     """Returns (old line, replacement line, expected new probe midpoint)."""
-    matches = list(SAMPLE_OFFSET_PATTERN.finditer(content))
-    if len(matches) != 1:
-        raise RuntimeError(
-            f"Expected exactly one SAMPLE_VERTICAL_OFFSET line, found {len(matches)}"
-        )
-    match = matches[0]
-    current_offset = float(match.group(2))
-    new_offset = (current_offset + 1.0) % 10.0
-    new_offset_text = f"{new_offset:.1f}"
-    new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset_text};"
-    new_y = BASE_PROBE_MIDPOINT_Y + new_offset
-    return match.group(0), new_line, f"midpoint ({BASE_PROBE_MIDPOINT_X:.1f}, {new_y:.1f})"
-
-
-# =============================================================================
-# Host config helpers
-# =============================================================================
-
-
-def install_test_project_settings() -> None:
-    """Backs up the example project's settings file and installs the test's."""
-    global ORIGINAL_HOST_CONFIG
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    if settings_path.exists():
-        ORIGINAL_HOST_CONFIG = settings_path.read_text(encoding="utf-8")
-    else:
-        ORIGINAL_HOST_CONFIG = None
-    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8", newline="")
-
-
-def restore_project_settings() -> None:
-    """Restores the project's settings file, or removes the test's own."""
-    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
-    if ORIGINAL_HOST_CONFIG is None:
-        settings_path.unlink(missing_ok=True)
-    else:
-        settings_path.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8", newline="")
+    edit = edit_spline_sample_offset(content)
+    new_y = BASE_PROBE_MIDPOINT_Y + edit.new_offset
+    return (
+        edit.old_line,
+        edit.new_line,
+        f"midpoint ({BASE_PROBE_MIDPOINT_X:.1f}, {new_y:.1f})",
+    )
 
 
 # =============================================================================
 # Process helpers
 # =============================================================================
 
-
-def kill_stray_hosts() -> None:
-    """Terminates leftover host processes so they cannot lock build outputs."""
-    if os.name != "nt":
-        return
-    subprocess.run(
-        ["taskkill", "/IM", "pill_standalone.exe", "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+# `rendering` is required rather than optional: examples/project_rs links
+# `pill_master_renderer`, so a host without it resolves `pill_core` differently
+# from the project and the project DLL fails to load with "The specified
+# procedure could not be found" (os error 127), the same reason the cascade
+# suite pins it. No `hot_patch`: this suite measures the plain reload path.
+HOST_POSTURE = HOST_DEV_RENDERING
 
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the host and returns process + monitor."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
-    return launch_process(
-        [
-            "cargo",
-            "run",
-            "--package",
-            "pill_standalone",
-            "--no-default-features",
-            # `rendering` is required rather than optional: examples/project_rs
-            # links `pill_master_renderer`, so a host without it resolves
-            # `pill_core` differently from the project and the project DLL
-            # fails to load with "The specified procedure could not be found"
-            # (os error 127), the same reason the cascade suite pins it.
-            "--features",
-            "dev,rendering",
-        ],
-        MODULES_ROOT,
-        process_environment,
-    )
+    return launch_process(host_command(HOST_POSTURE), MODULES_ROOT, process_environment)
 
 
 def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None:
     """Stops the monitor, terminates the host safely, then cleans stray hosts."""
     common.terminate_process(process, monitor)
-    kill_stray_hosts()
-
-
-def build_workspace() -> bool:
-    """Builds the standalone host so launch skips compilation."""
-    print("\n  [PREP] Building pill_standalone...")
-    try:
-        result = subprocess.run(
-            [
-                "cargo",
-                "build",
-                "-p",
-                "pill_standalone",
-                "--no-default-features",
-                # Matches the launch below; see the note there for why the
-                # project needs a rendering host.
-                "--features",
-                "dev,rendering",
-            ],
-            cwd=str(MODULES_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=PREBUILD_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  [FAIL] Pre-build timed out after {PREBUILD_TIMEOUT} seconds.")
-        return False
-    except FileNotFoundError:
-        print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
-        return False
-
-    if result.returncode != 0:
-        print("  [FAIL] Pre-build failed:")
-        print(result.stderr[-2000:])
-        return False
-
-    print("  [OK] Host built.")
-    return True
+    kill_stale_hosts()
 
 
 # =============================================================================
@@ -280,9 +169,9 @@ def run_suite(expected_midpoint: str) -> bool:
         print("  [OK] Baseline revision counter is quiet.")
 
         print("  [TEST] Editing the module sample offset...")
-        old_line, new_line, _ = plan_value_edit(read_source())
-        content = read_source().replace(old_line, new_line)
-        atomic_write(content)
+        old_line, new_line, _ = plan_value_edit(read_source(MODULE_LIB_RS))
+        content = read_source(MODULE_LIB_RS).replace(old_line, new_line)
+        atomic_write(MODULE_LIB_RS, content)
 
         if not monitor.wait_for(REVISION_BUMP_TOKEN, REVISION_BUMP_TIMEOUT):
             print("  [FAIL] No `editor revision bumped` after the reload.")
@@ -312,12 +201,7 @@ def run_suite(expected_midpoint: str) -> bool:
 def main() -> int:
     """Parses arguments, restores state, runs the scenario, reports result."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--timeout-scale",
-        type=float,
-        default=1.0,
-        help="Multiplies all timeouts (slow machines: 1.5).",
-    )
+    add_common_suite_arguments(parser)
     args = parser.parse_args()
 
     # Timeouts scale together so a slow machine only needs one knob.
@@ -332,7 +216,7 @@ def main() -> int:
         globals()[name] = int(globals()[name] * args.timeout_scale)
 
     global ORIGINAL_CONTENT
-    ORIGINAL_CONTENT = read_source()
+    ORIGINAL_CONTENT = read_source(MODULE_LIB_RS)
     try:
         _, new_line, expected_midpoint = plan_value_edit(ORIGINAL_CONTENT)
         print(f"  [PLAN] New offset line: {new_line.strip()}")
@@ -340,18 +224,27 @@ def main() -> int:
         print(f"  [FAIL] {error}")
         return 1
 
-    install_test_project_settings()
-    if not build_workspace():
-        restore_project_settings()
+    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
+    ensure_host_lock()
+    kill_stale_hosts()
+    BACKUP.capture(MODULE_LIB_RS)
+    BACKUP.capture(settings_path)
+    write_project_settings(NATIVE_PROJECT_ROOT, TEST_PROJECT_SETTINGS)
+    if not prepare_host(HOST_POSTURE, args, PREBUILD_TIMEOUT):
+        if not BACKUP.captured(settings_path):
+            settings_path.unlink(missing_ok=True)
+        BACKUP.restore_all(reset_mtime=False)
         restore_original()
         return 1
 
     try:
         ok = run_suite(expected_midpoint)
     finally:
-        restore_project_settings()
+        BACKUP.restore_all(reset_mtime=False)
+        if not BACKUP.captured(settings_path):
+            settings_path.unlink(missing_ok=True)
         restore_original()
-        kill_stray_hosts()
+        kill_stale_hosts()
 
     print(f"\n{'PASS' if ok else 'FAIL'}: test_editor_revision")
     return 0 if ok else 1

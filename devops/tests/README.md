@@ -50,13 +50,16 @@ left the tree mid-edit and the next suite's result would not be trustworthy.
 `run_hot_reload_tests.sh` runs the suites tagged `SETS: hot-reload`
 (`run_all.py --set hot-reload --list` prints them). Expect 15 to 20 minutes
 plus the first host build. `--timeout-scale` and `--skip-build` reach only the
-suites whose parser declares them.
+suites whose parser declares them, which is every suite built on
+`add_common_suite_arguments` in `devops/core/suite_common.py`.
 
 Common flags on the end-to-end suites:
 
 - `--timeout-scale S` multiplies every timeout. Use it on a slow or busy machine.
-- `--skip-build` assumes `pill_standalone` is already built. Not every suite
-  has it; those that don't always build what they need.
+- `--skip-build` reuses the built `pill_standalone` instead of building it.
+  The binary is never taken on trust: the suite checks it was built from the
+  same posture (`HostPosture`) and from sources no newer than it, and refuses
+  to run otherwise.
 
 When an agent runs a suite, it goes through `.agents/site/agent_run.py`
 (see `AGENTS.md`), which records the output under `.construction_site/runs/`.
@@ -87,7 +90,11 @@ too). A run goes through the same steps every time:
    leftover from an earlier run, never the host another suite is driving.
 3. **Back up every file it may touch** (see [Files the suites
    edit](#files-the-suites-edit)).
-4. **Build** `pill_standalone` (unless `--skip-build`).
+4. **Build** `pill_standalone` through the suite's `HostPosture` (unless
+   `--skip-build`). One posture per suite covers both the build and the launch,
+   so the host and the DLLs it loads always resolve the same feature graph; the
+   posture is recorded next to the binary so `--skip-build` can prove the
+   binary is the one this suite asked for.
 5. **Launch the host** with `PROJECT_PATH` pointing at the project under test,
    either as `modules/target/debug/pill_standalone.exe` or through `cargo run`.
    Some suites first write their own `project_settings.yaml` so the extension
@@ -272,8 +279,8 @@ with each suite's last recorded result from `.construction_site/runs/`.
 | `test_hot_reload_migration.py` | Component schema changes on reload: unchanged shape (fast path), added, removed, renamed and reordered fields, persistable downgraded to plain, a widened `Vec` element type, a retyped one whose snapshot no longer parses (row reset), and an alignment change that must be refused and rolled back. Asserts migrated entity counts and values. `--cycles N` repeats it. |
 | `test_multi_surface.py` | One renderer, two windows: the standalone dev host's test frontend (`PILL_SECOND_VIEW=1`) opens surface 1 with its own camera; both present, a renderer reload reattaches surface 1, and closing its window detaches only it. Backs up and restores `pill_master_renderer/src/lib.rs`. |
 | `test_picking.py` | Picking and outlines: the standalone dev host's test frontend (`PILL_PICK_TEST=1`) picks the center and the corner of `master_renderer_test`'s window in one frame; the center answers with the model's entity, the corner with nothing, and the hit entity is outlined while the host keeps drawing without a GPU error. |
-| `test_pill_ui.py <binary>` | The shared `pill_ui` dylib: the standalone dev host's UI probe (`PILL_UI_PROBE=1`) shapes and draws a sample with the bundled font without a project; exactly one `pill_ui.dll` - beside one `pill_core.dll` and one `pill_engine_core.dll` - is mapped in the running process, the probe reports glyph quads, atlas regions and vertices, and exits cleanly. |
-| `test_pill_ui_style.py <binary>` | Live restyling without a compile: the probe's style mode (`PILL_UI_PROBE=1 PILL_UI_PROBE_STYLE=<file>`) renders the UI Gallery through a stylesheet, the suite edits the file while the process runs, and the probe logs a `restyled revision=1` render with the new rule count before exiting cleanly. |
+| `test_pill_ui.py [binary]` | The shared `pill_ui` dylib: the standalone dev host's UI probe (`PILL_UI_PROBE=1`) shapes and draws a sample with the bundled font without a project; exactly one `pill_ui.dll` - beside one `pill_core.dll` and one `pill_engine_core.dll` - is mapped in the running process, the probe reports glyph quads, atlas regions and vertices, and exits cleanly. The probe draws through `pill_ui` alone, so it needs no renderer: with no path argument it builds (or, under `--skip-build`, reuses) the default dev host posture. |
+| `test_pill_ui_style.py [binary]` | Live restyling without a compile: the probe's style mode (`PILL_UI_PROBE=1 PILL_UI_PROBE_STYLE=<file>`) renders the UI Gallery through a stylesheet, the suite edits the file while the process runs, and the probe logs a `restyled revision=1` render with the new rule count before exiting cleanly. Same posture and lock handling as `test_pill_ui.py`. |
 | `test_editor_crates.py` | Extension editor crates: an ordinary host never builds or loads `pill_spline_editor`; in the editor posture (`PILL_EDITOR_POSTURE=1`) it loads after `pill_spline`, reloads after every `pill_spline` reload, and an edit to it reloads only it. |
 | `test_shared_component_identity.py` | A component and a resource linked by both the project and a module DLL, so each binary has its own `TypeId`. With `#[pill(shared)]` they bind to one registration; without it startup must fail with a collision error. Also: a module reload with two registrants, a resource inserted by one DLL and read by the other, and releasing values after a failed reload or failed first load. Runs the windowed host, because `project_rs` links the renderer. |
 | `test_csharp_bridge.py` | The C# side (needs .NET 8 SDK): the generated mirror's exact layout, a warning-free managed build, calls in both directions, assembly swaps keeping state, three swaps in one session (the old `AssemblyLoadContext` must unload), component layout migration, systems re-registered after a signature change, and a changed startup method refused while the old assembly keeps running. Also checks the committed mirror matches what the host generates. |
@@ -311,17 +318,28 @@ with each suite's last recorded result from `.construction_site/runs/`.
 
 - Import from `core.suite_common` after putting `devops/` on `sys.path`, as the
   existing suites do.
-- Launch the host with `launch_process` (it takes the host lock) and call
-  `kill_stale_hosts` first.
+- Call `ensure_host_lock()` first in `main`, before anything that reads or
+  writes a shared path. `launch_process` and `kill_stale_hosts` take it too, so
+  a suite that never touches a host pays nothing for it.
+- Declare one `HostPosture` and use it for both halves of the host's life:
+  `prepare_host(posture, args)` builds it (or verifies the one `--skip-build`
+  reuses) and `host_command(posture)` launches it. Declare the suite's
+  arguments with `add_common_suite_arguments(parser)`, which adds the
+  `--timeout-scale` and `--skip-build` that `run_all.py` passes through.
+  Launch the host with `launch_process` and call `kill_stale_hosts` before it.
 - `capture` every file you will edit **before** the first edit, use a
   `BackupRegistry` (or the shared `BACKUP`), and call `restore_all` in a
   `finally`. Decide `reset_mtime` by whether the host's last build was of the
-  original content.
+  original content; `BACKUP.captured(path)` tells you whether cleanup owns a
+  file at all.
 - Edit with raw bytes when line endings matter, otherwise with `atomic_write`.
 - Take `start_index = monitor.line_count` before each edit and only search
   output after it, so an earlier reload's line can't satisfy the wait.
 - Put new tokens in constants named `*_TOKEN` so `test_log_contract.py` checks them.
-- Add the suite to `SUITE_ORDER` in `run_all.py`, and to the table above.
+- Give the file a `PROTECTS:` and a `TIER:` line: `run_all.py` finds every
+  `test_*.py` here by itself and orders it by those, so there is no list to add
+  it to. Add it to the table above by hand, or with
+  `run_all.py --write-catalogue`.
 
 ## Gate matrix
 

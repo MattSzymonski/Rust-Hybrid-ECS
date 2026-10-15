@@ -18,8 +18,10 @@ DESCRIPTION
     Shared here: path resolution, the console-color `print` wrapper, the
     rolling output monitor with a dedicated counter-tick tail, atomic source
     editing, the edit that triggers a spline reload
-    (`edit_spline_sample_offset`), host process lifecycle helpers, and the log
-    tokens the suites assert on.
+    (`edit_spline_sample_offset`), the host postures with their one build and
+    one launch (`HostPosture`, `build_host`, `host_command`), the common suite
+    arguments, host process lifecycle helpers, and the log tokens the suites
+    assert on.
 
     The scenario runner those suites run their tables on - edit, wait, assert,
     restore - is one level up in `core/scenario.py`.
@@ -36,7 +38,9 @@ USAGE
 --- SCRIPT ---
 """
 
+import argparse
 import builtins
+import json
 import os
 import re
 import subprocess
@@ -335,6 +339,14 @@ class BackupRegistry:
             stat = path.stat()
             self._originals[path] = (path.read_bytes(), stat.st_mtime)
 
+    def captured(self, path: Path) -> bool:
+        """True when `path` was captured, i.e. cleanup will restore it.
+
+        Suites that plan an edit before they capture assert on this: an edit
+        written to a file no one captured would survive the run.
+        """
+        return path in self._originals
+
     def restore_all(self, reset_mtime: bool = True) -> None:
         """Writes every captured file back to its original bytes.
 
@@ -482,9 +494,7 @@ def edit_spline_sample_offset(content: str) -> SplineSampleOffsetEdit:
     takes the ordinary path rather than a schema migration. The native
     hot-reload suite's cascade scenario and the benchmark harness trigger a
     reload with it, which is why the edit is planned from the current source
-    instead of pinned to a literal pair. `test_editor_crates`,
-    `test_editor_revision` and `test_shared_component_identity` still carry
-    their own copy of the pattern; folding those in is the later stages' work.
+    instead of pinned to a literal pair.
 
     A pinned pair ("= 0.0" -> "= 10.0") only applies to a source nobody has
     edited yet, so the suites were order-dependent: a run that ended on a
@@ -746,6 +756,274 @@ def release_host_lock() -> None:
         _HOST_LOCK["fd"] = None
 
 
+# =============================================================================
+# Host postures: one definition of each host build and launch
+# =============================================================================
+
+# A suite's host is never "a pill_standalone": it is one built with a specific
+# feature set, and the set is not a preference. `pill_core.dll` and
+# `pill_engine_core.dll` export symbols hashed from their resolved features, so
+# a host built in one posture and a project DLL resolved in another fail at load
+# with "The specified procedure could not be found" (os error 127), naming
+# nothing. Each suite used to spell its own feature list, twice - once for the
+# build, once for the launch - which is how the two came apart; a `HostPosture`
+# is that one spelling, shared by both.
+@dataclass(frozen=True)
+class HostPosture:
+    """One feature selection for `pill_standalone`, plus the cargo flags it needs."""
+
+    name: str
+    feature_args: Tuple[str, ...] = ()
+    # Flags that select no feature and change no binary - `--offline` - so two
+    # spellings of one graph stay one posture, and a `--skip-build` run by a
+    # sibling suite still recognizes the binary.
+    cargo_args: Tuple[str, ...] = ()
+
+    @property
+    def build_command(self) -> List[str]:
+        """The `cargo build` that produces this posture's host binary."""
+        return [
+            "cargo",
+            "build",
+            "-p",
+            "pill_standalone",
+            *self.feature_args,
+            *self.cargo_args,
+        ]
+
+    @property
+    def launch_command(self) -> List[str]:
+        """The `cargo run` that launches this posture's host.
+
+        Through cargo rather than by spawning the binary: `-C prefer-dynamic`
+        means the host needs the toolchain's `std-*.dll` and the workspace's
+        `pill_core.dll` on the loader path, which `cargo run` sets up. After
+        `build_host` built the same posture this compiles nothing.
+        """
+        return [
+            "cargo",
+            "run",
+            "-p",
+            "pill_standalone",
+            *self.feature_args,
+            *self.cargo_args,
+        ]
+
+    @property
+    def description(self) -> str:
+        """The build command line, for the `[BUILD]` line a suite prints."""
+        return " ".join(self.build_command)
+
+
+# The postures in use. `--features rendering` on the defaults is the same graph
+# as the `--features pill_host/hot_patch,rendering` the hot-patch suites used to
+# spell out: `hot_patch` is a default feature and it is what forwards
+# `pill_host/hot_patch`.
+HOST_DEV_HOT_PATCH = HostPosture("dev+hot_patch")
+HOST_DEV = HostPosture("dev", ("--no-default-features", "--features", "dev"))
+HOST_DEV_HOT_PATCH_RENDERING = HostPosture("dev+hot_patch+rendering", ("--features", "rendering"))
+HOST_DEV_RENDERING = HostPosture(
+    "dev+rendering",
+    ("--no-default-features", "--features", "dev,rendering"),
+    ("--offline",),
+)
+
+# What a host build compiles, for `verify_host_build`'s staleness check.
+# Extension and project sources are deliberately absent: the host loads those as
+# DLLs, so editing `pill_spline` - which several suites do, leaving the file
+# stamped "now" - does not make cargo rebuild the host, and counting it here
+# would refuse `--skip-build` for a binary that is in fact up to date.
+#
+# `Cargo.lock` is absent for the same reason. The host regenerates its
+# `host_module_*` and `host_project_*` members on every start and prunes them on
+# exit, so the `cargo run` that follows every build rewrites the lockfile: a
+# record stamped 08:00:03.098 was followed by a lockfile written at
+# 08:00:03.830, and a lockfile newer than the record then refused every
+# `--skip-build` run made after a suite. The manifests that produce the lock are
+# roots themselves, so a dependency change is still caught by their mtimes.
+HOST_SOURCE_ROOTS = (
+    MODULES_ROOT / "Cargo.toml",
+    MODULES_ROOT / ".cargo",
+    MODULES_ROOT / "pill_core",
+    MODULES_ROOT / "pill_core_macros",
+    MODULES_ROOT / "pill_engine",
+    MODULES_ROOT / "pill_engine_core",
+    MODULES_ROOT / "pill_assets",
+    MODULES_ROOT / "pill_ui",
+    MODULES_ROOT / "pill_input",
+    MODULES_ROOT / "hosting",
+    MODULES_ROOT / "frontents" / "pill_standalone",
+)
+
+# What `build_host` records about the binary it produced. A binary carries no
+# feature tag, and cargo exports no `CARGO_FEATURE_*` to the process that runs
+# one, so a suite told to `--skip-build` cannot ask "was this built for my
+# posture?" - it reads this record instead.
+HOST_BUILD_RECORD = MODULES_ROOT / "target" / "pill_suite_host_build.json"
+
+# Directories under a host source root that are not build inputs: cargo's own
+# output, and the crates the host regenerates on every start.
+_NOT_HOST_SOURCE_DIRS = ("target", "generated")
+
+
+def _newest_host_source_mtime_ns() -> int:
+    """The newest modification time among the files a host build reads."""
+    newest = 0
+    for root in HOST_SOURCE_ROOTS:
+        if root.is_file():
+            newest = max(newest, root.stat().st_mtime_ns)
+            continue
+        for directory, subdirectories, files in os.walk(root):
+            subdirectories[:] = [
+                name for name in subdirectories if name not in _NOT_HOST_SOURCE_DIRS
+            ]
+            for name in files:
+                newest = max(newest, os.stat(os.path.join(directory, name)).st_mtime_ns)
+    return newest
+
+
+def _record_host_build(posture: HostPosture) -> None:
+    """Records the posture and identity of the binary `build_host` just built."""
+    try:
+        binary_mtime_ns = HOST_EXE.stat().st_mtime_ns
+    except OSError as error:
+        print(f"  [WARN] Could not record the host build: {error}")
+        return
+    record = {
+        "posture": posture.name,
+        "binary_mtime_ns": binary_mtime_ns,
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        HOST_BUILD_RECORD.parent.mkdir(parents=True, exist_ok=True)
+        HOST_BUILD_RECORD.write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as error:
+        print(f"  [WARN] Could not record the host build: {error}")
+
+
+def build_host(posture: HostPosture, timeout: int = BUILD_TIMEOUT) -> bool:
+    """Builds `pill_standalone` in `posture`; False when the build failed.
+
+    Takes the host lock first: the build writes the shared `modules/target`
+    every other host-driving suite reads. `cargo build` rather than letting
+    `cargo run` compile, so a failure is reported as a build failure with
+    cargo's own stderr, and so the launch that follows compiles nothing.
+    """
+    ensure_host_lock()
+    print(f"  [BUILD] {posture.description}")
+    try:
+        completed = subprocess.run(
+            posture.build_command,
+            cwd=str(MODULES_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  [FAIL] Host build timed out after {timeout} seconds.")
+        return False
+    except FileNotFoundError:
+        print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
+        return False
+    except OSError as error:
+        print(f"  [FAIL] Could not build the host: {error}")
+        return False
+    if completed.returncode != 0:
+        print("  [FAIL] Host build failed:")
+        print(completed.stderr[-2000:])
+        return False
+    _record_host_build(posture)
+    print("  [OK] Host built.")
+    return True
+
+
+def host_command(posture: HostPosture) -> List[str]:
+    """The `cargo run` that launches `pill_standalone` in `posture`."""
+    return posture.launch_command
+
+
+def verify_host_build(posture: HostPosture) -> bool:
+    """Checks a `--skip-build` host against `posture`; False means rebuild.
+
+    `--skip-build` exists so a slow machine can build once and run several
+    suites; the risk it carries is a binary from another posture, or from older
+    sources, and neither shows up where it happens - the host dies at load with
+    "The specified procedure could not be found" (os error 127) naming nothing,
+    or cargo quietly recompiles inside `cargo run`. So the flag verifies instead
+    of trusting: the recorded posture must be the one asked for, the binary must
+    be the one that build produced, and no host source may have changed since it.
+    """
+    if not HOST_EXE.exists():
+        print(f"  [FAIL] --skip-build: {HOST_EXE} does not exist; build it first.")
+        return False
+
+    try:
+        record = json.loads(HOST_BUILD_RECORD.read_text(encoding="utf-8"))
+        record_mtime_ns = HOST_BUILD_RECORD.stat().st_mtime_ns
+    except (OSError, ValueError):
+        record = {}
+        record_mtime_ns = 0
+
+    recorded_posture = record.get("posture")
+    if recorded_posture != posture.name:
+        print(
+            f"  [FAIL] --skip-build: the host was built for posture "
+            f"{recorded_posture!r}, this suite needs {posture.name!r}."
+        )
+        print("         Rebuild it without --skip-build.")
+        return False
+
+    binary_mtime_ns = HOST_EXE.stat().st_mtime_ns
+    if record.get("binary_mtime_ns") != binary_mtime_ns:
+        print("  [FAIL] --skip-build: the host binary is not the one that build produced.")
+        print("         Rebuild it without --skip-build.")
+        return False
+
+    # Against the record's own mtime, not the binary's: cargo rewrites a
+    # manifest or the lock and still leaves the binary alone when nothing needs
+    # recompiling, and the build that wrote this record ran cargo afterwards,
+    # so it is the moment the binary was last known to match these sources.
+    newest_source_mtime_ns = _newest_host_source_mtime_ns()
+    if newest_source_mtime_ns > record_mtime_ns:
+        print("  [FAIL] --skip-build: a host source changed after the recorded build.")
+        print("         Rebuild it without --skip-build.")
+        return False
+
+    print(f"  [OK] Reusing the host built for posture {posture.name}.")
+    return True
+
+
+def prepare_host(
+    posture: HostPosture, arguments: argparse.Namespace, timeout: int = BUILD_TIMEOUT
+) -> bool:
+    """Builds the host a suite drives, or verifies the one `--skip-build` reuses."""
+    if getattr(arguments, "skip_build", False):
+        return verify_host_build(posture)
+    return build_host(posture, timeout)
+
+
+def add_common_suite_arguments(parser: argparse.ArgumentParser) -> None:
+    """Adds the two arguments every host-driving suite accepts.
+
+    One definition, so the flags `run_all.py` passes through, the README and
+    every suite agree on the spellings. `--skip-build` is a slow-machine
+    shortcut whose binary is verified by `prepare_host`, never trusted.
+    """
+    parser.add_argument(
+        "--timeout-scale",
+        type=float,
+        default=1.0,
+        help="Multiply all timeouts for slow machines (default: 1.0)",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Reuse the built host, after checking it matches this suite's posture",
+    )
+
+
 def launch_process(
     command: Sequence[str],
     cwd: Path,
@@ -883,4 +1161,16 @@ __all__ = [
     "HOST_LOCK_PATH",
     "ensure_host_lock",
     "release_host_lock",
+    "HostPosture",
+    "HOST_DEV_HOT_PATCH",
+    "HOST_DEV",
+    "HOST_DEV_HOT_PATCH_RENDERING",
+    "HOST_DEV_RENDERING",
+    "HOST_SOURCE_ROOTS",
+    "HOST_BUILD_RECORD",
+    "build_host",
+    "host_command",
+    "verify_host_build",
+    "prepare_host",
+    "add_common_suite_arguments",
 ]

@@ -50,7 +50,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -78,8 +77,7 @@ DATA_CRATE_ROOT = (
 
 # Headless dev host: the project draws nothing here, and the asset path under
 # test is the same with or without a window.
-HOST_BUILD_COMMAND = ["cargo", "build", "-p", "pill_standalone"]
-HOST_LAUNCH_COMMAND = ["cargo", "run", "-p", "pill_standalone"]
+HOST_POSTURE = HOST_DEV_HOT_PATCH
 
 # Host log lines this suite asserts on (printed by `pill_host/src/runtime.rs`).
 ASSET_WATCH_TOKEN = "[assets] watching the project's assets for edits"
@@ -286,28 +284,10 @@ def material_edit(monitor: OutputMonitor) -> bool:
     return True
 
 
-def build_host() -> bool:
-    """Build the headless dev host."""
-    print(f"  [BUILD] {' '.join(HOST_BUILD_COMMAND)}")
-    completed = subprocess.run(
-        HOST_BUILD_COMMAND, cwd=str(MODULES_ROOT), capture_output=True, text=True,
-        timeout=BUILD_TIMEOUT_SECONDS,
-    )
-    if completed.returncode != 0:
-        print("  [FAIL] Host build failed:")
-        print(completed.stderr[-2000:])
-        return False
-    print("  [OK] Host built.")
-    return True
-
-
 def main() -> None:
     """Launch the host, run the scenarios in order, restore every file."""
     parser = argparse.ArgumentParser(description="Live asset reimport suite")
-    parser.add_argument("--timeout-scale", type=float, default=1.0,
-                        help="Multiply every timeout (slow machines)")
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Assume pill_standalone is already built")
+    add_common_suite_arguments(parser)
     arguments = parser.parse_args()
 
     global ASSET_TIMEOUT, RELOAD_TIMEOUT
@@ -320,17 +300,17 @@ def main() -> None:
     print(f"  Project: {PROJECT_ROOT}")
     print("=" * 70)
 
+    ensure_host_lock()
     kill_stale_hosts()
-    if not arguments.skip_build and not build_host():
+    if not prepare_host(HOST_POSTURE, arguments, BUILD_TIMEOUT_SECONDS):
         sys.exit(1)
 
-    backups = BackupRegistry()
     for path in (SOURCE_FILE, METADATA_FILE, DATA_CRATE_ROOT, MATERIAL_FILE):
-        backups.capture(path)
+        BACKUP.capture(path)
 
     environment = os.environ.copy()
     environment["PROJECT_PATH"] = "../examples/master_renderer_test"
-    process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
+    process, monitor = launch_process(host_command(HOST_POSTURE), MODULES_ROOT, environment)
     results = {}
     try:
         if not monitor.wait_for(STARTUP_TOKEN, startup_timeout):
@@ -358,7 +338,7 @@ def main() -> None:
         print("\n  [CLEANUP] Restoring files and stopping the host...")
         # The data crate's last build was of the edited source, so its mtime
         # must stay fresh for the next host start to rebuild the original.
-        backups.restore_all(reset_mtime=False)
+        BACKUP.restore_all(reset_mtime=False)
         terminate_process(process, monitor)
 
     passed = bool(results) and all(results.values())
