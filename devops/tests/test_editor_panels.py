@@ -126,6 +126,18 @@ def main() -> int:
         session.wait_token(EDITOR_SHELL_LOADED_TOKEN, 300, "shell loaded")
         session.wait_token(EDITOR_WINDOW_CREATED_TOKEN, 300, "editor started")
         session.wait_token(EDITOR_COMMAND_REGISTRY_TOKEN, 120, "registry ready")
+        # The module-system waits below need the project ticking (the editor
+        # can come up paused - see EditorSession.engine_is_running - and a
+        # paused, idle editor sleeps at its heartbeat rate).
+        if not session.engine_is_running():
+            resume_begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine resumed",
+                resume_begin,
+            )
 
         # Step 1: the registry lists the crate's panel and the harness'
         # panic fixture. These are startup lines, so they are searched from

@@ -1682,6 +1682,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
+    use crate::scratch::ScratchDirectory;
+
     /// The Stage 27 case: the artifact imports a symbol `pill_ui` does not
     /// export while `pill_core`'s copies differ. The message must name
     /// `pill_ui` and the symbol - the mismatch story must not win and bury
@@ -1826,9 +1828,7 @@ mod tests {
     /// below deliberately carries different modification times.
     #[test]
     fn files_equal_gates_length_and_compares_bytes() {
-        let directory = std::env::temp_dir().join("pill_files_equal");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create directory");
+        let directory = ScratchDirectory::new("files_equal");
 
         let first = directory.join("first.dll");
         let second = directory.join("second.dll");
@@ -1870,9 +1870,7 @@ mod tests {
     /// disarmed guard leaves the file for the library's own `Drop`.
     #[test]
     fn an_abandoned_copy_is_removed() {
-        let directory = std::env::temp_dir().join("pill_temporary_copy");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create directory");
+        let directory = ScratchDirectory::new("temporary_copy");
 
         let abandoned = directory.join("abandoned.dll");
         std::fs::write(&abandoned, b"copy").expect("write abandoned copy");

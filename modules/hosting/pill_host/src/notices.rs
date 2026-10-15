@@ -97,9 +97,23 @@ pub fn take() -> Vec<HostNotice> {
 mod tests {
     use super::*;
 
+    /// Serializes the two tests that share the process-global queue.
+    ///
+    /// `cargo test` runs them on parallel threads, so without this the
+    /// capacity test's 260 pushes land between the order test's two pushes
+    /// and its drain, failing both. nextest gives every test its own process
+    /// and never sees it, which is how the race survived until a plain
+    /// `cargo test -p pill_host` ran.
+    static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The queue hands notices back in order and empties on take.
     #[test]
     fn notices_drain_in_order() {
+        let _serialized = QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Whatever an earlier test left behind is not this test's business.
+        let _ = take();
         push(HostNotice::Reloaded {
             module: "pill_spline".to_string(),
             build_ms: 120,
@@ -122,6 +136,11 @@ mod tests {
     /// The queue drops the oldest notices past its cap, never the newest.
     #[test]
     fn the_cap_drops_oldest_first() {
+        let _serialized = QUEUE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Start from a known-empty queue, for the same reason.
+        let _ = take();
         for index in 0..NOTICE_CAPACITY + 4 {
             push(HostNotice::Reloaded {
                 module: format!("module_{index}"),

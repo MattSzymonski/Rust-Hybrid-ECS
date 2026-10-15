@@ -222,6 +222,19 @@ def main() -> int:
         )
 
         # Step 5: the editor crate's command and its survival of a reload.
+        # The crate's system prints the report on its next tick, so the
+        # engine must be running: the pause chords above leave the toggle
+        # count ambiguous when a stray input already toggled pause as the
+        # window appeared.
+        if not session.engine_is_running():
+            before = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine resumed for the module command",
+                before,
+            )
         before = len(session.read_log())
         session.send("command spline_editor.ping")
         position = session.wait(
@@ -243,6 +256,17 @@ def main() -> int:
             "editor crate reloaded",
             before,
         )
+        # The reloaded crate's system needs a running engine too, in case a
+        # stray input paused it while the reload settled.
+        if not session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine resumed after the reload",
+                begin,
+            )
         session.send("command spline_editor.ping")
         session.wait(
             re.escape(SPLINE_COMMAND_RAN_TOKEN)

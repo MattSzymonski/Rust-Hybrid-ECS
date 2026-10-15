@@ -219,6 +219,19 @@ def main() -> int:
         wait_for_token(
             main_session, re.escape(EDITOR_SHELL_LOADED_TOKEN), 180, "shell load"
         )
+        # A paused, idle editor sleeps at its heartbeat rate and paints no
+        # shell frames, so the engine is started ticking for the phases that
+        # watch frames. The editor can come up paused (see
+        # EditorSession.engine_is_running); the pause proofs below gate
+        # their own toggles.
+        if not main_session.engine_is_running():
+            main_session.send("command editor.pause_toggle")
+            wait_for_token(
+                main_session,
+                re.escape(TEST_COMMAND_REQUEST_TOKEN),
+                30,
+                "resume request",
+            )
         heartbeat = wait_for_token(
             main_session,
             re.escape(SHELL_FRAME_TOKEN) + r"\s+frames=(\d+)\s+panels=(\d+)",
@@ -1053,6 +1066,17 @@ def main() -> int:
         wait_for_token(
             idle_session, re.escape(EDITOR_SHELL_LOADED_TOKEN), 180, "idle run"
         )
+        # The idle session wakes the same way: a paused editor sleeps at its
+        # heartbeat rate and paints no shell frames until the toggle (an
+        # input) arrives; the pause proof below then pauses it again.
+        if not idle_session.engine_is_running():
+            idle_session.send("command editor.pause_toggle")
+            wait_for_token(
+                idle_session,
+                re.escape(TEST_COMMAND_REQUEST_TOKEN),
+                30,
+                "idle resume request",
+            )
         wait_for_token(
             idle_session,
             re.escape(SHELL_FRAME_TOKEN) + r"\s+frames=\d+\s+panels=([1-9]\d*)",
@@ -1060,11 +1084,14 @@ def main() -> int:
             "idle layout",
         )
         # Pause the project's systems; the shell's own system keeps running
-        # (that is what safe mode's liveness check relies on).
-        idle_session.send("command editor.pause_toggle")
-        wait_for_token(
-            idle_session, re.escape(TEST_COMMAND_REQUEST_TOKEN), 30, "pause request"
-        )
+        # (that is what safe mode's liveness check relies on). Skip the
+        # toggle if a stray input paused the engine already - a blind toggle
+        # would start the project ticking under the frame proofs.
+        if idle_session.engine_is_running():
+            idle_session.send("command editor.pause_toggle")
+            wait_for_token(
+                idle_session, re.escape(TEST_COMMAND_REQUEST_TOKEN), 30, "pause request"
+            )
         # Let the pause take effect before counting UI frames.
         time.sleep(2.0)
 

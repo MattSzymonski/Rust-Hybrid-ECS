@@ -85,6 +85,10 @@ mod asset_browser;
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod shader_watcher;
 
+/// Test-only scratch directories and explicit file dates.
+#[cfg(test)]
+mod scratch;
+
 // ===== Re-exports =====
 
 // Local host modules and the shared crate-root error surface.

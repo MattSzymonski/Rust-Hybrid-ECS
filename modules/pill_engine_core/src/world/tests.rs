@@ -15,6 +15,7 @@
 
 use super::*;
 use crate::archetype::{FieldSource, LayoutField};
+use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 
 /// The change-detection ticks of one entity's row for one component.
 fn ticks_of_row(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
@@ -33,27 +34,6 @@ fn two_u32_row(first: u32, second: u32) -> Vec<u8> {
     bytes.extend_from_slice(&second.to_ne_bytes());
     bytes
 }
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Position {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Velocity {
-    x: f32,
-    y: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Health {
-    hp: i32,
-}
-
-impl Component for Position {}
-impl Component for Velocity {}
-impl Component for Health {}
 
 /// A resource used to pin registration-stamp behaviour.
 #[derive(Debug, Default)]
@@ -1217,10 +1197,7 @@ fn invalid_descriptor_component_layouts_are_rejected() {
 /// - All entity IDs should be present in the entity_locations map
 #[test]
 fn test_create_entities_with_different_components() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     // Create entity with Position + Velocity
     let entity1 = world
@@ -1242,7 +1219,7 @@ fn test_create_entities_with_different_components() {
         .create_entity()
         .with(Position { x: 100.0, y: 200.0 })
         .with(Velocity { x: 5.0, y: 10.0 })
-        .with(Health { hp: 100 })
+        .with(Health(100))
         .build()
         .unwrap();
 
@@ -1317,10 +1294,7 @@ fn test_create_entities_with_different_components() {
 /// - Old archetype should be automatically removed, leaving 1 archetype
 #[test]
 fn test_add_component_to_entity() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     let entity = world
         .create_entity()
@@ -1336,7 +1310,7 @@ fn test_add_component_to_entity() {
     );
 
     // Add Health component
-    let result = world.add_component(entity, Health { hp: 50 });
+    let result = world.add_component(entity, Health(50));
 
     assert!(result.is_ok(), "Should successfully add component");
     assert!(world.entity_locations.contains_key(&entity));
@@ -1390,16 +1364,13 @@ fn test_add_component_to_nonexistent_entity() {
 /// - The entity should be in a different archetype (Position+Health instead of Position+Velocity+Health)
 #[test]
 fn test_remove_component_from_entity() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     let entity = world
         .create_entity()
         .with(Position { x: 100.0, y: 200.0 })
         .with(Velocity { x: 5.0, y: 10.0 })
-        .with(Health { hp: 100 })
+        .with(Health(100))
         .build()
         .unwrap();
 
@@ -1660,10 +1631,7 @@ fn test_cleanup_empty_archetypes() {
 /// - All three archetype IDs should be different from each other
 #[test]
 fn test_entity_archetype_migration() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     // Start with Position + Velocity
     let entity = world
@@ -1676,7 +1644,7 @@ fn test_entity_archetype_migration() {
     let initial_location = *world.entity_locations.get(&entity).unwrap();
 
     // Add Health - should migrate to new archetype
-    world.add_component(entity, Health { hp: 100 }).unwrap();
+    world.add_component(entity, Health(100)).unwrap();
 
     let after_add_location = *world.entity_locations.get(&entity).unwrap();
     assert_ne!(
@@ -1709,10 +1677,7 @@ fn test_entity_archetype_migration() {
 /// - The entity is correctly tracked in the new archetype
 #[test]
 fn test_automatic_empty_archetype_cleanup() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     // Create single entity with Position + Velocity
     let entity = world
@@ -1730,7 +1695,7 @@ fn test_automatic_empty_archetype_cleanup() {
 
     // Add Health - this should move entity to new archetype
     // The old archetype should be automatically removed since it becomes empty
-    world.add_component(entity, Health { hp: 100 }).unwrap();
+    world.add_component(entity, Health(100)).unwrap();
 
     assert_eq!(
         world.archetypes.len(),
@@ -2108,10 +2073,7 @@ fn slot_at_generation_max_is_retired_not_wrapped() {
 /// - Recycled IDs work correctly regardless of which archetype the original was in
 #[test]
 fn test_generations_with_multiple_archetypes_and_component_removal() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     // Create 3 entities:
     // entity1, entity2: Position + Velocity (same archetype)
@@ -2133,7 +2095,7 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     let entity3 = world
         .create_entity()
         .with(Position { x: 3.0, y: 3.0 })
-        .with(Health { hp: 100 })
+        .with(Health(100))
         .build()
         .unwrap();
 
@@ -2191,11 +2153,7 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     // entity1 (id=0) is still alive
 
     // Create new entity - should reuse ID 2 (last destroyed)
-    let new_entity1 = world
-        .create_entity()
-        .with(Health { hp: 50 })
-        .build()
-        .unwrap();
+    let new_entity1 = world.create_entity().with(Health(50)).build().unwrap();
 
     println!(
         "new_entity1: id={}, gen={}",
@@ -2357,10 +2315,7 @@ fn test_component_swap_remove_on_destroy() {
 /// - The swapped entity (if any) correctly maps to its swapped component data
 #[test]
 fn test_component_cleanup_on_archetype_migration() {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut world = setup_world();
 
     // Create 3 entities with Position + Velocity in the same archetype
     let entity0 = world
@@ -2400,7 +2355,7 @@ fn test_component_cleanup_on_archetype_migration() {
     // Now add Health to entity0 - this moves it to a NEW archetype (Position+Velocity+Health)
     // The old archetype (Position+Velocity) should swap_remove entity0's data
     // entity2 should be swapped into index 0
-    world.add_component(entity0, Health { hp: 50 }).unwrap();
+    world.add_component(entity0, Health(50)).unwrap();
 
     // Verify entity0 moved to new archetype and has all components
     assert!(world.get_component::<Position>(entity0).is_some());
@@ -2408,7 +2363,7 @@ fn test_component_cleanup_on_archetype_migration() {
     assert!(world.get_component::<Health>(entity0).is_some());
     assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
     assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
-    assert_eq!(world.get_component::<Health>(entity0).unwrap().hp, 50);
+    assert_eq!(world.get_component::<Health>(entity0).unwrap().0, 50);
 
     // CRITICAL: entity1 and entity2 should still have correct data in old archetype
     // If swap_remove wasn't applied to component storage, entity2 (now at index 0)
@@ -2848,7 +2803,7 @@ fn recycled_bit_does_not_alias_archetypes() {
     let health_entity = world
         .create_entity()
         .with(Position { x: 3.0, y: 4.0 })
-        .with(Health { hp: 5 })
+        .with(Health(5))
         .build()
         .unwrap();
     assert_eq!(world.live_row_count(health_id), 1);

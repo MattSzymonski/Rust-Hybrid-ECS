@@ -138,6 +138,10 @@ pub mod profiling;
 /// Query system for efficient iteration over entities with specific components.
 pub mod query;
 
+/// The components the crate's unit tests build worlds out of.
+#[cfg(test)]
+mod test_fixtures;
+
 /// Singleton resources stored in the [`World`], not attached to entities.
 pub mod resource;
 

@@ -199,15 +199,17 @@ def main() -> int:
             "panels ready",
         )
 
-        # The project rewrites component fields every tick; pause first.
-        begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused",
-            begin,
-        )
+        # The project rewrites component fields every tick; pause first, if
+        # a stray input has not paused the engine already.
+        if session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine paused",
+                begin,
+            )
 
         # Discover an entity carrying PhysicsState, like the panels suite.
         begin = len(session.read_log())
@@ -642,14 +644,17 @@ def main() -> int:
             300,
             "second editor ready",
         )
-        begin = len(second.read_log())
-        second.send("command editor.pause_toggle")
-        second.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "second engine paused",
-            begin,
-        )
+        # The paste proofs read values; pause first, if a stray input has
+        # not paused the engine already.
+        if second.engine_is_running():
+            begin = len(second.read_log())
+            second.send("command editor.pause_toggle")
+            second.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "second engine paused",
+                begin,
+            )
         before = entity_ids(second)
         begin = len(second.read_log())
         second.send("command editor.paste")

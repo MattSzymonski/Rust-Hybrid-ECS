@@ -685,6 +685,7 @@ fn compiler_token_index(tokens: &[String]) -> usize {
 mod tests {
     use super::*;
     use crate::build_runner::is_shared_slot_rlib;
+    use crate::scratch::{date_file, ScratchDirectory};
 
     /// A trimmed but structurally faithful copy of a real cargo -v line.
     fn sample() -> &'static str {
@@ -914,9 +915,7 @@ mod tests {
     /// old parser produced.
     #[test]
     fn a_cache_from_a_different_tokenizer_is_rejected() {
-        let directory = std::env::temp_dir().join("pill_flags_cache_version");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create cache dir");
+        let directory = ScratchDirectory::new("flags_cache_version");
         let cache = directory.join("flags");
         let inputs: Vec<std::path::PathBuf> = Vec::new();
         let command = vec!["cargo".to_string(), "build".to_string()];
@@ -980,9 +979,7 @@ mod tests {
     /// that existed before staging rather than to a broken command line.
     #[test]
     fn only_staged_shared_slots_are_redirected() {
-        let staged = std::env::temp_dir().join("pill_staged_externs_test");
-        let _ = std::fs::remove_dir_all(&staged);
-        std::fs::create_dir_all(&staged).expect("create staging dir");
+        let staged = ScratchDirectory::new("staged_externs_test");
         std::fs::write(staged.join("libpill_dummy_color.rlib"), b"staged")
             .expect("write staged copy");
 
@@ -997,7 +994,7 @@ mod tests {
         );
         assert!(redirected.starts_with("pill_dummy_color="));
         assert!(
-            redirected.contains("pill_staged_externs_test"),
+            redirected.contains("staged_externs_test"),
             "must point into the staging directory: {redirected}"
         );
 
@@ -1025,9 +1022,7 @@ mod tests {
     /// and only when that sibling exists.
     #[test]
     fn a_metadata_only_extern_prefers_the_rlib_beside_it() {
-        let directory = std::env::temp_dir().join("pill_rmeta_extern_test");
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create dir");
+        let directory = ScratchDirectory::new("rmeta_extern_test");
         let staged = directory.join("staged");
         std::fs::create_dir_all(&staged).expect("create staging dir");
         std::fs::write(
@@ -1066,9 +1061,7 @@ mod tests {
     /// The redirect reaches `replay_args`, which is where it has to happen.
     #[test]
     fn replay_redirects_a_staged_dependency() {
-        let staged = std::env::temp_dir().join("pill_staged_replay_test");
-        let _ = std::fs::remove_dir_all(&staged);
-        std::fs::create_dir_all(&staged).expect("create staging dir");
+        let staged = ScratchDirectory::new("staged_replay_test");
         std::fs::write(staged.join("libpill_dummy_color.rlib"), b"staged")
             .expect("write staged copy");
 
@@ -1079,7 +1072,7 @@ mod tests {
                 Path::new("patch.dll"),
                 "pill_hotpatch_1",
                 &[],
-                Some(staged.as_path()),
+                Some(staged.path()),
             )
             .join(" ");
 
@@ -1224,7 +1217,7 @@ mod tests {
     fn save_and_load_round_trip() {
         let command = vec!["cargo".to_string(), "build".to_string()];
         let line = parsed();
-        let directory = std::env::temp_dir().join("pill_cargo_line_test");
+        let directory = ScratchDirectory::new("cargo_line_test");
         let path = directory.join("line.txt");
         line.save(&path, &command).expect("save");
         let loaded = CargoRustcLine::load_if_fresh(&path, &[], &command).expect("load");
@@ -1261,14 +1254,18 @@ mod tests {
     #[test]
     fn load_rejects_a_stale_cache() {
         let command = vec!["cargo".to_string(), "build".to_string()];
-        let directory = std::env::temp_dir().join("pill_cargo_line_stale");
-        std::fs::create_dir_all(&directory).expect("create dir");
+        let directory = ScratchDirectory::new("cargo_line_stale");
         let cache = directory.join("line.txt");
         let manifest = directory.join("Cargo.toml");
 
         parsed().save(&cache, &command).expect("save");
-        // Written after the cache, so the cache must be rejected.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Everything below is written after the cache; dating the cache into
+        // the past makes each of them provably newer without pausing between
+        // the writes (SA-0069).
+        date_file(
+            &cache,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        );
         std::fs::write(&manifest, "[package]").expect("write manifest");
 
         assert!(CargoRustcLine::load_if_fresh(&cache, &[manifest], &command).is_none());
@@ -1282,13 +1279,11 @@ mod tests {
             if let Some(parent) = input.parent() {
                 std::fs::create_dir_all(parent).expect("create config directory");
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
             std::fs::write(&input, "").expect("write config input");
             assert!(
                 CargoRustcLine::load_if_fresh(&cache, &[input], &command).is_none(),
                 "a newer {relative} must invalidate the cache"
             );
         }
-        let _ = std::fs::remove_dir_all(&directory);
     }
 }

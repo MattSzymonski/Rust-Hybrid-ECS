@@ -63,6 +63,7 @@ EDITOR_VALIDATION_ROOT = REPOSITORY_ROOT / "local" / "editor-validation"
 EDITOR_SPLINE_CRATE_TOKEN = "[editor] pill_spline_editor loaded"
 EDITOR_SHELL_LOADED_TOKEN = "[editor] pill_editor_shell_editor loaded"
 EDITOR_WINDOW_CREATED_TOKEN = "[editor] window created"
+EDITOR_FRAME_REPORT_TOKEN = "[editor] scene frame report"
 EDITOR_COMMAND_REGISTRY_TOKEN = "[editor] command registry ready"
 EDITOR_PANEL_REGISTRY_TOKEN = "[editor] panel registry ready"
 EDITOR_PANEL_PLACEMENT_TOKEN = "[editor] panel placement"
@@ -290,6 +291,55 @@ class EditorSession:
     def wait_token(self, token: str, timeout: float, label: str, start: int = 0) -> int:
         """Waits for a plain token (escaped before the regex search)."""
         return self.wait(re.escape(token), timeout, label, start)
+
+    # -------------------------------------------------------------------------
+    # Engine run state: the pause gate the suites share
+    # -------------------------------------------------------------------------
+
+    # A running engine reports tens of frames a second in its scene frame
+    # report; a paused one about one. Anything below the limit reads as
+    # paused.
+    RUNNING_FPS_LIMIT = 8.0
+
+    def await_engine_frame_rate(self, timeout: float = 20.0) -> float:
+        """The engine's tick rate, from the next two scene frame reports.
+
+        The scene frame report prints about once a second in both states and
+        carries the engine's own tick rate. Suites gate their pauses on it:
+        an input or a leftover queued command can toggle the engine before a
+        step expects it, and a blind toggle would flip it the wrong way. The
+        wait is for fresh reports, not the last one in the log (a report
+        trails a state change by up to a second), and the SECOND report is
+        the one returned: the first can straddle the boot's own slow frames
+        and read like a paused engine. Returns the last rate seen, 0.0 when
+        no report lands within `timeout`.
+        """
+        deadline = time.monotonic() + timeout
+        seen = 0
+        rate = 0.0
+        while True:
+            start = len(self.read_log())
+            # Half a report interval: a fresh report is picked up as early
+            # as it lands.
+            time.sleep(0.5)
+            for line in self.read_log()[start:].splitlines():
+                match = re.search(
+                    re.escape(EDITOR_FRAME_REPORT_TOKEN) + r"\s+fps=([0-9.]+)", line
+                )
+                if match:
+                    seen += 1
+                    rate = float(match.group(1))
+            if seen >= 2 or time.monotonic() >= deadline:
+                return rate
+
+    def engine_is_running(self, timeout: float = 8.0) -> bool:
+        """Whether the engine is ticking, by `await_engine_frame_rate`.
+
+        No report yet counts as running: that is what the suites assumed
+        before they had a state to read.
+        """
+        rate = self.await_engine_frame_rate(timeout)
+        return rate == 0.0 or rate >= self.RUNNING_FPS_LIMIT
 
     def wait_occurrence(
         self, pattern: str, occurrence: int, timeout: float, label: str

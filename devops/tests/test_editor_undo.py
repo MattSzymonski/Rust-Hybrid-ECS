@@ -316,15 +316,18 @@ def main() -> int:
         # Step 0: pause the engine's systems, so the project's simulation
         # cannot rewrite the fields the phases below read back. The editor
         # itself runs post-update and keeps working while paused, which is
-        # exactly what makes scripted edits deterministic.
-        before = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused",
-            before,
-        )
+        # exactly what makes scripted edits deterministic. A stray input can
+        # pause the engine before this step, so the toggle is only sent while
+        # it is still running.
+        if session.engine_is_running():
+            before = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine paused",
+                before,
+            )
         before = len(session.read_log())
         session.send("dump entities")
         session.wait(re.escape(ENTITY_LIST_TOKEN) + r"\s", 30, "world reads while paused", before)
