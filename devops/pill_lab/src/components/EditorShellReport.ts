@@ -98,10 +98,10 @@ function renderTargetTiles(
     const delta =
       entry && baselineEntry
         ? computeDelta(
-            caseValue(entry),
-            caseValue(baselineEntry),
-            entry.better_when ?? 'lower',
-          )
+          caseValue(entry),
+          caseValue(baselineEntry),
+          entry.better_when ?? 'lower',
+        )
         : null;
     const deltaText = [
       `${target.met ? 'met' : 'MISSED'} · ${target.name}`,
@@ -140,10 +140,10 @@ function renderCasesSection(
     const baselineEntry = baselineCases.get(entry.name) ?? null;
     const delta = baselineEntry
       ? computeDelta(
-          caseValue(entry),
-          caseValue(baselineEntry),
-          entry.better_when ?? 'lower',
-        )
+        caseValue(entry),
+        caseValue(baselineEntry),
+        entry.better_when ?? 'lower',
+      )
       : null;
     section.appendChild(renderCaseCard(entry, baselineEntry, delta));
   }

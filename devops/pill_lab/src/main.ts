@@ -378,8 +378,8 @@ async function start(): Promise<void> {
       : defaults.selectedFile;
   const baselineFile =
     fromHash.baselineFile &&
-    fromHash.baselineFile !== selectedFile &&
-    entries.some((entry) => entry.file === fromHash.baselineFile)
+      fromHash.baselineFile !== selectedFile &&
+      entries.some((entry) => entry.file === fromHash.baselineFile)
       ? fromHash.baselineFile
       : defaults.baselineFile === selectedFile
         ? null
