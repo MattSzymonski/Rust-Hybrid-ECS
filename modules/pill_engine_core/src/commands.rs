@@ -869,25 +869,8 @@ mod tests {
 
     use super::*;
     use crate::archetype::Blittability;
+    use crate::test_fixtures::{Health, Position, Velocity};
     use crate::world::World;
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Position {
-        x: f32,
-        y: f32,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Velocity {
-        x: f32,
-        y: f32,
-    }
-
-    /// A third component, used to force an archetype migration.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Health {
-        value: u32,
-    }
 
     /// Counts how many `OwningComponent` values are alive.
     ///
@@ -937,10 +920,6 @@ mod tests {
     }
 
     impl Component for OwningComponent {}
-
-    impl Component for Position {}
-    impl Component for Velocity {}
-    impl Component for Health {}
 
     /// Tests basic entity creation through the deferred command queue.
     ///
@@ -1197,7 +1176,7 @@ mod tests {
         // Adding a component migrates the entity to another archetype, which is
         // what carries the owning component across.
         let mut queue = CommandQueue::new();
-        queue.add_component_adder_to_entity(entity, boxed_component_adder(Health { value: 5 }));
+        queue.add_component_adder_to_entity(entity, boxed_component_adder(Health(5)));
         queue.execute_queued_commands(&mut world, true).unwrap();
 
         assert_eq!(
@@ -1249,7 +1228,7 @@ mod tests {
         let entity = world
             .create_entity()
             .with(OwningComponent::new(vec![1, 2]))
-            .with(Health { value: 3 })
+            .with(Health(3))
             .build()
             .unwrap();
         assert_eq!(OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst), 1);
@@ -1264,7 +1243,7 @@ mod tests {
             "the component that did not travel is released by the source archetype"
         );
         assert!(world.get_component::<OwningComponent>(entity).is_none());
-        assert_eq!(world.get_component::<Health>(entity).unwrap().value, 3);
+        assert_eq!(world.get_component::<Health>(entity).unwrap().0, 3);
         assert!(world.destroy_entity(entity));
     }
 

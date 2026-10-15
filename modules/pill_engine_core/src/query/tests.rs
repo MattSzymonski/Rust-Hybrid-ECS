@@ -3,10 +3,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines the test-only [`Position`], [`Velocity`], and [`Health`]
-//!   component types shared by the whole suite.
-//! - Verifies sequential and parallel query iteration, including tracked
-//!   batch statistics.
+//! - Exercises the shared [`Position`], [`Velocity`], and [`Health`] fixture
+//!   components through sequential and parallel query iteration, including
+//!   tracked batch statistics.
 //! - Verifies change-detection semantics of [`Mut`] and the [`Added`] and
 //!   [`Changed`] filters.
 //! - Verifies archetype-scoping behaviour of the [`With`], [`Without`], and
@@ -28,59 +27,12 @@ use pill_core::rayon;
 use super::*;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
+use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 use crate::world::World;
-
-// =============================================================================
-// Types
-// =============================================================================
-
-// Test components
-/// 2D position component used as a test fixture across the query suite.
-///
-/// Plain `f32` fields keep the fixture minimal so tests focus on query
-/// semantics rather than component behaviour.
-#[derive(Debug, Clone, PartialEq)]
-struct Position {
-    x: f32,
-    y: f32,
-}
-impl Component for Position {}
-
-/// 2D velocity component used as a test fixture across the query suite.
-///
-/// Paired with [`Position`] in tests that exercise multi-component queries
-/// and parallel mutation.
-#[derive(Debug, Clone, PartialEq)]
-struct Velocity {
-    x: f32,
-    y: f32,
-}
-impl Component for Velocity {}
-
-/// Health value component used as a test fixture across the query suite.
-///
-/// A tuple-struct component that creates archetypes distinct from the
-/// `Position`/`Velocity` pair, giving filters disjoint sets to match.
-#[derive(Debug, Clone, PartialEq)]
-struct Health(i32);
-impl Component for Health {}
-
-// Registers the three fixture components with the `trait_type_map` dispatch
-// table so queries and the scheduler can access them by type.
 
 // =============================================================================
 // Test Helpers
 // =============================================================================
-
-/// Creates a fresh [`World`] with the `Position`, `Velocity`, and `Health`
-/// components registered, ready for tests to populate with entities.
-fn setup_world() -> World {
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world
-}
 
 // =============================================================================
 // Tests

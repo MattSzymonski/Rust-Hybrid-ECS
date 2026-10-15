@@ -2969,6 +2969,8 @@ mod host_project_member_validation_tests {
     };
     use pill_core::error::ConfigError;
 
+    use crate::scratch::ScratchDirectory;
+
     /// A project manifest whose one path dependency is filled in per test, so
     /// each case differs only in whether that path resolves.
     fn manifest_with_dependency(dependency_path: &str) -> String {
@@ -2981,9 +2983,8 @@ mod host_project_member_validation_tests {
     ///
     /// The project directory is a sibling of `extensions/`, matching the real
     /// layout closely enough that relative paths behave the same way.
-    fn workspace(test_name: &str, dependency_path: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("pill_member_{test_name}"));
-        let _ = std::fs::remove_dir_all(&root);
+    fn workspace(test_name: &str, dependency_path: &str) -> ScratchDirectory {
+        let root = ScratchDirectory::new(test_name);
         std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
         std::fs::create_dir_all(root.join("project").join("src")).unwrap();
         std::fs::write(
@@ -3105,6 +3106,8 @@ mod host_project_member_validation_tests {
 mod host_project_member_pruning_tests {
     use super::{prune_stale_host_project_members, EXTENSION_DIRECTORY, PROJECT_MEMBER_DIRECTORY};
 
+    use crate::scratch::ScratchDirectory;
+
     /// Creates `<directory>/<name>/Cargo.toml` under `root` and returns its
     /// directory, so a test can assert on the directory rather than the file.
     fn seed_member_in(root: &std::path::Path, directory: &str, name: &str) -> std::path::PathBuf {
@@ -3125,10 +3128,9 @@ name = \"x\"
         seed_member_in(root, PROJECT_MEMBER_DIRECTORY, name)
     }
 
-    /// Builds an empty temporary workspace root, removing any previous run's.
-    fn workspace(test_name: &str) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!("pill_prune_{test_name}"));
-        let _ = std::fs::remove_dir_all(&root);
+    /// Builds an empty temporary workspace root, removed on drop.
+    fn workspace(test_name: &str) -> ScratchDirectory {
+        let root = ScratchDirectory::new(test_name);
         std::fs::create_dir_all(root.join(PROJECT_MEMBER_DIRECTORY)).unwrap();
         root
     }
@@ -3169,8 +3171,7 @@ name = \"x\"
 
     #[test]
     fn tolerates_a_missing_extensions_directory() {
-        let root = std::env::temp_dir().join("pill_prune_missing");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ScratchDirectory::new("prune_missing");
 
         // Must not panic: a workspace with no `extensions/` directory yet is
         // valid, and refusing to start over it would be worse than the stale
@@ -3185,12 +3186,13 @@ mod hot_patch_manifest_tests {
         materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX, PROJECT_MEMBER_DIRECTORY,
     };
 
+    use crate::scratch::ScratchDirectory;
+
     /// A hot-patching host needs the generated member to build an `rlib` too,
     /// or a patch has nothing to link the project's types from.
     #[test]
     fn generated_member_builds_an_rlib_for_hot_patching() {
-        let root = std::env::temp_dir().join("pill_member_hot_patch_rlib");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ScratchDirectory::new("member_hot_patch_rlib");
         std::fs::create_dir_all(root.join("project").join("src")).unwrap();
         std::fs::write(
             root.join("project").join("Cargo.toml"),
@@ -3219,6 +3221,8 @@ mod hot_patch_manifest_tests {
 mod host_module_wrapper_pruning_tests {
     use super::{prune_stale_host_module_wrappers, EXTENSION_DIRECTORY, GENERATED_DIRECTORY};
 
+    use crate::scratch::ScratchDirectory;
+
     /// Creates `extensions/<folder>/generated/<wrapper>/Cargo.toml` under
     /// `root` and returns the wrapper's directory.
     fn seed_wrapper(root: &std::path::Path, folder: &str, wrapper: &str) -> std::path::PathBuf {
@@ -3237,8 +3241,7 @@ mod host_module_wrapper_pruning_tests {
     /// in `extensions/` are removed; real crates are never touched.
     #[test]
     fn keeps_only_the_wrappers_of_loaded_crates() {
-        let root = std::env::temp_dir().join("pill_prune_wrappers");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ScratchDirectory::new("prune_wrappers");
         let kept = seed_wrapper(&root, "pill_spline", "host_module_pill_spline");
         let unloaded = seed_wrapper(&root, "pill_audio", "host_module_pill_audio");
         let moved = seed_wrapper(&root, "pill_old_folder", "host_module_pill_spline");

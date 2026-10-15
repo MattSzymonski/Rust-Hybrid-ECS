@@ -2312,45 +2312,43 @@ fn native_library_filename(library_name: &str) -> String {
 mod tests {
     use super::*;
 
+    use crate::scratch::{date_file, ScratchDirectory};
+
     /// The token guard: a file written after the batch invalidates the token,
     /// one written before it does not, and a missing directory counts as
     /// changed.
     #[test]
     fn source_newer_than_watches_file_times() {
-        let directory =
-            std::env::temp_dir().join(format!("pill_batch_guard_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(directory.join("nested")).expect("create the test directory");
-        let before_write = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(directory.join("nested").join("edited.rs"), "// edited")
-            .expect("write the test file");
+        let directory = ScratchDirectory::new("batch_guard");
+        let batch_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // The walk recurses and compares a subdirectory's own time too, so the
+        // fixture stays flat: only the file can carry a dated time.
+        let edited = directory.join("edited.rs");
+        std::fs::write(&edited, "// edited").expect("write the test file");
+        date_file(&edited, batch_time + Duration::from_secs(1));
         assert!(
-            source_newer_than(&directory, before_write),
-            "a file written after the batch must invalidate the token"
+            source_newer_than(&directory, batch_time),
+            "a file dated after the batch must invalidate the token"
         );
-        let after_write = SystemTime::now();
+        let after_write = batch_time + Duration::from_secs(2);
         assert!(
             !source_newer_than(&directory, after_write),
-            "files older than the batch keep the token valid"
+            "files dated before the batch keep the token valid"
         );
         assert!(
             source_newer_than(&directory.join("missing"), after_write),
             "a missing watch directory counts as changed"
         );
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The token itself: refused when the sources moved on, consumed once.
     #[test]
     fn batch_validation_is_consumed_once() {
-        let directory =
-            std::env::temp_dir().join(format!("pill_batch_token_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create the test directory");
-        let stale_moment = SystemTime::now();
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(directory.join("lib.rs"), "// module").expect("write the test file");
+        let directory = ScratchDirectory::new("batch_token");
+        let stale_moment = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let source = directory.join("lib.rs");
+        std::fs::write(&source, "// module").expect("write the test file");
+        date_file(&source, stale_moment + Duration::from_secs(1));
         with_batch_validation(|state| {
             *state = Some(BatchValidation {
                 completed_at: stale_moment,
@@ -2372,7 +2370,6 @@ mod tests {
             !take_batch_validation("batch_guard_once", &directory),
             "the token belongs to one load only"
         );
-        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// Build a throwaway workspace containing one module, a path dependency,
@@ -2416,9 +2413,9 @@ mod tests {
         );
 
         // Another build writes a different library to the same path. It is
-        // newer than every source, so the modification-time check alone would
-        // accept it.
-        std::thread::sleep(Duration::from_millis(30));
+        // dated ahead of every source, so the modification-time check alone
+        // would accept it.
+        date_file(&output, SystemTime::now() + Duration::from_secs(3600));
         fs_write(&output, "a differently configured native library");
         assert!(
             !artifacts_are_host_built(
@@ -2518,9 +2515,7 @@ no-rendering+hot_patch",
     /// checked - they were just the wrong sources.
     #[test]
     fn a_different_project_with_the_same_package_name_is_not_host_built() {
-        let root = std::env::temp_dir().join("pill_stamp_other_project");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = ScratchDirectory::new("stamp_other_project");
         let output = root.join("project.dll");
         std::fs::write(&output, b"artifact").unwrap();
         let command = vec![
@@ -2625,9 +2620,9 @@ no-rendering+hot_patch",
             &artifacts
         ));
 
-        // Only the second artifact moves.
-        std::thread::sleep(Duration::from_millis(30));
+        // Only the second artifact moves, dated ahead of the stamp.
         fs_write(&rlib, "a differently configured rlib");
+        date_file(&rlib, SystemTime::now() + Duration::from_secs(3600));
         assert!(
             !artifacts_are_host_built(&root, "module", "module/src", &command, &artifacts),
             "a replaced rlib must invalidate the build as surely as a replaced library"
@@ -2669,7 +2664,9 @@ no-rendering+hot_patch",
                 Instant::now() < deadline,
                 "the grandchild must join the job"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            // A bounded wait between polls: this one waits on a live process,
+            // not on a timestamp, so no explicit date can replace it.
+            std::thread::park_timeout(Duration::from_millis(10));
         }
 
         stop_process_tree(tree.as_ref(), &mut child);
@@ -2677,19 +2674,20 @@ no-rendering+hot_patch",
         let deadline = Instant::now() + Duration::from_secs(10);
         while tree.as_ref().expect("created above").active_processes() != 0 {
             assert!(Instant::now() < deadline, "the tree must be gone");
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::park_timeout(Duration::from_millis(10));
         }
     }
 
-    fn test_workspace() -> (PathBuf, PathBuf) {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "pill_build_runner_test_{}_{unique}",
-            std::process::id()
-        ));
+    /// A throwaway workspace containing one module, a path dependency, and a
+    /// freshly produced artifact, under a scratch guard; returns the guard
+    /// (which removes the tree on drop) plus the module's manifest path.
+    ///
+    /// The artifact's modification time is dated explicitly, ahead of every
+    /// input, instead of pausing between the writes: the stamp tests rest on
+    /// "newer than the inputs", and dating it makes that true by construction
+    /// rather than by clock resolution (SA-0069).
+    fn test_workspace() -> (ScratchDirectory, PathBuf) {
+        let root = ScratchDirectory::new("build_runner");
 
         // Workspace-level inputs shared by every member build.
         fs_write(&root.join("Cargo.toml"), "[workspace]\nmembers = []\n");
@@ -2711,10 +2709,10 @@ no-rendering+hot_patch",
             "pub fn helper() -> u32 { 7 }\n",
         );
 
-        // The artifact is produced last so it is newer than every input.
-        std::thread::sleep(Duration::from_millis(30));
+        // The artifact is produced last and dated ahead of every input.
         let output = root.join("target/debug/module.dll");
         fs_write(&output, "fake native library");
+        date_file(&output, SystemTime::now() + Duration::from_secs(3600));
 
         let module_manifest = root.join("module/Cargo.toml");
         (root, module_manifest)

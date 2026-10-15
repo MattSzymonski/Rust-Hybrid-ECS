@@ -160,15 +160,19 @@ def main() -> int:
 
         # The project rewrites component fields every tick, so every value
         # proof pauses the engine first (the shell still runs when paused);
-        # the console phase resumes it because module systems must tick.
-        begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused",
-            begin,
-        )
+        # the console phase resumes it because module systems must tick. An
+        # input that lands on the Systems panel's Pause button while the
+        # window appears pauses the engine on its own, so the toggle is only
+        # sent while the engine is still running.
+        if session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine paused",
+                begin,
+            )
 
         # Step 1: discover an editable, visible Inspector field for the
         # entity. The Inspector clips to its dock (a scroll area), so the
@@ -355,15 +359,17 @@ def main() -> int:
             begin,
         )
 
-        # Resume so module systems tick again for the console phase.
-        begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine resumed",
-            begin,
-        )
+        # Resume so module systems tick again for the console phase, unless
+        # a stray input already did.
+        if not session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine resumed",
+                begin,
+            )
 
         # Step 3: the Console. A module command makes a game-channel line;
         # the heartbeat reports both channels; the filter buttons and the
@@ -581,15 +587,17 @@ def main() -> int:
             )
 
         # Editing without re-selecting proves the shared selection survived.
-        # Pause first: the project rewrites fields every tick while running.
-        begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused for the reload edit",
-            begin,
-        )
+        # Pause first: the project rewrites fields every tick while running,
+        # and only a running engine needs the toggle.
+        if session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine paused for the reload edit",
+                begin,
+            )
         begin = len(session.read_log())
         session.send(f"activate {widget}")
         session.wait(

@@ -206,15 +206,17 @@ def main() -> int:
                 time.sleep(0.5)
         assert match, "no Assets placement in the log"
         # Pause the engine before the gesture, so the project's systems
-        # cannot rewrite anything mid-drag.
-        begin = len(session.read_log())
-        session.send("command editor.pause_toggle")
-        session.wait(
-            re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
-            30,
-            "engine paused",
-            begin,
-        )
+        # cannot rewrite anything mid-drag (skip the toggle if a stray input
+        # paused it already).
+        if session.engine_is_running():
+            begin = len(session.read_log())
+            session.send("command editor.pause_toggle")
+            session.wait(
+                re.escape(EDITOR_COMMAND_EXECUTED_TOKEN) + r'\s+id="?editor\.pause_toggle"?',
+                30,
+                "engine paused",
+                begin,
+            )
         panel_x, panel_y, panel_width = (float(value) for value in match[:3])
         hwnd = editor_main_window(process.pid)
         scale = scale_factor(hwnd)

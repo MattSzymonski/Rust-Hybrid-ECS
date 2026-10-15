@@ -133,6 +133,13 @@ def main() -> int:
         session.wait_token(EDITOR_SHELL_LOADED_TOKEN, 300, "shell loaded")
         session.wait_token(EDITOR_WINDOW_CREATED_TOKEN, 300, "editor started")
         session.wait_token(EDITOR_COMMAND_REGISTRY_TOKEN, 120, "registry ready")
+        # A paused, idle editor sleeps at its heartbeat rate and paints no
+        # frames, so the engine is started ticking before the frame waits
+        # (the editor can come up paused; see
+        # EditorSession.engine_is_running). The "frames running" wait below
+        # doubles as the proof of the resume.
+        if not session.engine_is_running():
+            session.send("command editor.pause_toggle")
         session.wait_token(SHELL_FRAME_TOKEN, 120, "frames running")
 
         # Step 0: nothing is broken yet, so no problem was ever reported.

@@ -133,6 +133,11 @@ def main() -> int:
             120,
             "scene docked",
         )
+        # The gizmo proofs need the project ticking (the editor can come up
+        # paused - see EditorSession.engine_is_running - and a paused, idle
+        # editor sleeps at its heartbeat rate); the clicks below send wakes.
+        if not session.engine_is_running():
+            session.send("command editor.pause_toggle")
 
         # Step 1: the scene view's rectangle, in logical client pixels - the
         # space the scripted clicks use.

@@ -16,6 +16,7 @@ use libloading::Library;
 
 // Current crate
 use super::*;
+use crate::scratch::ScratchDirectory;
 
 /// A fan-out that reaches no copy is reported rather than treated as
 /// success, and the image parked in the graveyard is untouched by the
@@ -129,8 +130,7 @@ fn generated_source_namespaces_the_entry_and_the_export() {
 /// than through the engine's registry.
 #[test]
 fn a_plain_function_keeps_its_own_attribute() {
-    let directory = std::env::temp_dir().join("pill_generate_plain");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("generate_plain");
     let session = session_over(&directory, PLAIN_SOURCE);
 
     let generated = session
@@ -155,8 +155,7 @@ fn a_plain_function_keeps_its_own_attribute() {
 /// because the two are installed through entirely different machinery.
 #[test]
 fn classify_reports_the_plain_function_kind() {
-    let directory = std::env::temp_dir().join("pill_classify_plain");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_plain");
     let mut session = session_over(&directory, PLAIN_SOURCE);
 
     let edited = PLAIN_SOURCE.replace("133.0", "999.0");
@@ -178,8 +177,7 @@ fn classify_reports_the_plain_function_kind() {
 /// a submodule must not be looked up under the crate root's name.
 #[test]
 fn qualified_names_follow_the_source_tree() {
-    let directory = std::env::temp_dir().join("pill_qualified_names");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("qualified_names");
     let session = session_over(&directory, PLAIN_SOURCE);
     let free = plain_declaration("get_color_a");
 
@@ -208,8 +206,7 @@ fn qualified_names_follow_the_source_tree() {
 /// blamed the build script.
 #[test]
 fn a_method_is_named_through_its_type() {
-    let directory = std::env::temp_dir().join("pill_method_naming");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("method_naming");
     let session = session_over(&directory, PLAIN_SOURCE);
     let method = source::HotFunction {
         name: "mix".to_string(),
@@ -243,8 +240,7 @@ fn a_method_is_named_through_its_type() {
 /// may each define `draw` for it. `Type::draw` names all of them.
 #[test]
 fn a_trait_method_is_named_through_its_trait() {
-    let directory = std::env::temp_dir().join("pill_trait_method_naming");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("trait_method_naming");
     let session = session_over(&directory, PLAIN_SOURCE);
     let via_trait = source::HotFunction {
         name: "default".to_string(),
@@ -285,8 +281,7 @@ fn a_trait_method_is_named_through_its_trait() {
 /// trait, so the generated patch and the address lookup agree.
 #[test]
 fn classify_accepts_a_trait_method_body() {
-    let directory = std::env::temp_dir().join("pill_classify_trait_method");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_trait_method");
     let source = "pub struct Spline(u32);\n\nimpl Shape for Spline {
 fn size(&self) -> u32 { 1 }\n}\n";
     let mut session = session_over(&directory, source);
@@ -315,8 +310,7 @@ fn size(&self) -> u32 { 1 }\n}\n";
 /// hunting for which `impl` block was meant.
 #[test]
 fn classify_refuses_a_receiverless_trait_function() {
-    let directory = std::env::temp_dir().join("pill_classify_receiverless");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_receiverless");
     let source = "pub struct Spline(u32);\n\nimpl Default for Spline {
 fn default() -> Self { Spline(1) }\n}\n";
     let mut session = session_over(&directory, source);
@@ -352,8 +346,7 @@ fn default() -> Self { Spline(1) }\n}\n";
 /// install it for whichever type was patched.
 #[test]
 fn a_generated_trait_patch_carries_the_right_body() {
-    let directory = std::env::temp_dir().join("pill_generate_trait_method");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("generate_trait_method");
     let source = "pub struct Alpha(u32);\npub struct Beta(u32);\n
 impl Shape for Alpha {
 fn size(&self) -> u32 { 111 }\n}\n
@@ -400,8 +393,7 @@ fn size(&self) -> u32 { 222 }\n}\n";
 /// learn the type. The two forms are therefore expected to differ.
 #[test]
 fn a_slot_lookup_omits_the_type_the_macro_cannot_see() {
-    let directory = std::env::temp_dir().join("pill_slot_naming");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("slot_naming");
     let session = session_over(&directory, PLAIN_SOURCE);
     let method = source::HotFunction {
         name: "get_color_a".to_string(),
@@ -470,10 +462,8 @@ fn plain_declaration(name: &str) -> source::HotFunction {
 /// refuses, and that module can never be patched again in that session.
 #[test]
 fn patch_artifact_names_do_not_collide_across_sessions() {
-    let first = std::env::temp_dir().join("pill_names_first");
-    let second = std::env::temp_dir().join("pill_names_second");
-    let _ = std::fs::remove_dir_all(&first);
-    let _ = std::fs::remove_dir_all(&second);
+    let first = ScratchDirectory::new("names_first");
+    let second = ScratchDirectory::new("names_second");
 
     let mut colour = session_over(&first, PLAIN_SOURCE);
     colour.package = "pill_dummy_color".to_string();
@@ -503,8 +493,7 @@ fn patch_artifact_names_do_not_collide_across_sessions() {
 /// report an earlier time; that mistake made every classification miss.
 #[test]
 fn an_untouched_file_is_not_re_read() {
-    let directory = std::env::temp_dir().join("pill_classify_mtime_gate");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_mtime_gate");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     // A second file that never changes.
@@ -559,8 +548,7 @@ fn an_untouched_file_is_not_re_read() {
 /// snapshot, because its modification time moved.
 #[test]
 fn a_touched_file_is_re_read() {
-    let directory = std::env::temp_dir().join("pill_classify_mtime_touch");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_mtime_touch");
     let mut session = session_over(&directory, PLAIN_SOURCE);
 
     // Sleep past the filesystem's timestamp granularity, so the write is
@@ -588,8 +576,7 @@ fn a_touched_file_is_re_read() {
 /// delivered and then skipped by the modification-time gate.
 #[test]
 fn classify_returns_the_time_of_the_contents_it_read() {
-    let directory = std::env::temp_dir().join("pill_classify_modified_pair");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_modified_pair");
     let mut session = session_over(&directory, PLAIN_SOURCE);
 
     // Same coarse-timestamp guard as the other re-read tests: a write
@@ -636,8 +623,7 @@ fn classify_returns_the_time_of_the_contents_it_read() {
 /// after it was staged - a message that names the wrong crate entirely.
 #[test]
 fn a_stale_staged_rlib_is_refreshed_before_compiling() {
-    let directory = std::env::temp_dir().join("pill_restage_rlib");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("restage_rlib");
     let session = session_over(&directory, PLAIN_SOURCE);
 
     // What cargo produced (in the private module build tree under the
@@ -664,8 +650,7 @@ fn a_stale_staged_rlib_is_refreshed_before_compiling() {
 /// two metadata reads rather than a file copy.
 #[test]
 fn a_current_staged_rlib_is_left_alone() {
-    let directory = std::env::temp_dir().join("pill_restage_current");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("restage_current");
     let session = session_over(&directory, PLAIN_SOURCE);
 
     let built = directory
@@ -690,8 +675,7 @@ fn a_current_staged_rlib_is_left_alone() {
 /// copy - the only one there is - must survive untouched.
 #[test]
 fn refreshing_without_a_cargo_artifact_keeps_the_staged_copy() {
-    let directory = std::env::temp_dir().join("pill_restage_missing");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("restage_missing");
     let session = session_over(&directory, PLAIN_SOURCE);
     fs_write(&session.package_rlib, "the only copy");
 
@@ -823,8 +807,7 @@ fn draw(&self) -> f32 {
 /// is identified, and names the right function.
 #[test]
 fn classify_accepts_a_body_only_edit() {
-    let directory = std::env::temp_dir().join("pill_classify_accepts");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_accepts");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 2.0");
@@ -842,8 +825,7 @@ fn classify_accepts_a_body_only_edit() {
 
 #[test]
 fn classify_reports_no_change_when_nothing_moved() {
-    let directory = std::env::temp_dir().join("pill_classify_unchanged");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_unchanged");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     assert!(session.classify().expect("no error").is_none());
@@ -908,8 +890,7 @@ fn classify_refuses_everything_outside_a_hot_body() {
 /// that gap; this test pins the behaviour that depends on it.
 #[test]
 fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
-    let directory = std::env::temp_dir().join("pill_classify_resync_after_reload");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_resync_after_reload");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     // Step 1: an edit the fast path must refuse. In the host this falls
@@ -959,8 +940,7 @@ fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
 /// full reload the refusal fell back to, and the world is never torn down.
 #[test]
 fn classify_reports_every_changed_body() {
-    let directory = std::env::temp_dir().join("pill_classify_two_bodies");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_two_bodies");
     let mut session = session_over(&directory, TWO_HOT_SOURCE);
 
     let edited = TWO_HOT_SOURCE
@@ -1032,8 +1012,7 @@ fn stage_timings_accumulate_across_bodies() {
 /// Two changed files in one edit are refused with their own code.
 #[test]
 fn classify_refuses_two_changed_files() {
-    let directory = std::env::temp_dir().join("pill_classify_two_files");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_two_files");
     let mut session = session_over(&directory, HOT_SOURCE);
     // A second file that is part of the baseline, so changing it later is
     // an edit rather than a new file.
@@ -1066,8 +1045,7 @@ fn classify_refuses_two_changed_files() {
 /// and the address it replaces would belong to different functions.
 #[test]
 fn duplicate_bare_names_are_refused() {
-    let directory = std::env::temp_dir().join("pill_classify_duplicate_names");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_duplicate_names");
     let mut session = session_over(&directory, DUPLICATE_NAME_SOURCE);
 
     let edited = DUPLICATE_NAME_SOURCE.replace("self.value * 1.0", "self.value * 9.0");
@@ -1095,8 +1073,7 @@ fn duplicate_bare_names_are_refused() {
 /// definition, and says so with its own code.
 #[test]
 fn classify_refuses_a_new_source_file() {
-    let directory = std::env::temp_dir().join("pill_classify_new_file");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_new_file");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     std::fs::write(directory.join("appeared.rs"), HOT_SOURCE).expect("write new file");
@@ -1116,8 +1093,7 @@ fn classify_refuses_a_new_source_file() {
 /// than silently doing nothing, and names the function.
 #[test]
 fn rollback_refuses_an_unknown_function() {
-    let directory = std::env::temp_dir().join("pill_rollback_unknown");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("rollback_unknown");
     let session = session_over(&directory, HOT_SOURCE);
 
     assert!(!session.knows_function("project::movement"));
@@ -1135,8 +1111,7 @@ fn rollback_refuses_an_unknown_function() {
 /// not what went wrong. This pins the message a developer actually reads.
 #[test]
 fn a_prologue_generation_a_reload_invalidated_says_so() {
-    let directory = std::env::temp_dir().join("pill_rollback_dropped_history");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("rollback_dropped_history");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     // A generation delivered by overwriting code, as `apply` would record it.
@@ -1209,8 +1184,7 @@ fn a_prologue_generation_a_reload_invalidated_says_so() {
 /// the previous revision into the fresh artifact.
 #[test]
 fn a_reload_forgets_slot_generations() {
-    let directory = std::env::temp_dir().join("pill_reload_forgets_slots");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("reload_forgets_slots");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     // A generation delivered into a slot, as `apply` records one: no
@@ -1264,8 +1238,7 @@ fn a_reload_forgets_slot_generations() {
 /// plain `fn` in a participating crate is as patchable as an annotated one.
 #[test]
 fn classify_accepts_an_un_annotated_function() {
-    let directory = std::env::temp_dir().join("pill_classify_unannotated");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_unannotated");
     let plain = "fn ordinary(value: f32) -> f32 { value }\n";
     let mut session = session_over(&directory, plain);
 
@@ -1293,8 +1266,7 @@ fn classify_accepts_an_un_annotated_function() {
 /// to something the host could never reach says so.
 #[test]
 fn classify_refuses_a_file_with_no_functions() {
-    let directory = std::env::temp_dir().join("pill_classify_no_functions");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_no_functions");
     let mut session = session_over(&directory, "pub const SPEED: f32 = 1.0;\n");
 
     std::fs::write(directory.join("lib.rs"), "pub const SPEED: f32 = 2.0;\n").expect("write edit");
@@ -1309,8 +1281,7 @@ fn classify_refuses_a_file_with_no_functions() {
 /// structural change - one changed body is still the limit.
 #[test]
 fn classify_reports_whichever_body_changed() {
-    let directory = std::env::temp_dir().join("pill_classify_other_body");
-    let _ = std::fs::remove_dir_all(&directory);
+    let directory = ScratchDirectory::new("classify_other_body");
     let mut session = session_over(&directory, HOT_SOURCE);
 
     let edited = HOT_SOURCE.replace("value + 1.0", "value + 9.0");
