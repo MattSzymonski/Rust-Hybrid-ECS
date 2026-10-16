@@ -131,8 +131,11 @@ def main() -> int:
             "before running the editor suite - it rewrites the shared dylibs "
             "the modules load against"
         )
-    binary = arguments.binary.resolve() if arguments.binary else None
-    if binary is None and not EGUI_EDITOR_BINARY.is_file():
+    # The default must be the egui binary: EditorSession's own default is the
+    # native editor, whose binary is a different build and crashes at startup
+    # against the egui editor's dylib split.
+    binary = arguments.binary.resolve() if arguments.binary else EGUI_EDITOR_BINARY
+    if not binary.is_file():
         raise SystemExit(
             "editor binary not found at {}; build it with "
             "`cargo build -p pill_editor_egui` in modules/ first".format(EGUI_EDITOR_BINARY)

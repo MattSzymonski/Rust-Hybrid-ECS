@@ -33,7 +33,7 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_core_egui::editor_state::EditorSnapshot;
-use pill_editor_core_egui::layout::EditorTab;
+use pill_editor_core_egui::layout::{EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION};
 use pill_editor_core_egui::session::EguiShellState;
 use pill_engine_core::InputEvent;
 use pill_host::{HostConfig, RenderingHost};
@@ -41,7 +41,7 @@ use pill_input::winit_events::translate_window_event;
 use pill_runtime::{
     CameraBinding, CameraComponent, FrameDriver, SurfaceId, SurfaceOptions, TransformComponent,
 };
-use pill_ui_egui::boundary::{frame_from_output, EguiShellFrame, EguiShellInput};
+use pill_ui_egui::boundary::{frame_from_output, EguiShellFrame, EguiShellInput, ShellRect};
 use pill_ui_egui::egui;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -72,13 +72,11 @@ const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
 /// surface, shown by the main window itself.
 const SCENE_SURFACE: SurfaceId = SurfaceId(1);
 
-/// Where the scene view's child window sits inside the main window's client
-/// area, as (left fraction, top pixels, margin pixels) of the content area.
-/// The docking layout's own view rectangles replace this fixed split when
-/// the shell carries view rects across the boundary (follow-up work).
-const SCENE_VIEW_LEFT_FRACTION: f64 = 0.55;
-const SCENE_VIEW_TOP_MARGIN: f64 = 64.0;
-const SCENE_VIEW_MARGIN: f64 = 8.0;
+/// The scene view's rectangle before the shell's first scene rect arrives:
+/// the dock's default layout's center, in logical pixels. The shell's
+/// measured scene rect replaces it on the first frame.
+const SCENE_DEFAULT_TOP_MARGIN: f64 = 32.0;
+const SCENE_DEFAULT_MARGIN: f64 = 4.0;
 
 /// How much of each new frame feeds the displayed FPS, the rest being the
 /// running average.
@@ -184,6 +182,8 @@ impl ApplicationHandler for EditorApplication {
             WindowEvent::Resized(size) => {
                 if is_main {
                     editor.resize(size.width, size.height);
+                } else {
+                    editor.resize_scene(size.width, size.height);
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -397,18 +397,62 @@ impl EditorWindow {
         self.place_views();
     }
 
-    /// Place the scene view at its fixed rectangle inside the client area.
+    /// Handle a scene-window resize: the scene's surface reconfigures with
+    /// its window, like the native editor's view surfaces (D29) - a stale
+    /// render target draws the scene at the wrong size inside the tab. The
+    /// placement cache is cleared, so the next layout pass re-applies the
+    /// dock's rectangle.
+    fn resize_scene(&mut self, width: u32, height: u32) {
+        let Some(scene) = &mut self.scene else {
+            return;
+        };
+        scene.window.placed = None;
+        let (width, height) = (width.max(1), height.max(1));
+        self.host.resize_surface(scene.surface_id, width, height);
+        info!(
+            target: telemetry_target::ENGINE,
+            width,
+            height,
+            "[editor] scene surface resized"
+        );
+    }
+
+    /// Place the scene view at the dock's default layout's center inside
+    /// the client area, until the shell's first scene rect arrives.
     fn place_views(&mut self) {
         let Some(scene) = &mut self.scene else {
             return;
         };
-        let (width, height) = self.size;
-        let margin = (SCENE_VIEW_MARGIN * self.scale_factor as f64) as i32;
-        let left = (width as f64 * SCENE_VIEW_LEFT_FRACTION) as i32;
-        let top = (SCENE_VIEW_TOP_MARGIN * self.scale_factor as f64) as i32 + margin;
-        let width = (width as i32 - left - margin).max(1) as u32;
-        let height = (height as i32 - top - margin).max(1) as u32;
+        let (width, height) = (self.size.0 as i32, self.size.1 as i32);
+        let margin = (SCENE_DEFAULT_MARGIN * self.scale_factor as f64) as i32;
+        let side = (width as f64 * SIDE_COLUMN_FRACTION as f64) as i32;
+        let top = (SCENE_DEFAULT_TOP_MARGIN * self.scale_factor as f64) as i32 + margin;
+        let bottom = (height as f64 * BOTTOM_ROW_FRACTION as f64) as i32;
+        let left = side + margin;
+        let width = (width - 2 * side - 2 * margin).max(1) as u32;
+        let height = (height - top - bottom - margin).max(1) as u32;
         scene.window.place(left, top, width, height);
+    }
+
+    /// Place the scene view at the dock's scene rectangle, in logical
+    /// points, converted to the client area's physical pixels.
+    fn place_scene_rect(&mut self, rect: ShellRect) {
+        let Some(scene) = &mut self.scene else {
+            return;
+        };
+        let scale = self.scale_factor as f64;
+        let x = (rect.x as f64 * scale).round() as i32;
+        let y = (rect.y as f64 * scale).round() as i32;
+        let width = (rect.width as f64 * scale).round().max(1.0) as i32;
+        let height = (rect.height as f64 * scale).round().max(1.0) as i32;
+        // Keep the child inside the client area; the dock's rect can
+        // overshoot the window while a split is being dragged.
+        let (client_width, client_height) = (self.size.0 as i32, self.size.1 as i32);
+        let x = x.clamp(0, (client_width - 1).max(0));
+        let y = y.clamp(0, (client_height - 1).max(0));
+        let width = width.min((client_width - x).max(1)) as u32;
+        let height = height.min((client_height - y).max(1)) as u32;
+        scene.window.place(x, y, width, height);
     }
 
     /// Run one world frame: input, the shell's pass, the overlay draw.
@@ -525,9 +569,15 @@ impl EditorWindow {
             wants_keyboard,
             cursor_icon,
             clipboard_text,
+            scene_rect,
             ime_allowed: _,
             ime_rect: _,
         } = frame;
+        // The scene view follows the dock's scene rectangle, so the viewport
+        // tracks the layout when the user drags a splitter.
+        if let Some(scene_rect) = scene_rect {
+            self.place_scene_rect(scene_rect);
+        }
         // Step 2: the routing decision is visible in the log on change.
         if wants_pointer != self.claimed_pointer || wants_keyboard != self.claimed_keyboard {
             info!(
@@ -698,7 +748,20 @@ impl EditorWindow {
             );
             return;
         };
-        let index = state.dock.state_mut().add_window(vec![tab]);
+        // The tab must leave the dock as it enters the window: a tab drawn
+        // in two surfaces in one frame breaks egui's per-widget layer
+        // invariant. `detach_tab` both removes it and creates the window.
+        let dock = state.dock.state_mut();
+        let Some(location) = dock.find_tab(&tab) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                tab = tab_name(tab),
+                "[editor] undock needs the tab in the dock"
+            );
+            return;
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(220.0, 160.0), egui::vec2(360.0, 480.0));
+        let index = dock.detach_tab(location, rect);
         info!(
             target: telemetry_target::ENGINE,
             tab = tab_name(tab),
@@ -891,8 +954,10 @@ impl SceneView {
 /// Parse a tab name from a scripted command.
 fn parse_tab(name: &str) -> Option<EditorTab> {
     match name {
+        "scene" => Some(EditorTab::Scene),
         "entities" => Some(EditorTab::Entities),
         "systems" => Some(EditorTab::Systems),
+        "assets" => Some(EditorTab::Assets),
         _ => None,
     }
 }
@@ -900,8 +965,10 @@ fn parse_tab(name: &str) -> Option<EditorTab> {
 /// The tab's display name for log lines.
 fn tab_name(tab: EditorTab) -> &'static str {
     match tab {
+        EditorTab::Scene => "scene",
         EditorTab::Entities => "entities",
         EditorTab::Systems => "systems",
+        EditorTab::Assets => "assets",
     }
 }
 

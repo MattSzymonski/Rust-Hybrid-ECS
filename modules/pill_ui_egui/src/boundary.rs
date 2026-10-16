@@ -80,6 +80,10 @@ pub struct EguiShellFrame {
     pub cursor_icon: CursorIcon,
     /// Text egui asked to copy to the clipboard.
     pub clipboard_text: Option<String>,
+    /// The scene tab's body rectangle (logical points), when the shell
+    /// shows a scene tab: the frontend places the scene's child window
+    /// here, so the viewport follows the dock layout.
+    pub scene_rect: Option<ShellRect>,
     /// IME composition should be enabled.
     pub ime_allowed: bool,
     /// Where the IME candidate window should appear, logical points.
@@ -98,6 +102,7 @@ impl Default for EguiShellFrame {
             wants_keyboard: false,
             cursor_icon: CursorIcon::Default,
             clipboard_text: None,
+            scene_rect: None,
             ime_allowed: false,
             ime_rect: None,
         }
@@ -132,6 +137,9 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         wants_keyboard,
         cursor_icon: platform.cursor_icon,
         clipboard_text,
+        // The shell fills the scene rectangle after its dock pass runs;
+        // `frame_from_output` only knows egui's own output.
+        scene_rect: None,
         // The engine reports IME composition in its input events; the
         // candidate window follows the text field egui focuses, which the
         // frontend reads off the frame's focus state for now.

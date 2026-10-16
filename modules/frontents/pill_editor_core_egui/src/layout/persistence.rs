@@ -19,7 +19,11 @@ use super::EditorDock;
 use crate::error::LayoutPersistenceError;
 
 /// The schema of the dock-layout document this build writes and accepts.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 adds the Scene and Assets tabs and the side/bottom default layout, so
+/// documents written by the two-tab build are rejected and replaced by the
+/// new default.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
