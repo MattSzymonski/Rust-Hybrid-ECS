@@ -140,7 +140,11 @@ its suites immediately after, with nothing in between - or let
 `check_relevant.py` enforce the order for you. `verify.py`'s `editor` step
 encodes the same order: the two host-tier editor suites first (they build a
 narrowed `pill_standalone`), then `cargo build -p pill_editor`, then the
-`SETS: editor` suites (`run_all.py --set editor`).
+`SETS: editor` suites (`run_all.py --set editor`) - and finally
+`cargo build -p pill_editor_egui` on its own, then
+`run_all.py --only test_editor_egui.py`: the two editors' graphs must not be
+unioned in one build for a run, because the host and the module builds it
+spawns must share one feature resolution.
 
 Common flags on the end-to-end suites:
 

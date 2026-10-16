@@ -21,7 +21,7 @@ DESCRIPTION
                          GPU module does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
                          crates: pill_core, pill_core_macros, pill_engine,
-                         pill_ui, serde, thiserror, miette, raw-window-handle;
+                         pill_draw, serde, thiserror, miette, raw-window-handle;
                          and has no build dependencies.
       3. host          - `pill_runtime`, `pill_csharp_bridge`, `pill_host` and
                          `pill_standalone` name no data crate
@@ -73,8 +73,10 @@ API_ALLOWED_DEPENDENCIES = {
     "pill_core",
     "pill_core_macros",
     "pill_engine",
-    # The UI draw lists the frame carries.
-    "pill_ui",
+    # The UI draw data the frame carries (W-0032: the types live in
+    # `pill_draw`, moved out of `pill_ui`, so the contract shares them with
+    # the UI libraries without depending on one).
+    "pill_draw",
     "serde",
     "thiserror",
     "miette",
@@ -206,7 +208,7 @@ VALID_TREE = {
                           '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
-                                           'pill_engine = { path = "x" }\npill_ui = { path = "x" }\nserde = "1"\n',
+                                           'pill_engine = { path = "x" }\npill_draw = { path = "x" }\nserde = "1"\n',
     "modules/pill_host/Cargo.toml": '[package]\nname = "pill_host"\n[dependencies]\n'
                                    'renderer_data_dependency_graph = { package = "r_data", path = "x" }\n'
                                    'renderer_dependency_graph = { package = "r", path = "x" }\n',

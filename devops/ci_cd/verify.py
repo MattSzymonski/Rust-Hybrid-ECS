@@ -294,10 +294,13 @@ STEPS: List[Step] = [
         "Editor suites (the real executable, scripted)",
         [
             [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_crates.py", "test_editor_revision.py"],
-            # Both editors in one build: one feature resolution, one set of
-            # shared dylibs, valid for either binary's launch.
-            ["cargo", "build", "-p", "pill_editor", "-p", "pill_editor_egui"],
+            ["cargo", "build", "-p", "pill_editor"],
             [PYTHON, "../devops/tests/run_all.py", "--set", "editor"],
+            # The egui editor gets its own build right before its suite: a
+            # host and the module builds it spawns must share one feature
+            # resolution, and the two editors' graphs differ.
+            ["cargo", "build", "-p", "pill_editor_egui"],
+            [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_egui.py"],
         ],
     ),
 ]

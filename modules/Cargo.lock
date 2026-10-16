@@ -2728,6 +2728,7 @@ dependencies = [
 name = "pill_core"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "bytemuck",
  "chrono",
  "colored",
@@ -2759,6 +2760,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tracy",
  "tracy-client",
+ "ttf-parser",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -2786,6 +2788,13 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "pill_draw"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
 ]
 
 [[package]]
@@ -3048,8 +3057,8 @@ dependencies = [
  "miette",
  "pill_core",
  "pill_core_macros",
+ "pill_draw",
  "pill_engine",
- "pill_ui",
  "raw-window-handle",
  "serde",
  "thiserror 2.0.20",
@@ -3142,6 +3151,7 @@ dependencies = [
  "cssparser",
  "fontdb",
  "pill_core",
+ "pill_draw",
  "pill_engine_core",
  "resvg",
  "serde",

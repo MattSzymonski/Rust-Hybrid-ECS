@@ -3,7 +3,6 @@
 PROTECTS: The egui editor: startup, shell module, dock rearrangement, patch and reload state survival.
 TIER: editor
 SETS: editor
-SETS: editor
 
 Builds against an already-built `pill_editor_egui` binary, starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the

@@ -308,22 +308,14 @@ impl EditorWindow {
             trace: wgpu::Trace::Off,
         }))
         .map_err(|source| EditorError::DeviceRequest { source })?;
-        // Step 3: the host: the project, its extensions and the egui shell
-        // module, with the renderer attached to this window.
-        let config = HostConfig::from_environment_for_editor_frontend("egui")
-            .map_err(pill_core::error::HostError::from)?;
-        let mut host = pill_host::setup_rendering(config, Arc::clone(&window), size.0, size.1)?;
-        // Step 4: the scene view's child window and its renderer surface,
-        // with the editor camera it draws through.
-        let camera = EditorCamera::default();
-        let mut scene = SceneView::open(event_loop, &window);
-        if let Some(scene) = &mut scene {
-            let scene_size = scene.window.size();
-            scene.attach(&mut host, &camera, scene_size);
-        }
-        // Step 5: the UI's renderer and the composition overlay, best
-        // effort: without the overlay the window shows the game view alone,
-        // and the failure is logged once.
+        // Step 3: the UI's renderer and the composition overlay, best
+        // effort. The overlay must exist BEFORE the project's renderer
+        // creates its swapchain on this window: a DirectComposition target
+        // cannot be created for a window that is already composed, and
+        // attaching the renderer composes it
+        // (`DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`). Without the
+        // overlay the window shows the game view alone; the failure is
+        // logged once and retried rarely.
         let egui_renderer = egui_wgpu::Renderer::new(&device, EDITOR_FORMAT, None, 1, false);
         let overlay = match OverlaySurface::new(
             &instance,
@@ -344,6 +336,19 @@ impl EditorWindow {
                 None
             }
         };
+        // Step 4: the host: the project, its extensions and the egui shell
+        // module, with the renderer attached to this window.
+        let config = HostConfig::from_environment_for_editor_frontend("egui")
+            .map_err(pill_core::error::HostError::from)?;
+        let mut host = pill_host::setup_rendering(config, Arc::clone(&window), size.0, size.1)?;
+        // Step 5: the scene view's child window and its renderer surface,
+        // with the editor camera it draws through.
+        let camera = EditorCamera::default();
+        let mut scene = SceneView::open(event_loop, &window);
+        if let Some(scene) = &mut scene {
+            let scene_size = scene.window.size();
+            scene.attach(&mut host, &camera, scene_size);
+        }
         let mut editor = EditorWindow {
             window,
             device,
