@@ -113,6 +113,33 @@
             "env": {
                 "PROJECT_PATH": "../examples/project_rs"
             }
+        },
+        {
+            // The editor executable (Stages 17-35 of W-0004). Module builds
+            // land in `target/hot/build` as usual, so the same symbol search
+            // paths as the standalone configurations apply.
+            "name": "Debug editor (rendering)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "preLaunchTask": "build editor (debug)",
+            "program": "${workspaceFolder}/modules/target/debug/pill_editor.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/modules",
+            "environment": [
+                {
+                    "name": "PROJECT_PATH",
+                    "value": "../examples/project_rs"
+                }
+            ],
+            "symbolOptions": {
+                "searchPaths": [
+                    "${workspaceFolder}/modules/target/hot/build/debug",
+                    "${workspaceFolder}/modules/target/debug"
+                ],
+                "searchMicrosoftSymbolServer": false
+            },
+            "console": "integratedTerminal"
         }
     ]
 }

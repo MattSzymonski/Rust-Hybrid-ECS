@@ -6,7 +6,7 @@ SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
-  - A built modules/target/debug/pill_editor_native.exe
+  - A built modules/target/debug/pill_editor.exe
   - examples/italian_brainrot and its pill_dummy_color extension (the suite
     breaks and repairs that extension's only source file)
 

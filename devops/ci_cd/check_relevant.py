@@ -180,7 +180,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_editor_panels.py", "editor shell panel API changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor shell state recovery changed"))
         selected.append(suite_check("test_editor_viewports.py", "editor shell windows changed"))
-    if has("modules/frontents/pill_editor_native/**"):
+    if has("modules/frontents/pill_editor/**"):
         selected.append(suite_check("test_editor_native.py", "editor frontend changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor frontend exit path changed"))
         selected.append(suite_check("test_editor_viewports.py", "editor frontend views changed"))
@@ -286,7 +286,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-ui", ("modules/pill_ui/**",)),
     ("pill-ui-wgpu", ("modules/pill_ui_wgpu/**",)),
     ("editor-shell", ("modules/extensions/pill_editor_shell/**",)),
-    ("editor-frontend", ("modules/frontents/pill_editor_native/**",)),
+    ("editor-frontend", ("modules/frontents/pill_editor/**",)),
     ("editor-core", ("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
     ("pill-core", ("modules/pill_core/**",)),
@@ -337,7 +337,7 @@ def select_checks(paths: Sequence[str]) -> List[Check]:
     editor_rows = [check for check in ordered if check.label.startswith("suite:test_editor_")]
     if editor_rows:
         ordered = [check for check in ordered if not check.label.startswith("suite:test_editor_")]
-        uplift = cargo_check("editor build", ("build", "-p", "pill_editor_native", "--offline"),
+        uplift = cargo_check("editor build", ("build", "-p", "pill_editor", "--offline"),
                              "editor suites selected")
         uplift.reasons = ["editor suites need the frontend built on the current dylibs"]
         ordered.append(uplift)

@@ -6,7 +6,7 @@ SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
-  - A built modules/target/debug/pill_editor_native.exe
+  - A built modules/target/debug/pill_editor.exe
   - examples/project_rs with its spline editor crate (the suite asks it for
     a game-channel log line and reloads the shell crate)
 

@@ -10,7 +10,7 @@ SETS: editor
 
 REQUIREMENTS
   - Windows, Python 3.8+
-  - A built modules/target/debug/pill_editor_native.exe
+  - A built modules/target/debug/pill_editor.exe
   - examples/project_rs (window scenarios), examples/italian_brainrot with
     its master-renderer scene (the view scenarios)
 

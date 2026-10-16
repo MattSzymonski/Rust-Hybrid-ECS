@@ -1,5 +1,5 @@
 [package]
-name = "editor"
+name = "pill_editor"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,66 +7,56 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-pill_host = { package = "pill_host", path = "../../hosting/pill_host", features = [
-    "rendering",
-] }
-pill_engine = { path = "../../pill_engine" }
-# The layout model and the editor's engine view, shared with the native editor.
-pill_editor_core = { path = "../pill_editor_core" }
 pill_core = { path = "../../pill_core" }
-# The gamepads, shared with the standalone frontend. Keyboard and mouse come
-# from the Scene panel's DOM events instead (`scene_input`).
-pill_input = { path = "../pill_input", features = ["gamepad"] }
-# The telemetry bootstrap every frontend shares.
-pill_runtime = { path = "../../hosting/pill_runtime" }
+# The `#[engine_error]` attribute behind this binary's error type.
 pill_core_macros = { path = "../../pill_core_macros" }
-dioxus = { version = "0.7", features = ["desktop"] }
-futures-util = "0.3"
-tokio = { version = "1", features = ["rt", "time"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# The engine's input event types this executable translates winit events
+# into, the same shared dylib `pill_input` maps into: frontends name the
+# core, never the `pill_engine` facade with its per-DLL registries.
+pill_engine_core = { path = "../../pill_engine_core" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
-
-[build-dependencies]
-pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
-
-[dev-dependencies]
-# The editor's unit tests hand-write tiny `impl Component` test doubles and
-# need `impl_trait_accessible!` to reach them through the engine's storage;
-# production code never touches this crate.
-# Inspector tests use the real renderer component field layouts, which are
-# plain data: no GPU renderer is needed to test them.
-pill_master_renderer_data = { path = "../../extensions/pill_master_renderer/pill_master_renderer_data" }
-
-[features]
-# Match a normal `cargo run` of pill_standalone: per-function hot patching is
-# on so the Systems tab's `hot_patchable` column is meaningful.
-default = ["hot_patch"]
-# Per-function hot patching, forwarded to the host. Implies `hot_reload`.
-hot_patch = ["pill_host/hot_patch"]
-# The editor is always windowed - its `pill_host` dependency above already
-# forces `rendering`. The feature exists so the editor can be selected as
-# `build_runner::apply_cargo_host_overrides`'s cargo anchor (dx hosts keep it)
-# with the same feature vocabulary every frontend names; a frontend that had
-# no `rendering` feature to name would break that selection.
-rendering = ["pill_host/rendering"]
-# Enable Tracy profiling through the shared telemetry stack.
-profiling = ["pill_host/profiling"]
-# Investigative fine-grained profiling zones.
-profiling-fine = ["pill_host/profiling-fine"]
-# Repeated numerical measurements through the shared metrics recorder.
-metrics = ["pill_host/metrics"]
-# Compile the simple developer log macros (`log!`, `warn!`, `error!`).
-dev-logs = ["pill_host/dev-logs"]
-
-# The engine's own native surface on Linux (`src/scene_window.rs`): a Wayland
-# subsurface on GDK's connection, or an X11 child window. All of these are
-# already in the build through tao and wgpu; the versions match theirs.
-[target.'cfg(target_os = "linux")'.dependencies]
-x11-dl = "2.21"
-raw-window-handle = "0.6"
-gtk = "0.18"
-wayland-client = { version = "0.31", features = ["system"] }
-wayland-backend = { version = "0.3", features = ["client_system"] }
+# What runs the game: the frame driver this executable's loop is written
+# against, for hosting the project and its extensions in every posture.
+pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
+# The development host: builds, loads, watches and hot-patches the project
+# and every extension, including the editor shell module. The editor has no
+# shipping posture yet (Stage 25 decides what a shipped editor is), so
+# unlike `pill_standalone` this dependency is unconditional.
+pill_host = { path = "../../hosting/pill_host", default-features = false, features = [
+    "hot_reload",
+    "hot_patch",
+    "rendering",
+] }
+# The window and event loop: only frontends link winit.
+winit = "0.30"
+# The composition overlay and the popup placement (Stage 21, D23/D24): the
+# DirectComposition device, target and visual that put the overlay above the
+# scene's child window, and the monitor work area the popups flip inside.
+# Pinned to the version wgpu-hal's DX12 backend uses, so the visual pointer
+# it takes and the one this crate hands it are the same COM interface. Only
+# this executable names the `windows` crate: its large raw-dylib import set
+# must never reach a shared dylib (AGENTS.md).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Gdi",
+] }
+# winit's keyboard and mouse events as engine input events, shared with the
+# standalone.
+pill_input = { path = "../pill_input", features = ["winit", "gamepad"] }
+# The editor's own renderer for its UI: the executable owns its wgpu device
+# and presents the editor with it (D8, D19). The same wgpu the renderer
+# module uses - a second version in one process would bring a second copy of
+# its global types.
+wgpu = "25.0.0"
+pill_ui = { path = "../../pill_ui" }
+pill_ui_wgpu = { path = "../../pill_ui_wgpu" }
+# Docking: the layout model, geometry and actions, shared with the shell
+# module through the same dylib the executable loads.
+pill_editor_core = { path = "../pill_editor_core" }
+# The shell boundary: the plain data the executable and the reloadable shell
+# module exchange through world resources. A shared dylib, like `pill_ui`,
+# so both sides agree on the resource types' identity.
+pill_editor_api = { path = "../../hosting/pill_editor_api" }

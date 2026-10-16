@@ -137,16 +137,16 @@ register_editor_panels(
 
 Inside a panel, `context` gives you the frame's data and the work channel:
 
-| You want | Use |
-| --- | --- |
-| Entities, systems, pause state, assets | `context.snapshot` fields |
-| The engine/game log ring | `context.logs` |
-| The shared selection | `context.selection` |
-| The panel's rectangle in logical pixels | `context.rect` |
-| Persistent per-widget text buffers | `context.text_buffers` (key by a stable string) |
-| Queue a command | `context.work.command("id")` |
-| Ask for a selection change | `context.work.select_entity(...)`, `select_asset(...)` |
-| Open a window, close one | see section 5 |
+| You want                                | Use                                                    |
+| --------------------------------------- | ------------------------------------------------------ |
+| Entities, systems, pause state, assets  | `context.snapshot` fields                              |
+| The engine/game log ring                | `context.logs`                                         |
+| The shared selection                    | `context.selection`                                    |
+| The panel's rectangle in logical pixels | `context.rect`                                         |
+| Persistent per-widget text buffers      | `context.text_buffers` (key by a stable string)        |
+| Queue a command                         | `context.work.command("id")`                           |
+| Ask for a selection change              | `context.work.select_entity(...)`, `select_asset(...)` |
+| Open a window, close one                | see section 5                                          |
 
 Panel content is a **plain-data tree** built fresh every frame through
 `PanelBuilder`: labels, headings, rows, columns, buttons, checkboxes,
@@ -370,7 +370,7 @@ and the project. The rules that keep that safe are not optional:
 - An end-to-end suite of your own joins the editor group by carrying
   `SETS: editor` in its docstring: `run_all.py --set editor` runs the whole
   set, and the gate's `editor` step (`verify.py --only editor`) runs it
-  right after building `pill_editor_native`, the order the suites need.
+  right after building `pill_editor`, the order the suites need.
 
 ## 10. Checklist for a new editor part
 

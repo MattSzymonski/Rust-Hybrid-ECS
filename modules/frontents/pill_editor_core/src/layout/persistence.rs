@@ -121,18 +121,18 @@ fn write_atomic(path: &Path, document: &[u8]) -> Result<(), LayoutPersistenceErr
     // Unix rename replaces atomically. Windows rename does not replace an
     // existing target, so retain the previous valid file as a short-lived
     // backup while installing the new document.
-    if std::fs::rename(&temporary, &path).is_err() {
+    if std::fs::rename(&temporary, path).is_err() {
         let _ = std::fs::remove_file(&backup);
         if path.exists() {
-            std::fs::rename(&path, &backup).map_err(|source| {
+            std::fs::rename(path, &backup).map_err(|source| {
                 LayoutPersistenceError::Filesystem {
                     path: backup.display().to_string(),
                     source,
                 }
             })?;
         }
-        if let Err(source) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::rename(&backup, &path);
+        if let Err(source) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::rename(&backup, path);
             return Err(LayoutPersistenceError::Filesystem {
                 path: path.display().to_string(),
                 source,

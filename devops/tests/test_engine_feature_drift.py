@@ -34,11 +34,11 @@ DESCRIPTION
     therefore measure the same builds, and the count is printed so a drop is
     visible.
 
-    The editor adds one thing to every spawned build: the cargo anchor
-    `build_runner::apply_cargo_host_overrides` keeps for dioxus hosts, which
-    selects the editor package itself (probed here with
-    `--no-default-features` and the host's `hot_patch`/`rendering`) so the
-    editor's host-side macro-graph unions are reproduced exactly.
+    The editor is an ordinary native frontend: it receives its engine features
+    explicitly, exactly like the standalone builders, because nothing in its
+    graph unions host-side macro features the way the retired dioxus editor's
+    macros did. The host keeps the anchor machinery for that retired posture
+    (`build_runner::apply_cargo_host_overrides`), but no frontend reaches it.
 
     Extensions are found by convention (every `extensions/<folder>/<crate>`
     crate); the projects are every example with both a `project_settings.yaml`
@@ -78,12 +78,10 @@ ENGINE_DYLIBS = ("pill_core", "pill_engine_core", "pill_ui", "pill_editor_core",
 # The host postures module and project builds run under: the host's own cargo
 # selection, and the engine features `build_runner::host_engine_features`
 # mirrors from that host (the engine-affecting features `pill_host` declares:
-# `hot_patch`, the profiling levels, `metrics`, `dev-logs`). The editor is the
-# one posture that keeps a cargo anchor (see
-# `build_runner::apply_cargo_host_overrides`): its macro graph unions host-side
-# features that cannot be enumerated, so its builds also select the editor
-# package, without its defaults and with the features the running host was
-# built with.
+# `hot_patch`, the profiling levels, `metrics`, `dev-logs`). No native
+# frontend keeps a cargo anchor since the dioxus editor retired; the anchor
+# slot stays in the shape so a posture that ever needs one is measured with
+# it (`build_runner::apply_cargo_host_overrides`).
 FRONTENDS = {
     "headless": (["--package", "pill_standalone"], ["pill_engine/hot_patch"], None),
     "headless reload-only": (
@@ -96,7 +94,7 @@ FRONTENDS = {
         ["pill_engine/hot_patch"],
         None,
     ),
-    "editor": (["--package", "editor"], ["pill_engine/hot_patch"], ("editor", ["hot_patch", "rendering"])),
+    "editor": (["--package", "pill_editor"], ["pill_engine/hot_patch"], None),
 }
 
 # One `cargo tree --prefix depth -f "{p}|{f}"` line: depth, package, features.
@@ -206,10 +204,11 @@ def engine_selection(engine_features):
     return ["--features", ",".join(engine_features)] if engine_features else []
 
 
-# The extra `--package`/`--features` editor hosts append to every build: the
-# cargo anchor `build_runner::apply_cargo_host_overrides` keeps for dioxus
-# hosts, without its defaults and with the features the running host was built
-# with. One helper, so the build shapes below cannot drift apart on it.
+# The extra `--package`/`--features` a posture appends to every build when it
+# keeps a cargo anchor (`build_runner::apply_cargo_host_overrides`), without
+# its defaults and with the features the running host was built with. One
+# helper, so the build shapes below cannot drift apart on it. No posture sets
+# one today; the dioxus editor was the last that did.
 def anchor_selection(anchor):
     if not anchor:
         return []
