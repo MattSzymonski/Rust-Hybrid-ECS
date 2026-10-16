@@ -1269,14 +1269,13 @@ pub fn paint_status_bar(
     state.ui.set_hit_rects(saved_hits);
 }
 
-/// The status bar's clock text: `HH:MM` in UTC, from the system clock. The
-/// minute is the finest resolution the redraw-on-change gate (D25) allows:
-/// a seconds-precision clock would repaint a quiet editor every second.
+/// The status bar's clock text: `HH:MM` in UTC, from the engine's platform
+/// clock ([`pill_core::platform::unix_time`], which works on native and on
+/// the web alike). The minute is the finest resolution the redraw-on-change
+/// gate (D25) allows: a seconds-precision clock would repaint a quiet editor
+/// every second.
 fn utc_clock_text() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
+    let seconds = pill_core::platform::clock::unix_time().as_secs();
     format!("{:02}:{:02}", (seconds / 3600) % 24, (seconds / 60) % 60)
 }
 
