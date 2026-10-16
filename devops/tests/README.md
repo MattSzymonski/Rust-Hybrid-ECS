@@ -1,5 +1,31 @@
 # devops/tests
 
+## Summary
+
+1. **What this is.** The automated testing pipeline: Python scripts that each check one thing about the engine and report pass or fail.
+2. **Two kinds of check.** Static scripts read sources in seconds; end-to-end suites start a real host and take minutes.
+3. **Real files.** The big suites edit real files and put them back afterwards - Ctrl+C is safe, a hard kill is not.
+4. **Logs are the verdict.** Suites read the host's log lines and wait for specific text to appear.
+5. **Kept honest.** Guard tests check that those log lines still exist in the Rust sources, and that every suite keeps its header.
+6. **Just what changed.** `check_relevant.py` runs only the checks your change needs.
+7. **In tiers.** `run_all.py` runs everything in order: static, host, editor, build.
+8. **Cheap first.** Static checks run before the slow suites, so a stale log token fails in seconds.
+9. **One at a time.** Suites queue on a host lock instead of clashing over the same files.
+10. **One, or all.** Any suite runs alone (`python devops/tests/test_...py`); `run_all.py` runs the whole set.
+11. **Manual checks.** A few suites need a real screen or mouse, so they never run by default.
+12. **Found, not listed.** A new `test_*.py` with a header joins the pipeline automatically.
+13. **Results.** Runs record under `.construction_site/runs/`; `run_all.py --catalogue` shows each suite's last result.
+14. **Agents wrap their runs.** An agent starts suites and gates through `agent_run.py`, which records the status, full log and notes under `.construction_site/runs/`.
+15. **Tagged for history.** Run tags (`--item`, `--check`) feed `work ingest` and `work checks`, so the check's recorded time is a median of real runs.
+16. **Timeouts always.** Agent-started runs carry a `--timeout`, so a wait on the wrong log text ends instead of hanging.
+17. **Scoped first for agents.** Agents use `check_relevant.py` while iterating and the full gate only at milestones - and after a failure they re-run the scoped selection, not the gate.
+18. **Lint before done.** `check_changed.py` formats and lints the changed Rust files before an agent calls work finished.
+19. **Keep out while it runs.** Don't edit a file a running suite owns - its restore would overwrite it. That applies to agents too.
+20. **Docs come from the suites.** The catalogue below is generated from each suite's own header (`--write-catalogue`).
+21. **Numbers live elsewhere.** Performance measurement is in `devops/benchmarks/`, not here.
+22. **The full gate.** `verify.py` runs this directory plus every other CI check - it is what CI calls.
+23. **Editor rule.** Build `pill_editor` right before its suites, with nothing in between.
+
 The pass/fail checks for Rust-Hybrid-ECS. Every script here asserts and
 returns a non-zero exit code on failure, and every script runs standalone
 from any working directory. Performance measurement lives in
@@ -14,9 +40,50 @@ The scripts fall into three kinds:
 | **Build and smoke checks** | Build a release, shipping or web binary and check that it runs.                                    | Build output only         |
 
 Most of this document is about the second kind, because it is the one that
-changes files in your working tree while it runs.
+changes files in your working tree while it runs. `run_all.py` orders the
+scripts by **tier** - `static`, then `host`, `editor`, then `build`, with the
+manual ones set aside - and that is the order they run in.
+
+## Contents
+
+- [Run only what your change needs](#run-only-what-your-change-needs)
+- [The suites themselves](#the-suites-themselves)
+- [Where they run in CI](#where-they-run-in-ci)
+- [How an end-to-end suite works](#how-an-end-to-end-suite-works)
+- [Files the suites edit](#files-the-suites-edit)
+- [Suite reference](#suite-reference)
+- [Writing a new end-to-end suite](#writing-a-new-end-to-end-suite)
+- [Gate matrix](#gate-matrix)
+- [Generated C# mirrors](#generated-c-mirrors)
+- [Known quirks](#known-quirks)
+- [Performance measurement](#performance-measurement)
 
 ## Running
+
+### Run only what your change needs
+
+`devops/ci_cd/check_relevant.py` is the inner loop. It diffs the working tree
+against `HEAD` (untracked files included), matches the paths against a rule
+table of repository areas, and runs only that area's checks: format and
+coding-standards on Rust changes, the area's cargo tests, the suites named for
+it, the goldens, and the few `verify.py` steps that guard it. A file no rule
+recognizes falls back to `verify.py --quick`, so no area passes unchecked, and
+an editor selection gets its `cargo build -p pill_editor` prepended
+automatically with the editor suites immediately after (see the ordering rule
+below).
+
+```powershell
+python devops/ci_cd/check_relevant.py --dry-run     # select and print, run nothing
+python devops/ci_cd/check_relevant.py               # run the selection
+python devops/ci_cd/check_relevant.py --paths modules/pill_ui/src/layout.rs
+python devops/ci_cd/check_relevant.py --list-rules  # the area table
+```
+
+The full gate (`python devops/ci_cd/verify.py`) and the full runs below are
+for stage boundaries and milestones. When a scoped selection fails, fix and
+re-run the selection, not the whole gate.
+
+### The suites themselves
 
 ```powershell
 # Every suite (manual ones aside), tier by tier, one PASS/FAIL summary at the end
@@ -37,10 +104,22 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 3
 ```
 
+Roughly how long runs take on the development machine (the catalogue below
+carries each suite's last recorded result):
+
+| Run                                                      | Roughly                        |
+| -------------------------------------------------------- | ------------------------------ |
+| The static tier                                          | seconds                        |
+| One editor suite                                         | 15 s to 190 s                  |
+| `cargo build -p pill_editor` + `run_all.py --set editor`  | ~10 min                        |
+| The hot-reload set (`run_hot_reload_tests.sh`)           | 15-20 min plus the first build |
+| The full gate (`verify.py`)                              | ~2 h                           |
+
 `run_all.py` finds the suites itself: every `test_*.py` here is one, and its
 docstring declares `PROTECTS:` (what it guards) and `TIER:` (`static`, `host`,
 `editor` or `build`), optionally `SETS:` (named groups) and `RUN: manual - <why>`
-(not run by default: it needs an argument or an unattended screen). A suite
+(not run by default: it needs an argument or an unattended screen;
+`--include-manual` picks it up when the machine allows). A suite
 without a valid tier stops `run_all.py` with a usage error, so a new suite
 cannot silently drop out of the run. Static suites run first, so a broken
 matcher or a reworded log line fails in seconds rather than twenty minutes in.
@@ -53,10 +132,15 @@ plus the first host build. `--timeout-scale` and `--skip-build` reach only the
 suites whose parser declares them, which is every suite built on
 `add_common_suite_arguments` in `devops/core/suite_common.py`.
 
-`verify.py`'s `editor` step carries that build order: it runs the two
-host-tier editor suites (they build a narrowed `pill_standalone`) first,
-builds `pill_editor`, and only then runs the suites tagged
-`SETS: editor` (`run_all.py --set editor`).
+**The editor ordering rule.** Any cargo build or test between
+`cargo build -p pill_editor` and the `SETS: editor` suites re-splits the
+shared dylibs under the built binary, and the editor then dies at process
+start (`0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`). Build the editor and run
+its suites immediately after, with nothing in between - or let
+`check_relevant.py` enforce the order for you. `verify.py`'s `editor` step
+encodes the same order: the two host-tier editor suites first (they build a
+narrowed `pill_standalone`), then `cargo build -p pill_editor`, then the
+`SETS: editor` suites (`run_all.py --set editor`).
 
 Common flags on the end-to-end suites:
 
@@ -77,7 +161,9 @@ When an agent runs a suite, it goes through `.agents/site/agent_run.py`
 | `nightly.yml`, 04:00 UTC           | Builds the windowed host, then the suites tagged `SETS: nightly` (failures fail the nightly) and `SETS: nightly-allowed-to-fail` (known drift, logged only), and the hot-reload benchmark. Logs are uploaded as an artifact.                                                                                                                                                                                                                                                                                                                    |
 
 Every other end-to-end suite is local only. Run the ones that cover the area
-you changed (see the reference below, or the `pill-run-and-reload` skill).
+you changed: `check_relevant.py` selects them from the change set, and the
+reference below (plus the `pill-run-and-reload` skill) maps areas to suites by
+hand.
 
 ## How an end-to-end suite works
 
@@ -171,6 +257,9 @@ runs. Every suite puts its files back when it finishes, including when it fails.
 | `test_wrapper_entry_points.py`      | Writes `modules/extensions/pill_dummy_color/generated/host_module_wrapper_probe/` (a generated-namespace crate)                                                                                                                                                                             | Deleted at the end unless `--keep-probe`; a host run prunes it as a stale wrapper too                             |
 | `test_web_smoke.py`                 | Regenerates `build/pill_shipping_bundle/`; writes `examples/master_renderer_test/build/web/`                                                                                                                                                                                                | The bundle is snapshotted and restored                                                                            |
 | `test_shipping_smoke.py`            | Regenerates `build/pill_shipping_bundle/` (gitignored)                                                                                                                                                                                                                                      | Not restored                                                                                                      |
+| `test_editor_recovery.py`           | Writes `local/editor-validation/recovery-<run id>/`, a `LOCALAPPDATA` sandbox per scenario                                                                                                                                                                                                  | Nothing tracked                                                                                                   |
+| `test_editor_viewports.py`          | Writes `local/editor-validation/viewports-<run id>/`, a `LOCALAPPDATA` sandbox per scenario                                                                                                                                                                                                 | Nothing tracked                                                                                                   |
+| `test_editor_drag_out.py`           | Writes `local/editor-validation/drag-out-<run id>/`; moves the real mouse (manual)                                                                                                                                                                                                           | Nothing tracked                                                                                                   |
 
 ### Edits and restores
 
@@ -344,12 +433,17 @@ with each suite's last recorded result from `.construction_site/runs/`.
   `test_*.py` here by itself and orders it by those, so there is no list to add
   it to. Add it to the table above by hand, or with
   `run_all.py --write-catalogue`.
+- If the suite guards a path no rule in `devops/ci_cd/check_relevant.py`
+  matches, add the area there (`area_checks` and `RULE_GLOBS` together, kept in
+  step), or the scoped selection falls back to the quick gate for it.
 
 ## Gate matrix
 
-The gates a change must keep green. Run them from `modules/`. The counts were
-measured on 2026-09-17; record what you actually measure and update a row in
-the same commit that changes it.
+The gates a change must keep green at stage boundaries and milestones. For
+iteration, `check_relevant.py` runs the subset the change actually needs (see
+[Run only what your change needs](#run-only-what-your-change-needs)). Run
+these from `modules/`. The counts were measured on 2026-09-17; record what you
+actually measure and update a row in the same commit that changes it.
 
 | Gate                      | Command                                                         | Expected         |
 | ------------------------- | --------------------------------------------------------------- | ---------------- |

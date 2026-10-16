@@ -1,0 +1,34 @@
+[package]
+name = "pill_editor_shell_egui_editor"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+# Named after the crate rather than `lib.rs`, like every extension crate.
+path = "src/pill_editor_shell_egui_editor.rs"
+# `rlib` only: the artifact an editor host loads is built by the generated
+# `host_module_pill_editor_shell_egui_editor` wrapper in this folder's
+# `generated/`.
+crate-type = ["rlib"]
+
+# The egui editor's shell: the docked UI the egui frontend shows, rebuilt
+# and swapped while the editor runs. An editor-only extension (the folder
+# holds only this crate): loaded by the egui editor, never by a game or by
+# the `pill_ui` editor (see the `editor_frontend` tag below).
+[dependencies]
+pill_core = { path = "../../../pill_core" }
+# The engine facade: the module ABI (`pill_module`), the hot attributes and
+# the system resource parameters.
+pill_engine = { path = "../../../pill_engine" }
+# The egui library: the context, the style and the boundary resources.
+pill_ui_egui = { path = "../../../pill_ui_egui" }
+# The model: the dock, the shared selection and the engine snapshots.
+pill_editor_core_egui = { path = "../../../frontents/pill_editor_core_egui" }
+
+[package.metadata.pill]
+# This shell builds the egui editor's UI; the `pill_ui` editor loads its own
+# shell instead (W-0017 Stage 6/7).
+editor_frontend = "egui"

@@ -787,3 +787,5 @@ mod tests {
         assert_eq!(fields, [("x", "f32", 0), ("y", "f32", 4), ("z", "f32", 8)]);
     }
 }
+
+// panels suite reload check

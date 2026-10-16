@@ -342,3 +342,5 @@ fn reseed_control_points(spline: &mut Spline) {
     }
     spline.control_point_count = MAX_CONTROL_POINTS as u32;
 }
+
+// panels suite window reload check
