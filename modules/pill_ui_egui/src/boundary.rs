@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - [`EguiShellInput`]: what the frontend writes for the shell each frame
-//!   (surface geometry, scale, focus, time).
+//!   (surface geometry, scale, focus, time, frame rate).
 //! - [`EguiShellFrame`]: what the shell hands back (tessellated meshes,
 //!   texture deltas, interaction state, cursor, clipboard), drained by the
 //!   frontend.
@@ -35,6 +35,8 @@ pub struct EguiShellInput {
     pub focused: bool,
     /// Seconds since the editor started, monotonic.
     pub time: f64,
+    /// The editor's smoothed frame rate, for the shell's overlays.
+    pub frames_per_second: f32,
 }
 
 impl Resource for EguiShellInput {}
@@ -46,6 +48,7 @@ impl Default for EguiShellInput {
             scale_factor: 1.0,
             focused: true,
             time: 0.0,
+            frames_per_second: 0.0,
         }
     }
 }

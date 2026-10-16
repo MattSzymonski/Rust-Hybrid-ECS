@@ -265,6 +265,7 @@ mod tests {
             scale_factor: 2.0,
             focused: true,
             time: 12.5,
+            frames_per_second: 117.0,
         };
         let raw = raw_input(&engine, &geometry);
         assert_eq!(

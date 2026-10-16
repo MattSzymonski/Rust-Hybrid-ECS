@@ -36,6 +36,17 @@ use pill_ui_egui::egui_dock::{DockArea, Style, TabViewer};
 /// behind the overlay shows around the viewport's edge.
 const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
+/// The scene's frame counter: its box in logical points, and the gap to the
+/// tab body's corner.
+const SCENE_COUNTER_WIDTH: f32 = 76.0;
+const SCENE_COUNTER_HEIGHT: f32 = 20.0;
+const SCENE_COUNTER_MARGIN: f32 = 8.0;
+
+/// The example button beside the counter: its width, and the gap between
+/// the two.
+const SCENE_BUTTON_WIDTH: f32 = 72.0;
+const SCENE_BUTTON_GAP: f32 = 6.0;
+
 /// The rows the Assets tab mocks, as (name, kind); the real panel arrives
 /// with the asset-store port.
 const MOCK_ASSETS: [(&str, &str); 6] = [
@@ -78,6 +89,7 @@ pub fn run_frame(
         snapshot,
         selection,
         scene_rect: None,
+        frames_per_second: shell_input.frames_per_second,
     };
     let output = context.run(raw_input, |context| {
         DockArea::new(state.dock.state_mut())
@@ -102,6 +114,8 @@ struct EditorTabViewer<'a> {
     /// The Scene tab's body rectangle this pass, in logical points; the
     /// frontend places the scene's child window at it.
     scene_rect: Option<ShellRect>,
+    /// The editor's smoothed frame rate, for the scene's counter.
+    frames_per_second: f32,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -113,7 +127,10 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         match tab {
-            EditorTab::Scene => self.scene_rect = Some(scene_body_rect(ui)),
+            EditorTab::Scene => {
+                self.scene_rect = Some(scene_body_rect(ui));
+                scene_overlay(ui, self.frames_per_second);
+            }
             EditorTab::Entities => entities_tab(ui, self.snapshot, self.selection),
             EditorTab::Systems => systems_tab(ui, self.snapshot),
             EditorTab::Assets => assets_tab(ui),
@@ -146,6 +163,61 @@ fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
         width: rect.width(),
         height: rect.height(),
     }
+}
+
+/// The Scene tab's overlay strip, anchored to the viewport's top-right
+/// corner: an example button and the frame counter. The overlay paints
+/// above the scene's child window, so both sit over the viewport, and both
+/// take input, so a click on either never reaches the project.
+fn scene_overlay(ui: &mut egui::Ui, frames_per_second: f32) {
+    let counter_rect = frame_counter_rect(ui);
+    let button_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            counter_rect.left() - SCENE_BUTTON_WIDTH - SCENE_BUTTON_GAP,
+            counter_rect.top(),
+        ),
+        egui::vec2(SCENE_BUTTON_WIDTH, SCENE_COUNTER_HEIGHT),
+    );
+    let button = ui.put(
+        button_rect,
+        egui::Button::new("Example").min_size(button_rect.size()),
+    );
+    if button.clicked() {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            "[editor] example button clicked"
+        );
+    }
+    // The counter is painted rather than laid out, so it costs the tab body
+    // no layout space; its rectangle still senses clicks.
+    let _ = ui.interact(
+        counter_rect,
+        ui.id().with("scene_frame_counter"),
+        egui::Sense::click(),
+    );
+    ui.painter().rect_filled(
+        counter_rect,
+        egui::CornerRadius::same(4),
+        egui::Color32::from_black_alpha(179),
+    );
+    ui.painter().text(
+        counter_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        format!("{frames_per_second:.0} fps"),
+        egui::FontId::monospace(12.0),
+        ui.visuals().strong_text_color(),
+    );
+}
+
+/// The frame counter's rectangle: the strip's right-anchored box.
+fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            ui.max_rect().right() - SCENE_COUNTER_WIDTH - SCENE_COUNTER_MARGIN,
+            ui.max_rect().top() + SCENE_COUNTER_MARGIN,
+        ),
+        egui::vec2(SCENE_COUNTER_WIDTH, SCENE_COUNTER_HEIGHT),
+    )
 }
 
 /// One row per live entity: the entity and its label, for the Entities tab.
@@ -274,6 +346,7 @@ mod tests {
                 entities_tab(ui, &snapshot, &mut selection);
                 systems_tab(ui, &snapshot);
                 assets_tab(ui);
+                scene_overlay(ui, 120.0);
             });
         });
     }
