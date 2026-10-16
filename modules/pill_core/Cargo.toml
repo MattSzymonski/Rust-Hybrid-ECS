@@ -25,7 +25,8 @@ libloading = "0.8"
 notify = "6"
 # `FixedString64` serializes through `#[serde(into/from)]`; glam pulls serde
 # in already, but naming it here is what lets this crate's own types derive.
-serde = { version = "1", features = ["alloc", "derive"] }
+# `rc` is part of the feature pin below (the egui editor's stack turns it on).
+serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive", "fancy"] }
@@ -75,9 +76,10 @@ metrics = { version = "0.24", optional = true }
 # does not need the renderer crates in its own graph. None of these crates is
 # used directly. Measured with `local/temp/pill_core_feature_union.py`; extend
 # the list if a new module adds a feature to pill_core's tree. The editor is
-# the other source: its dioxus graph unions `either/std`, `proc-macro2`'s
-# `span-locations`, `syn`'s `full`+`visit-mut`, `time/macros` and `serde`'s
-# `alloc`.
+# the other source: the egui editor's stack (W-0017) unions `serde`'s `rc`,
+# `ahash`'s `no-rng`+`serde` and `ttf-parser`'s `gvar-alloc`; the retired
+# dioxus editor used to union `either/std`, `proc-macro2`'s `span-locations`,
+# `syn`'s `full`+`visit-mut` and `time/macros`, which stay pinned.
 bytemuck = { version = "1", features = [
     "aarch64_simd",
     "derive",
@@ -85,6 +87,7 @@ bytemuck = { version = "1", features = [
     "min_const_generics",
     "wasm_simd",
 ] }
+ahash = { version = "0.8", features = ["no-rng", "serde"] }
 crossbeam-utils = "0.8"
 either = { version = "1", features = ["std", "use_std"] }
 libm = { version = "0.2", features = ["arch"] }
@@ -102,6 +105,7 @@ smallvec = { version = "1", features = [
 ] }
 syn = { version = "3", features = ["full", "visit-mut"] }
 time = { version = "0.3", features = ["macros"] }
+ttf-parser = { version = "0.25", features = ["gvar-alloc", "no-std-float"] }
 
 # Three `windows-sys` pins (0.59, 0.60, 0.61) stood here until 2026-10-06;
 # they are gone for cost, not for drift: `test_engine_feature_drift.py` passes

@@ -33,6 +33,10 @@ pill_core = { path = "../pill_core" }
 # type used here (`Input`, `InputEvent`, `Asset`, `World`, ...) is the
 # core's, re-exported by the facade under the same paths.
 pill_engine_core = { path = "../pill_engine_core" }
+# The plain draw data this crate produces and the renderer contract carries
+# (`RenderFrame.ui`): moved out of this crate so the contract can name the
+# frame's UI type without depending on the UI library (W-0032).
+pill_draw = { path = "../pill_draw" }
 # Text shaping, line breaking and rasterization (plan decision D6). Defaults
 # off: the crate's `fontconfig`/`sys-locale` defaults serve its own automatic
 # FontSystem setup, which `pill_ui` replaces with its own font database (the

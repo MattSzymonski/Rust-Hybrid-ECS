@@ -7,6 +7,11 @@ members = [
     "pill_engine_macros",
     "pill_core",
     "pill_core_macros",
+    # The plain draw data the UI library produces and the renderer contract
+    # shares (`pill_renderer_api::RenderFrame.ui`): one shared dylib, so the
+    # frame's UI type has one identity across every artifact that builds or
+    # draws it (W-0032).
+    "pill_draw",
     # The UI library: one shared dylib for the editor, module tools and
     # immediate-mode in-game/debug UI (plan decision D17).
     "pill_ui",
