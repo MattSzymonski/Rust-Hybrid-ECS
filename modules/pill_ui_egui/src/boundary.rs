@@ -53,6 +53,10 @@ impl Default for EguiShellInput {
     }
 }
 
+/// The scene viewports the shell and the frontend share: one per scene
+/// tab, so two today.
+pub const SCENE_VIEWPORTS: usize = 2;
+
 /// A logical-pixel rectangle crossing the boundary (IME placement).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ShellRect {
@@ -64,6 +68,13 @@ pub struct ShellRect {
     pub width: f32,
     /// Extent along y.
     pub height: f32,
+}
+
+impl ShellRect {
+    /// Whether a logical point lies inside the rectangle, edges included.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
+    }
 }
 
 /// One frame of egui output, as plain data.
@@ -83,10 +94,15 @@ pub struct EguiShellFrame {
     pub cursor_icon: CursorIcon,
     /// Text egui asked to copy to the clipboard.
     pub clipboard_text: Option<String>,
-    /// The scene tab's body rectangle (logical points), when the shell
-    /// shows a scene tab: the frontend places the scene's child window
-    /// here, so the viewport follows the dock layout.
-    pub scene_rect: Option<ShellRect>,
+    /// The scene viewports' body rectangles (logical points), one slot per
+    /// scene tab: the frontend places the slot's child window here, so each
+    /// viewport follows the dock layout. A slot the shell leaves `None`
+    /// hides that viewport's window - its tab is not shown.
+    pub scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
+    /// The overlay's opaque chips this pass (logical points): a click
+    /// inside one over a scene viewport is the UI's, not the scene's, so
+    /// the frontend routes it without asking the scene what is under it.
+    pub overlay_regions: Vec<ShellRect>,
     /// IME composition should be enabled.
     pub ime_allowed: bool,
     /// Where the IME candidate window should appear, logical points.
@@ -105,7 +121,8 @@ impl Default for EguiShellFrame {
             wants_keyboard: false,
             cursor_icon: CursorIcon::Default,
             clipboard_text: None,
-            scene_rect: None,
+            scene_rects: [None; SCENE_VIEWPORTS],
+            overlay_regions: Vec::new(),
             ime_allowed: false,
             ime_rect: None,
         }
@@ -140,9 +157,11 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         wants_keyboard,
         cursor_icon: platform.cursor_icon,
         clipboard_text,
-        // The shell fills the scene rectangle after its dock pass runs;
+        // The shell fills the scene rectangles after its dock pass runs;
         // `frame_from_output` only knows egui's own output.
-        scene_rect: None,
+        scene_rects: [None; SCENE_VIEWPORTS],
+        // Same for the overlay chips: the shell records them as it draws.
+        overlay_regions: Vec::new(),
         // The engine reports IME composition in its input events; the
         // candidate window follows the text field egui focuses, which the
         // frontend reads off the frame's focus state for now.
@@ -171,6 +190,22 @@ mod tests {
             .iter()
             .all(|clipped| matches!(clipped.primitive, egui::epaint::Primitive::Mesh(_))));
         assert!(frame.pixels_per_point > 0.0);
+        assert!(frame.overlay_regions.is_empty());
+    }
+
+    #[test]
+    fn a_shell_rect_contains_its_edges() {
+        let rect = ShellRect {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+        };
+        assert!(rect.contains(10.0, 20.0));
+        assert!(rect.contains(110.0, 70.0));
+        assert!(rect.contains(60.0, 45.0));
+        assert!(!rect.contains(9.9, 45.0));
+        assert!(!rect.contains(60.0, 70.1));
     }
 
     #[test]
