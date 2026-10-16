@@ -153,15 +153,23 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(verify_check("coding-standards", "Rust files changed"))
 
     # pill_ui: the shared UI dylib. Unit tests always; the goldens and the
-    # GPU-side compile check when painting or the backend contract could move;
-    # the host-side pill_ui suite checks the single-dylib identity.
+    # GPU-side compile check when drawing could move (layout and text
+    # metrics included: the button-sizing regression lived in layout.rs and
+    # changed widgets.png, which the old painting-files-only trigger would
+    # have missed); one broad editor suite because pill_ui is what the
+    # editor draws, and its panels and dialogs are where a layout change
+    # shows first (the Assets toolbar and the create dialog). The editor
+    # gate covers the remaining suites at milestones; the host-side pill_ui
+    # suite checks the single-dylib identity.
     matched = has("modules/pill_ui/**")
     if matched:
         selected.append(cargo_check("test pill_ui", ("test", "-p", "pill_ui", "--offline"), "pill_ui changed"))
         selected.append(suite_check("test_pill_ui.py", "pill_ui changed"))
-        if has("modules/pill_ui/src/paint.rs", "modules/pill_ui/src/draw.rs", "modules/pill_ui/src/theme.rs",
-               "modules/pill_ui/src/css/**", "modules/pill_ui/assets/**"):
-            selected.append(golden_check("pill_ui painting changed"))
+        if has("modules/pill_ui/src/**", "modules/pill_ui/assets/**"):
+            selected.append(golden_check("pill_ui drawing changed"))
+        if has("modules/pill_ui/src/layout.rs", "modules/pill_ui/src/panel.rs", "modules/pill_ui/src/text.rs"):
+            selected.append(suite_check("test_editor_builtin_panels.py",
+                                        "pill_ui layout is editor-visible"))
         if has("modules/pill_ui/src/css/**", "modules/pill_ui/src/context.rs", "modules/pill_ui/src/frame.rs"):
             selected.append(verify_check("check-hot-patch", "pill_ui API surface changed"))
 

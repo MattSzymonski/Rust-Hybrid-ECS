@@ -108,12 +108,17 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// host that does not itself map it (the renderer standalone running the
 /// editor crates) must find it staged beside the module - a mapped copy wins
 /// by basename and makes the staging a no-op where the executable links it.
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 5] = [
+/// `pill_ui_egui` and `pill_editor_core_egui` are the egui editor's copies of
+/// `pill_ui` and `pill_editor_core` (W-0017). Its frontend and shell will
+/// exchange their types the same way, so they get the same treatment.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 7] = [
     "pill_core",
     "pill_engine_core",
     "pill_ui",
     "pill_editor_core",
     "pill_editor_api",
+    "pill_ui_egui",
+    "pill_editor_core_egui",
 ];
 
 /// Whether a module build produced engine dylibs different from the ones the

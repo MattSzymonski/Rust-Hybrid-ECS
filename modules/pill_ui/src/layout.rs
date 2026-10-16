@@ -30,7 +30,7 @@ use taffy::prelude::{
     AvailableSpace, Dimension, Display, FlexDirection, JustifyContent, LengthPercentage,
     LengthPercentageAuto, NodeId, Size as TaffySize, Style, TaffyTree,
 };
-use taffy::{AlignItems, BoxSizing, Overflow, Point, Position, Rect as TaffyRect};
+use taffy::{AlignItems, BoxSizing, FlexWrap, Overflow, Point, Position, Rect as TaffyRect};
 
 // Current crate
 use crate::css::parse::{
@@ -522,6 +522,23 @@ fn build_node(
             order.push(id);
             id
         }
+        PanelNode::Button { label, .. } => {
+            // A button sizes to its own label: painting centres the text
+            // and clips it to the box, so a box narrower than its label
+            // shows the label's middle letters (`Create Asset...` read
+            // `ate`). The style is the painter's own (`Look::label_style`
+            // equals `text_style` for a widget), and a button never wraps.
+            let context = TextMeasure {
+                text: label.clone(),
+                style: text_style(node, theme, css),
+                wrap: false,
+            };
+            let id = taffy
+                .new_leaf_with_context(style, context)
+                .expect("leaf creation");
+            order.push(id);
+            id
+        }
         _ => {
             let id = taffy.new_leaf(style).expect("leaf creation");
             order.push(id);
@@ -601,10 +618,15 @@ fn node_style(
 
     let item = Dimension::length(theme.item_height);
     match node {
-        PanelNode::Row { .. } => {
+        PanelNode::Row { wrap, .. } => {
             style.display = Display::Flex;
             style.flex_direction = FlexDirection::Row;
             style.align_items = Some(AlignItems::CENTER);
+            if *wrap {
+                // A toolbar in a narrow panel flows onto a further line
+                // instead of clipping its last buttons away.
+                style.flex_wrap = FlexWrap::Wrap;
+            }
         }
         PanelNode::Column { .. } => {
             style.display = Display::Flex;
@@ -1026,6 +1048,126 @@ mod tests {
             &mut previous_right,
         );
         assert_eq!(index, layout.rects.len(), "walk visited every node");
+    }
+
+    #[test]
+    fn a_buttons_label_fits_its_rect() {
+        // The create-asset dialog builds one labelled button per asset type
+        // inside a row; the Assets toolbar does the same. A button box
+        // narrower than its own label clips it to its middle letters (the
+        // "Create Asset..." button showed "ate"), so a button must never
+        // measure smaller than the text it paints.
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let theme = Theme::default();
+        let mut sheet = Stylesheet::parse(crate::DEFAULT_SHEET);
+        state.input.begin_frame();
+        let (output, layout) = run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            ctrl(420.0, 320.0),
+            |ui| {
+                ui.label("In res");
+                ui.separator();
+                for index in 0..2 {
+                    ui.row(|row| {
+                        row.button_named(&format!("create.type.{index}"), "Material (.material)");
+                    });
+                }
+                ui.separator();
+                let mut name = String::new();
+                ui.text_field("create.name", &mut name);
+            },
+        );
+        fn walk(
+            node: &PanelNode,
+            index: &mut usize,
+            layout: &PanelLayout,
+            text: &mut TextSystem,
+            theme: &Theme,
+        ) {
+            let rect = layout.rects[*index];
+            if let PanelNode::Button { label, .. } = node {
+                let style = text_style(node, theme, &layout.styles[*index]);
+                let measured = text.measure(label, &style, None);
+                assert!(
+                    rect.width() + 0.01 >= measured.x,
+                    "button {label:?} clips: rect width={} but the text measures {}",
+                    rect.width(),
+                    measured.x
+                );
+            }
+            *index += 1;
+            for child in node.children() {
+                walk(child, index, layout, text, theme);
+            }
+        }
+        let mut index = 0usize;
+        walk(&output.tree.root, &mut index, &layout, &mut text, &theme);
+        assert_eq!(index, layout.rects.len(), "walk visited every node");
+    }
+
+    #[test]
+    fn a_wrapped_row_keeps_its_last_button_reachable() {
+        // The Assets toolbar in a 254px panel: without wrapping the fourth
+        // button sits past the panel's clip and has no hit rectangle at
+        // all, so the scripted channel cannot activate it and neither can
+        // a person click it.
+        let mut state = UiState::new();
+        let mut text = text_system();
+        let theme = Theme::default();
+        let mut sheet = Stylesheet::parse(crate::DEFAULT_SHEET);
+        let labels = [
+            "Create Asset...",
+            "Delete Asset",
+            "Rename Asset...",
+            "Write Asset Meta",
+        ];
+        state.input.begin_frame();
+        let (output, layout) = run_frame(
+            &mut state,
+            &mut text,
+            &theme,
+            &mut sheet,
+            ctrl(254.0, 300.0),
+            |ui| {
+                ui.row_wrapped(|row| {
+                    for label in labels {
+                        row.button(label);
+                    }
+                });
+            },
+        );
+        fn walk(node: &PanelNode, index: &mut usize, layout: &PanelLayout, buttons: &mut usize) {
+            let rect = layout.rects[*index];
+            if let PanelNode::Button { id, label, .. } = node {
+                let hit = layout
+                    .interactive
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{label} has a hit rectangle"));
+                assert!(
+                    hit.min.x >= -0.01 && hit.max.x <= 254.0 + 0.01,
+                    "{label} overflows the panel: {hit:?}"
+                );
+                *buttons += 1;
+            }
+            *index += 1;
+            for child in node.children() {
+                walk(child, index, layout, buttons);
+            }
+        }
+        let mut index = 0usize;
+        let mut buttons = 0usize;
+        walk(&output.tree.root, &mut index, &layout, &mut buttons);
+        assert_eq!(buttons, labels.len(), "every button was visited");
+        // Preorder: the root column, then the row that carries the buttons.
+        let row_height = layout.rects[1].height();
+        assert!(
+            row_height > theme.item_height * 1.5,
+            "the toolbar wrapped onto more than one line: height={row_height}"
+        );
     }
 
     #[test]

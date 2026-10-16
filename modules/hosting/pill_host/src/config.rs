@@ -121,6 +121,12 @@ const GENERATED_DIRECTORY: &str = "generated";
 /// loads (after the folder's runtime crates) and no other build ever sees.
 pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 
+/// The editor frontend the `pill_ui` editor and the standalone's editor
+/// posture report as. An editor crate tagged with another name (see
+/// `declared_editor_frontend`) loads only under that other frontend
+/// (W-0017 Stage 6).
+pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "pill_ui";
+
 /// Workspace-relative directory holding the generated project member.
 ///
 /// Projects live outside the workspace, so the member that builds one as part
@@ -764,7 +770,7 @@ impl HostConfig {
     /// configuration cannot be derived, the project settings file is missing
     /// or cannot be read/parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        Self::from_environment_in_posture(false)
+        Self::from_environment_in_posture(false, DEFAULT_EDITOR_FRONTEND)
     }
 
     /// [`Self::from_environment`] for an editor host: the extensions'
@@ -774,12 +780,31 @@ impl HostConfig {
     ///
     /// As [`Self::from_environment`].
     pub fn from_environment_for_editor() -> Result<Self, ConfigError> {
-        Self::from_environment_in_posture(true)
+        Self::from_environment_in_posture(true, DEFAULT_EDITOR_FRONTEND)
+    }
+
+    /// [`Self::from_environment_for_editor`] for a named editor frontend:
+    /// editor crates load, and one whose manifest declares
+    /// `[package.metadata.pill] editor_frontend = "<name>"` loads only when
+    /// that name is this host's (W-0017 Stage 6). Untagged editor crates
+    /// load under every editor frontend.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_environment`].
+    pub fn from_environment_for_editor_frontend(
+        editor_frontend: &str,
+    ) -> Result<Self, ConfigError> {
+        Self::from_environment_in_posture(true, editor_frontend)
     }
 
     /// The configuration of either posture; `load_editor_crates` selects the
-    /// editor one.
-    fn from_environment_in_posture(load_editor_crates: bool) -> Result<Self, ConfigError> {
+    /// editor one and `editor_frontend` names this host's editor frontend for
+    /// the editor-crate tag convention (`resolve_editor_crates`).
+    fn from_environment_in_posture(
+        load_editor_crates: bool,
+        editor_frontend: &str,
+    ) -> Result<Self, ConfigError> {
         // Step 1: Resolve the project from the PROJECT_PATH environment
         // variable; there is no other source for it.
         let project_path = required_environment(PROJECT_PATH_ENVIRONMENT_VARIABLE)?;
@@ -848,7 +873,7 @@ impl HostConfig {
                 }
             }
             let (editor_crates, editor_only) =
-                Self::resolve_editor_crates(&runtime_folders, &extensions_root);
+                Self::resolve_editor_crates(&runtime_folders, &extensions_root, editor_frontend);
             extensions.extend(editor_crates);
             // The editor-only modules may fail their first load without
             // taking the editor down; the embedder surfaces the errors and
@@ -1005,18 +1030,48 @@ impl HostConfig {
     fn resolve_editor_crates(
         runtime_folders: &[String],
         extensions_root: &Path,
+        editor_frontend: &str,
     ) -> (Vec<ExtensionConfig>, Vec<String>) {
         let editor_crate_of = |folder: &str| format!("{folder}{EDITOR_CRATE_SUFFIX}");
-        let has_editor_crate = |folder: &str| {
-            extensions_root
-                .join(folder)
-                .join(editor_crate_of(folder))
-                .join("Cargo.toml")
-                .is_file()
+        // The editor frontend a crate's manifest tags itself for, if any:
+        // `editor_frontend = "<name>"` in the `[package.metadata.pill]`
+        // table (W-0017 Stage 6). Text-scanned rather than parsed so the
+        // host gains no TOML dependency for one string.
+        let declared_frontend = |directory: &Path| -> Option<String> {
+            let manifest = std::fs::read_to_string(directory.join("Cargo.toml")).ok()?;
+            let mut in_pill_metadata = false;
+            for line in manifest.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') {
+                    in_pill_metadata = trimmed == "[package.metadata.pill]";
+                    continue;
+                }
+                if !in_pill_metadata {
+                    continue;
+                }
+                let Some(rest) = trimmed.strip_prefix("editor_frontend") else {
+                    continue;
+                };
+                let value = rest.split_once('=')?.1.trim();
+                return Some(value.trim_matches('"').to_string());
+            }
+            None
+        };
+        // A crate tagged for another editor frontend stays out; an untagged
+        // one loads under every editor frontend.
+        let loads_editor_crate = |folder: &str| {
+            let directory = extensions_root.join(folder).join(editor_crate_of(folder));
+            if !directory.join("Cargo.toml").is_file() {
+                return false;
+            }
+            match declared_frontend(&directory) {
+                Some(declared) => declared == editor_frontend,
+                None => true,
+            }
         };
         let mut folders: Vec<String> = Vec::new();
         for folder in runtime_folders {
-            if !folders.contains(folder) && has_editor_crate(folder) {
+            if !folders.contains(folder) && loads_editor_crate(folder) {
                 folders.push(folder.clone());
             }
         }
@@ -1036,7 +1091,7 @@ impl HostConfig {
             if folder.starts_with('_') || folder == "rendering" || folders.contains(&folder) {
                 continue;
             }
-            if !has_editor_crate(&folder) {
+            if !loads_editor_crate(&folder) {
                 continue;
             }
             let editor_crate = editor_crate_of(&folder);
@@ -2437,6 +2492,7 @@ serde = { version = "1", features = ["derive"] }
         let (resolved, editor_only) = HostConfig::resolve_editor_crates(
             &["pill_audio".to_string(), "pill_spline".to_string()],
             &root,
+            "pill_ui",
         );
         let names: Vec<&str> = resolved
             .iter()
@@ -2457,7 +2513,7 @@ serde = { version = "1", features = ["derive"] }
         );
 
         let (none, none_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root);
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "pill_ui");
         assert_eq!(
             none.iter()
                 .map(|crate_config| crate_config.name.as_str())
@@ -2466,6 +2522,31 @@ serde = { version = "1", features = ["derive"] }
             "only the editor-only folder loads when no loaded folder has an editor crate"
         );
         assert_eq!(none_optional, ["pill_editor_shell_editor"]);
+
+        // A crate tagged for another editor frontend stays out of this
+        // frontend's editor crates and loads under its own (W-0017 Stage 6).
+        let tagged = root
+            .join("pill_editor_shell")
+            .join("pill_editor_shell_editor")
+            .join("Cargo.toml");
+        let mut manifest = std::fs::read_to_string(&tagged).expect("seeded manifest");
+        manifest.push_str("\n[package.metadata.pill]\neditor_frontend = \"egui\"\n");
+        std::fs::write(&tagged, manifest).expect("tag the manifest");
+        let (untagged_frontend, untagged_optional) =
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "pill_ui");
+        assert!(untagged_frontend.is_empty());
+        assert!(untagged_optional.is_empty());
+        let (tagged_frontend, tagged_optional) =
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "egui");
+        assert_eq!(
+            tagged_frontend
+                .iter()
+                .map(|crate_config| crate_config.name.as_str())
+                .collect::<Vec<_>>(),
+            ["pill_editor_shell_editor"],
+            "the tagged crate loads under its own frontend"
+        );
+        assert_eq!(tagged_optional, ["pill_editor_shell_editor"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

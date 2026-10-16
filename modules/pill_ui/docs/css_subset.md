@@ -31,17 +31,17 @@ The two sheets shipped today:
 
 ## Selectors
 
-| Syntax | Meaning |
-| --- | --- |
-| `type` | The node's type: `row`, `column`, `label`, `heading`, `separator`, `image`, `button`, `checkbox`, `slider`, `drag-value`, `text-field`, `combo-box`, `color-field`, `vector-field`, `collapsing`, `scroll-area`, `table`, `tree-row` |
-| `.class` | A class attached with `ui.class("...")` (applies to the next widget or group) |
-| `#name` | The name the widget was built with (`ui.button("Bake")` is `#Bake`; containers are named by their group) |
-| `a b` | Descendant: `b` anywhere inside `a` |
-| `a > b` | Child: `b` a direct child of `a` |
-| `a, b` | Either selector |
-| `*` | Anything |
-| `:hover` `:active` `:focus-visible` `:disabled` | The widget's state, from the frame's input and the widget's `enabled` flag |
-| `:root` | The variable scope - `:root { --x: ...; }`; matches no widget |
+| Syntax                                          | Meaning                                                                                                                                                                                                                              |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `type`                                          | The node's type: `row`, `column`, `label`, `heading`, `separator`, `image`, `button`, `checkbox`, `slider`, `drag-value`, `text-field`, `combo-box`, `color-field`, `vector-field`, `collapsing`, `scroll-area`, `table`, `tree-row` |
+| `.class`                                        | A class attached with `ui.class("...")` (applies to the next widget or group)                                                                                                                                                        |
+| `#name`                                         | The name the widget was built with (`ui.button("Bake")` is `#Bake`; containers are named by their group)                                                                                                                             |
+| `a b`                                           | Descendant: `b` anywhere inside `a`                                                                                                                                                                                                  |
+| `a > b`                                         | Child: `b` a direct child of `a`                                                                                                                                                                                                     |
+| `a, b`                                          | Either selector                                                                                                                                                                                                                      |
+| `*`                                             | Anything                                                                                                                                                                                                                             |
+| `:hover` `:active` `:focus-visible` `:disabled` | The widget's state, from the frame's input and the widget's `enabled` flag                                                                                                                                                           |
+| `:root`                                         | The variable scope - `:root { --x: ...; }`; matches no widget                                                                                                                                                                        |
 
 Specificity is (ids, classes-and-pseudos, types); `!important` beats it.
 Later rules win ties. Not in the subset: attribute selectors (`[...]`),

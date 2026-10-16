@@ -2148,7 +2148,10 @@ fn assets_panel(
     let mut delete = false;
     let mut rename = false;
     let mut write_meta = false;
-    builder.row(|row| {
+    // Wrapped (Stage 34 follow-up): the four buttons do not fit a narrow
+    // Assets panel on one line, and a clipped button has no hit rectangle
+    // at all - not even the scripted channel can reach it.
+    builder.row_wrapped(|row| {
         create = row.button("Create Asset...");
         if selected_is_file {
             delete = row.button("Delete Asset");

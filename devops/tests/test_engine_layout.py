@@ -32,11 +32,12 @@ DESCRIPTION
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
       4. shared UI    - each UI-independent shared dylib (`pill_editor_core`,
-                        and `pill_ui` once it exists) is built as a `dylib`
-                        (one copy per process) and links no UI framework,
-                        window system or GPU crate (`dioxus`, `tao`, `wry`,
-                        `winit`, `wgpu`), followed through every path
-                        dependency.
+                        `pill_ui` and the egui editor's copies of the two,
+                        `pill_editor_core_egui` and `pill_ui_egui`) is built
+                        as a `dylib` (one copy per process) and links no UI
+                        framework, window system or GPU crate (`dioxus`,
+                        `tao`, `wry`, `winit`, `wgpu`), followed through
+                        every path dependency.
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -76,6 +77,9 @@ REGISTRY_PATH_PREFIX = "inventory::"
 SHARED_UI_INDEPENDENT_DYLIBS = (
     ("pill_editor_core", "frontents/pill_editor_core"),
     ("pill_ui", "pill_ui"),
+    # The egui editor's copies (W-0017): one shared dylib each, same rule.
+    ("pill_editor_core_egui", "frontents/pill_editor_core_egui"),
+    ("pill_ui_egui", "pill_ui_egui"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 

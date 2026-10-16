@@ -28,6 +28,11 @@ DESCRIPTION
       4. import groups   - the `// Standard library`, `// External crates` and
                            `// Current crate` headers appear in that order.
       5. tests at bottom - no new top-level section starts after `mod tests`.
+      6. egui state     - a reloadable crate (`extensions/**`, `examples/**`)
+                          never stores its own types or callbacks inside
+                          egui's `Context` (plan decision E4, W-0017): no
+                          `data`/`data_mut`, repaint callbacks, plugin
+                          callbacks or `PaintCallback` shapes.
 
     The two window sizes are tunable through the environment, matching the
     shell version: `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES`
@@ -35,13 +40,14 @@ DESCRIPTION
 
 USAGE
   python devops/tests/test_coding_standards.py [--root <path>] [--list]
-                                              [--report <path>]
+                                              [--self-test] [--report <path>]
                                               [--exclude <path>]...
   python devops/tests/test_coding_standards.py <path/to/file.rs | path/to/dir> ...
 
 EXAMPLE USAGE
   python devops/tests/test_coding_standards.py
   python devops/tests/test_coding_standards.py --list
+  python devops/tests/test_coding_standards.py --self-test
   python devops/tests/test_coding_standards.py --root modules/pill_engine/src
   python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs
   python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs \
@@ -149,6 +155,22 @@ IMPORT_GROUP_HEADERS = (
 
 # A `mod tests` inside a file this short is not worth flagging.
 TESTS_PLACEMENT_MINIMUM_LINES = 20
+
+# The APIs that keep boxed `Any`/`Fn` values inside egui's `Context` (plan
+# decision E4, W-0017). A reloadable crate that stores its own types or
+# callbacks through them leaves dangling type IDs, drop code and vtables
+# behind after a reload, so the egui shell keeps its long-lived state in a
+# world resource instead; the contract is documented in `pill_ui_egui`'s
+# crate docs. The patterns are dot-prefixed so an unrelated `metadata::<`,
+# turbofish cannot trip the `data` rule.
+EGUI_CONTEXT_STORAGE_PATTERNS = (
+    (re.compile(r"\.data_mut::<"), "stores a type in egui's Context (IdTypeMap)"),
+    (re.compile(r"\.data::<"), "reads a type from egui's Context (IdTypeMap)"),
+    (re.compile(r"\.set_request_repaint_callback"), "stores a callback in egui's Context"),
+    (re.compile(r"\.on_begin_pass"), "installs an egui plugin callback"),
+    (re.compile(r"\.on_end_pass"), "installs an egui plugin callback"),
+    (re.compile(r"PaintCallback"), "paints a callback shape carrying user data"),
+)
 
 
 # =============================================================================
@@ -477,6 +499,105 @@ def check_tests_at_bottom(
 
 
 # =============================================================================
+# Check 6/6 - no egui context storage in reloadable crates
+# =============================================================================
+
+
+# Whether a display path belongs to a crate that reloads while it runs:
+# extension crates and example projects do; the engine, the hosts and the
+# editor frontends do not.
+def is_reloadable_source(display_path: str) -> bool:
+    """Whether the egui-storage rule applies to this path."""
+    parts = display_path.split("/")
+    return "extensions" in parts or "examples" in parts
+
+
+# Flags the egui context-storage APIs; see `EGUI_CONTEXT_STORAGE_PATTERNS`.
+def check_egui_context_storage(
+    lines: List[str], display_path: str, collector: ViolationCollector
+) -> None:
+    """Flags egui context-storage APIs in crates that reload at runtime.
+
+    The same calls are fine in shared libraries and frontends, which never
+    unload; the rule is scoped to `extensions/**` and `examples/**`, where
+    the stored value may outlive the image that stored it.
+    """
+    if not is_reloadable_source(display_path):
+        return
+    for line_number, line in enumerate(lines, start=1):
+        if COMMENT_LINE_PATTERN.match(line):
+            continue
+        for pattern, detail in EGUI_CONTEXT_STORAGE_PATTERNS:
+            if pattern.search(line):
+                collector.record(
+                    display_path,
+                    "egui state",
+                    f"line {line_number}: {detail}; keep long-lived egui state "
+                    "in a world resource (pill_ui_egui's reload-safety contract)",
+                )
+
+
+# =============================================================================
+# Self test
+# =============================================================================
+
+
+class SilentCollector(ViolationCollector):
+    """A collector for the self test: counts violations without printing."""
+
+    def record(self, display_path: str, check: str, detail: str) -> None:
+        """Counts one violation, skipping the per-file printout."""
+        self.violation_count += 1
+        self.entries.append((display_path, check, detail))
+
+
+# Runs the egui-storage rule against planted sources: the rule must fire on
+# a reloadable crate and stay quiet everywhere else.
+def self_test() -> int:
+    """Proves the egui-storage rule fails its plant and only its plant."""
+    cases = (
+        (
+            "a plant in an extension crate fails",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "let stored = context.data_mut::<Widget>();\n",
+            1,
+        ),
+        (
+            "the same plant outside a reloadable crate passes",
+            "modules/frontents/pill_editor_egui/src/runner.rs",
+            "let stored = context.data_mut::<Widget>();\n",
+            0,
+        ),
+        (
+            "a comment naming the rule passes",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "// never call context.data_mut::<Widget>() here\n",
+            0,
+        ),
+        (
+            "a paint callback in an example fails",
+            "examples/acme/src/lib.rs",
+            "let shape = egui::Shape::Callback(PaintCallback { .. });\n",
+            1,
+        ),
+        (
+            "an unrelated metadata turbofish passes",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "let value = entry.metadata::<Todo>();\n",
+            0,
+        ),
+    )
+    passed = True
+    for description, display_path, source, expected in cases:
+        collector = SilentCollector()
+        check_egui_context_storage(source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
+    return 0 if passed else 1
+
+
+# =============================================================================
 # Entry point
 # =============================================================================
 
@@ -517,6 +638,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--list",
         action="store_true",
         help="Print every .rs file that would be checked, then exit",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        dest="self_test",
+        help="Run the planted-violation self test of the egui-state rule, then exit",
     )
     parser.add_argument(
         "--report",
@@ -590,6 +717,9 @@ def resolve_targets(arguments: argparse.Namespace) -> List[Path]:
 def main() -> int:
     """Scans the targets and reports every violation found."""
     arguments = build_parser().parse_args()
+    if arguments.self_test:
+        print(colorize("Pill comment & layout lint - self test", ANSI_BOLD))
+        return self_test()
     targets = resolve_targets(arguments)
     files = collect_files(targets, [Path(entry) for entry in arguments.exclude])
 
@@ -610,29 +740,33 @@ def main() -> int:
         return 0
 
     collector = ViolationCollector()
-    # Every file is read once and its lines reused by all five checks; the
+    # Every file is read once and its lines reused by all six checks; the
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/5) Module header")
+    section("(1/6) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/5) Safety comments")
+    section("(2/6) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/5) Public item docs")
+    section("(3/6) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/5) Import group order")
+    section("(4/6) Import group order")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
 
-    section("(5/5) Tests at the bottom")
+    section("(5/6) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
+
+    section("(6/6) egui state (reloadable crates)")
+    for _, display_path, lines, _text in sources:
+        check_egui_context_storage(lines, display_path, collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

@@ -178,7 +178,12 @@ STEPS: List[Step] = [
         # same file set (SA-0070; this step used to scan `--root modules`
         # only, which left every example, the test project and the shipping
         # bundle unlinted in CI while the hook still flagged them).
-        [[PYTHON, "devops/tests/test_coding_standards.py"]],
+        # The self test first proves the egui-state rule still fails its
+        # planted violation; the run then holds every .rs file to the rules.
+        [
+            [PYTHON, "devops/tests/test_coding_standards.py", "--self-test"],
+            [PYTHON, "devops/tests/test_coding_standards.py"],
+        ],
         working_directory=REPOSITORY_ROOT,
         quick=True,
     ),
@@ -289,7 +294,9 @@ STEPS: List[Step] = [
         "Editor suites (the real executable, scripted)",
         [
             [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_crates.py", "test_editor_revision.py"],
-            ["cargo", "build", "-p", "pill_editor"],
+            # Both editors in one build: one feature resolution, one set of
+            # shared dylibs, valid for either binary's launch.
+            ["cargo", "build", "-p", "pill_editor", "-p", "pill_editor_egui"],
             [PYTHON, "../devops/tests/run_all.py", "--set", "editor"],
         ],
     ),

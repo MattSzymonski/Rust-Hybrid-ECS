@@ -14,6 +14,10 @@ members = [
     # users (the editor shell, tests and the golden harness), never loaded as
     # a module itself (plan decisions D8, D26).
     "pill_ui_wgpu",
+    # The egui editor's own UI library (W-0017): a second shared dylib
+    # beside `pill_ui`, so the egui editor's world can replace its UI core
+    # without touching the `pill_ui` editor's.
+    "pill_ui_egui",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild

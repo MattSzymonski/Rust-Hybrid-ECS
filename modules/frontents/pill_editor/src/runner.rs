@@ -3057,8 +3057,8 @@ impl EditorWindow {
             return false;
         };
         let scale = self.window.scale_factor() as f32;
-        let x = rect.x as f32 + position.x as f32 / scale;
-        let y = rect.y as f32 + position.y as f32 / scale;
+        let x = rect.x + position.x as f32 / scale;
+        let y = rect.y + position.y as f32 / scale;
         self.overlay_opaque.iter().any(|region| {
             x >= region.x
                 && x <= region.x + region.width

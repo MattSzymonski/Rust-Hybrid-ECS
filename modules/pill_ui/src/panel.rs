@@ -115,6 +115,10 @@ pub enum PanelNode {
     Row {
         /// The row's children, left to right.
         children: Vec<PanelNode>,
+        /// Whether children that do not fit flow onto a further line
+        /// instead of running past the row's edge (a toolbar in a narrow
+        /// panel).
+        wrap: bool,
     },
     /// A vertical group of widgets.
     Column {
@@ -317,7 +321,7 @@ impl PanelNode {
     /// The node's child nodes, in paint order.
     pub fn children(&self) -> &[PanelNode] {
         match self {
-            PanelNode::Row { children }
+            PanelNode::Row { children, .. }
             | PanelNode::Column { children }
             | PanelNode::ColorField { children, .. }
             | PanelNode::VectorField { children, .. }
@@ -552,6 +556,7 @@ impl<'a> PanelBuilder<'a> {
             segment,
             PanelNode::Row {
                 children: Vec::new(),
+                wrap: false,
             },
             add,
         );
@@ -564,6 +569,23 @@ impl<'a> PanelBuilder<'a> {
             name.to_string(),
             PanelNode::Row {
                 children: Vec::new(),
+                wrap: false,
+            },
+            add,
+        );
+    }
+
+    /// Run `add` inside a horizontal group whose children flow onto a
+    /// further line when they do not fit: a toolbar in a panel narrow
+    /// enough that its last buttons would be clipped away entirely (no
+    /// hit rectangle, no way to click them).
+    pub fn row_wrapped(&mut self, add: impl FnOnce(&mut Self)) {
+        let segment = self.auto_name("row");
+        self.push_group(
+            segment,
+            PanelNode::Row {
+                children: Vec::new(),
+                wrap: true,
             },
             add,
         );
@@ -1457,7 +1479,7 @@ impl<'a> PanelBuilder<'a> {
             .expect("a group is always open while building");
         parent.meta.children.push(meta);
         match &mut parent.node {
-            PanelNode::Row { children }
+            PanelNode::Row { children, .. }
             | PanelNode::Column { children }
             | PanelNode::ColorField { children, .. }
             | PanelNode::VectorField { children, .. }
