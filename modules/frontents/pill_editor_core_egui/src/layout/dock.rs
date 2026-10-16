@@ -2,12 +2,13 @@
 //!
 //! # Responsibilities
 //!
-//! - [`EditorTab`]: the editor's four tabs - the scene view's placeholder,
-//!   the world's entities and systems, and the assets mock - and their
-//!   titles.
+//! - [`EditorTab`]: the editor's six tabs - the two scene viewports'
+//!   placeholders, the world's entities and systems, the selection's
+//!   inspector, and the assets mock - and their titles.
 //! - [`EditorDock`]: the `egui_dock` state with the default layout (the
-//!   scene in the center, the entity and system columns on the sides, the
-//!   assets row below), the schema version its documents carry, and
+//!   scene in the center, the entity column on the left, the inspector
+//!   above the system column on the right, the assets row below), the
+//!   schema version its documents carry, and
 //!   [`EditorDock::settled`] which replaces the placeholder rectangles an
 //!   unpacked layout has not computed yet.
 //!
@@ -31,29 +32,40 @@ pub const SIDE_COLUMN_FRACTION: f32 = 0.16;
 /// layout.
 pub const BOTTOM_ROW_FRACTION: f32 = 0.24;
 
+/// The fraction of the right column's height the Inspector takes in the
+/// default layout; the Systems list keeps the rest below it.
+pub const INSPECTOR_COLUMN_FRACTION: f32 = 0.4;
+
 /// One tab of the egui editor.
 ///
 /// The enum is serialized into the saved layout, so adding a tab is a
 /// schema change (`LAYOUT_SCHEMA_VERSION`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EditorTab {
-    /// The scene view's placeholder: the shell measures this tab's body and
-    /// draws nothing, so the scene's child window shows through the center.
+    /// The first scene view's placeholder: the shell measures this tab's
+    /// body and draws nothing, so the scene's child window shows through.
     Scene,
+    /// The second scene view's placeholder: like [`EditorTab::Scene`], with
+    /// its own child window and renderer surface.
+    SecondScene,
     /// The world's entities: id, name, click to select.
     Entities,
     /// The world's systems: name, stage, enabled.
     Systems,
+    /// The selected entity's detail: its components and their field values.
+    Inspector,
     /// The assets panel's mock: fixed rows until the asset store is ported.
     Assets,
 }
 
 impl EditorTab {
     /// Every tab, in tab-strip order.
-    pub const ALL: [EditorTab; 4] = [
+    pub const ALL: [EditorTab; 6] = [
         EditorTab::Scene,
+        EditorTab::SecondScene,
         EditorTab::Entities,
         EditorTab::Systems,
+        EditorTab::Inspector,
         EditorTab::Assets,
     ];
 
@@ -61,8 +73,10 @@ impl EditorTab {
     pub fn title(self) -> &'static str {
         match self {
             EditorTab::Scene => "Scene",
+            EditorTab::SecondScene => "Scene 2",
             EditorTab::Entities => "Entities",
             EditorTab::Systems => "Systems",
+            EditorTab::Inspector => "Inspector",
             EditorTab::Assets => "Assets",
         }
     }
@@ -89,11 +103,12 @@ impl Default for EditorDock {
 }
 
 impl EditorDock {
-    /// A dock with the default layout: the scene in the center, the entity
-    /// and system lists as side columns, and the assets mock as a bottom
-    /// row across the window.
+    /// A dock with the default layout: the two scene viewports tabbed
+    /// together in the center, the entity list as the left column, the
+    /// inspector above the system list on the right, and the assets mock as
+    /// a bottom row across the window.
     pub fn new() -> Self {
-        let mut state = DockState::new(vec![EditorTab::Scene]);
+        let mut state = DockState::new(vec![EditorTab::Scene, EditorTab::SecondScene]);
         let tree = state.main_surface_mut();
         // The assets row spans the full width, so it splits off first; the
         // old node keeps the space above it.
@@ -108,11 +123,19 @@ impl EditorDock {
         // node in the fraction-sized slot on the left.
         let [middle, _entities] =
             tree.split_left(upper, SIDE_COLUMN_FRACTION, vec![EditorTab::Entities]);
-        // The system column takes as much of the middle node as a side
-        // column takes of the whole window.
+        // The right column takes as much of the middle node as a side
+        // column takes of the whole window; it carries the inspector.
         let system_fraction = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
-        let [_center, _systems] =
-            tree.split_right(middle, system_fraction, vec![EditorTab::Systems]);
+        let [_center, right_column] =
+            tree.split_right(middle, system_fraction, vec![EditorTab::Inspector]);
+        // The inspector sits on top of the right column; `split_below`'s
+        // fraction is the share the old node keeps, so the systems list
+        // takes the space below it.
+        let [_inspector, _systems] = tree.split_below(
+            right_column,
+            INSPECTOR_COLUMN_FRACTION,
+            vec![EditorTab::Systems],
+        );
         Self {
             schema_version: super::LAYOUT_SCHEMA_VERSION,
             state,
@@ -231,21 +254,34 @@ mod tests {
             "the entity column is not a side split"
         );
         assert_eq!(tabs_at(upper.left()), vec![EditorTab::Entities]);
-        // The rest splits into the scene center and the system column.
+        // The rest splits into the scene center and the system column; the
+        // two viewport tabs share the center group.
         let rest = upper.right();
         assert!(
             state[surface][rest].is_horizontal(),
             "the system column is not a side split"
         );
-        assert_eq!(tabs_at(rest.left()), vec![EditorTab::Scene]);
-        assert_eq!(tabs_at(rest.right()), vec![EditorTab::Systems]);
+        assert_eq!(
+            tabs_at(rest.left()),
+            vec![EditorTab::Scene, EditorTab::SecondScene]
+        );
+        // The right column stacks the inspector above the systems list.
+        let column = rest.right();
+        assert!(
+            state[surface][column].is_vertical(),
+            "the inspector is not stacked above the systems list"
+        );
+        assert_eq!(tabs_at(column.left()), vec![EditorTab::Inspector]);
+        assert_eq!(tabs_at(column.right()), vec![EditorTab::Systems]);
         // Each side column is one `SIDE_COLUMN_FRACTION` of its split, the
-        // assets row one `BOTTOM_ROW_FRACTION` of the window, and the scene
+        // assets row one `BOTTOM_ROW_FRACTION` of the window, the inspector
+        // one `INSPECTOR_COLUMN_FRACTION` of its column, and the scene
         // keeps the rest.
         assert!((fraction_at(root) - (1.0 - BOTTOM_ROW_FRACTION)).abs() < f32::EPSILON);
         assert!((fraction_at(upper) - SIDE_COLUMN_FRACTION).abs() < f32::EPSILON);
         let scene_share = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
         assert!((fraction_at(rest) - scene_share).abs() < f32::EPSILON);
+        assert!((fraction_at(column) - INSPECTOR_COLUMN_FRACTION).abs() < f32::EPSILON);
     }
 
     #[test]

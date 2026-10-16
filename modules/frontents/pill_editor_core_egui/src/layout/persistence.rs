@@ -23,7 +23,13 @@ use crate::error::LayoutPersistenceError;
 /// v2 adds the Scene and Assets tabs and the side/bottom default layout, so
 /// documents written by the two-tab build are rejected and replaced by the
 /// new default.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 adds the second viewport tab (`EditorTab::SecondScene`), so documents
+/// written before it are rejected and replaced by the new default.
+///
+/// v4 adds the Inspector tab (`EditorTab::Inspector`) and its slot in the
+/// default layout, so previous documents are rejected and replaced too.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 4;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
