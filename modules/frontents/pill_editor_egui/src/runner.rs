@@ -35,6 +35,7 @@ use pill_core::{info, warn};
 use pill_editor_core_egui::editor_state::EditorSnapshot;
 use pill_editor_core_egui::layout::{EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION};
 use pill_editor_core_egui::session::EguiShellState;
+use pill_engine_core::input::{ButtonState, MouseButton};
 use pill_engine_core::InputEvent;
 use pill_host::{HostConfig, RenderingHost};
 use pill_input::winit_events::translate_window_event;
@@ -199,7 +200,44 @@ impl ApplicationHandler for EditorApplication {
                 }
             }
             other => {
+                // The scene window's pointer positions are relative to its
+                // own client area, while the engine - which also feeds the
+                // shell's egui pass - works in the main window's client
+                // coordinates. The window's placed origin bridges the two,
+                // so hovering and clicking the overlay strip works.
+                let origin = if is_child {
+                    editor.scene_origin()
+                } else {
+                    (0.0, 0.0)
+                };
                 for event in translate_window_event(&other) {
+                    let event = offset_pointer(event, origin);
+                    // TEMP: pointer routing trace, removed after the click
+                    // diagnosis.
+                    match &event {
+                        InputEvent::CursorMoved { position } => info!(
+                            target: telemetry_target::ENGINE,
+                            child = is_child,
+                            origin_x = origin.0,
+                            origin_y = origin.1,
+                            x = position.x,
+                            y = position.y,
+                            "[editor] trace cursor"
+                        ),
+                        InputEvent::MouseButton { button, state } => info!(
+                            target: telemetry_target::ENGINE,
+                            child = is_child,
+                            button = ?button,
+                            state = ?state,
+                            "[editor] trace button"
+                        ),
+                        InputEvent::CursorLeft => info!(
+                            target: telemetry_target::ENGINE,
+                            child = is_child,
+                            "[editor] trace cursor left"
+                        ),
+                        _ => {}
+                    }
                     editor.pending_events.push(event);
                 }
             }
@@ -397,6 +435,18 @@ impl EditorWindow {
         self.place_views();
     }
 
+    /// The scene window's client-area origin in the main window's client
+    /// coordinates, in physical pixels: the position the last placement
+    /// applied. A resize never moves the window, so the origin stands even
+    /// while the placement cache is cleared mid-layout; a drag across the
+    /// separator therefore never sees the pointer jump.
+    fn scene_origin(&self) -> (f32, f32) {
+        match &self.scene {
+            Some(scene) => (scene.window.origin.0 as f32, scene.window.origin.1 as f32),
+            None => (0.0, 0.0),
+        }
+    }
+
     /// Handle a scene-window resize: the scene's surface reconfigures with
     /// its window, like the native editor's view surfaces (D29) - a stale
     /// render target draws the scene at the wrong size inside the tab. The
@@ -510,6 +560,7 @@ impl EditorWindow {
                 scale_factor: self.scale_factor,
                 focused: self.focused,
                 time: self.started.elapsed().as_secs_f64(),
+                frames_per_second: self.fps,
             };
         }
         // Step 4: the frame's snapshot for the shell's data tabs, when the
@@ -727,6 +778,18 @@ impl EditorWindow {
                         ),
                     }
                 }
+                Some("click") => {
+                    let x = parts.next().and_then(|value| value.parse().ok());
+                    let y = parts.next().and_then(|value| value.parse().ok());
+                    match (x, y) {
+                        (Some(x), Some(y)) => self.inject_click(x, y),
+                        _ => warn!(
+                            target: telemetry_target::ENGINE,
+                            command,
+                            "[editor] click needs an x and a y"
+                        ),
+                    }
+                }
                 Some("dump") if parts.next() == Some("tabs") => self.dump_tabs(),
                 Some(other) => warn!(
                     target: telemetry_target::ENGINE,
@@ -736,6 +799,32 @@ impl EditorWindow {
                 None => {}
             }
         }
+    }
+
+    /// Inject a full left click at a point of the window's client area, in
+    /// its physical pixels, through the same engine input seam a real click
+    /// enters: the shell's egui pass hit-tests and routes it, so an overlay
+    /// widget takes it while a point with no widget still reaches the
+    /// scene. Press and release arrive in one input frame, which the engine
+    /// reports as both edges; the egui bridge forwards them in order.
+    fn inject_click(&mut self, x: f32, y: f32) {
+        let position = pill_core::math::Vector2f::new(x, y);
+        let engine = self.host.host_mut().engine_mut();
+        engine.push_input_event(InputEvent::CursorMoved { position });
+        engine.push_input_event(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: ButtonState::Pressed,
+        });
+        engine.push_input_event(InputEvent::MouseButton {
+            button: MouseButton::Left,
+            state: ButtonState::Released,
+        });
+        info!(
+            target: telemetry_target::ENGINE,
+            x,
+            y,
+            "[editor] click injected"
+        );
     }
 
     /// Float a dock tab into its own egui window, through the shell's state.
@@ -833,6 +922,11 @@ struct SurfaceWindow {
     /// The last placed rectangle in physical pixels, so redundant moves
     /// and resizes are skipped.
     placed: Option<(i32, i32, u32, u32)>,
+    /// The client-area origin in the parent's coordinates the last
+    /// placement applied, in physical pixels. Pointer events this window
+    /// reports are relative to it; a resize clears `placed` but never moves
+    /// the window, so the origin survives that.
+    origin: (i32, i32),
 }
 
 impl SurfaceWindow {
@@ -875,6 +969,7 @@ impl SurfaceWindow {
                         window: Arc::new(window),
                         detached: false,
                         placed: None,
+                        origin: (0, 0),
                     })
                 }
                 Err(error) => {
@@ -898,6 +993,7 @@ impl SurfaceWindow {
             window: Arc::new(window),
             detached: true,
             placed: None,
+            origin: (0, 0),
         })
     }
 
@@ -910,6 +1006,10 @@ impl SurfaceWindow {
         }
         if !self.detached {
             self.window.set_outer_position(PhysicalPosition::new(x, y));
+            // Recorded separately from the placement cache: pointer events
+            // this window reports are relative to it, and a resize (which
+            // clears the cache) does not move the window.
+            self.origin = (x, y);
         }
         let _ = self
             .window
@@ -948,6 +1048,21 @@ impl SceneView {
                 "[editor] scene surface refused; the scene view stays empty"
             ),
         }
+    }
+}
+
+/// Shift a pointer event the scene window reported into the main window's
+/// client coordinates. Only cursor positions move: buttons and wheels carry
+/// no position of their own, and egui reads the cursor's for them.
+fn offset_pointer(event: InputEvent, (dx, dy): (f32, f32)) -> InputEvent {
+    if dx == 0.0 && dy == 0.0 {
+        return event;
+    }
+    match event {
+        InputEvent::CursorMoved { position } => InputEvent::CursorMoved {
+            position: pill_core::math::Vector2f::new(position.x + dx, position.y + dy),
+        },
+        other => other,
     }
 }
 
