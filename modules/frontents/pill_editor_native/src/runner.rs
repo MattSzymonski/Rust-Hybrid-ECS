@@ -1476,7 +1476,11 @@ impl EditorWindow {
                 window: surface,
                 camera: EditorCamera::default(),
                 owner: request.owner,
-                logical: None,
+                // The placement is known before the first frame the view
+                // paints: input that arrives with the surface already
+                // routes to the view instead of the UI (the same rule a
+                // click in the safe-mode column follows).
+                logical: Some(request.rect),
             };
             match self.host.attach_surface(
                 surface_id,
@@ -1560,6 +1564,7 @@ impl EditorWindow {
                 id: view.id.clone(),
                 node: view.node,
                 owner: view.window.clone(),
+                rect: view.rect,
             });
         }
         for index in 0..self.views.len() {
@@ -5502,6 +5507,9 @@ struct PendingViewCreate {
     node: u64,
     /// The popped-out window that will hold the view, when one does.
     owner: Option<String>,
+    /// The placement the shell asked for, applied with the surface so the
+    /// view routes input from its first frame.
+    rect: EditorRect,
 }
 
 // =============================================================================

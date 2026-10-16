@@ -81,7 +81,11 @@ pub const PREFERENCES_FILE: &str = pill_editor_core::commands::PREFERENCES_FILE;
 
 /// The menu bar's height, in logical pixels; the dock layout gets what is
 /// left below it.
-pub const MENU_BAR_HEIGHT: f64 = 26.0;
+pub const MENU_BAR_HEIGHT: f64 = 28.0;
+
+/// The status bar's height, in logical pixels; the dock layout gets what is
+/// left above it (design v5).
+pub const STATUS_BAR_HEIGHT: f64 = 24.0;
 
 /// How often the live readouts - the frame-rate badge's text and the
 /// Statistics panel's numbers - refresh, in shell frames (Stage 22, D25):
@@ -92,8 +96,12 @@ pub const READOUT_REFRESH_FRAMES: u64 = 120;
 /// One dropdown or palette row's height, in logical pixels.
 const MENU_ITEM_HEIGHT: f64 = 24.0;
 
-/// How wide a top-level menu title is, in logical pixels (monospace rows).
-const MENU_TITLE_WIDTH: f64 = 84.0;
+/// How wide the menu bar's right cluster is, in logical pixels (the run
+/// state and the frame rate, design v5).
+const RIGHT_CLUSTER_WIDTH: f32 = 220.0;
+
+/// How wide the status bar's right cluster is, in logical pixels (design v5).
+const STATUS_CLUSTER_WIDTH: f32 = 180.0;
 
 /// The palette's size, in logical pixels.
 const PALETTE_WIDTH: f64 = 420.0;
@@ -995,14 +1003,72 @@ fn subframe(
     (list, output.clipboard, output.named)
 }
 
-/// The docking chrome: a raised strip with the tab titles for every tabset,
-/// and one thin line per splitter.
+/// Like [`subframe`], also returning the label rectangles in build order
+/// (the chrome's tabs and menu titles) and the widget inputs the build
+/// produced, so the chrome can draw state under exactly what it measured
+/// and hit-test against it.
+#[allow(clippy::too_many_arguments)]
+fn subframe_laid_out(
+    ui: &mut UiState,
+    text: &mut TextSystem,
+    theme: &Theme,
+    sheet: &mut Stylesheet,
+    atlas: &mut Atlas,
+    origin: Vector2f,
+    size: Vector2f,
+    build: impl FnOnce(&mut PanelBuilder<'_>),
+) -> (
+    DrawList,
+    Vec<ClipboardRequest>,
+    Vec<Rect>,
+    Vec<pill_ui::panel::PanelInput>,
+) {
+    let (output, layout) = run_frame(ui, text, theme, sheet, size, build);
+    let mut list = DrawList::new();
+    paint(&output.tree, &layout, theme, ui, text, atlas, &mut list);
+    list.translate(origin);
+    let mut labels = Vec::new();
+    let mut index = 0usize;
+    collect_label_rects(&output.tree.root, &layout, &mut index, origin, &mut labels);
+    (list, output.clipboard, labels, output.inputs)
+}
+
+/// The absolute rectangles of every label node, in build order.
+fn collect_label_rects(
+    node: &pill_ui::panel::PanelNode,
+    layout: &pill_ui::layout::PanelLayout,
+    index: &mut usize,
+    origin: Vector2f,
+    out: &mut Vec<Rect>,
+) {
+    let rect = layout.rects[*index];
+    if matches!(node, pill_ui::panel::PanelNode::Label { .. }) {
+        out.push(Rect::from_min_size(
+            rect.min + origin,
+            Vector2f::new(rect.width(), rect.height()),
+        ));
+    }
+    *index += 1;
+    for child in node.children() {
+        collect_label_rects(child, layout, index, origin, out);
+    }
+}
+
+/// The docking chrome: tab strips with the tab titles for every tabset,
+/// and one line per splitter (design v5: an active tab carries the panel
+/// background and a 2px red rule, hovered surfaces lighten, the splitter
+/// under the pointer highlights).
 pub fn paint_dock_chrome(
     state: &mut EditorShellState,
     snapshot: &LayoutSnapshot,
     frame: &mut EditorShellFrame,
     previous_hits: &BTreeMap<WidgetId, Rect>,
 ) {
+    let pointer = state.ui.input.pointer();
+    let clicked = state
+        .ui
+        .input
+        .mouse_button_released(pill_engine::MouseButton::Left);
     let EditorShellState {
         layout,
         ui,
@@ -1013,8 +1079,11 @@ pub fn paint_dock_chrome(
         panel_over,
         ..
     } = state;
-    // Step 1: the tab strips. The fill goes into the frame first so it sits
-    // under the titles painted after it.
+    let mut pending_select: Option<pill_editor_core::layout::NodeId> = None;
+    // Step 1: the tab strips. The fills go into the frame first so they sit
+    // under the titles painted after them; the active tab takes the panel
+    // background and a 2px red rule, a hovered one a step of lightening
+    // (design v5).
     for (id, node) in &layout.nodes {
         let LayoutNode::TabSet(tabset) = node else {
             continue;
@@ -1031,7 +1100,7 @@ pub fn paint_dock_chrome(
         // interactive widgets, so its build may replace the hit map; the
         // panel loop restores its own copy around each panel.
         ui.set_hit_rects(previous_hits.clone());
-        let (mut list, clipboard, _named) = subframe(
+        let (mut list, clipboard, labels, _inputs) = subframe_laid_out(
             ui,
             text,
             theme,
@@ -1046,7 +1115,7 @@ pub fn paint_dock_chrome(
                             // An over-budget module panel's tab carries the
                             // warning badge (Stage 16).
                             match &tab.panel {
-                                PanelKind::Module(id) if panel_over.contains(id) => {
+                                PanelKind::Module(panel_id) if panel_over.contains(panel_id) => {
                                     row.label(&format!("{}{}", tab.title, PANEL_BADGE));
                                 }
                                 _ => {
@@ -1058,17 +1127,157 @@ pub fn paint_dock_chrome(
                 });
             },
         );
+        for (index, tab_id) in tabset.tabs.iter().enumerate() {
+            let Some(rect) = labels.get(index).copied() else {
+                continue;
+            };
+            let hovered = pointer.is_some_and(|point| {
+                point.x >= rect.min.x
+                    && point.x <= rect.max.x
+                    && point.y >= rect.min.y
+                    && point.y <= rect.max.y
+            });
+            let active = tabset.selected == Some(*tab_id);
+            if active {
+                // The active tab keeps the strip's fill; the 2px red rule
+                // alone marks it (design v5).
+                frame.panels.push_fill(
+                    Rect::from_min_size(
+                        Vector2f::new(rect.min.x, rect.max.y - 2.0),
+                        Vector2f::new(rect.width(), 2.0),
+                    ),
+                    theme.highlight,
+                );
+            } else if hovered {
+                frame.panels.push_fill(rect, theme.hover);
+            }
+            if clicked && hovered {
+                pending_select = Some(*tab_id);
+            }
+        }
         frame.panels.append(std::mem::take(&mut list));
         frame.clipboard.extend(clipboard);
     }
-    // Step 2: the splitters, one thin line each.
+    // A tab click applies after the walk: the layout may not change under
+    // the iteration borrowing its nodes.
+    if let Some(tab) = pending_select {
+        let _ = layout.apply(LayoutAction::SelectTab { tab });
+    }
+    // Step 2: the splitters, one thin line each; hover marks the one under
+    // the pointer (design v5).
     for splitter in &snapshot.splitters {
         let rect = Rect::from_min_size(
             Vector2f::new(splitter.rect.x as f32, splitter.rect.y as f32),
             Vector2f::new(splitter.rect.width as f32, splitter.rect.height as f32),
         );
-        frame.panels.push_fill(rect, theme.border);
+        let hovered = pointer.is_some_and(|point| {
+            point.x >= rect.min.x
+                && point.x <= rect.max.x
+                && point.y >= rect.min.y
+                && point.y <= rect.max.y
+        });
+        frame.panels.push_fill(
+            rect,
+            if hovered {
+                theme.highlight
+            } else {
+                theme.border
+            },
+        );
     }
+}
+
+/// The status bar (design v5): the run state, the entity count and the
+/// posture on the left; the build and the clock on the right.
+pub fn paint_status_bar(
+    state: &mut EditorShellState,
+    entities: usize,
+    frame: &mut EditorShellFrame,
+    available: Vector2f,
+) {
+    let y = (available.y - STATUS_BAR_HEIGHT as f32).max(0.0);
+    let bar = Rect::from_min_size(
+        Vector2f::new(0.0, y),
+        Vector2f::new(available.x, STATUS_BAR_HEIGHT as f32),
+    );
+    let paused = state.paused;
+    // Like the menu layer: the status bar isolates its own builds and puts
+    // the panels' hit rectangles back before returning, so widgets keep
+    // answering activations and clicks.
+    let saved_hits = state.ui.hit_rects().clone();
+    let EditorShellState {
+        ui,
+        text,
+        theme,
+        sheet,
+        atlas,
+        ..
+    } = state;
+    frame.panels.push_fill(bar, theme.window);
+    frame.panels.push_fill(
+        Rect::from_min_size(Vector2f::new(0.0, y), Vector2f::new(available.x, 1.0)),
+        theme.border,
+    );
+    // The left cluster: state, counts, posture.
+    ui.set_hit_rects(BTreeMap::new());
+    let (mut list, clipboard, _labels, _inputs) = subframe_laid_out(
+        ui,
+        text,
+        theme,
+        sheet,
+        atlas,
+        Vector2f::new(8.0, y),
+        Vector2f::new((available.x - 16.0).max(0.0), STATUS_BAR_HEIGHT as f32),
+        |builder| {
+            builder.row(|row| {
+                row.class(if paused { "run-warn" } else { "run-dot" });
+                row.label("●");
+                row.class("chrome-secondary");
+                row.label(if paused { "Paused" } else { "Ready" });
+                row.class("chrome-muted");
+                row.label(&format!("{entities} entities"));
+                row.class("chrome-muted");
+                row.label("dev");
+            });
+        },
+    );
+    frame.panels.append(std::mem::take(&mut list));
+    frame.clipboard.extend(clipboard);
+    // The right cluster: the build and the clock.
+    let clock = utc_clock_text();
+    let origin = Vector2f::new((available.x - STATUS_CLUSTER_WIDTH).max(0.0), y);
+    ui.set_hit_rects(BTreeMap::new());
+    let (mut list, clipboard, _labels, _inputs) = subframe_laid_out(
+        ui,
+        text,
+        theme,
+        sheet,
+        atlas,
+        origin,
+        Vector2f::new(STATUS_CLUSTER_WIDTH, STATUS_BAR_HEIGHT as f32),
+        |builder| {
+            builder.row(|row| {
+                row.class("chrome-muted");
+                row.label(&format!("Pill {}", env!("CARGO_PKG_VERSION")));
+                row.class("chrome-muted");
+                row.label(&clock);
+            });
+        },
+    );
+    frame.panels.append(std::mem::take(&mut list));
+    frame.clipboard.extend(clipboard);
+    state.ui.set_hit_rects(saved_hits);
+}
+
+/// The status bar's clock text: `HH:MM` in UTC, from the system clock. The
+/// minute is the finest resolution the redraw-on-change gate (D25) allows:
+/// a seconds-precision clock would repaint a quiet editor every second.
+fn utc_clock_text() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("{:02}:{:02}", (seconds / 3600) % 24, (seconds / 60) % 60)
 }
 
 /// The read-only view every panel builds from (Stage 17).
@@ -1680,16 +1889,22 @@ fn console_panel(
         extras.console_channel
     ));
     builder.separator();
-    // Newest first, a bounded window.
+    // Newest first, a bounded window. The level word carries the feedback
+    // colour; the rest stays in the console's own text colour (design v5).
     for line in visible.iter().rev().take(PANEL_ROWS).rev() {
-        let severity = match line.level {
-            5 => "ERROR",
-            4 => "WARN",
-            3 => "INFO",
-            2 => "DEBUG",
-            _ => "TRACE",
+        let (severity, class) = match line.level {
+            5 => ("ERROR", "run-error"),
+            4 => ("WARN", "run-warn"),
+            3 => ("INFO", "run-info"),
+            2 => ("DEBUG", "chrome-muted"),
+            _ => ("TRACE", "chrome-muted"),
         };
-        builder.label(&format!("{severity} {}: {}", line.target, line.message));
+        builder.row(|row| {
+            row.class(class);
+            row.label(severity);
+            row.class("chrome-secondary");
+            row.label(&format!("{}: {}", line.target, line.message));
+        });
     }
     if let Some(level) = level {
         work.console_level = Some(level);
@@ -3849,6 +4064,11 @@ pub fn paint_menu(
         state.ui.set_hit_rects(saved_hits);
         return;
     }
+    let pointer = state.ui.input.pointer();
+    let open_title = state.menu_open.clone();
+    let paused = state.paused;
+    let frames_per_second = state.readout_frames_per_second;
+    let title_rects: Vec<Rect>;
     {
         let EditorShellState {
             ui,
@@ -3866,7 +4086,7 @@ pub fn paint_menu(
             theme.raised,
         );
         ui.set_hit_rects(BTreeMap::new());
-        let (mut list, clipboard, _named) = subframe(
+        let (mut list, clipboard, labels, _inputs) = subframe_laid_out(
             ui,
             text,
             theme,
@@ -3882,17 +4102,80 @@ pub fn paint_menu(
                 });
             },
         );
+        // The titles' states, under the labels: hover lightens a title, and
+        // the open menu reads as pressed (design v5). The boxes pad the
+        // labels like the mock's chips, so a click just past a short title
+        // still belongs to it.
+        const TITLE_PAD: f32 = 8.0;
+        title_rects = labels
+            .iter()
+            .map(|rect| {
+                Rect::from_min_size(
+                    Vector2f::new((rect.min.x - TITLE_PAD).max(0.0), rect.min.y),
+                    Vector2f::new(rect.width() + TITLE_PAD * 2.0, rect.height()),
+                )
+            })
+            .collect();
+        for ((top, _), rect) in menus.iter().zip(title_rects.iter()) {
+            if open_title.as_deref() == Some(top.as_str()) {
+                frame.panels.push_fill(*rect, theme.active);
+            } else if pointer.is_some_and(|point| {
+                point.x >= rect.min.x
+                    && point.x <= rect.max.x
+                    && point.y >= rect.min.y
+                    && point.y <= rect.max.y
+            }) {
+                frame.panels.push_fill(*rect, theme.hover);
+            }
+        }
         frame.panels.append(std::mem::take(&mut list));
         frame.clipboard.extend(clipboard);
     }
-    // The titles' hit rectangles, matching the uniform layout above.
-    let mut x = 6.0;
-    for (top, _) in &menus {
+    // The right cluster: the run state and the frame rate (design v5).
+    {
+        let EditorShellState {
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            ..
+        } = state;
+        let origin = Vector2f::new((available.x - RIGHT_CLUSTER_WIDTH).max(0.0), 0.0);
+        ui.set_hit_rects(BTreeMap::new());
+        let (mut list, clipboard, _labels, _inputs) = subframe_laid_out(
+            ui,
+            text,
+            theme,
+            sheet,
+            atlas,
+            origin,
+            Vector2f::new(RIGHT_CLUSTER_WIDTH, MENU_BAR_HEIGHT as f32),
+            |builder| {
+                builder.row(|row| {
+                    row.class(if paused { "run-warn" } else { "run-dot" });
+                    row.label("●");
+                    row.class("chrome-secondary");
+                    row.label(if paused { "Paused" } else { "Running" });
+                    row.class("chrome-muted");
+                    row.label(&format!("{frames_per_second:.0} fps"));
+                });
+            },
+        );
+        frame.panels.append(std::mem::take(&mut list));
+        frame.clipboard.extend(clipboard);
+    }
+    // The titles' hit rectangles, the padded boxes the fills drew.
+    for (top, rect) in menus.iter().map(|(top, _)| top).zip(title_rects.iter()) {
         state.menu_bar_hits.push((
             top.clone(),
-            LayoutRect::new(x, 0.0, MENU_TITLE_WIDTH, MENU_BAR_HEIGHT),
+            LayoutRect::new(
+                rect.min.x as f64,
+                rect.min.y as f64,
+                rect.width() as f64,
+                rect.height() as f64,
+            ),
         ));
-        x += MENU_TITLE_WIDTH;
     }
     // The dropdown, when one is open.
     let Some(open) = state.menu_open.clone() else {

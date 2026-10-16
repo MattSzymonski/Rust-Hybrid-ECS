@@ -47,10 +47,10 @@ use pill_editor_shell_editor::shell::{
     handle_command_shortcuts, handle_file_drops, handle_menu_pointer, handle_popup_closed,
     handle_popup_pointer, handle_window_closed, handle_window_key, handle_window_pointer,
     handle_window_text, paint_context_menu, paint_dock_chrome, paint_drop_preview, paint_menu,
-    paint_overlay_badge, paint_overlay_labels, paint_palette, paint_panels, paint_toasts,
-    paint_windows, run_clipboard_action, scroll_last_widget, select_tab_by_title,
+    paint_overlay_badge, paint_overlay_labels, paint_palette, paint_panels, paint_status_bar,
+    paint_toasts, paint_windows, run_clipboard_action, scroll_last_widget, select_tab_by_title,
     sync_command_files, sync_panel_commands, view_id, ConsoleLine, EditorShellState, Toast,
-    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, TOAST_FRAMES,
+    CONSOLE_LINES_MAX, MENU_BAR_HEIGHT, STATUS_BAR_HEIGHT, TOAST_FRAMES,
 };
 
 /// The shell's UI work: state, docking layout, panel dispatch and
@@ -354,15 +354,17 @@ pub fn editor_shell_update(
             );
         }
     }
-    // Step 2: docking geometry for the client area under the menu bar.
+    // Step 2: docking geometry for the client area under the menu bar and
+    // above the status bar (design v5).
     let available = input.logical_size;
+    let entity_count = editor_snapshot.entities.len();
     let snapshot = compute_layout(
         &state.layout,
         LayoutRect::new(
             0.0,
             MENU_BAR_HEIGHT,
             available.x as f64,
-            (available.y as f64 - MENU_BAR_HEIGHT).max(0.0),
+            (available.y as f64 - MENU_BAR_HEIGHT - STATUS_BAR_HEIGHT).max(0.0),
         ),
         LayoutMetrics::default(),
     );
@@ -704,6 +706,7 @@ pub fn editor_shell_update(
     paint_menu(&mut state, &registry, &mut frame, available);
     paint_palette(&mut state, &registry, &mut frame, available);
     paint_context_menu(&mut state, &registry, &mut frame);
+    paint_status_bar(&mut state, entity_count, &mut frame, available);
     // Step 5b: the overlay layer's own content (Stage 21): the labels the
     // executable projected, the toast stack and the frame-rate badge, all of
     // them above the panels and above the view surfaces' windows (D24).

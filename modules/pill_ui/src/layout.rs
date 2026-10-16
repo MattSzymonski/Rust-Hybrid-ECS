@@ -1175,7 +1175,7 @@ mod tests {
         let middle_id = WidgetId::named(scroller, "b");
         let last = WidgetId::named(scroller, "c");
         let build = |ui: &mut PanelBuilder<'_>| {
-            ui.scroll_area("scroller", 30.0, |ui| {
+            ui.scroll_area("scroller", 44.0, |ui| {
                 ui.drag_value("a", 0.0, 0.1);
                 ui.drag_value("b", 0.0, 0.1);
                 ui.drag_value("c", 0.0, 0.1);
