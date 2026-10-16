@@ -83,6 +83,8 @@ CLIPBOARD_PASTE_COMPONENT_TOKEN = "[editor] clipboard paste component"
 DROP_PREVIEW_TOKEN = "[editor] drop preview shown"
 IMPORT_QUEUED_TOKEN = "[editor] file drop import queued"
 IMPORTED_ASSET_TOKEN = "[assets] imported a new asset"
+COMMAND_FAILED_TOKEN = "[editor] command failed"
+TOAST_TOKEN = "[editor] toast"
 TEST_CLICK_TOKEN = "[editor] test click"
 
 ENTITY_ROW_PATTERN = re.escape(ENTITY_LIST_TOKEN) + r"\s+entity=(\S+)\s"
@@ -504,6 +506,32 @@ def main() -> int:
             time.sleep(0.25)
         assert not DROP_COPY.exists(), "undo must remove the copied file"
         print("  [OK] undo removed the imported file")
+
+        # Step 4a-bis (Stage 34): a folder dropped on the Assets panel is
+        # refused with a visible message - the import command fails its
+        # validation and the failure reaches the screen as a toast - and
+        # nothing is copied. The manual checklist read the old silence as
+        # "the drop is broken".
+        folder_source = REPOSITORY_ROOT / "local" / "temp" / "s18_drop_folder"
+        folder_source.mkdir(parents=True, exist_ok=True)
+        (folder_source / "inner.png").write_bytes(DROP_SOURCE.read_bytes())
+        folder_copy = ASSET_ROOT / folder_source.name
+        begin = len(session.read_log())
+        session.send(f"drop-file {folder_source}")
+        session.wait(
+            re.escape(COMMAND_FAILED_TOKEN) + r"[^\n]*is not a file",
+            30,
+            "folder refusal",
+            begin,
+        )
+        session.wait(
+            re.escape(TOAST_TOKEN) + r"[^\n]*is not a file",
+            30,
+            "refusal toast",
+            begin,
+        )
+        assert not folder_copy.exists(), "a refused drop must copy nothing"
+        print("  [OK] folder drop refused with a visible message")
 
         # Step 4b: several files dropped together share one undo step, and a
         # type no imported asset type claims still copies - without metadata.
