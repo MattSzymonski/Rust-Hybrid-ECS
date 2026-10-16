@@ -4,9 +4,10 @@
 //!
 //! - [`Theme`]: every colour and metric the built-in widget painting uses
 //!   ([`Theme::color_tokens`] lists the colours for the UI Gallery).
-//! - The built-in default (plan decision D7): the approved Stage 10 design
-//!   (W-0004 v4) in code; `assets/default.css` states the same tokens in the
-//!   CSS subset and wins wherever a rule is more specific.
+//! - The built-in default (plan decision D7): the approved v5 design
+//!   (W-0004, design_proposal_v5.html; D35) in code; `assets/default.css`
+//!   states the same tokens in the CSS subset and wins wherever a rule is
+//!   more specific.
 //!
 //! # Design
 //!
@@ -26,6 +27,8 @@ use crate::draw::Color;
 pub struct Theme {
     /// Regular text size in logical pixels.
     pub font_size: f32,
+    /// Small text: log lines, badges, the status bar.
+    pub font_small: f32,
     /// Heading text size in logical pixels.
     pub heading_size: f32,
     /// Line height for regular text.
@@ -66,6 +69,14 @@ pub struct Theme {
     pub highlight: Color,
     /// The highlight's wash: selected rows and hovered menu items.
     pub highlight_wash: Color,
+    /// A healthy state: the running pill, ready states.
+    pub ok: Color,
+    /// A warning state: warn badges and log levels.
+    pub warn: Color,
+    /// An error state: error badges and log levels.
+    pub error: Color,
+    /// An informational state: info badges and log levels.
+    pub info: Color,
     /// A default button's fill.
     pub button: Color,
     /// A hovered button's fill.
@@ -107,15 +118,16 @@ impl Default for Theme {
         Theme {
             // 13/15 px, 18 px lines: the approved type scale (--fs-md, --fs-lg).
             font_size: 13.0,
+            font_small: 12.0,
             heading_size: 15.0,
             line_height: 18.0,
-            item_height: 24.0,
+            item_height: 26.0,
             spacing: 6.0,
             padding: 8.0,
             indent: 14.0,
             // The same values `assets/default.css` states, exactly; the two
-            // are the approved Stage 10 design (W-0004 v4) in code and in
-            // the subset (D7).
+            // are the approved v5 design (W-0004, D35) in code and in the
+            // subset (D7).
             window: Color::rgba(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 1.0),
             panel: Color::rgba(25.0 / 255.0, 25.0 / 255.0, 25.0 / 255.0, 1.0),
             raised: Color::rgba(31.0 / 255.0, 31.0 / 255.0, 31.0 / 255.0, 1.0),
@@ -130,6 +142,10 @@ impl Default for Theme {
             text_disabled: Color::rgba(78.0 / 255.0, 78.0 / 255.0, 78.0 / 255.0, 1.0),
             highlight: Color::rgba(240.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0, 1.0),
             highlight_wash: Color::rgba(240.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0, 0.16),
+            ok: Color::rgba(108.0 / 255.0, 197.0 / 255.0, 125.0 / 255.0, 1.0),
+            warn: Color::rgba(223.0 / 255.0, 161.0 / 255.0, 78.0 / 255.0, 1.0),
+            error: Color::rgba(240.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0, 1.0),
+            info: Color::rgba(107.0 / 255.0, 167.0 / 255.0, 224.0 / 255.0, 1.0),
             button: Color::rgba(42.0 / 255.0, 42.0 / 255.0, 42.0 / 255.0, 1.0),
             button_hover: Color::rgba(51.0 / 255.0, 51.0 / 255.0, 51.0 / 255.0, 1.0),
             button_active: Color::rgba(61.0 / 255.0, 61.0 / 255.0, 61.0 / 255.0, 1.0),
@@ -141,10 +157,10 @@ impl Default for Theme {
             scrollbar_track: Color::rgba(25.0 / 255.0, 25.0 / 255.0, 25.0 / 255.0, 1.0),
             scrollbar_width: 9.0,
             border_width: 1.0,
-            radius_tiny: 2.0,
-            radius_small: 3.0,
-            radius_medium: 5.0,
-            radius_large: 6.0,
+            radius_tiny: 3.0,
+            radius_small: 5.0,
+            radius_medium: 7.0,
+            radius_large: 9.0,
         }
     }
 }
@@ -167,6 +183,10 @@ impl Theme {
             ("text_disabled", self.text_disabled),
             ("highlight", self.highlight),
             ("highlight_wash", self.highlight_wash),
+            ("ok", self.ok),
+            ("warn", self.warn),
+            ("error", self.error),
+            ("info", self.info),
             ("button", self.button),
             ("button_hover", self.button_hover),
             ("button_active", self.button_active),
@@ -193,7 +213,7 @@ mod tests {
         let theme = Theme::default();
         assert!(theme.item_height >= theme.line_height);
         assert!(theme.padding > 0.0 && theme.spacing > 0.0);
-        assert_eq!(theme.color_tokens().len(), 23);
+        assert_eq!(theme.color_tokens().len(), 27);
         // Every colour is visible against the background it sits on.
         assert!(theme.text.a > 0.9);
         assert!(theme.highlight.a > 0.9);

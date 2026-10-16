@@ -34,6 +34,8 @@ pub fn ui_gallery(ui: &mut PanelBuilder<'_>) {
 
     ui.collapsing("Buttons", true, |ui| {
         ui.button("Default");
+        ui.class("primary");
+        ui.button("Primary");
         ui.button_enabled("Disabled", false);
         ui.row(|ui| {
             ui.button("Row A");
