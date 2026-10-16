@@ -2,12 +2,14 @@
 //!
 //! # Responsibilities
 //!
-//! - [`EditorTab`]: the MVP's two tabs - the world's entities and systems -
-//!   and their titles.
-//! - [`EditorDock`]: the `egui_dock` state with the default layout, the
-//!   schema version its documents carry, and [`EditorDock::settled`] which
-//!   replaces the placeholder rectangles an unpacked layout has not
-//!   computed yet.
+//! - [`EditorTab`]: the editor's four tabs - the scene view's placeholder,
+//!   the world's entities and systems, and the assets mock - and their
+//!   titles.
+//! - [`EditorDock`]: the `egui_dock` state with the default layout (the
+//!   scene in the center, the entity and system columns on the sides, the
+//!   assets row below), the schema version its documents carry, and
+//!   [`EditorDock::settled`] which replaces the placeholder rectangles an
+//!   unpacked layout has not computed yet.
 //!
 //! # Design
 //!
@@ -18,35 +20,56 @@
 
 // External crates
 use pill_ui_egui::egui::Rect;
-use pill_ui_egui::egui_dock::{DockState, Node};
+use pill_ui_egui::egui_dock::{DockState, Node, NodeIndex};
 use serde::{Deserialize, Serialize};
+
+/// The fraction of the window's width one side column takes in the default
+/// layout.
+pub const SIDE_COLUMN_FRACTION: f32 = 0.16;
+
+/// The fraction of the window's height the bottom row takes in the default
+/// layout.
+pub const BOTTOM_ROW_FRACTION: f32 = 0.24;
 
 /// One tab of the egui editor.
 ///
-/// The MVP's two tabs (plan decisions E2, Stage 7). The enum is serialized
-/// into the saved layout, so adding a tab is a schema change.
+/// The enum is serialized into the saved layout, so adding a tab is a
+/// schema change (`LAYOUT_SCHEMA_VERSION`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EditorTab {
+    /// The scene view's placeholder: the shell measures this tab's body and
+    /// draws nothing, so the scene's child window shows through the center.
+    Scene,
     /// The world's entities: id, name, click to select.
     Entities,
     /// The world's systems: name, stage, enabled.
     Systems,
+    /// The assets panel's mock: fixed rows until the asset store is ported.
+    Assets,
 }
 
 impl EditorTab {
     /// Every tab, in tab-strip order.
-    pub const ALL: [EditorTab; 2] = [EditorTab::Entities, EditorTab::Systems];
+    pub const ALL: [EditorTab; 4] = [
+        EditorTab::Scene,
+        EditorTab::Entities,
+        EditorTab::Systems,
+        EditorTab::Assets,
+    ];
 
     /// The tab's display title.
     pub fn title(self) -> &'static str {
         match self {
+            EditorTab::Scene => "Scene",
             EditorTab::Entities => "Entities",
             EditorTab::Systems => "Systems",
+            EditorTab::Assets => "Assets",
         }
     }
 }
 
-/// The editor's dock: an `egui_dock` state with the MVP's default layout.
+/// The editor's dock: an `egui_dock` state with the editor's default
+/// layout.
 ///
 /// The shell keeps one of these in its session resource, so a reload of the
 /// shell module finds the dock exactly where the user left it; persistence
@@ -66,11 +89,33 @@ impl Default for EditorDock {
 }
 
 impl EditorDock {
-    /// A dock with the default layout: one tab set holding both tabs.
+    /// A dock with the default layout: the scene in the center, the entity
+    /// and system lists as side columns, and the assets mock as a bottom
+    /// row across the window.
     pub fn new() -> Self {
+        let mut state = DockState::new(vec![EditorTab::Scene]);
+        let tree = state.main_surface_mut();
+        // The assets row spans the full width, so it splits off first; the
+        // old node keeps the space above it.
+        let [upper, _assets] = tree.split_below(
+            NodeIndex::root(),
+            1.0 - BOTTOM_ROW_FRACTION,
+            vec![EditorTab::Assets],
+        );
+        // The entity column then splits the upper node; the old node keeps
+        // the space right of the column. Unlike `split_below`/`split_right`,
+        // whose fraction is taken by the old node, `split_left` puts the new
+        // node in the fraction-sized slot on the left.
+        let [middle, _entities] =
+            tree.split_left(upper, SIDE_COLUMN_FRACTION, vec![EditorTab::Entities]);
+        // The system column takes as much of the middle node as a side
+        // column takes of the whole window.
+        let system_fraction = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
+        let [_center, _systems] =
+            tree.split_right(middle, system_fraction, vec![EditorTab::Systems]);
         Self {
             schema_version: super::LAYOUT_SCHEMA_VERSION,
-            state: DockState::new(EditorTab::ALL.to_vec()),
+            state,
         }
     }
 
@@ -139,12 +184,68 @@ fn settle_rect(rect: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_ui_egui::egui_dock::SurfaceIndex;
 
     #[test]
-    fn the_default_layout_holds_both_tabs() {
+    fn the_default_layout_holds_every_tab() {
         let dock = EditorDock::new();
-        assert!(dock.contains(EditorTab::Entities));
-        assert!(dock.contains(EditorTab::Systems));
+        for tab in EditorTab::ALL {
+            assert!(
+                dock.contains(tab),
+                "{tab:?} is missing from the default layout"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_layout_centers_scene_with_columns_and_a_bottom_row() {
+        let dock = EditorDock::new();
+        let state = dock.state();
+        let surface = SurfaceIndex::main();
+        let tabs_at = |index: NodeIndex| -> Vec<EditorTab> {
+            state[surface][index]
+                .get_leaf()
+                .expect("the layout index points at a leaf")
+                .tabs
+                .clone()
+        };
+        // A split's fraction is the share of its top/left child, which is
+        // the slot each `split_*` call assigns by its own rule.
+        let fraction_at = |index: NodeIndex| -> f32 {
+            match &state[surface][index] {
+                Node::Vertical(split) | Node::Horizontal(split) => split.fraction,
+                _ => panic!("the layout index points at a split"),
+            }
+        };
+        // The root stacks the assets row below everything else.
+        let root = NodeIndex::root();
+        assert!(
+            state[surface][root].is_vertical(),
+            "the assets row is not a bottom split"
+        );
+        assert_eq!(tabs_at(root.right()), vec![EditorTab::Assets]);
+        // The node above splits into the entity column and the rest.
+        let upper = root.left();
+        assert!(
+            state[surface][upper].is_horizontal(),
+            "the entity column is not a side split"
+        );
+        assert_eq!(tabs_at(upper.left()), vec![EditorTab::Entities]);
+        // The rest splits into the scene center and the system column.
+        let rest = upper.right();
+        assert!(
+            state[surface][rest].is_horizontal(),
+            "the system column is not a side split"
+        );
+        assert_eq!(tabs_at(rest.left()), vec![EditorTab::Scene]);
+        assert_eq!(tabs_at(rest.right()), vec![EditorTab::Systems]);
+        // Each side column is one `SIDE_COLUMN_FRACTION` of its split, the
+        // assets row one `BOTTOM_ROW_FRACTION` of the window, and the scene
+        // keeps the rest.
+        assert!((fraction_at(root) - (1.0 - BOTTOM_ROW_FRACTION)).abs() < f32::EPSILON);
+        assert!((fraction_at(upper) - SIDE_COLUMN_FRACTION).abs() < f32::EPSILON);
+        let scene_share = 1.0 - SIDE_COLUMN_FRACTION / (1.0 - SIDE_COLUMN_FRACTION);
+        assert!((fraction_at(rest) - scene_share).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -154,8 +255,9 @@ mod tests {
         // the worst case and must round-trip.
         let json = serde_json::to_string(&dock.settled()).expect("serialize the dock");
         let restored: EditorDock = serde_json::from_str(&json).expect("deserialize the dock");
-        assert!(restored.contains(EditorTab::Entities));
-        assert!(restored.contains(EditorTab::Systems));
+        for tab in EditorTab::ALL {
+            assert!(restored.contains(tab));
+        }
         assert_eq!(restored.schema_version(), dock.schema_version());
     }
 }

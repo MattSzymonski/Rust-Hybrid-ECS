@@ -29,10 +29,14 @@ pill_engine_core = { path = "../pill_engine_core" }
 # (`egui-wgpu` 0.32.3) works with the engine's pinned wgpu 25. `default_fonts`
 # is the one feature this library needs; every consumer names egui through
 # this crate's re-exports.
-egui = { version = "0.32.3", default-features = false, features = ["default_fonts"] }
+egui = { version = "0.32.3", default-features = false, features = [
+    "default_fonts",
+] }
 # Docking (plan decision E2): tabs, splits and undocked windows. `serde`
 # lets the editor's model crate persist the layout.
-egui_dock = { version = "0.17.0", default-features = false, features = ["serde"] }
+egui_dock = { version = "0.17.0", default-features = false, features = [
+    "serde",
+] }
 
 # Feature pins, in the style of `pill_ui`'s pin block: this `dylib`'s
 # exported symbol names hash the features of every crate below it, and the
@@ -45,4 +49,6 @@ egui_dock = { version = "0.17.0", default-features = false, features = ["serde"]
 # (its vertex buffer conversion) and the module world never links
 # `egui-wgpu`; neither `egui` nor `egui_dock` adds features beyond the
 # requests above, so those need no extra pins.
-epaint = { version = "0.32.3", default-features = false, features = ["bytemuck"] }
+epaint = { version = "0.32.3", default-features = false, features = [
+    "bytemuck",
+] }
