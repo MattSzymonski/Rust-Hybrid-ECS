@@ -87,6 +87,23 @@
                     "endsPattern": "waiting up to .* for a managed debugger"
                 }
             }
+        },
+        {
+            // Debug build of the editor executable. Matches
+            // `cargo build --package pill_editor --offline`.
+            "label": "build editor (debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "pill_editor",
+                "--offline"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/modules"
+            },
+            "group": "build"
         }
     ]
 }

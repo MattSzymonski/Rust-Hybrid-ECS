@@ -29,7 +29,7 @@ DESCRIPTION
     The `editor` step is the end-to-end lane. It first runs the two host-tier
     editor suites (`test_editor_crates.py`, `test_editor_revision.py`), which
     build a narrowed `pill_standalone` and would re-split the shared DLLs if
-    they ran later; then it builds `pill_editor_native` (the uplift), and
+    they ran later; then it builds `pill_editor` (the uplift), and
     then runs the suites tagged `SETS: editor` through
     `devops/tests/run_all.py --set editor` - serially, each with its own
     timeout, and with `RUN: manual` suites (the real-mouse drag-out session)
@@ -82,12 +82,12 @@ PYTHON = sys.executable
 HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
 # The default test lane must compile without hot_patch, so the plain-reload
 # code paths (`cfg(not(feature = "hot_patch"))`) are built and tested. Cargo
-# unifies features across one invocation, and these three members turn
-# hot_patch on (`editor` by default, `pill_editor_native` unconditionally,
-# `pill_standalone` by default), so the lane leaves them out; the hot_patch lane
-# runs the whole workspace, them included. The `default-lane-features` step
-# fails if a new member brings hot_patch back.
-DEFAULT_LANE = ["--workspace", "--exclude", "pill_standalone", "--exclude", "editor", "--exclude", "pill_editor_native"]
+# unifies features across one invocation, and these two members turn
+# hot_patch on (`pill_editor` unconditionally, `pill_standalone` by default),
+# so the lane leaves them out; the hot_patch lane runs the whole workspace,
+# them included. The `default-lane-features` step fails if a new member brings
+# hot_patch back.
+DEFAULT_LANE = ["--workspace", "--exclude", "pill_standalone", "--exclude", "pill_editor"]
 
 # The unit-test steps run through nextest when it is installed, and through
 # `cargo test` when it is not, so the gate still runs on a machine that never
@@ -277,7 +277,7 @@ STEPS: List[Step] = [
     # The end-to-end editor lane: the real executable, driven through its
     # scripted channel. Order is the whole point. The two host-tier suites
     # build their own narrowed `pill_standalone`, which re-splits the shared
-    # DLLs, so they run first; the uplift (`pill_editor_native` on the
+    # DLLs, so they run first; the uplift (`pill_editor` on the
     # current dylibs) must then be the last build before any launch, or the
     # editor dies on 0xC0000139 (`check_relevant.py` encodes the same rule
     # for the change-scoped runs). The desktop suites launch the pre-built
@@ -289,7 +289,7 @@ STEPS: List[Step] = [
         "Editor suites (the real executable, scripted)",
         [
             [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_crates.py", "test_editor_revision.py"],
-            ["cargo", "build", "-p", "pill_editor_native"],
+            ["cargo", "build", "-p", "pill_editor"],
             [PYTHON, "../devops/tests/run_all.py", "--set", "editor"],
         ],
     ),

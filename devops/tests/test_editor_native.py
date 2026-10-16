@@ -4,7 +4,7 @@ PROTECTS: The native editor: startup, shell module, input routing, live patch, o
 TIER: editor
 SETS: editor
 
-Builds against an already-built `pill_editor_native` binary, starts it on
+Builds against an already-built `pill_editor` binary, starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the
 suite's heartbeat waits are short - with the scripted input channel
 (`PILL_EDITOR_TEST_COMMANDS`), and asserts on its log tokens: startup, the
@@ -132,7 +132,7 @@ def main() -> int:
     parser.add_argument(
         "--binary",
         type=Path,
-        help="the built pill_editor_native binary (default: the debug build)",
+        help="the built pill_editor binary (default: the debug build)",
     )
     parser.add_argument(
         "--project",

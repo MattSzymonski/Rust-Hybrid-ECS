@@ -79,17 +79,17 @@ third-party families - from the binary wasm-opt has not stripped yet.
 Shared code, imported by everything above. Nothing here executes a measurement
 or asserts anything.
 
-| Module | Role |
-| --- | --- |
-| `paths.py` | devops/repository layout, plus `ensure_devops_on_path()` |
-| `environment.py` | git / OS / CPU / toolchain metadata |
-| `storage.py` | measurement files and the `index.json` manifest |
-| `compare.py` | baseline comparison behind `pill_lab.py compare` |
-| `criterion.py` | Criterion output parsing |
-| `cargo_timings.py` | cargo `--timings` report parsing |
-| `cli.py` | the argument-parser and store/report contract benchmarks share |
-| `test_report.py` | pass/fail/skip tally, summary block, size reports, cargo test totals |
-| `suite_common.py` | host process plumbing: log tokens, output monitor, backup/restore |
+| Module             | Role                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| `paths.py`         | devops/repository layout, plus `ensure_devops_on_path()`             |
+| `environment.py`   | git / OS / CPU / toolchain metadata                                  |
+| `storage.py`       | measurement files and the `index.json` manifest                      |
+| `compare.py`       | baseline comparison behind `pill_lab.py compare`                     |
+| `criterion.py`     | Criterion output parsing                                             |
+| `cargo_timings.py` | cargo `--timings` report parsing                                     |
+| `cli.py`           | the argument-parser and store/report contract benchmarks share       |
+| `test_report.py`   | pass/fail/skip tally, summary block, size reports, cargo test totals |
+| `suite_common.py`  | host process plumbing: log tokens, output monitor, backup/restore    |
 
 A standalone script reaches it by putting `devops/` on `sys.path` first:
 
@@ -114,13 +114,13 @@ python devops/pill_lab/pill_lab.py serve     # browse the history
 
 The CI gate, the release build and the shell entry points.
 
-| File | What it is |
-| --- | --- |
-| `verify.py` | the CI gate: every check CI runs, as named steps (`--list`, `--only`, `--quick`) |
-| `check_relevant.py` | runs only the checks a change set needs, by repository area |
-| `build_release.py` / `.sh` | release builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails) |
-| `run_hot_reload_tests.sh` | the hot-reload regression net: a fixed set of suites in `tests/` |
-| `generate_documentation.sh` | `docs/generate_documentation_markdown.py` |
+| File                        | What it is                                                                       |
+| --------------------------- | -------------------------------------------------------------------------------- |
+| `verify.py`                 | the CI gate: every check CI runs, as named steps (`--list`, `--only`, `--quick`) |
+| `check_relevant.py`         | runs only the checks a change set needs, by repository area                      |
+| `build_release.py` / `.sh`  | release builds (they clear `RUSTFLAGS`; a plain `cargo build --release` fails)   |
+| `run_hot_reload_tests.sh`   | the hot-reload regression net: a fixed set of suites in `tests/`                 |
+| `generate_documentation.sh` | `docs/generate_documentation_markdown.py`                                        |
 
 `check_relevant.py` is the loop to use after a change: it reads the working
 tree's change set (or `--paths`), matches every file against a per-area rule
@@ -132,7 +132,7 @@ editor build (the uplift) prepended; a file no rule recognizes falls back to
 and the tier runs stay for stage boundaries and milestones.
 
 The gate itself carries the editor end to end: its `editor` step runs the
-two host-tier editor suites, builds `pill_editor_native` (the uplift), and
+two host-tier editor suites, builds `pill_editor` (the uplift), and
 then runs every suite tagged `SETS: editor` (`run_all.py --set editor`),
 serially and with the manual drag-out session reported as skipped - that
 order is required, because the host suites' narrowed build re-splits the

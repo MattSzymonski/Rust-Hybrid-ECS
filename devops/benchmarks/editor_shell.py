@@ -4,7 +4,7 @@ Editor Shell benchmark: the native editor's startup, steady-state frames and
 its four D32 performance numbers (W-0004 Stage 23).
 
 REQUIREMENTS: Python 3.8+, a built editor binary (prefers the
-`dev-optimized` profile: `cargo build -p pill_editor_native --profile
+`dev-optimized` profile: `cargo build -p pill_editor --profile
 dev-optimized` in modules/), a matching `pill_standalone` build for the
 comparison cases, and a GPU the windowed editor can render with.
 
@@ -184,7 +184,7 @@ def profile_binary(name: str) -> Path:
 
 def editor_binary() -> Path:
     """The editor executable, required to exist already."""
-    return profile_binary("pill_editor_native")
+    return profile_binary("pill_editor")
 
 
 def standalone_binary() -> Path:
@@ -196,7 +196,7 @@ def kill_editors() -> None:
     """Kills stray editors so they cannot fight this run over the module
     build directory, the way every host-driving suite does."""
     subprocess.run(
-        ["taskkill", "/F", "/IM", "pill_editor_native.exe"],
+        ["taskkill", "/F", "/IM", "pill_editor.exe"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -750,7 +750,7 @@ def run(
 
     return {
         "command": {
-            "argv": ["pill_editor_native", "--project", project],
+            "argv": ["pill_editor", "--project", project],
             "cwd": str(MODULES_ROOT),
         },
         "measurement": {

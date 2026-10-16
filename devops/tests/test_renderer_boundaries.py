@@ -17,7 +17,7 @@ DESCRIPTION
 
       1. wgpu          - only a GPU module depends on `wgpu` (or one of the
                          named exceptions, `pill_ui_wgpu` and
-                         `pill_editor_native`), and at least one GPU module
+                         `pill_editor`), and at least one GPU module
                          does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
                          crates: pill_core, pill_core_macros, pill_engine,
@@ -93,9 +93,9 @@ GRAPHICS_CRATE = "wgpu"
 
 # Crates outside the renderer split that link the graphics crate by design:
 # `pill_ui_wgpu` is the shared UI draw-list backend (an `rlib` compiled into
-# its users, never a module) and `pill_editor_native` the editor shell, which
+# its users, never a module) and `pill_editor` the editor shell, which
 # owns the window and its swap chain (plan decisions D8, D19).
-WGPU_EXCEPTION_CRATES = {"pill_ui_wgpu", "pill_editor_native"}
+WGPU_EXCEPTION_CRATES = {"pill_ui_wgpu", "pill_editor"}
 
 
 # Every broken rule under `repository`, as (rule number, message) pairs.
