@@ -310,6 +310,11 @@ pub fn layout_directory() -> PathBuf {
 /// Windows: `%LOCALAPPDATA%`. Elsewhere: `$XDG_STATE_HOME`, or
 /// `~/.local/state` when it is unset, as the XDG base directory spec says.
 /// The temp directory is the last resort for an environment with neither.
+///
+/// A browser has no environment and no filesystem; `std::env` panics there
+/// (Stage 30), so the web posture reports the working directory and every
+/// file read or write fails gracefully into the default workspace instead.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn editor_state_directory() -> PathBuf {
     if cfg!(windows) {
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -325,6 +330,12 @@ pub fn editor_state_directory() -> PathBuf {
         }
     }
     std::env::temp_dir()
+}
+
+/// The web posture's editor state directory; see the native function above.
+#[cfg(target_arch = "wasm32")]
+pub fn editor_state_directory() -> PathBuf {
+    PathBuf::from("editor-state")
 }
 
 #[cfg(test)]

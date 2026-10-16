@@ -47,6 +47,9 @@ from pathlib import Path
 # Locations, relative to the repository root.
 GENERATOR = Path("devops") / "tools" / "generate_shipping_bundle.py"
 PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "index.html"
+# The editor posture's page (Stage 30): two stacked canvases and the scripted
+# channel's page hook.
+EDITOR_PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "editor.html"
 WEB_APP_DIRECTORY = Path("build") / "pill_web_app"
 WORKSPACE_LOCK = Path("modules") / "Cargo.lock"
 WEB_TARGET_DIRECTORY = Path("build") / "build_meta" / "web_target"
@@ -70,16 +73,22 @@ def main() -> int:
     # Parse the flags and the optional project path.
     development = False
     wasm_opt = True
+    editor = False
     positional = []
     for argument in sys.argv[1:]:
         if argument == "--dev":
             development = True
+        elif argument == "--editor":
+            editor = True
         elif argument == "--no-wasm-opt":
             wasm_opt = False
         else:
             positional.append(argument)
     if len(positional) > 1:
-        print("usage: build_web.py [--dev] [--no-wasm-opt] [project_path]", file=sys.stderr)
+        print(
+            "usage: build_web.py [--dev] [--editor] [--no-wasm-opt] [project_path]",
+            file=sys.stderr,
+        )
         return 2
     project_path = positional[0] if positional else os.environ.get("PROJECT_PATH", "")
     if not project_path:
@@ -88,8 +97,14 @@ def main() -> int:
     root = repository_root()
     project_root = (root / project_path).resolve()
 
-    # Step 1: regenerate the shipping bundle and the web app crate.
-    status = run([sys.executable, root / GENERATOR, "--web", project_path], root)
+    # Step 1: regenerate the shipping bundle and the web app crate. The
+    # editor posture links the shell and the project's editor crates into
+    # the same wasm (Stage 30).
+    generator_command = [sys.executable, root / GENERATOR, "--web"]
+    if editor:
+        generator_command.append("--editor")
+    generator_command.append(project_path)
+    status = run(generator_command, root)
     if status != 0:
         return status
 
@@ -123,7 +138,8 @@ def main() -> int:
     status = run(command, web_app_directory, environment)
     if status != 0:
         return status
-    shutil.copyfile(root / PAGE_TEMPLATE, output_directory / "index.html")
+    page_template = EDITOR_PAGE_TEMPLATE if editor else PAGE_TEMPLATE
+    shutil.copyfile(root / page_template, output_directory / "index.html")
 
     # Step 4: report where it is and how to open it.
     module_path = package_directory / WEB_MODULE_NAME

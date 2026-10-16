@@ -14,6 +14,14 @@ pill_core = { path = "../../pill_core" }
 # What runs the game: the engine, the linked project and the renderer attached
 # to the canvas.
 pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
+# The editor posture (Stage 30): the shell's plain-data contract and the UI
+# renderer its frame draws through. The shell crate itself is linked by the
+# generated bundle, which calls its `register`.
+pill_editor_api = { path = "../../hosting/pill_editor_api" }
+pill_engine_core = { path = "../../pill_engine_core" }
+pill_ui = { path = "../../pill_ui" }
+pill_ui_wgpu = { path = "../../pill_ui_wgpu" }
+wgpu = "25.0.0"
 # The canvas window and the browser's event loop.
 winit = "0.30"
 # The canvas's keyboard and mouse events as engine input events.

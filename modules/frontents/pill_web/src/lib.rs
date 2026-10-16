@@ -42,6 +42,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
+/// The editor posture (Stage 30): the scene on one canvas, the shell's UI on
+/// another.
+#[cfg(target_arch = "wasm32")]
+pub mod editor;
+
 /// Run `project` in the page's canvas whose element id is `canvas_id`.
 ///
 /// Returns once the event loop is handed to the browser; the game then runs on
@@ -236,7 +241,7 @@ impl WebApplication {
 ///
 /// Returns a description of what is missing: the document, the element, or
 /// an element that is not a canvas.
-fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
+pub(crate) fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
     let document = web_sys::window()
         .and_then(|window| window.document())
         .ok_or("the page has no document")?;
@@ -258,7 +263,9 @@ fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> {
 /// # Errors
 ///
 /// Returns the JS error if `focus` is missing or the call rejects.
-fn focus_without_scrolling(element: &HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
+pub(crate) fn focus_without_scrolling(
+    element: &HtmlCanvasElement,
+) -> Result<(), wasm_bindgen::JsValue> {
     let element: &wasm_bindgen::JsValue = element.as_ref();
     let options = js_sys::Object::new();
     js_sys::Reflect::set(
@@ -277,14 +284,14 @@ fn focus_without_scrolling(element: &HtmlCanvasElement) -> Result<(), wasm_bindg
 }
 
 /// The canvas's laid-out size in physical pixels, at least 1x1.
-fn physical_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
+pub(crate) fn physical_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
     let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
     let scale = |css_pixels: i32| (f64::from(css_pixels) * ratio).round().max(1.0) as u32;
     (scale(canvas.client_width()), scale(canvas.client_height()))
 }
 
 /// Report a failure to the log, with its whole cause chain.
-fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
+pub(crate) fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
     let cause_chain = format_error_chain(error);
     error!(target: telemetry_target::ENGINE, error = %cause_chain, "{} failed", context);
 }
