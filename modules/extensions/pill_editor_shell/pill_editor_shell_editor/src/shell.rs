@@ -3670,6 +3670,17 @@ pub fn handle_file_drops(
             count = dropped.len(),
             "[editor] file drop ignored outside the assets panel"
         );
+        // The refusal is visible (Stage 34): the manual checklist read the
+        // silence as "the drop is broken".
+        state.toasts.push_back(Toast {
+            level: EditorProblemLevel::Warning,
+            text: String::from("Drop files on the Assets panel to import them"),
+            expires_at_frame: state.frame_index + TOAST_FRAMES,
+        });
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[editor] file drop refusal toast"
+        );
         return;
     }
     let Some(root) = input.asset_root.clone() else {

@@ -132,6 +132,75 @@ const OVERLAY_LABEL_LIFT: f32 = 18.0;
 /// overlay path without a log line per frame (Stage 21).
 const OVERLAY_HEARTBEAT_FRAMES: u64 = 120;
 
+/// The message a failed command shows the person: the reason alone, with a
+/// `Command { ... }:` debug prefix and the directory parts of quoted paths
+/// trimmed - the console records the full form, and the raw text read as
+/// noise in a toast (Stage 34's checklist).
+fn failure_message_for_display(message: &str) -> String {
+    let reason = message
+        .split_once("}: ")
+        .map_or(message, |(_command, reason)| reason);
+    let mut display = String::with_capacity(reason.len());
+    let mut rest = reason;
+    while let Some(start) = rest.find('`') {
+        let (before, from_tick) = rest.split_at(start);
+        display.push_str(before);
+        let tail = &from_tick[1..];
+        let Some(end) = tail.find('`') else {
+            // An unpaired tick: keep the rest as it stands.
+            display.push_str(from_tick);
+            rest = "";
+            break;
+        };
+        let quoted = &tail[..end];
+        let shortened = if quoted.contains(['\\', '/']) {
+            quoted
+                .rsplit(['\\', '/'])
+                .find(|part| !part.is_empty())
+                .unwrap_or(quoted)
+        } else {
+            quoted
+        };
+        display.push('`');
+        display.push_str(shortened);
+        display.push('`');
+        rest = &tail[end + 1..];
+    }
+    display.push_str(rest);
+    display
+}
+
+#[cfg(test)]
+mod failure_message_tests {
+    use super::failure_message_for_display;
+
+    #[test]
+    fn the_command_debug_prefix_is_dropped() {
+        let message = r#"ImportFiles { sources: ["C:\\a\\New folder"], destination: "D:\\p\\res" }: `C:\Users\mateu\Desktop\New folder` is not a file"#;
+        assert_eq!(
+            failure_message_for_display(message),
+            "`New folder` is not a file"
+        );
+    }
+
+    #[test]
+    fn quoted_paths_shorten_to_their_file_name() {
+        let message = "the copy into `D:\\assets\\res\\hero.png` was refused";
+        assert_eq!(
+            failure_message_for_display(message),
+            "the copy into `hero.png` was refused"
+        );
+    }
+
+    #[test]
+    fn plain_and_tickless_messages_pass_through() {
+        let message = "the pick found no entity";
+        assert_eq!(failure_message_for_display(message), message);
+        let quoted = "the group `terrain` could not be removed";
+        assert_eq!(failure_message_for_display(quoted), quoted);
+    }
+}
+
 #[cfg(test)]
 mod gizmo_tests {
     use super::*;
@@ -2822,18 +2891,51 @@ impl EditorWindow {
             }
         }
         match event {
+            // The OS drag-and-drop events reach whichever window is under
+            // the pointer; a drop on the scene is the same drop the panels
+            // take (Stage 18, and the Stage 34 checklist found the gap).
+            WindowEvent::HoveredFile(path) => {
+                self.hover_file(path.clone());
+                return;
+            }
+            WindowEvent::HoveredFileCancelled => {
+                self.clear_hovered_files();
+                return;
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.drop_file(path.clone());
+                return;
+            }
+            _ => {}
+        }
+        match event {
             WindowEvent::CursorMoved { position, .. } => {
-                let view = &mut self.views[index];
-                if let Some((last_x, last_y)) = view.window.last_cursor {
+                // The editor UI owns the overlay's opaque regions even where
+                // a scene window sits under them (Stage 34: the real-mouse
+                // badge click); the scripted channel always routed this way,
+                // and the real pointer now follows the same rule. A camera
+                // gesture or a gizmo drag in flight keeps its moves.
+                let previous = self.views[index].window.last_cursor;
+                self.views[index].window.last_cursor = Some((position.x as f32, position.y as f32));
+                let mid_gesture = self.gizmo_drag.is_some()
+                    || self.views[index].window.orbiting
+                    || self.views[index].window.panning;
+                if !mid_gesture && self.scene_point_is_ui(index, *position) {
+                    if let Some(rebased) = self.rebase_scene_pointer(index, event) {
+                        self.push_ui_input(&rebased);
+                    }
+                    return;
+                }
+                if let Some((last_x, last_y)) = previous {
                     let delta_x = position.x as f32 - last_x;
                     let delta_y = position.y as f32 - last_y;
+                    let view = &mut self.views[index];
                     if view.window.orbiting {
                         view.camera.orbit(delta_x, delta_y);
                     } else if view.window.panning {
                         view.camera.pan(delta_x, delta_y);
                     }
                 }
-                view.window.last_cursor = Some((position.x as f32, position.y as f32));
                 // A gizmo drag follows the cursor (Stage 20); the move is a
                 // re-read of the ray, not an accumulation of deltas.
                 if self.gizmo_drag.is_some() {
@@ -2857,9 +2959,36 @@ impl EditorWindow {
                 winit::event::MouseButton::Left => match *state {
                     winit::event::ElementState::Pressed => {
                         let cursor = self.views[index].window.last_cursor;
+                        let mid_gesture = self.gizmo_drag.is_some()
+                            || self.views[index].window.orbiting
+                            || self.views[index].window.panning;
+                        let over_ui = !mid_gesture
+                            && cursor.is_some_and(|(x, y)| {
+                                self.scene_point_is_ui(
+                                    index,
+                                    winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                                )
+                            });
+                        if over_ui {
+                            // A press over the overlay's own region is the
+                            // UI's; its release pairs back below.
+                            self.push_ui_input(event);
+                            return;
+                        }
                         self.scene_press = cursor.map(|(x, y)| (index, x, y));
                     }
                     winit::event::ElementState::Released => {
+                        let cursor = self.views[index].window.last_cursor;
+                        let over_ui = cursor.is_some_and(|(x, y)| {
+                            self.scene_point_is_ui(
+                                index,
+                                winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                            )
+                        });
+                        if over_ui && self.gizmo_drag.is_none() {
+                            self.push_ui_input(event);
+                            return;
+                        }
                         // A release while a gizmo drag runs ends the drag; the
                         // press that started it already asked its pick.
                         if self.gizmo_drag.is_some() {
@@ -2874,6 +3003,20 @@ impl EditorWindow {
                 _ => {}
             },
             WindowEvent::MouseWheel { delta, .. } => {
+                // A wheel over a UI-owned region scrolls the UI; over the
+                // scene it dollies the editor camera.
+                let cursor = self.views[index].window.last_cursor;
+                let over_ui = self.gizmo_drag.is_none()
+                    && cursor.is_some_and(|(x, y)| {
+                        self.scene_point_is_ui(
+                            index,
+                            winit::dpi::PhysicalPosition::new(x as f64, y as f64),
+                        )
+                    });
+                if over_ui {
+                    self.push_ui_input(event);
+                    return;
+                }
                 let amount = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, lines) => *lines,
                     winit::event::MouseScrollDelta::PixelDelta(position) => position.y as f32,
@@ -2903,6 +3046,46 @@ impl EditorWindow {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Whether a scene window's client point is over one of the overlay's
+    /// opaque regions, in the main window's logical client pixels (Stage 34):
+    /// the same rule the scripted channel's click routing already used.
+    fn scene_point_is_ui(&self, index: usize, position: winit::dpi::PhysicalPosition<f64>) -> bool {
+        let Some(rect) = self.views.get(index).and_then(|view| view.logical) else {
+            return false;
+        };
+        let scale = self.window.scale_factor() as f32;
+        let x = rect.x as f32 + position.x as f32 / scale;
+        let y = rect.y as f32 + position.y as f32 / scale;
+        self.overlay_opaque.iter().any(|region| {
+            x >= region.x
+                && x <= region.x + region.width
+                && y >= region.y
+                && y <= region.y + region.height
+        })
+    }
+
+    /// A scene window's pointer event rebased into the main window's physical
+    /// pixels (Stage 34), so the UI sees a main-window position; `None` for
+    /// events that carry no position of their own.
+    fn rebase_scene_pointer(&self, index: usize, event: &WindowEvent) -> Option<WindowEvent> {
+        let rect = self.views.get(index).and_then(|view| view.logical)?;
+        let scale = self.window.scale_factor();
+        match event {
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+                ..
+            } => Some(WindowEvent::CursorMoved {
+                device_id: *device_id,
+                position: winit::dpi::PhysicalPosition::new(
+                    f64::from(rect.x) * scale + position.x,
+                    f64::from(rect.y) * scale + position.y,
+                ),
+            }),
+            _ => None,
         }
     }
 
@@ -4522,6 +4705,26 @@ impl EditorWindow {
                         message = %message,
                         "[editor] command failed"
                     );
+                    // The person sees it too (Stage 34): a refused command -
+                    // a folder dropped as an import, say - says so on screen
+                    // instead of only in the console ring. The console keeps
+                    // the full form; the toast shows the readable reason.
+                    let text = failure_message_for_display(&message);
+                    let level = EditorProblemLevel::Warning;
+                    let seq = self.notices.next_event_seq;
+                    self.notices.next_event_seq = seq + 1;
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        level = notice_level_name(level),
+                        text = text.as_str(),
+                        "[editor] toast"
+                    );
+                    self.notices
+                        .events
+                        .push(EditorNoticeEvent { seq, level, text });
+                    self.scene_dirty = true;
+                    self.ui_dirty = true;
+                    self.quiet_keep_frames = self.frame_count + NOTICE_KEEP_FRAMES;
                 }
                 // Step 4b-2: a restore assigned fresh handles; the history
                 // follows them before anything else is recorded, so a later
@@ -5376,8 +5579,14 @@ impl SurfaceWindow {
                 // the view window: `EditorWindow` drops the surfaces before
                 // the main window, and the renderer detaches before both.
                 unsafe {
+                    // The view sits inside the editor's frame, so it carries
+                    // no frame of its own: a caption and System buttons would
+                    // be painted inside the editor's content area (the
+                    // checklist read them as chrome that should not be
+                    // there).
                     Window::default_attributes()
                         .with_title(title)
+                        .with_decorations(false)
                         .with_parent_window(Some(handle.as_raw()))
                         .with_inner_size(INITIAL_SCENE_SIZE)
                 }

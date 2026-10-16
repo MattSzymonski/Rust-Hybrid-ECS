@@ -315,6 +315,10 @@ struct PopupWindow {
     surface: wgpu::Surface<'static>,
     /// Its configuration: the popup's size in physical pixels.
     configuration: wgpu::SurfaceConfiguration,
+    /// The inner size last asked of the popup window. `follow` compares the
+    /// shell's request against this rather than `configuration`: the surface
+    /// follows the window lazily in `render`.
+    requested_size: (u32, u32),
     /// Where the platform put it, in physical screen pixels.
     placement: PopupPlacement,
     /// What to draw, in the popup's own logical pixels.
@@ -378,6 +382,7 @@ impl PopupWindow {
             window,
             surface,
             configuration,
+            requested_size: size,
             placement,
             draw: request.draw.clone(),
             signature: None,
@@ -392,14 +397,17 @@ impl PopupWindow {
     fn follow(&mut self, request: &EditorPopup, parent: &Window) {
         let scale_factor = parent.scale_factor().max(0.01) as f32;
         let size = physical_size(request.rect, scale_factor);
-        if (self.configuration.width, self.configuration.height) != size {
-            self.configuration.width = size.0;
-            self.configuration.height = size.1;
+        if self.requested_size != size {
+            self.requested_size = size;
             let _ = self
                 .window
                 .request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
             // The surface follows the window in `render`, which reconfigures
-            // from the window's own size before it draws.
+            // from the window's own size before it draws. `configuration`
+            // stays untouched here: it names the surface's real size, and a
+            // wish written into it would make that reconfiguration skip the
+            // `configure` the resize still needs - a later frame then clipped
+            // wider than the target and tripped wgpu's validation.
         }
         let anchor = anchor_on_screen(parent, request.rect, scale_factor);
         if let Some(work) = work_area(parent) {
@@ -462,6 +470,11 @@ impl PopupWindow {
             .surface
             .get_current_texture()
             .map_err(|error| format!("the popup swapchain is unavailable: {error}"))?;
+        // What the renderer clamps its scissors against must be the texture
+        // this pass really writes: a resize landing between `reconfigure`
+        // and here leaves the texture smaller than `configuration` for one
+        // frame, and a scissor past the target is a wgpu validation error.
+        let target = (frame.texture.width(), frame.texture.height());
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -473,7 +486,7 @@ impl PopupWindow {
             queue,
             &mut encoder,
             &view,
-            (self.configuration.width, self.configuration.height),
+            target,
             self.window.scale_factor().max(0.01) as f32,
             &self.draw,
             Some(background),
