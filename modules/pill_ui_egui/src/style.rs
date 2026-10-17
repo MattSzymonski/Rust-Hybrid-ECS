@@ -69,6 +69,9 @@ pub const SELECTION_FILL: Color32 = Color32::from_rgb(56, 73, 94);
 
 /// Install the editor's dark theme and spacing on `context`.
 pub fn apply(context: &Context) {
+    // The icon fonts ride the theme: the shell draws the chrome's icons in
+    // the families this registers.
+    crate::icons::install(context);
     context.set_theme(ThemePreference::Dark);
     context.style_mut_of(Theme::Dark, |style| {
         let visuals = &mut style.visuals;

@@ -96,6 +96,9 @@ pub enum CameraBinding {
 pub struct SurfaceCameras {
     /// Binding per surface id (`SurfaceId.0`).
     pub bindings: BTreeMap<u32, CameraBinding>,
+    /// The scene grid the view-bound surfaces draw; off until a frontend
+    /// turns it on.
+    pub grid: crate::SceneGrid,
 }
 
 impl SurfaceCameras {

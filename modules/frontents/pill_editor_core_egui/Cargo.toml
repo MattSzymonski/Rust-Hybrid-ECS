@@ -28,6 +28,9 @@ pill_core = { path = "../../pill_core" }
 pill_core_macros = { path = "../../pill_core_macros" }
 pill_engine = { path = "../../pill_engine" }
 pill_assets = { path = "../../pill_assets" }
+# The renderer contract: the scene grid's switch lives beside the surface
+# camera bindings the command flips.
+pill_renderer_api = { path = "../../hosting/pill_renderer_api" }
 # The egui UI library: the dock model names `egui_dock` through its
 # re-exports, so the shell, the frontend and this crate resolve one pinned
 # copy of egui (W-0017, plan decision E3).

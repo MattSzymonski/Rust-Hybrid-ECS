@@ -3253,16 +3253,19 @@ pub fn run_clipboard_action(
             if action == ClipboardAction::Cut {
                 match offered {
                     Some(entity) => {
-                        // The destroy and the selection clear are one step:
+                        // The selection clear and the destroy are one step:
                         // undo restores the entity and the selection that
-                        // pointed at it (Stage 25).
-                        let mut commands = vec![EditorCommand::DestroyEntity { entity }];
+                        // pointed at it (Stage 25). The clear comes FIRST so
+                        // the undo's restore runs first and the batch's own
+                        // selection command follows the fresh handle.
+                        let mut commands = Vec::new();
                         if selection.entity == Some(entity) {
                             commands.push(EditorCommand::SetSelection {
                                 entity: None,
                                 asset: selection.asset.clone(),
                             });
                         }
+                        commands.push(EditorCommand::DestroyEntity { entity });
                         pending.push_recorded(commands, "cut entity", None);
                         pill_core::info!(
                             target: pill_core::telemetry::telemetry_target::ECS,
@@ -3281,11 +3284,16 @@ pub fn run_clipboard_action(
         // a recorded step, without the clipboard write Cut also does.
         ClipboardAction::Delete => match selection.entity {
             Some(entity) => {
-                let mut commands = vec![EditorCommand::DestroyEntity { entity }];
-                commands.push(EditorCommand::SetSelection {
-                    entity: None,
-                    asset: selection.asset.clone(),
-                });
+                // The clear comes first: an undo walks the step backwards, so
+                // the restore runs first and the batch's own selection
+                // command follows the entity to its fresh handle.
+                let commands = vec![
+                    EditorCommand::SetSelection {
+                        entity: None,
+                        asset: selection.asset.clone(),
+                    },
+                    EditorCommand::DestroyEntity { entity },
+                ];
                 pending.push_recorded(commands, "delete entity", None);
                 // NOTE: asserted on by the editor's end-to-end suite.
                 pill_core::info!(

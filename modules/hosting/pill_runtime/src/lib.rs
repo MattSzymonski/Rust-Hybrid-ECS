@@ -51,8 +51,9 @@ mod telemetry;
 /// ([`FrameDriver`], the windowed runtime), re-exported for frontends.
 pub use pill_engine::common_components::TransformComponent;
 pub use pill_renderer_api::{
-    CameraBinding, CameraComponent, PickHit, PickRequests, PickResults, PresentPreference,
-    RenderViewport, RendererError, SelectionOutlines, SurfaceId, SurfaceOptions,
+    frame_grid, CameraBinding, CameraComponent, FrameGrid, PickHit, PickRequests, PickResults,
+    PresentPreference, RenderViewport, RendererError, SceneGrid, SelectionOutlines, SurfaceCameras,
+    SurfaceId, SurfaceOptions,
 };
 pub use runtime::{
     insert_debug_resources, run_one_frame, set_surface_camera, setup, FrameDriver, FrameReport,

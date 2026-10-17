@@ -237,6 +237,9 @@ pub struct RenderFrame {
     pub outlined: Vec<pill_engine::Entity>,
     /// The colour of every outline.
     pub outline_color: [f32; 4],
+    /// The scene grid this frame draws: its spacing and the surfaces that
+    /// draw it, or nothing when no frontend asked for one.
+    pub grid: Option<crate::FrameGrid>,
     /// The picks asked for since the last frame; the renderer answers them
     /// through [`crate::PillRenderer::take_pick_results`].
     pub pick_requests: Vec<crate::PickRequest>,
@@ -265,6 +268,7 @@ impl Default for RenderFrame {
             debug: pill_engine::DebugFrame::default(),
             outlined: Vec::new(),
             outline_color: [1.0, 0.55, 0.1, 1.0],
+            grid: None,
             pick_requests: Vec::new(),
             sequence: 0,
             ui: pill_draw::UiFrame::default(),

@@ -323,6 +323,11 @@ pub fn rendering_system(
             }
         }
     }
+    // The scene grid, when a frontend asked for one: every surface bound to a
+    // view camera draws it - the editor's own viewports - and a surface drawn
+    // through a world camera never does.
+    frame.grid =
+        bindings.and_then(|bindings| pill_renderer_api::frame_grid(bindings, bindings.grid));
 
     // The game's UI, when the project has a context: drain what its systems
     // built this update - the draw lists and the glyph-atlas changes. Without

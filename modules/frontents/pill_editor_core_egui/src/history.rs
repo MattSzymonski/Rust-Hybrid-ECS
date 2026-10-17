@@ -164,7 +164,12 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
             | EditorCommand::SetGizmoTool { .. }
+            | EditorCommand::SetGrid { .. }
             | EditorCommand::StepOnce => 0,
+            EditorCommand::SetPreferences { values } => values
+                .iter()
+                .map(|(key, text)| key.len() + text.len())
+                .sum(),
             EditorCommand::ImportFiles {
                 sources,
                 destination,

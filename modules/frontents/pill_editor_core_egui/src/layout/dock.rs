@@ -2,13 +2,14 @@
 //!
 //! # Responsibilities
 //!
-//! - [`EditorTab`]: the editor's six tabs - the two scene viewports'
-//!   placeholders, the world's entities and systems, the selection's
-//!   inspector, and the assets mock - and their titles.
+//! - [`EditorTab`]: the editor's eight tabs - the game viewport and the
+//!   two scene viewports' placeholders, the world's entities and systems,
+//!   the selection's inspector, the assets mock, and the preferences form -
+//!   and their titles.
 //! - [`EditorDock`]: the `egui_dock` state with the default layout (the
-//!   scene in the center, the entity column on the left, the inspector
-//!   above the system column on the right, the assets row below), the
-//!   schema version its documents carry, and
+//!   scene and game views in the center, the entity column on the left, the
+//!   inspector above the system column on the right, the assets row below),
+//!   the schema version its documents carry, and
 //!   [`EditorDock::settled`] which replaces the placeholder rectangles an
 //!   unpacked layout has not computed yet.
 //!
@@ -48,6 +49,10 @@ pub enum EditorTab {
     /// The second scene view's placeholder: like [`EditorTab::Scene`], with
     /// its own child window and renderer surface.
     SecondScene,
+    /// The game viewport's placeholder: like the scene tabs, but its child
+    /// window carries the primary surface, so it shows the project through
+    /// the project's own camera.
+    Game,
     /// The world's entities: id, name, click to select.
     Entities,
     /// The world's systems: name, stage, enabled.
@@ -56,17 +61,22 @@ pub enum EditorTab {
     Inspector,
     /// The assets panel's mock: fixed rows until the asset store is ported.
     Assets,
+    /// The preferences file's editor-wide rows and the current project's
+    /// remembered gizmo choices.
+    Preferences,
 }
 
 impl EditorTab {
     /// Every tab, in tab-strip order.
-    pub const ALL: [EditorTab; 6] = [
+    pub const ALL: [EditorTab; 8] = [
         EditorTab::Scene,
         EditorTab::SecondScene,
+        EditorTab::Game,
         EditorTab::Entities,
         EditorTab::Systems,
         EditorTab::Inspector,
         EditorTab::Assets,
+        EditorTab::Preferences,
     ];
 
     /// The tab's display title.
@@ -74,10 +84,12 @@ impl EditorTab {
         match self {
             EditorTab::Scene => "Scene",
             EditorTab::SecondScene => "Scene 2",
+            EditorTab::Game => "Game",
             EditorTab::Entities => "Entities",
             EditorTab::Systems => "Systems",
             EditorTab::Inspector => "Inspector",
             EditorTab::Assets => "Assets",
+            EditorTab::Preferences => "Preferences",
         }
     }
 }
@@ -103,12 +115,16 @@ impl Default for EditorDock {
 }
 
 impl EditorDock {
-    /// A dock with the default layout: the two scene viewports tabbed
+    /// A dock with the default layout: the game and scene viewports tabbed
     /// together in the center, the entity list as the left column, the
     /// inspector above the system list on the right, and the assets mock as
     /// a bottom row across the window.
     pub fn new() -> Self {
-        let mut state = DockState::new(vec![EditorTab::Scene, EditorTab::SecondScene]);
+        let mut state = DockState::new(vec![
+            EditorTab::Scene,
+            EditorTab::SecondScene,
+            EditorTab::Game,
+        ]);
         let tree = state.main_surface_mut();
         // The assets row spans the full width, so it splits off first; the
         // old node keeps the space above it.
@@ -130,11 +146,12 @@ impl EditorDock {
             tree.split_right(middle, system_fraction, vec![EditorTab::Inspector]);
         // The inspector sits on top of the right column; `split_below`'s
         // fraction is the share the old node keeps, so the systems list
-        // takes the space below it.
+        // takes the space below it - with the preferences form tabbed
+        // beside it.
         let [_inspector, _systems] = tree.split_below(
             right_column,
             INSPECTOR_COLUMN_FRACTION,
-            vec![EditorTab::Systems],
+            vec![EditorTab::Systems, EditorTab::Preferences],
         );
         Self {
             schema_version: super::LAYOUT_SCHEMA_VERSION,
@@ -255,7 +272,7 @@ mod tests {
         );
         assert_eq!(tabs_at(upper.left()), vec![EditorTab::Entities]);
         // The rest splits into the scene center and the system column; the
-        // two viewport tabs share the center group.
+        // two scene viewports and the game view share the center group.
         let rest = upper.right();
         assert!(
             state[surface][rest].is_horizontal(),
@@ -263,16 +280,20 @@ mod tests {
         );
         assert_eq!(
             tabs_at(rest.left()),
-            vec![EditorTab::Scene, EditorTab::SecondScene]
+            vec![EditorTab::Scene, EditorTab::SecondScene, EditorTab::Game]
         );
-        // The right column stacks the inspector above the systems list.
+        // The right column stacks the inspector above the systems list,
+        // with the preferences form tabbed beside the list.
         let column = rest.right();
         assert!(
             state[surface][column].is_vertical(),
             "the inspector is not stacked above the systems list"
         );
         assert_eq!(tabs_at(column.left()), vec![EditorTab::Inspector]);
-        assert_eq!(tabs_at(column.right()), vec![EditorTab::Systems]);
+        assert_eq!(
+            tabs_at(column.right()),
+            vec![EditorTab::Systems, EditorTab::Preferences]
+        );
         // Each side column is one `SIDE_COLUMN_FRACTION` of its split, the
         // assets row one `BOTTOM_ROW_FRACTION` of the window, the inspector
         // one `INSPECTOR_COLUMN_FRACTION` of its column, and the scene

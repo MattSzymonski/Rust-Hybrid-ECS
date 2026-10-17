@@ -29,7 +29,13 @@ use crate::error::LayoutPersistenceError;
 ///
 /// v4 adds the Inspector tab (`EditorTab::Inspector`) and its slot in the
 /// default layout, so previous documents are rejected and replaced too.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 adds the Preferences tab (`EditorTab::Preferences`), tabbed with the
+/// Systems list, so previous documents are rejected and replaced too.
+///
+/// v6 adds the Game tab (`EditorTab::Game`), tabbed with the scene
+/// viewports, so previous documents are rejected and replaced too.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 6;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
