@@ -11,6 +11,8 @@
 //!   ([`clipboard`]).
 //! - Own the transform gizmos' geometry, drag math and snapping
 //!   ([`gizmo`]).
+//! - Own the floating viewport toolbox's rows, geometry and commands
+//!   ([`toolbox`]).
 //! - Declare the layout persistence failures ([`error`]).
 //!
 //! # Design
@@ -21,21 +23,34 @@
 //! manifest) because its values cross between the editor executable and the
 //! reloadable egui shell module.
 
+/// The Assets pipeline: the dialogs' state and the recorded file batches.
+pub mod assets;
 /// The clipboard payload documents the copy and paste commands share.
 pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.
 pub mod commands;
 /// The editor's snapshots of the engine and the commands it applies to it.
 pub mod editor_state;
+/// The Entities tab's shared actions: the recorded create and delete.
+pub mod entities;
 /// Layout persistence failures.
 pub mod error;
 /// Transform gizmos: handle geometry, drag math and snapping.
 pub mod gizmo;
 /// The undo and redo history of editor edits.
 pub mod history;
+/// The Inspector's editing helpers: field edits and asset settings rows.
+pub mod inspector;
 /// The `egui_dock` layout: tab set, default layout and persistence.
 pub mod layout;
+/// The Preferences tab's shared vocabulary: the file's editable keys.
+pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.
 pub mod problems;
 /// The egui shell's long-lived session state.
 pub mod session;
+/// The Systems tab's shared logic: row labels, system toggles and the
+/// pause/step controls.
+pub mod systems;
+/// The floating viewport toolbox: rows, geometry and the commanded edits.
+pub mod toolbox;

@@ -99,6 +99,11 @@ pub struct EguiShellFrame {
     /// viewport follows the dock layout. A slot the shell leaves `None`
     /// hides that viewport's window - its tab is not shown.
     pub scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
+    /// The game viewport's body rectangle (logical points): the frontend
+    /// places the primary surface's child window here, so the game view
+    /// follows the dock layout. `None` hides that window - the Game tab is
+    /// not shown.
+    pub game_rect: Option<ShellRect>,
     /// The overlay's opaque chips this pass (logical points): a click
     /// inside one over a scene viewport is the UI's, not the scene's, so
     /// the frontend routes it without asking the scene what is under it.
@@ -122,6 +127,7 @@ impl Default for EguiShellFrame {
             cursor_icon: CursorIcon::Default,
             clipboard_text: None,
             scene_rects: [None; SCENE_VIEWPORTS],
+            game_rect: None,
             overlay_regions: Vec::new(),
             ime_allowed: false,
             ime_rect: None,
@@ -160,6 +166,9 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         // The shell fills the scene rectangles after its dock pass runs;
         // `frame_from_output` only knows egui's own output.
         scene_rects: [None; SCENE_VIEWPORTS],
+        // Same for the game rectangle: the shell records it as it draws
+        // the Game tab.
+        game_rect: None,
         // Same for the overlay chips: the shell records them as it draws.
         overlay_regions: Vec::new(),
         // The engine reports IME composition in its input events; the

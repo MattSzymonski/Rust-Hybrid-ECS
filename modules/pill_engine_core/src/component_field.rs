@@ -24,7 +24,8 @@
 //! The [`FieldValue`] vocabulary mirrors the derive's closed `type_tag`
 //! vocabulary one-to-one. `struct:` fields (and anything else the engine
 //! cannot interpret) are surfaced as [`FieldValue::Opaque`] on read and are
-//! never writable, so an inspector can show them instead of hiding them.
+//! never edited by value, so an inspector can show them instead of hiding
+//! them; a restore hands the captured bytes back exactly as they were read.
 //!
 //! A nested `struct:` field whose type has a known layout is expanded before it
 //! ever reaches here: the world flattens it into dotted leaf rows when the
@@ -54,10 +55,12 @@ use crate::world::World;
 /// (`List` and `Text`, summarized rather than materialized), and an `Opaque`
 /// escape hatch for fields the engine can locate but not interpret (`struct:`
 /// tags whose value type is not resolvable, and any tag outside the
-/// vocabulary). `Opaque` carries the raw bytes so the UI can show them; it is
-/// never writable. `List` and `Text` are read-only through this path — writes
-/// go through the container field's generated accessors, which reach the live
-/// buffer instead of rebuilding the row.
+/// vocabulary). `Opaque` carries the raw bytes so the UI can show them; no
+/// edit can introduce one, but a captured payload whose tag and size match
+/// the field's own descriptor writes back verbatim, which is how a restore
+/// re-creates a destroyed row. `List` and `Text` are read-only through this
+/// path — writes go through the container field's generated accessors, which
+/// reach the live buffer instead of rebuilding the row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     /// A 32-bit IEEE-754 floating point value.
@@ -829,19 +832,30 @@ fn encode_field_write(
             reason: "heap-backed fields are read-only here; edit them through the field accessors",
         });
     }
+    // A captured payload writes back byte-faithfully: the bytes came out of
+    // this exact field's column, and the value's tag plus its exact size pin
+    // them to it. This is the route a restore takes (an editor re-creating a
+    // destroyed entity, or re-attaching a removed component); a value of any
+    // other kind still walks the editable rules below.
+    if let FieldValue::Opaque { type_tag, bytes } = value {
+        if *type_tag == descriptor.type_tag && bytes.len() == descriptor.size {
+            return Ok(FieldWrite {
+                row_offset: descriptor.offset,
+                bytes: bytes.clone(),
+            });
+        }
+        return Err(ComponentFieldError::TypeMismatch {
+            field: field.to_string(),
+            expected: tag,
+            found: value.variant_tag(),
+        });
+    }
     // A `struct:` field, or any other tag the engine cannot interpret, is
     // never writable through the generic path.
     if !is_scalar_tag(tag) && !tag.starts_with("array:") {
         return Err(ComponentFieldError::UnsupportedField {
             field: field.to_string(),
             reason: "the field's type is outside the editable vocabulary",
-        });
-    }
-    if matches!(value, FieldValue::Opaque { .. }) {
-        return Err(ComponentFieldError::TypeMismatch {
-            field: field.to_string(),
-            expected: tag,
-            found: value.variant_tag(),
         });
     }
     if let Some(inner_tag) = tag.strip_prefix("array:") {
@@ -1510,6 +1524,89 @@ mod tests {
         assert_eq!(layout.len(), 1);
         assert_eq!(layout[0].name, "mystery");
         assert_eq!(layout[0].type_tag, "struct:NoSuchTypeExists");
+    }
+
+    /// A captured opaque payload round-trips: read it off a live row, write it
+    /// back through both generic paths (a field write and a whole image), and
+    /// the bytes match; a payload that does not pin to the field is refused.
+    #[test]
+    fn captured_opaque_payloads_round_trip_and_are_pinned_to_their_field() {
+        static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+            name: "mystery",
+            type_tag: "struct:NoSuchTypeExists",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        }];
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        struct OpaqueHolder {
+            mystery: u32,
+        }
+        impl Component for OpaqueHolder {}
+
+        let mut world = World::new();
+        world.register_component_with_layout::<OpaqueHolder>(FIELDS);
+        let name = crate::component::ComponentRegistry::registered_name::<OpaqueHolder>();
+
+        let entity = world
+            .create_entity()
+            .with(OpaqueHolder {
+                mystery: 0xAAAA_BBBB,
+            })
+            .build()
+            .expect("entity builds");
+        let captured = world
+            .read_component_field(entity, &name, "mystery")
+            .expect("the opaque field reads");
+        let FieldValue::Opaque { type_tag, bytes } = captured.clone() else {
+            panic!("a struct-tagged field must read as opaque, got {captured:?}");
+        };
+        assert_eq!(type_tag, "struct:NoSuchTypeExists");
+        assert_eq!(bytes, 0xAAAA_BBBBu32.to_le_bytes());
+
+        // A field write of the captured payload lands the same bytes back.
+        world
+            .write_component_field(entity, &name, "mystery", captured.clone())
+            .expect("the captured payload writes back");
+        assert_eq!(
+            world.read_component_field(entity, &name, "mystery"),
+            Ok(captured.clone())
+        );
+
+        // A whole captured image builds too, which is the restore path.
+        let image = world
+            .build_component_image(&name, &[("mystery".to_string(), captured.clone())])
+            .expect("the captured image builds");
+        assert_eq!(image, 0xAAAA_BBBBu32.to_le_bytes());
+
+        // A payload whose size or tag does not pin to the field is refused.
+        let short = FieldValue::Opaque {
+            type_tag,
+            bytes: vec![0, 1],
+        };
+        assert_eq!(
+            world.write_component_field(entity, &name, "mystery", short.clone()),
+            Err(ComponentFieldError::TypeMismatch {
+                field: "mystery".to_string(),
+                expected: "struct:NoSuchTypeExists",
+                found: "opaque",
+            })
+        );
+        let mistagged = FieldValue::Opaque {
+            type_tag: "struct:SomethingElse",
+            bytes: bytes.clone(),
+        };
+        assert_eq!(
+            world.build_component_image(&name, &[("mystery".to_string(), mistagged)]),
+            Err(ComponentFieldError::TypeMismatch {
+                field: "mystery".to_string(),
+                expected: "struct:NoSuchTypeExists",
+                found: "opaque",
+            })
+        );
     }
 
     #[test]

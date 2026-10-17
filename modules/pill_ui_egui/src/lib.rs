@@ -10,6 +10,9 @@
 //!   shell exchange through world resources (plan decision E7).
 //! - Provides the engine-input to egui bridge ([`input`]) and the editor's
 //!   egui style ([`style`]).
+//! - Vendors Phosphor's icon fonts and paints the editor chrome's icons
+//!   ([`icons`]): the regular weight inline, the duotone weight as two
+//!   layers.
 //! - Documents the reload-safety contract egui state follows, below.
 //!
 //! # Design
@@ -50,6 +53,8 @@ pub use egui_dock;
 
 /// The plain data crossing the frontend/shell boundary.
 pub mod boundary;
+/// Phosphor's icons: the fonts, the glyphs and the duotone painting.
+pub mod icons;
 /// The engine-input to egui bridge.
 pub mod input;
 /// The editor's egui theme.

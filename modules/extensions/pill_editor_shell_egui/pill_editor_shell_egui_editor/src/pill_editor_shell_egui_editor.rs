@@ -28,6 +28,7 @@
 extern crate self as pill_editor_shell_egui_editor;
 
 // External crates
+use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
 use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
 use pill_editor_core_egui::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
@@ -54,14 +55,18 @@ pub mod shell;
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     let world = engine.world_mut();
-    // Step 1: the session (the egui context and the dock), built on first
+    // Step 1: the command resources the assets actions queue into (the
+    // registry, the inbox, the pending batches and the history), shared
+    // with the executable and re-claimed so a reload keeps them.
+    ensure_command_resources(world);
+    // Step 2: the session (the egui context and the dock), built on first
     // load only. Its type lives in `pill_editor_core_egui`, so a reload of
     // this module finds the same resource and keeps the context alive.
     world.register_resource::<EguiShellState>();
     if world.get_resource::<EguiShellState>().is_none() {
         world.insert_resource(EguiShellState::new());
     }
-    // Step 2: the boundary resources, shared with the executable.
+    // Step 3: the boundary resources, shared with the executable.
     world.register_resource::<EguiShellInput>();
     if world.get_resource::<EguiShellInput>().is_none() {
         world.insert_resource(EguiShellInput::default());
@@ -70,7 +75,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EguiShellFrame>().is_none() {
         world.insert_resource(EguiShellFrame::default());
     }
-    // Step 3: the data the tabs read and the selection they write, re-claimed
+    // Step 4: the data the tabs read and the selection they write, re-claimed
     // so a reload keeps which entity was selected. The executable refreshes
     // the snapshot each frame; a host without one gets an empty dock instead
     // of a missing resource.
@@ -82,7 +87,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EditorSelection>().is_none() {
         world.insert_resource(EditorSelection::default());
     }
-    // Step 4: the per-frame system that runs the dock. Post-update, like the
+    // Step 5: the per-frame system that runs the dock. Post-update, like the
     // renderer's frame build: it keeps running while the engine is paused.
     engine.register_post_update_system("egui_shell", egui_shell_update);
     // NOTE: asserted on by the egui editor's end-to-end suite.
@@ -109,27 +114,30 @@ pub fn egui_shell_update(
         ResMut<EguiShellState>,
         ResMut<EguiShellInput>,
         ResMut<EguiShellFrame>,
-        Res<EditorSnapshot>,
-        ResMut<EditorSelection>,
+        // The nested pair keeps this system within the engine's
+        // six-parameter tuple arity.
+        (Res<EditorSnapshot>, ResMut<EditorSelection>),
+        ResMut<PendingEditorCommands>,
         Res<pill_engine::Input>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
     // is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, snapshot, mut selection, engine_input) = resources;
+    let (mut state, mut input, mut frame, (snapshot, mut selection), mut pending, engine_input) =
+        resources;
     let (
         Some(mut state),
         Some(input),
         Some(mut frame),
-        Some(snapshot),
-        Some(mut selection),
+        (Some(snapshot), Some(mut selection)),
+        Some(mut pending),
         Some(engine_input),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
-        snapshot.get(),
-        selection.get_mut(),
+        (snapshot.get(), selection.get_mut()),
+        pending.get_mut(),
         engine_input.get(),
     )
     else {
@@ -141,6 +149,7 @@ pub fn egui_shell_update(
         &mut frame,
         snapshot,
         &mut selection,
+        &mut pending,
         engine_input,
     );
 }

@@ -110,6 +110,21 @@ pub struct StandaloneTypeInfo {
     pub extension: String,
 }
 
+/// The selected asset's detail for the Inspector (Stage 17): its row data
+/// and the import settings document the editable rows build on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetDetail {
+    /// Project-relative path, forward slashes.
+    pub path: String,
+    /// A short kind label: the asset type, `file`, or `folder`.
+    pub kind: String,
+    /// Whether the entry is a standalone asset (its own document).
+    pub standalone: bool,
+    /// The import settings document (a standalone asset's body, or the
+    /// sidecar's `settings`); `None` for folders and unknown extensions.
+    pub settings: Option<serde_json::Value>,
+}
+
 /// The editor's shared selection, read by every data panel and the scene.
 ///
 /// One entity slot and one asset slot: the Hierarchy selects entities, the
@@ -147,8 +162,20 @@ pub struct EditorSnapshot {
     /// The live standalone asset types (Stage 25): what a create dialog may
     /// offer.
     pub standalone_types: Vec<StandaloneTypeInfo>,
+    /// The selected asset's detail (Stage 17): the Inspector's asset
+    /// section.
+    pub asset_detail: Option<AssetDetail>,
     /// Whether the engine's system phase is paused.
     pub paused: bool,
+    /// The gizmo tool's settings (mode, space, snapping); the Scene tab's
+    /// context menu checks its items against them.
+    pub gizmo: crate::gizmo::GizmoSettings,
+    /// Whether the scene grid is on (Stage 23); the toolbox's grid row and
+    /// the Scene tab's menu check it against the renderer's switch.
+    pub grid_enabled: bool,
+    /// The preferences file's values and the current project's remembered
+    /// entry (Stage 20); the Preferences tab's rows read them.
+    pub preferences: crate::preferences::PreferencesView,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
 }
@@ -171,7 +198,19 @@ impl EditorSnapshot {
             components: Self::capture_components(engine),
             assets: Vec::new(),
             standalone_types: Vec::new(),
+            asset_detail: None,
             paused: engine.systems_paused(),
+            gizmo: engine
+                .world()
+                .get_resource::<crate::gizmo::GizmoState>()
+                .map(|state| state.settings)
+                .unwrap_or_default(),
+            grid_enabled: engine
+                .world()
+                .get_resource::<pill_renderer_api::SurfaceCameras>()
+                .map(|cameras| cameras.grid.enabled)
+                .unwrap_or(false),
+            preferences: crate::preferences::PreferencesView::default(),
             errors,
         }
     }
@@ -414,6 +453,12 @@ pub enum EditorCommand {
         /// The snapping toggle's new state.
         snap: Option<bool>,
     },
+    /// Turn the scene grid on or off (Stage 23): the infinite ground the
+    /// editor's view-bound surfaces draw.
+    SetGrid {
+        /// The grid's new state.
+        enabled: bool,
+    },
     /// Run exactly one system phase on the next frame, then pause again.
     StepOnce,
     /// Copy files from outside the project into the assets directory (a
@@ -524,6 +569,15 @@ pub enum EditorCommand {
         entity: Option<Entity>,
         /// The selected asset's path, when one is.
         asset: Option<String>,
+    },
+    /// Write preferences file values (Stage 20): one `(key, text)` pair per
+    /// edited row, applied as a read-modify-write of the preferences
+    /// document so keys other writers own survive. A pair whose text is
+    /// blank writes nothing; the file's live reader applies the values
+    /// (history limits, snapping steps) on its next look.
+    SetPreferences {
+        /// `(key, value)` pairs; keys are the file's own, dots nest.
+        values: Vec<(String, String)>,
     },
 }
 
@@ -665,7 +719,9 @@ impl EditorCommand {
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
             | EditorCommand::SetGizmoTool { .. }
+            | EditorCommand::SetGrid { .. }
             | EditorCommand::StepOnce
+            | EditorCommand::SetPreferences { .. }
             | EditorCommand::ImportFiles { .. }
             | EditorCommand::RemoveFiles { .. }
             | EditorCommand::CreateStandaloneAsset { .. }
@@ -711,7 +767,9 @@ impl EditorCommand {
             | EditorCommand::SetSystemEnabled { .. }
             | EditorCommand::SetPaused { .. }
             | EditorCommand::SetGizmoTool { .. }
+            | EditorCommand::SetGrid { .. }
             | EditorCommand::StepOnce
+            | EditorCommand::SetPreferences { .. }
             | EditorCommand::ImportFiles { .. }
             | EditorCommand::RemoveFiles { .. }
             | EditorCommand::CreateStandaloneAsset { .. }
@@ -740,24 +798,38 @@ impl EditorCommand {
     /// discards the recording. A command is only recorded when it succeeded
     /// and produced an inverse, so an undo can never half-restore a batch;
     /// [`RecordedApply::fully_invertible`] reports whether that held.
+    ///
+    /// The batch runs against its own copy because a restore assigns a fresh
+    /// handle mid-batch: every command behind it - and every inverse already
+    /// collected - follows the entity to the new handle, exactly like the
+    /// history entries do. Without that, a delete recorded as `destroy, clear
+    /// the selection` would undo its clear before the restore exists and the
+    /// selection would come back pointing at nothing.
     pub fn apply_recorded(engine: &mut Engine, commands: &[EditorCommand]) -> RecordedApply {
         let mut outcome = RecordedApply {
             fully_invertible: true,
             ..RecordedApply::default()
         };
-        for (index, command) in commands.iter().enumerate() {
-            if !command.recordable() {
+        let mut working = commands.to_vec();
+        for index in 0..working.len() {
+            if !working[index].recordable() {
                 outcome.fully_invertible = false;
             }
-            match Self::apply_one(engine, command) {
+            match Self::apply_one(engine, &working[index]) {
                 Ok(applied) => {
                     if let Some(inverse) = applied.inverse {
                         outcome.inverses.push(inverse);
                     } else {
                         outcome.fully_invertible = false;
                     }
-                    if let Some(pair) = applied.remap {
-                        outcome.remaps.push(pair);
+                    if let Some((previous, assigned)) = applied.remap {
+                        for later in &mut working[index + 1..] {
+                            later.remap_entity(previous, assigned);
+                        }
+                        for inverse in &mut outcome.inverses {
+                            inverse.remap_entity(previous, assigned);
+                        }
+                        outcome.remaps.push((previous, assigned));
                     }
                 }
                 Err(message) => {
@@ -899,6 +971,31 @@ impl EditorCommand {
                 }
                 if let Some(snap) = snap {
                     state.settings.snap = *snap;
+                }
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SetGrid { enabled } => {
+                let world = engine.world_mut();
+                if world
+                    .get_resource::<pill_renderer_api::SurfaceCameras>()
+                    .is_none()
+                {
+                    world.insert_resource(pill_renderer_api::SurfaceCameras::default());
+                }
+                let Some(cameras) = world.get_resource_mut::<pill_renderer_api::SurfaceCameras>()
+                else {
+                    return Err(format!(
+                        "{command:?}: the surface cameras could not be claimed"
+                    ));
+                };
+                if cameras.grid.enabled != *enabled {
+                    cameras.grid.enabled = *enabled;
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        enabled = *enabled,
+                        "[editor] scene grid"
+                    );
                 }
                 Ok(CommandOutcome::plain())
             }
@@ -1333,6 +1430,35 @@ impl EditorCommand {
                 selection.entity = entity;
                 selection.asset = asset.clone();
                 Ok(CommandOutcome::inverse(previous))
+            }
+
+            EditorCommand::SetPreferences { values } => {
+                // Read-modify-write, so the per-project gizmo entry and any
+                // key another writer owns survive; blanks write nothing, so
+                // an untouched row keeps the consumer's own default.
+                let directory = crate::layout::layout_directory();
+                let mut document = crate::preferences::read_document(&directory);
+                let mut written = 0usize;
+                for (key, text) in values {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    written += 1;
+                    crate::preferences::set_key(
+                        &mut document,
+                        key,
+                        crate::preferences::parse_value(text),
+                    )
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                }
+                crate::preferences::write_document(&directory, &document)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    keys = written,
+                    "[editor] preferences saved"
+                );
+                Ok(CommandOutcome::plain())
             }
 
             EditorCommand::DestroyEntity { entity } => {
@@ -2190,5 +2316,69 @@ mod tests {
         // Controls never enter the history as steps.
         assert!(!recorded.fully_invertible);
         assert!(recorded.inverses.is_empty());
+    }
+
+    #[test]
+    fn recorded_delete_group_restores_the_entity_and_the_selection() {
+        let mut engine = demo_engine();
+        let entity = engine
+            .world_mut()
+            .create_entity()
+            .with(DemoComponent {
+                strength: 6.5,
+                enabled: true,
+            })
+            .build()
+            .expect("entity builds");
+        // The user had this entity (and a file) selected.
+        let failures = EditorCommand::apply(
+            &mut engine,
+            &[EditorCommand::SetSelection {
+                entity: Some(entity),
+                asset: Some("textures/x.png".to_string()),
+            }],
+        );
+        assert!(failures.is_empty(), "{failures:?}");
+
+        // The delete the menu records: clear the selection, then destroy.
+        let (commands, label) =
+            crate::entities::entity_delete(entity, Some("textures/x.png".to_string()));
+        assert_eq!(label, "delete entity");
+        let recorded = EditorCommand::apply_recorded(&mut engine, &commands);
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        assert!(recorded.fully_invertible);
+        assert!(!engine.world().is_entity_valid(entity));
+        let selection = engine
+            .world()
+            .get_resource::<EditorSelection>()
+            .expect("the delete wrote the selection resource");
+        assert_eq!(selection.entity, None, "the delete clears the selection");
+
+        // The undo restores the entity under a fresh handle, and the batch's
+        // own selection command follows it there.
+        let undo = EditorCommand::apply_recorded(&mut engine, &recorded.inverses);
+        assert!(undo.failures.is_empty(), "{:?}", undo.failures);
+        let [(previous, restored)] = undo.remaps.as_slice() else {
+            panic!(
+                "the delete's undo must report the restore's remap, got {:?}",
+                undo.remaps
+            );
+        };
+        assert_eq!(*previous, entity);
+        let selection = engine
+            .world()
+            .get_resource::<EditorSelection>()
+            .expect("selection resource");
+        assert_eq!(
+            selection.entity,
+            Some(*restored),
+            "the selection must follow the restored entity to its fresh handle"
+        );
+        assert_eq!(selection.asset.as_deref(), Some("textures/x.png"));
+        let strength = engine
+            .world()
+            .read_component_field(*restored, &demo_component_name(), "strength")
+            .expect("restored value");
+        assert_eq!(strength, FieldValue::F32(6.5));
     }
 }

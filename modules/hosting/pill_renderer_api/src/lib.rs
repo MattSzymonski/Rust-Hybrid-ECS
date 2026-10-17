@@ -14,6 +14,8 @@
 //! - Carry a window across to a renderer as plain data ([`RawWindowData`]).
 //! - Let one renderer draw into several surfaces, each through its own camera
 //!   ([`SurfaceId`], [`SurfaceCameras`]).
+//! - Carry the scene grid an editor draws in its view-bound surfaces
+//!   ([`SceneGrid`], [`FrameGrid`]).
 //! - Carry debug drawing, selection outlines and picking between the world and
 //!   any renderer ([`SelectionOutlines`], [`PickRequests`], [`PickResults`]).
 //!
@@ -42,6 +44,10 @@ pub mod error;
 /// The frame a renderer draws: instances, resolved passes, camera and clock.
 pub mod frame;
 
+/// The scene grid of the view-bound surfaces: its switch, spacing and
+/// resolution into a frame.
+pub mod grid;
+
 /// A window's platform handles as plain data, for attaching a renderer to it.
 pub mod raw_window;
 
@@ -60,6 +66,7 @@ pub use error::RendererError;
 pub use frame::{
     CullMode, MaterialParameter, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
 };
+pub use grid::{frame_grid, FrameGrid, SceneGrid};
 pub use picking::{
     decode_pick_value, PickHit, PickRequest, PickRequests, PickResult, PickResults,
     SelectionOutlines, PICK_HANDLE_BIT,

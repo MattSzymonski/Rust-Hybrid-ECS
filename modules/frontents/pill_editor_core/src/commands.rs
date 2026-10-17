@@ -800,7 +800,7 @@ pub struct GizmoPreferences {
 }
 
 /// One project's gizmo choices.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GizmoProjectPreferences {
     /// The project's last active mode.
     #[serde(default)]

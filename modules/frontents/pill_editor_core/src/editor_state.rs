@@ -745,19 +745,33 @@ impl EditorCommand {
             fully_invertible: true,
             ..RecordedApply::default()
         };
-        for (index, command) in commands.iter().enumerate() {
-            if !command.recordable() {
+        // The batch runs against its own copy because a restore assigns a
+        // fresh handle mid-batch: every command behind it - and every inverse
+        // already collected - follows the entity to the new handle, exactly
+        // like the history entries do. Without that, a delete recorded as
+        // `clear the selection, destroy` would undo its clear before the
+        // restore exists and the selection would come back pointing at
+        // nothing.
+        let mut working = commands.to_vec();
+        for index in 0..working.len() {
+            if !working[index].recordable() {
                 outcome.fully_invertible = false;
             }
-            match Self::apply_one(engine, command) {
+            match Self::apply_one(engine, &working[index]) {
                 Ok(applied) => {
                     if let Some(inverse) = applied.inverse {
                         outcome.inverses.push(inverse);
                     } else {
                         outcome.fully_invertible = false;
                     }
-                    if let Some(pair) = applied.remap {
-                        outcome.remaps.push(pair);
+                    if let Some((previous, assigned)) = applied.remap {
+                        for later in &mut working[index + 1..] {
+                            later.remap_entity(previous, assigned);
+                        }
+                        for inverse in &mut outcome.inverses {
+                            inverse.remap_entity(previous, assigned);
+                        }
+                        outcome.remaps.push((previous, assigned));
                     }
                 }
                 Err(message) => {
