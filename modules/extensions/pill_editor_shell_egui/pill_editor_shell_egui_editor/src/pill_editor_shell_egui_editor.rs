@@ -22,6 +22,13 @@
 //! (`use pill_editor_shell_egui_editor::shell::...`), never as a file-local
 //! item - the same constraint a project's hot file follows, for the same
 //! reason.
+//!
+//! An edit in `shell.rs` is patched the same way, and its generated crate
+//! adds only `use pill_editor_shell_egui_editor::*;` on top of that file's own
+//! `use` lines. That glob reaches this module's items, so the shell's public
+//! items are re-exported below: without the re-export a tab body's call to a
+//! sibling by bare name does not resolve, the patch fails to compile, and the
+//! host silently falls back to reloading the module.
 
 // The crate's own name, so the package paths below resolve inside this
 // crate too; the generated patch crate sees the same `use` lines.
@@ -43,7 +50,11 @@ use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
 include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 
 // Current crate
-use pill_editor_shell_egui_editor::shell::run_frame;
+// The shell's public items, re-exported where a patch crate's
+// `use pill_editor_shell_egui_editor::*;` can reach them (see the crate
+// header). `run_frame` comes through this glob too, which is why the system
+// below names it bare.
+pub use pill_editor_shell_egui_editor::shell::*;
 
 /// The shell's UI work: the dock, the two tabs and the frame build.
 pub mod shell;

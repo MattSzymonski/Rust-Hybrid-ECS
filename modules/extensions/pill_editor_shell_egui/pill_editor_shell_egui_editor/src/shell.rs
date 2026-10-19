@@ -18,6 +18,14 @@
 //! resource the next generation re-claims. Nothing here stores anything in
 //! egui's `Context` (the reload-safety contract `pill_ui_egui` documents);
 //! the tabs read the snapshot and write the shared selection.
+//!
+//! # Patchability
+//!
+//! A generated patch crate holds one function body and reaches this module
+//! only through the crate root's re-export, so every item an edited body can
+//! name - a sibling function, a constant, a type - is `pub` here. A body that
+//! calls a helper by bare name is therefore fine; a body that names a private
+//! item fails to compile as a patch and the host reloads the module instead.
 
 // External crates
 use pill_editor_core_egui::assets::{self, AssetDialog};
@@ -51,51 +59,55 @@ use serde_json::Value as JsonValue;
 // Constants
 // =============================================================================
 
+// Public like every item a patched body may name: a patch crate sees this
+// module through the crate root's re-export, and a private constant would
+// fail its compile (`error[E0425]`) after which the host reloads.
+
 /// How far the scene rectangle extends past the measured tab body, in
 /// logical points: the body's padding and outline sit inside the leaf, and
 /// the child window must back them too, so no sliver of the game view
 /// behind the overlay shows around the viewport's edge.
-const SCENE_RECT_OVERSHOOT: f32 = 16.0;
+pub const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
 /// A shell update slower than this logs its own `[editor] egui frame` line
 /// in addition to the 210-frame heartbeat: the D32 bar for the whole UI pass
 /// is 2 ms, so anything near it is worth a sample on a slow (debug) run.
-const SLOW_UPDATE_MICROS: u64 = 800;
+pub const SLOW_UPDATE_MICROS: u64 = 800;
 
 /// The scene's frame counter: its box in logical points, and the gap to the
 /// tab body's corner.
-const SCENE_COUNTER_WIDTH: f32 = 76.0;
-const SCENE_COUNTER_HEIGHT: f32 = 20.0;
-const SCENE_COUNTER_MARGIN: f32 = 8.0;
+pub const SCENE_COUNTER_WIDTH: f32 = 76.0;
+pub const SCENE_COUNTER_HEIGHT: f32 = 20.0;
+pub const SCENE_COUNTER_MARGIN: f32 = 8.0;
 
 /// The example button beside the counter: its width, and the gap between
 /// the two.
-const SCENE_BUTTON_WIDTH: f32 = 72.0;
-const SCENE_BUTTON_GAP: f32 = 6.0;
+pub const SCENE_BUTTON_WIDTH: f32 = 72.0;
+pub const SCENE_BUTTON_GAP: f32 = 6.0;
 
 /// The Assets tab's tree pane: its default width and the range the splitter
 /// drags it through, in points.
-const ASSETS_TREE_WIDTH: f32 = 176.0;
-const ASSETS_TREE_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 96.0..=320.0;
+pub const ASSETS_TREE_WIDTH: f32 = 176.0;
+pub const ASSETS_TREE_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 96.0..=320.0;
 
 /// One folder tree row's indentation per level and the width the expander's
 /// caret (or its empty slot) takes, in points.
-const ASSETS_TREE_INDENT: f32 = 12.0;
-const ASSETS_TREE_CARET_WIDTH: f32 = 14.0;
-const ASSETS_TREE_CARET_SIZE: f32 = 10.0;
+pub const ASSETS_TREE_INDENT: f32 = 12.0;
+pub const ASSETS_TREE_CARET_WIDTH: f32 = 14.0;
+pub const ASSETS_TREE_CARET_SIZE: f32 = 10.0;
 
 /// The Assets tab's grid tiles: the gap around each tile, the band under its
 /// icon for the name, the icon's inset, and the corner radius of the
 /// selected and hovered washes, in points.
-const ASSETS_TILE_GAP: f32 = 8.0;
-const ASSETS_TILE_LABEL_HEIGHT: f32 = 26.0;
-const ASSETS_TILE_LABEL_GAP: f32 = 2.0;
-const ASSETS_TILE_ICON_INSET: f32 = 6.0;
-const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
-const ASSETS_TILE_LABEL_SIZE: f32 = 11.0;
+pub const ASSETS_TILE_GAP: f32 = 8.0;
+pub const ASSETS_TILE_LABEL_HEIGHT: f32 = 26.0;
+pub const ASSETS_TILE_LABEL_GAP: f32 = 2.0;
+pub const ASSETS_TILE_ICON_INSET: f32 = 6.0;
+pub const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
+pub const ASSETS_TILE_LABEL_SIZE: f32 = 11.0;
 
 /// The rows a tile's name may wrap to before it elides, like Unity's two.
-const ASSETS_TILE_LABEL_ROWS: usize = 2;
+pub const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
 /// One shell frame: engine input becomes egui input, the dock runs, and the
 /// output becomes the executable's frame. The asset dialog, when one is
@@ -457,14 +469,14 @@ pub fn about_window(context: &egui::Context, mark: &egui::TextureHandle, open: &
 
 /// The Inspector's label column width, in points: Unity's label/control
 /// split leaves the control side most of a narrow panel.
-const INSPECTOR_LABEL_WIDTH: f32 = 80.0;
+pub const INSPECTOR_LABEL_WIDTH: f32 = 80.0;
 
 /// One vector element's group width, in points: the axis letter and its
 /// field together, so a wrap moves the pair and never separates them.
-const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
+pub const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
 
 /// The gap between two menu titles in the bar.
-const MENU_TITLE_GAP: f32 = 2.0;
+pub const MENU_TITLE_GAP: f32 = 2.0;
 
 /// The icon a dock tab's title carries: the view or panel the tab shows.
 pub fn tab_icon(tab: EditorTab) -> icons::Icon {
