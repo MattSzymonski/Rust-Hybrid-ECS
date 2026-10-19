@@ -67,6 +67,7 @@ sys.path.insert(0, str(DEVOPS_ROOT))
 from core.editor_session import (  # noqa: E402
     EditorSession,
     EDITOR_WINDOW_CREATED_TOKEN,
+    ScriptedCommandRejected,
     run_directory,
 )
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E402
@@ -326,13 +327,11 @@ def toolbox_row(session: EditorSession, view: int, item: str) -> tuple:
 def toolbox_click(session: EditorSession, view: int, item: str, label: str) -> None:
     """Clicks one toolbox row at its logged center and waits for its token."""
     x, y = rect_center(toolbox_row(session, view, item))
-    begin = len(session.read_log())
-    session.send(f"click {x:.0f} {y:.0f}")
-    session.wait(
+    session.request(
+        f"click {x:.0f} {y:.0f}",
         re.escape(TOOLBOX_CLICK_TOKEN) + rf'\s+view={view}\s+item="{item}"',
         30,
         label,
-        begin,
     )
 
 
@@ -361,13 +360,11 @@ def menu_click(session: EditorSession, menu: str, label: str, action_label: str)
     recorded rectangle from an earlier opening would address a closed popup.
     """
     center = rect_center(menu_title_rect(session, menu))
-    begin = len(session.read_log())
-    session.send(f"click {center[0]:.0f} {center[1]:.0f}")
-    session.wait(
+    session.request(
+        f"click {center[0]:.0f} {center[1]:.0f}",
         re.escape(MENU_OPENED_TOKEN) + rf'\s+menu="{menu}"',
         30,
         f"the {menu} menu opened",
-        begin,
     )
     found = [
         match
@@ -645,12 +642,30 @@ def main() -> int:
         assert match and int(match.group(1)) > 0, f"no entities in the rows: {rows}"
         print(f"  [OK] shell loaded, {rows}")
 
+        # A misspelled verb must be refused at once: the session raises on the
+        # channel's rejection line instead of the suite waiting out its
+        # timeout for an answer that never comes.
+        started = time.monotonic()
+        refusal = None
+        try:
+            session.request("nonsense-verb", "an answer that never comes", 30, "a refusal")
+        except ScriptedCommandRejected as error:
+            refusal = error
+        elapsed = time.monotonic() - started
+        assert refusal is not None, "the channel accepted a verb it does not know"
+        assert refusal.command == "nonsense-verb", f"refused {refusal.command!r}, not the verb"
+        assert "unknown verb" in refusal.reason, f"unexpected reason: {refusal.reason}"
+        assert elapsed < 15, f"the refusal took {elapsed:.1f}s"
+        print(f"  [OK] a misspelled verb was refused in {elapsed:.1f}s: {refusal.reason}")
+
         def field_values(entity: str, field: str) -> "list[float]":
             """One array field of `entity`, from a scripted `dump field`."""
-            start = len(session.read_log())
-            session.send(f"dump field {entity} {TRANSFORM_COMPONENT} {field}")
-            session.wait(re.escape(FIELD_TOKEN), 30, f"the {field} dump", start)
-            dump = session.read_log()[start:]
+            dump = session.request(
+                f"dump field {entity} {TRANSFORM_COMPONENT} {field}",
+                re.escape(FIELD_TOKEN),
+                30,
+                f"the {field} dump",
+            )
             match = re.search(r"value=Array\(\[([^\]]*)\]\)", dump)
             assert match, "the {} dump carried no array: {}".format(field, dump[-500:])
             return [
@@ -676,17 +691,17 @@ def main() -> int:
         # nothing and clears both. The view's rectangle comes from the
         # frontend's own log, in the physical pixels the scripted clicks
         # use.
-        session.send("dump scenes")
-        begin = len(session.read_log())
-        scene_rect = None
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            match = re.search(SCENE_RECT_PATTERN, session.read_log()[begin:])
-            if match and match.group(1) == "0" and match.group(6) == "true":
-                scene_rect = tuple(int(value) for value in match.groups()[1:5])
-                break
-            # Poll until the frontend answers the dump.
-            time.sleep(0.5)
+        scenes = session.request(
+            "dump scenes", SCENE_RECT_PATTERN, 30, "the scene rects dumped"
+        )
+        scene_rect = next(
+            (
+                tuple(int(value) for value in match.groups()[1:5])
+                for match in re.finditer(SCENE_RECT_PATTERN, scenes)
+                if match.group(1) == "0" and match.group(6) == "true"
+            ),
+            None,
+        )
         assert scene_rect, "no visible scene view rect in the log"
         scene_x, scene_y, scene_width, scene_height = scene_rect
         print(
@@ -1985,16 +2000,16 @@ def main() -> int:
             """Dumps the scene rects until the game line reports `visible`.
 
             The window follows the tab on the next layout pass, so a dump
-            may reach the log before the placement did.
+            may reach the log before the placement did; each dump is its own
+            anchored request, so no sleep stands in for the answer.
             """
             deadline = time.monotonic() + 30
             wanted = "true" if visible else "false"
             while time.monotonic() < deadline:
-                begin = len(session.read_log())
-                session.send("dump scenes")
-                # Give the frame loop a moment to run the dump command.
-                time.sleep(0.4)
-                for match in re.finditer(GAME_RECT_PATTERN, session.read_log()[begin:]):
+                scenes = session.request(
+                    "dump scenes", SCENE_RECT_PATTERN, 30, "the scene dump"
+                )
+                for match in re.finditer(GAME_RECT_PATTERN, scenes):
                     if match.group(5) == wanted:
                         print(f"  [OK] {label}")
                         return match
@@ -2470,8 +2485,10 @@ def main() -> int:
         print("  [OK] a section collapses and expands from its header")
 
         # The Add Component button lists what the entity lacks; a pick adds
-        # one recorded component, which the suite then removes again.
-        components_before = latest_detail_components(session)
+        # one recorded component, which the suite then removes again. The
+        # click that opens the list can also land as a pick through the dock
+        # and move the selection, so the count and the entity are read from a
+        # heartbeat drawn for the opened list, not from before the click.
         add = rect_center(inspector_add_rect(session))
         begin = len(session.read_log())
         session.send(f"click {add[0]:.0f} {add[1]:.0f}")
@@ -2484,6 +2501,15 @@ def main() -> int:
             for match in re.finditer(INSPECTOR_ADD_ENTRY_PATTERN, session.read_log()[begin:])
         ]
         assert entries, "the add list was empty"
+        opened_at = session.read_log().rfind(INSPECTOR_ADD_OPENED_TOKEN)
+        session.wait(
+            re.escape(EGUI_ROWS_TOKEN),
+            30,
+            "a rows heartbeat after the add list opened",
+            opened_at,
+        )
+        components_before = latest_detail_components(session)
+        detail_entity = latest_detail_entity(session)
         chosen = entries[0]
         entry_rect_matches = [
             match
@@ -2504,7 +2530,9 @@ def main() -> int:
             begin,
         )
         wait_for_detail_components(
-            session, components_before + 1, "the added component reached the section"
+            session,
+            components_before + 1,
+            f"the added component reached the section of {detail_entity}",
         )
         begin = len(session.read_log())
         session.send(f"edit remove {detail_entity} {chosen}")
@@ -2534,17 +2562,17 @@ def main() -> int:
             "the Inspector tab shown again",
             begin,
         )
-        begin = len(session.read_log())
-        session.send("dump scenes")
-        viewport = None
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            match = re.search(SCENE_RECT_PATTERN, session.read_log()[begin:])
-            if match and match.group(1) == "0" and match.group(6) == "true":
-                viewport = tuple(int(value) for value in match.groups()[1:5])
-                break
-            # Poll until the frontend answers the dump.
-            time.sleep(0.5)
+        scenes = session.request(
+            "dump scenes", SCENE_RECT_PATTERN, 30, "the scene rects dumped"
+        )
+        viewport = next(
+            (
+                tuple(int(value) for value in match.groups()[1:5])
+                for match in re.finditer(SCENE_RECT_PATTERN, scenes)
+                if match.group(1) == "0" and match.group(6) == "true"
+            ),
+            None,
+        )
         assert viewport, "no visible scene view rect for the decorator step"
         showcase_rows = []
         for fraction_x, fraction_y in ((0.5, 0.5), (0.35, 0.4), (0.65, 0.4)):
@@ -2657,12 +2685,8 @@ def main() -> int:
         session.wait_occurrence(
             re.escape(EGUI_SHELL_LOADED_TOKEN), loads + 1, 180, "shell reloaded"
         )
-        session.send("dump tabs")
-        after = session.wait_occurrence(
-            DOCK_DUMP_PATTERN,
-            occurrence_count(session, DOCK_DUMP_PATTERN) + 1,
-            30,
-            "dock dump after shell reload",
+        after = session.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after shell reload"
         )
         assert re.search(r"surfaces=2\b", after), (
             "the shell reload reset the dock: {}".format(after)
@@ -2681,12 +2705,8 @@ def main() -> int:
         session.wait_occurrence(
             re.escape(PROJECT_RELOAD_TOKEN), reloads + 1, 240, "project reload"
         )
-        session.send("dump tabs")
-        after = session.wait_occurrence(
-            DOCK_DUMP_PATTERN,
-            occurrence_count(session, DOCK_DUMP_PATTERN) + 1,
-            30,
-            "dock dump after project reload",
+        after = session.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after project reload"
         )
         assert re.search(r"surfaces=2\b", after), (
             "the project reload reset the dock: {}".format(after)
@@ -2714,10 +2734,9 @@ def main() -> int:
             30,
             "second viewport undock",
         )
-        session.send("dump tabs")
-        third = session.wait_occurrence(
+        third = session.request(
+            "dump tabs",
             DOCK_DUMP_PATTERN,
-            occurrence_count(session, DOCK_DUMP_PATTERN) + 1,
             30,
             "dock dump after the second viewport's undock",
         )

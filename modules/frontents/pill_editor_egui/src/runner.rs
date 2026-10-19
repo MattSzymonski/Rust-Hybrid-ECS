@@ -2793,10 +2793,9 @@ impl EditorWindow {
             _ => None,
         };
         let Some((command_value, label)) = queued else {
-            warn!(
-                target: telemetry_target::ENGINE,
+            self.reject_scripted(
                 command,
-                "[editor] edit asset needs create, delete, move or meta with its arguments"
+                "edit asset needs create, delete, move or meta with its arguments",
             );
             return;
         };
@@ -2851,20 +2850,15 @@ impl EditorWindow {
         let (Some(entity_text), Some(component_text), Some(field)) =
             (parts.next(), parts.next(), parts.next())
         else {
-            warn!(
-                target: telemetry_target::ENGINE,
+            self.reject_scripted(
                 command,
-                "[editor] edit set needs an entity, a component, a field and a value"
+                "edit set needs an entity, a component, a field and a value",
             );
             return;
         };
         let value_text = parts.collect::<Vec<_>>().join(" ");
         if value_text.is_empty() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit set needs a value"
-            );
+            self.reject_scripted(command, "edit set needs a value");
             return;
         }
         let Some((entity, component, current)) =
@@ -2903,28 +2897,22 @@ impl EditorWindow {
         let (Some(entity_text), Some(component_text), Some(field), Some(index_text)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
-            warn!(
-                target: telemetry_target::ENGINE,
+            self.reject_scripted(
                 command,
-                "[editor] edit array needs an entity, a component, a field, an index and a value"
+                "edit array needs an entity, a component, a field, an index and a value",
             );
             return;
         };
         let Some(index) = index_text.parse::<usize>().ok() else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                index = index_text,
-                "[editor] edit array needs a numeric index"
+            self.reject_scripted(
+                command,
+                &format!("edit array needs a numeric index, got '{index_text}'"),
             );
             return;
         };
         let value_text = parts.collect::<Vec<_>>().join(" ");
         if value_text.is_empty() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit array needs a value"
-            );
+            self.reject_scripted(command, "edit array needs a value");
             return;
         }
         let Some((entity, component, current)) =
@@ -2971,20 +2959,15 @@ impl EditorWindow {
         command: &str,
     ) {
         let (Some(path), Some(key)) = (parts.next(), parts.next()) else {
-            warn!(
-                target: telemetry_target::ENGINE,
+            self.reject_scripted(
                 command,
-                "[editor] edit asset-settings needs a path, a key and a value"
+                "edit asset-settings needs a path, a key and a value",
             );
             return;
         };
         let value_text = parts.collect::<Vec<_>>().join(" ");
         if value_text.is_empty() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit asset-settings needs a value"
-            );
+            self.reject_scripted(command, "edit asset-settings needs a value");
             return;
         }
         let Ok(key_path) = inspector::parse_settings_key_path(key) else {
@@ -3648,30 +3631,18 @@ impl EditorWindow {
         command: &str,
     ) {
         let (Some(index), Some(state)) = (parts.next(), parts.next()) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit system needs an index and on or off"
-            );
+            self.reject_scripted(command, "edit system needs an index and on or off");
             return;
         };
         let Ok(index) = index.parse::<usize>() else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit system needs an index and on or off"
-            );
+            self.reject_scripted(command, "edit system needs an index and on or off");
             return;
         };
         let enabled = match state {
             "on" => true,
             "off" => false,
             _ => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    command,
-                    "[editor] edit system needs an index and on or off"
-                );
+                self.reject_scripted(command, "edit system needs an index and on or off");
                 return;
             }
         };
@@ -3698,20 +3669,12 @@ impl EditorWindow {
         command: &str,
     ) {
         let Some(key) = parts.next() else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit preference needs a key and a value"
-            );
+            self.reject_scripted(command, "edit preference needs a key and a value");
             return;
         };
         let value = parts.collect::<Vec<_>>().join(" ");
         if value.is_empty() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                command,
-                "[editor] edit preference needs a key and a value"
-            );
+            self.reject_scripted(command, "edit preference needs a key and a value");
             return;
         }
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -3806,10 +3769,9 @@ impl EditorWindow {
         add: bool,
     ) {
         let (Some(entity_text), Some(component_text)) = (parts.next(), parts.next()) else {
-            warn!(
-                target: telemetry_target::ENGINE,
+            self.reject_scripted(
                 command,
-                "[editor] edit add or remove needs an entity and a component"
+                "edit add or remove needs an entity and a component",
             );
             return;
         };
@@ -4019,6 +3981,21 @@ impl EditorWindow {
         }
     }
 
+    /// Refuses one scripted line, naming it and why it cannot run.
+    ///
+    /// Every refusal - an unknown verb, an unknown target, a missing or
+    /// malformed argument - prints this one token, so a suite can tell a
+    /// rejected line from a slow answer without pinning twenty messages, and
+    /// `EditorSession` raises on it the moment it lands instead of timing out.
+    fn reject_scripted(&self, command: &str, reason: &str) {
+        warn!(
+            target: telemetry_target::ENGINE,
+            command,
+            reason,
+            "[editor] scripted command rejected"
+        );
+    }
+
     /// Run the scripted commands appended since the last frame.
     fn poll_test_channel(&mut self) {
         let Some(channel) = &mut self.test_channel else {
@@ -4036,22 +4013,14 @@ impl EditorWindow {
                     let tab = parts.next().and_then(parse_tab);
                     match tab {
                         Some(tab) => self.undock_tab(tab),
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] unknown undock target"
-                        ),
+                        None => self.reject_scripted(&command, "undock needs a tab"),
                     }
                 }
                 Some("tab") => {
                     let tab = parts.next().and_then(parse_tab);
                     match tab {
                         Some(tab) => self.activate_tab(tab),
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] unknown tab target"
-                        ),
+                        None => self.reject_scripted(&command, "tab needs a tab name"),
                     }
                 }
                 Some("click") => {
@@ -4059,11 +4028,7 @@ impl EditorWindow {
                     let y = parts.next().and_then(|value| value.parse().ok());
                     match (x, y) {
                         (Some(x), Some(y)) => self.inject_click(x, y),
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] click needs an x and a y"
-                        ),
+                        _ => self.reject_scripted(&command, "click needs an x and a y"),
                     }
                 }
                 Some("rclick") => {
@@ -4071,11 +4036,7 @@ impl EditorWindow {
                     let y = parts.next().and_then(|value| value.parse().ok());
                     match (x, y) {
                         (Some(x), Some(y)) => self.inject_rclick(x, y),
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] rclick needs an x and a y"
-                        ),
+                        _ => self.reject_scripted(&command, "rclick needs an x and a y"),
                     }
                 }
                 Some("drag") => {
@@ -4087,11 +4048,7 @@ impl EditorWindow {
                         (Some(x1), Some(y1), Some(x2), Some(y2)) => {
                             self.start_scripted_drag((x1, y1), (x2, y2))
                         }
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] drag needs x1 y1 x2 y2"
-                        ),
+                        _ => self.reject_scripted(&command, "drag needs x1 y1 x2 y2"),
                     }
                 }
                 Some("gizmo") => match parts.next() {
@@ -4104,10 +4061,9 @@ impl EditorWindow {
                             (Some(handle), Some(delta_x), Some(delta_y)) => {
                                 self.start_synthetic_gizmo_drag(handle, Some((delta_x, delta_y)))
                             }
-                            _ => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] gizmo drag needs x, y, z, xy, xz or yz and two pixel deltas"
+                            _ => self.reject_scripted(
+                                &command,
+                                "gizmo drag needs an axis or plane and two pixel deltas",
                             ),
                         }
                     }
@@ -4116,11 +4072,9 @@ impl EditorWindow {
                         let handle = name.and_then(|name| self.scripted_gizmo_handle(name));
                         match handle {
                             Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
-                            None => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] gizmo press needs x, y, z, xy, xz or yz"
-                            ),
+                            None => {
+                                self.reject_scripted(&command, "gizmo press needs an axis or plane")
+                            }
                         }
                     }
                     Some("move") => {
@@ -4130,27 +4084,17 @@ impl EditorWindow {
                             (Some(delta_x), Some(delta_y)) => {
                                 self.scripted_gizmo_move(delta_x, delta_y)
                             }
-                            _ => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] gizmo move needs two pixel deltas"
-                            ),
+                            _ => {
+                                self.reject_scripted(&command, "gizmo move needs two pixel deltas")
+                            }
                         }
                     }
                     Some("release") => self.scripted_gizmo_release(),
                     Some(other) => match parse_gizmo_mode(other) {
                         Some(mode) => self.set_gizmo_tool(mode),
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] unknown gizmo target"
-                        ),
+                        None => self.reject_scripted(&command, "unknown gizmo target"),
                     },
-                    None => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] gizmo needs a tool or a drag"
-                    ),
+                    None => self.reject_scripted(&command, "gizmo needs a tool or a drag"),
                 },
                 Some("dump") => match parts.next() {
                     Some("tabs") => self.dump_tabs(),
@@ -4171,26 +4115,17 @@ impl EditorWindow {
                             (Some(entity), Some(component), Some(field)) => {
                                 self.dump_field(entity, component, field)
                             }
-                            _ => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] dump field needs an entity, a component and a field"
+                            _ => self.reject_scripted(
+                                &command,
+                                "dump field needs an entity, a component and a field",
                             ),
                         }
                     }
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] unknown dump target"
-                    ),
+                    _ => self.reject_scripted(&command, "unknown dump target"),
                 },
                 Some("browser") => match parts.next() {
                     Some(folder) => self.scripted_browser(folder),
-                    None => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] browser needs a folder path or root"
-                    ),
+                    None => self.reject_scripted(&command, "browser needs a folder path or root"),
                 },
                 Some("camera") => match parts.next() {
                     Some(action @ ("orbit" | "pan")) => {
@@ -4205,10 +4140,9 @@ impl EditorWindow {
                                 };
                                 self.scripted_camera(navigation, delta_x, delta_y);
                             }
-                            _ => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] camera orbit and pan need two pixel deltas"
+                            _ => self.reject_scripted(
+                                &command,
+                                "camera orbit and pan need two pixel deltas",
                             ),
                         }
                     }
@@ -4217,27 +4151,17 @@ impl EditorWindow {
                         Some(delta_y) => {
                             self.scripted_camera(CameraNavigation::Dolly, 0.0, delta_y)
                         }
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] camera dolly needs a pixel delta"
-                        ),
+                        None => self.reject_scripted(&command, "camera dolly needs a pixel delta"),
                     },
                     Some("zoom") => {
                         match parts.next().and_then(|value| value.parse::<f32>().ok()) {
                             Some(lines) => self.zoom_camera(self.active_view, lines),
-                            None => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] camera zoom needs a line count"
-                            ),
+                            None => {
+                                self.reject_scripted(&command, "camera zoom needs a line count")
+                            }
                         }
                     }
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] camera needs orbit, pan, dolly or zoom"
-                    ),
+                    _ => self.reject_scripted(&command, "camera needs orbit, pan, dolly or zoom"),
                 },
                 Some("hover") => {
                     let view = parts.next().and_then(|value| value.parse::<usize>().ok());
@@ -4245,85 +4169,49 @@ impl EditorWindow {
                     let y = parts.next().and_then(|value| value.parse::<f32>().ok());
                     match (view, x, y) {
                         (Some(view), Some(x), Some(y)) => self.scripted_hover(view, x, y),
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] hover needs a view, an x and a y"
-                        ),
+                        _ => self.reject_scripted(&command, "hover needs a view, an x and a y"),
                     }
                 }
                 Some("select") => match parts.next() {
                     Some("asset") => match parts.next() {
                         Some(path) => self.scripted_select_asset(path),
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] select asset needs a path"
-                        ),
+                        None => self.reject_scripted(&command, "select asset needs a path"),
                     },
                     Some("entity") => match parts.next() {
                         Some(handle) => self.scripted_select_entity(handle),
-                        None => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] select entity needs a handle"
-                        ),
+                        None => self.reject_scripted(&command, "select entity needs a handle"),
                     },
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] unknown select target"
-                    ),
+                    _ => self.reject_scripted(&command, "unknown select target"),
                 },
                 Some("toolbar") => match parts.next() {
                     Some(action @ ("create" | "rename" | "delete" | "meta")) => {
                         self.scripted_toolbar(action)
                     }
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] toolbar needs create, rename, delete or meta"
-                    ),
+                    _ => self
+                        .reject_scripted(&command, "toolbar needs create, rename, delete or meta"),
                 },
                 Some("dialog") => match parts.next() {
                     Some("open") => match parts.next() {
                         Some(kind @ ("create" | "rename")) => self.scripted_toolbar(kind),
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] dialog open needs create or rename"
-                        ),
+                        _ => self.reject_scripted(&command, "dialog open needs create or rename"),
                     },
                     Some("set") => match parts.next() {
                         Some("name") => match parts.next() {
                             Some(name) => self.scripted_dialog_set_name(name),
-                            None => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] dialog set name needs the text"
-                            ),
+                            None => {
+                                self.reject_scripted(&command, "dialog set name needs the text")
+                            }
                         },
                         Some("type") => match parts.next() {
                             Some(type_name) => self.scripted_dialog_set_type(type_name),
-                            None => warn!(
-                                target: telemetry_target::ENGINE,
-                                command,
-                                "[editor] dialog set type needs the type name"
-                            ),
+                            None => self
+                                .reject_scripted(&command, "dialog set type needs the type name"),
                         },
-                        _ => warn!(
-                            target: telemetry_target::ENGINE,
-                            command,
-                            "[editor] dialog set needs name or type"
-                        ),
+                        _ => self.reject_scripted(&command, "dialog set needs name or type"),
                     },
                     Some("submit") => self.scripted_dialog_submit(),
                     Some("cancel") => self.scripted_dialog_cancel(),
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] dialog needs open, set, submit or cancel"
-                    ),
+                    _ => self.reject_scripted(&command, "dialog needs open, set, submit or cancel"),
                 },
                 Some("edit") => match parts.next() {
                     Some("asset") => self.scripted_asset_edit(&mut parts, &command),
@@ -4334,11 +4222,7 @@ impl EditorWindow {
                     Some("preference") => self.scripted_edit_preference(&mut parts, &command),
                     Some("add") => self.scripted_component_edit(&mut parts, &command, true),
                     Some("remove") => self.scripted_component_edit(&mut parts, &command, false),
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] unknown edit target"
-                    ),
+                    _ => self.reject_scripted(&command, "unknown edit target"),
                 },
                 Some("command") => match parts.next() {
                     Some("editor.undo") => self.scripted_undo(),
@@ -4368,16 +4252,12 @@ impl EditorWindow {
                         };
                         self.scripted_gizmo_tool(None, Some(next), None)
                     }
-                    Some(other) => warn!(
-                        target: telemetry_target::ENGINE,
-                        command = other,
-                        "[editor] command not executable in the egui editor"
-                    ),
-                    None => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] command needs an id"
-                    ),
+                    Some(other) => {
+                        let reason =
+                            format!("command '{other}' is not executable in the egui editor");
+                        self.reject_scripted(&command, &reason)
+                    }
+                    None => self.reject_scripted(&command, "command needs an id"),
                 },
                 Some("refresh") => match parts.next() {
                     Some("assets") => {
@@ -4387,17 +4267,9 @@ impl EditorWindow {
                             "[editor] test assets refresh"
                         );
                     }
-                    _ => warn!(
-                        target: telemetry_target::ENGINE,
-                        command,
-                        "[editor] refresh needs a target"
-                    ),
+                    _ => self.reject_scripted(&command, "refresh needs a target"),
                 },
-                Some(other) => warn!(
-                    target: telemetry_target::ENGINE,
-                    command = other,
-                    "[editor] unknown scripted command"
-                ),
+                Some(other) => self.reject_scripted(&command, &format!("unknown verb '{other}'")),
                 None => {}
             }
         }
