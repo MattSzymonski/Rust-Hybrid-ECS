@@ -291,7 +291,9 @@ def launch_editor(
     return process
 
 
-def launch_standalone(project: str, appdata: Path, log_path: Path) -> subprocess.Popen:
+def launch_standalone(
+    project: str, appdata: Path, log_path: Path, binary: Path = None
+) -> subprocess.Popen:
     """Starts the windowed standalone host on the same project, same
     present mode, so the frame rates compare."""
     environment = dict(os.environ)
@@ -300,7 +302,7 @@ def launch_standalone(project: str, appdata: Path, log_path: Path) -> subprocess
     environment["PILL_PRESENT_MODE"] = "immediate"
     log = log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
-        [str(standalone_binary())],
+        [str(binary or standalone_binary())],
         cwd=str(MODULES_ROOT),
         env=environment,
         stdout=log,
@@ -494,12 +496,14 @@ def measure_idle_cpu(
 
 
 def measure_standalone(
-    project: str, steady_seconds: int, appdata: Path, log_path: Path
+    project: str, steady_seconds: int, appdata: Path, log_path: Path, binary: Path = None
 ) -> Dict[str, Any]:
     """One standalone session: spawn -> project loop, and the frame rate
-    over the same steady window the editor's rate was measured in."""
+    over the same steady window the editor's rate was measured in. `binary`
+    overrides the profile `profile_binary` would pick, so a caller that
+    measured another profile compares against the same one."""
     kill_standalones()
-    process = launch_standalone(project, appdata, log_path)
+    process = launch_standalone(project, appdata, log_path, binary)
     started = time.monotonic()
     wait_for(process, log_path, STANDALONE_LOOP_TOKEN, STANDALONE_START_TIMEOUT_SECONDS)
     startup_ms = (time.monotonic() - started) * 1000.0

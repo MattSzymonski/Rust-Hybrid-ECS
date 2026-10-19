@@ -25,3 +25,9 @@ pill_engine = { path = "../../../pill_engine" }
 pill_spline = { path = "../pill_spline", default-features = false }
 pill_ui = { path = "../../../pill_ui" }
 serde = { version = "1", features = ["derive"] }
+
+[package.metadata.pill]
+# This editor part speaks the `pill_ui` panel contract. The egui editor loads
+# only crates tagged for it, so this part stays out of the egui build until
+# W-0038 ports it (W-0037 Stage 0, SA-0085).
+editor_frontend = "pill_ui"

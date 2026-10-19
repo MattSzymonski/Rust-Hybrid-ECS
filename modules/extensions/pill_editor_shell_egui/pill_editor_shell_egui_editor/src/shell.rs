@@ -57,6 +57,11 @@ use serde_json::Value as JsonValue;
 /// behind the overlay shows around the viewport's edge.
 const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
+/// A shell update slower than this logs its own `[editor] egui frame` line
+/// in addition to the 210-frame heartbeat: the D32 bar for the whole UI pass
+/// is 2 ms, so anything near it is worth a sample on a slow (debug) run.
+const SLOW_UPDATE_MICROS: u64 = 800;
+
 /// The scene's frame counter: its box in logical points, and the gap to the
 /// tab body's corner.
 const SCENE_COUNTER_WIDTH: f32 = 76.0;
@@ -105,11 +110,12 @@ pub fn run_frame(
     engine_input: &Input,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
+    let frame_index = state.frame_index;
     // The row heartbeat: the editor suite reads it to prove both tabs see
     // the project's data, that the frame counter - and with it the session
     // resource - survives a reload or patch, and which entity the
     // Inspector's detail tier describes.
-    if state.frame_index.is_multiple_of(210) {
+    if frame_index.is_multiple_of(210) {
         let detail_entity = snapshot
             .detail
             .as_ref()
@@ -120,7 +126,7 @@ pub fn run_frame(
             .map_or(0, |detail| detail.components.len());
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
-            frames = state.frame_index,
+            frames = frame_index,
             entities = snapshot.entities.len(),
             systems = snapshot.systems.len(),
             paused = snapshot.paused,
@@ -129,6 +135,11 @@ pub fn run_frame(
             "[editor] egui shell rows"
         );
     }
+    // The UI heartbeat: one full shell update (input conversion, the egui
+    // dock and its tabs, the frame conversion) in microseconds. The shell
+    // benchmark measures the D32 UI-redraw case from it; the GPU overlay
+    // draw is outside it, as presentation is vsync-bound.
+    let ui_started = pill_core::platform::Instant::now();
     let raw_input = pill_ui_egui::input::raw_input(engine_input, shell_input);
     // The brand mark is uploaded once per session: the context owns the
     // texture, so a shell reload finds it already there.
@@ -197,6 +208,18 @@ pub fn run_frame(
         pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
     }
     *frame = shell_frame;
+    let ui_micros = ui_started.elapsed().as_micros() as u64;
+    // The periodic heartbeat, plus any update that runs past the D32 UI
+    // budget: the suites prove the counter advances, and the benchmark gets
+    // samples even when 210 frames take longer than its measurement window.
+    if frame_index.is_multiple_of(210) || ui_micros >= SLOW_UPDATE_MICROS {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            frames = frame_index,
+            ui_us = ui_micros,
+            "[editor] egui frame"
+        );
+    }
 }
 
 // =============================================================================

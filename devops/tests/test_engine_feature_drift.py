@@ -17,14 +17,17 @@ DESCRIPTION
     could not be found".
 
     For each host posture (headless `pill_standalone` with and without
-    `hot_patch`, windowed `pill_standalone`, the editor), this resolves each
-    engine dylib's subtree for the host alone, then for every build a host
-    spawns for a project: each extension's module build - the crate selected
-    directly with the feature set its generated `host_module_<name>` wrapper
-    would enable - the project's own build, and the project's startup batch,
-    each plus the engine features `build_runner::host_engine_features` mirrors
-    from the running host. Any crate whose features differ from the host's own
-    resolution is reported.
+    `hot_patch`, windowed `pill_standalone`, the native editor, the egui
+    editor), this resolves each shared dylib's subtree for the host alone,
+    then for every build a host spawns for a project: each extension's module
+    build - the crate selected directly with the feature set its generated
+    `host_module_<name>` wrapper would enable - the project's own build, and
+    the project's startup batch, each plus the engine features
+    `build_runner::host_engine_features` mirrors from the running host. Any
+    crate whose features differ from the host's own resolution is reported.
+    A posture is measured only against the dylibs it loads: the two editors
+    skip each other's editor parts (`editor_frontend`), so one family's
+    dylibs never reach the other's process.
 
     What is measured comes from tracked sources only - the extension crates by
     their `extensions/<folder>/<crate>` convention, the projects from their
@@ -34,11 +37,12 @@ DESCRIPTION
     therefore measure the same builds, and the count is printed so a drop is
     visible.
 
-    The editor is an ordinary native frontend: it receives its engine features
-    explicitly, exactly like the standalone builders, because nothing in its
-    graph unions host-side macro features the way the retired dioxus editor's
-    macros did. The host keeps the anchor machinery for that retired posture
-    (`build_runner::apply_cargo_host_overrides`), but no frontend reaches it.
+    Both editors are ordinary native frontends: they receive their engine
+    features explicitly, exactly like the standalone builders, because nothing
+    in their graph unions host-side macro features the way the retired dioxus
+    editor's macros did. The host keeps the anchor machinery for that retired
+    posture (`build_runner::apply_cargo_host_overrides`), but no frontend
+    reaches it.
 
     Extensions are found by convention (every `extensions/<folder>/<crate>`
     crate); the projects are every example with both a `project_settings.yaml`
@@ -69,11 +73,38 @@ from core.workspace_graph import Crate, example_projects  # noqa: E402
 REPOSITORY = Path(__file__).resolve().parents[2]
 MODULES = REPOSITORY / "modules"
 
-# The shared engine libraries whose subtrees must resolve identically.
-# The shared dylibs whose resolved features must agree in every build: the
-# engine's, the UI library every editor module and the GPU module share, and
-# the editor core every editor module and the editor share.
-ENGINE_DYLIBS = ("pill_core", "pill_engine_core", "pill_ui", "pill_editor_core", "pill_editor_api")
+# The shared engine libraries whose subtrees must resolve identically in every
+# posture: the engine's, and the plain draw data the UI library and the
+# renderer contract share.
+ENGINE_DYLIBS = (
+    "pill_core",
+    "pill_engine_core",
+    "pill_draw",
+)
+
+# The native (`pill_ui`) editor's shared dylibs: its UI library, its model and
+# its API. Only the postures that load `pill_ui` editor parts resolve them.
+NATIVE_EDITOR_DYLIBS = (
+    "pill_ui",
+    "pill_editor_core",
+    "pill_editor_api",
+)
+
+# The egui editor's shared dylibs: the egui boundary and its model. Only the
+# postures that load egui editor parts resolve them.
+EGUI_EDITOR_DYLIBS = (
+    "pill_ui_egui",
+    "pill_editor_core_egui",
+)
+
+# The two editor families are separate: the native editor skips every part
+# tagged `editor_frontend = "egui"` and the egui editor every part tagged
+# `pill_ui`, so neither posture links the other's dylibs. Comparing a family
+# against a posture that never loads it reports drift nothing can act on (the
+# dylib's subtree is pulled in by the host's graph-only entries, not linked).
+NATIVE_DYLIBS = ENGINE_DYLIBS + NATIVE_EDITOR_DYLIBS
+EGUI_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
+ALL_DYLIBS = ENGINE_DYLIBS + NATIVE_EDITOR_DYLIBS + EGUI_EDITOR_DYLIBS
 
 # The host postures module and project builds run under: the host's own cargo
 # selection, and the engine features `build_runner::host_engine_features`
@@ -83,18 +114,36 @@ ENGINE_DYLIBS = ("pill_core", "pill_engine_core", "pill_ui", "pill_editor_core",
 # slot stays in the shape so a posture that ever needs one is measured with
 # it (`build_runner::apply_cargo_host_overrides`).
 FRONTENDS = {
-    "headless": (["--package", "pill_standalone"], ["pill_engine/hot_patch"], None),
+    "headless": (
+        ["--package", "pill_standalone"],
+        ["pill_engine/hot_patch"],
+        None,
+        ALL_DYLIBS,
+    ),
     "headless reload-only": (
         ["--package", "pill_standalone", "--no-default-features", "--features", "dev"],
         [],
         None,
+        ALL_DYLIBS,
     ),
     "windowed": (
         ["--package", "pill_standalone", "--features", "pill_standalone/rendering"],
         ["pill_engine/hot_patch"],
         None,
+        ALL_DYLIBS,
     ),
-    "editor": (["--package", "pill_editor"], ["pill_engine/hot_patch"], None),
+    "editor": (
+        ["--package", "pill_editor"],
+        ["pill_engine/hot_patch"],
+        None,
+        NATIVE_DYLIBS,
+    ),
+    "editor egui": (
+        ["--package", "pill_editor_egui"],
+        ["pill_engine/hot_patch"],
+        None,
+        EGUI_DYLIBS,
+    ),
 }
 
 # One `cargo tree --prefix depth -f "{p}|{f}"` line: depth, package, features.
@@ -273,7 +322,7 @@ def project_selection(crate, engine_features, anchor):
 # settings, as the union of that project's modules; the member's own graph is
 # the project build above.
 def spawned_builds(frontend):
-    _, engine_features, anchor = FRONTENDS[frontend]
+    _, engine_features, anchor, _ = FRONTENDS[frontend]
     builds = {}
     for module in module_names():
         builds[f"module {module}"] = module_selection(module, engine_features, anchor)
@@ -315,8 +364,8 @@ def main():
     drift = {}
     measured_count = 0
     try:
-        for dylib in ENGINE_DYLIBS:
-            for frontend, (selection, _, _) in FRONTENDS.items():
+        for frontend, (selection, _, _, dylibs) in FRONTENDS.items():
+            for dylib in dylibs:
                 reference = dylib_tree(dylib, selection)
                 for label, build in spawned_builds(frontend).items():
                     measured_count += 1
@@ -334,7 +383,7 @@ def main():
             print(f"        from: {', '.join(builds)}")
     if drift:
         return 1
-    print(f"  PASS  {', '.join(ENGINE_DYLIBS)} resolve identically in every spawned build")
+    print(f"  PASS  {', '.join(ALL_DYLIBS)} resolve identically in every spawned build")
     return 0
 
 

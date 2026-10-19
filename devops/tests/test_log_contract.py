@@ -62,6 +62,7 @@ EXAMPLE USAGE
 # Standard library
 import io
 import re
+import subprocess
 import sys
 import tokenize
 from functools import lru_cache
@@ -82,11 +83,6 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 # Directories whose Python modules declare host-output tokens.
 TOKEN_SOURCE_DIRECTORIES = ("devops/tests", "devops/core", "devops/benchmarks")
-
-# The workspace build tree. The Rust under it is generated - a dependency's
-# `out/` code, the hot patch wrappers - so it is not the host's own source, and
-# a token that only a build artifact can print would be a false pass.
-MODULES_BUILD_ROOT = REPOSITORY_ROOT / "modules" / "target"
 
 # Matches `SOME_TOKEN = "literal"` at module level, capturing name and literal.
 TOKEN_DEFINITION_RE = re.compile(
@@ -293,14 +289,34 @@ def rust_source_files() -> Tuple[Tuple[Path, str], ...]:
     """
     Every first-party Rust source under `modules/`, with its text, once a run.
 
-    The checks below scan the same tree several times, and reading it is the
-    bulk of this suite's runtime.
+    Only git-tracked files count: the host leaves hot-patch copies under
+    `modules/pill_standalone_temp/` and generated `host_module_*` crates in the
+    tree, and either would keep a renamed token green after the real source
+    moved. The checks below scan the same tree several times, and reading it is
+    the bulk of this suite's runtime.
     """
-    return tuple(
-        (source_path, source_path.read_text(encoding="utf-8", errors="replace"))
-        for source_path in sorted((REPOSITORY_ROOT / "modules").rglob("*.rs"))
-        if MODULES_BUILD_ROOT not in source_path.parents
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "modules"],
+        cwd=str(REPOSITORY_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "git ls-files failed; the log contract needs a git work tree:\n"
+            + completed.stderr[-800:]
+        )
+    sources = []
+    for relative in completed.stdout.split("\0"):
+        if not relative or not relative.endswith(".rs"):
+            continue
+        source_path = REPOSITORY_ROOT / relative
+        sources.append(
+            (source_path, source_path.read_text(encoding="utf-8", errors="replace"))
+        )
+    return tuple(sources)
 
 
 def iter_rust_string_literals(source: str) -> Iterator[Tuple[str, int]]:

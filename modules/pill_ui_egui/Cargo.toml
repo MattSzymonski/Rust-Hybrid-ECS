@@ -52,3 +52,9 @@ egui_dock = { version = "0.17.0", default-features = false, features = [
 epaint = { version = "0.32.3", default-features = false, features = [
     "bytemuck",
 ] }
+# `egui` asks `bitflags` for its own use and the egui world adds nothing on
+# top; the host world's resolve does, because the host also carries the native
+# `pill_ui` (its `cosmic-text` asks `bitflags` for `serde`), and one process
+# resolve unifies the two. Pinned here so the module world resolves the same
+# tree the host builds this DLL with.
+bitflags = { version = "2", features = ["serde"] }
