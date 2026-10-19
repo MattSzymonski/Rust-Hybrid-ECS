@@ -36,6 +36,8 @@ pub mod camera;
 pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.
 pub mod commands;
+/// The frame boundary: the pending-command drain and the undo/redo walk.
+pub mod drain;
 /// The editor's snapshots of the engine and the commands it applies to it.
 pub mod editor_state;
 /// The Entities tab's shared actions: the recorded create and delete.

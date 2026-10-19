@@ -258,6 +258,9 @@ pub struct CommandHistory {
     memory_budget_bytes: usize,
     /// Sum of the entries' `memory_bytes`.
     memory_used_bytes: usize,
+    /// The component-registry stamp `drop_stale` last pruned against; zero
+    /// before the first prune, so the first call always runs.
+    registry_stamp: u64,
 }
 
 impl Default for CommandHistory {
@@ -282,6 +285,7 @@ impl CommandHistory {
             step_cap,
             memory_budget_bytes,
             memory_used_bytes: 0,
+            registry_stamp: 0,
         }
     }
 
@@ -450,8 +454,15 @@ impl CommandHistory {
     ///
     /// `is_valid` receives `"component"` and `"component.field"` identifiers;
     /// an entry with any invalid identifier goes, because undoing it would
-    /// target storage that no longer exists. Returns how many were dropped.
-    pub fn drop_stale(&mut self, is_valid: impl Fn(&str) -> bool) -> usize {
+    /// target storage that no longer exists. `stamp` identifies the registry
+    /// the check ran against: an unchanged stamp skips the walk, so a caller
+    /// may ask on every frame for one hash and no allocation. Returns how
+    /// many were dropped.
+    pub fn drop_stale(&mut self, is_valid: impl Fn(&str) -> bool, stamp: u64) -> usize {
+        if self.registry_stamp == stamp {
+            return 0;
+        }
+        self.registry_stamp = stamp;
         let applied_before = self.cursor;
         let mut dropped = 0;
         let mut kept: Vec<HistoryEntry> = Vec::with_capacity(self.entries.len());
@@ -652,11 +663,15 @@ mod tests {
         );
         history.push(field_entry("keep two", 3.0), 2000, WINDOW);
         history.pop_undo(); // "keep two" is now unapplied.
-        let dropped = history.drop_stale(|identifier| !identifier.starts_with("Gone"));
+        let dropped = history.drop_stale(|identifier| !identifier.starts_with("Gone"), 1);
         assert_eq!(dropped, 1);
         assert_eq!(history.steps(), 2);
         assert_eq!(history.undo_depth(), 1);
         assert_eq!(history.redo_depth(), 1);
+        // The same registry stamp reports nothing the second time: the prune
+        // rides one registry change, not one call.
+        assert_eq!(history.drop_stale(|_| false, 1), 0);
+        assert_eq!(history.drop_stale(|_| false, 2), 2);
     }
 
     #[test]
