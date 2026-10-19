@@ -24,8 +24,14 @@
 #   restore the committed stub afterwards with
 #   `git checkout -- build/pill_shipping_bundle`.
 #
-# USAGE: python devops/tools/build_web.py [--dev] [--no-wasm-opt] [project_path]
+# USAGE: python devops/tools/build_web.py [--dev] [--editor] [--editor-frontend egui|pill_ui]
+#          [--no-wasm-opt] [project_path]
 #          --dev           unoptimized build with debug info (faster to build)
+#          --editor        build the editor posture: the shell compiled into
+#                          the wasm, the two-canvas editor page beside it
+#          --editor-frontend
+#                          which editor shell an --editor build links:
+#                          `egui` (default, W-0029) or `pill_ui` (W-0004 Stage 30)
 #          --no-wasm-opt   skip wasm-opt in a release build
 #          [project_path]  workspace-relative project directory; defaults to
 #                          the PROJECT_PATH environment variable
@@ -33,6 +39,7 @@
 # EXAMPLE USAGE:
 #   python devops/tools/build_web.py examples/master_renderer_test
 #   python devops/tools/build_web.py --dev examples/master_renderer_test
+#   python devops/tools/build_web.py --dev --editor examples/project_rs
 #   python -m http.server 8000 -d examples/master_renderer_test/build/web
 
 # --- SCRIPT ---
@@ -47,9 +54,12 @@ from pathlib import Path
 # Locations, relative to the repository root.
 GENERATOR = Path("devops") / "tools" / "generate_shipping_bundle.py"
 PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "index.html"
-# The editor posture's page (Stage 30): two stacked canvases and the scripted
-# channel's page hook.
+# The editor posture's page (W-0004 Stage 30, W-0029): two stacked canvases
+# and the scripted channel's page hook.
 EDITOR_PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "editor.html"
+# The editor shells an `--editor` build can link (the generator's list).
+EDITOR_FRONTENDS = ("egui", "pill_ui")
+DEFAULT_EDITOR_FRONTEND = "egui"
 WEB_APP_DIRECTORY = Path("build") / "pill_web_app"
 WORKSPACE_LOCK = Path("modules") / "Cargo.lock"
 WEB_TARGET_DIRECTORY = Path("build") / "build_meta" / "web_target"
@@ -74,19 +84,40 @@ def main() -> int:
     development = False
     wasm_opt = True
     editor = False
+    editor_frontend = DEFAULT_EDITOR_FRONTEND
     positional = []
-    for argument in sys.argv[1:]:
+    arguments = sys.argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
         if argument == "--dev":
             development = True
         elif argument == "--editor":
             editor = True
+        elif argument == "--editor-frontend":
+            index += 1
+            if index >= len(arguments):
+                print("error: --editor-frontend requires a value", file=sys.stderr)
+                return 2
+            editor_frontend = arguments[index]
+        elif argument.startswith("--editor-frontend="):
+            editor_frontend = argument[len("--editor-frontend=") :]
         elif argument == "--no-wasm-opt":
             wasm_opt = False
         else:
             positional.append(argument)
+        index += 1
+    if editor_frontend not in EDITOR_FRONTENDS:
+        print(
+            "error: --editor-frontend must be one of "
+            f"{', '.join(EDITOR_FRONTENDS)}; got {editor_frontend}",
+            file=sys.stderr,
+        )
+        return 2
     if len(positional) > 1:
         print(
-            "usage: build_web.py [--dev] [--editor] [--no-wasm-opt] [project_path]",
+            "usage: build_web.py [--dev] [--editor] [--editor-frontend egui|pill_ui] "
+            "[--no-wasm-opt] [project_path]",
             file=sys.stderr,
         )
         return 2
@@ -98,11 +129,11 @@ def main() -> int:
     project_root = (root / project_path).resolve()
 
     # Step 1: regenerate the shipping bundle and the web app crate. The
-    # editor posture links the shell and the project's editor crates into
-    # the same wasm (Stage 30).
+    # editor posture links a shell into the same wasm; `--editor-frontend`
+    # picks which one (the egui shell by default).
     generator_command = [sys.executable, root / GENERATOR, "--web"]
     if editor:
-        generator_command.append("--editor")
+        generator_command += ["--editor", "--editor-frontend", editor_frontend]
     generator_command.append(project_path)
     status = run(generator_command, root)
     if status != 0:

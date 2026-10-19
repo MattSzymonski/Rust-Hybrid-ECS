@@ -97,9 +97,15 @@ EXTENSION_DIRECTORY = Path("modules") / "extensions"
 # `modules/extensions/<extension>/<crate>/`.
 # Suffix of an extension's editor crate, which no shipped build ever links.
 EDITOR_CRATE_SUFFIX = "_editor"
-# An editor build (Stage 30) also links the shell, and compiles the UI
-# canvas's element id into the web app.
+# An editor build (W-0004 Stage 30, W-0029) also links a shell, and compiles
+# the UI canvas's element id into the web app. `--editor-frontend` picks the
+# shell: the egui shell is an editor-only extension crate and knows nothing
+# about `pill_ui`, while the `pill_ui` posture links the shell next to every
+# selected extension's editor crate.
 EDITOR_SHELL_CRATE_NAME = "pill_editor_shell_editor"
+EDITOR_EGUI_SHELL_CRATE_NAME = "pill_editor_shell_egui_editor"
+EDITOR_FRONTENDS = ("egui", "pill_ui")
+DEFAULT_EDITOR_FRONTEND = "egui"
 EDITOR_UI_CANVAS_ID = "pill-editor-ui"
 # The crates a bundle names: the runtime always (the static-link types), and the
 # C# bridge for a managed project (its external project backend). Never the
@@ -720,13 +726,29 @@ def build_web_app_manifest(web_app_directory: Path, root: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_web_app_source(editor: bool = False) -> str:
+def build_web_app_source(
+    editor: bool = False, editor_frontend: str = DEFAULT_EDITOR_FRONTEND
+) -> str:
     """Builds the web app crate's src/lib.rs: the browser entry point.
 
-    `editor` emits the editor posture's entry point (Stage 30): the shell
-    draws on a second canvas above the scene's.
+    `editor` emits the editor posture's entry point: the shell draws on a
+    second canvas above the scene's. `editor_frontend` picks the runner, the
+    egui one (W-0029) or the `pill_ui` one (W-0004 Stage 30).
     """
-    if editor:
+    if editor and editor_frontend == "egui":
+        entry = (
+            f"    pill_web::editor_egui::run_editor_egui(\n"
+            f"        {BUNDLE_CRATE_NAME}::static_project(),\n"
+            f'        "{WEB_CANVAS_ID}",\n'
+            f'        "{EDITOR_UI_CANVAS_ID}",\n'
+            "    );"
+        )
+        responsibilities = (
+            "//! - Run the shipping bundle's project as the egui editor in the\n"
+            "//!   page's canvases (W-0029) when the browser has instantiated\n"
+            "//!   this module: the scene below, the egui shell's UI above."
+        )
+    elif editor:
         entry = (
             f"    pill_web::editor::run_editor(\n"
             f"        {BUNDLE_CRATE_NAME}::static_project(),\n"
@@ -783,12 +805,14 @@ def main() -> int:
     resolution the host uses at startup.
     """
     # Parse `--feature <name>` (repeatable), `--csharp-aot`, `--rid <rid>`,
-    # `--web`, `--editor`, and the optional project path.
+    # `--web`, `--editor`, `--editor-frontend <name>`, and the optional
+    # project path.
     arguments = sys.argv[1:]
     requested_features = []
     aot = False
     web = False
     editor = False
+    editor_frontend = DEFAULT_EDITOR_FRONTEND
     rid = "win-x64"
     positional = []
     index = 0
@@ -809,9 +833,16 @@ def main() -> int:
             web = True
             requested_features.append(RENDERING_FEATURE)
         elif argument == "--editor":
-            # The browser editor posture (Stage 30): the bundle also links
-            # the shell and every selected extension's editor crate.
+            # The browser editor posture: the bundle also links a shell.
             editor = True
+        elif argument == "--editor-frontend":
+            index += 1
+            if index >= len(arguments):
+                print("error: --editor-frontend requires a value", file=sys.stderr)
+                return 2
+            editor_frontend = arguments[index]
+        elif argument.startswith("--editor-frontend="):
+            editor_frontend = argument[len("--editor-frontend=") :]
         elif argument == "--rid":
             index += 1
             if index >= len(arguments):
@@ -823,6 +854,13 @@ def main() -> int:
         else:
             positional.append(argument)
         index += 1
+    if editor_frontend not in EDITOR_FRONTENDS:
+        print(
+            "error: --editor-frontend must be one of "
+            f"{', '.join(EDITOR_FRONTENDS)}; got {editor_frontend}",
+            file=sys.stderr,
+        )
+        return 2
     if len(positional) > 1:
         print(
             "usage: generate_shipping_bundle.py [--feature <name>...] [project_path]",
@@ -906,21 +944,26 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    # Step 1c: an editor build (Stage 30) links the shell and every selected
-    # extension's editor crate beside the runtime modules, the same discovery
-    # an editor host does. They register last: the shell's own resources exist
-    # either way (its `register` tolerates missing panels), and the editor
-    # crates fill the panel registry.
+    # Step 1c: an editor build links a shell beside the runtime modules. The
+    # `pill_ui` posture also links every selected extension's editor crate
+    # (the same discovery an editor host does); the egui posture links only
+    # its editor-only shell, because the extension editor crates carry the
+    # `pill_ui` contract and must not join an egui wasm. They register last:
+    # the shell's own resources exist either way (its `register` tolerates
+    # missing panels), and the editor crates fill the panel registry.
     if editor:
-        editor_modules = [EDITOR_SHELL_CRATE_NAME]
-        editor_modules += [
-            name + EDITOR_CRATE_SUFFIX
-            for name in modules
-            if (
-                extension_crate_directory(root, name + EDITOR_CRATE_SUFFIX)
-                / PROJECT_MANIFEST_FILE_NAME
-            ).is_file()
-        ]
+        if editor_frontend == "egui":
+            editor_modules = [EDITOR_EGUI_SHELL_CRATE_NAME]
+        else:
+            editor_modules = [EDITOR_SHELL_CRATE_NAME]
+            editor_modules += [
+                name + EDITOR_CRATE_SUFFIX
+                for name in modules
+                if (
+                    extension_crate_directory(root, name + EDITOR_CRATE_SUFFIX)
+                    / PROJECT_MANIFEST_FILE_NAME
+                ).is_file()
+            ]
         missing_editor_crates = [
             name
             for name in editor_modules
@@ -1032,7 +1075,8 @@ def main() -> int:
             build_web_app_manifest(web_app_directory, root),
         )
         wrote_web |= write_if_changed(
-            web_app_directory / "src" / "lib.rs", build_web_app_source(editor)
+            web_app_directory / "src" / "lib.rs",
+            build_web_app_source(editor, editor_frontend),
         )
         print(f"web app: {os.path.relpath(web_app_directory, root)}")
         print("  regenerated (changed)" if wrote_web else "  unchanged")

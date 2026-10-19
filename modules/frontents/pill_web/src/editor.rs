@@ -8,10 +8,10 @@
 //!   canvas pair above it, and drive the shell's plain-data frame
 //!   (`EditorShellInput`/`EditorShellFrame`) the way the native executable
 //!   does.
-//! - [`editor_command`]: the scripted channel's entry point, the web
-//!   counterpart of `PILL_EDITOR_TEST_COMMANDS` (Stage 30): a line per call,
-//!   drained into the shell's input the next frame and logged for the
-//!   headless suite to assert on.
+//! - The scripted channel: the web counterpart of
+//!   `PILL_EDITOR_TEST_COMMANDS` (Stage 30), shared with the egui runner
+//!   ([`crate::scripted`]): one line per call, drained into the shell's
+//!   input the next frame and logged for the headless suite to assert on.
 //!
 //! # Design
 //!
@@ -36,7 +36,6 @@ use pill_input::winit_events::translate_window_event;
 use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject};
 use pill_ui::draw::Color;
 use pill_ui_wgpu::UiRenderer;
-use wasm_bindgen::prelude::wasm_bindgen;
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -44,24 +43,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
+use crate::scripted::take_scripted_lines;
 use crate::{find_canvas, focus_without_scrolling, physical_size, report_failure};
 
 /// The atlas the UI renderer starts with; the shell's frame updates grow it.
 const UI_ATLAS_SIZE: (u32, u32) = (512, 512);
-
-/// Lines the page scripted through [`editor_command`], drained by the next
-/// frame. Single-threaded like every wasm module.
-thread_local! {
-    static SCRIPTED_LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-}
-
-/// The scripted channel's entry point (Stage 30): the web counterpart of
-/// the native `PILL_EDITOR_TEST_COMMANDS` file. One line per call; the next
-/// frame drains the queue into the shell's input.
-#[wasm_bindgen]
-pub fn editor_command(line: &str) {
-    SCRIPTED_LINES.with(|lines| lines.borrow_mut().push(line.to_owned()));
-}
 
 /// Run `project` as an editor in the page: the scene on the canvas named
 /// `scene_canvas_id`, the shell's UI on the canvas named `ui_canvas_id`.
@@ -295,8 +281,7 @@ impl WebEditorApplication {
                 pill_core::math::Vector2f::new(size.width as f32, size.height as f32) / scale_factor
             })
             .unwrap_or(pill_core::math::Vector2f::new(1.0, 1.0));
-        let lines: Vec<String> =
-            SCRIPTED_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
+        let lines = take_scripted_lines();
         let frames_per_second = self.frames_per_second;
         {
             let mut driver = self.driver.borrow_mut();

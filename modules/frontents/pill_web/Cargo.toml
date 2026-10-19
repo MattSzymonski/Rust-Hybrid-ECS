@@ -14,13 +14,19 @@ pill_core = { path = "../../pill_core" }
 # What runs the game: the engine, the linked project and the renderer attached
 # to the canvas.
 pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
-# The editor posture (Stage 30): the shell's plain-data contract and the UI
-# renderer its frame draws through. The shell crate itself is linked by the
-# generated bundle, which calls its `register`.
+# The `pill_ui` editor posture (W-0004 Stage 30): the shell's plain-data
+# contract and the UI renderer its frame draws through. The shell crate
+# itself is linked by the generated bundle, which calls its `register`.
 pill_editor_api = { path = "../../hosting/pill_editor_api" }
 pill_engine_core = { path = "../../pill_engine_core" }
 pill_ui = { path = "../../pill_ui" }
 pill_ui_wgpu = { path = "../../pill_ui_wgpu" }
+# The egui editor posture (W-0029): the boundary types and the shared model
+# the egui shell writes its frame with, plus egui's own wgpu renderer.
+pill_ui_egui = { path = "../../pill_ui_egui" }
+pill_editor_core_egui = { path = "../../frontents/pill_editor_core_egui" }
+egui-wgpu = "0.32.3"
+# The device both UI canvases are drawn through.
 wgpu = "25.0.0"
 # The canvas window and the browser's event loop.
 winit = "0.30"
