@@ -464,7 +464,11 @@ struct EditorWindow {
     frame_index: u64,
     /// When the last frame started, for the smoothed FPS.
     last_frame_time: Option<Instant>,
-    /// The smoothed frame rate, logged with the heartbeat every 210 frames.
+    /// When the heartbeat last printed; the heartbeat fires every 210 frames
+    /// or every two seconds, whichever comes first, so a slow run (the
+    /// benchmark's debug posture) still reports inside its window.
+    last_heartbeat: Option<Instant>,
+    /// The smoothed frame rate, logged with the heartbeat.
     fps: f32,
     /// When the run started, against which the test deadline is measured.
     started: Instant,
@@ -706,6 +710,7 @@ impl EditorWindow {
             scale_factor,
             frame_index: 0,
             last_frame_time: None,
+            last_heartbeat: None,
             fps: 0.0,
             started: Instant::now(),
             claimed_pointer: false,
@@ -3056,7 +3061,12 @@ impl EditorWindow {
             }
         }
         self.last_frame_time = Some(now);
-        if self.frame_index.is_multiple_of(210) {
+        if self.frame_index.is_multiple_of(210)
+            || self
+                .last_heartbeat
+                .is_none_or(|at| now.duration_since(at).as_secs_f32() >= 2.0)
+        {
+            self.last_heartbeat = Some(now);
             let overlay_frames = self
                 .overlay
                 .as_ref()

@@ -33,4 +33,10 @@ thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 # Window handles as plain data (`RawWindowData`): the standard the windowing
 # crates (winit, tao) and wgpu share, with no windowing crate behind it.
-raw-window-handle = "0.6"
+#
+# The features are pinned because this crate is shared: the host links `wgpu`
+# (which asks for `alloc` and `std`) while a module build never does, so
+# without the pin the two resolves compile two differently featured copies of
+# this crate and the module's artifact cannot import against the host's
+# (`devops/tests/test_engine_feature_drift.py`).
+raw-window-handle = { version = "0.6", features = ["alloc", "std"] }
