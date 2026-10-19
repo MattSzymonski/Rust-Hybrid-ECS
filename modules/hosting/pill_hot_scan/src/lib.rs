@@ -562,7 +562,11 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                 b'}' => depth = depth.saturating_sub(1),
                 _ => {}
             }
-            if source[index..].starts_with("fn ")
+            // Compared on bytes, not on a `&str` slice: `index` walks one
+            // byte at a time, so it can sit inside a multi-byte character
+            // (a `'…'` literal is code the mask keeps), and a `&str` slice
+            // there would panic instead of skipping the byte.
+            if bytes[index..].starts_with(b"fn ")
                 && (index == 0 || !is_identifier_byte(bytes[index - 1]))
             {
                 let name_start = index + 3;
@@ -2048,5 +2052,27 @@ fn quoted() -> &'static str {
             .filter_map(|name| find_function(source, name).map(|found| (name.clone(), found.body)))
             .collect();
         assert_eq!(function_bodies(source, &names), expected);
+    }
+
+    /// A multi-byte character outside a string must not stop the scan: the
+    /// walk steps one byte at a time, so it reaches the continuation bytes of
+    /// a `'…'` literal, which the mask keeps as code.
+    #[test]
+    fn multi_byte_characters_do_not_break_the_scan() {
+        let source = "\
+/// A name cut with an ellipsis.
+pub fn elided() -> bool {
+    let ellipsis = '…';
+    ellipsis.is_ascii()
+}
+
+pub fn after() {}
+";
+        let names: HashSet<String> = all_functions(source)
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+        assert!(names.contains("elided"), "{names:?}");
+        assert!(names.contains("after"), "{names:?}");
     }
 }

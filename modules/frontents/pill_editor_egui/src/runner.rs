@@ -1680,6 +1680,34 @@ impl EditorWindow {
         }
     }
 
+    /// Log the Assets tab's open folder and the rows its grid lists there -
+    /// the suite's window into the tree and grid navigation, which needs no
+    /// pixel clicks.
+    fn dump_browser(&mut self) {
+        let folder = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            match world.get_resource::<EguiShellState>() {
+                Some(state) => state.browser.folder.clone(),
+                None => String::new(),
+            }
+        };
+        let entries = pill_editor_core_egui::browser::children(&self.asset_entries, &folder);
+        info!(
+            target: telemetry_target::ENGINE,
+            folder = folder.as_str(),
+            count = entries.len(),
+            "[test] browser"
+        );
+        for row in entries {
+            info!(
+                target: telemetry_target::ENGINE,
+                path = row.path.as_str(),
+                kind = row.kind.as_str(),
+                "[test] browser item"
+            );
+        }
+    }
+
     /// Log the live standalone types the create dialog offers; the suite
     /// reads the first one to drive a create.
     fn dump_standalone_types(&mut self) {
@@ -1774,6 +1802,28 @@ impl EditorWindow {
             snap = ?view.project_gizmo.snap,
             "[test] preferences project"
         );
+    }
+
+    /// Open a folder in the Assets tab's browser (`root` opens the asset
+    /// root), through the shell's session state - the scripted channel's
+    /// stand-in for clicking the folder tree.
+    fn scripted_browser(&mut self, folder: &str) {
+        let folder = if folder == "root" { "" } else { folder };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] browser navigation needs the shell module's state"
+            );
+            return;
+        };
+        if !state.browser.open(folder) {
+            info!(
+                target: telemetry_target::ENGINE,
+                folder,
+                "[editor] browser folder unchanged"
+            );
+        }
     }
 
     /// The scripted asset selection: the same shared resource an Assets row
@@ -3312,6 +3362,7 @@ impl EditorWindow {
                     Some("scenes") => self.dump_scenes(),
                     Some("grid") => self.dump_grid(),
                     Some("assets") => self.dump_assets(),
+                    Some("browser") => self.dump_browser(),
                     Some("standalone-types") => self.dump_standalone_types(),
                     Some("selection") => self.dump_selection(),
                     Some("systems") => self.dump_systems(),
@@ -3335,6 +3386,14 @@ impl EditorWindow {
                         target: telemetry_target::ENGINE,
                         command,
                         "[editor] unknown dump target"
+                    ),
+                },
+                Some("browser") => match parts.next() {
+                    Some(folder) => self.scripted_browser(folder),
+                    None => warn!(
+                        target: telemetry_target::ENGINE,
+                        command,
+                        "[editor] browser needs a folder path or root"
                     ),
                 },
                 Some("select") => match parts.next() {

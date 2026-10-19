@@ -93,6 +93,7 @@ __pycache__/
 AGENTS.md
 
 /examples/circus_demo_cs
+/examples/circus_recreation
 
 # Profiling and benchmark artifacts
 graphify-out/

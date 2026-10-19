@@ -112,6 +112,9 @@ HISTORY_UNDO_TOKEN = "[editor] history undo"
 HISTORY_REDO_TOKEN = "[editor] history redo"
 ASSETS_DUMP_TOKEN = "[test] assets"
 ASSET_ROW_TOKEN = "[test] asset"
+BROWSER_FOLDER_TOKEN = "[editor] browser folder"
+BROWSER_DUMP_TOKEN = "[test] browser"
+BROWSER_ITEM_TOKEN = "[test] browser item"
 STANDALONE_TYPE_TOKEN = "[test] standalone type"
 SYSTEMS_DUMP_TOKEN = "[test] systems"
 SYSTEM_ROW_TOKEN = "[test] system"
@@ -788,6 +791,47 @@ def main() -> int:
         )
         assert staged_row, "the staged meta probe is not in the listing: " + dump[-800:]
         assert staged_row.group(3) == "false", "the staging probe already has a sidecar"
+
+        # The browser is Unity's project panel: a folder tree beside a grid of
+        # the open folder's items. A scripted navigation lands the grid on
+        # textures, which lists that folder's own entries and nothing that
+        # lives at the root.
+        begin = len(session.read_log())
+        session.send("browser textures")
+        session.wait(
+            re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path="(textures)"',
+            30,
+            "the browser opened the textures folder",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump browser")
+        session.wait(
+            re.escape(BROWSER_DUMP_TOKEN) + r'\s+folder="textures"\s+count=(\d+)',
+            30,
+            "browser dumped",
+            begin,
+        )
+        grid = session.read_log()[begin:]
+        assert re.search(
+            re.escape(BROWSER_ITEM_TOKEN)
+            + r'\s+path="?textures/chimpanzini_bananini_color\.png',
+            grid,
+        ), "the grid misses the textures folder's texture: " + grid[-800:]
+        for outside in ("config.ini", "s16_stage.png"):
+            assert not re.search(
+                re.escape(BROWSER_ITEM_TOKEN) + r'\s+path="?' + re.escape(outside), grid
+            ), "the grid lists an entry outside the open folder: " + grid[-800:]
+        print("  [OK] the browser's grid lists the open folder")
+        # Back to the asset root, the tree's first row, for the steps below.
+        begin = len(session.read_log())
+        session.send("browser root")
+        session.wait(
+            re.escape(BROWSER_FOLDER_TOKEN) + r'\s+path=""',
+            30,
+            "the browser returned to the asset root",
+            begin,
+        )
 
         begin = len(session.read_log())
         session.send("dump standalone-types")
@@ -1875,12 +1919,16 @@ def main() -> int:
             "\n/// A marker the egui suite adds so the module grows an item and "
             "must reload, not patch.\npub fn egui_suite_marker() -> u32 {\n    1\n}\n"
         )
-        session.edit_source(shell_source, structural)
+        # Count both tokens BEFORE the edit: the reloaded module's own loaded
+        # line is logged before the reload's processed line, so counting the
+        # loaded token after waiting for the reload would already include it
+        # and wait for one occurrence that never comes.
         reloads = occurrence_count(session, re.escape(EXTENSION_RELOAD_TOKEN))
+        loads = occurrence_count(session, re.escape(EGUI_SHELL_LOADED_TOKEN))
+        session.edit_source(shell_source, structural)
         session.wait_occurrence(
             re.escape(EXTENSION_RELOAD_TOKEN), reloads + 1, 180, "shell reload"
         )
-        loads = occurrence_count(session, re.escape(EGUI_SHELL_LOADED_TOKEN))
         session.wait_occurrence(
             re.escape(EGUI_SHELL_LOADED_TOKEN), loads + 1, 180, "shell reloaded"
         )
@@ -1926,7 +1974,14 @@ def main() -> int:
         # Step 9: the second viewport's tab floats into its own egui window;
         # its own scene surface (view=1) goes live at that window's body
         # rectangle. The dock then holds three surfaces: the main one, the
-        # Entities window from step 2, and the viewport's.
+        # Entities window from step 2, and the viewport's. The resize count
+        # comes before the undock, because the undock's own resize (logged
+        # right after the token) is the one this step waits for.
+        view_one = (
+            re.escape(SCENE_SURFACE_RESIZED_TOKEN)
+            + r"\s+width=(\d+)\s+height=(\d+)\s+view=1"
+        )
+        before = occurrence_count(session, view_one)
         session.send("undock scene2")
         wait_for_token(
             session,
@@ -1944,11 +1999,6 @@ def main() -> int:
         assert re.search(r"surfaces=3\b", third), (
             "the second viewport's tab did not become a third dock surface: {}".format(third)
         )
-        view_one = (
-            re.escape(SCENE_SURFACE_RESIZED_TOKEN)
-            + r"\s+width=(\d+)\s+height=(\d+)\s+view=1"
-        )
-        before = occurrence_count(session, view_one)
         session.wait_occurrence(view_one, before + 1, 30, "second viewport surface")
         print("  [OK] second viewport undocked, its surface is live")
 
