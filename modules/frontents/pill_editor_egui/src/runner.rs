@@ -42,6 +42,7 @@ use pill_editor_core_egui::commands::{
     ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, EditorPreferences,
     KeymapPreset, PendingEditorCommands, PREFERENCES_FILE,
 };
+use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{
     AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, StandaloneTypeInfo,
 };
@@ -49,7 +50,7 @@ use pill_editor_core_egui::entities;
 use pill_editor_core_egui::gizmo::{
     self, GizmoGeometry, GizmoMode, GizmoSettings, GizmoSpace, GizmoState, HandleKind, HandleStates,
 };
-use pill_editor_core_egui::history::{CommandHistory, HistoryEntry, HistoryEntryKind};
+use pill_editor_core_egui::history::CommandHistory;
 use pill_editor_core_egui::inspector;
 use pill_editor_core_egui::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
@@ -3133,129 +3134,18 @@ impl EditorWindow {
         registry.settings_json(&relative).ok()
     }
 
-    /// Apply the command batches the shell's assets actions and the
-    /// scripted channel queued: the frame boundary the `EditorCommand`
-    /// contract names, the same drain the native editor's frame runs. A
-    /// failed command never aborts the batch; recorded batches land in the
-    /// history; the selection follows a move and clears with a delete; and
-    /// a batch that touched files marks the listing for an immediate walk.
+    /// Apply the batches the shell's assets actions and the scripted channel
+    /// queued, then publish what the frame needs to follow them.
+    ///
+    /// The application itself is the shared core drain
+    /// ([`pill_editor_core_egui::drain::apply_pending`]), so the browser
+    /// editor runs exactly this contract; the only executable-owned half is
+    /// the asset listing walk a file batch asks for.
     fn apply_pending_commands(&mut self) {
-        let batches = {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            world
-                .get_resource_mut::<PendingEditorCommands>()
-                .map(|pending| std::mem::take(&mut pending.batches))
-                .unwrap_or_default()
-        };
-        if batches.is_empty() {
-            return;
-        }
         let now_millis = self.started.elapsed().as_millis() as u64;
-        for batch in batches {
-            let engine = self.host.host_mut().engine_mut();
-            let recorded = EditorCommand::apply_recorded(engine, &batch.commands);
-            info!(
-                target: telemetry_target::ENGINE,
-                count = batch.commands.len(),
-                "[editor] engine commands applied"
-            );
-            // The shared selection follows its file: a move re-points it, a
-            // delete clears it - the resource agreeing with the disk.
-            for command in &batch.commands {
-                let world = self.host.host_mut().engine_mut().world_mut();
-                let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
-                    break;
-                };
-                match command {
-                    EditorCommand::MoveAssetFile { from, to }
-                        if selection.asset.as_deref() == Some(from.as_str()) =>
-                    {
-                        selection.asset = Some(to.clone());
-                        info!(
-                            target: telemetry_target::ENGINE,
-                            path = to.as_str(),
-                            "[editor] selection followed the move"
-                        );
-                    }
-                    EditorCommand::DeleteAssetFile { path }
-                        if selection.asset.as_deref() == Some(path.as_str()) =>
-                    {
-                        selection.asset = None;
-                        info!(
-                            target: telemetry_target::ENGINE,
-                            path = path.as_str(),
-                            "[editor] selection cleared with the delete"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            // A batch that moved files on disk brings the rows up to date
-            // at once: the toolbar acts on what the rows say.
-            if batch.commands.iter().any(|command| {
-                matches!(
-                    command,
-                    EditorCommand::CreateStandaloneAsset { .. }
-                        | EditorCommand::RestoreAssetFile { .. }
-                        | EditorCommand::DeleteAssetFile { .. }
-                        | EditorCommand::MoveAssetFile { .. }
-                        | EditorCommand::WriteAssetMeta { .. }
-                        | EditorCommand::ImportFiles { .. }
-                        | EditorCommand::RemoveFiles { .. }
-                )
-            }) {
-                self.asset_listing_dirty = true;
-            }
-            for (index, message) in recorded.failures {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    index,
-                    message = %message,
-                    "[editor] command failed"
-                );
-            }
-            // A restore assigned fresh handles; the history follows them
-            // before anything else is recorded, so a later undo cannot
-            // target the dead handle.
-            for (previous, assigned) in &recorded.remaps {
-                let world = self.host.host_mut().engine_mut().world_mut();
-                let Some(history) = world.get_resource_mut::<CommandHistory>() else {
-                    break;
-                };
-                history.remap_entity(*previous, *assigned);
-                info!(
-                    target: telemetry_target::ENGINE,
-                    previous = %previous,
-                    assigned = %assigned,
-                    "[editor] history remap"
-                );
-            }
-            // An edit batch becomes one undo step, unless it failed or
-            // could not be inverted in full - a step that could not be
-            // undone would be worse than no step.
-            if batch.record && recorded.fully_invertible && !batch.commands.is_empty() {
-                let entry = HistoryEntry::engine(
-                    batch.label.clone(),
-                    batch.commands.clone(),
-                    recorded.inverses.clone(),
-                );
-                let entry = match &batch.coalesce_key {
-                    Some(key) => entry.coalescing(key.clone(), now_millis),
-                    None => entry,
-                };
-                let world = self.host.host_mut().engine_mut().world_mut();
-                if let Some(history) = world.get_resource_mut::<CommandHistory>() {
-                    let outcome =
-                        history.push(entry, now_millis, CommandHistory::DEFAULT_COALESCE_WINDOW);
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        label = batch.label.as_str(),
-                        steps = outcome.steps,
-                        coalesced = outcome.coalesced,
-                        "[editor] history push"
-                    );
-                }
-            }
+        let outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
+        if outcome.files_changed {
+            self.asset_listing_dirty = true;
         }
     }
 
@@ -3371,89 +3261,17 @@ impl EditorWindow {
         }
     }
 
-    /// Run `editor.undo` from the scripted channel: pop the newest undo
-    /// entry and queue its inverse batch - applied, never recorded - the
-    /// same walk the native editor's command takes.
+    /// Run `editor.undo` from the scripted channel: the shared core walk pops
+    /// the newest step and queues its inverse - applied, never recorded, the
+    /// same walk the browser editor and the native editor take.
     fn scripted_undo(&mut self) {
-        let step = {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            let Some(history) = world.get_resource_mut::<CommandHistory>() else {
-                return;
-            };
-            match history.pop_undo() {
-                None => {
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] history undo empty"
-                    );
-                    return;
-                }
-                Some(entry) => {
-                    let label = entry.label.clone();
-                    let remaining = history.undo_depth();
-                    let commands = match entry.entry {
-                        HistoryEntryKind::Engine { inverse, .. } => Some(inverse),
-                        HistoryEntryKind::Selection { .. } => None,
-                    };
-                    (label, remaining, commands)
-                }
-            }
-        };
-        let (label, remaining, commands) = step;
-        if let Some(commands) = commands {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push(commands);
-            }
-        }
-        info!(
-            target: telemetry_target::ENGINE,
-            label = label.as_str(),
-            remaining,
-            "[editor] history undo"
-        );
+        drain::step_history(self.host.host_mut().engine_mut(), HistoryDirection::Undo);
     }
 
-    /// Run `editor.redo` from the scripted channel: pop the newest redo
-    /// entry and queue its forward batch.
+    /// Run `editor.redo` from the scripted channel: the same walk, queueing
+    /// the next step's forward batch.
     fn scripted_redo(&mut self) {
-        let step = {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            let Some(history) = world.get_resource_mut::<CommandHistory>() else {
-                return;
-            };
-            match history.pop_redo() {
-                None => {
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        "[editor] history redo empty"
-                    );
-                    return;
-                }
-                Some(entry) => {
-                    let label = entry.label.clone();
-                    let remaining = history.redo_depth();
-                    let commands = match entry.entry {
-                        HistoryEntryKind::Engine { forward, .. } => Some(forward),
-                        HistoryEntryKind::Selection { .. } => None,
-                    };
-                    (label, remaining, commands)
-                }
-            }
-        };
-        let (label, remaining, commands) = step;
-        if let Some(commands) = commands {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push(commands);
-            }
-        }
-        info!(
-            target: telemetry_target::ENGINE,
-            label = label.as_str(),
-            remaining,
-            "[editor] history redo"
-        );
+        drain::step_history(self.host.host_mut().engine_mut(), HistoryDirection::Redo);
     }
 
     /// Run `editor.pause_toggle` from the scripted channel: queue the flip

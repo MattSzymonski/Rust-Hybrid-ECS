@@ -39,9 +39,9 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
 use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
+use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
 use pill_editor_core_egui::gizmo::GizmoState;
-use pill_editor_core_egui::history::{CommandHistory, HistoryEntry, HistoryEntryKind};
 use pill_editor_core_egui::{entities, systems};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
@@ -428,11 +428,12 @@ impl WebEditorApplication {
 
 /// Apply the command batches the shell queued last frame.
 ///
-/// Mirrors the native runner's frame boundary: apply each batch with its
-/// inverses, record one undo step when the batch is recordable and fully
-/// invertible, follow a moved or deleted asset in the shared selection, and
-/// log every failure. The scripted channel's verbs queue the same batches the
-/// native test channel's do, so the browser suite drives one vocabulary.
+/// The scripted lines are the browser's own vocabulary; the application is
+/// the shared core drain ([`pill_editor_core_egui::drain::apply_pending`]),
+/// so the browser applies batches, records history steps, follows a moved or
+/// deleted asset and remaps a restored entity exactly as the native editor
+/// does. The listing flag has no work here: the browser stages no asset panel
+/// yet.
 fn apply_pending_commands(
     engine: &mut pill_engine_core::Engine,
     elapsed: std::time::Duration,
@@ -472,68 +473,8 @@ fn apply_pending_commands(
             None => {}
         }
     }
-    let batches = {
-        let world = engine.world_mut();
-        world
-            .get_resource_mut::<PendingEditorCommands>()
-            .map(|pending| std::mem::take(&mut pending.batches))
-            .unwrap_or_default()
-    };
     let now_millis = elapsed.as_millis() as u64;
-    for batch in batches {
-        let recorded = EditorCommand::apply_recorded(engine, &batch.commands);
-        info!(
-            target: telemetry_target::ENGINE,
-            count = batch.commands.len(),
-            "[editor] engine commands applied"
-        );
-        for command in &batch.commands {
-            let world = engine.world_mut();
-            let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
-                break;
-            };
-            match command {
-                EditorCommand::MoveAssetFile { from, to }
-                    if selection.asset.as_deref() == Some(from.as_str()) =>
-                {
-                    selection.asset = Some(to.clone());
-                }
-                EditorCommand::DeleteAssetFile { path }
-                    if selection.asset.as_deref() == Some(path.as_str()) =>
-                {
-                    selection.asset = None;
-                }
-                _ => {}
-            }
-        }
-        for (index, message) in recorded.failures {
-            warn!(
-                target: telemetry_target::ENGINE,
-                index,
-                message = %message,
-                "[editor] command failed"
-            );
-        }
-        if batch.record && recorded.fully_invertible && !batch.commands.is_empty() {
-            let entry = HistoryEntry::engine(
-                batch.label.clone(),
-                batch.commands.clone(),
-                recorded.inverses.clone(),
-            );
-            let world = engine.world_mut();
-            if let Some(history) = world.get_resource_mut::<CommandHistory>() {
-                let outcome =
-                    history.push(entry, now_millis, CommandHistory::DEFAULT_COALESCE_WINDOW);
-                info!(
-                    target: telemetry_target::ENGINE,
-                    label = batch.label.as_str(),
-                    steps = outcome.steps,
-                    coalesced = outcome.coalesced,
-                    "[editor] history push"
-                );
-            }
-        }
-    }
+    let _ = drain::apply_pending(engine, now_millis);
 }
 
 /// Run one scripted command id: the native test channel's core verbs, queued
@@ -599,70 +540,18 @@ fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
                 "[editor] delete entity queued"
             );
         }
-        "editor.undo" => step_history(engine, true),
-        "editor.redo" => step_history(engine, false),
+        "editor.undo" => {
+            drain::step_history(engine, HistoryDirection::Undo);
+        }
+        "editor.redo" => {
+            drain::step_history(engine, HistoryDirection::Redo);
+        }
         other => warn!(
             target: telemetry_target::ENGINE,
             command = other,
             "[editor] command not executable in the browser"
         ),
     }
-}
-
-/// Pop one undo or redo entry and queue its batch - applied, never recorded,
-/// the native `editor.undo`/`editor.redo` walk.
-///
-/// `undo` asks for the inverse batch; without one (a selection-only step)
-/// the entry is consumed and the depth logged.
-fn step_history(engine: &mut pill_engine_core::Engine, undo: bool) {
-    let step = {
-        let world = engine.world_mut();
-        let Some(history) = world.get_resource_mut::<CommandHistory>() else {
-            return;
-        };
-        let entry = if undo {
-            history.pop_undo()
-        } else {
-            history.pop_redo()
-        };
-        let Some(entry) = entry else {
-            info!(
-                target: telemetry_target::ENGINE,
-                undo,
-                "[editor] history walk empty"
-            );
-            return;
-        };
-        let label = entry.label.clone();
-        let remaining = if undo {
-            history.undo_depth()
-        } else {
-            history.redo_depth()
-        };
-        let commands = match entry.entry {
-            HistoryEntryKind::Engine { forward, inverse } => {
-                Some(if undo { inverse } else { forward })
-            }
-            HistoryEntryKind::Selection { .. } => None,
-        };
-        (label, remaining, commands)
-    };
-    let (label, remaining, commands) = step;
-    if let Some(commands) = commands {
-        if let Some(pending) = engine
-            .world_mut()
-            .get_resource_mut::<PendingEditorCommands>()
-        {
-            pending.push(commands);
-        }
-    }
-    info!(
-        target: telemetry_target::ENGINE,
-        label = label.as_str(),
-        remaining,
-        undo,
-        "[editor] history walk"
-    );
 }
 
 /// Capture the entity and system tiers for the shell's data tabs.
