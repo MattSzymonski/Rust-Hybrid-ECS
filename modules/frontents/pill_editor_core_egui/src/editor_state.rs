@@ -176,6 +176,11 @@ pub struct EditorSnapshot {
     /// The preferences file's values and the current project's remembered
     /// entry (Stage 20); the Preferences tab's rows read them.
     pub preferences: crate::preferences::PreferencesView,
+    /// How many steps the undo history holds; the menu bar's Undo row greys
+    /// out at zero.
+    pub undo_depth: usize,
+    /// How many steps the redo history holds.
+    pub redo_depth: usize,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
 }
@@ -211,6 +216,8 @@ impl EditorSnapshot {
                 .map(|cameras| cameras.grid.enabled)
                 .unwrap_or(false),
             preferences: crate::preferences::PreferencesView::default(),
+            undo_depth: 0,
+            redo_depth: 0,
             errors,
         }
     }

@@ -22,7 +22,7 @@
 
 // External crates
 use pill_ui_egui::egui::Rect;
-use pill_ui_egui::egui_dock::{DockState, Node, NodeIndex};
+use pill_ui_egui::egui_dock::{DockState, Node, NodeIndex, TabIndex};
 use serde::{Deserialize, Serialize};
 
 /// The fraction of the window's width one side column takes in the default
@@ -90,6 +90,20 @@ impl EditorTab {
             EditorTab::Inspector => "Inspector",
             EditorTab::Assets => "Assets",
             EditorTab::Preferences => "Preferences",
+        }
+    }
+
+    /// The wire name the logs and the scripted channel use.
+    pub fn name(self) -> &'static str {
+        match self {
+            EditorTab::Scene => "scene",
+            EditorTab::SecondScene => "scene2",
+            EditorTab::Game => "game",
+            EditorTab::Entities => "entities",
+            EditorTab::Systems => "systems",
+            EditorTab::Inspector => "inspector",
+            EditorTab::Assets => "assets",
+            EditorTab::Preferences => "preferences",
         }
     }
 }
@@ -221,6 +235,26 @@ fn settle_rect(rect: Rect) -> Rect {
     }
 }
 
+/// Bring `tab` to the front of its group, returning whether the dock held it.
+///
+/// The Window menu and the scripted `tab` share this path. `set_active_tab`
+/// takes the tab's index inside its leaf, and the node index must address the
+/// leaf on its own surface: a floating surface's tree is separate.
+pub fn activate_tab(dock: &mut DockState<EditorTab>, tab: EditorTab) -> bool {
+    let Some((surface, node, _)) = dock.find_tab(&tab) else {
+        return false;
+    };
+    let Some(index) = dock[surface][node]
+        .get_leaf()
+        .and_then(|leaf| leaf.tabs.iter().position(|candidate| *candidate == tab))
+    else {
+        return false;
+    };
+    dock.set_active_tab((surface, node, TabIndex(index)));
+    dock.set_focused_node_and_surface((surface, node));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +350,27 @@ mod tests {
             assert!(restored.contains(tab));
         }
         assert_eq!(restored.schema_version(), dock.schema_version());
+    }
+
+    #[test]
+    fn activating_a_tab_brings_it_to_its_leaf_s_front() {
+        let mut dock = EditorDock::new();
+        assert!(activate_tab(dock.state_mut(), EditorTab::Systems));
+        let (surface, node, _) = dock
+            .state()
+            .find_tab(&EditorTab::Systems)
+            .expect("the systems tab is in the default dock");
+        let leaf = dock.state()[surface][node]
+            .get_leaf()
+            .expect("the tab sits in a leaf");
+        let active = leaf.tabs[leaf.active.0];
+        assert_eq!(active, EditorTab::Systems);
+    }
+
+    #[test]
+    fn activating_a_tab_the_dock_lacks_reports_it() {
+        let mut state = DockState::new(vec![EditorTab::Scene]);
+        assert!(!activate_tab(&mut state, EditorTab::Systems));
+        assert!(activate_tab(&mut state, EditorTab::Scene));
     }
 }

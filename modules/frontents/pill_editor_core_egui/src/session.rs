@@ -22,12 +22,12 @@ use std::collections::BTreeMap;
 
 use pill_engine::Resource;
 use pill_ui_egui::boundary::SCENE_VIEWPORTS;
-use pill_ui_egui::egui::{Context, Pos2, Rect};
+use pill_ui_egui::egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 
 // Current crate
 use crate::assets::AssetDialog;
 use crate::browser::ProjectBrowser;
-use crate::layout::EditorDock;
+use crate::layout::{EditorDock, EditorTab};
 
 /// The egui shell's session: the UI context and the dock layout.
 pub struct EguiShellState {
@@ -49,6 +49,12 @@ pub struct EguiShellState {
     /// The Assets tab's project browser: the folder its grid lists, the
     /// tree's open folders and the tile size.
     pub browser: ProjectBrowser,
+    /// The brand mark's texture, uploaded on the first frame and kept for the
+    /// session: the context owns it, so a shell reload reuses it.
+    pub mark: Option<TextureHandle>,
+    /// The menu bar's already-logged geometry and the requests its items
+    /// raised.
+    pub menubar: MenubarSession,
 }
 
 /// The floating viewport toolbox's session state (Stage 22): a drag parks
@@ -76,6 +82,56 @@ impl Default for ToolboxSession {
     }
 }
 
+/// The menu bar's logged geometry: the strip and each title, so a placement is
+/// reported once (the toolbox's pattern) and a suite can click the titles.
+pub struct MenubarSession {
+    /// The strip's last logged rectangle.
+    pub bar: Option<Rect>,
+    /// Each title's last logged rectangle, by [`crate::menubar::Menu::ALL`]
+    /// index.
+    pub titles: [Option<Rect>; crate::menubar::MENU_TITLE_COUNT],
+    /// Each open menu entry's last logged rectangle, keyed `menu/label`; a
+    /// menu's entries log while it is open, so their presence is the proof it
+    /// opened.
+    pub entries: Vec<(String, Rect)>,
+    /// Undo/redo the menus asked for, drained by the executable.
+    pub history_requests: Vec<HistoryRequest>,
+    /// The dock tab the Window menu asked for, drained by the executable.
+    pub pending_tab: Option<EditorTab>,
+    /// Whether the About window is open.
+    pub about_open: bool,
+    /// The menu whose dropdown is open, while one is; the log reports each
+    /// opening once so a suite can tell an open menu from a closed one.
+    pub open: Option<crate::menubar::Menu>,
+    /// Whether a menu asked the editor to quit; the shell moves it to the
+    /// frame at the end of the pass and clears it.
+    pub quit_requested: bool,
+}
+
+impl Default for MenubarSession {
+    fn default() -> Self {
+        Self {
+            bar: None,
+            titles: [None; crate::menubar::MENU_TITLE_COUNT],
+            entries: Vec::new(),
+            history_requests: Vec::new(),
+            pending_tab: None,
+            about_open: false,
+            open: None,
+            quit_requested: false,
+        }
+    }
+}
+
+/// An undo or redo the menu bar asked for, drained by the executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRequest {
+    /// Undo the newest recorded step.
+    Undo,
+    /// Redo the newest undone step.
+    Redo,
+}
+
 impl Resource for EguiShellState {}
 
 impl EguiShellState {
@@ -91,7 +147,23 @@ impl EguiShellState {
             preferences_draft: None,
             toolbox: ToolboxSession::default(),
             browser: ProjectBrowser::default(),
+            mark: None,
+            menubar: MenubarSession::default(),
         }
+    }
+
+    /// The brand mark's texture, uploaded on first use and cloned from then on.
+    pub fn mark_texture(&mut self) -> TextureHandle {
+        if let Some(mark) = &self.mark {
+            return mark.clone();
+        }
+        let texture = self.context.load_texture(
+            "pill_editor.mark",
+            crate::brand::mark_color_image(),
+            TextureOptions::LINEAR,
+        );
+        self.mark = Some(texture.clone());
+        texture
     }
 }
 

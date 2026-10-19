@@ -25,9 +25,13 @@
 
 /// The Assets pipeline: the dialogs' state and the recorded file batches.
 pub mod assets;
+/// The editor's brand mark: the pill logotype as baked coverage.
+pub mod brand;
 /// The Assets tab's project browser: the open folder and the listing math
 /// the tree and the grid share.
 pub mod browser;
+/// The scene viewports' orbit cameras and their navigation gestures.
+pub mod camera;
 /// The clipboard payload documents the copy and paste commands share.
 pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.
@@ -46,6 +50,8 @@ pub mod history;
 pub mod inspector;
 /// The `egui_dock` layout: tab set, default layout and persistence.
 pub mod layout;
+/// The editor's menu bar: its titles, metrics and the items each menu holds.
+pub mod menubar;
 /// The Preferences tab's shared vocabulary: the file's editable keys.
 pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.

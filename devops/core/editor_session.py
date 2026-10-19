@@ -252,6 +252,16 @@ class EditorSession:
         assert self._process is not None, "the session has not started"
         return self._process.wait(timeout=timeout)
 
+    def wait_exit(self, timeout: float = 120.0) -> int:
+        """Waits for the editor to leave on its own (a UI quit); returns its code."""
+        assert self._process is not None, "the session has not started"
+        return self._process.wait(timeout=timeout)
+
+    def exit_code(self) -> Optional[int]:
+        """The editor's exit code once it has left, `None` while it runs."""
+        assert self._process is not None, "the session has not started"
+        return self._process.poll()
+
     # -------------------------------------------------------------------------
     # The log: file-backed, byte-anchored waits
     # -------------------------------------------------------------------------

@@ -17,7 +17,7 @@
 mod dock;
 mod persistence;
 
-pub use dock::{EditorDock, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION};
+pub use dock::{activate_tab, EditorDock, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION};
 pub use persistence::{
     layout_directory, load_or_default, save, LayoutError, LAYOUT_SCHEMA_VERSION,
 };

@@ -203,7 +203,8 @@ pub fn breadcrumb(folder: &str) -> Vec<(String, String)> {
 /// How many tiles fit across `available_width` points when each cell takes
 /// `cell_width` - at least one, so a narrow pane still draws its rows.
 pub fn tile_columns(available_width: f32, cell_width: f32) -> usize {
-    if !(cell_width > 0.0) {
+    // A zero, negative, NaN or infinite cell has no honest column count.
+    if !cell_width.is_finite() || cell_width <= 0.0 {
         return 1;
     }
     ((available_width / cell_width).floor() as usize).max(1)

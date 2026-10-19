@@ -112,6 +112,10 @@ pub struct EguiShellFrame {
     pub ime_allowed: bool,
     /// Where the IME candidate window should appear, logical points.
     pub ime_rect: Option<ShellRect>,
+    /// The shell's menu asked the editor to quit. The winit frontend honours
+    /// it through the same path a window close takes; a browser frontend
+    /// ignores it (a page cannot close itself safely).
+    pub quit_requested: bool,
 }
 
 impl Resource for EguiShellFrame {}
@@ -131,6 +135,7 @@ impl Default for EguiShellFrame {
             overlay_regions: Vec::new(),
             ime_allowed: false,
             ime_rect: None,
+            quit_requested: false,
         }
     }
 }
@@ -176,6 +181,8 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         // frontend reads off the frame's focus state for now.
         ime_allowed: wants_keyboard,
         ime_rect: None,
+        // Only the shell's menu can ask to quit; it sets the flag itself.
+        quit_requested: false,
     }
 }
 

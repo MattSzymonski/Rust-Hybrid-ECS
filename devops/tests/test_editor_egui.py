@@ -97,6 +97,22 @@ GIZMO_TOOL_TOKEN = "[editor] gizmo tool"
 GIZMO_DRAG_PRESS_TOKEN = "[editor] gizmo drag press"
 GIZMO_DRAG_STARTED_TOKEN = "[editor] gizmo drag started"
 GIZMO_DRAG_ENDED_TOKEN = "[editor] gizmo drag ended"
+GIZMO_DRAG_RELEASED_TOKEN = "[editor] gizmo drag ended without a move"
+GIZMO_DRAG_MOVED_TOKEN = "[editor] gizmo drag moved"
+GIZMO_HOVER_TOKEN = "[editor] gizmo hover handle"
+GIZMO_HOVER_NONE_TOKEN = "[editor] gizmo hover none"
+GIZMO_GUIDES_TOKEN = "[editor] gizmo guides"
+VIEWPORT_DUMP_TOKEN = "[test] viewport"
+VIEWPORT_CAMERA_TOKEN = "[test] viewport camera"
+MENU_BAR_RECT_TOKEN = "[editor] menu bar rect"
+MENU_TITLE_RECT_TOKEN = "[editor] menu item rect"
+MENU_ENTRY_RECT_TOKEN = "[editor] menu entry rect"
+MENU_OPENED_TOKEN = "[editor] menu opened"
+MENU_ACTION_TOKEN = "[editor] menu action"
+QUIT_REQUESTED_TOKEN = "[editor] quit requested"
+ACTIVE_VIEWPORT_TOKEN = "[editor] active viewport"
+CAMERA_GESTURE_TOKEN = "[editor] camera gesture applied"
+CAMERA_ZOOM_TOKEN = "[editor] camera zoom"
 FIELD_TOKEN = "[test] field"
 ASSET_LISTING_TOKEN = "[editor] asset listing refreshed"
 ASSET_SELECTED_TOKEN = "[editor] asset selected"
@@ -178,6 +194,24 @@ TOOLBOX_RECT_PATTERN = (
 TOOLBOX_ITEM_PATTERN = (
     re.escape(TOOLBOX_ITEM_TOKEN)
     + r'\s+view=(\d+)\s+item="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+# The menu bar's runtime values, in the field order the shell logs them: the
+# strip's rectangle, each title's, and each open menu entry's - all in logical
+# points, the physical pixels of the click injections while the suite runs at a
+# scale factor of 1.
+MENU_BAR_RECT_PATTERN = (
+    re.escape(MENU_BAR_RECT_TOKEN)
+    + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+MENU_TITLE_RECT_PATTERN = (
+    re.escape(MENU_TITLE_RECT_TOKEN)
+    + r'\s+name="([a-z]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+MENU_ENTRY_RECT_PATTERN = (
+    re.escape(MENU_ENTRY_RECT_TOKEN)
+    + r'\s+menu="([a-z]+)"\s+label="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
 )
 # The scene grid's state, in the field order the frontend logs it: the
@@ -267,6 +301,59 @@ def toolbox_click(session: EditorSession, view: int, item: str, label: str) -> N
         re.escape(TOOLBOX_CLICK_TOKEN) + rf'\s+view={view}\s+item="{item}"',
         30,
         label,
+        begin,
+    )
+
+
+def menu_title_rect(session: EditorSession, name: str) -> tuple:
+    """One menu title's last logged rectangle, looked up by its wire name."""
+    matches = [
+        match
+        for match in re.finditer(MENU_TITLE_RECT_PATTERN, session.read_log())
+        if match.group(1) == name
+    ]
+    if not matches:
+        raise AssertionError(f"no menu title {name!r} in the log")
+    last = matches[-1]
+    return (
+        float(last.group(2)),
+        float(last.group(3)),
+        float(last.group(4)),
+        float(last.group(5)),
+    )
+
+
+def menu_click(session: EditorSession, menu: str, label: str, action_label: str) -> None:
+    """Opens `menu`, clicks the `label` item and waits for its action's log line.
+
+    Every menu is opened fresh: a click on an item closes its menu, so a
+    recorded rectangle from an earlier opening would address a closed popup.
+    """
+    center = rect_center(menu_title_rect(session, menu))
+    begin = len(session.read_log())
+    session.send(f"click {center[0]:.0f} {center[1]:.0f}")
+    session.wait(
+        re.escape(MENU_OPENED_TOKEN) + rf'\s+menu="{menu}"',
+        30,
+        f"the {menu} menu opened",
+        begin,
+    )
+    found = [
+        match
+        for match in re.finditer(MENU_ENTRY_RECT_PATTERN, session.read_log())
+        if match.group(1) == menu and match.group(2) == label
+    ]
+    assert found, f"the {menu} menu did not list {label!r}: " + session.read_log()[-600:]
+    entry = found[-1]
+    x = float(entry.group(3)) + float(entry.group(5)) / 2.0
+    y = float(entry.group(4)) + float(entry.group(6)) / 2.0
+    begin = len(session.read_log())
+    session.send(f"click {x:.0f} {y:.0f}")
+    session.wait(
+        re.escape(MENU_ACTION_TOKEN)
+        + rf'\s+menu="{menu}"\s+label="{re.escape(action_label)}"',
+        30,
+        f"the {menu} menu ran {action_label!r}",
         begin,
     )
 
@@ -730,6 +817,123 @@ def main() -> int:
         assert abs(factor - 1.0) > 0.01, f"the scale drag wrote no change: {factor}"
         scale = field_values(gizmo_entity, "scale")
         print(f"  [OK] scale drag wrote {factor:.3f} (scale now {scale})")
+
+        # Step 3b: the viewport's interaction states (Stage 28). A drag begins
+        # on the press and ends on the release; the hover highlight follows
+        # the pointer; the axis guide and the displacement line appear with
+        # the drag; and the translation tool's plane handles move in their
+        # own plane.
+        begin = len(session.read_log())
+        session.send("gizmo translate")
+        session.wait(
+            re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="translate"',
+            30,
+            "the translate tool is active again",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump viewport")
+        session.wait(
+            re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=0\s+interaction="idle"',
+            30,
+            "the viewport is idle",
+            begin,
+        )
+        print("  [OK] the viewport starts active and idle")
+
+        # The press reports the exact handle pixel and starts the drag - no
+        # release needed - and a release with no move finishes it.
+        press_begin = len(session.read_log())
+        session.send("gizmo press x")
+        press_pattern = (
+            re.escape(GIZMO_DRAG_PRESS_TOKEN) + r'\s+axis="x"\s+x=([-\d.]+)\s+y=([-\d.]+)'
+        )
+        session.wait(press_pattern, 30, "the X handle was pressed", press_begin)
+        press = session.find(press_pattern, press_begin)
+        press_x, press_y = float(press.group(1)), float(press.group(2))
+        session.wait(
+            re.escape(GIZMO_DRAG_STARTED_TOKEN) + r'\s+mode="translate"\s+axis="x"',
+            60,
+            "the drag started on the press",
+            press_begin,
+        )
+        print("  [OK] the drag begins on the press, before any release")
+        session.wait(
+            re.escape(GIZMO_GUIDES_TOKEN) + r'\s+axis="x"\s+dotted=true',
+            30,
+            "the axis guide and the displacement line appeared",
+            press_begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump viewport")
+        session.wait(
+            re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=0\s+interaction="dragging-axis"',
+            30,
+            "the drag owns the viewport",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("gizmo release")
+        session.wait(
+            re.escape(GIZMO_DRAG_RELEASED_TOKEN) + r'\s+mode="translate"\s+axis="x"',
+            60,
+            "the release ended the drag",
+            begin,
+        )
+        session.wait(
+            re.escape(GIZMO_GUIDES_TOKEN) + r'\s+guides=false',
+            30,
+            "the guides cleared with the drag",
+            begin,
+        )
+        print("  [OK] the release ends the drag and its guides")
+
+        # The pointer over the handle highlights it, and leaving the gizmo
+        # clears the highlight. The press moved nothing, so the handle still
+        # sits on the pixel the press reported.
+        begin = len(session.read_log())
+        session.send(f"hover 0 {press_x:.0f} {press_y:.0f}")
+        session.wait(
+            re.escape(GIZMO_HOVER_TOKEN) + r'\s+view=0\s+handle=1',
+            30,
+            "the X handle highlighted",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("hover 0 5 5")
+        session.wait(
+            re.escape(GIZMO_HOVER_NONE_TOKEN),
+            30,
+            "the highlight cleared",
+            begin,
+        )
+        print("  [OK] the pointer highlights the handle under it")
+
+        # A plane handle drags in its own plane: X and Y follow the drag, Z
+        # keeps its value.
+        before_plane = field_values(gizmo_entity, "translation")
+        begin = len(session.read_log())
+        session.send("gizmo drag xy 40 30")
+        session.wait(
+            re.escape(GIZMO_DRAG_STARTED_TOKEN) + r'\s+mode="translate"\s+plane="xy"',
+            60,
+            "the drag started on the XY square",
+            begin,
+        )
+        session.wait(
+            re.escape(GIZMO_DRAG_ENDED_TOKEN) + r'\s+mode="translate"\s+plane="xy"',
+            60,
+            "the plane drag ended",
+            begin,
+        )
+        after_plane = field_values(gizmo_entity, "translation")
+        assert abs(after_plane[0] - before_plane[0]) > 0.05 and abs(
+            after_plane[1] - before_plane[1]
+        ) > 0.05, f"the plane drag did not move both axes: {before_plane} -> {after_plane}"
+        assert abs(after_plane[2] - before_plane[2]) < 1e-4, (
+            f"the plane drag left the plane on z: {before_plane} -> {after_plane}"
+        )
+        print(f"  [OK] the XY plane drag moved {before_plane} -> {after_plane}")
 
         # Step 4: the Assets pipeline - the listing, a create through its
         # dialog, a rename whose move the selection follows, a move into a
@@ -1840,6 +2044,106 @@ def main() -> int:
         )
         print("  [OK] the second viewport's toolbox and the parked position")
 
+        # The active viewport (Stage 28): a click inside a viewport makes it
+        # the one camera navigation addresses, and navigation moves only
+        # that view's camera.
+        begin = len(session.read_log())
+        session.send("tab scene2")
+        session.wait(
+            re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene2"',
+            30,
+            "the second viewport shown again",
+            begin,
+        )
+        session.send("dump scenes")
+        # Give the frame loop a moment to place the window and dump it.
+        time.sleep(0.4)
+        second_rect = logged_scene_rect(session, 1)
+        corner_x = second_rect[0] + 6
+        corner_y = second_rect[1] + 6
+        begin = len(session.read_log())
+        session.send(f"click {corner_x} {corner_y}")
+        session.wait(
+            re.escape(ACTIVE_VIEWPORT_TOKEN) + r"\s+view=1",
+            30,
+            "the second viewport activated",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump viewport")
+        session.wait(
+            re.escape(VIEWPORT_DUMP_TOKEN) + r'\s+active=1\s+interaction="idle"',
+            30,
+            "the second viewport is active",
+            begin,
+        )
+        print("  [OK] a click activates the viewport it lands in")
+
+        def viewport_cameras() -> dict:
+            """The newest viewport dump's per-view camera rows."""
+            begin = len(session.read_log())
+            session.send("dump viewport")
+            session.wait(re.escape(VIEWPORT_DUMP_TOKEN), 30, "the viewport dumped", begin)
+            rows = re.findall(
+                re.escape(VIEWPORT_CAMERA_TOKEN)
+                + r'\s+view=(\d+)\s+eye="([-\d.,]+)"\s+pivot="([-\d.,]+)"'
+                + r"\s+distance=([-\d.eE+]+)\s+yaw=([-\d.eE+]+)\s+pitch=([-\d.eE+]+)",
+                session.read_log()[begin:],
+            )
+            return {int(row[0]): row[1:] for row in rows}
+
+        before_navigation = viewport_cameras()
+        begin = len(session.read_log())
+        session.send("camera orbit 60 20")
+        session.wait(
+            re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="orbit"',
+            30,
+            "the orbit applied",
+            begin,
+        )
+        session.send("camera pan 30 10")
+        session.wait(
+            re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="pan"',
+            30,
+            "the pan applied",
+            begin,
+        )
+        session.send("camera dolly 25")
+        session.wait(
+            re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=1\s+navigation="dolly"',
+            30,
+            "the dolly applied",
+            begin,
+        )
+        session.send("camera zoom 3")
+        session.wait(
+            re.escape(CAMERA_ZOOM_TOKEN) + r"\s+view=1",
+            30,
+            "the wheel zoom applied",
+            begin,
+        )
+        after_navigation = viewport_cameras()
+        assert after_navigation[0] == before_navigation[0], (
+            "navigation moved the inactive viewport's camera: {} -> {}".format(
+                before_navigation[0], after_navigation[0]
+            )
+        )
+        assert after_navigation[1] != before_navigation[1], (
+            "navigation left the active viewport's camera where it was"
+        )
+        print("  [OK] camera navigation moved the active viewport only")
+
+        # Back to the first viewport's tab: the steps below read the primary
+        # scene's viewport and its dock.
+        begin = len(session.read_log())
+        session.send("tab scene")
+        session.wait(
+            re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="scene"',
+            30,
+            "the scene tab back again",
+            begin,
+        )
+
         # Step 4g: the infinite scene grid (Stage 23) - the view-bound scene
         # viewports draw it under the world; the toolbox's grid row flips the
         # renderer's one switch, and the resolution names only the scene
@@ -1882,6 +2186,88 @@ def main() -> int:
             "a grid row click reached the scene: {}".format(picks[-500:])
         )
         print("  [OK] the grid toggles through the toolbox row")
+
+        # Step 4h: the menu bar (W-0034) - the pill mark and the six titles
+        # above the dock. Every item runs the action its panel runs, so the
+        # assertions are the same tokens: a tab activated, a recorded create
+        # and its undo, the snapping switch.
+        bar = session.find(MENU_BAR_RECT_PATTERN)
+        assert bar, "the menu bar never reported its rectangle"
+        bar_rect = (float(bar.group(1)), float(bar.group(2)), float(bar.group(3)))
+        bar_height = float(bar.group(4))
+        assert bar_rect[1] < 10.0, f"the bar is not at the top of the window: {bar_rect}"
+        assert bar_rect[2] > 200.0, f"the bar is too narrow to hold the menus: {bar_rect}"
+        assert bar_height >= 20.0, f"the bar is too short to hold the mark: {bar_height}"
+        titles = {name: menu_title_rect(session, name) for name in
+                  ("file", "edit", "create", "view", "window", "help")}
+        ordered = sorted(titles.items(), key=lambda item: item[1][0])
+        assert [name for name, _ in ordered] == ["file", "edit", "create", "view", "window", "help"], (
+            "the titles are out of Unity's order: {}".format(ordered)
+        )
+        first_title_left = titles["file"][0]
+        # The mark sits at x=10 and is 18 wide, then the gap: a title inside
+        # that room would be drawn over the logo.
+        assert first_title_left >= 30.0, (
+            "the mark's room is missing before the first title: {}".format(first_title_left)
+        )
+        print(f"  [OK] the bar holds the mark and six titles from x={first_title_left:.0f}")
+
+        # The Window menu brings the Systems tab forward - the same
+        # activation the scripted `tab` command takes.
+        begin = len(session.read_log())
+        menu_click(session, "window", "Systems", "Systems")
+        session.wait(
+            re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="systems"',
+            30,
+            "the Window menu activated the Systems tab",
+            begin,
+        )
+
+        # Create -> New Entity records an entity; Edit -> Undo takes it back.
+        count_before = latest_entity_count()
+        begin = len(session.read_log())
+        menu_click(session, "create", "New Entity", "New Entity")
+        wait_for_entity_count(count_before + 1, "the Create menu's new entity")
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="new entity"',
+            30,
+            "the Create menu's step recorded",
+            begin,
+        )
+        begin = len(session.read_log())
+        menu_click(session, "edit", "Undo", "Undo")
+        session.wait(
+            re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="new entity"',
+            30,
+            "the Edit menu undid it",
+            begin,
+        )
+        wait_for_entity_count(count_before, "the undo removed the menu's entity")
+        print("  [OK] the Create and Edit menus round-trip a recorded step")
+
+        # View -> Snap flips the same switch the toolbox's row does, twice, so
+        # the suite leaves it where it found it.
+        begin = len(session.read_log())
+        menu_click(session, "view", "Snap", "Snap")
+        session.wait(
+            re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r"[^\n]*snap=true",
+            30,
+            "the View menu turned snapping on",
+            begin,
+        )
+        begin = len(session.read_log())
+        menu_click(session, "view", "Snap", "Snap")
+        session.wait(
+            re.escape(GIZMO_PREFERENCES_WRITTEN_TOKEN) + r"[^\n]*snap=false",
+            30,
+            "the View menu turned snapping back off",
+            begin,
+        )
+        picks = session.read_log()[step_begin:]
+        assert "scene pick" not in picks, (
+            "a menu item click reached the scene: {}".format(picks[-500:])
+        )
+        print("  [OK] the View menu drives the gizmo's snapping, and its menus stay off the scene")
 
         # Step 5: the dock rearranges - an undocked tab becomes a second
         # dock surface - through the scripted channel.
@@ -2002,9 +2388,16 @@ def main() -> int:
         session.wait_occurrence(view_one, before + 1, 30, "second viewport surface")
         print("  [OK] second viewport undocked, its surface is live")
 
-        # Step 10: a graceful quit, with the clean exit code.
-        status = session.quit_and_wait(timeout=60)
-        assert status == 0, f"editor exited {status} on the test quit"
+        # Step 10: Help -> About opens the About window, and File -> Quit
+        # Editor leaves through the shell's own request - the graceful quit
+        # and its clean exit code.
+        menu_click(session, "help", "About Pill Editor", "About Pill Editor")
+        print("  [OK] the Help menu opened the About window")
+        begin = len(session.read_log())
+        menu_click(session, "file", "Quit Editor", "Quit Editor")
+        session.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the quit reached the frontend", begin)
+        status = session.wait_exit(timeout=60)
+        assert status == 0, f"editor exited {status} on the menu's quit"
         assert "panic" not in session.read_log(), "a panic was logged"
         print("  [OK] clean exit, code 0")
     finally:
