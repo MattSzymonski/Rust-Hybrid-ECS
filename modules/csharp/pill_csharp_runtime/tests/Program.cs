@@ -48,6 +48,26 @@ internal struct TestComponent8 { public uint Value; }
 [StructLayout(LayoutKind.Sequential)]
 internal struct CommandOnlyComponent { public uint Value; }
 
+/// <summary>
+/// A project component whose fields declare the presentation decorators, used
+/// to prove the manifest carries them to the Inspector untouched.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct DecoratedProbe
+{
+    [Header("Combat")]
+    [Tooltip("Current hit points")]
+    [Range(0f, 100f)]
+    public float Health;
+
+    [Space(10)]
+    [Min(0f)]
+    public int Ammo;
+
+    [HideInInspector]
+    public uint InternalId;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct InvalidBoolComponent { public bool Value; }
 
@@ -750,6 +770,37 @@ internal static class Program
                         component.GetProperty("full_name").GetString() ==
                         typeof(CommandOnlyComponent).FullName),
                     "command-only project component was omitted from the manifest");
+            });
+
+            Test("manifest carries a field's presentation decorators", () =>
+            {
+                using var json = System.Text.Json.JsonDocument.Parse(
+                    ProjectManifestBuilder.Build([], typeof(DecoratedProbe).Assembly));
+                var probe = json.RootElement.EnumerateArray().Single(component =>
+                    component.GetProperty("full_name").GetString() ==
+                    typeof(DecoratedProbe).FullName);
+                var fields = probe.GetProperty("fields").EnumerateArray().ToArray();
+                var health = fields.Single(field =>
+                    field.GetProperty("name").GetString() == "Health");
+                var decorators = health.GetProperty("decorators")
+                    .EnumerateArray().ToArray();
+                // Declaration order, which is what the Inspector draws by.
+                Equal(string.Join(",", decorators.Select(decorator =>
+                        decorator.GetProperty("kind").GetString())),
+                    "header,tooltip,range", "Health decorator order mismatch");
+                Assert(decorators[0].GetProperty("text").GetString() == "Combat",
+                    "the header text was not carried");                Equal(decorators[2].GetProperty("min").GetSingle(), 0f,
+                    "the range minimum was not carried");
+                Equal(decorators[2].GetProperty("max").GetSingle(), 100f,
+                    "the range maximum was not carried");
+                var ammo = fields.Single(field =>
+                    field.GetProperty("name").GetString() == "Ammo");
+                Equal(string.Join(",", ammo.GetProperty("decorators")
+                        .EnumerateArray().Select(decorator =>
+                            decorator.GetProperty("kind").GetString())),
+                    "space,min", "Ammo decorator order mismatch");
+                Equal(ammo.GetProperty("decorators")[0].GetProperty("number").GetSingle(), 10f,
+                    "the gap height was not carried");
             });
 
             Test("ball physics declares PhysicsState, Position, and TransformComponent writes", () =>

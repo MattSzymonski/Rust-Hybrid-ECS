@@ -44,6 +44,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -52,6 +53,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 
@@ -65,6 +67,7 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -73,6 +76,7 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 

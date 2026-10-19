@@ -22,6 +22,7 @@ use std::sync::Mutex;
 
 // External crates
 use pill_core::error::EngineMessage;
+use pill_engine::component_registry::FieldDecorator;
 use pill_engine::{
     ComponentId, ComponentTicks, Engine, Entity, SystemAccess, SystemError, SystemScheduler,
 };
@@ -669,6 +670,125 @@ fn descriptor_registration_still_installs_field_layout() {
     assert_eq!(layout.len(), 1, "one manifest field means one descriptor");
     assert_eq!(layout[0].name, "Value");
     assert_eq!(layout[0].type_tag, "u32");
+}
+
+/// The presentation decorators a managed field declares reach the editor's
+/// layout unchanged and in declaration order, and an undecorated field carries
+/// none.
+#[test]
+fn managed_field_decorators_reach_the_editor_layout() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.DecoratedProbe");
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.DecoratedProbe",
+        "size": 12,
+        "alignment": 4,
+        "schema_hash": 4,
+        "shared": false,
+        "fields": [
+            {
+                "name": "Health",
+                "offset": 0,
+                "size": 4,
+                "primitive_type": "System.Single",
+                "decorations": [
+                    { "kind": "header", "text": "Combat" },
+                    { "kind": "tooltip", "text": "Current hit points" },
+                    { "kind": "range", "min": 0.0, "max": 100.0 }
+                ],
+                "fields": []
+            },
+            {
+                "name": "Ammo",
+                "offset": 4,
+                "size": 4,
+                "primitive_type": "System.Int32",
+                "decorations": [{ "kind": "min", "number": 0.0 }],
+                "fields": []
+            },
+            {
+                "name": "Plain",
+                "offset": 8,
+                "size": 4,
+                "primitive_type": "System.Single",
+                "fields": []
+            }
+        ]
+    }]);
+    let bindings =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .expect("a decorated manifest registers");
+    let layout = engine
+        .world()
+        .component_field_layout(bindings[&stable_id].component_id())
+        .expect("the descriptor component keeps its field layout");
+
+    assert_eq!(
+        layout[0].decorators.as_ref(),
+        &[
+            FieldDecorator::Header("Combat".into()),
+            FieldDecorator::Tooltip("Current hit points".into()),
+            FieldDecorator::Range {
+                min: 0.0,
+                max: 100.0,
+            },
+        ],
+        "decorators keep their declaration order"
+    );
+    assert_eq!(layout[1].decorators.as_ref(), &[FieldDecorator::Min(0.0)]);
+    assert!(
+        layout[2].decorators.is_empty(),
+        "an undecorated field carries no decorators"
+    );
+}
+
+/// A decorator that cannot mean what it says is refused with the field named,
+/// instead of being silently ignored the way Unity ignores a bad range.
+#[test]
+fn an_impossible_decorator_is_refused() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.BadDecorators");
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.BadDecorators",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 5,
+        "shared": false,
+        "fields": [{
+            "name": "Health",
+            "offset": 0,
+            "size": 4,
+            "primitive_type": "System.Single",
+            "decorations": [{ "kind": "range", "min": 100.0, "max": 0.0 }],
+            "fields": []
+        }]
+    }]);
+
+    // `expect_err` needs `Debug` on the bindings map, which the binding type
+    // does not implement, so the refusal is matched out directly.
+    let error = match register_component_manifest(
+        &mut engine,
+        &serde_json::to_vec(&manifest).unwrap(),
+        shared,
+    ) {
+        Ok(_) => panic!("a range with the maximum first is refused"),
+        Err(error) => error,
+    };
+    let message = error.to_plain_message();
+    assert!(
+        message.contains("Health"),
+        "the refusal names the field: {message}"
+    );
+    assert!(
+        message.contains("range"),
+        "the refusal names the decorator: {message}"
+    );
 }
 
 /// A caller that passes nowhere to write gets a status, not silent truncation.

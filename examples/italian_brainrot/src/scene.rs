@@ -6,7 +6,7 @@
 //! - Spawn one model variant per tagged shape, each guarded by its tag so a
 //!   reload re-runs the system without stacking duplicates.
 
-use crate::{asset_loading::SceneAssets, TagAlphaComponent};
+use crate::{asset_loading::SceneAssets, ShowcaseComponent, TagAlphaComponent};
 use pill_engine::{Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
@@ -40,11 +40,14 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
         return Ok(());
     }
 
-    for (translation, material) in [
+    for (index, (translation, material)) in [
         ([-1.25, 0.0, 0.0], assets.lit),
         ([1.25, 0.0, 0.0], assets.unlit),
         ([0.0, 0.0, 1.5], assets.cartoon),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         world
             .create_entity()
             .with(TransformComponent {
@@ -57,6 +60,14 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
                     .material(&material)
                     .build(),
             )
+            // The Inspector showcase: each model carries one, with distinct
+            // values so the sliders and drag values open on different numbers.
+            .with(ShowcaseComponent {
+                internal_id: index as u32 + 1,
+                frame: 0.0,
+                lean: index as f32 * 0.5 - 0.5,
+                scale: 1.0 + index as f32 * 0.5,
+            })
             .with(TagAlphaComponent)
             .build()
             .map_err(|error| error.to_string())?;

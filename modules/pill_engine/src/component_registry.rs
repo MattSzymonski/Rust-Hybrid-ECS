@@ -63,7 +63,9 @@ pub struct PillComponentDescriptor {
 /// it generates mirrors. `Copy` so the module ABI can hand the array to the
 /// host by value; the inner `fields` slice stays a pointer into the declaring
 /// artifact's static data, which remains mapped for the artifact's lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `PartialEq` only: a field's presentation decorators compare by value, and a
+/// float payload rules out `Eq`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PillValueTypeDescriptor {
     /// Fully-qualified type name, as `std::any::type_name` would report it.
     pub type_name: &'static str,

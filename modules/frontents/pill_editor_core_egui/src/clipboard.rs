@@ -360,6 +360,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 1,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }
     }
 

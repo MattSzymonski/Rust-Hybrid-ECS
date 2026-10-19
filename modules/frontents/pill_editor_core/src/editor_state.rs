@@ -1581,6 +1581,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "enabled",
@@ -1589,6 +1590,7 @@ mod tests {
             size: 1,
             align: 1,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -1687,6 +1689,7 @@ mod tests {
         size: 6,
         align: 2,
         element_count: 3,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     }];
 
     fn array_component_name() -> String {

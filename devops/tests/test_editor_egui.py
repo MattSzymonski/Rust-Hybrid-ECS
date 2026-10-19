@@ -110,6 +110,12 @@ MENU_ENTRY_RECT_TOKEN = "[editor] menu entry rect"
 MENU_OPENED_TOKEN = "[editor] menu opened"
 MENU_ACTION_TOKEN = "[editor] menu action"
 QUIT_REQUESTED_TOKEN = "[editor] quit requested"
+INSPECTOR_SECTION_TOKEN = "[editor] inspector section"
+INSPECTOR_SECTION_RECT_TOKEN = "[editor] inspector section rect"
+INSPECTOR_ADD_RECT_TOKEN = "[editor] inspector add rect"
+INSPECTOR_ADD_OPENED_TOKEN = "[editor] inspector add opened"
+INSPECTOR_ADD_ENTRY_TOKEN = "[editor] inspector add entry"
+INSPECTOR_ROW_TOKEN = "[editor] inspector row"
 ACTIVE_VIEWPORT_TOKEN = "[editor] active viewport"
 CAMERA_GESTURE_TOKEN = "[editor] camera gesture applied"
 CAMERA_ZOOM_TOKEN = "[editor] camera zoom"
@@ -213,6 +219,31 @@ MENU_ENTRY_RECT_PATTERN = (
     re.escape(MENU_ENTRY_RECT_TOKEN)
     + r'\s+menu="([a-z]+)"\s+label="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
     + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+# The Inspector's runtime values: a section header's rectangle (keyed by the
+# registered component type), the Add Component button's, and an addable
+# entry's - all in logical points like the rest of the shell's geometry.
+INSPECTOR_SECTION_RECT_PATTERN = (
+    re.escape(INSPECTOR_SECTION_RECT_TOKEN)
+    + r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+INSPECTOR_ADD_RECT_PATTERN = (
+    re.escape(INSPECTOR_ADD_RECT_TOKEN)
+    + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+INSPECTOR_ADD_ENTRY_PATTERN = (
+    re.escape(INSPECTOR_ADD_ENTRY_TOKEN)
+    + r'\s+component="([^"]+)"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)'
+    + r"\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+# One drawn Inspector row, in the field order the shell logs it: the row's
+# kind, the component it belongs to, then whatever that kind carries (a
+# field's name, widget and tooltip, a header's text, a gap's height). The
+# kind logs unquoted because the shell passes it as a literal.
+INSPECTOR_ROW_PATTERN = (
+    re.escape(INSPECTOR_ROW_TOKEN)
+    + r'\s+kind="?([a-z-]+)"?\s+component="([^"]+)"([^\n]*)'
 )
 # The scene grid's state, in the field order the frontend logs it: the
 # switch, the cell size, and the surfaces the renderer draws it on (empty
@@ -367,6 +398,84 @@ def logged_scene_rect(session: EditorSession, view: int) -> tuple:
         float(match.group(4)),
         float(match.group(5)),
         match.group(6) == "true",
+    )
+
+
+def inspector_section_rect(session: EditorSession, component: str) -> tuple:
+    """One Inspector section header's last logged rectangle."""
+    matches = [
+        match
+        for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log())
+        if match.group(1) == component
+    ]
+    if not matches:
+        raise AssertionError(f"no Inspector section for {component!r} in the log")
+    last = matches[-1]
+    return (
+        float(last.group(2)),
+        float(last.group(3)),
+        float(last.group(4)),
+        float(last.group(5)),
+    )
+
+
+def inspector_add_rect(session: EditorSession) -> tuple:
+    """The Add Component button's last logged rectangle."""
+    matches = list(re.finditer(INSPECTOR_ADD_RECT_PATTERN, session.read_log()))
+    if not matches:
+        raise AssertionError("the Inspector's add button never reported its rectangle")
+    last = matches[-1]
+    return (
+        float(last.group(1)),
+        float(last.group(2)),
+        float(last.group(3)),
+        float(last.group(4)),
+    )
+
+
+def latest_detail_entity(session: EditorSession) -> str:
+    """The entity the newest rows heartbeat reports as the Inspector's detail."""
+    details = re.findall(r'detail="([^"-][^"]*)"', session.read_log())
+    if not details:
+        raise AssertionError("no rows heartbeat reported a selected entity")
+    return details[-1]
+
+
+def inspector_rows(session: EditorSession, component_suffix: str) -> list:
+    """Every drawn Inspector row of the components whose name ends that way.
+
+    Each entry is `(kind, component, rest)`: the row's kind, the component it
+    belongs to, and the rest of the line (a field's name and widget, a
+    header's text, a gap's height) for the caller to read.
+    """
+    return [
+        (match.group(1), match.group(2), match.group(3))
+        for match in re.finditer(INSPECTOR_ROW_PATTERN, session.read_log())
+        if match.group(2).endswith(component_suffix)
+    ]
+
+
+def latest_detail_components(session: EditorSession) -> int:
+    """How many components the newest rows heartbeat sees on the detail entity."""
+    counts = re.findall(r"detail_components=(\d+)", session.read_log())
+    if not counts:
+        raise AssertionError("no rows heartbeat reported a component count")
+    return int(counts[-1])
+
+
+def wait_for_detail_components(session: EditorSession, target: int, label: str) -> None:
+    """Waits until the newest rows heartbeat reports `target` component count."""
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        counts = re.findall(r"detail_components=(\d+)", session.read_log())
+        if counts and int(counts[-1]) == target:
+            print("  [OK] {}".format(label))
+            return
+        # Poll until a heartbeat with the expected count shows up.
+        time.sleep(0.3)
+    raise TimeoutError(
+        "{}: the heartbeats never reported detail_components={}\n".format(label, target)
+        + session.read_log()[-2000:]
     )
 
 
@@ -2268,6 +2377,236 @@ def main() -> int:
             "a menu item click reached the scene: {}".format(picks[-500:])
         )
         print("  [OK] the View menu drives the gizmo's snapping, and its menus stay off the scene")
+
+        # Step 4i: the Unity-style Inspector (W-0035) - one collapsible
+        # section per component (a caret, a duotone icon, the label), typed
+        # rows, and the Add Component button in the tab's top-right.
+        begin = len(session.read_log())
+        session.send("tab inspector")
+        session.wait(
+            re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="inspector"',
+            30,
+            "the Inspector tab shown",
+            begin,
+        )
+        # A live handle: the rows heartbeat names the entity the Inspector
+        # describes, and re-selecting it is the recorded path the entities
+        # list takes.
+        detail_entity = latest_detail_entity(session)
+        begin = len(session.read_log())
+        session.send(f"select entity {detail_entity}")
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(detail_entity)}",
+            30,
+            "an entity selected for the Inspector",
+            begin,
+        )
+        section_begin = len(session.read_log())
+        session.send("dump viewport")
+        session.wait(re.escape(VIEWPORT_DUMP_TOKEN), 30, "a frame drawn", section_begin)
+        # The rectangles log once per placement (and again whenever the
+        # layout moves them), so a section drawn since the editor started is
+        # read from the whole log, not from this window. The Inspector is a
+        # narrow column that scrolls, so only its top is guaranteed to be
+        # visible: the section whose logged header sits highest is the one a
+        # scripted click can always reach.
+        section_rects = [
+            (
+                match.group(1),
+                float(match.group(2)),
+                float(match.group(3)),
+                float(match.group(4)),
+                float(match.group(5)),
+            )
+            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log())
+        ]
+        assert section_rects, "the Inspector never reported a section's rectangle"
+        sections = [entry[0] for entry in section_rects]
+        # Ties on the smallest y are broken by the latest log entry: the most
+        # recent placement is the one the panel is showing.
+        topmost = min(
+            enumerate(section_rects), key=lambda entry: (entry[1][2], -entry[0])
+        )[1]
+        transform_section = topmost[0]
+        print(
+            f"  [OK] the Inspector draws {len(set(sections))} section(s), "
+            f"toggling {transform_section}"
+        )
+
+        # A header click collapses its section; a second brings it back. The
+        # click lands on the bar's upper half, which stays inside the panel's
+        # visible viewport even when the header is partly scrolled out.
+        def header_click_point() -> tuple:
+            rect = inspector_section_rect(session, transform_section)
+            return (rect[0] + 12.0, rect[1] + 6.0)
+
+        center = header_click_point()
+        begin = len(session.read_log())
+        session.send(f"click {center[0]:.0f} {center[1]:.0f}")
+        session.wait(
+            re.escape(INSPECTOR_SECTION_TOKEN)
+            + rf'\s+component="{re.escape(transform_section)}"\s+collapsed=true',
+            30,
+            "the section collapsed",
+            begin,
+        )
+        # egui answers a click from the previous frame's widget rectangles, and
+        # collapsing a section reshapes everything below it. A frame with no
+        # click in flight lets the header settle as the pointer's target before
+        # the second click arrives.
+        settle = len(session.read_log())
+        session.send("dump viewport")
+        session.wait(re.escape(VIEWPORT_DUMP_TOKEN), 30, "a settling frame", settle)
+        begin = len(session.read_log())
+        center = header_click_point()
+        session.send(f"click {center[0]:.0f} {center[1]:.0f}")
+        session.wait(
+            re.escape(INSPECTOR_SECTION_TOKEN)
+            + rf'\s+component="{re.escape(transform_section)}"\s+collapsed=false',
+            30,
+            "the section expanded again",
+            begin,
+        )
+        print("  [OK] a section collapses and expands from its header")
+
+        # The Add Component button lists what the entity lacks; a pick adds
+        # one recorded component, which the suite then removes again.
+        components_before = latest_detail_components(session)
+        add = rect_center(inspector_add_rect(session))
+        begin = len(session.read_log())
+        session.send(f"click {add[0]:.0f} {add[1]:.0f}")
+        session.wait(re.escape(INSPECTOR_ADD_OPENED_TOKEN), 30, "the add list opened", begin)
+        session.wait(
+            INSPECTOR_ADD_ENTRY_PATTERN, 30, "the add list reported its entries", begin
+        )
+        entries = [
+            match.group(1)
+            for match in re.finditer(INSPECTOR_ADD_ENTRY_PATTERN, session.read_log()[begin:])
+        ]
+        assert entries, "the add list was empty"
+        chosen = entries[0]
+        entry_rect_matches = [
+            match
+            for match in re.finditer(INSPECTOR_ADD_ENTRY_PATTERN, session.read_log()[begin:])
+            if match.group(1) == chosen
+        ]
+        entry = entry_rect_matches[-1]
+        entry_center = (
+            float(entry.group(2)) + float(entry.group(4)) / 2.0,
+            float(entry.group(3)) + float(entry.group(5)) / 2.0,
+        )
+        begin = len(session.read_log())
+        session.send(f"click {entry_center[0]:.0f} {entry_center[1]:.0f}")
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="add ',
+            30,
+            "the add recorded a step",
+            begin,
+        )
+        wait_for_detail_components(
+            session, components_before + 1, "the added component reached the section"
+        )
+        begin = len(session.read_log())
+        session.send(f"edit remove {detail_entity} {chosen}")
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="remove ',
+            30,
+            "the suite removed the added component again",
+            begin,
+        )
+        wait_for_detail_components(
+            session, components_before, "the removal took it back out"
+        )
+        print(f"  [OK] the Add Component button added {chosen} and the suite removed it")
+
+        # Step 4j: the field decorators (W-0036) - a component whose fields
+        # declare [Header]/[Space]/[Tooltip]/[Range]/[Min]/[HideInInspector]
+        # draws the rows the model chose: a separator line, a gap, a slider
+        # carrying its tooltip, a clamped drag value, and no row at all for
+        # the hidden field. `italian_brainrot`'s models carry the decorated
+        # `ShowcaseComponent`, so the step picks one the way the scene
+        # selection step does.
+        begin = len(session.read_log())
+        session.send("tab inspector")
+        session.wait(
+            re.escape(TAB_ACTIVATED_TOKEN) + r'\s+tab="inspector"',
+            30,
+            "the Inspector tab shown again",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump scenes")
+        viewport = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            match = re.search(SCENE_RECT_PATTERN, session.read_log()[begin:])
+            if match and match.group(1) == "0" and match.group(6) == "true":
+                viewport = tuple(int(value) for value in match.groups()[1:5])
+                break
+            # Poll until the frontend answers the dump.
+            time.sleep(0.5)
+        assert viewport, "no visible scene view rect for the decorator step"
+        showcase_rows = []
+        for fraction_x, fraction_y in ((0.5, 0.5), (0.35, 0.4), (0.65, 0.4)):
+            x = int(viewport[0] + viewport[2] * fraction_x)
+            y = int(viewport[1] + viewport[3] * fraction_y)
+            probe = len(session.read_log())
+            session.send(f"click {x} {y}")
+            session.send("dump viewport")
+            session.wait(re.escape(VIEWPORT_DUMP_TOKEN), 30, "a frame drawn", probe)
+            showcase_rows = inspector_rows(session, "ShowcaseComponent")
+            if showcase_rows:
+                break
+        assert showcase_rows, (
+            "no decorated component reached the Inspector; the scene probe never "
+            "selected a model carrying ShowcaseComponent"
+        )
+        kinds = [kind for kind, _, _ in showcase_rows]
+        assert "header" in kinds, f"no header row was drawn: {showcase_rows}"
+        assert "space" in kinds, f"no gap row was drawn: {showcase_rows}"
+        header = next(rest for kind, _, rest in showcase_rows if kind == "header")
+        assert 'text="Frame"' in header, f"the header text did not reach the row: {header}"
+        space = next(rest for kind, _, rest in showcase_rows if kind == "space")
+        assert "pixels=6" in space, f"the gap height did not reach the row: {space}"
+        slider = next(
+            rest for kind, _, rest in showcase_rows
+            if kind == "field" and 'field="lean"' in rest
+        )
+        assert 'widget="float-slider"' in slider, (
+            f"the range decorator did not become a slider: {slider}"
+        )
+        assert 'tooltip="How far the shape leans towards the camera"' in slider, (
+            f"the tooltip did not reach the row: {slider}"
+        )
+        clamped = next(
+            rest for kind, _, rest in showcase_rows
+            if kind == "field" and 'field="scale"' in rest
+        )
+        assert 'widget="float-drag"' in clamped, (
+            f"the minimum decorator did not clamp the drag value: {clamped}"
+        )
+        assert not any(
+            'field="internal_id"' in rest for _, _, rest in showcase_rows
+        ), f"the hidden field drew a row: {showcase_rows}"
+        print("  [OK] the Inspector drew the decorated rows and hid the hidden field")
+
+        # A slider edit is one recorded step, like any other field write; the
+        # value it wrote answers through the field dump.
+        slider_entity = latest_detail_entity(session)
+        begin = len(session.read_log())
+        session.send(f"edit set {slider_entity} ShowcaseComponent lean 0.25")
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="set ShowcaseComponent\.lean"',
+            30,
+            "the slider edit recorded a step",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send(f"dump field {slider_entity} ShowcaseComponent lean")
+        session.wait(re.escape(FIELD_TOKEN), 30, "the edited field", begin)
+        dump = session.read_log()[begin:]
+        assert "0.25" in dump, f"the edit did not reach the field: {dump[-400:]}"
+        print("  [OK] a decorated field edit records and reads back")
 
         # Step 5: the dock rearranges - an undocked tab becomes a second
         # dock surface - through the scripted channel.

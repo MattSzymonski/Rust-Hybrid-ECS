@@ -76,6 +76,24 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 ///   moved between modules and the old identity must be kept. The name must be
 ///   unique process-wide, so it should stay namespaced.
 ///
+/// Supported field decorators (`#[pill(...)]` on a field, Unity's vocabulary;
+/// several per field either comma-separated in one attribute or as one
+/// attribute each):
+/// - `#[pill(hide_in_inspector)]` - the Inspector does not draw the field;
+///   it is still stored, serialized and copied;
+/// - `#[pill(header("Text"))]` - a separator line with the text above the field;
+/// - `#[pill(space(10.0))]` - a vertical gap above the field;
+/// - `#[pill(tooltip("Text"))]` - the text on hover of the field's label;
+/// - `#[pill(range(0.0, 100.0))]` - a slider over the range (an integer field
+///   slides in whole steps);
+/// - `#[pill(text_area)]`, `#[pill(text_area(3, 10))]` - a multi-line text box
+///   for a `String` field;
+/// - `#[pill(multiline(5))]` - a fixed-height multi-line text box;
+/// - `#[pill(min(0.0))]` - a drag value that never goes below the minimum.
+///
+/// Decorators are presentation only: they change nothing about storage,
+/// persistence, the schema fingerprint or the generated C# mirror.
+///
 /// Supported field types:
 /// - blittable values — primitives, fixed-size arrays, `#[derive(PillMirror)]`
 ///   structs — become typed C# fields on the generated mirror;
@@ -277,7 +295,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
 /// layout is registered first.
 ///
 /// [`ComponentLayout`]: ::pill_engine::component_registry::ComponentLayout
-#[proc_macro_derive(PillLayout)]
+#[proc_macro_derive(PillLayout, attributes(pill))]
 pub fn derive_pill_layout(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -373,6 +391,7 @@ fn component_field_descriptors(
         let field_ty = &field.ty;
         let field_name = field_ident.to_string();
         let type_tag = field_type_tag(field_ty, allow_containers)?;
+        let decorators = parse_field_decorators(&field.attrs)?;
         // Array lengths may be a literal or a `const` path; both resolve in a
         // const context, so the count is computed here rather than parsed.
         let element_count = match field_ty {
@@ -390,6 +409,7 @@ fn component_field_descriptors(
                 size: ::core::mem::size_of::<#field_ty>(),
                 align: ::core::mem::align_of::<#field_ty>(),
                 element_count: #element_count,
+                decorators: #decorators,
             }
         });
         // A container field additionally gets one accessor per supported
@@ -425,6 +445,252 @@ fn component_field_descriptors(
         #layout_consts
     };
     Ok((declared, quote! { #static_name }, quote! { #(#accessors)* }))
+}
+
+/// The argument list of a decorator written with parentheses, e.g.
+/// `range(0.0, 100.0)`.
+type DecoratorArguments = syn::punctuated::Punctuated<syn::Lit, syn::Token![,]>;
+
+/// Parse the `#[pill(...)]` decorators a field declares into the expression
+/// the descriptor emission stores in `decorators`.
+///
+/// A field that declares none yields an empty borrowed slice, so the descriptor
+/// literal stays const-constructible.
+fn parse_field_decorators(attributes: &[syn::Attribute]) -> syn::Result<proc_macro2::TokenStream> {
+    let mut decorators: Vec<proc_macro2::TokenStream> = Vec::new();
+    for attribute in attributes {
+        if !attribute.path().is_ident("pill") {
+            continue;
+        }
+        attribute.parse_nested_meta(|meta| add_field_decorator(&meta, &mut decorators))?;
+    }
+    Ok(quote! {
+        ::std::borrow::Cow::Borrowed(&[ #(#decorators),* ])
+    })
+}
+
+/// Append one parsed field decorator to `decorators`, or refuse the key with
+/// the set a field actually takes.
+fn add_field_decorator(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    decorators: &mut Vec<proc_macro2::TokenStream>,
+) -> syn::Result<()> {
+    let path = &meta.path;
+    if path.is_ident("hide_in_inspector") {
+        decorators.push(quote! {
+            ::pill_engine::component_registry::FieldDecorator::HideInInspector
+        });
+        return Ok(());
+    }
+    if path.is_ident("header") || path.is_ident("tooltip") {
+        let key = if path.is_ident("header") {
+            "header"
+        } else {
+            "tooltip"
+        };
+        let argument = single_argument(meta, key, "header(\"Text\")")?;
+        let syn::Lit::Str(text) = argument else {
+            return Err(syn::Error::new_spanned(
+                argument,
+                format!("`{key}` takes a string, as in {key}(\"Text\")"),
+            ));
+        };
+        decorators.push(if path.is_ident("header") {
+            quote! {
+                ::pill_engine::component_registry::FieldDecorator::Header(
+                    ::std::borrow::Cow::Borrowed(#text)
+                )
+            }
+        } else {
+            quote! {
+                ::pill_engine::component_registry::FieldDecorator::Tooltip(
+                    ::std::borrow::Cow::Borrowed(#text)
+                )
+            }
+        });
+        return Ok(());
+    }
+    if path.is_ident("space") || path.is_ident("min") {
+        let key = if path.is_ident("space") {
+            "space"
+        } else {
+            "min"
+        };
+        let usage = if path.is_ident("space") {
+            "space(10.0)"
+        } else {
+            "min(0.0)"
+        };
+        let argument = single_argument(meta, key, usage)?;
+        let value = literal_as_f32(&argument, key)?;
+        if !value.is_finite() || (path.is_ident("space") && value < 0.0) {
+            return Err(syn::Error::new_spanned(
+                argument,
+                format!("`{key}` takes a finite, non-negative number"),
+            ));
+        }
+        decorators.push(if path.is_ident("space") {
+            quote! { ::pill_engine::component_registry::FieldDecorator::Space(#value) }
+        } else {
+            quote! { ::pill_engine::component_registry::FieldDecorator::Min(#value) }
+        });
+        return Ok(());
+    }
+    if path.is_ident("range") {
+        let arguments = decorator_arguments(meta, "range", "range(0.0, 100.0)")?;
+        let [min_literal, max_literal] =
+            arguments_of_two(&arguments, "range", "range(0.0, 100.0)")?;
+        let min = literal_as_f32(min_literal, "range")?;
+        let max = literal_as_f32(max_literal, "range")?;
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return Err(syn::Error::new_spanned(
+                min_literal,
+                "`range` needs finite bounds with the minimum first, as in range(0.0, 100.0)",
+            ));
+        }
+        decorators.push(quote! {
+            ::pill_engine::component_registry::FieldDecorator::Range { min: #min, max: #max }
+        });
+        return Ok(());
+    }
+    if path.is_ident("text_area") {
+        // Unity's parameterless `[TextArea]` opens a three-row box.
+        if !meta.input.peek(syn::token::Paren) {
+            decorators.push(quote! {
+                ::pill_engine::component_registry::FieldDecorator::TextArea {
+                    min_lines: 3usize,
+                    max_lines: 3usize,
+                }
+            });
+            return Ok(());
+        }
+        let arguments = decorator_arguments(meta, "text_area", "text_area(3, 10)")?;
+        let [min_literal, max_literal] =
+            arguments_of_two(&arguments, "text_area", "text_area(3, 10)")?;
+        let min_lines = literal_as_usize(min_literal, "text_area")?;
+        let max_lines = literal_as_usize(max_literal, "text_area")?;
+        if min_lines == 0 || min_lines > max_lines {
+            return Err(syn::Error::new_spanned(
+                min_literal,
+                "`text_area` needs at least one line with the minimum count first, as in text_area(3, 10)",
+            ));
+        }
+        decorators.push(quote! {
+            ::pill_engine::component_registry::FieldDecorator::TextArea {
+                min_lines: #min_lines,
+                max_lines: #max_lines,
+            }
+        });
+        return Ok(());
+    }
+    if path.is_ident("multiline") {
+        let argument = single_argument(meta, "multiline", "multiline(5)")?;
+        let lines = literal_as_usize(&argument, "multiline")?;
+        if lines == 0 {
+            return Err(syn::Error::new_spanned(
+                argument,
+                "`multiline` needs at least one line, as in multiline(5)",
+            ));
+        }
+        decorators.push(quote! {
+            ::pill_engine::component_registry::FieldDecorator::Multiline(#lines)
+        });
+        return Ok(());
+    }
+    if path.is_ident("persistable") || path.is_ident("shared") {
+        return Err(syn::Error::new_spanned(
+            path,
+            format!(
+                "`{}` declares the type, not a field; a field takes one of the field \
+                 decorators (`hide_in_inspector`, `header(\"Text\")`, `space(10.0)`, \
+                 `tooltip(\"Text\")`, `range(0.0, 100.0)`, `text_area`, \
+                 `text_area(3, 10)`, `multiline(5)`, `min(0.0)`)",
+                path.to_token_stream()
+            ),
+        ));
+    }
+    Err(syn::Error::new_spanned(
+        path,
+        "unknown `pill` field decorator; expected `hide_in_inspector`, `header(\"Text\")`, \
+         `space(10.0)`, `tooltip(\"Text\")`, `range(0.0, 100.0)`, `text_area`, \
+         `text_area(3, 10)`, `multiline(5)` or `min(0.0)`",
+    ))
+}
+
+/// Read a decorator's parenthesised argument list, insisting the parentheses
+/// are there so `#[pill(min)]` names its usage instead of failing on a token.
+fn decorator_arguments(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    key: &str,
+    usage: &str,
+) -> syn::Result<DecoratorArguments> {
+    if !meta.input.peek(syn::token::Paren) {
+        return Err(syn::Error::new_spanned(
+            meta.path.clone(),
+            format!("`{key}` takes arguments, as in {usage}"),
+        ));
+    }
+    let content;
+    syn::parenthesized!(content in meta.input);
+    content.call(DecoratorArguments::parse_terminated)
+}
+
+/// The one argument of a single-argument decorator, or a usage error.
+fn single_argument(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    key: &str,
+    usage: &str,
+) -> syn::Result<syn::Lit> {
+    let arguments = decorator_arguments(meta, key, usage)?;
+    let mut literals = arguments.into_iter();
+    let (Some(only), None) = (literals.next(), literals.next()) else {
+        return Err(syn::Error::new_spanned(
+            meta.path.clone(),
+            format!("`{key}` takes one argument, as in {usage}"),
+        ));
+    };
+    Ok(only)
+}
+
+/// The two arguments of a two-argument decorator, or a usage error.
+fn arguments_of_two<'a>(
+    arguments: &'a DecoratorArguments,
+    key: &str,
+    usage: &str,
+) -> syn::Result<[&'a syn::Lit; 2]> {
+    let mut literals = arguments.iter();
+    let (Some(first), Some(second), None) = (literals.next(), literals.next(), literals.next())
+    else {
+        return Err(syn::Error::new_spanned(
+            arguments,
+            format!("`{key}` takes two arguments, as in {usage}"),
+        ));
+    };
+    Ok([first, second])
+}
+
+/// Read a numeric decorator argument, accepting an integer literal for a
+/// `f32` parameter (`space(10)` as well as `space(10.0)`).
+fn literal_as_f32(literal: &syn::Lit, key: &str) -> syn::Result<f32> {
+    match literal {
+        syn::Lit::Float(value) => value.base10_parse::<f32>(),
+        syn::Lit::Int(value) => value.base10_parse::<f32>(),
+        _ => Err(syn::Error::new_spanned(
+            literal,
+            format!("`{key}` takes a number"),
+        )),
+    }
+}
+
+/// Read a line-count decorator argument, insisting it is a plain integer.
+fn literal_as_usize(literal: &syn::Lit, key: &str) -> syn::Result<usize> {
+    match literal {
+        syn::Lit::Int(value) => value.base10_parse::<usize>(),
+        _ => Err(syn::Error::new_spanned(
+            literal,
+            format!("`{key}` takes a whole line count"),
+        )),
+    }
 }
 
 /// What the managed side needs to know about one heap-owning field.
@@ -1116,7 +1382,7 @@ fn is_primitive_tag(tag: &str) -> bool {
 /// discriminant. Generic types are rejected.
 ///
 /// [`PillValueTypeDescriptor`]: ::pill_engine::component_registry::PillValueTypeDescriptor
-#[proc_macro_derive(PillMirror)]
+#[proc_macro_derive(PillMirror, attributes(pill))]
 pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let ident = &input.ident;

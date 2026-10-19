@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 /// The fraction of the window's width one side column takes in the default
 /// layout.
-pub const SIDE_COLUMN_FRACTION: f32 = 0.16;
+pub const SIDE_COLUMN_FRACTION: f32 = 0.22;
 
 /// The fraction of the window's height the bottom row takes in the default
 /// layout.

@@ -3435,6 +3435,7 @@ fn a_foreign_resource_serves_its_declared_field_layout() {
                     size: 4,
                     align: 4,
                     element_count: 0,
+                    decorators: std::borrow::Cow::Borrowed(&[]),
                 },
                 crate::component_registry::ComponentFieldDescriptor {
                     name: "gain",
@@ -3443,6 +3444,7 @@ fn a_foreign_resource_serves_its_declared_field_layout() {
                     size: 4,
                     align: 4,
                     element_count: 0,
+                    decorators: std::borrow::Cow::Borrowed(&[]),
                 },
             ],
         )
@@ -3478,6 +3480,7 @@ fn an_impossible_resource_field_layout_is_refused() {
             size: 8,
             align: 8,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }],
     );
     assert!(
@@ -3494,6 +3497,7 @@ fn an_impossible_resource_field_layout_is_refused() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }],
     );
     assert!(
@@ -3523,6 +3527,7 @@ fn a_relayout_drops_the_stored_resource_field_layout() {
                 size: 4,
                 align: 4,
                 element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
             }],
         )
         .expect("the field fits");

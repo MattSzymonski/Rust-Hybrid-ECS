@@ -49,7 +49,7 @@ use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
 use pill_engine::archetype::{FieldPlan, LayoutField};
-use pill_engine::component_registry::ComponentFieldDescriptor;
+use pill_engine::component_registry::{ComponentFieldDescriptor, FieldDecorator};
 use pill_engine::{Engine, ResourceId, World};
 
 // Current crate
@@ -102,6 +102,12 @@ pub(super) struct ResourceFieldLayout {
     /// Bytes a declared default writes for this field when a reload adds or
     /// resets it, already parsed against the field's declared type.
     pub(super) default: Option<Vec<u8>>,
+    /// Presentation decorators the field declares, in declaration order.
+    ///
+    /// Owned here for the same reason the other members are: a resource layout
+    /// lives exactly as long as its binding, so there is nothing to borrow it
+    /// from.
+    pub(super) decorations: Vec<FieldDecorator>,
 }
 
 /// Every managed resource, keyed by the stable identity of its full name.
@@ -622,6 +628,7 @@ fn publish_field_layout(
             // no array arity to carry.
             align: field.size.max(1),
             element_count: 0,
+            decorators: std::borrow::Cow::Owned(field.decorations.clone()),
         })
         .collect();
     if let Err(error) = engine

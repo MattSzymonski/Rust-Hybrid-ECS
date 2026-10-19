@@ -23,6 +23,31 @@ mod systems;
 #[pill(shared = "italian_brainrot::TagAlphaComponent", persistable)]
 pub struct TagAlphaComponent;
 
+/// Presentation metadata for the Inspector, one field per decorator.
+///
+/// The fields carry no meaning to the scene: they exist so the editor suites
+/// have a real component whose Inspector section draws a header, a gap, a
+/// tooltip, a slider, a clamped drag value and a hidden field, without
+/// inventing a second test project.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PillComponent)]
+#[pill(persistable)]
+pub struct ShowcaseComponent {
+    /// Hidden noise: the row must not reach the Inspector, but the value is
+    /// stored, serialized and copied like any other field.
+    #[pill(hide_in_inspector)]
+    pub internal_id: u32,
+    /// A header line and a gap above the reading the section opens with.
+    #[pill(header("Frame"), space(6.0))]
+    pub frame: f32,
+    /// A slider over its range, with the explanation on hover.
+    #[pill(tooltip("How far the shape leans towards the camera"), range(-1.0, 1.0))]
+    pub lean: f32,
+    /// A drag value with a floor and no ceiling.
+    #[pill(min(0.0))]
+    pub scale: f32,
+}
+
 /// Registers the renderer, loads the bundled assets, and creates the scene.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
@@ -39,6 +64,7 @@ pub fn init(engine: &mut Engine) -> u32 {
         .expect("register inserts the RenderingManager resource")
         .clear();
     __pill_register_TagAlphaComponent(engine.world_mut());
+    __pill_register_ShowcaseComponent(engine.world_mut());
 
     let assets = match asset_loading::load(engine.world_mut()) {
         Ok(assets) => assets,

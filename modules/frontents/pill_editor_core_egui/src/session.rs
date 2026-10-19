@@ -55,6 +55,8 @@ pub struct EguiShellState {
     /// The menu bar's already-logged geometry and the requests its items
     /// raised.
     pub menubar: MenubarSession,
+    /// The Inspector's collapsed component sections and its logged geometry.
+    pub inspector: InspectorSession,
 }
 
 /// The floating viewport toolbox's session state (Stage 22): a drag parks
@@ -132,6 +134,30 @@ pub enum HistoryRequest {
     Redo,
 }
 
+/// The Inspector's session state: which component sections are collapsed, and
+/// the geometry its log already reported.
+///
+/// Session-scoped like the toolbox: a shell reload keeps it, a restart starts
+/// every section expanded. The collapse state is keyed by the registered type
+/// name, so selecting another entity keeps a type's foldout where the user
+/// left it (Unity's behaviour).
+#[derive(Default)]
+pub struct InspectorSession {
+    /// The component type names whose sections are collapsed.
+    pub collapsed: std::collections::BTreeSet<String>,
+    /// Each section header's last logged rectangle, keyed by type name.
+    pub section_rects: Vec<(String, Rect)>,
+    /// The Add Component button's last logged rectangle.
+    pub add_rect: Option<Rect>,
+    /// Whether the Add Component popup is open.
+    pub add_open: bool,
+    /// The addable entries' last logged rectangles, keyed by type name.
+    pub add_entries: Vec<(String, Rect)>,
+    /// The row signatures already logged, so a panel that redraws every frame
+    /// does not flood the log with the same row.
+    pub rows_logged: Vec<String>,
+}
+
 impl Resource for EguiShellState {}
 
 impl EguiShellState {
@@ -149,6 +175,7 @@ impl EguiShellState {
             browser: ProjectBrowser::default(),
             mark: None,
             menubar: MenubarSession::default(),
+            inspector: InspectorSession::default(),
         }
     }
 
