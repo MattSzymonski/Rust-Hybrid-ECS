@@ -1898,11 +1898,7 @@ pub fn inspector_field_row(
 /// Note one Inspector row's signature, answering whether it is new, so a
 /// panel that redraws every frame does not flood the log with the same row.
 pub fn remember_inspector_row(session: &mut InspectorSession, signature: String) -> bool {
-    if session
-        .rows_logged
-        .iter()
-        .any(|logged| *logged == signature)
-    {
+    if session.rows_logged.contains(&signature) {
         return false;
     }
     session.rows_logged.push(signature);
