@@ -31,7 +31,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 // Current crate
-use crate::commands::{GizmoProjectPreferences, PREFERENCES_FILE};
+use crate::commands::{GizmoProjectPreferences, KeymapPreset, PREFERENCES_FILE};
 
 /// The tab's unsaved field buffers: one text per editable key.
 pub type PreferencesDraft = BTreeMap<String, String>;
@@ -89,6 +89,22 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 8] = [
         fallback: "",
     },
 ];
+
+/// The keymap preset the file selects, or the default (Blender) when the
+/// key is absent, blank or unknown - the preset the viewport navigation
+/// table reads.
+pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
+    let Some(Value::String(name)) = lookup(document, "keymap_preset") else {
+        return KeymapPreset::default();
+    };
+    match name.trim().to_ascii_lowercase().as_str() {
+        "blender" => KeymapPreset::Blender,
+        "unity" => KeymapPreset::Unity,
+        "godot" => KeymapPreset::Godot,
+        "unreal" => KeymapPreset::Unreal,
+        _ => KeymapPreset::default(),
+    }
+}
 
 /// The file's current values as the tab shows them.
 #[derive(Clone, Debug, Default, PartialEq)]

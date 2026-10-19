@@ -30,8 +30,9 @@ use pill_editor_core_egui::entities;
 use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSpace};
 use pill_editor_core_egui::inspector;
 use pill_editor_core_egui::layout::EditorTab;
+use pill_editor_core_egui::menubar;
 use pill_editor_core_egui::preferences;
-use pill_editor_core_egui::session::{EguiShellState, ToolboxSession};
+use pill_editor_core_egui::session::{EguiShellState, MenubarSession, ToolboxSession};
 use pill_editor_core_egui::systems;
 use pill_editor_core_egui::toolbox;
 use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
@@ -127,6 +128,9 @@ pub fn run_frame(
         );
     }
     let raw_input = pill_ui_egui::input::raw_input(engine_input, shell_input);
+    // The brand mark is uploaded once per session: the context owns the
+    // texture, so a shell reload finds it already there.
+    let mark = state.mark_texture();
     // The context is a cheap clone (refcounted handle); the dock and the
     // asset dialog are separate fields, borrowed apart so the dock's layout
     // borrow and the dialog's state borrow coexist.
@@ -137,6 +141,7 @@ pub fn run_frame(
         preferences_draft,
         toolbox,
         browser,
+        menubar,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -157,6 +162,9 @@ pub fn run_frame(
         tab_redock: None,
     };
     let output = context.run(raw_input, |context| {
+        // The strip comes first, so the dock - and every viewport rectangle it
+        // reports - starts below it.
+        menu_bar(context, menubar, &mark, &mut viewer);
         // Tab bars carry the tabs and their close buttons only: without the
         // collapse chevron and the panel-level close-all ✖, a panel closes
         // exactly when its last tab does.
@@ -172,11 +180,13 @@ pub fn run_frame(
             viewer.pending,
             viewer.snapshot,
         );
+        pill_editor_shell_egui_editor::shell::about_window(context, &mark, &mut menubar.about_open);
     });
     let mut shell_frame = frame_from_output(&context, output);
     shell_frame.scene_rects = viewer.scene_rects;
     shell_frame.game_rect = viewer.game_rect;
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
+    shell_frame.quit_requested = std::mem::take(&mut menubar.quit_requested);
     // A tab menu's re-dock runs after the dock finished drawing: changing
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
@@ -188,6 +198,238 @@ pub fn run_frame(
 // =============================================================================
 // The tab viewer and the tabs
 // =============================================================================
+
+/// The menu bar above the dock: the pill mark, then Unity's six titles.
+///
+/// Drawn as a top panel before the dock, so the dock's layout and every
+/// viewport rectangle the frame reports start below the strip. The bar's
+/// geometry is logged once per placement (the toolbox's pattern), so a suite
+/// can click a title without guessing at fonts or theme metrics, and an open
+/// menu's entries log theirs for the same reason.
+///
+/// Public because a hot patch of [`run_frame`] calls it through the package
+/// path, like every other function a patch can reach.
+pub fn menu_bar(
+    context: &egui::Context,
+    session: &mut MenubarSession,
+    mark: &egui::TextureHandle,
+    viewer: &mut EditorTabViewer<'_>,
+) {
+    let style = context.style();
+    let tint = style.visuals.text_color();
+    egui::TopBottomPanel::top("pill_editor_shell_egui.menu_bar")
+        .exact_height(menubar::MENU_BAR_HEIGHT)
+        .frame(
+            egui::Frame::side_top_panel(style.as_ref()).inner_margin(egui::Margin::symmetric(0, 4)),
+        )
+        .show(context, |ui| {
+            let bar = ui.max_rect();
+            let mut open_menu: Option<menubar::Menu> = None;
+            if session.bar != Some(bar) {
+                session.bar = Some(bar);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    x = bar.min.x,
+                    y = bar.min.y,
+                    width = bar.width(),
+                    height = bar.height(),
+                    "[editor] menu bar rect"
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // Unity's strip: plain labels at rest, a wash under the
+                // pointer or the open menu - not resting buttons.
+                ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                ui.add_space(menubar::MENU_MARK_LEFT);
+                let side = egui::vec2(menubar::MENU_MARK_SIDE, menubar::MENU_MARK_SIDE);
+                ui.add(egui::Image::new((mark.id(), side)).tint(tint));
+                ui.add_space(menubar::MENU_MARK_GAP);
+                for (index, menu) in menubar::Menu::ALL.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(MENU_TITLE_GAP);
+                    }
+                    let title = ui.menu_button(menu.title(), |ui| {
+                        menu_body(ui, *menu, session, viewer);
+                    });
+                    if title.inner.is_some() {
+                        open_menu = Some(*menu);
+                    }
+                    let response = title.response;
+                    if session.titles[index] != Some(response.rect) {
+                        session.titles[index] = Some(response.rect);
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ENGINE,
+                            name = menu.name(),
+                            x = response.rect.min.x,
+                            y = response.rect.min.y,
+                            width = response.rect.width(),
+                            height = response.rect.height(),
+                            "[editor] menu item rect"
+                        );
+                    }
+                }
+            });
+            if let Some(menu) = open_menu {
+                if session.open != Some(menu) {
+                    session.open = Some(menu);
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        menu = menu.name(),
+                        "[editor] menu opened"
+                    );
+                }
+            } else {
+                session.open = None;
+            }
+        });
+}
+
+/// One open menu: its model rows, their placement logging, and the action a
+/// click runs.
+pub fn menu_body(
+    ui: &mut egui::Ui,
+    menu: menubar::Menu,
+    session: &mut MenubarSession,
+    viewer: &mut EditorTabViewer<'_>,
+) {
+    let view = menubar::MenuView {
+        snapshot: viewer.snapshot,
+        selection: viewer.selection,
+    };
+    for entry in menubar::entries(menu, &view) {
+        match entry {
+            menubar::MenuEntry::Separator => {
+                ui.separator();
+            }
+            menubar::MenuEntry::Action {
+                label,
+                action,
+                enabled,
+                checked,
+            } => {
+                let response = ui.add_enabled(
+                    enabled,
+                    egui::Button::selectable(checked.unwrap_or(false), label),
+                );
+                let key = format!("{}/{}", menu.name(), label);
+                if session
+                    .entries
+                    .iter()
+                    .find(|(logged, _)| *logged == key)
+                    .is_none_or(|(_, rect)| *rect != response.rect)
+                {
+                    if let Some((_, rect)) = session
+                        .entries
+                        .iter_mut()
+                        .find(|(logged, _)| *logged == key)
+                    {
+                        *rect = response.rect;
+                    } else {
+                        session.entries.push((key, response.rect));
+                    }
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        menu = menu.name(),
+                        label,
+                        x = response.rect.min.x,
+                        y = response.rect.min.y,
+                        width = response.rect.width(),
+                        height = response.rect.height(),
+                        "[editor] menu entry rect"
+                    );
+                }
+                if response.clicked() {
+                    run_menu_action(menu, label, action, session, viewer);
+                    ui.close();
+                }
+            }
+        }
+    }
+    // The popup floats over the dock and the viewports, so its rectangle is
+    // the UI's: a click on an item must never become a scene pick.
+    let rect = ui.min_rect();
+    viewer.overlay_regions.push(ShellRect {
+        x: rect.min.x,
+        y: rect.min.y,
+        width: rect.width(),
+        height: rect.height(),
+    });
+}
+
+/// Run one menu item through the same calls the tabs, the toolbox and the
+/// scripted channel make.
+pub fn run_menu_action(
+    menu: menubar::Menu,
+    label: &str,
+    action: menubar::MenuAction,
+    session: &mut MenubarSession,
+    viewer: &mut EditorTabViewer<'_>,
+) {
+    match action {
+        menubar::MenuAction::Inert => {}
+        menubar::MenuAction::Queue {
+            label: history_label,
+            commands,
+        } => {
+            viewer.pending.push_recorded(commands, history_label, None);
+        }
+        menubar::MenuAction::CreateAsset => {
+            assets::open_create(
+                viewer.asset_dialog,
+                viewer.selection,
+                &viewer.snapshot.assets,
+                &viewer.snapshot.standalone_types,
+            );
+        }
+        menubar::MenuAction::WriteAssetMeta => {
+            assets::write_meta_selection(viewer.pending, viewer.selection, &viewer.snapshot.assets);
+        }
+        menubar::MenuAction::Undo => session
+            .history_requests
+            .push(pill_editor_core_egui::session::HistoryRequest::Undo),
+        menubar::MenuAction::Redo => session
+            .history_requests
+            .push(pill_editor_core_egui::session::HistoryRequest::Redo),
+        menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
+        menubar::MenuAction::About => session.about_open = true,
+        menubar::MenuAction::Quit => session.quit_requested = true,
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        menu = menu.name(),
+        label,
+        "[editor] menu action"
+    );
+}
+
+/// The About window: the mark, the editor's name and the shell's version.
+pub fn about_window(context: &egui::Context, mark: &egui::TextureHandle, open: &mut bool) {
+    if !*open {
+        return;
+    }
+    let mut opened = *open;
+    egui::Window::new("About Pill Editor")
+        .open(&mut opened)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                let side = egui::vec2(40.0, 40.0);
+                ui.add(egui::Image::new((mark.id(), side)));
+                ui.vertical(|ui| {
+                    ui.heading("Pill Editor");
+                    ui.label(format!("shell {}", env!("CARGO_PKG_VERSION")));
+                    ui.label("an egui frontend for the Pill engine");
+                });
+            });
+        });
+    *open = opened;
+}
+
+/// The gap between two menu titles in the bar.
+const MENU_TITLE_GAP: f32 = 2.0;
 
 /// The icon a dock tab's title carries: the view or panel the tab shows.
 pub fn tab_icon(tab: EditorTab) -> icons::Icon {
@@ -1814,20 +2056,16 @@ pub fn assets_grid(
             if entries.is_empty() {
                 ui.label(egui::RichText::new("This folder is empty").weak());
             }
+            let mut writes = AssetTileWrites {
+                selection: &mut *selection,
+                dialog: &mut *dialog,
+                pending: &mut *pending,
+                overlay_regions: &mut *overlay_regions,
+            };
             for row in entries.chunks(columns) {
                 ui.horizontal(|ui| {
                     for entry in row {
-                        asset_tile(
-                            ui,
-                            entry,
-                            cell,
-                            browser,
-                            selection,
-                            snapshot,
-                            dialog,
-                            pending,
-                            overlay_regions,
-                        );
+                        asset_tile(ui, entry, cell, browser, snapshot, &mut writes);
                     }
                 });
             }
@@ -1858,6 +2096,21 @@ pub fn assets_grid(
         });
 }
 
+/// The handles a grid tile writes through: the selection a click moves, the
+/// dialog a menu entry opens, the commands it queues and the overlay regions
+/// an open menu marks as the UI's. One bundle keeps `asset_tile`'s signature
+/// readable and within clippy's argument budget.
+pub struct AssetTileWrites<'a> {
+    /// The shared selection the tile's clicks move.
+    pub selection: &'a mut EditorSelection,
+    /// The create/rename dialog the tile's menu can open.
+    pub dialog: &'a mut Option<AssetDialog>,
+    /// The recorded file commands the tile's menu queues.
+    pub pending: &'a mut PendingEditorCommands,
+    /// The regions an open menu marks so a click inside is never a scene pick.
+    pub overlay_regions: &'a mut Vec<ShellRect>,
+}
+
 /// One grid tile: the row's duotone icon and its name, the selection and
 /// hover washes, the double-click that opens a folder, the drag a tile
 /// carries and the menu the right-click opens.
@@ -1866,15 +2119,12 @@ pub fn asset_tile(
     row: &AssetListing,
     cell: egui::Vec2,
     browser: &mut ProjectBrowser,
-    selection: &mut EditorSelection,
     snapshot: &EditorSnapshot,
-    dialog: &mut Option<AssetDialog>,
-    pending: &mut PendingEditorCommands,
-    overlay_regions: &mut Vec<ShellRect>,
+    writes: &mut AssetTileWrites<'_>,
 ) {
     let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
     let visuals = ui.visuals().clone();
-    let selected = selection.asset.as_deref() == Some(row.path.as_str());
+    let selected = writes.selection.asset.as_deref() == Some(row.path.as_str());
     if selected || response.hovered() {
         let fill = if selected {
             visuals.selection.bg_fill
@@ -1913,24 +2163,32 @@ pub fn asset_tile(
     ui.painter()
         .galley(label_origin, label, visuals.text_color());
     if response.clicked() {
-        select_asset(selection, &row.path);
+        select_asset(writes.selection, &row.path);
     }
     if response.double_clicked() && browser::is_folder(row) {
         browser.open(&row.path);
     }
     if response.secondary_clicked() {
-        select_asset(selection, &row.path);
+        select_asset(writes.selection, &row.path);
         log_context_menu("assets");
     }
-    let opened =
-        response.context_menu(|ui| asset_menu_items(ui, snapshot, row, selection, dialog, pending));
-    mark_menu_region(opened, overlay_regions);
+    let opened = response.context_menu(|ui| {
+        asset_menu_items(
+            ui,
+            snapshot,
+            row,
+            writes.selection,
+            writes.dialog,
+            writes.pending,
+        )
+    });
+    mark_menu_region(opened, writes.overlay_regions);
     // Folders are drop targets (a tile lands inside one) and every tile is a
     // drag source, so a file moves by dragging it onto a folder.
     if browser::is_folder(row) {
         if let Some(dragged) = response.dnd_release_payload::<String>() {
             if let Some(to) = assets::drop_destination(&dragged, &row.path) {
-                assets::queue_move(pending, &dragged, &to);
+                assets::queue_move(writes.pending, &dragged, &to);
             }
         }
     }

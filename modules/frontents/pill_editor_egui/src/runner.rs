@@ -37,25 +37,28 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_core_egui::assets::{self, AssetDialog};
+use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
 use pill_editor_core_egui::commands::{
     ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, EditorPreferences,
-    PendingEditorCommands, PREFERENCES_FILE,
+    KeymapPreset, PendingEditorCommands, PREFERENCES_FILE,
 };
 use pill_editor_core_egui::editor_state::{
     AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, StandaloneTypeInfo,
 };
 use pill_editor_core_egui::entities;
-use pill_editor_core_egui::gizmo::{self, GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
+use pill_editor_core_egui::gizmo::{
+    self, GizmoGeometry, GizmoMode, GizmoSettings, GizmoSpace, GizmoState, HandleKind, HandleStates,
+};
 use pill_editor_core_egui::history::{CommandHistory, HistoryEntry, HistoryEntryKind};
 use pill_editor_core_egui::inspector;
 use pill_editor_core_egui::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
 };
-use pill_editor_core_egui::preferences::PreferencesView;
-use pill_editor_core_egui::session::EguiShellState;
+use pill_editor_core_egui::preferences::{self, PreferencesView};
+use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
-use pill_engine_core::debug_draw::DebugDraw;
+use pill_engine_core::debug_draw::{DebugDraw, DebugStyle};
 use pill_engine_core::input::{ButtonState, MouseButton};
 use pill_engine_core::Entity;
 use pill_engine_core::FieldValue;
@@ -119,6 +122,18 @@ const GIZMO_PRESS_FRACTION: f32 = 0.92;
 
 /// Frames between gizmo anchor logs while the handle layout stands still.
 const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
+
+/// How far the axis constraint guide reaches on both sides of the gizmo, as
+/// a fraction of the handle length: long enough to leave any view.
+const GIZMO_GUIDE_SPAN: f32 = 200.0;
+
+/// The hover test's radius around a handle, as a fraction of the handle
+/// length: roughly the width the overlay draws a line with.
+const GIZMO_HOVER_RADIUS: f32 = 0.07;
+
+/// One dash (and one gap) of the translation displacement line, as a
+/// fraction of the handle length.
+const GIZMO_DASH: f32 = 0.05;
 
 /// Frames between periodic asset-listing walks; a file command refreshes
 /// the listing at once instead of waiting for the cadence.
@@ -246,11 +261,27 @@ impl ApplicationHandler for EditorApplication {
                 }
             }
             WindowEvent::Focused(focused) => {
+                // A window losing focus takes every press with it: no
+                // release is coming, so no interaction may stay in flight.
+                if !focused {
+                    editor.cancel_interactions("focus lost");
+                }
                 if is_main {
                     editor.focused = focused;
                 }
             }
             other => {
+                // The modifiers are read here, before the event is routed:
+                // navigation chords match on them, and winit reports them on
+                // the window that has focus.
+                if let WindowEvent::ModifiersChanged(modifiers) = &other {
+                    let state = modifiers.state();
+                    editor.modifiers = Modifiers {
+                        shift: state.shift_key(),
+                        control: state.control_key(),
+                        alt: state.alt_key(),
+                    };
+                }
                 // The scene and game windows' pointer positions are
                 // relative to their own client areas, while the engine -
                 // which also feeds the shell's egui pass - works in the
@@ -259,6 +290,19 @@ impl ApplicationHandler for EditorApplication {
                 // overlay strip works.
                 if let WindowEvent::KeyboardInput { event, .. } = &other {
                     editor.gizmo_shortcut(event);
+                }
+                // A release over the editor's own UI still finishes a gizmo
+                // drag or a navigation that left its viewport's window: no
+                // pointer capture is platform-independent, so the release
+                // is honoured wherever it lands.
+                if let WindowEvent::MouseInput { state, button, .. } = &other {
+                    if is_main
+                        && *button == winit::event::MouseButton::Left
+                        && *state == winit::event::ElementState::Released
+                    {
+                        editor.release_scene(editor.active_view);
+                        editor.end_camera_navigation();
+                    }
                 }
                 if let Some(view) = child_view {
                     editor.scene_window_event(view, &other);
@@ -305,9 +349,26 @@ struct EditorWindow {
     /// the primary surface, so the project's renderer presents the game
     /// view there. `None` leaves the primary on the main window.
     game_surface: Option<SurfaceWindow>,
-    /// The editor's camera: what both scene viewports draw through, and the
-    /// basis every scene ray and screen projection here is built from.
-    camera: EditorCamera,
+    /// The editor's cameras, one per scene viewport: navigation moves the
+    /// active viewport's camera only, and every scene ray projects through
+    /// its own view's camera.
+    cameras: [OrbitCamera; SCENE_VIEWPORTS],
+    /// The viewport the last scene click activated; camera navigation and
+    /// the gizmo read it.
+    active_view: usize,
+    /// Whether each scene view's left button is down: a pick answers a frame
+    /// or two after the press, and a handle grab only starts a drag while
+    /// the button is still held.
+    left_down: [bool; SCENE_VIEWPORTS],
+    /// The camera navigation drag in flight, when one is.
+    camera_drag: Option<CameraDrag>,
+    /// The keyboard modifiers held, as of the last modifiers event.
+    modifiers: Modifiers,
+    /// The keymap preset the preferences name: the navigation table in force.
+    keymap: KeymapPreset,
+    /// Whether each view's published camera binding is stale: navigation
+    /// marks it and the next frame re-publishes the surface camera.
+    camera_dirty: [bool; SCENE_VIEWPORTS],
     /// egui's own renderer on the editor's device.
     egui_renderer: egui_wgpu::Renderer,
     /// The composition overlay the UI is presented through; `None` until it
@@ -326,9 +387,10 @@ struct EditorWindow {
     /// The last pointer position each scene window reported, in its own
     /// client-area physical pixels; `None` before its first move.
     scene_cursor: [Option<(f32, f32)>; SCENE_VIEWPORTS],
-    /// The scene left press waiting for its release: the view and the
-    /// press position. The release turns it into a pick.
-    scene_press: Option<(usize, f32, f32)>,
+    /// The scene left press waiting for its pick answer: the view, the press
+    /// position and the pick id. The answer starts a gizmo drag on a handle
+    /// or moves the selection - both while the button is held.
+    press_pick: Option<PressPick>,
     /// The pick request an answer is pending for, matched by id when the
     /// renderer answers frames later.
     pending_pick: Option<u64>,
@@ -340,6 +402,17 @@ struct EditorWindow {
     overlay_regions: Vec<ShellRect>,
     /// The gizmo drag in flight, when one is.
     gizmo_drag: Option<GizmoDrag>,
+    /// The gizmo geometry drawn this frame: the hover test runs against the
+    /// exact handles on screen, so the highlight cannot disagree with them.
+    gizmo_geometry: GizmoGeometry,
+    /// The handle under the pointer, when one is.
+    hovered_handle: Option<u32>,
+    /// How long the handles were when they were last built, in world units:
+    /// the hover test's radius and the drag guides' dash length follow it.
+    gizmo_reference: f32,
+    /// Whether the drag guides drew last frame, so the log line appears on
+    /// the state change instead of every frame.
+    gizmo_guides: Option<bool>,
     /// The last logged gizmo anchor header (mode, space, x, y): the log
     /// line appears on changes and on the heartbeat.
     gizmo_logged: Option<(GizmoMode, GizmoSpace, i32, i32)>,
@@ -348,6 +421,13 @@ struct EditorWindow {
     synthetic_press_ids: Vec<u64>,
     /// The pixel delta a scripted grab applies once its pick answers.
     synthetic_gizmo_pending: Option<(f32, f32)>,
+    /// Whether a scripted press holds the drag open instead of finishing it:
+    /// `gizmo press`, `gizmo move` and `gizmo release` drive the same drag a
+    /// real mouse does, one command per frame.
+    synthetic_gizmo_hold: bool,
+    /// The press pixel of the scripted drag in flight, in its view's
+    /// physical pixels: every scripted move measures its delta from here.
+    synthetic_gizmo_press: Option<(f32, f32)>,
     /// The view a scripted grab belongs to.
     synthetic_gizmo_view: Option<usize>,
     /// The asset browser's rows, refreshed on a cadence and at once after
@@ -542,16 +622,17 @@ impl EditorWindow {
         // undo history); the shell re-claims the same set on load.
         ensure_command_resources(world);
         // Step 5: the scene views' child windows and their renderer
-        // surfaces, with the editor camera they draw through. Both start
-        // hidden; each shows when the dock shows its tab.
-        let camera = EditorCamera::default();
+        // surfaces, each with its own camera (navigation moves the active
+        // viewport's). Both start hidden; each shows when the dock shows its
+        // tab.
+        let cameras = [OrbitCamera::default(); SCENE_VIEWPORTS];
         let mut views: [Option<SceneView>; SCENE_VIEWPORTS] = [None, None];
         for (view, slot) in views.iter_mut().enumerate() {
             let Some(mut scene) = SceneView::open(event_loop, &window, view) else {
                 continue;
             };
             let scene_size = scene.window.size();
-            scene.attach(&mut host, &camera, scene_size);
+            scene.attach(&mut host, &cameras[view], scene_size);
             *slot = Some(scene);
         }
         // The scene grid (Stage 23): the editor's view-bound viewports draw
@@ -575,7 +656,13 @@ impl EditorWindow {
             host,
             views,
             game_surface,
-            camera,
+            cameras,
+            active_view: 0,
+            left_down: [false; SCENE_VIEWPORTS],
+            camera_drag: None,
+            modifiers: Modifiers::default(),
+            keymap: KeymapPreset::default(),
+            camera_dirty: [true; SCENE_VIEWPORTS],
             egui_renderer,
             overlay,
             overlay_retry_frame: 0,
@@ -590,14 +677,20 @@ impl EditorWindow {
             reported_fallback: false,
             pending_events: Vec::new(),
             scene_cursor: [None; SCENE_VIEWPORTS],
-            scene_press: None,
+            press_pick: None,
             pending_pick: None,
             outlined_entity: None,
             overlay_regions: Vec::new(),
             gizmo_drag: None,
+            gizmo_geometry: GizmoGeometry::default(),
+            hovered_handle: None,
+            gizmo_reference: 0.0,
+            gizmo_guides: None,
             gizmo_logged: None,
             synthetic_press_ids: Vec::new(),
             synthetic_gizmo_pending: None,
+            synthetic_gizmo_hold: false,
+            synthetic_gizmo_press: None,
             synthetic_gizmo_view: None,
             asset_entries: Vec::new(),
             standalone_types: Vec::new(),
@@ -781,45 +874,302 @@ impl EditorWindow {
         }
     }
 
-    /// Route one scene window's event (Stage 13, Stage 15): record its
-    /// pointer, feed a gizmo drag in flight its moves, and turn a left
-    /// press-and-release into a scene pick. The pick is asked on the
-    /// release, so the press point is what gets picked; a press that began
-    /// over the overlay's chips is the UI's and never becomes one.
+    /// Route one scene window's event: activate the viewport on any press,
+    /// start camera navigation on its chord, start a gizmo drag or ask a
+    /// pick on a left press, feed a drag in flight its moves, and end what
+    /// the release ends.
+    ///
+    /// The viewport that owns an interaction keeps it: winit reports a
+    /// drag's moves to the window whose press started it even when the
+    /// pointer leaves it, so a gizmo drag or a navigation that crosses the
+    /// viewport's edge carries on and no other viewport takes the pointer
+    /// mid-drag.
     fn scene_window_event(&mut self, view: usize, event: &WindowEvent) {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
-                self.scene_cursor[view] = Some((position.x as f32, position.y as f32));
-                // While a gizmo drag runs, every move re-reads its ray.
-                if self.gizmo_drag.is_some() {
-                    self.update_gizmo_drag(position.x as f32, position.y as f32);
+                let point = (position.x as f32, position.y as f32);
+                self.scene_cursor[view] = Some(point);
+                if let Some(drag) = &self.camera_drag {
+                    if drag.view == view {
+                        self.update_camera_navigation(point);
+                        return;
+                    }
+                }
+                if let Some(drag) = &self.gizmo_drag {
+                    if drag.view == view {
+                        self.update_gizmo_drag(point.0, point.1);
+                    }
+                    return;
+                }
+                self.update_hover(view, point);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = *state == winit::event::ElementState::Pressed;
+                let button = match button {
+                    winit::event::MouseButton::Left => CameraButton::Left,
+                    winit::event::MouseButton::Middle => CameraButton::Middle,
+                    winit::event::MouseButton::Right => CameraButton::Right,
+                    _ => return,
+                };
+                if button == CameraButton::Left {
+                    self.left_down[view] = pressed;
+                }
+                if !pressed {
+                    if button == CameraButton::Left {
+                        self.release_scene(view);
+                    }
+                    if self
+                        .camera_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.view == view)
+                    {
+                        self.end_camera_navigation();
+                    }
+                    return;
+                }
+                // A press over the overlay's chips is the UI's: no activation
+                // and no scene interaction.
+                if self.scene_point_is_ui(view) {
+                    return;
+                }
+                self.activate_view(view);
+                let Some(point) = self.scene_cursor[view] else {
+                    return;
+                };
+                if let Some(navigation) = self.navigation_for(button) {
+                    self.begin_camera_navigation(view, navigation, point);
+                    return;
+                }
+                if button == CameraButton::Left {
+                    self.press_scene(view, point.0, point.1);
                 }
             }
-            WindowEvent::MouseInput { state, button, .. }
-                if *button == winit::event::MouseButton::Left =>
-            {
-                match state {
-                    winit::event::ElementState::Pressed => {
-                        self.scene_press = if self.scene_point_is_ui(view) {
-                            None
-                        } else {
-                            self.scene_cursor[view].map(|(x, y)| (view, x, y))
-                        };
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, lines) => *lines,
+                    winit::event::MouseScrollDelta::PixelDelta(position) => {
+                        position.y as f32 / 40.0
                     }
-                    winit::event::ElementState::Released => {
-                        // A release while a gizmo drag runs drops it; the
-                        // press that started it already asked its pick.
-                        if self.gizmo_drag.is_some() {
-                            self.end_gizmo_drag();
-                        } else if let Some((pressed_view, x, y)) = self.scene_press.take() {
-                            if pressed_view == view {
-                                self.request_scene_pick(view, x, y);
-                            }
-                        }
-                    }
+                };
+                if lines == 0.0 {
+                    return;
                 }
+                // The wheel zooms the viewport it arrived over without
+                // taking the active slot: a click is what activates.
+                self.zoom_camera(view, lines);
             }
             _ => {}
+        }
+    }
+
+    /// Make `view` the active viewport: the one camera navigation, the
+    /// gizmo's handle length and the viewport commands address. Only a
+    /// press inside a scene view reaches here - a click on the editor's own
+    /// UI never activates a viewport.
+    fn activate_view(&mut self, view: usize) {
+        if self.active_view == view {
+            return;
+        }
+        self.active_view = view;
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            "[editor] active viewport"
+        );
+    }
+
+    /// The navigation gesture a press means right now, if any: no gesture
+    /// while a gizmo drag or another navigation owns the pointer.
+    fn navigation_for(&self, button: CameraButton) -> Option<CameraNavigation> {
+        if self.gizmo_drag.is_some() || self.camera_drag.is_some() {
+            return None;
+        }
+        camera::navigation_binding(self.keymap, button, self.modifiers)
+    }
+
+    /// Ask what is under a left press, while the button is held: the answer
+    /// either starts a gizmo drag on the handle it names or moves the shared
+    /// selection.
+    fn press_scene(&mut self, view: usize, x: f32, y: f32) {
+        let physical_x = x.max(0.0).round() as u32;
+        let physical_y = y.max(0.0).round() as u32;
+        let Some(id) = self.queue_scene_pick_at(view, physical_x, physical_y) else {
+            return;
+        };
+        self.press_pick = Some(PressPick {
+            view,
+            x: physical_x as f32,
+            y: physical_y as f32,
+            id,
+        });
+        self.pending_pick = Some(id);
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            x = physical_x,
+            y = physical_y,
+            id,
+            "[editor] pick requested"
+        );
+    }
+
+    /// A left release in `view`: it ends the gizmo drag a press started -
+    /// the drag applied its moves all along - and does nothing when the
+    /// press became a selection.
+    fn release_scene(&mut self, view: usize) {
+        if self
+            .gizmo_drag
+            .as_ref()
+            .is_some_and(|drag| drag.view == view)
+        {
+            self.end_gizmo_drag();
+        }
+    }
+
+    /// Begin a camera navigation: the press records the anchor pixel every
+    /// later move measures its delta against.
+    fn begin_camera_navigation(
+        &mut self,
+        view: usize,
+        navigation: CameraNavigation,
+        start: (f32, f32),
+    ) {
+        if self.gizmo_drag.is_some() || self.camera_drag.is_some() {
+            return;
+        }
+        self.camera_drag = Some(CameraDrag {
+            view,
+            navigation,
+            last: start,
+        });
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            navigation = camera_navigation_name(navigation),
+            "[editor] camera navigation started"
+        );
+    }
+
+    /// Apply one navigation move: the pixel delta since the last move goes
+    /// through the gesture's own clamped math.
+    fn update_camera_navigation(&mut self, point: (f32, f32)) {
+        let Some(mut drag) = self.camera_drag.take() else {
+            return;
+        };
+        let (delta_x, delta_y) = (point.0 - drag.last.0, point.1 - drag.last.1);
+        drag.last = point;
+        self.apply_camera_gesture(drag.view, drag.navigation, delta_x, delta_y);
+        if self.camera_drag.is_none() {
+            self.camera_drag = Some(drag);
+        }
+    }
+
+    /// Move one view's camera by a gesture's pixel delta; the drags and the
+    /// scripted channel both land here.
+    fn apply_camera_gesture(
+        &mut self,
+        view: usize,
+        navigation: CameraNavigation,
+        delta_x: f32,
+        delta_y: f32,
+    ) {
+        if delta_x == 0.0 && delta_y == 0.0 {
+            return;
+        }
+        let (_, height) = self.scene_pixel_size(view).unwrap_or((1.0, 1.0));
+        let fov = CameraComponent::default()
+            .vertical_fov
+            .clamp(1.0, 179.0)
+            .to_radians();
+        let camera = &mut self.cameras[view];
+        match navigation {
+            CameraNavigation::Orbit => camera.orbit(delta_x, delta_y),
+            CameraNavigation::Pan => {
+                let world_per_pixel = 2.0 * camera.distance * (fov * 0.5).tan() / height.max(1.0);
+                camera.pan(delta_x, delta_y, world_per_pixel);
+            }
+            CameraNavigation::Dolly => camera.dolly(delta_y),
+        }
+        self.camera_dirty[view] = true;
+    }
+
+    /// End the navigation in flight, logging the gesture that finished.
+    fn end_camera_navigation(&mut self) {
+        let Some(drag) = self.camera_drag.take() else {
+            return;
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            view = drag.view,
+            navigation = camera_navigation_name(drag.navigation),
+            "[editor] camera navigation ended"
+        );
+    }
+
+    /// Zoom one view's camera by a wheel's line count.
+    fn zoom_camera(&mut self, view: usize, lines: f32) {
+        self.cameras[view].zoom(lines);
+        self.camera_dirty[view] = true;
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            lines,
+            distance = self.cameras[view].distance,
+            "[editor] camera zoom"
+        );
+    }
+
+    /// Update the hovered handle from the pointer's ray, against the handles
+    /// the last frame drew. The radius follows the handle length, so it
+    /// reads like the drawn line rather than a fixed world distance.
+    fn update_hover(&mut self, view: usize, point: (f32, f32)) {
+        if self.gizmo_drag.is_some() || self.camera_drag.is_some() {
+            return;
+        }
+        let Some((ray_origin, ray_direction)) = self.scene_ray(view, point.0, point.1) else {
+            self.set_hovered_handle(view, None);
+            return;
+        };
+        let radius = (self.gizmo_reference * GIZMO_HOVER_RADIUS).max(1e-4);
+        let hit = gizmo::hit_test(&self.gizmo_geometry, ray_origin, ray_direction, radius);
+        self.set_hovered_handle(view, hit);
+    }
+
+    /// Record the hovered handle, logging the change once - the suite's
+    /// window into the feedback states.
+    fn set_hovered_handle(&mut self, view: usize, handle: Option<u32>) {
+        if self.hovered_handle == handle {
+            return;
+        }
+        self.hovered_handle = handle;
+        match handle {
+            Some(handle) => info!(
+                target: telemetry_target::ENGINE,
+                view,
+                handle,
+                "[editor] gizmo hover handle"
+            ),
+            None => info!(
+                target: telemetry_target::ENGINE,
+                view,
+                "[editor] gizmo hover none"
+            ),
+        }
+    }
+
+    /// Publish every view's camera binding whose camera moved: the renderer
+    /// reads the binding, so a navigation shows on the next frame.
+    fn publish_cameras(&mut self) {
+        for view in 0..self.views.len() {
+            if !self.camera_dirty[view] {
+                continue;
+            }
+            let Some(surface_id) = self.views[view].as_ref().map(|scene| scene.surface_id) else {
+                continue;
+            };
+            let binding = camera_binding(&self.cameras[view]);
+            self.host.set_surface_camera(surface_id, Some(binding));
+            self.camera_dirty[view] = false;
         }
     }
 
@@ -863,26 +1213,6 @@ impl EditorWindow {
         None
     }
 
-    /// Ask the renderer what is under one physical pixel of a scene
-    /// surface (Stage 13); the answer arrives frames later in the world's
-    /// `PickResults`, and [`Self::drain_scene_picks`] applies it.
-    fn request_scene_pick(&mut self, view: usize, x: f32, y: f32) {
-        let physical_x = x.max(0.0).round() as u32;
-        let physical_y = y.max(0.0).round() as u32;
-        let Some(id) = self.queue_scene_pick_at(view, physical_x, physical_y) else {
-            return;
-        };
-        self.pending_pick = Some(id);
-        info!(
-            target: telemetry_target::ENGINE,
-            view,
-            x = physical_x,
-            y = physical_y,
-            id,
-            "[editor] pick requested"
-        );
-    }
-
     /// Queue one pick at an explicit surface pixel and return its id,
     /// leaving the answer to [`Self::drain_scene_picks`]: the shared half of
     /// the click pick and the scripted gizmo grab.
@@ -923,25 +1253,33 @@ impl EditorWindow {
             {
                 self.synthetic_press_ids.remove(index);
                 if let PickHit::Handle(handle) = result.hit {
-                    if let Some(delta) = self.synthetic_gizmo_pending.take() {
+                    let delta = self.synthetic_gizmo_pending.take();
+                    // A `gizmo press` holds the drag open for the following
+                    // `gizmo move`/`gizmo release`; a `gizmo drag` carries
+                    // its own delta and finishes in this answer.
+                    if delta.is_some() || self.synthetic_gizmo_hold {
                         let view = self.synthetic_gizmo_view.take().unwrap_or(0);
                         info!(
                             target: telemetry_target::ENGINE,
                             handle,
                             "[editor] scene pick handle"
                         );
+                        self.synthetic_gizmo_press =
+                            Some((result.request.x as f32, result.request.y as f32));
                         handle_press = Some((
                             view,
                             handle,
                             result.request.x as f32,
                             result.request.y as f32,
-                            Some(delta),
+                            delta,
                         ));
                     }
                 } else if self.synthetic_press_ids.is_empty()
-                    && self.synthetic_gizmo_pending.is_some()
+                    && (self.synthetic_gizmo_pending.is_some() || self.synthetic_gizmo_hold)
                 {
                     self.synthetic_gizmo_pending = None;
+                    self.synthetic_gizmo_hold = false;
+                    self.synthetic_gizmo_view = None;
                     warn!(
                         target: telemetry_target::ENGINE,
                         "[editor] gizmo drag refused: the press point hit no handle"
@@ -949,9 +1287,16 @@ impl EditorWindow {
                 }
                 continue;
             }
-            if Some(result.request.id) != self.pending_pick {
+            let Some(press) = self
+                .press_pick
+                .as_ref()
+                .filter(|press| press.id == result.request.id)
+                .map(|press| (press.view, press.x, press.y))
+            else {
                 continue;
-            }
+            };
+            let (view, press_x, press_y) = press;
+            self.press_pick = None;
             self.pending_pick = None;
             match result.hit {
                 PickHit::Entity(entity) => {
@@ -986,17 +1331,20 @@ impl EditorWindow {
                         handle,
                         "[editor] scene pick handle"
                     );
-                    let view = SCENE_SURFACES
-                        .iter()
-                        .position(|surface| *surface == result.request.surface)
-                        .unwrap_or(0);
-                    handle_press = Some((
-                        view,
-                        handle,
-                        result.request.x as f32,
-                        result.request.y as f32,
-                        None,
-                    ));
+                    // The drag begins while the button is still held: the
+                    // press asked the pick, and the answer starts the
+                    // manipulation, not the release. A click that began and
+                    // ended before the answer arrived (the scripted channel's
+                    // one-command click) manipulates nothing.
+                    if self.left_down[view] {
+                        handle_press = Some((view, handle, press_x, press_y, None));
+                    } else {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            handle,
+                            "[editor] gizmo drag skipped: the press was released"
+                        );
+                    }
                 }
             }
         }
@@ -1050,13 +1398,17 @@ impl EditorWindow {
         }
     }
 
-    /// Draw the gizmo handles for the selection (Stage 15).
+    /// Draw the gizmo handles for the selection (Stage 15, extended in
+    /// Stage 28 with the hover/drag states, the translation planes, the
+    /// dynamic scale handles and the drag guides).
     ///
     /// The contract's own primitives with handle ids set: the same frame the
     /// renderer draws is the frame it picks, so a handle a drag grabs is
     /// always the handle that was on screen. Handles keep a constant screen
-    /// size - their world length follows the camera distance - and the frame
-    /// they are drawn into is one frame's worth: nothing to clear here.
+    /// size - their world length follows the active view's camera distance -
+    /// and the frame they are drawn into is one frame's worth: nothing to
+    /// clear here. The geometry is kept for the hover test, so what the
+    /// pointer sees and what the highlight names cannot disagree.
     fn publish_gizmo_geometry(&mut self) {
         // Read the frame's inputs first: the world borrow must end before
         // the camera helpers (which borrow `self`) run.
@@ -1077,15 +1429,51 @@ impl EditorWindow {
                     // No handles on screen: the next selection logs its
                     // anchor at once instead of on the heartbeat.
                     self.gizmo_logged = None;
+                    self.gizmo_geometry = GizmoGeometry::default();
+                    self.gizmo_reference = 0.0;
+                    self.hovered_handle = None;
                     return;
                 }
             }
         };
         let origin = transform.translation;
         let basis = gizmo_basis(settings.space, &transform);
-        let length = self.gizmo_length(origin);
-        let geometry = gizmo::build_geometry(settings.mode, origin, basis, length);
+        let view = self.active_view;
+        let length = self.gizmo_length(view, origin);
+        let states = HandleStates {
+            hovered: self.hovered_handle,
+            active: self.gizmo_drag.as_ref().map(|drag| drag.handle),
+        };
+        // A scale drag grows or shrinks the dragged axis' handle with the
+        // factor it is writing: the handle's length is derived from the
+        // press's scale every frame, never from the previous frame's, so it
+        // cannot drift.
+        let lengths = match self.gizmo_drag.as_ref() {
+            Some(drag) => match drag.kind {
+                HandleKind::Axis {
+                    mode: GizmoMode::Scale,
+                    axis,
+                } => gizmo::scale_handle_lengths(
+                    drag.reference,
+                    drag.original.scale,
+                    transform.scale,
+                    axis,
+                ),
+                _ => [length; 3],
+            },
+            None => [length; 3],
+        };
+        let geometry = gizmo::build_geometry_styled(settings.mode, origin, basis, lengths, states);
         let anchor = self.project_to_screen(origin);
+        let guides = self.gizmo_drag.as_ref().map(|drag| {
+            (
+                drag.kind,
+                drag.basis,
+                drag.start_pivot,
+                drag.current_pivot,
+                drag.reference,
+            )
+        });
         let world = self.host.host_mut().engine_mut().world_mut();
         if world.get_resource::<DebugDraw>().is_none() {
             world.insert_resource(DebugDraw::new(true));
@@ -1097,7 +1485,32 @@ impl EditorWindow {
             for (corners, color, handle) in &geometry.triangles {
                 debug.gizmo_triangle(*corners, *color, *handle);
             }
+            if let Some((kind, basis, start_pivot, current_pivot, reference)) = guides {
+                draw_gizmo_guides(debug, kind, basis, start_pivot, current_pivot, reference);
+            }
         }
+        let guide_state = self.gizmo_drag.as_ref().map(|drag| drag.kind);
+        let dotted = guide_state.is_some_and(|kind| gizmo_drag_mode(kind) == GizmoMode::Translate);
+        let axis_guide = guide_state.and_then(HandleKind::axis).map(|(_, axis)| axis);
+        if self.gizmo_guides != Some(guide_state.is_some()) {
+            self.gizmo_guides = Some(guide_state.is_some());
+            match axis_guide {
+                Some(axis) => info!(
+                    target: telemetry_target::ENGINE,
+                    axis = gizmo_axis_name(axis),
+                    dotted,
+                    "[editor] gizmo guides"
+                ),
+                None => info!(
+                    target: telemetry_target::ENGINE,
+                    guides = guide_state.is_some(),
+                    dotted,
+                    "[editor] gizmo guides"
+                ),
+            }
+        }
+        self.gizmo_geometry = geometry;
+        self.gizmo_reference = length;
         // The anchor line, on a change or on the periodic cadence: what a
         // developer (and the suite) reads to know where the handles are.
         if let Some((x, y)) = anchor {
@@ -1106,6 +1519,7 @@ impl EditorWindow {
                 || self.frame_index.is_multiple_of(GIZMO_HEARTBEAT_FRAMES)
             {
                 self.gizmo_logged = Some(header);
+                let geometry = &self.gizmo_geometry;
                 info!(
                     target: telemetry_target::ENGINE,
                     entity = %entity,
@@ -1169,11 +1583,12 @@ impl EditorWindow {
         })
     }
 
-    /// How long the handles are, in world units, at `origin`: a constant
-    /// fraction of the camera distance, so the gizmo neither shrinks away
-    /// nor swallows the scene.
-    fn gizmo_length(&self, origin: [f32; 3]) -> f32 {
-        (gizmo::distance(self.camera.eye(), origin) * GIZMO_SCREEN_FRACTION).clamp(0.05, 50.0)
+    /// How long the handles are, in world units, at `origin` in `view`: a
+    /// constant fraction of that view's camera distance, so the gizmo
+    /// neither shrinks away nor swallows the scene.
+    fn gizmo_length(&self, view: usize, origin: [f32; 3]) -> f32 {
+        (gizmo::distance(self.cameras[view].eye(), origin) * GIZMO_SCREEN_FRACTION)
+            .clamp(0.05, 50.0)
     }
 
     /// One scene view's surface size in physical pixels.
@@ -1192,8 +1607,9 @@ impl EditorWindow {
     fn scene_ray(&self, view: usize, x: f32, y: f32) -> Option<([f32; 3], [f32; 3])> {
         let (width, height) = self.scene_pixel_size(view)?;
         let (tan, aspect) = projection_terms(width, height);
-        let forward = self.camera.forward();
-        let right = self.camera.right();
+        let camera = &self.cameras[view];
+        let forward = camera.forward();
+        let right = camera.right();
         let up = gizmo::cross(right, forward);
         let ndc_x = x / width * 2.0 - 1.0;
         let ndc_y = 1.0 - y / height * 2.0;
@@ -1204,13 +1620,13 @@ impl EditorWindow {
                 gizmo::scale(up, ndc_y * tan),
             ),
         );
-        gizmo::normalize(direction).map(|direction| (self.camera.eye(), direction))
+        gizmo::normalize(direction).map(|direction| (camera.eye(), direction))
     }
 
-    /// Where a world point lands on the first scene view's surface, in
+    /// Where a world point lands on the active scene view's surface, in
     /// physical pixels.
     fn project_to_screen(&self, point: [f32; 3]) -> Option<(f32, f32)> {
-        self.project_to_screen_in(0, point)
+        self.project_to_screen_in(self.active_view, point)
     }
 
     /// Where a world point lands on one scene view's surface, in physical
@@ -1218,9 +1634,10 @@ impl EditorWindow {
     fn project_to_screen_in(&self, view: usize, point: [f32; 3]) -> Option<(f32, f32)> {
         let (width, height) = self.scene_pixel_size(view)?;
         let (tan, aspect) = projection_terms(width, height);
-        let eye = self.camera.eye();
-        let forward = self.camera.forward();
-        let right = self.camera.right();
+        let camera = &self.cameras[view];
+        let eye = camera.eye();
+        let forward = camera.forward();
+        let right = camera.right();
         let up = gizmo::cross(right, forward);
         let relative = gizmo::sub(point, eye);
         let depth = gizmo::dot(relative, forward);
@@ -1235,7 +1652,7 @@ impl EditorWindow {
     /// Begin a drag from a handle pick: the press pixel's ray records the
     /// parameter or angle every later move is measured against.
     fn begin_gizmo_drag(&mut self, view: usize, handle: u32, press_x: f32, press_y: f32) {
-        let Some((mode, axis)) = gizmo::handle_axis(handle) else {
+        let Some(kind) = gizmo::handle_kind(handle) else {
             warn!(
                 target: telemetry_target::ENGINE,
                 handle,
@@ -1265,8 +1682,11 @@ impl EditorWindow {
         };
         let basis = gizmo_basis(settings.space, &original);
         let origin = original.translation;
-        let start_value = match mode {
-            GizmoMode::Rotate => {
+        let (start_value, start_plane) = match kind {
+            HandleKind::Axis {
+                mode: GizmoMode::Rotate,
+                axis,
+            } => {
                 let Some(point) =
                     gizmo::ray_plane_point(origin, basis[axis], ray_origin, ray_direction)
                 else {
@@ -1276,9 +1696,9 @@ impl EditorWindow {
                     );
                     return;
                 };
-                gizmo::plane_angle(origin, basis[axis], point)
+                (gizmo::plane_angle(origin, basis[axis], point), None)
             }
-            _ => {
+            HandleKind::Axis { axis, .. } => {
                 let Some(value) =
                     gizmo::closest_axis_point(origin, basis[axis], ray_origin, ray_direction)
                 else {
@@ -1288,185 +1708,389 @@ impl EditorWindow {
                     );
                     return;
                 };
-                value
+                (value, None)
+            }
+            HandleKind::Plane { first, second } => {
+                // The plane is the one the pair spans: its normal is the
+                // remaining axis, whichever space the basis is in.
+                let normal = basis[3 - first - second];
+                let Some(point) = gizmo::ray_plane_point(origin, normal, ray_origin, ray_direction)
+                else {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] gizmo drag refused: the ray is parallel to the plane"
+                    );
+                    return;
+                };
+                let (along_first, along_second) =
+                    gizmo::plane_coordinates(origin, basis[first], basis[second], point);
+                (0.0, Some((along_first, along_second)))
             }
         };
-        let reference = self.gizmo_length(origin);
+        let reference = self.gizmo_length(view, origin);
         self.gizmo_drag = Some(GizmoDrag {
             view,
-            mode,
-            axis,
+            handle,
+            kind,
             entity,
             original,
+            basis,
             start_value,
+            start_plane,
+            start_pivot: origin,
+            current_pivot: origin,
             reference,
             last_value: None,
         });
-        info!(
-            target: telemetry_target::ENGINE,
-            mode = gizmo_mode_name(mode),
-            axis = gizmo_axis_name(axis),
-            entity = %entity,
-            handle,
-            "[editor] gizmo drag started"
-        );
+        // The grabbed handle is the active one from here on, so it draws
+        // dimmed for as long as the drag runs.
+        self.set_hovered_handle(view, Some(handle));
+        match kind.plane() {
+            Some((first, second)) => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(GizmoMode::Translate),
+                plane = gizmo_plane_name(first, second),
+                entity = %entity,
+                handle,
+                "[editor] gizmo drag started"
+            ),
+            None => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(gizmo::handle_axis(handle).map(|(mode, _)| mode).unwrap_or(GizmoMode::Translate)),
+                axis = gizmo_axis_name(kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
+                entity = %entity,
+                handle,
+                "[editor] gizmo drag started"
+            ),
+        }
     }
 
     /// Apply one move of the drag in flight: re-read the ray, take the delta
     /// against the press, snap it when the tool snaps, and write the values
     /// straight into the world. No undo entry yet - the egui editor has no
     /// command queue wired (W-0027).
+    ///
+    /// Every write is computed from the press's transform, never from the
+    /// previous frame's, so a snapped or clamped drag cannot accumulate
+    /// rounding - and the drag's basis is the one the handles were built in,
+    /// so a local-space drag keeps following the object's own axes.
     fn update_gizmo_drag(&mut self, cursor_x: f32, cursor_y: f32) {
         let Some(drag) = self.gizmo_drag.as_ref() else {
             return;
         };
-        let (view, mode, axis, entity) = (drag.view, drag.mode, drag.axis, drag.entity);
+        let (view, kind, entity) = (drag.view, drag.kind, drag.entity);
+        let (original, basis) = (drag.original, drag.basis);
+        let (start_value, start_plane) = (drag.start_value, drag.start_plane);
         let reference = drag.reference;
-        let start_value = drag.start_value;
-        let original = drag.original;
         let Some((ray_origin, ray_direction)) = self.scene_ray(view, cursor_x, cursor_y) else {
             return;
         };
-        // The settings and the basis come first: both borrow `self`, and the
-        // world borrow below must not overlap them.
-        let settings = self
-            .host
-            .host_mut()
-            .engine_mut()
-            .world()
-            .get_resource::<GizmoState>()
-            .map(|state| state.settings)
-            .unwrap_or_default();
-        let basis = gizmo_basis(settings.space, &original);
+        let settings = self.gizmo_settings();
         let origin = original.translation;
-        let delta = match mode {
-            GizmoMode::Rotate => {
+        let (written, pivot) = match kind {
+            HandleKind::Axis {
+                mode: GizmoMode::Rotate,
+                axis,
+            } => {
                 let Some(point) =
                     gizmo::ray_plane_point(origin, basis[axis], ray_origin, ray_direction)
                 else {
                     return;
                 };
-                gizmo::wrap_angle(gizmo::plane_angle(origin, basis[axis], point) - start_value)
+                let delta =
+                    gizmo::wrap_angle(gizmo::plane_angle(origin, basis[axis], point) - start_value);
+                let degrees = if settings.snap {
+                    gizmo::snap_value(delta.to_degrees(), settings.rotate_step_degrees)
+                } else {
+                    delta.to_degrees()
+                };
+                // The axis is the basis' own, so a local-mode drag turns
+                // around the object's axis and a world-mode drag around the
+                // world's.
+                let turn = gizmo::axis_angle_quaternion(basis[axis], degrees.to_radians());
+                let combined = quaternion_product(turn, original.rotation);
+                let written = self.write_rotation(entity, combined);
+                (written.then_some(combined), origin)
             }
-            _ => {
+            HandleKind::Axis {
+                mode: GizmoMode::Translate,
+                axis,
+            } => {
                 let Some(value) =
                     gizmo::closest_axis_point(origin, basis[axis], ray_origin, ray_direction)
                 else {
                     return;
                 };
-                value - start_value
+                let mut delta = value - start_value;
+                if settings.snap {
+                    delta = gizmo::snap_value(delta, settings.translate_step);
+                }
+                // The displacement is along the handle's axis, not a world
+                // component: in local space the two differ as soon as the
+                // object is rotated.
+                let translation =
+                    gizmo::add(original.translation, gizmo::scale(basis[axis], delta));
+                let written = self.write_translation(entity, translation);
+                (
+                    written.then_some([translation[0], translation[1], translation[2], 1.0]),
+                    translation,
+                )
+            }
+            HandleKind::Axis {
+                mode: GizmoMode::Scale,
+                axis,
+            } => {
+                let Some(value) =
+                    gizmo::closest_axis_point(origin, basis[axis], ray_origin, ray_direction)
+                else {
+                    return;
+                };
+                let factor = 1.0 + (value - start_value) / reference.max(1e-4);
+                let mut scaled = original.scale[axis] * factor;
+                if settings.snap {
+                    scaled = gizmo::snap_value(scaled, settings.scale_step);
+                }
+                // A zero or negative scale is a degenerate mesh; the drag
+                // stops at the smallest positive value instead.
+                let scaled = scaled.max(0.01);
+                let mut values = original.scale;
+                values[axis] = scaled;
+                let written = self.write_scale(entity, values);
+                (written.then_some([scaled, 0.0, 0.0, 0.0]), origin)
+            }
+            HandleKind::Plane { first, second } => {
+                let Some((start_first, start_second)) = start_plane else {
+                    return;
+                };
+                let normal = basis[3 - first - second];
+                let Some(point) = gizmo::ray_plane_point(origin, normal, ray_origin, ray_direction)
+                else {
+                    return;
+                };
+                let (along_first, along_second) =
+                    gizmo::plane_coordinates(origin, basis[first], basis[second], point);
+                let (mut delta_first, mut delta_second) =
+                    (along_first - start_first, along_second - start_second);
+                if settings.snap {
+                    delta_first = gizmo::snap_value(delta_first, settings.translate_step);
+                    delta_second = gizmo::snap_value(delta_second, settings.translate_step);
+                }
+                let translation = gizmo::add(
+                    gizmo::add(
+                        original.translation,
+                        gizmo::scale(basis[first], delta_first),
+                    ),
+                    gizmo::scale(basis[second], delta_second),
+                );
+                let written = self.write_translation(entity, translation);
+                (
+                    written.then_some([delta_first, delta_second, 0.0, 0.0]),
+                    translation,
+                )
             }
         };
-        let Some(value) =
-            self.write_gizmo_drag(mode, axis, entity, &original, delta, &settings, reference)
-        else {
-            return;
-        };
         if let Some(drag) = self.gizmo_drag.as_mut() {
-            drag.last_value = Some(value);
+            if let Some(written) = written {
+                drag.last_value = Some(written);
+            }
+            drag.current_pivot = pivot;
         }
     }
 
-    /// Write one drag move's values straight into the world; returns the
-    /// value for the end log, `None` when the write failed.
-    fn write_gizmo_drag(
-        &mut self,
-        mode: GizmoMode,
-        axis: usize,
-        entity: Entity,
-        original: &TransformComponent,
-        delta: f32,
-        settings: &GizmoSettings,
-        reference: f32,
-    ) -> Option<[f32; 4]> {
+    /// Write a translation straight into the world; false when a component
+    /// refused the write.
+    fn write_translation(&mut self, entity: Entity, translation: [f32; 3]) -> bool {
+        self.write_transform_field(entity, "translation", &translation)
+    }
+
+    /// Write a rotation straight into the world.
+    fn write_rotation(&mut self, entity: Entity, rotation: [f32; 4]) -> bool {
+        self.write_transform_field(entity, "rotation", &rotation)
+    }
+
+    /// Write a scale straight into the world.
+    fn write_scale(&mut self, entity: Entity, scale: [f32; 3]) -> bool {
+        self.write_transform_field(entity, "scale", &scale)
+    }
+
+    /// Write one transform field's components, in order; false when any of
+    /// them was refused.
+    fn write_transform_field(&mut self, entity: Entity, field: &str, values: &[f32]) -> bool {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let write = |world: &mut pill_engine_core::World, field: &str, index: usize, value: f32| {
-            world
+        let mut written = true;
+        for (index, value) in values.iter().enumerate() {
+            written &= world
                 .write_component_array_element(
                     entity,
                     TRANSFORM_SHARED_NAME,
                     field,
                     index,
-                    FieldValue::F32(value),
+                    FieldValue::F32(*value),
                 )
-                .ok()
-        };
-        match mode {
-            GizmoMode::Translate => {
-                let delta = if settings.snap {
-                    gizmo::snap_value(delta, settings.translate_step)
-                } else {
-                    delta
-                };
-                let value = original.translation[axis] + delta;
-                write(world, "translation", axis, value).map(|_| [value, 0.0, 0.0, 0.0])
-            }
-            GizmoMode::Rotate => {
-                let degrees = delta.to_degrees();
-                let degrees = if settings.snap {
-                    gizmo::snap_value(degrees, settings.rotate_step_degrees)
-                } else {
-                    degrees
-                };
-                let turn = gizmo::axis_angle_quaternion(gizmo::AXES[axis], degrees.to_radians());
-                let combined = quaternion_product(turn, original.rotation);
-                let mut written = true;
-                for index in 0..4 {
-                    written &= write(world, "rotation", index, combined[index]).is_some();
-                }
-                written.then_some(combined)
-            }
-            GizmoMode::Scale => {
-                let factor = 1.0 + delta / reference.max(1e-4);
-                let mut value = original.scale[axis] * factor;
-                if settings.snap {
-                    value = gizmo::snap_value(value, settings.scale_step);
-                }
-                // A zero or negative scale is a degenerate mesh; the drag
-                // stops at the smallest positive value instead.
-                let value = value.max(0.01);
-                write(world, "scale", axis, value).map(|_| [value, 0.0, 0.0, 0.0])
-            }
+                .is_ok();
         }
+        written
     }
 
-    /// End the drag in flight, reporting what it wrote.
+    /// Write the press's whole transform back: a cancelled drag leaves the
+    /// object exactly where it started.
+    fn restore_transform(&mut self, entity: Entity, transform: &TransformComponent) {
+        let _ = self.write_translation(entity, transform.translation);
+        let _ = self.write_rotation(entity, transform.rotation);
+        let _ = self.write_scale(entity, transform.scale);
+    }
+
+    /// End the drag in flight, reporting what it wrote. The guides and the
+    /// active highlight go with it: the handles return to their idle (or
+    /// hovered) look on the next frame.
     fn end_gizmo_drag(&mut self) {
         let Some(drag) = self.gizmo_drag.take() else {
             return;
         };
-        let settings = self
-            .host
-            .host_mut()
-            .engine_mut()
-            .world()
-            .get_resource::<GizmoState>()
-            .map(|state| state.settings)
-            .unwrap_or_default();
-        match drag.last_value {
-            Some(value) => info!(
+        let settings = self.gizmo_settings();
+        let mode = gizmo_drag_mode(drag.kind);
+        match (drag.kind.plane(), drag.last_value) {
+            (Some((first, second)), Some(value)) => info!(
                 target: telemetry_target::ENGINE,
-                mode = gizmo_mode_name(drag.mode),
-                axis = gizmo_axis_name(drag.axis),
+                mode = gizmo_mode_name(mode),
+                plane = gizmo_plane_name(first, second),
                 entity = %drag.entity,
                 value = ?value,
                 snapped = settings.snap,
                 "[editor] gizmo drag ended"
             ),
-            None => info!(
+            (Some((first, second)), None) => info!(
                 target: telemetry_target::ENGINE,
-                mode = gizmo_mode_name(drag.mode),
-                axis = gizmo_axis_name(drag.axis),
+                mode = gizmo_mode_name(mode),
+                plane = gizmo_plane_name(first, second),
+                entity = %drag.entity,
+                "[editor] gizmo drag ended without a move"
+            ),
+            (None, Some(value)) => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(mode),
+                axis = gizmo_axis_name(drag.kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
+                entity = %drag.entity,
+                value = ?value,
+                snapped = settings.snap,
+                "[editor] gizmo drag ended"
+            ),
+            (None, None) => info!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(mode),
+                axis = gizmo_axis_name(drag.kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
                 entity = %drag.entity,
                 "[editor] gizmo drag ended without a move"
             ),
         }
+        self.set_hovered_handle(drag.view, None);
     }
 
-    /// Press on one axis handle of the active tool (the scripted channel):
-    /// the press pixel is the handle's grab point projected, so the pick
-    /// that answers it proves the same geometry the renderer draws.
-    fn start_synthetic_gizmo_drag(&mut self, axis: usize, delta_x: f32, delta_y: f32) {
+    /// Cancel the drag in flight: the press's transform is written back and
+    /// the drag dropped, so a focus loss or a viewport change leaves no
+    /// half-applied manipulation (or its guides) behind.
+    fn cancel_gizmo_drag(&mut self) {
+        let Some(drag) = self.gizmo_drag.take() else {
+            return;
+        };
+        self.restore_transform(drag.entity, &drag.original);
+        info!(
+            target: telemetry_target::ENGINE,
+            mode = gizmo_mode_name(gizmo_drag_mode(drag.kind)),
+            entity = %drag.entity,
+            "[editor] gizmo drag canceled"
+        );
+        self.set_hovered_handle(drag.view, None);
+    }
+
+    /// Drop every interaction in flight: the focus was lost, so no press or
+    /// release is coming to finish them.
+    fn cancel_interactions(&mut self, reason: &str) {
+        if self.camera_drag.take().is_some() {
+            info!(
+                target: telemetry_target::ENGINE,
+                reason,
+                "[editor] camera navigation canceled"
+            );
+        }
+        self.cancel_gizmo_drag();
+        self.press_pick = None;
+        self.pending_pick = None;
+        self.left_down = [false; SCENE_VIEWPORTS];
+        self.set_hovered_handle(self.active_view, None);
+    }
+
+    /// Resolve a scripted handle name to its id: `x`/`y`/`z` name the
+    /// active tool's axes, `xy`/`xz`/`yz` the translation planes.
+    fn scripted_gizmo_handle(&mut self, name: &str) -> Option<u32> {
+        let settings = self.gizmo_settings();
+        if let Some(axis) = parse_gizmo_axis(name) {
+            return Some(gizmo::axis_handle(settings.mode, axis));
+        }
+        let (first, second) = match name {
+            "xy" => (0, 1),
+            "xz" => (0, 2),
+            "yz" => (1, 2),
+            _ => return None,
+        };
+        if settings.mode != GizmoMode::Translate {
+            warn!(
+                target: telemetry_target::ENGINE,
+                mode = gizmo_mode_name(settings.mode),
+                "[editor] plane handles belong to the translate tool"
+            );
+            return None;
+        }
+        Some(gizmo::plane_handle(first, second))
+    }
+
+    /// Apply a scripted camera gesture to the active viewport, through the
+    /// same math a drag uses.
+    fn scripted_camera(&mut self, navigation: CameraNavigation, delta_x: f32, delta_y: f32) {
+        let view = self.active_view;
+        self.apply_camera_gesture(view, navigation, delta_x, delta_y);
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            navigation = camera_navigation_name(navigation),
+            "[editor] camera gesture applied"
+        );
+    }
+
+    /// Move one view's pointer and update the hovered handle - the scripted
+    /// channel's stand-in for a real pointer move.
+    fn scripted_hover(&mut self, view: usize, x: f32, y: f32) {
+        if view >= self.views.len() {
+            warn!(
+                target: telemetry_target::ENGINE,
+                view,
+                "[editor] hover needs an existing scene view"
+            );
+            return;
+        }
+        self.scene_cursor[view] = Some((x, y));
+        self.update_hover(view, (x, y));
+        info!(
+            target: telemetry_target::ENGINE,
+            view,
+            x,
+            y,
+            "[editor] hover injected"
+        );
+    }
+
+    /// Press on one handle of the active tool (the scripted channel): the
+    /// press pixel is the handle's grab point projected, so the pick that
+    /// answers it proves the same geometry the renderer draws.
+    fn start_synthetic_gizmo_drag(&mut self, handle: u32, delta: Option<(f32, f32)>) {
+        let Some(kind) = gizmo::handle_kind(handle) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                handle,
+                "[editor] gizmo drag refused: unknown handle"
+            );
+            return;
+        };
         if self.gizmo_drag.is_some() {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -1508,43 +2132,61 @@ impl EditorWindow {
             (settings, transform)
         };
         let basis = gizmo_basis(settings.space, &transform);
-        let length = self.gizmo_length(transform.translation);
-        // A rotation ring is a circle of `length` radius, so its grab point
-        // sits on that radius - at the diagonal of the two axes the ring
-        // turns around, where no other ring passes a pixel away. The
-        // straight handles are grabbed just short of their tip instead,
-        // along their own axis.
-        let grab_direction = match settings.mode {
-            GizmoMode::Rotate => {
-                gizmo::normalize(gizmo::add(basis[(axis + 1) % 3], basis[(axis + 2) % 3]))
-                    .unwrap_or(basis[axis])
-            }
-            _ => basis[axis],
+        let length = self.gizmo_length(view, transform.translation);
+        // Each handle is grabbed where its own geometry carries it: a
+        // rotation ring on its radius at the diagonal between two axes (no
+        // other ring passes a pixel away), a plane square at its centre,
+        // and a straight handle just short of its tip.
+        let grab = match kind {
+            HandleKind::Axis { axis, .. } => match gizmo_drag_mode(kind) {
+                GizmoMode::Rotate => gizmo::add(
+                    transform.translation,
+                    gizmo::scale(
+                        gizmo::normalize(gizmo::add(basis[(axis + 1) % 3], basis[(axis + 2) % 3]))
+                            .unwrap_or(basis[axis]),
+                        length,
+                    ),
+                ),
+                _ => gizmo::add(
+                    transform.translation,
+                    gizmo::scale(basis[axis], length * GIZMO_PRESS_FRACTION),
+                ),
+            },
+            HandleKind::Plane { first, second } => gizmo::add(
+                transform.translation,
+                gizmo::add(
+                    gizmo::scale(basis[first], length * gizmo::PLANE_OFFSET),
+                    gizmo::scale(basis[second], length * gizmo::PLANE_OFFSET),
+                ),
+            ),
         };
-        let grab_distance = match settings.mode {
-            GizmoMode::Rotate => length,
-            _ => length * GIZMO_PRESS_FRACTION,
-        };
-        let tip = gizmo::add(
-            transform.translation,
-            gizmo::scale(grab_direction, grab_distance),
-        );
-        let Some((x, y)) = self.project_to_screen_in(view, tip) else {
+        let Some((x, y)) = self.project_to_screen_in(view, grab) else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] gizmo drag refused: the handle is behind the camera"
             );
             return;
         };
-        self.synthetic_gizmo_pending = Some((delta_x, delta_y));
+        self.synthetic_gizmo_pending = delta;
+        self.synthetic_gizmo_hold = delta.is_none();
+        self.synthetic_gizmo_press = None;
         self.synthetic_gizmo_view = Some(view);
-        info!(
-            target: telemetry_target::ENGINE,
-            axis = gizmo_axis_name(axis),
-            x,
-            y,
-            "[editor] gizmo drag press"
-        );
+        match kind.plane() {
+            Some((first, second)) => info!(
+                target: telemetry_target::ENGINE,
+                plane = gizmo_plane_name(first, second),
+                x,
+                y,
+                "[editor] gizmo drag press"
+            ),
+            None => info!(
+                target: telemetry_target::ENGINE,
+                axis = gizmo_axis_name(kind.axis().map(|(_, axis)| axis).unwrap_or(0)),
+                x,
+                y,
+                "[editor] gizmo drag press"
+            ),
+        }
         // The press pixel projects onto the handle's own geometry, but a
         // one-pixel line straddles pixel rows: the press asks the exact
         // pixel and its four neighbours, and the first that names a handle
@@ -1564,6 +2206,45 @@ impl EditorWindow {
                 self.synthetic_press_ids.push(id);
             }
         }
+    }
+
+    /// Apply one scripted move to the drag a `gizmo press` started: the
+    /// delta is measured from the press pixel, exactly like a pointer move.
+    fn scripted_gizmo_move(&mut self, delta_x: f32, delta_y: f32) {
+        let Some((press_x, press_y)) = self.synthetic_gizmo_press else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo move needs a scripted press first"
+            );
+            return;
+        };
+        if self.gizmo_drag.is_none() {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo move needs a drag in flight"
+            );
+            return;
+        }
+        self.update_gizmo_drag(press_x + delta_x, press_y + delta_y);
+        info!(
+            target: telemetry_target::ENGINE,
+            delta_x,
+            delta_y,
+            "[editor] gizmo drag moved"
+        );
+    }
+
+    /// Finish the drag a `gizmo press` started, like a mouse release.
+    fn scripted_gizmo_release(&mut self) {
+        if self.gizmo_drag.is_none() {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] gizmo release needs a drag in flight"
+            );
+            return;
+        }
+        self.synthetic_gizmo_press = None;
+        self.end_gizmo_drag();
     }
 
     /// Log one component field's value: the suite's window into the world
@@ -1631,6 +2312,53 @@ impl EditorWindow {
                 visible = game.visible,
                 "[editor] game view rect"
             );
+        }
+    }
+
+    /// Log the active viewport, the interaction state, the hovered handle
+    /// and every view's camera: the suite's window into navigation and the
+    /// viewport routing, with no pixel clicks.
+    fn dump_viewport(&mut self) {
+        let hovered = self
+            .hovered_handle
+            .map(|handle| handle.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        info!(
+            target: telemetry_target::ENGINE,
+            active = self.active_view,
+            interaction = self.interaction_name(),
+            hovered = hovered.as_str(),
+            keymap = %self.keymap,
+            "[test] viewport"
+        );
+        for view in 0..self.views.len() {
+            let camera = self.cameras[view];
+            let eye = camera.eye();
+            let pivot = camera.pivot;
+            info!(
+                target: telemetry_target::ENGINE,
+                view,
+                eye = format!("{:.3},{:.3},{:.3}", eye[0], eye[1], eye[2]).as_str(),
+                pivot = format!("{:.3},{:.3},{:.3}", pivot[0], pivot[1], pivot[2]).as_str(),
+                distance = camera.distance,
+                yaw = camera.yaw,
+                pitch = camera.pitch,
+                "[test] viewport camera"
+            );
+        }
+    }
+
+    /// The viewport interaction state's name: one owner at a time, so the
+    /// dump and the logs say who has the pointer.
+    fn interaction_name(&self) -> &'static str {
+        if self.camera_drag.is_some() {
+            return "navigating";
+        }
+        match self.gizmo_drag.as_ref().map(|drag| drag.kind) {
+            Some(HandleKind::Plane { .. }) => "dragging-plane",
+            Some(HandleKind::Axis { .. }) => "dragging-axis",
+            None if self.hovered_handle.is_some() => "hovering",
+            None => "idle",
         }
     }
 
@@ -1891,8 +2619,10 @@ impl EditorWindow {
                 .and_then(|selection| selection.asset.clone());
             (rows, types, selected)
         };
-        let mut selection = EditorSelection::default();
-        selection.asset = selected;
+        let selection = EditorSelection {
+            asset: selected,
+            ..EditorSelection::default()
+        };
         match action {
             "create" => {
                 let world = self.host.host_mut().engine_mut().world_mut();
@@ -2346,6 +3076,9 @@ impl EditorWindow {
         for event in self.pending_events.drain(..) {
             self.host.host_mut().engine_mut().push_input_event(event);
         }
+        // Step 2a: any camera a navigation moved is re-published, so the
+        // renderer draws the frame with the view the user just steered.
+        self.publish_cameras();
         // Step 2b: a scripted drag in flight takes its next stage - the
         // press, the move and the release, one per frame.
         self.advance_scripted_drag();
@@ -2396,6 +3129,9 @@ impl EditorWindow {
         // move the shared selection; the outline follows on the next
         // publish (Stage 13).
         self.drain_scene_picks();
+        // Step 7b: the menu bar's requests - undo/redo, a window switch and a
+        // quit - taken through the same paths the scripted channel uses.
+        self.drain_menu_requests();
         // Step 8: draw the shell frame through the overlay.
         self.present_ui();
         // Step 9: the scripted channel, then the auto-quit deadline.
@@ -2441,6 +3177,13 @@ impl EditorWindow {
             &self.preferences_document,
             self.gizmo_project.as_deref(),
         );
+        let (undo_depth, redo_depth) = engine
+            .world()
+            .get_resource::<CommandHistory>()
+            .map(|history| (history.undo_depth(), history.redo_depth()))
+            .unwrap_or((0, 0));
+        snapshot.undo_depth = undo_depth;
+        snapshot.redo_depth = redo_depth;
         if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {
             *resource = snapshot;
         }
@@ -2731,6 +3474,17 @@ impl EditorWindow {
             .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
+        // The keymap preset the file names drives the viewport navigation
+        // chords; Blender's table stands until the file says otherwise.
+        let keymap = preferences::keymap_preset(&self.preferences_document);
+        if keymap != self.keymap {
+            self.keymap = keymap;
+            info!(
+                target: telemetry_target::ENGINE,
+                preset = %keymap,
+                "[editor] camera keymap"
+            );
+        }
         let world = self.host.host_mut().engine_mut().world_mut();
         let step_cap = preferences
             .history_step_cap
@@ -3107,6 +3861,9 @@ impl EditorWindow {
             overlay_regions,
             ime_allowed: _,
             ime_rect: _,
+            // The menu bar's quit is drained at the frame boundary (Step 7b),
+            // not while the frame is presented.
+            quit_requested: _,
         } = frame;
         // Each scene viewport follows its dock rectangle, so the viewports
         // track the layout when the user drags a splitter; a viewport whose
@@ -3329,20 +4086,48 @@ impl EditorWindow {
                 }
                 Some("gizmo") => match parts.next() {
                     Some("drag") => {
-                        let axis = parts.next().and_then(parse_gizmo_axis);
+                        let name = parts.next();
+                        let handle = name.and_then(|name| self.scripted_gizmo_handle(name));
                         let delta_x = parts.next().and_then(|value| value.parse().ok());
                         let delta_y = parts.next().and_then(|value| value.parse().ok());
-                        match (axis, delta_x, delta_y) {
-                            (Some(axis), Some(delta_x), Some(delta_y)) => {
-                                self.start_synthetic_gizmo_drag(axis, delta_x, delta_y)
+                        match (handle, delta_x, delta_y) {
+                            (Some(handle), Some(delta_x), Some(delta_y)) => {
+                                self.start_synthetic_gizmo_drag(handle, Some((delta_x, delta_y)))
                             }
                             _ => warn!(
                                 target: telemetry_target::ENGINE,
                                 command,
-                                "[editor] gizmo drag needs an axis (x/y/z) and two pixel deltas"
+                                "[editor] gizmo drag needs x, y, z, xy, xz or yz and two pixel deltas"
                             ),
                         }
                     }
+                    Some("press") => {
+                        let name = parts.next();
+                        let handle = name.and_then(|name| self.scripted_gizmo_handle(name));
+                        match handle {
+                            Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
+                            None => warn!(
+                                target: telemetry_target::ENGINE,
+                                command,
+                                "[editor] gizmo press needs x, y, z, xy, xz or yz"
+                            ),
+                        }
+                    }
+                    Some("move") => {
+                        let delta_x = parts.next().and_then(|value| value.parse::<f32>().ok());
+                        let delta_y = parts.next().and_then(|value| value.parse::<f32>().ok());
+                        match (delta_x, delta_y) {
+                            (Some(delta_x), Some(delta_y)) => {
+                                self.scripted_gizmo_move(delta_x, delta_y)
+                            }
+                            _ => warn!(
+                                target: telemetry_target::ENGINE,
+                                command,
+                                "[editor] gizmo move needs two pixel deltas"
+                            ),
+                        }
+                    }
+                    Some("release") => self.scripted_gizmo_release(),
                     Some(other) => match parse_gizmo_mode(other) {
                         Some(mode) => self.set_gizmo_tool(mode),
                         None => warn!(
@@ -3360,6 +4145,7 @@ impl EditorWindow {
                 Some("dump") => match parts.next() {
                     Some("tabs") => self.dump_tabs(),
                     Some("scenes") => self.dump_scenes(),
+                    Some("viewport") => self.dump_viewport(),
                     Some("grid") => self.dump_grid(),
                     Some("assets") => self.dump_assets(),
                     Some("browser") => self.dump_browser(),
@@ -3396,6 +4182,66 @@ impl EditorWindow {
                         "[editor] browser needs a folder path or root"
                     ),
                 },
+                Some("camera") => match parts.next() {
+                    Some(action @ ("orbit" | "pan")) => {
+                        let delta_x = parts.next().and_then(|value| value.parse::<f32>().ok());
+                        let delta_y = parts.next().and_then(|value| value.parse::<f32>().ok());
+                        match (delta_x, delta_y) {
+                            (Some(delta_x), Some(delta_y)) => {
+                                let navigation = if action == "orbit" {
+                                    CameraNavigation::Orbit
+                                } else {
+                                    CameraNavigation::Pan
+                                };
+                                self.scripted_camera(navigation, delta_x, delta_y);
+                            }
+                            _ => warn!(
+                                target: telemetry_target::ENGINE,
+                                command,
+                                "[editor] camera orbit and pan need two pixel deltas"
+                            ),
+                        }
+                    }
+                    Some("dolly") => match parts.next().and_then(|value| value.parse::<f32>().ok())
+                    {
+                        Some(delta_y) => {
+                            self.scripted_camera(CameraNavigation::Dolly, 0.0, delta_y)
+                        }
+                        None => warn!(
+                            target: telemetry_target::ENGINE,
+                            command,
+                            "[editor] camera dolly needs a pixel delta"
+                        ),
+                    },
+                    Some("zoom") => {
+                        match parts.next().and_then(|value| value.parse::<f32>().ok()) {
+                            Some(lines) => self.zoom_camera(self.active_view, lines),
+                            None => warn!(
+                                target: telemetry_target::ENGINE,
+                                command,
+                                "[editor] camera zoom needs a line count"
+                            ),
+                        }
+                    }
+                    _ => warn!(
+                        target: telemetry_target::ENGINE,
+                        command,
+                        "[editor] camera needs orbit, pan, dolly or zoom"
+                    ),
+                },
+                Some("hover") => {
+                    let view = parts.next().and_then(|value| value.parse::<usize>().ok());
+                    let x = parts.next().and_then(|value| value.parse::<f32>().ok());
+                    let y = parts.next().and_then(|value| value.parse::<f32>().ok());
+                    match (view, x, y) {
+                        (Some(view), Some(x), Some(y)) => self.scripted_hover(view, x, y),
+                        _ => warn!(
+                            target: telemetry_target::ENGINE,
+                            command,
+                            "[editor] hover needs a view, an x and a y"
+                        ),
+                    }
+                }
                 Some("select") => match parts.next() {
                     Some("asset") => match parts.next() {
                         Some(path) => self.scripted_select_asset(path),
@@ -3596,10 +4442,10 @@ impl EditorWindow {
             y,
             "[editor] click injected"
         );
-        // A click inside a visible scene viewport also asks what is under
-        // it (Stage 13): the pick's answer moves the shared selection, and
-        // the outline follows. A point over the overlay's chips is the
-        // UI's, not the scene's.
+        // A click inside a visible scene viewport activates it and asks what
+        // is under it, through the same press the window events route: the
+        // pick's answer moves the shared selection, and the outline follows.
+        // A point over the overlay's chips is the UI's, not the scene's.
         if let Some(view) = self.scene_view_at(x, y) {
             let scale = self.scale_factor;
             let over_ui = self
@@ -3615,7 +4461,12 @@ impl EditorWindow {
                     y,
                     "[editor] scene view click"
                 );
-                self.request_scene_pick(view, x - origin_x, y - origin_y);
+                // A scripted click is a press and a release in one command:
+                // the pick answers later with the button already up, so a
+                // handle under the point does not start a drag.
+                self.activate_view(view);
+                self.press_scene(view, x - origin_x, y - origin_y);
+                self.release_scene(view);
             }
         }
     }
@@ -3738,36 +4589,55 @@ impl EditorWindow {
             );
             return;
         };
-        let dock = state.dock.state_mut();
-        let Some((surface, node, _)) = dock.find_tab(&tab) else {
+        if pill_editor_core_egui::layout::activate_tab(state.dock.state_mut(), tab) {
+            info!(
+                target: telemetry_target::ENGINE,
+                tab = tab.name(),
+                "[editor] tab activated"
+            );
+        } else {
             warn!(
                 target: telemetry_target::ENGINE,
-                tab = tab_name(tab),
+                tab = tab.name(),
                 "[editor] tab activation needs the tab in the dock"
             );
-            return;
+        }
+    }
+
+    /// Drain what the menu bar asked for at the frame boundary: undo and redo
+    /// through the scripted channel's own walk, the Window menu's tab through
+    /// the shared activation, and a quit through the frame's flag.
+    fn drain_menu_requests(&mut self) {
+        let (requests, tab, quit) = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let quit = world
+                .get_resource::<EguiShellFrame>()
+                .is_some_and(|frame| frame.quit_requested);
+            match world.get_resource_mut::<EguiShellState>() {
+                Some(state) => (
+                    std::mem::take(&mut state.menubar.history_requests),
+                    state.menubar.pending_tab.take(),
+                    quit,
+                ),
+                None => (Vec::new(), None, quit),
+            }
         };
-        // `set_active_tab` takes the tab's index inside its leaf, and the
-        // node index must address the leaf on its own surface: a floating
-        // surface's tree is separate.
-        let Some(index) = dock[surface][node]
-            .get_leaf()
-            .and_then(|leaf| leaf.tabs.iter().position(|candidate| *candidate == tab))
-        else {
-            warn!(
+        for request in requests {
+            match request {
+                HistoryRequest::Undo => self.scripted_undo(),
+                HistoryRequest::Redo => self.scripted_redo(),
+            }
+        }
+        if let Some(tab) = tab {
+            self.activate_tab(tab);
+        }
+        if quit {
+            info!(
                 target: telemetry_target::ENGINE,
-                tab = tab_name(tab),
-                "[editor] tab activation needs the tab in a leaf"
+                "[editor] quit requested"
             );
-            return;
-        };
-        dock.set_active_tab((surface, node, pill_ui_egui::egui_dock::TabIndex(index)));
-        dock.set_focused_node_and_surface((surface, node));
-        info!(
-            target: telemetry_target::ENGINE,
-            tab = tab_name(tab),
-            "[editor] tab activated"
-        );
+            self.quit = true;
+        }
     }
 
     /// Log the dock's surfaces and tabs, for the suite's assertions.
@@ -3962,7 +4832,7 @@ impl SurfaceWindow {
 
 impl SceneView {
     /// Attach the scene window to the renderer and publish its camera.
-    fn attach(&mut self, host: &mut RenderingHost, camera: &EditorCamera, size: (u32, u32)) {
+    fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, size: (u32, u32)) {
         match host.attach_surface(
             self.surface_id,
             Arc::clone(&self.window.window),
@@ -3971,7 +4841,7 @@ impl SceneView {
             SurfaceOptions::default(),
         ) {
             Ok(()) => {
-                host.set_surface_camera(self.surface_id, Some(camera.binding()));
+                host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
                 info!(
                     target: telemetry_target::ENGINE,
                     detached = self.window.detached,
@@ -4019,99 +4889,23 @@ fn parse_tab(name: &str) -> Option<EditorTab> {
 
 /// The tab's display name for log lines.
 fn tab_name(tab: EditorTab) -> &'static str {
-    match tab {
-        EditorTab::Scene => "scene",
-        EditorTab::SecondScene => "scene2",
-        EditorTab::Game => "game",
-        EditorTab::Entities => "entities",
-        EditorTab::Systems => "systems",
-        EditorTab::Inspector => "inspector",
-        EditorTab::Assets => "assets",
-        EditorTab::Preferences => "preferences",
-    }
+    tab.name()
 }
 
 // =============================================================================
 // EditorCamera
 // =============================================================================
 
-/// The editor's own camera for the Scene view, as plain data (D29).
-///
-/// The camera never enters the world - the scene surface is bound to it as
-/// a [`CameraBinding::View`], which keeps project systems from seeing or
-/// moving it. Navigation gestures are follow-up work (Stage 10).
-struct EditorCamera {
-    /// The point the camera looks at and orbits around.
-    pivot: [f32; 3],
-    /// Rotation around the world's Y axis, in radians.
-    yaw: f32,
-    /// Downward tilt, in radians; positive looks down at the pivot.
-    pitch: f32,
-    /// Distance from the pivot.
-    distance: f32,
-}
-
-impl Default for EditorCamera {
-    fn default() -> Self {
-        Self {
-            pivot: [0.0, 0.0, 0.0],
-            yaw: 0.0,
-            pitch: 0.30,
-            distance: 16.0,
-        }
-    }
-}
-
-impl EditorCamera {
-    /// The direction the camera looks along.
-    fn forward(&self) -> [f32; 3] {
-        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        [-cos_pitch * sin_yaw, -sin_pitch, -cos_pitch * cos_yaw]
-    }
-
-    /// The camera's right direction, horizontal by construction: the gizmo's
-    /// screen-space rays are built from it.
-    fn right(&self) -> [f32; 3] {
-        let forward = self.forward();
-        let horizontal = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
-        if horizontal <= f32::EPSILON {
-            return [1.0, 0.0, 0.0];
-        }
-        [-forward[2] / horizontal, 0.0, forward[0] / horizontal]
-    }
-
-    /// Where the camera sits: the pivot, backed off along the look
-    /// direction.
-    fn eye(&self) -> [f32; 3] {
-        let forward = self.forward();
-        [
-            self.pivot[0] - forward[0] * self.distance,
-            self.pivot[1] - forward[1] * self.distance,
-            self.pivot[2] - forward[2] * self.distance,
-        ]
-    }
-
-    /// The camera's orientation as a quaternion built from yaw and pitch,
-    /// in the transform's `[x, y, z, w]` layout.
-    fn rotation(&self) -> [f32; 4] {
-        let half_yaw = self.yaw * 0.5;
-        let half_pitch = self.pitch * 0.5;
-        let yaw_quaternion = [0.0, half_yaw.sin(), 0.0, half_yaw.cos()];
-        let pitch_quaternion = [(-half_pitch).sin(), 0.0, 0.0, half_pitch.cos()];
-        quaternion_product(yaw_quaternion, pitch_quaternion)
-    }
-
-    /// The binding the scene surface draws through.
-    fn binding(&self) -> CameraBinding {
-        CameraBinding::View {
-            camera: CameraComponent::default(),
-            transform: TransformComponent {
-                translation: self.eye(),
-                rotation: self.rotation(),
-                ..Default::default()
-            },
-        }
+/// The camera binding the scene surface draws through: the view's orbit
+/// camera as a camera transform, never a world entity (D29).
+fn camera_binding(camera: &OrbitCamera) -> CameraBinding {
+    CameraBinding::View {
+        camera: CameraComponent::default(),
+        transform: TransformComponent {
+            translation: camera.eye(),
+            rotation: camera.rotation(),
+            ..Default::default()
+        },
     }
 }
 
@@ -4259,28 +5053,127 @@ fn projection_terms(width: f32, height: f32) -> (f32, f32) {
 
 /// One gizmo drag in flight.
 ///
-/// The press records where the drag started - the axis parameter or ring
-/// angle the cursor ray named, plus the transform it started from - so every
-/// move applies a delta against it and nothing jumps on the first pixel.
+/// The press records where the drag started - the axis parameter, ring
+/// angle or in-plane coordinates the cursor ray named, the transform it
+/// started from and the basis its handles were built in - so every move
+/// applies a delta against the press and nothing jumps on the first pixel.
+/// The start pivot stays put for the displacement line while the current
+/// one follows the object.
 struct GizmoDrag {
     /// The scene view the drag belongs to: every move re-reads that view's
     /// ray.
     view: usize,
-    /// The tool mode the grabbed handle belongs to.
-    mode: GizmoMode,
-    /// The axis index the handle belongs to.
-    axis: usize,
+    /// The handle id the drag holds: its axis, or its plane's pair.
+    handle: u32,
+    /// What the handle addresses.
+    kind: HandleKind,
     /// The entity being dragged.
     entity: Entity,
     /// The transform at the press; every move is computed from it, so a
     /// snapped drag cannot accumulate rounding.
     original: TransformComponent,
+    /// The frame the handles were built in (the world axes, or the object's
+    /// rotated ones): a local-space drag follows these for its whole life.
+    basis: [[f32; 3]; 3],
     /// The axis parameter (translate, scale) or ring angle (rotate) at the
-    /// press.
+    /// press; unused by a plane drag.
     start_value: f32,
+    /// The in-plane coordinates at the press; `None` for a single axis.
+    start_plane: Option<(f32, f32)>,
+    /// The gizmo's world pivot when the drag began: the displacement line's
+    /// fixed end.
+    start_pivot: [f32; 3],
+    /// The pivot now, so the line's other end follows every move.
+    current_pivot: [f32; 3],
     /// How long the handles were at the press, in world units: the scale
-    /// drag's reference.
+    /// drag's reference and the guides' dash length.
     reference: f32,
     /// The value written on the previous move, for the end log.
     last_value: Option<[f32; 4]>,
+}
+
+/// The pick a scene press asked: the view and press pixel it happened at,
+/// and the request id its answer will carry.
+struct PressPick {
+    /// The view the press landed in.
+    view: usize,
+    /// The press pixel in the view's physical surface coordinates.
+    x: f32,
+    /// The press pixel in the view's physical surface coordinates.
+    y: f32,
+    /// The pick request the answer is matched by.
+    id: u64,
+}
+
+/// A camera navigation drag in flight.
+struct CameraDrag {
+    /// The view whose camera the drag moves.
+    view: usize,
+    /// The gesture the press matched.
+    navigation: CameraNavigation,
+    /// The last pointer position, in the view's physical pixels: every move
+    /// applies its delta since this one.
+    last: (f32, f32),
+}
+
+/// The tool mode a handle's drag edits: a plane square translates.
+fn gizmo_drag_mode(kind: HandleKind) -> GizmoMode {
+    match kind {
+        HandleKind::Axis { mode, .. } => mode,
+        HandleKind::Plane { .. } => GizmoMode::Translate,
+    }
+}
+
+/// The display name of a plane handle, as the axis pair it spans.
+fn gizmo_plane_name(first: usize, second: usize) -> &'static str {
+    match (first, second) {
+        (0, 1) => "xy",
+        (0, 2) => "xz",
+        _ => "yz",
+    }
+}
+
+/// Draw the drag guides: the axis constraint line through a single-axis
+/// handle's axis, and - for a translation drag - the dotted line from the
+/// press's pivot to the current one.
+///
+/// They are plain debug lines, not gizmo geometry: no handle id, so a pick
+/// never names them and they cannot be grabbed. The axis guide uses the
+/// handle's own colour; the displacement line is neutral so it never reads
+/// as a fourth axis.
+fn draw_gizmo_guides(
+    debug: &mut DebugDraw,
+    kind: HandleKind,
+    basis: [[f32; 3]; 3],
+    start_pivot: [f32; 3],
+    current_pivot: [f32; 3],
+    reference: f32,
+) {
+    let style = |color: [f32; 4]| DebugStyle {
+        color,
+        depth_test: false,
+        ..DebugStyle::default()
+    };
+    if let Some((_, axis)) = kind.axis() {
+        let span = reference * GIZMO_GUIDE_SPAN;
+        let (from, to) = gizmo::axis_guide(current_pivot, basis[axis], span);
+        let mut color = gizmo::AXIS_COLORS[axis];
+        color[3] = 0.9;
+        debug.line(from, to, style(color));
+    }
+    if gizmo_drag_mode(kind) == GizmoMode::Translate {
+        let dash = reference * GIZMO_DASH;
+        for (from, to) in gizmo::dotted_segments(start_pivot, current_pivot, dash) {
+            debug.line(from, to, style([0.92, 0.92, 0.92, 0.85]));
+        }
+    }
+}
+
+/// The display name of a camera navigation gesture.
+fn camera_navigation_name(navigation: CameraNavigation) -> &'static str {
+    match navigation {
+        CameraNavigation::Orbit => "orbit",
+        CameraNavigation::Pan => "pan",
+        CameraNavigation::Dolly => "dolly",
+    }
 }
