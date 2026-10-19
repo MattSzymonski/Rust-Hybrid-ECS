@@ -2,12 +2,14 @@
 <!--
   REQUIREMENTS: a browser with WebGPU (Chrome/Edge 113+, Safari 18+, Firefox 141+),
                 served over HTTP (module scripts do not load from file://).
-  DESCRIPTION:  The page a Pill *editor* web build runs in (Stage 30).
-                `devops/tools/build_web.py --editor` copies it beside the
-                generated `pkg/` directory. Two stacked, pixel-aligned
-                canvases: `pill-canvas` below (the scene), `pill-editor-ui`
-                above (the shell's panels and overlays, drawn transparent),
-                the arrangement the native composition overlay uses.
+  DESCRIPTION:  The page a Pill *editor* web build runs in (W-0004 Stage 30,
+                W-0029). `devops/tools/build_web.py --editor` copies it
+                beside the generated `pkg/` directory; the build's
+                `--editor-frontend` picks the `pill_ui` or egui shell. Two
+                stacked, pixel-aligned canvases: `pill-canvas` below (the
+                scene), `pill-editor-ui` above (the shell's panels and
+                overlays, drawn transparent), the arrangement the native
+                composition overlay uses.
                 `window.pillEditor.command("<line>")` pushes one line into
                 the scripted channel (the web counterpart of
                 `PILL_EDITOR_TEST_COMMANDS`); the headless suite drives it.

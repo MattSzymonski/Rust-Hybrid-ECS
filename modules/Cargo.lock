@@ -3192,13 +3192,16 @@ name = "pill_web"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "egui-wgpu",
  "js-sys",
  "pill_core",
  "pill_editor_api",
+ "pill_editor_core_egui",
  "pill_engine_core",
  "pill_input",
  "pill_runtime",
  "pill_ui",
+ "pill_ui_egui",
  "pill_ui_wgpu",
  "wasm-bindgen",
  "web-sys",
