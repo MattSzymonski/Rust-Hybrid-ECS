@@ -789,7 +789,7 @@ internal static class Program
                         decorator.GetProperty("kind").GetString())),
                     "header,tooltip,range", "Health decorator order mismatch");
                 Assert(decorators[0].GetProperty("text").GetString() == "Combat",
-                    "the header text was not carried");                Equal(decorators[2].GetProperty("min").GetSingle(), 0f,
+                    "the header text was not carried"); Equal(decorators[2].GetProperty("min").GetSingle(), 0f,
                     "the range minimum was not carried");
                 Equal(decorators[2].GetProperty("max").GetSingle(), 100f,
                     "the range maximum was not carried");
