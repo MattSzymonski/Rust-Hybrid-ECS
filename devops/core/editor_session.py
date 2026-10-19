@@ -77,6 +77,26 @@ EDITOR_TEST_QUIT_TOKEN = "[editor] test channel: quit requested"
 EDITOR_QUIT_TOKEN = "[editor] quitting on request"
 EDITOR_DRAG_OUT_BEGAN_TOKEN = "[editor] drag out began"
 EDITOR_DRAG_OUT_ENDED_TOKEN = "[editor] drag out ended"
+# The egui editor's one refusal line for a scripted line it cannot run: an
+# unknown verb, an unknown target, or a missing or malformed argument. A suite
+# typo raises `ScriptedCommandRejected` from the next wait instead of running
+# out its timeout, and `test_log_contract.py` pins the literal against Rust.
+EDITOR_SCRIPTED_REJECTED_TOKEN = "[editor] scripted command rejected"
+REJECTION_PATTERN = re.compile(
+    re.escape(EDITOR_SCRIPTED_REJECTED_TOKEN)
+    + r'\s+command="((?:[^"\\]|\\.)*)"\s+reason="((?:[^"\\]|\\.)*)"'
+)
+
+
+class ScriptedCommandRejected(RuntimeError):
+    """A scripted line the editor refused, raised before any timeout can hide it."""
+
+    def __init__(self, command: str, reason: str) -> None:
+        super().__init__(
+            "the editor rejected the scripted line {!r}: {}".format(command, reason)
+        )
+        self.command = command
+        self.reason = reason
 
 # =============================================================================
 # Run directories
@@ -136,6 +156,10 @@ class EditorSession:
         self._binary = Path(binary) if binary is not None else EDITOR_BINARY
         self._process: Optional[subprocess.Popen] = None
         self._sources: Dict[Path, str] = {}
+        # Refusals already reported to a suite, so a wait that reads the whole
+        # log (the default anchor) only raises on a line new since the last
+        # one: a probe that expects a refusal must not poison every later wait.
+        self._rejections_seen = 0
 
     @property
     def binary(self) -> Path:
@@ -278,16 +302,26 @@ class EditorSession:
 
         Same contract the suites grew up with: prints `[OK] <label>` on a
         match, raises `RuntimeError` when a running editor exits first, and
-        `TimeoutError` on timeout - both with the log tail for diagnosis.
+        `TimeoutError` on timeout - both with the log tail for diagnosis. A
+        refusal of a scripted line raises `ScriptedCommandRejected` the moment
+        it lands, so a typo never waits out the timeout; a refusal an earlier
+        wait already raised on is not raised again.
         """
         deadline = time.monotonic() + timeout
         expression = re.compile(pattern)
         process = self._process
         while time.monotonic() < deadline:
             text = self.read_log()
-            if expression.search(text[start:]):
+            window = text[start:]
+            if expression.search(window):
                 print("  [OK] {}".format(label))
                 return len(text)
+            if EDITOR_SCRIPTED_REJECTED_TOKEN in text:
+                rejected = REJECTION_PATTERN.findall(text)
+                if len(rejected) > self._rejections_seen:
+                    self._rejections_seen = len(rejected)
+                    command, reason = rejected[-1]
+                    raise ScriptedCommandRejected(command, reason)
             if process is not None and process.poll() is not None:
                 raise RuntimeError(
                     "{}: the editor exited {}\n".format(label, process.returncode)
@@ -422,6 +456,26 @@ class EditorSession:
         """Appends one scripted command, flushed, so the editor sees it whole."""
         with self.commands_path.open("a", encoding="utf-8") as file:
             file.write(line + "\n")
+
+    def request(
+        self,
+        text: str,
+        pattern: str,
+        timeout: float = 30.0,
+        label: Optional[str] = None,
+    ) -> str:
+        """Appends one scripted line and waits for its answer, anchored.
+
+        The wait starts at the log's length before the line is written, so an
+        answer the log already carried cannot satisfy it; a refusal of the
+        line raises `ScriptedCommandRejected` at once. `pattern` is a regex
+        (suites pass `re.escape(<token>)` for a literal). Returns the log text
+        from the anchor through the answer, for the callers that parse it.
+        """
+        start = len(self.read_log())
+        self.send(text)
+        self.wait(pattern, timeout, label or "scripted {}".format(text), start)
+        return self.read_log()[start:]
 
     def send_many(self, lines: List[str]) -> None:
         """Appends several scripted commands in one write.
