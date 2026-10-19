@@ -59,7 +59,7 @@ use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
 use pill_engine_core::debug_draw::{DebugDraw, DebugStyle};
-use pill_engine_core::input::{ButtonState, MouseButton};
+use pill_engine_core::input::{ButtonState, KeyCode, Modifiers as EngineModifiers, MouseButton};
 use pill_engine_core::Entity;
 use pill_engine_core::FieldValue;
 use pill_engine_core::InputEvent;
@@ -83,6 +83,7 @@ use winit::window::{Window, WindowId};
 // Current crate
 use crate::frontend::EditorError;
 use crate::overlay::OverlaySurface;
+use crate::scripted::{AssetEdit, Dump, KeyChord, ScriptedCommand, ToolbarAction};
 use crate::test_channel::{self, TestChannel};
 
 // =============================================================================
@@ -1541,7 +1542,8 @@ impl EditorWindow {
     }
 
     /// The tool shortcuts: W/E/R select translate/rotate/scale - the Unity
-    /// preset's bindings, the same ones the native editor defaults to.
+    /// preset's bindings, the same ones the native editor defaults to, and
+    /// the same mapping a scripted `key` chord runs.
     fn gizmo_shortcut(&mut self, event: &winit::event::KeyEvent) {
         if event.state != winit::event::ElementState::Pressed || event.repeat {
             return;
@@ -1549,13 +1551,12 @@ impl EditorWindow {
         let winit::keyboard::PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
-        let mode = match code {
-            winit::keyboard::KeyCode::KeyW => GizmoMode::Translate,
-            winit::keyboard::KeyCode::KeyE => GizmoMode::Rotate,
-            winit::keyboard::KeyCode::KeyR => GizmoMode::Scale,
-            _ => return,
+        let Some(key) = pill_input::winit_events::key_code(code) else {
+            return;
         };
-        self.set_gizmo_tool(mode);
+        if let Some(mode) = gizmo_mode_for_key(key) {
+            self.set_gizmo_tool(mode);
+        }
     }
 
     /// Switch the gizmo's mode; the shortcuts, the scripted command and
@@ -2213,32 +2214,6 @@ impl EditorWindow {
         }
     }
 
-    /// Apply one scripted move to the drag a `gizmo press` started: the
-    /// delta is measured from the press pixel, exactly like a pointer move.
-    fn scripted_gizmo_move(&mut self, delta_x: f32, delta_y: f32) {
-        let Some((press_x, press_y)) = self.synthetic_gizmo_press else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] gizmo move needs a scripted press first"
-            );
-            return;
-        };
-        if self.gizmo_drag.is_none() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] gizmo move needs a drag in flight"
-            );
-            return;
-        }
-        self.update_gizmo_drag(press_x + delta_x, press_y + delta_y);
-        info!(
-            target: telemetry_target::ENGINE,
-            delta_x,
-            delta_y,
-            "[editor] gizmo drag moved"
-        );
-    }
-
     /// Finish the drag a `gizmo press` started, like a mouse release.
     fn scripted_gizmo_release(&mut self) {
         if self.gizmo_drag.is_none() {
@@ -2455,25 +2430,6 @@ impl EditorWindow {
         }
     }
 
-    /// Log the shared selection, entity and asset, with `-` for the empty
-    /// halves - the native editor's shape.
-    fn dump_selection(&mut self) {
-        let world = self.host.host_mut().engine_mut().world_mut();
-        let (entity, asset) = world
-            .get_resource::<EditorSelection>()
-            .map(|selection| (selection.entity, selection.asset.clone()))
-            .unwrap_or((None, None));
-        let entity_text = entity
-            .map(|entity| entity.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        info!(
-            target: telemetry_target::ENGINE,
-            entity = entity_text.as_str(),
-            asset = asset.as_deref().unwrap_or("-"),
-            "[test] selection"
-        );
-    }
-
     /// Log every registered system with the state the Systems tab draws,
     /// then the engine's pause flag - the tab's exact data, so a suite can
     /// assert a toggle or a pause without reading the tab's pixels.
@@ -2610,7 +2566,7 @@ impl EditorWindow {
 
     /// One Assets toolbar button, driven by the scripted channel: the same
     /// core helpers the buttons call, enablement rules included.
-    fn scripted_toolbar(&mut self, action: &str) {
+    fn scripted_toolbar(&mut self, action: ToolbarAction) {
         // The rows, the types and the selection the helpers read, cloned
         // out first: the world's mutable resources are borrowed below.
         let (rows, types, selected) = {
@@ -2629,31 +2585,30 @@ impl EditorWindow {
             ..EditorSelection::default()
         };
         match action {
-            "create" => {
+            ToolbarAction::Create => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(state) = world.get_resource_mut::<EguiShellState>() {
                     assets::open_create(&mut state.asset_dialog, &selection, &rows, &types);
                 }
             }
-            "rename" => {
+            ToolbarAction::Rename => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(state) = world.get_resource_mut::<EguiShellState>() {
                     assets::open_rename(&mut state.asset_dialog, &selection, &rows);
                 }
             }
-            "delete" => {
+            ToolbarAction::Delete => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
                     assets::delete_selection(pending, &selection, &rows);
                 }
             }
-            "meta" => {
+            ToolbarAction::Meta => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
                     assets::write_meta_selection(pending, &selection, &rows);
                 }
             }
-            _ => {}
         }
     }
 
@@ -2670,24 +2625,6 @@ impl EditorWindow {
                 None => warn!(
                     target: telemetry_target::ENGINE,
                     "[editor] dialog set without an open dialog"
-                ),
-            }
-        }
-    }
-
-    /// Set the create dialog's chosen type - what clicking a type row does.
-    fn scripted_dialog_set_type(&mut self, type_name: &str) {
-        let world = self.host.host_mut().engine_mut().world_mut();
-        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-            match state.asset_dialog.as_mut() {
-                Some(AssetDialog::Create {
-                    type_name: field, ..
-                }) => {
-                    *field = type_name.to_string();
-                }
-                _ => warn!(
-                    target: telemetry_target::ENGINE,
-                    "[editor] dialog set type needs the create dialog"
                 ),
             }
         }
@@ -2731,73 +2668,37 @@ impl EditorWindow {
         }
     }
 
-    /// Close the open dialog without acting - the window's Cancel button.
-    fn scripted_dialog_cancel(&mut self) {
-        let world = self.host.host_mut().engine_mut().world_mut();
-        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-            assets::cancel(&mut state.asset_dialog);
-        }
-    }
-
-    /// Drive one direct asset edit through the recorded command path:
-    /// `edit asset create <type> <folder|-> <name>`, `edit asset delete
-    /// <path>`, `edit asset move <from> <to>` and `edit asset meta <path>` -
-    /// the same route the native editor's scripted edits take.
-    fn scripted_asset_edit<'a>(
-        &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
-    ) {
-        let queued = match parts.next() {
-            Some("create") => match (parts.next(), parts.next(), parts.next()) {
-                (Some(type_name), Some(folder), Some(name)) => Some((
-                    EditorCommand::CreateStandaloneAsset {
-                        type_name: type_name.to_string(),
-                        folder: if folder == "-" {
-                            String::new()
-                        } else {
-                            folder.to_string()
-                        },
-                        name: name.to_string(),
-                    },
-                    format!("create asset {name}"),
-                )),
-                _ => None,
-            },
-            Some("delete") => parts.next().map(|path| {
-                (
-                    EditorCommand::DeleteAssetFile {
-                        path: path.to_string(),
-                    },
-                    format!("delete asset {path}"),
-                )
-            }),
-            Some("move") => match (parts.next(), parts.next()) {
-                (Some(from), Some(to)) => Some((
-                    EditorCommand::MoveAssetFile {
-                        from: from.to_string(),
-                        to: to.to_string(),
-                    },
-                    format!("move asset {from}"),
-                )),
-                _ => None,
-            },
-            Some("meta") => parts.next().map(|path| {
-                (
-                    EditorCommand::WriteAssetMeta {
-                        path: path.to_string(),
-                    },
-                    format!("write meta {path}"),
-                )
-            }),
-            _ => None,
-        };
-        let Some((command_value, label)) = queued else {
-            self.reject_scripted(
-                command,
-                "edit asset needs create, delete, move or meta with its arguments",
-            );
-            return;
+    /// One `edit asset` command, queued as the recorded edit the Assets tab's
+    /// actions also queue.
+    fn scripted_asset_edit(&mut self, edit: AssetEdit) {
+        let (command_value, label) = match edit {
+            AssetEdit::Create {
+                type_name,
+                folder,
+                name,
+            } => (
+                EditorCommand::CreateStandaloneAsset {
+                    folder: if folder == "-" { String::new() } else { folder },
+                    name: name.clone(),
+                    type_name,
+                },
+                format!("create asset {name}"),
+            ),
+            AssetEdit::Delete { path } => (
+                EditorCommand::DeleteAssetFile { path: path.clone() },
+                format!("delete asset {path}"),
+            ),
+            AssetEdit::Move { from, to } => (
+                EditorCommand::MoveAssetFile {
+                    from: from.clone(),
+                    to,
+                },
+                format!("move asset {from}"),
+            ),
+            AssetEdit::Meta { path } => (
+                EditorCommand::WriteAssetMeta { path: path.clone() },
+                format!("write meta {path}"),
+            ),
         };
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -2846,27 +2747,19 @@ impl EditorWindow {
     /// One scripted whole-field edit (`edit set <entity> <component>
     /// <field> <value>`): the same recorded `SetField` batch an inspector
     /// widget queues, parsed against the field's current kind.
-    fn scripted_edit_set<'a>(&mut self, parts: &mut std::str::SplitWhitespace<'a>, command: &str) {
-        let (Some(entity_text), Some(component_text), Some(field)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            self.reject_scripted(
-                command,
-                "edit set needs an entity, a component, a field and a value",
-            );
-            return;
-        };
-        let value_text = parts.collect::<Vec<_>>().join(" ");
-        if value_text.is_empty() {
-            self.reject_scripted(command, "edit set needs a value");
-            return;
-        }
+    fn scripted_edit_set(
+        &mut self,
+        entity_text: &str,
+        component_text: &str,
+        field: &str,
+        value_text: &str,
+    ) {
         let Some((entity, component, current)) =
             self.resolve_edit_target(entity_text, component_text, field)
         else {
             return;
         };
-        let value = match inspector::parse_field_value(&value_text, &current) {
+        let value = match inspector::parse_field_value(value_text, &current) {
             Ok(value) => value,
             Err(message) => {
                 warn!(
@@ -2889,32 +2782,14 @@ impl EditorWindow {
     /// One scripted array-element edit (`edit array <entity> <component>
     /// <field> <index> <value>`): the same recorded `SetArrayElement` batch
     /// an inspector element widget queues.
-    fn scripted_edit_array<'a>(
+    fn scripted_edit_array(
         &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
+        entity_text: &str,
+        component_text: &str,
+        field: &str,
+        index: usize,
+        value_text: &str,
     ) {
-        let (Some(entity_text), Some(component_text), Some(field), Some(index_text)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            self.reject_scripted(
-                command,
-                "edit array needs an entity, a component, a field, an index and a value",
-            );
-            return;
-        };
-        let Some(index) = index_text.parse::<usize>().ok() else {
-            self.reject_scripted(
-                command,
-                &format!("edit array needs a numeric index, got '{index_text}'"),
-            );
-            return;
-        };
-        let value_text = parts.collect::<Vec<_>>().join(" ");
-        if value_text.is_empty() {
-            self.reject_scripted(command, "edit array needs a value");
-            return;
-        }
         let Some((entity, component, current)) =
             self.resolve_edit_target(entity_text, component_text, field)
         else {
@@ -2929,7 +2804,7 @@ impl EditorWindow {
             );
             return;
         };
-        let value = match inspector::parse_field_value(&value_text, &element) {
+        let value = match inspector::parse_field_value(value_text, &element) {
             Ok(value) => value,
             Err(message) => {
                 warn!(
@@ -2953,23 +2828,7 @@ impl EditorWindow {
     /// One scripted asset-settings edit (`edit asset-settings <path> <key>
     /// <value>`): the same recorded `SetAssetSettings` batch the Inspector's
     /// settings rows queue, parsed against the leaf's current JSON kind.
-    fn scripted_asset_settings<'a>(
-        &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
-    ) {
-        let (Some(path), Some(key)) = (parts.next(), parts.next()) else {
-            self.reject_scripted(
-                command,
-                "edit asset-settings needs a path, a key and a value",
-            );
-            return;
-        };
-        let value_text = parts.collect::<Vec<_>>().join(" ");
-        if value_text.is_empty() {
-            self.reject_scripted(command, "edit asset-settings needs a value");
-            return;
-        }
+    fn scripted_asset_settings(&mut self, path: &str, key: &str, value_text: &str) {
         let Ok(key_path) = inspector::parse_settings_key_path(key) else {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -2995,7 +2854,7 @@ impl EditorWindow {
             );
             return;
         };
-        let value = match inspector::parse_settings_value(&value_text, current) {
+        let value = match inspector::parse_settings_value(value_text, current) {
             Ok(value) => value,
             Err(message) => {
                 warn!(
@@ -3625,27 +3484,7 @@ impl EditorWindow {
 
     /// Run `edit system <index> on|off` from the scripted channel: the same
     /// recorded, undoable toggle the Systems tab's state buttons queue.
-    fn scripted_edit_system<'a>(
-        &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
-    ) {
-        let (Some(index), Some(state)) = (parts.next(), parts.next()) else {
-            self.reject_scripted(command, "edit system needs an index and on or off");
-            return;
-        };
-        let Ok(index) = index.parse::<usize>() else {
-            self.reject_scripted(command, "edit system needs an index and on or off");
-            return;
-        };
-        let enabled = match state {
-            "on" => true,
-            "off" => false,
-            _ => {
-                self.reject_scripted(command, "edit system needs an index and on or off");
-                return;
-            }
-        };
+    fn scripted_edit_system(&mut self, index: usize, enabled: bool) {
         let (edit, label) = systems::system_toggle(index, enabled);
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -3663,30 +3502,17 @@ impl EditorWindow {
     /// the same `SetPreferences` batch the tab's Save button queues, with
     /// the one row. The value is everything after the key, so a text value
     /// keeps its spaces.
-    fn scripted_edit_preference<'a>(
-        &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
-    ) {
-        let Some(key) = parts.next() else {
-            self.reject_scripted(command, "edit preference needs a key and a value");
-            return;
-        };
-        let value = parts.collect::<Vec<_>>().join(" ");
-        if value.is_empty() {
-            self.reject_scripted(command, "edit preference needs a key and a value");
-            return;
-        }
+    fn scripted_edit_preference(&mut self, key: &str, value: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push(vec![EditorCommand::SetPreferences {
-                values: vec![(key.to_string(), value.clone())],
+                values: vec![(key.to_string(), value.to_string())],
             }]);
         }
         info!(
             target: telemetry_target::ENGINE,
             key,
-            value = value.as_str(),
+            value,
             "[editor] preference edit queued"
         );
     }
@@ -3762,19 +3588,7 @@ impl EditorWindow {
     /// Run `edit add <entity> <component>` / `edit remove <entity>
     /// <component>` from the scripted channel: the same recorded component
     /// attach or detach the Inspector's menu items queue.
-    fn scripted_component_edit<'a>(
-        &mut self,
-        parts: &mut std::str::SplitWhitespace<'a>,
-        command: &str,
-        add: bool,
-    ) {
-        let (Some(entity_text), Some(component_text)) = (parts.next(), parts.next()) else {
-            self.reject_scripted(
-                command,
-                "edit add or remove needs an entity and a component",
-            );
-            return;
-        };
+    fn scripted_component_edit(&mut self, entity_text: &str, component_text: &str, add: bool) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = resolve_display_entity(world, entity_text) else {
             warn!(
@@ -3997,281 +3811,173 @@ impl EditorWindow {
     }
 
     /// Run the scripted commands appended since the last frame.
+    ///
+    /// The grammar lives in [`crate::scripted`]: this parses each line and
+    /// dispatches it, and a line that cannot be parsed takes the one refusal
+    /// path, so a suite sees it at once instead of waiting out a timeout.
     fn poll_test_channel(&mut self) {
         let Some(channel) = &mut self.test_channel else {
             return;
         };
-        let commands = channel.poll();
-        for command in commands {
-            let mut parts = command.split_whitespace();
-            match parts.next() {
-                Some("quit") => {
-                    info!(target: telemetry_target::ENGINE, "[editor] quit requested");
-                    self.quit = true;
-                }
-                Some("undock") => {
-                    let tab = parts.next().and_then(parse_tab);
-                    match tab {
-                        Some(tab) => self.undock_tab(tab),
-                        None => self.reject_scripted(&command, "undock needs a tab"),
-                    }
-                }
-                Some("tab") => {
-                    let tab = parts.next().and_then(parse_tab);
-                    match tab {
-                        Some(tab) => self.activate_tab(tab),
-                        None => self.reject_scripted(&command, "tab needs a tab name"),
-                    }
-                }
-                Some("click") => {
-                    let x = parts.next().and_then(|value| value.parse().ok());
-                    let y = parts.next().and_then(|value| value.parse().ok());
-                    match (x, y) {
-                        (Some(x), Some(y)) => self.inject_click(x, y),
-                        _ => self.reject_scripted(&command, "click needs an x and a y"),
-                    }
-                }
-                Some("rclick") => {
-                    let x = parts.next().and_then(|value| value.parse().ok());
-                    let y = parts.next().and_then(|value| value.parse().ok());
-                    match (x, y) {
-                        (Some(x), Some(y)) => self.inject_rclick(x, y),
-                        _ => self.reject_scripted(&command, "rclick needs an x and a y"),
-                    }
-                }
-                Some("drag") => {
-                    let x1 = parts.next().and_then(|value| value.parse().ok());
-                    let y1 = parts.next().and_then(|value| value.parse().ok());
-                    let x2 = parts.next().and_then(|value| value.parse().ok());
-                    let y2 = parts.next().and_then(|value| value.parse().ok());
-                    match (x1, y1, x2, y2) {
-                        (Some(x1), Some(y1), Some(x2), Some(y2)) => {
-                            self.start_scripted_drag((x1, y1), (x2, y2))
-                        }
-                        _ => self.reject_scripted(&command, "drag needs x1 y1 x2 y2"),
-                    }
-                }
-                Some("gizmo") => match parts.next() {
-                    Some("drag") => {
-                        let name = parts.next();
-                        let handle = name.and_then(|name| self.scripted_gizmo_handle(name));
-                        let delta_x = parts.next().and_then(|value| value.parse().ok());
-                        let delta_y = parts.next().and_then(|value| value.parse().ok());
-                        match (handle, delta_x, delta_y) {
-                            (Some(handle), Some(delta_x), Some(delta_y)) => {
-                                self.start_synthetic_gizmo_drag(handle, Some((delta_x, delta_y)))
-                            }
-                            _ => self.reject_scripted(
-                                &command,
-                                "gizmo drag needs an axis or plane and two pixel deltas",
-                            ),
-                        }
-                    }
-                    Some("press") => {
-                        let name = parts.next();
-                        let handle = name.and_then(|name| self.scripted_gizmo_handle(name));
-                        match handle {
-                            Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
-                            None => {
-                                self.reject_scripted(&command, "gizmo press needs an axis or plane")
-                            }
-                        }
-                    }
-                    Some("move") => {
-                        let delta_x = parts.next().and_then(|value| value.parse::<f32>().ok());
-                        let delta_y = parts.next().and_then(|value| value.parse::<f32>().ok());
-                        match (delta_x, delta_y) {
-                            (Some(delta_x), Some(delta_y)) => {
-                                self.scripted_gizmo_move(delta_x, delta_y)
-                            }
-                            _ => {
-                                self.reject_scripted(&command, "gizmo move needs two pixel deltas")
-                            }
-                        }
-                    }
-                    Some("release") => self.scripted_gizmo_release(),
-                    Some(other) => match parse_gizmo_mode(other) {
-                        Some(mode) => self.set_gizmo_tool(mode),
-                        None => self.reject_scripted(&command, "unknown gizmo target"),
-                    },
-                    None => self.reject_scripted(&command, "gizmo needs a tool or a drag"),
-                },
-                Some("dump") => match parts.next() {
-                    Some("tabs") => self.dump_tabs(),
-                    Some("scenes") => self.dump_scenes(),
-                    Some("viewport") => self.dump_viewport(),
-                    Some("grid") => self.dump_grid(),
-                    Some("assets") => self.dump_assets(),
-                    Some("browser") => self.dump_browser(),
-                    Some("standalone-types") => self.dump_standalone_types(),
-                    Some("selection") => self.dump_selection(),
-                    Some("systems") => self.dump_systems(),
-                    Some("preferences") => self.dump_preferences(),
-                    Some("field") => {
-                        let entity = parts.next();
-                        let component = parts.next();
-                        let field = parts.next();
-                        match (entity, component, field) {
-                            (Some(entity), Some(component), Some(field)) => {
-                                self.dump_field(entity, component, field)
-                            }
-                            _ => self.reject_scripted(
-                                &command,
-                                "dump field needs an entity, a component and a field",
-                            ),
-                        }
-                    }
-                    _ => self.reject_scripted(&command, "unknown dump target"),
-                },
-                Some("browser") => match parts.next() {
-                    Some(folder) => self.scripted_browser(folder),
-                    None => self.reject_scripted(&command, "browser needs a folder path or root"),
-                },
-                Some("camera") => match parts.next() {
-                    Some(action @ ("orbit" | "pan")) => {
-                        let delta_x = parts.next().and_then(|value| value.parse::<f32>().ok());
-                        let delta_y = parts.next().and_then(|value| value.parse::<f32>().ok());
-                        match (delta_x, delta_y) {
-                            (Some(delta_x), Some(delta_y)) => {
-                                let navigation = if action == "orbit" {
-                                    CameraNavigation::Orbit
-                                } else {
-                                    CameraNavigation::Pan
-                                };
-                                self.scripted_camera(navigation, delta_x, delta_y);
-                            }
-                            _ => self.reject_scripted(
-                                &command,
-                                "camera orbit and pan need two pixel deltas",
-                            ),
-                        }
-                    }
-                    Some("dolly") => match parts.next().and_then(|value| value.parse::<f32>().ok())
-                    {
-                        Some(delta_y) => {
-                            self.scripted_camera(CameraNavigation::Dolly, 0.0, delta_y)
-                        }
-                        None => self.reject_scripted(&command, "camera dolly needs a pixel delta"),
-                    },
-                    Some("zoom") => {
-                        match parts.next().and_then(|value| value.parse::<f32>().ok()) {
-                            Some(lines) => self.zoom_camera(self.active_view, lines),
-                            None => {
-                                self.reject_scripted(&command, "camera zoom needs a line count")
-                            }
-                        }
-                    }
-                    _ => self.reject_scripted(&command, "camera needs orbit, pan, dolly or zoom"),
-                },
-                Some("hover") => {
-                    let view = parts.next().and_then(|value| value.parse::<usize>().ok());
-                    let x = parts.next().and_then(|value| value.parse::<f32>().ok());
-                    let y = parts.next().and_then(|value| value.parse::<f32>().ok());
-                    match (view, x, y) {
-                        (Some(view), Some(x), Some(y)) => self.scripted_hover(view, x, y),
-                        _ => self.reject_scripted(&command, "hover needs a view, an x and a y"),
-                    }
-                }
-                Some("select") => match parts.next() {
-                    Some("asset") => match parts.next() {
-                        Some(path) => self.scripted_select_asset(path),
-                        None => self.reject_scripted(&command, "select asset needs a path"),
-                    },
-                    Some("entity") => match parts.next() {
-                        Some(handle) => self.scripted_select_entity(handle),
-                        None => self.reject_scripted(&command, "select entity needs a handle"),
-                    },
-                    _ => self.reject_scripted(&command, "unknown select target"),
-                },
-                Some("toolbar") => match parts.next() {
-                    Some(action @ ("create" | "rename" | "delete" | "meta")) => {
-                        self.scripted_toolbar(action)
-                    }
-                    _ => self
-                        .reject_scripted(&command, "toolbar needs create, rename, delete or meta"),
-                },
-                Some("dialog") => match parts.next() {
-                    Some("open") => match parts.next() {
-                        Some(kind @ ("create" | "rename")) => self.scripted_toolbar(kind),
-                        _ => self.reject_scripted(&command, "dialog open needs create or rename"),
-                    },
-                    Some("set") => match parts.next() {
-                        Some("name") => match parts.next() {
-                            Some(name) => self.scripted_dialog_set_name(name),
-                            None => {
-                                self.reject_scripted(&command, "dialog set name needs the text")
-                            }
-                        },
-                        Some("type") => match parts.next() {
-                            Some(type_name) => self.scripted_dialog_set_type(type_name),
-                            None => self
-                                .reject_scripted(&command, "dialog set type needs the type name"),
-                        },
-                        _ => self.reject_scripted(&command, "dialog set needs name or type"),
-                    },
-                    Some("submit") => self.scripted_dialog_submit(),
-                    Some("cancel") => self.scripted_dialog_cancel(),
-                    _ => self.reject_scripted(&command, "dialog needs open, set, submit or cancel"),
-                },
-                Some("edit") => match parts.next() {
-                    Some("asset") => self.scripted_asset_edit(&mut parts, &command),
-                    Some("set") => self.scripted_edit_set(&mut parts, &command),
-                    Some("array") => self.scripted_edit_array(&mut parts, &command),
-                    Some("asset-settings") => self.scripted_asset_settings(&mut parts, &command),
-                    Some("system") => self.scripted_edit_system(&mut parts, &command),
-                    Some("preference") => self.scripted_edit_preference(&mut parts, &command),
-                    Some("add") => self.scripted_component_edit(&mut parts, &command, true),
-                    Some("remove") => self.scripted_component_edit(&mut parts, &command, false),
-                    _ => self.reject_scripted(&command, "unknown edit target"),
-                },
-                Some("command") => match parts.next() {
-                    Some("editor.undo") => self.scripted_undo(),
-                    Some("editor.redo") => self.scripted_redo(),
-                    Some("editor.pause_toggle") => self.scripted_pause_toggle(),
-                    Some("editor.step") => self.scripted_step(),
-                    Some("editor.entity_create") => self.scripted_entity_create(),
-                    Some("editor.entity_delete") => self.scripted_entity_delete(),
-                    Some("editor.tool_translate") => {
-                        self.scripted_gizmo_tool(Some(GizmoMode::Translate), None, None)
-                    }
-                    Some("editor.tool_rotate") => {
-                        self.scripted_gizmo_tool(Some(GizmoMode::Rotate), None, None)
-                    }
-                    Some("editor.tool_scale") => {
-                        self.scripted_gizmo_tool(Some(GizmoMode::Scale), None, None)
-                    }
-                    Some("editor.tool_snap_toggle") => {
-                        let snap = self.gizmo_settings().snap;
-                        self.scripted_gizmo_tool(None, None, Some(!snap))
-                    }
-                    Some("editor.tool_space_toggle") => {
-                        let space = self.gizmo_settings().space;
-                        let next = match space {
-                            GizmoSpace::World => GizmoSpace::Local,
-                            GizmoSpace::Local => GizmoSpace::World,
-                        };
-                        self.scripted_gizmo_tool(None, Some(next), None)
-                    }
-                    Some(other) => {
-                        let reason =
-                            format!("command '{other}' is not executable in the egui editor");
-                        self.reject_scripted(&command, &reason)
-                    }
-                    None => self.reject_scripted(&command, "command needs an id"),
-                },
-                Some("refresh") => match parts.next() {
-                    Some("assets") => {
-                        self.asset_listing_dirty = true;
-                        info!(
-                            target: telemetry_target::ENGINE,
-                            "[editor] test assets refresh"
-                        );
-                    }
-                    _ => self.reject_scripted(&command, "refresh needs a target"),
-                },
-                Some(other) => self.reject_scripted(&command, &format!("unknown verb '{other}'")),
-                None => {}
+        for line in channel.poll() {
+            match ScriptedCommand::parse(&line) {
+                Ok(command) => self.run_scripted(&line, command),
+                Err(error) => self.reject_scripted(&line, &error.reason),
             }
+        }
+    }
+
+    /// Run one parsed scripted command.
+    ///
+    /// No grammar is left here: an arm names its side effect, so the verbs,
+    /// their arguments and their refusal sentences have exactly one home.
+    fn run_scripted(&mut self, line: &str, command: ScriptedCommand) {
+        match command {
+            ScriptedCommand::Quit => {
+                info!(target: telemetry_target::ENGINE, "[editor] quit requested");
+                self.quit = true;
+            }
+            ScriptedCommand::Undock(tab) => self.undock_tab(tab),
+            ScriptedCommand::ActivateTab(tab) => self.activate_tab(tab),
+            ScriptedCommand::Click { x, y } => self.inject_click(x, y),
+            ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
+            ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
+            ScriptedCommand::GizmoDrag { target, delta } => {
+                match self.scripted_gizmo_handle(&target) {
+                    Some(handle) => self.start_synthetic_gizmo_drag(handle, Some(delta)),
+                    None => self.reject_scripted(line, "gizmo drag needs a known axis or plane"),
+                }
+            }
+            ScriptedCommand::GizmoPress { target } => match self.scripted_gizmo_handle(&target) {
+                Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
+                None => self.reject_scripted(line, "gizmo press needs a known axis or plane"),
+            },
+            ScriptedCommand::GizmoRelease => self.scripted_gizmo_release(),
+            ScriptedCommand::GizmoTool(mode) => self.set_gizmo_tool(mode),
+            ScriptedCommand::Key(chord) => self.inject_key(&chord),
+            ScriptedCommand::Dump(dump) => match dump {
+                Dump::Tabs => self.dump_tabs(),
+                Dump::Scenes => self.dump_scenes(),
+                Dump::Viewport => self.dump_viewport(),
+                Dump::Grid => self.dump_grid(),
+                Dump::Assets => self.dump_assets(),
+                Dump::Browser => self.dump_browser(),
+                Dump::StandaloneTypes => self.dump_standalone_types(),
+                Dump::Systems => self.dump_systems(),
+                Dump::Preferences => self.dump_preferences(),
+                Dump::Field {
+                    entity,
+                    component,
+                    field,
+                } => self.dump_field(&entity, &component, &field),
+            },
+            ScriptedCommand::Browser(folder) => self.scripted_browser(&folder),
+            ScriptedCommand::Camera { navigation, delta } => {
+                self.scripted_camera(navigation, delta.0, delta.1)
+            }
+            ScriptedCommand::CameraZoom(lines) => self.zoom_camera(self.active_view, lines),
+            ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
+            ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
+            ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
+            ScriptedCommand::Toolbar(action) => self.scripted_toolbar(action),
+            ScriptedCommand::DialogSetName(text) => self.scripted_dialog_set_name(&text),
+            ScriptedCommand::DialogSubmit => self.scripted_dialog_submit(),
+            ScriptedCommand::EditAsset(edit) => self.scripted_asset_edit(edit),
+            ScriptedCommand::EditSet {
+                entity,
+                component,
+                field,
+                value,
+            } => self.scripted_edit_set(&entity, &component, &field, &value),
+            ScriptedCommand::EditArray {
+                entity,
+                component,
+                field,
+                index,
+                value,
+            } => self.scripted_edit_array(&entity, &component, &field, index, &value),
+            ScriptedCommand::EditAssetSettings { path, key, value } => {
+                self.scripted_asset_settings(&path, &key, &value)
+            }
+            ScriptedCommand::EditSystem { index, enabled } => {
+                self.scripted_edit_system(index, enabled)
+            }
+            ScriptedCommand::EditPreference { key, value } => {
+                self.scripted_edit_preference(&key, &value)
+            }
+            ScriptedCommand::EditComponent {
+                entity,
+                component,
+                add,
+            } => self.scripted_component_edit(&entity, &component, add),
+            ScriptedCommand::Undo => self.scripted_undo(),
+            ScriptedCommand::Redo => self.scripted_redo(),
+            ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
+            ScriptedCommand::Step => self.scripted_step(),
+            ScriptedCommand::EntityCreate => self.scripted_entity_create(),
+            ScriptedCommand::EntityDelete => self.scripted_entity_delete(),
+            ScriptedCommand::SnapToggle => {
+                let snap = self.gizmo_settings().snap;
+                self.scripted_gizmo_tool(None, None, Some(!snap))
+            }
+            ScriptedCommand::SpaceToggle => {
+                let space = self.gizmo_settings().space;
+                let next = match space {
+                    GizmoSpace::World => GizmoSpace::Local,
+                    GizmoSpace::Local => GizmoSpace::World,
+                };
+                self.scripted_gizmo_tool(None, Some(next), None)
+            }
+        }
+    }
+
+    /// Inject a keyboard chord through the same engine input seam a real key
+    /// enters: the modifiers, the press, the typed text and the release, in
+    /// the order a window reports them.
+    ///
+    /// The editor's own tool shortcuts read winit events rather than the
+    /// engine's input stream, so the chord also runs the handler a real press
+    /// runs - without that, `key w` would reach the shell but never switch
+    /// the tool.
+    fn inject_key(&mut self, chord: &KeyChord) {
+        let held = EngineModifiers {
+            shift: chord.shift,
+            control: chord.control,
+            alt: chord.alt,
+            super_key: chord.super_key,
+        };
+        let engine = self.host.host_mut().engine_mut();
+        engine.push_input_event(InputEvent::ModifiersChanged { modifiers: held });
+        engine.push_input_event(InputEvent::Key {
+            key: chord.key,
+            state: ButtonState::Pressed,
+        });
+        if let Some(character) = chord.typed_character() {
+            engine.push_input_event(InputEvent::TextInput {
+                text: character.to_string(),
+            });
+        }
+        engine.push_input_event(InputEvent::Key {
+            key: chord.key,
+            state: ButtonState::Released,
+        });
+        // The chord releases its modifiers as it ends: a later injection must
+        // not inherit a held Control from this one.
+        engine.push_input_event(InputEvent::ModifiersChanged {
+            modifiers: EngineModifiers {
+                shift: false,
+                control: false,
+                alt: false,
+                super_key: false,
+            },
+        });
+        info!(
+            target: telemetry_target::ENGINE,
+            chord = chord.label().as_str(),
+            "[editor] key injected"
+        );
+        if let Some(mode) = gizmo_mode_for_key(chord.key) {
+            self.set_gizmo_tool(mode);
         }
     }
 
@@ -4754,21 +4460,6 @@ fn offset_pointer(event: InputEvent, (dx, dy): (f32, f32)) -> InputEvent {
     }
 }
 
-/// Parse a tab name from a scripted command.
-fn parse_tab(name: &str) -> Option<EditorTab> {
-    match name {
-        "scene" => Some(EditorTab::Scene),
-        "scene2" => Some(EditorTab::SecondScene),
-        "game" => Some(EditorTab::Game),
-        "entities" => Some(EditorTab::Entities),
-        "systems" => Some(EditorTab::Systems),
-        "inspector" => Some(EditorTab::Inspector),
-        "assets" => Some(EditorTab::Assets),
-        "preferences" => Some(EditorTab::Preferences),
-        _ => None,
-    }
-}
-
 /// The tab's display name for log lines.
 fn tab_name(tab: EditorTab) -> &'static str {
     tab.name()
@@ -4849,6 +4540,17 @@ fn gizmo_mode_name(mode: GizmoMode) -> &'static str {
     }
 }
 
+/// The tool a bare W, E or R picks - the winit shortcut handler and a
+/// scripted `key` chord read this one mapping, so the two cannot drift.
+fn gizmo_mode_for_key(key: KeyCode) -> Option<GizmoMode> {
+    match key {
+        KeyCode::KeyW => Some(GizmoMode::Translate),
+        KeyCode::KeyE => Some(GizmoMode::Rotate),
+        KeyCode::KeyR => Some(GizmoMode::Scale),
+        _ => None,
+    }
+}
+
 /// The wire name of a gizmo space.
 fn gizmo_space_name(space: GizmoSpace) -> &'static str {
     match space {
@@ -4863,16 +4565,6 @@ fn gizmo_axis_name(axis: usize) -> &'static str {
         0 => "x",
         1 => "y",
         _ => "z",
-    }
-}
-
-/// Parse a scripted tool name (`gizmo translate` and friends).
-fn parse_gizmo_mode(name: &str) -> Option<GizmoMode> {
-    match name {
-        "translate" => Some(GizmoMode::Translate),
-        "rotate" => Some(GizmoMode::Rotate),
-        "scale" => Some(GizmoMode::Scale),
-        _ => None,
     }
 }
 
