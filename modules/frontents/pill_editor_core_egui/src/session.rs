@@ -6,6 +6,7 @@
 //!   world resource.
 //! - Own [`ToolboxSession`]: where each scene view's floating toolbox sits
 //!   and what the log already reported about it.
+//! - Carry the Assets tab's [`ProjectBrowser`]: the folder its grid lists.
 //!
 //! # Design
 //!
@@ -25,6 +26,7 @@ use pill_ui_egui::egui::{Context, Pos2, Rect};
 
 // Current crate
 use crate::assets::AssetDialog;
+use crate::browser::ProjectBrowser;
 use crate::layout::EditorDock;
 
 /// The egui shell's session: the UI context and the dock layout.
@@ -44,6 +46,9 @@ pub struct EguiShellState {
     pub preferences_draft: Option<BTreeMap<String, String>>,
     /// The floating viewport toolboxes' session state.
     pub toolbox: ToolboxSession,
+    /// The Assets tab's project browser: the folder its grid lists, the
+    /// tree's open folders and the tile size.
+    pub browser: ProjectBrowser,
 }
 
 /// The floating viewport toolbox's session state (Stage 22): a drag parks
@@ -85,6 +90,7 @@ impl EguiShellState {
             asset_dialog: None,
             preferences_draft: None,
             toolbox: ToolboxSession::default(),
+            browser: ProjectBrowser::default(),
         }
     }
 }

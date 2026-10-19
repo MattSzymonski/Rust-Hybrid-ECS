@@ -31,7 +31,7 @@ pub const SIDE_COLUMN_FRACTION: f32 = 0.16;
 
 /// The fraction of the window's height the bottom row takes in the default
 /// layout.
-pub const BOTTOM_ROW_FRACTION: f32 = 0.24;
+pub const BOTTOM_ROW_FRACTION: f32 = 0.3;
 
 /// The fraction of the right column's height the Inspector takes in the
 /// default layout; the Systems list keeps the rest below it.

@@ -25,6 +25,9 @@
 
 /// The Assets pipeline: the dialogs' state and the recorded file batches.
 pub mod assets;
+/// The Assets tab's project browser: the open folder and the listing math
+/// the tree and the grid share.
+pub mod browser;
 /// The clipboard payload documents the copy and paste commands share.
 pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.

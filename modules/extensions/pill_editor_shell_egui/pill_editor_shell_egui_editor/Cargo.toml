@@ -6,6 +6,13 @@ edition = "2021"
 [lints]
 workspace = true
 
+# The crate's build script emits the function-address inventory the host uses
+# to patch any function, annotated or not. Without it only `#[pill_hot]`
+# systems (which go through the engine's registry) can be patched, while an
+# edit to `run_frame` or a tab body falls back to a full reload.
+[build-dependencies]
+pill_hot_scan = { path = "../../../hosting/pill_hot_scan" }
+
 [lib]
 # Named after the crate rather than `lib.rs`, like every extension crate.
 path = "src/pill_editor_shell_egui_editor.rs"

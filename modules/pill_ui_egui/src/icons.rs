@@ -160,11 +160,25 @@ pub enum Icon {
     FloppyDisk,
     /// A box with an arrow: move a tab back into the dock.
     ArrowSquareOut,
+    /// A closed folder: a folder row of the project browser.
+    Folder,
+    /// A right-pointing chevron: a closed tree row.
+    CaretRight,
+    /// A down-pointing chevron: an open tree row.
+    CaretDown,
+    /// A blank sheet: a file with no more specific kind.
+    File,
+    /// A framed picture: a texture or an image file.
+    Image,
+    /// A shaded ball: a material.
+    Sphere,
+    /// Angle brackets: a shader or another source file.
+    Code,
 }
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Icon; 29] = [
+    pub const ALL: [Icon; 36] = [
         Icon::Cube,
         Icon::CubeTransparent,
         Icon::MonitorPlay,
@@ -194,6 +208,13 @@ impl Icon {
         Icon::XCircle,
         Icon::FloppyDisk,
         Icon::ArrowSquareOut,
+        Icon::Folder,
+        Icon::CaretRight,
+        Icon::CaretDown,
+        Icon::File,
+        Icon::Image,
+        Icon::Sphere,
+        Icon::Code,
     ];
 
     /// The icon's codepoint in the vendored fonts: the regular font draws
@@ -229,6 +250,13 @@ impl Icon {
             Icon::XCircle => 0xe4f8,
             Icon::FloppyDisk => 0xe248,
             Icon::ArrowSquareOut => 0xe5de,
+            Icon::Folder => 0xe24a,
+            Icon::CaretRight => 0xe13a,
+            Icon::CaretDown => 0xe136,
+            Icon::File => 0xe230,
+            Icon::Image => 0xe2ca,
+            Icon::Sphere => 0xee66,
+            Icon::Code => 0xe1bc,
         }
     }
 
@@ -264,6 +292,13 @@ impl Icon {
             Icon::XCircle => "x-circle",
             Icon::FloppyDisk => "floppy-disk",
             Icon::ArrowSquareOut => "arrow-square-out",
+            Icon::Folder => "folder",
+            Icon::CaretRight => "caret-right",
+            Icon::CaretDown => "caret-down",
+            Icon::File => "file",
+            Icon::Image => "image",
+            Icon::Sphere => "sphere",
+            Icon::Code => "code",
         }
     }
 

@@ -34,6 +34,14 @@ use pill_editor_core_egui::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
 
+// The build script scans this crate and emits one address entry per function
+// into `function_inventory.rs`; the `include!` is what makes every function
+// resolvable by qualified path with nothing in its source annotated. Without
+// it the host can patch only the `#[pill_hot]` system, whose address rides
+// the engine registry, and a body edit to `shell::run_frame` falls back to a
+// reload.
+include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
+
 // Current crate
 use pill_editor_shell_egui_editor::shell::run_frame;
 

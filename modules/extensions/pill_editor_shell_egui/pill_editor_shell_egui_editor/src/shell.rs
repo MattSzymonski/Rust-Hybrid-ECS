@@ -21,6 +21,7 @@
 
 // External crates
 use pill_editor_core_egui::assets::{self, AssetDialog};
+use pill_editor_core_egui::browser::{self, ProjectBrowser};
 use pill_editor_core_egui::commands::PendingEditorCommands;
 use pill_editor_core_egui::editor_state::{
     AssetListing, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
@@ -63,6 +64,30 @@ const SCENE_COUNTER_MARGIN: f32 = 8.0;
 /// the two.
 const SCENE_BUTTON_WIDTH: f32 = 72.0;
 const SCENE_BUTTON_GAP: f32 = 6.0;
+
+/// The Assets tab's tree pane: its default width and the range the splitter
+/// drags it through, in points.
+const ASSETS_TREE_WIDTH: f32 = 176.0;
+const ASSETS_TREE_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 96.0..=320.0;
+
+/// One folder tree row's indentation per level and the width the expander's
+/// caret (or its empty slot) takes, in points.
+const ASSETS_TREE_INDENT: f32 = 12.0;
+const ASSETS_TREE_CARET_WIDTH: f32 = 14.0;
+const ASSETS_TREE_CARET_SIZE: f32 = 10.0;
+
+/// The Assets tab's grid tiles: the gap around each tile, the band under its
+/// icon for the name, the icon's inset, and the corner radius of the
+/// selected and hovered washes, in points.
+const ASSETS_TILE_GAP: f32 = 8.0;
+const ASSETS_TILE_LABEL_HEIGHT: f32 = 26.0;
+const ASSETS_TILE_LABEL_GAP: f32 = 2.0;
+const ASSETS_TILE_ICON_INSET: f32 = 6.0;
+const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
+const ASSETS_TILE_LABEL_SIZE: f32 = 11.0;
+
+/// The rows a tile's name may wrap to before it elides, like Unity's two.
+const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
 /// One shell frame: engine input becomes egui input, the dock runs, and the
 /// output becomes the executable's frame. The asset dialog, when one is
@@ -111,15 +136,20 @@ pub fn run_frame(
         asset_dialog,
         preferences_draft,
         toolbox,
+        browser,
         ..
     } = state;
-    let mut viewer = EditorTabViewer {
+    // Named through the package path, not as a file-local item: a hot patch
+    // compiles this body in a crate of its own, where only the package's
+    // public items exist (see the crate header).
+    let mut viewer = pill_editor_shell_egui_editor::shell::EditorTabViewer {
         snapshot,
         selection,
         asset_dialog,
         pending,
         preferences_draft,
         toolbox,
+        browser,
         scene_rects: [None; SCENE_VIEWPORTS],
         game_rect: None,
         overlay_regions: Vec::new(),
@@ -136,7 +166,7 @@ pub fn run_frame(
             .show_leaf_close_all_buttons(false)
             .show(context, &mut viewer);
         // The create/rename dialog floats over the dock while it is open.
-        asset_dialog_window(
+        pill_editor_shell_egui_editor::shell::asset_dialog_window(
             context,
             viewer.asset_dialog,
             viewer.pending,
@@ -150,7 +180,7 @@ pub fn run_frame(
     // A tab menu's re-dock runs after the dock finished drawing: changing
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
-        apply_tab_redock(dock.state_mut(), surface);
+        pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
     }
     *frame = shell_frame;
 }
@@ -160,7 +190,7 @@ pub fn run_frame(
 // =============================================================================
 
 /// The icon a dock tab's title carries: the view or panel the tab shows.
-fn tab_icon(tab: EditorTab) -> icons::Icon {
+pub fn tab_icon(tab: EditorTab) -> icons::Icon {
     match tab {
         EditorTab::Scene => icons::Icon::Cube,
         EditorTab::SecondScene => icons::Icon::CubeTransparent,
@@ -174,37 +204,45 @@ fn tab_icon(tab: EditorTab) -> icons::Icon {
 }
 
 /// Draws the dock's tabs; the tab bodies come from the tab functions.
-struct EditorTabViewer<'a> {
+///
+/// Public - fields included - because a hot patch for [`run_frame`] is
+/// compiled as its own crate and builds this value: the generated source
+/// reaches the type and its fields through the package path, the rule the
+/// crate header states for every hot function's dependencies.
+pub struct EditorTabViewer<'a> {
     /// The engine data the tabs read.
-    snapshot: &'a EditorSnapshot,
+    pub snapshot: &'a EditorSnapshot,
     /// The shared selection the Entities tab writes.
-    selection: &'a mut EditorSelection,
+    pub selection: &'a mut EditorSelection,
     /// The asset dialog that is open, if one is; the Assets tab and the
     /// dialog window both read and write it.
-    asset_dialog: &'a mut Option<AssetDialog>,
+    pub asset_dialog: &'a mut Option<AssetDialog>,
     /// The queue the assets actions push their recorded batches into.
-    pending: &'a mut PendingEditorCommands,
+    pub pending: &'a mut PendingEditorCommands,
     /// The Preferences tab's unsaved field buffers; the tab seeds them
     /// from the snapshot and a save clears them.
-    preferences_draft: &'a mut Option<preferences::PreferencesDraft>,
+    pub preferences_draft: &'a mut Option<preferences::PreferencesDraft>,
     /// The floating viewport toolboxes' session state: where each scene
     /// view's toolbox floats and what the log already reported.
-    toolbox: &'a mut ToolboxSession,
+    pub toolbox: &'a mut ToolboxSession,
+    /// The Assets tab's project browser: the folder its grid lists, the
+    /// tree's open folders and the tile size.
+    pub browser: &'a mut ProjectBrowser,
     /// The scene viewports' body rectangles this pass, in logical points,
     /// one slot per scene tab; the frontend places each viewport's child
     /// window at its slot.
-    scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
+    pub scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
     /// The game viewport's body rectangle this pass, in logical points; the
     /// frontend places the primary surface's child window at it.
-    game_rect: Option<ShellRect>,
+    pub game_rect: Option<ShellRect>,
     /// The overlay chips' rectangles this pass, in logical points: points
     /// over a scene viewport where a click is the UI's, not the scene's.
-    overlay_regions: Vec<ShellRect>,
+    pub overlay_regions: Vec<ShellRect>,
     /// The editor's smoothed frame rate, for the scene's counter.
-    frames_per_second: f32,
+    pub frames_per_second: f32,
     /// The surface a tab menu asked to re-dock, drained by `run_frame`
     /// after the dock finishes drawing.
-    tab_redock: Option<SurfaceIndex>,
+    pub tab_redock: Option<SurfaceIndex>,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -256,6 +294,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 self.asset_dialog,
                 self.pending,
                 &mut self.overlay_regions,
+                self.browser,
             ),
             EditorTab::Preferences => {
                 preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)
@@ -324,12 +363,12 @@ impl TabViewer for EditorTabViewer<'_> {
 /// A scene tab's body rectangle in logical points, overshooting by
 /// [`SCENE_RECT_OVERSHOOT`] so the child window backs the tab body's padding
 /// and outline too.
-fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
+pub fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
     shell_rect(ui.max_rect().expand(SCENE_RECT_OVERSHOOT))
 }
 
 /// Convert an egui rectangle into the boundary's plain rectangle.
-fn shell_rect(rect: egui::Rect) -> ShellRect {
+pub fn shell_rect(rect: egui::Rect) -> ShellRect {
     ShellRect {
         x: rect.min.x,
         y: rect.min.y,
@@ -344,7 +383,11 @@ fn shell_rect(rect: egui::Rect) -> ShellRect {
 /// both sit over the viewport, and both take input, so a click on either
 /// never reaches the project. Both rectangles are recorded as the UI's
 /// own, so a click on them is never read as a scene pick.
-fn scene_overlay(ui: &mut egui::Ui, frames_per_second: f32, overlay_regions: &mut Vec<ShellRect>) {
+pub fn scene_overlay(
+    ui: &mut egui::Ui,
+    frames_per_second: f32,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
     let counter_rect = frame_counter_rect(ui);
     let button_rect = egui::Rect::from_min_size(
         egui::pos2(
@@ -392,7 +435,7 @@ fn scene_overlay(ui: &mut egui::Ui, frames_per_second: f32, overlay_regions: &mu
 }
 
 /// The frame counter's rectangle: the strip's right-anchored box.
-fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
+pub fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
     egui::Rect::from_min_size(
         egui::pos2(
             ui.max_rect().right() - SCENE_COUNTER_WIDTH - SCENE_COUNTER_MARGIN,
@@ -609,7 +652,7 @@ pub fn preferences_tab(
 }
 
 /// One gizmo mode's lowercase name, for the preferences rows.
-fn gizmo_mode_label(mode: GizmoMode) -> &'static str {
+pub fn gizmo_mode_label(mode: GizmoMode) -> &'static str {
     match mode {
         GizmoMode::Translate => "translate",
         GizmoMode::Rotate => "rotate",
@@ -618,7 +661,7 @@ fn gizmo_mode_label(mode: GizmoMode) -> &'static str {
 }
 
 /// One gizmo space's lowercase name, for the preferences rows.
-fn gizmo_space_label(space: GizmoSpace) -> &'static str {
+pub fn gizmo_space_label(space: GizmoSpace) -> &'static str {
     match space {
         GizmoSpace::World => "world",
         GizmoSpace::Local => "local",
@@ -664,7 +707,7 @@ pub fn entities_tab(
 
 /// The entity menu: New Entity everywhere, Delete Entity for the row under
 /// the pointer. Both edits are recorded, so one undo step reverses them.
-fn entity_menu_items(
+pub fn entity_menu_items(
     ui: &mut egui::Ui,
     entity: Option<Entity>,
     selection: &EditorSelection,
@@ -701,13 +744,13 @@ fn entity_menu_items(
 
 /// The trailing right-click area below a panel's rows: a strip of the
 /// panel's width where the panel's own menu opens, away from any row.
-fn empty_area(ui: &egui::Ui) -> egui::Vec2 {
+pub fn empty_area(ui: &egui::Ui) -> egui::Vec2 {
     egui::Vec2::new(ui.available_width(), 32.0)
 }
 
 /// Log a context menu opening, so a suite can see which area's menu the
 /// right-click opened.
-fn log_context_menu(area: &str) {
+pub fn log_context_menu(area: &str) {
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
         area,
@@ -719,7 +762,7 @@ fn log_context_menu(area: &str) {
 /// menu floats over whatever it was opened on (a clamped menu can hang over
 /// the scene viewport), and a click inside it must never reach the scene
 /// behind it.
-fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut Vec<ShellRect>) {
+pub fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut Vec<ShellRect>) {
     if let Some(menu) = opened {
         let rect = menu.response.rect;
         regions.push(ShellRect {
@@ -733,7 +776,10 @@ fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut Vec<S
 
 /// Bring a floating surface's tabs back into the dock: the tab menu's
 /// Redock, run after the dock has drawn the frame that asked.
-fn apply_tab_redock(dock: &mut DockState<EditorTab>, surface: SurfaceIndex) {
+///
+/// Public because [`run_frame`]'s generated hot patch calls it through the
+/// package path.
+pub fn apply_tab_redock(dock: &mut DockState<EditorTab>, surface: SurfaceIndex) {
     let tabs: Vec<EditorTab> = dock
         .iter_all_tabs()
         .filter(|((index, _), _)| *index == surface)
@@ -756,7 +802,7 @@ fn apply_tab_redock(dock: &mut DockState<EditorTab>, surface: SurfaceIndex) {
 /// The component menu: detach the heading's component, and attach any
 /// registered one the entity does not carry yet - both recorded under the
 /// native labels (`add {short}` / `remove {short}`).
-fn component_menu_items(
+pub fn component_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     detail: &EntityDetail,
@@ -1084,7 +1130,7 @@ pub fn inspector_tab(
 /// One entity's components; every editable field is a widget row and every
 /// component heading carries its menu (attach and detach - the native
 /// Inspector's two component actions, recorded and undoable).
-fn entity_inspector(
+pub fn entity_inspector(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     detail: &EntityDetail,
@@ -1132,7 +1178,7 @@ fn entity_inspector(
 /// commit its change queues. A field that changed while the snapshot was
 /// stale is not a problem: each commit carries the widget's value, and a
 /// change the next snapshot overwrites was one the user just made anyway.
-fn entity_field_row(
+pub fn entity_field_row(
     ui: &mut egui::Ui,
     entity: Entity,
     component: &str,
@@ -1197,7 +1243,7 @@ fn entity_field_row(
 }
 
 /// Whether a value has its own widget kind.
-fn is_scalar_field(value: &FieldValue) -> bool {
+pub fn is_scalar_field(value: &FieldValue) -> bool {
     matches!(
         value,
         FieldValue::F32(_)
@@ -1218,7 +1264,7 @@ fn is_scalar_field(value: &FieldValue) -> bool {
 /// The edit control for one scalar: a checkbox for booleans, a drag value
 /// (drag to scrub, click to type) for numbers. `None` when the kind has no
 /// widget, so the caller paints it read-only.
-fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> {
+pub fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> {
     match value {
         FieldValue::Bool(current) => {
             let mut edited = *current;
@@ -1301,7 +1347,7 @@ fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> {
 }
 
 /// One read-only (name, value) row.
-fn read_only_row(ui: &mut egui::Ui, label: &str, value: &str) {
+pub fn read_only_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(label).color(style::TEXT_MUTED));
         ui.label(value);
@@ -1310,7 +1356,7 @@ fn read_only_row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 /// The settings document's rows: objects and arrays nest their children,
 /// every scalar leaf edits.
-fn asset_settings_rows(
+pub fn asset_settings_rows(
     ui: &mut egui::Ui,
     asset_path: &str,
     settings: &JsonValue,
@@ -1330,7 +1376,7 @@ fn asset_settings_rows(
 
 /// One settings row: a leaf gets the widget its JSON kind asks for (its
 /// commit carries the whole patched document), a container nests.
-fn asset_settings_row(
+pub fn asset_settings_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
@@ -1444,7 +1490,7 @@ fn asset_settings_row(
 
 /// Queue the recorded edit that puts `value` at `key` in the settings; the
 /// command carries the whole patched document, the native contract.
-fn settings_commit(
+pub fn settings_commit(
     pending: &mut PendingEditorCommands,
     asset_path: &str,
     root: &JsonValue,
@@ -1511,10 +1557,11 @@ pub fn format_field_value(value: &FieldValue) -> String {
     }
 }
 
-/// The Assets tab: the project's entries, the toolbar that edits them, and
-/// the rows a click selects - the browser half of the native Assets panel.
-/// A row dragged onto a folder moves the file there; the create and rename
-/// dialogs open as windows over the dock.
+/// The Assets tab: Unity's project panel - a folder tree on the left, the
+/// open folder's path over a grid of tiles on the right, and the toolbar
+/// that edits the selected entry. A tile dragged onto a folder row (or onto
+/// a folder tile) moves the file there; a row's menu and the strip under
+/// the tiles open the create/rename dialogs as windows over the dock.
 #[pill_hot_fn]
 pub fn assets_tab(
     ui: &mut egui::Ui,
@@ -1523,16 +1570,20 @@ pub fn assets_tab(
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
+    browser: &mut ProjectBrowser,
 ) {
-    ui.heading(icons::rich(icons::Icon::FolderOpen, "Assets"));
+    // A folder that vanished (deleted, renamed, or the project reloaded onto
+    // another tree) falls back to its nearest ancestor, so the grid never
+    // lists a path the listing no longer holds.
+    browser.settle(&snapshot.assets);
     let selected_row = assets::selected_row(selection, &snapshot.assets);
     let selected_is_file = selected_row.is_some_and(|row| row.kind != "folder");
     let missing_meta =
         selected_row.is_some_and(|row| row.kind != "folder" && !row.standalone && !row.has_meta);
-    ui.label(format!("{} entries", snapshot.assets.len()));
     // The toolbar: creating opens the dialog; the rest act on the selected
     // entry and queue recorded file commands. The buttons only appear when
-    // they can act, like the native panel's.
+    // they can act, like the native panel's. The tab's own title already
+    // names the panel, so a second heading would only cost the grid room.
     ui.horizontal_wrapped(|ui| {
         if ui
             .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
@@ -1572,48 +1623,220 @@ pub fn assets_tab(
         {
             assets::write_meta_selection(pending, selection, &snapshot.assets);
         }
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("{} entries", snapshot.assets.len())).weak());
     });
     ui.separator();
+    egui::SidePanel::left("pill_editor_shell_egui.assets_tree")
+        .resizable(true)
+        .default_width(ASSETS_TREE_WIDTH)
+        .width_range(ASSETS_TREE_WIDTH_RANGE)
+        .show_inside(ui, |ui| {
+            assets_tree(ui, snapshot, browser, selection, pending);
+        });
+    egui::TopBottomPanel::top("pill_editor_shell_egui.assets_path").show_inside(ui, |ui| {
+        assets_path_bar(ui, browser);
+    });
+    egui::TopBottomPanel::bottom("pill_editor_shell_egui.assets_zoom").show_inside(ui, |ui| {
+        assets_zoom_bar(ui, &snapshot.assets, browser);
+    });
+    egui::CentralPanel::default().show_inside(ui, |ui| {
+        assets_grid(
+            ui,
+            snapshot,
+            browser,
+            selection,
+            dialog,
+            pending,
+            overlay_regions,
+        );
+    });
+}
+
+/// The Assets tab's folder tree: the project's asset root, then every folder
+/// under it at its own indent, with the open folder's row highlighted. A
+/// row click opens that folder in the grid and selects it (the create
+/// dialog's destination follows the selection); the caret opens and closes
+/// its children; a dropped tile moves its file into the row's folder.
+pub fn assets_tree(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    browser: &mut ProjectBrowser,
+    selection: &mut EditorSelection,
+    pending: &mut PendingEditorCommands,
+) {
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for row in &snapshot.assets {
-                let is_folder = row.kind == "folder";
-                let text = if is_folder {
-                    format!("{}/", row.path)
-                } else {
-                    format!("{} [{}]", row.path, row.kind)
-                };
-                let selected = selection.asset.as_deref() == Some(row.path.as_str());
-                let response = ui.selectable_label(selected, text);
-                if response.clicked() {
-                    select_asset(selection, &row.path);
-                }
-                if response.secondary_clicked() {
-                    select_asset(selection, &row.path);
-                    log_context_menu("assets");
-                }
-                let opened = response.context_menu(|ui| {
-                    asset_menu_items(ui, snapshot, row, selection, dialog, pending)
-                });
-                mark_menu_region(opened, overlay_regions);
-                // Rows are drag sources, folders are drop targets: dropping a
-                // row on a folder queues the recorded move (the sidecar
-                // travels along and the selection follows the move).
-                if is_folder {
-                    if let Some(dragged) = response.dnd_release_payload::<String>() {
-                        if let Some(to) = assets::drop_destination(&dragged, &row.path) {
-                            assets::queue_move(pending, &dragged, &to);
-                        }
-                    }
-                } else {
-                    response.dnd_set_drag_payload(row.path.clone());
+            let root = ui.selectable_label(
+                browser.folder.is_empty(),
+                icons::rich(icons::Icon::Folder, browser::ROOT_LABEL),
+            );
+            if root.clicked() {
+                browser.open("");
+            }
+            if let Some(dragged) = root.dnd_release_payload::<String>() {
+                if let Some(to) = assets::drop_destination(&dragged, "") {
+                    assets::queue_move(pending, &dragged, &to);
                 }
             }
-            // The strip below the rows creates an asset anywhere in the
-            // panel, so the menu is reachable without a row under the
-            // pointer.
-            let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
+            root.on_hover_text("The project's asset root");
+            folder_tree_rows(ui, &snapshot.assets, browser, selection, pending, "", 1);
+        });
+}
+
+/// One level of the folder tree: a row per folder under `parent` and, for
+/// each open row, its own children under it.
+pub fn folder_tree_rows(
+    ui: &mut egui::Ui,
+    assets: &[AssetListing],
+    browser: &mut ProjectBrowser,
+    selection: &mut EditorSelection,
+    pending: &mut PendingEditorCommands,
+    parent: &str,
+    depth: usize,
+) {
+    for folder in browser::child_folders(assets, parent) {
+        let path = folder.path.as_str();
+        let expanded = browser.is_expanded(path);
+        let has_children = !browser::child_folders(assets, path).is_empty();
+        let mut toggle = false;
+        let mut open = false;
+        let mut dropped = None;
+        ui.horizontal(|ui| {
+            ui.add_space(ASSETS_TREE_INDENT * depth as f32);
+            if has_children {
+                let icon = if expanded {
+                    icons::Icon::CaretDown
+                } else {
+                    icons::Icon::CaretRight
+                };
+                let caret = egui::RichText::new(icon.glyph().to_string())
+                    .family(egui::FontFamily::Name(icons::FAMILY.into()))
+                    .size(ASSETS_TREE_CARET_SIZE);
+                if ui.add(egui::Button::new(caret).frame(false)).clicked() {
+                    toggle = true;
+                }
+            } else {
+                ui.add_space(ASSETS_TREE_CARET_WIDTH);
+            }
+            let label = ui.selectable_label(
+                browser.folder == path,
+                icons::rich(icons::Icon::Folder, browser::file_name(path)),
+            );
+            if label.clicked() {
+                open = true;
+            }
+            if let Some(dragged) = label.dnd_release_payload::<String>() {
+                dropped = Some(dragged);
+            }
+            label.on_hover_text(path);
+        });
+        if toggle {
+            browser.toggle_expanded(path);
+        }
+        if open {
+            browser.open(path);
+            select_asset(selection, path);
+        }
+        if let Some(dragged) = dropped {
+            if let Some(to) = assets::drop_destination(&dragged, path) {
+                assets::queue_move(pending, &dragged, &to);
+            }
+        }
+        if expanded {
+            folder_tree_rows(ui, assets, browser, selection, pending, path, depth + 1);
+        }
+    }
+}
+
+/// The path strip over the grid: the asset root and every segment of the
+/// open folder, the ancestors clickable so a single click walks back up.
+pub fn assets_path_bar(ui: &mut egui::Ui, browser: &mut ProjectBrowser) {
+    ui.horizontal(|ui| {
+        let segments = browser::breadcrumb(&browser.folder);
+        let last = segments.len().saturating_sub(1);
+        for (index, (path, label)) in segments.iter().enumerate() {
+            if index > 0 {
+                ui.label(egui::RichText::new(">").weak());
+            }
+            if index == last {
+                ui.label(egui::RichText::new(label).strong());
+            } else if ui.link(label).clicked() {
+                browser.open(path);
+            }
+        }
+    });
+}
+
+/// The strip under the grid: how many items the open folder holds, and
+/// Unity's tile size slider, which resizes every tile live.
+pub fn assets_zoom_bar(ui: &mut egui::Ui, assets: &[AssetListing], browser: &mut ProjectBrowser) {
+    ui.horizontal(|ui| {
+        let count = browser::children(assets, &browser.folder).len();
+        ui.label(egui::RichText::new(format!("{count} items")).weak());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(
+                egui::Slider::new(&mut browser.tile_size, browser::TILE_SIZE_RANGE)
+                    .show_value(false),
+            )
+            .on_hover_text("Tile size");
+        });
+    });
+}
+
+/// The open folder's tiles: its folders first, then its files, each an icon
+/// with its own name under it. The strip below the tiles lands a dropped
+/// tile in the open folder and opens the create dialog from its menu.
+pub fn assets_grid(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    browser: &mut ProjectBrowser,
+    selection: &mut EditorSelection,
+    dialog: &mut Option<AssetDialog>,
+    pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
+    let cell = egui::vec2(
+        browser.tile_size + ASSETS_TILE_GAP,
+        browser.tile_size + ASSETS_TILE_LABEL_HEIGHT,
+    );
+    let folder = browser.folder.clone();
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // The gap lives inside each cell, so the tiles sit edge to edge:
+            // egui's item spacing would add a gutter per tile and push the
+            // last column of a full row past the pane's width.
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            let columns = browser::tile_columns(ui.available_width(), cell.x);
+            let entries = browser::children(&snapshot.assets, &folder);
+            if entries.is_empty() {
+                ui.label(egui::RichText::new("This folder is empty").weak());
+            }
+            for row in entries.chunks(columns) {
+                ui.horizontal(|ui| {
+                    for entry in row {
+                        asset_tile(
+                            ui,
+                            entry,
+                            cell,
+                            browser,
+                            selection,
+                            snapshot,
+                            dialog,
+                            pending,
+                            overlay_regions,
+                        );
+                    }
+                });
+            }
+            let empty = ui.allocate_response(empty_area(ui), egui::Sense::click_and_drag());
+            if let Some(dragged) = empty.dnd_release_payload::<String>() {
+                if let Some(to) = assets::drop_destination(&dragged, &folder) {
+                    assets::queue_move(pending, &dragged, &to);
+                }
+            }
             if empty.secondary_clicked() {
                 log_context_menu("assets");
             }
@@ -1635,10 +1858,131 @@ pub fn assets_tab(
         });
 }
 
+/// One grid tile: the row's duotone icon and its name, the selection and
+/// hover washes, the double-click that opens a folder, the drag a tile
+/// carries and the menu the right-click opens.
+pub fn asset_tile(
+    ui: &mut egui::Ui,
+    row: &AssetListing,
+    cell: egui::Vec2,
+    browser: &mut ProjectBrowser,
+    selection: &mut EditorSelection,
+    snapshot: &EditorSnapshot,
+    dialog: &mut Option<AssetDialog>,
+    pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
+    let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
+    let visuals = ui.visuals().clone();
+    let selected = selection.asset.as_deref() == Some(row.path.as_str());
+    if selected || response.hovered() {
+        let fill = if selected {
+            visuals.selection.bg_fill
+        } else {
+            visuals.widgets.hovered.weak_bg_fill
+        };
+        ui.painter()
+            .rect_filled(rect, ASSETS_TILE_CORNER_RADIUS, fill);
+    }
+    let icon_side = (cell.x - ASSETS_TILE_GAP - ASSETS_TILE_ICON_INSET * 2.0).max(8.0);
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.center().x - icon_side * 0.5,
+            rect.min.y + ASSETS_TILE_ICON_INSET,
+        ),
+        egui::vec2(icon_side, icon_side),
+    );
+    let tint = if selected {
+        visuals.selection.stroke.color
+    } else {
+        visuals.text_color()
+    };
+    icons::paint_duotone(ui.painter(), icon_rect, asset_icon(row), tint);
+    let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
+    let job = tile_name_job(
+        browser::file_name(&row.path),
+        &font,
+        visuals.text_color(),
+        cell.x - ASSETS_TILE_GAP,
+    );
+    let label = ui.painter().layout_job(job);
+    let label_origin = egui::pos2(
+        rect.center().x - label.size().x * 0.5,
+        icon_rect.max.y + ASSETS_TILE_LABEL_GAP,
+    );
+    ui.painter()
+        .galley(label_origin, label, visuals.text_color());
+    if response.clicked() {
+        select_asset(selection, &row.path);
+    }
+    if response.double_clicked() && browser::is_folder(row) {
+        browser.open(&row.path);
+    }
+    if response.secondary_clicked() {
+        select_asset(selection, &row.path);
+        log_context_menu("assets");
+    }
+    let opened =
+        response.context_menu(|ui| asset_menu_items(ui, snapshot, row, selection, dialog, pending));
+    mark_menu_region(opened, overlay_regions);
+    // Folders are drop targets (a tile lands inside one) and every tile is a
+    // drag source, so a file moves by dragging it onto a folder.
+    if browser::is_folder(row) {
+        if let Some(dragged) = response.dnd_release_payload::<String>() {
+            if let Some(to) = assets::drop_destination(&dragged, &row.path) {
+                assets::queue_move(pending, &dragged, &to);
+            }
+        }
+    }
+    response.dnd_set_drag_payload(row.path.clone());
+    response.on_hover_text(row.path.as_str());
+}
+
+/// The icon a row's tile draws: folders, the project's asset types by their
+/// last type-name segment, and plain files by their extension.
+pub fn asset_icon(row: &AssetListing) -> icons::Icon {
+    if browser::is_folder(row) {
+        return icons::Icon::Folder;
+    }
+    let type_leaf = row.kind.rsplit("::").next().unwrap_or(row.kind.as_str());
+    let extension = row
+        .path
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match type_leaf {
+        "Mesh" => icons::Icon::Cube,
+        "Texture" => icons::Icon::Image,
+        "Material" => icons::Icon::Sphere,
+        _ => match extension.as_str() {
+            "png" | "jpg" | "jpeg" | "bmp" | "tga" | "hdr" => icons::Icon::Image,
+            "obj" | "gltf" | "glb" => icons::Icon::Cube,
+            "hlsl" | "wgsl" | "glsl" | "frag" | "vert" | "comp" => icons::Icon::Code,
+            _ => icons::Icon::File,
+        },
+    }
+}
+
+/// A tile name's layout job: wrapped to two rows at `width` points, broken
+/// inside a word when it must (a long extension has no spaces), with an
+/// ellipsis where the second row runs out - Unity's tile captions.
+pub fn tile_name_job(
+    text: &str,
+    font: &egui::FontId,
+    color: egui::Color32,
+    width: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), font.clone(), color, width);
+    job.wrap.max_rows = ASSETS_TILE_LABEL_ROWS;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    job
+}
+
 /// The asset row's menu: the toolbar's actions on the row the right-click
 /// selected. Create always; rename, delete and the write-meta action only
 /// when they can act on that row, like the toolbar's buttons.
-fn asset_menu_items(
+pub fn asset_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     row: &AssetListing,
@@ -1712,7 +2056,10 @@ pub fn select_asset(selection: &mut EditorSelection, path: &str) -> bool {
 /// rename dialog the current path and the new name; their buttons run the
 /// shared submit helpers, which queue the recorded batch and close the
 /// dialog.
-fn asset_dialog_window(
+///
+/// Public because [`run_frame`]'s generated hot patch calls it through the
+/// package path.
+pub fn asset_dialog_window(
     context: &egui::Context,
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
@@ -1870,6 +2217,7 @@ mod tests {
         let mut dialog: Option<AssetDialog> = None;
         let mut pending = PendingEditorCommands::default();
         let mut draft: Option<preferences::PreferencesDraft> = None;
+        let mut browser = ProjectBrowser::default();
         let context = egui::Context::default();
         style::apply(&context);
         let mut regions = Vec::new();
@@ -1885,12 +2233,134 @@ mod tests {
                     &mut dialog,
                     &mut pending,
                     &mut regions,
+                    &mut browser,
                 );
                 preferences_tab(ui, &snapshot, &mut draft, &mut pending);
                 scene_overlay(ui, 120.0, &mut regions);
             });
         });
         assert_eq!(regions.len(), 2, "the two chips are the UI's regions");
+    }
+
+    #[test]
+    fn the_browser_draws_its_tree_path_and_tiles() {
+        let engine = Engine::new();
+        let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+        snapshot.assets = vec![
+            AssetListing {
+                path: "models".to_string(),
+                kind: "folder".to_string(),
+                standalone: false,
+                has_meta: false,
+            },
+            AssetListing {
+                path: "models/nested".to_string(),
+                kind: "folder".to_string(),
+                standalone: false,
+                has_meta: false,
+            },
+            AssetListing {
+                path: "models/cube.obj".to_string(),
+                kind: "pill_master_renderer::assets::Mesh".to_string(),
+                standalone: false,
+                has_meta: true,
+            },
+            AssetListing {
+                path: "shaders/code.wgsl".to_string(),
+                kind: "file".to_string(),
+                standalone: false,
+                has_meta: false,
+            },
+        ];
+        let mut browser = ProjectBrowser::default();
+        assert!(browser.open("models"));
+        assert!(browser.is_expanded("models") || browser.folder == "models");
+        let mut selection = EditorSelection::default();
+        let mut dialog: Option<AssetDialog> = None;
+        let mut pending = PendingEditorCommands::default();
+        let context = egui::Context::default();
+        style::apply(&context);
+        let mut regions = Vec::new();
+        let mut caption_rows = 0usize;
+        let mut caption_width = 0.0f32;
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assets_tree(ui, &snapshot, &mut browser, &mut selection, &mut pending);
+                assets_path_bar(ui, &mut browser);
+                assets_zoom_bar(ui, &snapshot.assets, &mut browser);
+                assets_grid(
+                    ui,
+                    &snapshot,
+                    &mut browser,
+                    &mut selection,
+                    &mut dialog,
+                    &mut pending,
+                    &mut regions,
+                );
+                let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
+                let job = tile_name_job(
+                    "a_name_that_is_much_too_long_for_a_tile.png",
+                    &font,
+                    egui::Color32::WHITE,
+                    40.0,
+                );
+                let galley = ui.painter().layout_job(job);
+                caption_rows = galley.rows.len();
+                caption_width = galley.size().x;
+            });
+        });
+        assert_eq!(caption_rows, 2, "a long name wraps to the two caption rows");
+        assert!(
+            caption_width <= 41.0,
+            "the caption stays inside the tile: {caption_width}"
+        );
+        assert!(pending.batches.is_empty(), "drawing queues no commands");
+        assert_eq!(regions.len(), 0, "the tiles draw no overlay regions");
+        assert_eq!(
+            browser::children(&snapshot.assets, "models")
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["models/nested", "models/cube.obj"],
+            "the grid lists the open folder's own children"
+        );
+    }
+
+    #[test]
+    fn tiles_pick_an_icon_from_the_kind_and_the_extension() {
+        let row = |path: &str, kind: &str| AssetListing {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            standalone: false,
+            has_meta: false,
+        };
+        assert_eq!(asset_icon(&row("models", "folder")), icons::Icon::Folder);
+        assert_eq!(
+            asset_icon(&row(
+                "models/cube.obj",
+                "pill_master_renderer::assets::Mesh"
+            )),
+            icons::Icon::Cube
+        );
+        assert_eq!(
+            asset_icon(&row(
+                "textures/skin.png",
+                "pill_master_renderer::assets::Texture"
+            )),
+            icons::Icon::Image
+        );
+        assert_eq!(
+            asset_icon(&row(
+                "textures/stone.material",
+                "pill_master_renderer::Material"
+            )),
+            icons::Icon::Sphere
+        );
+        assert_eq!(
+            asset_icon(&row("shaders/code.wgsl", "file")),
+            icons::Icon::Code
+        );
+        assert_eq!(asset_icon(&row("config.ini", "file")), icons::Icon::File);
     }
 
     #[test]

@@ -474,13 +474,16 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
     );
     let anchor = host_anchor_package();
-    let editor_host = anchor.as_deref() == Some("editor");
+    let editor_host = anchor.as_deref().is_some_and(is_editor_anchor);
     if crate::config::running_under_dioxus_cli() || editor_host {
-        // The editor keeps the cargo anchor. Its dependency graph must be
+        // An editor keeps the cargo anchor. Its dependency graph must be
         // part of the module build too: its renderer dependencies affect the
         // shared engine dylibs even though the project itself only depends on
-        // renderer data. Under the Dioxus CLI the same anchor also reproduces
-        // the editor's macro graph
+        // renderer data. A reload builds one module on its own, while the
+        // startup batch builds every module together - without the anchor the
+        // two resolve different feature unions onto `pill_core.dll` and the
+        // reloaded artifact cannot import against the running host. The same
+        // anchor also reproduces the Dioxus editor's macro graph
         // (dioxus' procedural macros) unions features onto the HOST units of
         // `proc-macro2`/`quote`/`syn` - a resolution cargo keeps separate
         // from the target side - and those unions change the metadata of the
@@ -539,16 +542,16 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
     }
 }
 
-/// The workspace package name to anchor dx-hosted module builds to.
+/// The workspace package name to anchor editor module builds to.
 ///
 /// Cargo unifies features across every selected package, so module builds
-/// under the dioxus CLI select the editor's own package (`-p editor`) to
-/// force the shared engine crates onto the editor's exact feature universe.
-/// The package name is normally the executable's file stem (`editor` ->
-/// package `editor`), but the Dioxus CLI (`dx`) stages the built binary under
-/// a cargo-metadata-hash suffixed name such as `editor-d6d95e94.exe`; trim
-/// that trailing `-<hex>` suffix so the anchor still resolves to the real
-/// package.
+/// select the running editor's own package (`-p editor`, `-p pill_editor`,
+/// `-p pill_editor_egui`) to force the shared engine crates onto that
+/// editor's exact feature universe. The package name is normally the
+/// executable's file stem, but the Dioxus CLI (`dx`) stages the built binary
+/// under a cargo-metadata-hash suffixed name such as `editor-d6d95e94.exe`;
+/// trim that trailing `-<hex>` suffix so the anchor still resolves to the
+/// real package.
 fn host_anchor_package() -> Option<String> {
     let stem = std::env::current_exe()
         .ok()?
@@ -566,6 +569,15 @@ fn host_anchor_package() -> Option<String> {
         }
     }
     Some(stem)
+}
+
+/// Whether an executable's package is one of the editor anchors: the
+/// retired Dioxus frontend (`editor`), the `pill_ui` editor, or the egui
+/// editor. Their dependency graphs carry the renderer and UI unions a reload
+/// build must reproduce; a plain game host needs only the explicit engine
+/// features.
+fn is_editor_anchor(package: &str) -> bool {
+    matches!(package, "editor" | "pill_editor" | "pill_editor_egui")
 }
 
 /// The frontend features the running host was built with, used to pick the

@@ -200,6 +200,17 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_editor_undo.py", "editor history changed"))
         selected.append(suite_check("test_editor_recovery.py", "editor state persistence changed"))
         selected.append(suite_check("test_editor_viewports.py", "editor view model changed"))
+    # The egui editor: the shared model crate, the UI library, the reloadable
+    # shell module and the frontend. Its suites are the crates' own unit
+    # tests plus the egui editor suite; the editor build uplift is added
+    # below, since only that build re-freezes the shared dylibs.
+    if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**"):
+        selected.append(cargo_check("test egui editor crates",
+                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_ui_egui",
+                                     "-p", "pill_editor_shell_egui_editor", "--offline"),
+                                    "egui editor crates changed"))
+        selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
     # Engine core and the shared crates below it: unit tests plus the
     # hot-reload regression net that runs a host against real projects.
@@ -296,6 +307,8 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("editor-shell", ("modules/extensions/pill_editor_shell/**",)),
     ("editor-frontend", ("modules/frontents/pill_editor/**",)),
     ("editor-core", ("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**")),
+    ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+                     "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
     ("pill-core", ("modules/pill_core/**",)),
     ("host", ("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**")),
