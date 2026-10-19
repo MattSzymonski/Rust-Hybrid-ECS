@@ -38,6 +38,7 @@ fn an_overflowing_field_layout_is_refused() {
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     }];
     world
         .register_component_descriptor_with_layout(component_id, good.clone())
@@ -50,6 +51,7 @@ fn an_overflowing_field_layout_is_refused() {
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     }];
     assert!(
         world
@@ -65,6 +67,7 @@ fn an_overflowing_field_layout_is_refused() {
         size: 8,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     }];
     assert!(
         world
@@ -103,6 +106,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "label",
@@ -111,6 +115,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -119,6 +124,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 
@@ -132,6 +138,7 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "label",
@@ -140,6 +147,7 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -148,6 +156,7 @@ static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 
@@ -161,6 +170,7 @@ static STRING_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "label",
@@ -169,6 +179,7 @@ static STRING_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -177,6 +188,7 @@ static STRING_ELEMENT_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 
@@ -200,6 +212,7 @@ static NAME_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -208,6 +221,7 @@ static NAME_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 
@@ -221,6 +235,7 @@ static NAME_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 24,
         align: 8,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
     ComponentFieldDescriptor {
         name: "weight",
@@ -229,6 +244,7 @@ static NAME_ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
         size: 4,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     },
 ];
 

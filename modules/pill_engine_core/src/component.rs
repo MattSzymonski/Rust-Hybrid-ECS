@@ -1229,6 +1229,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
         static FIELDS_B: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
             name: "second",
@@ -1237,6 +1238,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
 
         let mut registry = ComponentRegistry::new();

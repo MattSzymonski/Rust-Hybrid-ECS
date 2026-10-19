@@ -6,6 +6,9 @@
 //!   [`ComponentFieldDescriptor`](crate::component_registry::ComponentFieldDescriptor),
 //!   the field layout the derive macros emit and the world stores for the
 //!   editor and the C# mirror codegen.
+//! - Declare
+//!   [`FieldDecorator`](crate::component_registry::FieldDecorator), the
+//!   presentation metadata a field declares for the editor's Inspector.
 //! - Declare the
 //!   [`ComponentLayout`](crate::component_registry::ComponentLayout) trait the
 //!   derives implement.
@@ -22,13 +25,60 @@
 //! every DLL, so each DLL's registries hold exactly what that DLL declared;
 //! this crate holds only what is the same for all of them.
 
+// Standard library
+use std::borrow::Cow;
+
+/// Presentation metadata one field declares for the editor's Inspector.
+///
+/// The vocabulary is Unity's; a decorator never reaches storage, persistence,
+/// the schema fingerprint or the C# mirror - it only changes what the
+/// Inspector draws and how it draws it. Text payloads are [`Cow`] so a
+/// deriving artifact can borrow its literals while the C# manifest lane owns
+/// what it parsed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldDecorator {
+    /// Unity's `[HideInInspector]`: the field is not drawn. It is still stored,
+    /// serialized and copied; only its row disappears.
+    HideInInspector,
+    /// Unity's `[Header("Text")]`: a separator line with the text is drawn
+    /// above the field.
+    Header(Cow<'static, str>),
+    /// Unity's `[Space(pixels)]`: a vertical gap is drawn above the field.
+    Space(f32),
+    /// Unity's `[Tooltip("Text")]`: the text is shown on hover of the field's
+    /// label.
+    Tooltip(Cow<'static, str>),
+    /// Unity's `[Range(min, max)]`: a numeric field is drawn as a slider over
+    /// the range. Integer fields slide in whole steps.
+    Range {
+        /// Lowest value the slider offers.
+        min: f32,
+        /// Highest value the slider offers.
+        max: f32,
+    },
+    /// Unity's `[TextArea]` / `[TextArea(minLines, maxLines)]`: a text field is
+    /// drawn as a multi-line box of that many rows.
+    TextArea {
+        /// Rows the box starts with.
+        min_lines: usize,
+        /// Rows the box grows to before it scrolls.
+        max_lines: usize,
+    },
+    /// Unity's `[Multiline(lines)]`: a text field is drawn as a fixed-height
+    /// multi-line box.
+    Multiline(usize),
+    /// Unity's `[Min(value)]`: a numeric field's drag value never goes below
+    /// the minimum.
+    Min(f32),
+}
+
 /// One named field of a `#[derive(PillComponent)]` component or a
 /// `#[derive(PillMirror)]` value type, captured at compile time so the host
 /// can emit a typed C# mirror instead of an opaque ABI blob.
 ///
 /// Every value is const-constructible (`offset_of!`/`size_of!`/`align_of!`),
 /// so a descriptor array can live in a static inside the declaring artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ComponentFieldDescriptor {
     /// Rust field name (snake_case); the C# codegen maps it to PascalCase.
     pub name: &'static str,
@@ -55,6 +105,12 @@ pub struct ComponentFieldDescriptor {
     /// Computed from the array length expression at compile time, so const
     /// and literal lengths alike resolve here.
     pub element_count: usize,
+    /// The presentation decorators the field declared, in declaration order.
+    ///
+    /// Borrowed from the declaring artifact's static data for a Rust type, and
+    /// owned by the world for a layout described at runtime (the C# manifest
+    /// lane). Empty when the field declares none.
+    pub decorators: Cow<'static, [FieldDecorator]>,
 }
 
 /// The compile-time field layout of a type, as the derive macros emit it.
@@ -110,6 +166,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
 
         let mut with_layout = World::new();
@@ -137,6 +194,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
 
         let mut world = World::new();

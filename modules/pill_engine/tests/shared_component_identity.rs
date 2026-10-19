@@ -445,6 +445,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "segments",
@@ -453,6 +454,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
     const AS_INTEGERS: &[ComponentFieldDescriptor] = &[
@@ -463,6 +465,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "segments",
@@ -471,6 +474,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -489,6 +493,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "tension",
@@ -497,6 +502,7 @@ fn a_same_sized_but_differently_typed_layout_is_still_rejected() {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
     assert_ne!(
@@ -896,6 +902,7 @@ const fn relaid_fields(
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         pill_engine::component_registry::ComponentFieldDescriptor {
             name: trailing,
@@ -904,6 +911,7 @@ const fn relaid_fields(
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ]
 }

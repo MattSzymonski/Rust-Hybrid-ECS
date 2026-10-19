@@ -10,6 +10,9 @@
 //!   inspector's parsing rule - used by the scripted channel and any text
 //!   field.
 //! - [`element_field`]: one element of an array value.
+//! - The section model the tab draws: [`component_label`],
+//!   [`component_icon`], [`widget_for`] and [`rows`] - what each component
+//!   section holds and which widget each row asks for.
 //! - Asset settings as editable data: key paths (`a.b[0]`), leaf reads and
 //!   patches, and the [`EditorCommand::SetAssetSettings`] builder.
 //!
@@ -20,15 +23,332 @@
 //! the history records them - the same split the Assets pipeline follows.
 
 // External crates
+use pill_engine::component_registry::FieldDecorator;
 use pill_engine::{Entity, FieldValue};
+use pill_ui_egui::egui::Color32;
+use pill_ui_egui::icons::Icon;
 use serde_json::Value as JsonValue;
 
 // Current crate
-use crate::editor_state::EditorCommand;
+use crate::editor_state::{ComponentView, EditorCommand};
 
 /// The name after the last `::`, for labels and history entries.
 pub fn short_component_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
+}
+
+/// The title a component section's header shows.
+///
+/// Unity names a component without its type suffix (`Transform`,
+/// `Mesh Renderer`), so the engine's `TransformComponent` reads `Transform`;
+/// a type without that suffix keeps its own short name.
+pub fn component_label(type_name: &str) -> &str {
+    let short = short_component_name(type_name);
+    short.strip_suffix("Component").unwrap_or(short)
+}
+
+/// The duotone icon a component section's header draws, from its type name.
+///
+/// The engine's components carry no icon metadata, so the mark follows the
+/// name's words: a transform points in all directions, a mesh or collider is
+/// a cube (the collider an outlined one), a sprite or texture is an image, a
+/// material a sphere, a light a power switch, a camera a monitor, a script or
+/// behaviour a code mark, and anything else the property sliders.
+pub fn component_icon(type_name: &str) -> Icon {
+    let lower = type_name.to_lowercase();
+    if lower.contains("transform") {
+        Icon::ArrowsOutCardinal
+    } else if lower.contains("collider") || lower.contains("collision") {
+        Icon::CubeTransparent
+    } else if lower.contains("mesh") || lower.contains("model") {
+        Icon::Cube
+    } else if lower.contains("sprite") || lower.contains("texture") || lower.contains("image") {
+        Icon::Image
+    } else if lower.contains("material") {
+        Icon::Sphere
+    } else if lower.contains("light") {
+        Icon::Power
+    } else if lower.contains("camera") {
+        Icon::MonitorPlay
+    } else if lower.contains("audio") || lower.contains("sound") {
+        Icon::Play
+    } else if lower.contains("script")
+        || lower.contains("behaviour")
+        || lower.contains("behavior")
+        || lower.contains("system")
+    {
+        Icon::Code
+    } else if lower.contains("rigid") || lower.contains("physics") || lower.contains("velocity") {
+        Icon::ArrowsOut
+    } else {
+        Icon::SlidersHorizontal
+    }
+}
+
+/// The widget a value's kind asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FieldWidget {
+    /// A boolean: a checkbox.
+    Checkbox,
+    /// A whole number: a drag field that scrubs and accepts typed input.
+    Integer,
+    /// A floating point number: a drag field with decimals.
+    Float,
+    /// A string: a single-line text edit.
+    Text,
+    /// A value the engine can locate but not interpret: shown as text.
+    ReadOnly,
+    /// A `[Range]` on a floating point field: a slider over the range.
+    FloatSlider {
+        /// Lowest value the slider offers.
+        min: f32,
+        /// Highest value the slider offers.
+        max: f32,
+    },
+    /// A `[Range]` on a whole-number field: a slider in whole steps.
+    IntegerSlider {
+        /// Lowest value the slider offers.
+        min: f32,
+        /// Highest value the slider offers.
+        max: f32,
+    },
+    /// A `[Min]` on a floating point field: a drag value with a floor.
+    FloatDrag {
+        /// Lowest value the drag value accepts.
+        min: f32,
+    },
+    /// A `[Min]` on a whole-number field: a drag value with a floor.
+    IntegerDrag {
+        /// Lowest value the drag value accepts.
+        min: f32,
+    },
+    /// A `[TextArea]` or `[Multiline]` on a text field: a box of that many
+    /// rows.
+    MultilineText {
+        /// Rows the box shows.
+        lines: usize,
+    },
+}
+
+/// The widget a field's current value asks for.
+pub fn widget_for(value: &FieldValue) -> FieldWidget {
+    match value {
+        FieldValue::Bool(_) => FieldWidget::Checkbox,
+        FieldValue::F32(_) | FieldValue::F64(_) => FieldWidget::Float,
+        FieldValue::I8(_)
+        | FieldValue::I16(_)
+        | FieldValue::I32(_)
+        | FieldValue::I64(_)
+        | FieldValue::U8(_)
+        | FieldValue::U16(_)
+        | FieldValue::U32(_)
+        | FieldValue::U64(_)
+        | FieldValue::Usize(_)
+        | FieldValue::Isize(_) => FieldWidget::Integer,
+        FieldValue::Text(_) => FieldWidget::Text,
+        FieldValue::Array(_) | FieldValue::List { .. } | FieldValue::Opaque { .. } => {
+            FieldWidget::ReadOnly
+        }
+    }
+}
+
+/// The widget a field's value asks for once its decorators are applied.
+///
+/// Decorators that cannot apply to the value - a `[Range]` on a string, a
+/// `[TextArea]` on a number - are ignored rather than refused: the declaration
+/// is presentation, and a wrong one must not hide the field it decorates. A
+/// range wins over a minimum, since a slider already bounds below, and a text
+/// area's first row count is the box height.
+pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -> FieldWidget {
+    let mut widget = widget_for(value);
+    let mut range: Option<(f32, f32)> = None;
+    let mut minimum: Option<f32> = None;
+    let mut lines: Option<usize> = None;
+    for decorator in decorators {
+        match decorator {
+            FieldDecorator::Range { min, max } => range = Some((*min, *max)),
+            FieldDecorator::Min(value) => minimum = Some(*value),
+            FieldDecorator::TextArea { min_lines, .. } => lines = Some(*min_lines),
+            FieldDecorator::Multiline(count) => lines = Some(*count),
+            FieldDecorator::HideInInspector
+            | FieldDecorator::Header(_)
+            | FieldDecorator::Space(_)
+            | FieldDecorator::Tooltip(_) => {}
+        }
+    }
+    if let Some((min, max)) = range {
+        widget = match widget {
+            FieldWidget::Float => FieldWidget::FloatSlider { min, max },
+            FieldWidget::Integer => FieldWidget::IntegerSlider { min, max },
+            other => other,
+        };
+    } else if let Some(min) = minimum {
+        widget = match widget {
+            FieldWidget::Float => FieldWidget::FloatDrag { min },
+            FieldWidget::Integer => FieldWidget::IntegerDrag { min },
+            other => other,
+        };
+    }
+    if let (FieldWidget::Text, Some(lines)) = (widget, lines) {
+        widget = FieldWidget::MultilineText { lines };
+    }
+    widget
+}
+
+/// How many side-by-side elements a vector row holds at most: X, Y, Z, W.
+pub const VECTOR_AXES_MAX: usize = 4;
+
+/// One row of a component section.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldRow {
+    /// A separator line with the text a field's `[Header]` declared.
+    Header {
+        /// Text the line shows.
+        text: String,
+    },
+    /// A vertical gap a field's `[Space]` declared.
+    Space {
+        /// Gap height, in pixels.
+        pixels: f32,
+    },
+    /// One field with the widget its kind asks for.
+    Single {
+        /// The field's position in the component's field list (the value's,
+        /// too).
+        index: usize,
+        /// The field's registered name.
+        field: String,
+        /// The widget to draw.
+        widget: FieldWidget,
+        /// Text the field's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
+    /// A short array of scalars: one row, one widget per element, labelled
+    /// with the element's axis (`X`, `Y`, `Z`, `W`) - Unity's vector row.
+    Vector {
+        /// The array's position in the component's field list.
+        index: usize,
+        /// The field's registered name.
+        field: String,
+        /// The element widgets' kind.
+        widget: FieldWidget,
+        /// How many elements the row holds (2..=`VECTOR_AXES_MAX`).
+        elements: usize,
+        /// Text the field's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
+    /// A field shown read-only (a long array, a list, an opaque value).
+    ReadOnly {
+        /// The field's position in the component's field list.
+        index: usize,
+        /// The field's registered name.
+        field: String,
+        /// Text the field's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
+}
+
+/// The rows a component section draws, in field order.
+///
+/// A scalar array of two to four elements becomes one vector row (Unity draws
+/// a `Vector3` as three fields on one line); anything longer stays one row per
+/// element, drawn by the caller from the array's own value.
+///
+/// Decorators are applied here so the shell only draws what the model asks
+/// for: `[HideInInspector]` drops the field together with its header and gap,
+/// `[Header]` and `[Space]` emit their own rows above the field in declaration
+/// order, and `[Tooltip]` rides on the field's row.
+pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
+    let mut rows = Vec::new();
+    for (index, (descriptor, value)) in component
+        .fields
+        .iter()
+        .zip(component.values.iter())
+        .enumerate()
+    {
+        // A hidden field takes its decorations with it: drawing a header over
+        // nothing would be worse than drawing nothing at all.
+        if descriptor
+            .decorators
+            .iter()
+            .any(|decorator| matches!(decorator, FieldDecorator::HideInInspector))
+        {
+            continue;
+        }
+        let mut tooltip: Option<String> = None;
+        for decorator in descriptor.decorators.iter() {
+            match decorator {
+                FieldDecorator::Header(text) => rows.push(FieldRow::Header {
+                    text: text.to_string(),
+                }),
+                FieldDecorator::Space(pixels) => rows.push(FieldRow::Space { pixels: *pixels }),
+                FieldDecorator::Tooltip(text) => tooltip = Some(text.to_string()),
+                FieldDecorator::HideInInspector
+                | FieldDecorator::Range { .. }
+                | FieldDecorator::TextArea { .. }
+                | FieldDecorator::Multiline(_)
+                | FieldDecorator::Min(_) => {}
+            }
+        }
+        let widget = widget_for_decorated(value, descriptor.decorators.as_ref());
+        let row = match value {
+            FieldValue::Array(elements)
+                if (2..=VECTOR_AXES_MAX).contains(&elements.len())
+                    && elements.iter().all(|element| {
+                        matches!(
+                            widget_for(element),
+                            FieldWidget::Integer | FieldWidget::Float
+                        )
+                    }) =>
+            {
+                FieldRow::Vector {
+                    index,
+                    field: descriptor.name.to_string(),
+                    // A range belongs to one scalar, so a vector row keeps the
+                    // plain element widget and the tooltip.
+                    widget: widget_for(elements.first().expect("the array is not empty")),
+                    elements: elements.len(),
+                    tooltip,
+                }
+            }
+            FieldValue::Array(_) | FieldValue::List { .. } | FieldValue::Opaque { .. } => {
+                FieldRow::ReadOnly {
+                    index,
+                    field: descriptor.name.to_string(),
+                    tooltip,
+                }
+            }
+            _ => FieldRow::Single {
+                index,
+                field: descriptor.name.to_string(),
+                widget,
+                tooltip,
+            },
+        };
+        rows.push(row);
+    }
+    rows
+}
+
+/// The axis label a vector row shows for element `index`: `X`, `Y`, `Z`, `W`.
+pub fn axis_label(index: usize) -> &'static str {
+    match index {
+        0 => "X",
+        1 => "Y",
+        2 => "Z",
+        _ => "W",
+    }
+}
+
+/// The colour a vector row's axis label takes: the gizmo's X red, Y green,
+/// Z blue (the guide's colours), W muted for a fourth element.
+pub fn axis_color(index: usize) -> Color32 {
+    match index {
+        0 => Color32::from_rgb(214, 96, 96),
+        1 => Color32::from_rgb(112, 190, 112),
+        2 => Color32::from_rgb(104, 148, 232),
+        _ => Color32::GRAY,
+    }
 }
 
 /// The recorded component attach, under the native label (`add {short}`):
@@ -440,5 +760,458 @@ mod tests {
             component_remove(entity, "italian_brainrot::TagAlphaComponent");
         assert_eq!(remove_label, "remove TagAlphaComponent");
         assert!(matches!(remove, EditorCommand::RemoveComponent { .. }));
+    }
+
+    /// A component view over a field/value pair list.
+    fn component(name: &str, values: Vec<FieldValue>) -> ComponentView {
+        /// Field names for the fixture (the descriptor's name is a `&'static
+        /// str`), indexed by the value's position.
+        const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        ComponentView {
+            type_name: name.to_string(),
+            persistable: false,
+            editable: true,
+            fields: values
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, _)| pill_engine::component_registry::ComponentFieldDescriptor {
+                        name: NAMES[index],
+                        type_tag: "f32",
+                        offset: 0,
+                        size: 4,
+                        align: 4,
+                        element_count: 0,
+                        decorators: std::borrow::Cow::Borrowed(&[]),
+                    },
+                )
+                .collect(),
+            values,
+        }
+    }
+
+    #[test]
+    fn the_widget_follows_the_value_kind() {
+        assert_eq!(widget_for(&FieldValue::Bool(true)), FieldWidget::Checkbox);
+        assert_eq!(widget_for(&FieldValue::F32(1.0)), FieldWidget::Float);
+        assert_eq!(widget_for(&FieldValue::F64(1.0)), FieldWidget::Float);
+        for value in [
+            FieldValue::I8(1),
+            FieldValue::I16(1),
+            FieldValue::I32(1),
+            FieldValue::I64(1),
+            FieldValue::U8(1),
+            FieldValue::U16(1),
+            FieldValue::U32(1),
+            FieldValue::U64(1),
+            FieldValue::Usize(1),
+            FieldValue::Isize(1),
+        ] {
+            assert_eq!(widget_for(&value), FieldWidget::Integer);
+        }
+        assert_eq!(
+            widget_for(&FieldValue::Text("x".to_string())),
+            FieldWidget::Text
+        );
+        assert_eq!(
+            widget_for(&FieldValue::Opaque {
+                type_tag: "struct:x",
+                bytes: vec![0; 4]
+            }),
+            FieldWidget::ReadOnly
+        );
+    }
+
+    #[test]
+    fn a_short_scalar_array_becomes_one_vector_row() {
+        let transform = component(
+            "TransformComponent",
+            vec![
+                FieldValue::Array(vec![
+                    FieldValue::F32(1.0),
+                    FieldValue::F32(2.0),
+                    FieldValue::F32(3.0),
+                ]),
+                FieldValue::Bool(true),
+            ],
+        );
+        assert_eq!(
+            rows(&transform),
+            vec![
+                FieldRow::Vector {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::Float,
+                    elements: 3,
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::Checkbox,
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_or_non_scalar_array_stays_read_only() {
+        let long = component(
+            "Big",
+            vec![FieldValue::Array(
+                (0..8).map(|index| FieldValue::F32(index as f32)).collect(),
+            )],
+        );
+        assert_eq!(
+            rows(&long),
+            vec![FieldRow::ReadOnly {
+                index: 0,
+                field: "a".to_string(),
+                tooltip: None,
+            }]
+        );
+        let nested = component(
+            "Nested",
+            vec![FieldValue::Array(vec![
+                FieldValue::Array(vec![FieldValue::F32(1.0), FieldValue::F32(2.0)]),
+                FieldValue::Array(vec![FieldValue::F32(3.0), FieldValue::F32(4.0)]),
+            ])],
+        );
+        assert_eq!(
+            rows(&nested),
+            vec![FieldRow::ReadOnly {
+                index: 0,
+                field: "a".to_string(),
+                tooltip: None,
+            }]
+        );
+        let list = component(
+            "List",
+            vec![FieldValue::List {
+                element_tag: "f32",
+                element_count: 3,
+            }],
+        );
+        assert_eq!(
+            rows(&list),
+            vec![FieldRow::ReadOnly {
+                index: 0,
+                field: "a".to_string(),
+                tooltip: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_two_element_array_is_a_vector_too() {
+        let value = component(
+            "Vec2-ish",
+            vec![FieldValue::Array(vec![
+                FieldValue::I32(1),
+                FieldValue::I32(2),
+            ])],
+        );
+        assert_eq!(
+            rows(&value),
+            vec![FieldRow::Vector {
+                index: 0,
+                field: "a".to_string(),
+                widget: FieldWidget::Integer,
+                elements: 2,
+                tooltip: None,
+            }]
+        );
+    }
+
+    /// A component whose fields carry the decorations at their position.
+    fn decorated(values: Vec<FieldValue>, decorators: Vec<Vec<FieldDecorator>>) -> ComponentView {
+        /// Field names for the fixture (the descriptor's name is a `&'static
+        /// str`), indexed by the value's position.
+        const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        ComponentView {
+            type_name: "Decorated".to_string(),
+            persistable: false,
+            editable: true,
+            fields: values
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, _)| pill_engine::component_registry::ComponentFieldDescriptor {
+                        name: NAMES[index],
+                        type_tag: "f32",
+                        offset: 0,
+                        size: 4,
+                        align: 4,
+                        element_count: 0,
+                        decorators: std::borrow::Cow::Owned(decorators[index].clone()),
+                    },
+                )
+                .collect(),
+            values,
+        }
+    }
+
+    #[test]
+    fn header_and_space_decorators_become_rows_above_their_field() {
+        let view = decorated(
+            vec![FieldValue::F32(1.0), FieldValue::Bool(true)],
+            vec![
+                vec![
+                    FieldDecorator::Header("Timing".into()),
+                    FieldDecorator::Space(10.0),
+                ],
+                Vec::new(),
+            ],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::Header {
+                    text: "Timing".to_string(),
+                },
+                FieldRow::Space { pixels: 10.0 },
+                FieldRow::Single {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::Float,
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::Checkbox,
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hidden_field_takes_its_header_and_gap_with_it() {
+        let view = decorated(
+            vec![FieldValue::F32(1.0), FieldValue::F32(2.0)],
+            vec![
+                vec![
+                    FieldDecorator::Header("Hidden".into()),
+                    FieldDecorator::HideInInspector,
+                ],
+                vec![FieldDecorator::Tooltip("Kept".into())],
+            ],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![FieldRow::Single {
+                index: 1,
+                field: "b".to_string(),
+                widget: FieldWidget::Float,
+                tooltip: Some("Kept".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_range_decorator_picks_the_slider_for_the_value_kind() {
+        let view = decorated(
+            vec![FieldValue::F32(50.0), FieldValue::I32(5)],
+            vec![
+                vec![FieldDecorator::Range {
+                    min: 0.0,
+                    max: 100.0,
+                }],
+                vec![FieldDecorator::Range {
+                    min: 0.0,
+                    max: 100.0,
+                }],
+            ],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::Single {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::FloatSlider {
+                        min: 0.0,
+                        max: 100.0,
+                    },
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::IntegerSlider {
+                        min: 0.0,
+                        max: 100.0,
+                    },
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_minimum_decorator_clamps_the_drag_value() {
+        let view = decorated(
+            vec![FieldValue::F32(1.0), FieldValue::I32(1)],
+            vec![
+                vec![FieldDecorator::Min(0.0)],
+                vec![FieldDecorator::Min(-5.0)],
+            ],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::Single {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::FloatDrag { min: 0.0 },
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::IntegerDrag { min: -5.0 },
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn text_decorators_make_a_multiline_box() {
+        let view = decorated(
+            vec![FieldValue::Text("a".into()), FieldValue::Text("b".into())],
+            vec![
+                vec![FieldDecorator::TextArea {
+                    min_lines: 3,
+                    max_lines: 10,
+                }],
+                vec![FieldDecorator::Multiline(5)],
+            ],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::Single {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::MultilineText { lines: 3 },
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::MultilineText { lines: 5 },
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decorators_that_cannot_apply_leave_the_widget_alone() {
+        let numeric = decorated(
+            vec![FieldValue::F32(1.0), FieldValue::Text("x".into())],
+            vec![
+                vec![FieldDecorator::TextArea {
+                    min_lines: 3,
+                    max_lines: 3,
+                }],
+                vec![FieldDecorator::Range { min: 0.0, max: 1.0 }],
+            ],
+        );
+        assert_eq!(
+            rows(&numeric),
+            vec![
+                FieldRow::Single {
+                    index: 0,
+                    field: "a".to_string(),
+                    widget: FieldWidget::Float,
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 1,
+                    field: "b".to_string(),
+                    widget: FieldWidget::Text,
+                    tooltip: None,
+                },
+            ]
+        );
+        // A range belongs to one scalar: a vector row keeps the plain element
+        // widget and the tooltip.
+        let vector = decorated(
+            vec![FieldValue::Array(vec![
+                FieldValue::F32(1.0),
+                FieldValue::F32(2.0),
+            ])],
+            vec![vec![
+                FieldDecorator::Range { min: 0.0, max: 1.0 },
+                FieldDecorator::Tooltip("Vec".into()),
+            ]],
+        );
+        assert_eq!(
+            rows(&vector),
+            vec![FieldRow::Vector {
+                index: 0,
+                field: "a".to_string(),
+                widget: FieldWidget::Float,
+                elements: 2,
+                tooltip: Some("Vec".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn labels_drop_the_component_suffix_and_the_module_path() {
+        assert_eq!(
+            component_label("pill_master_renderer::component::TransformComponent"),
+            "Transform"
+        );
+        assert_eq!(component_label("TransformComponent"), "Transform");
+        assert_eq!(
+            component_label("italian_brainrot::TagAlphaComponent"),
+            "TagAlpha"
+        );
+        assert_eq!(component_label("pill_spline::Spline"), "Spline");
+        assert_eq!(component_label("Weird"), "Weird");
+    }
+
+    #[test]
+    fn icons_follow_the_component_name() {
+        assert_eq!(
+            component_icon("x::TransformComponent"),
+            Icon::ArrowsOutCardinal
+        );
+        assert_eq!(component_icon("x::MeshRendererComponent"), Icon::Cube);
+        assert_eq!(component_icon("x::BoxCollider"), Icon::CubeTransparent);
+        assert_eq!(component_icon("x::SpriteComponent"), Icon::Image);
+        assert_eq!(component_icon("x::TextureAsset"), Icon::Image);
+        assert_eq!(component_icon("x::MaterialComponent"), Icon::Sphere);
+        assert_eq!(component_icon("x::DirectionalLightComponent"), Icon::Power);
+        assert_eq!(component_icon("x::CameraComponent"), Icon::MonitorPlay);
+        assert_eq!(component_icon("x::AudioSource"), Icon::Play);
+        assert_eq!(component_icon("x::HealthBehaviour"), Icon::Code);
+        assert_eq!(component_icon("x::SomeScript"), Icon::Code);
+        assert_eq!(component_icon("x::RigidbodyBody"), Icon::ArrowsOut);
+        assert_eq!(component_icon("x::UnknownThing"), Icon::SlidersHorizontal);
+    }
+
+    #[test]
+    fn vector_axes_are_named_and_coloured_like_the_gizmo_guides() {
+        assert_eq!(
+            (0..4).map(axis_label).collect::<Vec<_>>(),
+            vec!["X", "Y", "Z", "W"]
+        );
+        let red = axis_color(0);
+        let green = axis_color(1);
+        let blue = axis_color(2);
+        assert!(red.r() > red.g() && red.r() > red.b(), "X is red-ish");
+        assert!(
+            green.g() > green.r() && green.g() > green.b(),
+            "Y is green-ish"
+        );
+        assert!(blue.b() > blue.r() && blue.b() > blue.g(), "Z is blue-ish");
+        assert_eq!(axis_color(3), Color32::GRAY);
     }
 }

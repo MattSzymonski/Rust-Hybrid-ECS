@@ -24,7 +24,7 @@ use pill_editor_core_egui::assets::{self, AssetDialog};
 use pill_editor_core_egui::browser::{self, ProjectBrowser};
 use pill_editor_core_egui::commands::PendingEditorCommands;
 use pill_editor_core_egui::editor_state::{
-    AssetListing, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
+    AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
 };
 use pill_editor_core_egui::entities;
 use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSpace};
@@ -32,7 +32,9 @@ use pill_editor_core_egui::inspector;
 use pill_editor_core_egui::layout::EditorTab;
 use pill_editor_core_egui::menubar;
 use pill_editor_core_egui::preferences;
-use pill_editor_core_egui::session::{EguiShellState, MenubarSession, ToolboxSession};
+use pill_editor_core_egui::session::{
+    EguiShellState, InspectorSession, MenubarSession, ToolboxSession,
+};
 use pill_editor_core_egui::systems;
 use pill_editor_core_egui::toolbox;
 use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
@@ -142,6 +144,7 @@ pub fn run_frame(
         toolbox,
         browser,
         menubar,
+        inspector,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -155,6 +158,7 @@ pub fn run_frame(
         preferences_draft,
         toolbox,
         browser,
+        inspector,
         scene_rects: [None; SCENE_VIEWPORTS],
         game_rect: None,
         overlay_regions: Vec::new(),
@@ -428,6 +432,14 @@ pub fn about_window(context: &egui::Context, mark: &egui::TextureHandle, open: &
     *open = opened;
 }
 
+/// The Inspector's label column width, in points: Unity's label/control
+/// split leaves the control side most of a narrow panel.
+const INSPECTOR_LABEL_WIDTH: f32 = 80.0;
+
+/// One vector element's group width, in points: the axis letter and its
+/// field together, so a wrap moves the pair and never separates them.
+const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
+
 /// The gap between two menu titles in the bar.
 const MENU_TITLE_GAP: f32 = 2.0;
 
@@ -467,6 +479,8 @@ pub struct EditorTabViewer<'a> {
     /// The floating viewport toolboxes' session state: where each scene
     /// view's toolbox floats and what the log already reported.
     pub toolbox: &'a mut ToolboxSession,
+    /// The Inspector's collapsed sections and its logged geometry.
+    pub inspector: &'a mut InspectorSession,
     /// The Assets tab's project browser: the folder its grid lists, the
     /// tree's open folders and the tile size.
     pub browser: &'a mut ProjectBrowser,
@@ -528,6 +542,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 &*self.selection,
                 self.pending,
                 &mut self.overlay_regions,
+                self.inspector,
             ),
             EditorTab::Assets => assets_tab(
                 ui,
@@ -1302,13 +1317,12 @@ pub fn select_entity(selection: &mut EditorSelection, entity: Entity) -> bool {
     true
 }
 
-/// The Inspector tab: the selected entity's components with interactive
-/// field widgets (checkboxes, number drags, text fields; an array field
-/// gets one control per element), and the selected asset's import settings
-/// as editable leaves. Every commit is a recorded `SetField` /
+/// The Inspector tab: the selected entity's components as collapsible
+/// sections (a caret, the component's duotone icon and its label), the Add
+/// Component button in the tab's top-right, and the selected asset's import
+/// settings as editable leaves below. Every commit is a recorded `SetField` /
 /// `SetArrayElement` / `SetAssetSettings` edit, coalesced per widget so a
-/// drag or a typing run is one undo step - the add/remove component actions
-/// stay with the W-0027 port.
+/// drag or a typing run is one undo step.
 #[pill_hot_fn]
 pub fn inspector_tab(
     ui: &mut egui::Ui,
@@ -1316,13 +1330,13 @@ pub fn inspector_tab(
     selection: &EditorSelection,
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
+    session: &mut InspectorSession,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         match snapshot.detail.as_ref() {
             Some(detail) => {
-                ui.label(egui::RichText::new(format!("entity {}", detail.entity)).strong());
-                ui.separator();
-                entity_inspector(ui, snapshot, detail, pending, overlay_regions);
+                inspector_header(ui, snapshot, detail, pending, overlay_regions, session);
+                entity_inspector(ui, snapshot, detail, pending, overlay_regions, session);
             }
             None => match selection.entity {
                 Some(entity) => {
@@ -1369,25 +1383,206 @@ pub fn inspector_tab(
     });
 }
 
-/// One entity's components; every editable field is a widget row and every
-/// component heading carries its menu (attach and detach - the native
-/// Inspector's two component actions, recorded and undoable).
+/// The Inspector's top row: the selected entity's name and, right aligned,
+/// the Add Component button with the components it can attach.
+pub fn inspector_header(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    detail: &EntityDetail,
+    pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+    session: &mut InspectorSession,
+) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("entity {}", detail.entity)).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let button = ui
+                .add(
+                    icons::IconButton::new(icons::Icon::Plus, "")
+                        .fixed_size(egui::vec2(24.0, 18.0))
+                        .active(session.add_open),
+                )
+                .on_hover_text("Add Component");
+            if session.add_rect != Some(button.rect) {
+                session.add_rect = Some(button.rect);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    x = button.rect.min.x,
+                    y = button.rect.min.y,
+                    width = button.rect.width(),
+                    height = button.rect.height(),
+                    "[editor] inspector add rect"
+                );
+            }
+            if button.clicked() {
+                session.add_open = !session.add_open;
+                if session.add_open {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        "[editor] inspector add opened"
+                    );
+                }
+            }
+        });
+    });
+    if session.add_open {
+        inspector_add_popup(ui, snapshot, detail, pending, overlay_regions, session);
+    }
+}
+
+/// The Add Component popup: every registered addable component the entity
+/// does not carry yet, under the `+` button. A pick queues the recorded
+/// `add {short}` step the header menu and the scripted channel queue.
+pub fn inspector_add_popup(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    detail: &EntityDetail,
+    pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+    session: &mut InspectorSession,
+) {
+    let Some(anchor) = session.add_rect else {
+        return;
+    };
+    let addable = addable_components(snapshot, detail);
+    let mut picked = None;
+    let area = egui::Area::new(egui::Id::new("pill_editor_shell_egui.inspector_add"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(anchor.max.x - 220.0, anchor.max.y + 2.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(220.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        if addable.is_empty() {
+                            ui.label(egui::RichText::new("every component is attached").weak());
+                        }
+                        for type_name in &addable {
+                            let response = ui.selectable_label(
+                                false,
+                                icons::rich(
+                                    inspector::component_icon(type_name),
+                                    inspector::component_label(type_name),
+                                ),
+                            );
+                            if remember_entry_rect(
+                                &mut session.add_entries,
+                                type_name,
+                                response.rect,
+                            ) {
+                                pill_core::info!(
+                                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                                    component = type_name,
+                                    x = response.rect.min.x,
+                                    y = response.rect.min.y,
+                                    width = response.rect.width(),
+                                    height = response.rect.height(),
+                                    "[editor] inspector add entry"
+                                );
+                            }
+                            if response.clicked() {
+                                picked = Some((*type_name).to_string());
+                                ui.close();
+                            }
+                        }
+                    });
+            });
+        });
+    // The popup floats over the panels; its rectangle is the UI's.
+    overlay_regions.push(shell_rect(area.response.rect));
+    if let Some(type_name) = picked {
+        let (command, label) = inspector::component_add(detail.entity, &type_name);
+        pending.push_recorded(vec![command], label, None);
+        session.add_open = false;
+    } else if addable.is_empty() {
+        // Nothing to pick: a second click on the button closes it.
+    }
+    // A press anywhere outside the button and the popup closes the popup.
+    let outside = ui.ctx().input(|input| {
+        input.pointer.any_pressed()
+            && input.pointer.interact_pos().is_some_and(|position| {
+                !anchor.contains(position) && !area.response.rect.contains(position)
+            })
+    });
+    if outside {
+        session.add_open = false;
+    }
+}
+
+/// The components a section may attach: registered, addable and not already
+/// on the entity.
+pub fn addable_components<'a>(snapshot: &'a EditorSnapshot, detail: &EntityDetail) -> Vec<&'a str> {
+    snapshot
+        .components
+        .iter()
+        .filter(|registered| registered.addable)
+        .filter(|registered| {
+            !detail
+                .components
+                .iter()
+                .any(|carried| carried.type_name == registered.type_name)
+        })
+        .map(|registered| registered.type_name.as_str())
+        .collect()
+}
+
+/// Whether `rect` is new for `key`, recording it as the placement to compare
+/// against. The caller logs with its own literal message - a token passed as
+/// a variable would become a tracing field instead of the message.
+pub fn remember_entry_rect(
+    logged: &mut Vec<(String, egui::Rect)>,
+    key: &str,
+    rect: egui::Rect,
+) -> bool {
+    if let Some((_, previous)) = logged.iter_mut().find(|(name, _)| name == key) {
+        if *previous == rect {
+            return false;
+        }
+        *previous = rect;
+    } else {
+        logged.push((key.to_string(), rect));
+    }
+    true
+}
+
+/// Note one keyed rectangle, answering whether it is new or has moved, so a
+/// section that shifts as the panel grows or collapses reports its place
+/// again instead of leaving a stale one in the log.
+pub fn remember_moved_rect(
+    logged: &mut Vec<(String, egui::Rect)>,
+    key: &str,
+    rect: egui::Rect,
+) -> bool {
+    if let Some(entry) = logged.iter_mut().find(|(name, _)| name == key) {
+        if entry.1 == rect {
+            return false;
+        }
+        entry.1 = rect;
+        return true;
+    }
+    logged.push((key.to_string(), rect));
+    true
+}
+
+/// One entity's components as collapsible sections: a header bar (caret,
+/// duotone icon, label) that toggles the session's collapse state and carries
+/// the component menu, then the rows the field model asks for.
 pub fn entity_inspector(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     detail: &EntityDetail,
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
+    session: &mut InspectorSession,
 ) {
     for component in &detail.components {
-        let heading = ui.add(
-            egui::Label::new(egui::RichText::new(component.type_name.as_str()).strong())
-                .sense(egui::Sense::click()),
-        );
-        if heading.secondary_clicked() {
+        let collapsed = session.collapsed.contains(&component.type_name);
+        let header = inspector_section_header(ui, component, collapsed, session);
+        if header.secondary_clicked() {
             log_context_menu("inspector");
         }
-        let opened = heading.context_menu(|ui| {
+        let opened = header.context_menu(|ui| {
             component_menu_items(
                 ui,
                 snapshot,
@@ -1397,91 +1592,359 @@ pub fn entity_inspector(
             )
         });
         mark_menu_region(opened, overlay_regions);
-        if !component.editable {
-            ui.label(egui::RichText::new("no editable fields").weak().italics());
-            ui.separator();
-            continue;
-        }
-        for (descriptor, value) in component.fields.iter().zip(component.values.iter()) {
-            entity_field_row(
-                ui,
-                detail.entity,
-                &component.type_name,
-                descriptor.name,
-                value,
-                pending,
+        if header.clicked() {
+            if collapsed {
+                session.collapsed.remove(&component.type_name);
+            } else {
+                session.collapsed.insert(component.type_name.clone());
+            }
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                component = component.type_name.as_str(),
+                collapsed = !collapsed,
+                "[editor] inspector section"
             );
         }
-        ui.separator();
+        if collapsed {
+            continue;
+        }
+        if !component.editable {
+            ui.label(egui::RichText::new("no editable fields").weak().italics());
+            ui.add_space(4.0);
+            continue;
+        }
+        for row in inspector::rows(component) {
+            inspector_field_row(ui, detail.entity, component, &row, pending, session);
+        }
+        ui.add_space(6.0);
     }
 }
 
-/// One field row: the widget its value's kind asks for, and the recorded
-/// commit its change queues. A field that changed while the snapshot was
-/// stale is not a problem: each commit carries the widget's value, and a
-/// change the next snapshot overwrites was one the user just made anyway.
-pub fn entity_field_row(
+/// One component section's header bar: the foldout caret, the component's
+/// duotone icon and its label, on the panel's control fill. The bar is
+/// clickable as a whole (a click toggles the section) and logs its rectangle
+/// once per placement.
+pub fn inspector_section_header(
+    ui: &mut egui::Ui,
+    component: &ComponentView,
+    collapsed: bool,
+    session: &mut InspectorSession,
+) -> egui::Response {
+    let caret = if collapsed {
+        icons::Icon::CaretRight
+    } else {
+        icons::Icon::CaretDown
+    };
+    let frame = egui::Frame::new()
+        .fill(style::CONTROL_FILL)
+        .corner_radius(3.0)
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (caret_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                icons::paint_duotone(ui.painter(), caret_rect, caret, style::TEXT_MUTED);
+                let (icon_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                icons::paint_duotone(
+                    ui.painter(),
+                    icon_rect,
+                    inspector::component_icon(&component.type_name),
+                    ui.visuals().text_color(),
+                );
+                ui.label(
+                    egui::RichText::new(inspector::component_label(&component.type_name)).strong(),
+                );
+            });
+        });
+    let rect = frame.response.rect;
+    if remember_moved_rect(&mut session.section_rects, &component.type_name, rect) {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            component = component.type_name.as_str(),
+            x = rect.min.x,
+            y = rect.min.y,
+            width = rect.width(),
+            height = rect.height(),
+            "[editor] inspector section rect"
+        );
+    }
+    ui.interact(
+        rect,
+        ui.id()
+            .with(("inspector-section", component.type_name.as_str())),
+        egui::Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// One row of a component section, drawn from the Inspector's row model: a
+/// separator line or gap a field's decorators declared, a single widget, a
+/// vector row (side-by-side fields with axis labels in the gizmo's colours),
+/// or a read-only value.
+pub fn inspector_field_row(
     ui: &mut egui::Ui,
     entity: Entity,
-    component: &str,
-    field: &str,
-    value: &FieldValue,
+    component: &ComponentView,
+    row: &inspector::FieldRow,
     pending: &mut PendingEditorCommands,
+    session: &mut InspectorSession,
 ) {
-    match value {
-        FieldValue::Text(current) => {
-            let mut edited = current.clone();
+    let type_name = component.type_name.as_str();
+    match row {
+        inspector::FieldRow::Header { text } => {
+            if remember_inspector_row(session, format!("{type_name}|header|{text}")) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    text = text.as_str(),
+                    "[editor] inspector row kind=header"
+                );
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(text).strong());
+            ui.add_space(2.0);
+        }
+        inspector::FieldRow::Space { pixels } => {
+            if remember_inspector_row(session, format!("{type_name}|space|{pixels}")) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    pixels = *pixels,
+                    "[editor] inspector row kind=space"
+                );
+            }
+            ui.add_space(*pixels);
+        }
+        inspector::FieldRow::Single {
+            index,
+            field,
+            widget,
+            tooltip,
+        } => {
+            let Some(value) = component.values.get(*index) else {
+                return;
+            };
+            let tooltip = tooltip.as_deref();
+            if remember_inspector_row(
+                session,
+                format!(
+                    "{type_name}|field|{field}|{}|{}",
+                    field_widget_name(widget),
+                    tooltip.unwrap_or_default()
+                ),
+            ) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    widget = field_widget_name(widget),
+                    tooltip = tooltip.unwrap_or_default(),
+                    "[editor] inspector row kind=field"
+                );
+            }
+            match value {
+                FieldValue::Text(current) => {
+                    let mut edited = current.clone();
+                    let lines = match widget {
+                        inspector::FieldWidget::MultilineText { lines } => Some(*lines),
+                        _ => None,
+                    };
+                    inspector_row(ui, field, tooltip, &mut |ui| {
+                        let text_edit = match lines {
+                            Some(lines) => egui::TextEdit::multiline(&mut edited)
+                                .desired_rows(lines)
+                                .desired_width(f32::INFINITY),
+                            None => {
+                                egui::TextEdit::singleline(&mut edited).desired_width(f32::INFINITY)
+                            }
+                        };
+                        let response = ui.add(text_edit);
+                        if response.lost_focus() && edited != *current {
+                            let committed = FieldValue::Text(edited.clone());
+                            let (command, label) =
+                                inspector::field_edit(entity, type_name, field, committed);
+                            pending.push_recorded(
+                                vec![command],
+                                label,
+                                Some(inspector::field_coalesce_key(entity, type_name, field)),
+                            );
+                        }
+                    });
+                }
+                other => {
+                    inspector_row(ui, field, tooltip, &mut |ui| match scalar_edit_decorated(
+                        ui, other, widget,
+                    ) {
+                        Some(edited) => {
+                            let (command, label) =
+                                inspector::field_edit(entity, type_name, field, edited);
+                            pending.push_recorded(
+                                vec![command],
+                                label,
+                                Some(inspector::field_coalesce_key(entity, type_name, field)),
+                            );
+                        }
+                        None => {
+                            ui.label(format_field_value(other));
+                        }
+                    });
+                }
+            }
+        }
+        inspector::FieldRow::Vector {
+            index,
+            field,
+            elements,
+            tooltip,
+            ..
+        } => {
+            let Some(FieldValue::Array(values)) = component.values.get(*index) else {
+                return;
+            };
+            if remember_inspector_row(
+                session,
+                format!(
+                    "{type_name}|vector|{field}|{}",
+                    tooltip.as_deref().unwrap_or_default()
+                ),
+            ) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    tooltip = tooltip.as_deref().unwrap_or_default(),
+                    "[editor] inspector row kind=vector"
+                );
+            }
+            // One row that wraps: a wide panel shows X/Y/Z side by side, a
+            // narrow dock moves the overflowing fields to the next line
+            // instead of clipping them past the panel's edge.
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(field).color(style::TEXT_MUTED));
-                let response = ui.add(egui::TextEdit::singleline(&mut edited).desired_width(160.0));
-                if response.lost_focus() && edited != *current {
-                    let (command, label) =
-                        inspector::field_edit(entity, component, field, FieldValue::Text(edited));
-                    pending.push_recorded(
-                        vec![command],
-                        label,
-                        Some(inspector::field_coalesce_key(entity, component, field)),
+                let label = ui.add_sized(
+                    egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
+                    egui::Label::new(egui::RichText::new(field).color(style::TEXT_MUTED))
+                        .truncate(),
+                );
+                if let Some(text) = tooltip.as_deref() {
+                    label.on_hover_text(text);
+                }
+                for (element_index, element) in values.iter().take(*elements).enumerate() {
+                    // One axis letter with its field as a unit, so a wrap
+                    // never separates a label from its widget.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(inspector::axis_label(element_index))
+                                    .color(inspector::axis_color(element_index))
+                                    .small(),
+                            );
+                            if let Some(edited) = scalar_edit(ui, element) {
+                                let (command, label) = inspector::element_edit(
+                                    entity,
+                                    type_name,
+                                    field,
+                                    element_index,
+                                    edited,
+                                );
+                                pending.push_recorded(
+                                    vec![command],
+                                    label,
+                                    Some(inspector::field_coalesce_key(
+                                        entity,
+                                        type_name,
+                                        &format!("{field}[{element_index}]"),
+                                    )),
+                                );
+                            }
+                        },
                     );
+                    ui.add_space(2.0);
                 }
             });
         }
-        FieldValue::Array(elements) if elements.iter().all(is_scalar_field) => {
-            for (index, element) in elements.iter().enumerate() {
-                let label = format!("{field}[{index}]");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(&label).color(style::TEXT_MUTED));
-                    if let Some(edited) = scalar_edit(ui, element) {
-                        let (command, commit_label) =
-                            inspector::element_edit(entity, component, field, index, edited);
-                        pending.push_recorded(
-                            vec![command],
-                            commit_label,
-                            Some(inspector::field_coalesce_key(entity, component, &label)),
-                        );
-                    }
-                });
+        inspector::FieldRow::ReadOnly {
+            index,
+            field,
+            tooltip,
+        } => {
+            let Some(value) = component.values.get(*index) else {
+                return;
+            };
+            if remember_inspector_row(
+                session,
+                format!(
+                    "{type_name}|read-only|{field}|{}",
+                    tooltip.as_deref().unwrap_or_default()
+                ),
+            ) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    tooltip = tooltip.as_deref().unwrap_or_default(),
+                    "[editor] inspector row kind=read-only"
+                );
             }
-        }
-        other => {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(field).color(style::TEXT_MUTED));
-                match scalar_edit(ui, other) {
-                    Some(edited) => {
-                        let (command, label) =
-                            inspector::field_edit(entity, component, field, edited);
-                        pending.push_recorded(
-                            vec![command],
-                            label,
-                            Some(inspector::field_coalesce_key(entity, component, field)),
-                        );
-                    }
-                    None => {
-                        ui.label(format_field_value(other));
-                    }
-                }
+            inspector_row(ui, field, tooltip.as_deref(), &mut |ui| {
+                ui.label(egui::RichText::new(format_field_value(value)).weak());
             });
         }
     }
+}
+
+/// Note one Inspector row's signature, answering whether it is new, so a
+/// panel that redraws every frame does not flood the log with the same row.
+pub fn remember_inspector_row(session: &mut InspectorSession, signature: String) -> bool {
+    if session
+        .rows_logged
+        .iter()
+        .any(|logged| *logged == signature)
+    {
+        return false;
+    }
+    session.rows_logged.push(signature);
+    true
+}
+
+/// The wire name a row's widget logs under, so suites can assert what the
+/// model chose without reading pixels.
+pub fn field_widget_name(widget: &inspector::FieldWidget) -> &'static str {
+    match widget {
+        inspector::FieldWidget::Checkbox => "checkbox",
+        inspector::FieldWidget::Integer => "integer",
+        inspector::FieldWidget::Float => "float",
+        inspector::FieldWidget::Text => "text",
+        inspector::FieldWidget::ReadOnly => "read-only",
+        inspector::FieldWidget::FloatSlider { .. } => "float-slider",
+        inspector::FieldWidget::IntegerSlider { .. } => "integer-slider",
+        inspector::FieldWidget::FloatDrag { .. } => "float-drag",
+        inspector::FieldWidget::IntegerDrag { .. } => "integer-drag",
+        inspector::FieldWidget::MultilineText { .. } => "multiline",
+    }
+}
+
+/// The Inspector's two columns: the field's label on the left, its widget on
+/// the right - Unity's label/control split. A decorator's tooltip shows while
+/// the pointer rests on the label.
+pub fn inspector_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    tooltip: Option<&str>,
+    widget: &mut dyn FnMut(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let label = ui.add_sized(
+            egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
+            egui::Label::new(egui::RichText::new(label).color(style::TEXT_MUTED)).truncate(),
+        );
+        if let Some(text) = tooltip {
+            label.on_hover_text(text);
+        }
+        widget(ui);
+    });
 }
 
 /// Whether a value has its own widget kind.
@@ -1501,6 +1964,244 @@ pub fn is_scalar_field(value: &FieldValue) -> bool {
             | FieldValue::Usize(_)
             | FieldValue::Bool(_)
     )
+}
+
+/// The edit control for one scalar, honouring the widget the row model chose:
+/// a slider over a `[Range]`, a drag value with a `[Min]` floor, and the plain
+/// widget for every other kind.
+///
+/// A whole-number slider or floor runs through `f64` and rounds back, which is
+/// exact for the 8- to 32-bit kinds and precise to the float mantissa above
+/// that.
+pub fn scalar_edit_decorated(
+    ui: &mut egui::Ui,
+    value: &FieldValue,
+    widget: &inspector::FieldWidget,
+) -> Option<FieldValue> {
+    use inspector::FieldWidget as Row;
+    match (value, widget) {
+        (FieldValue::F32(current), Row::FloatSlider { min, max }) => {
+            let mut edited = *current;
+            let (low, high) = ascending(*min, *max);
+            ui.add(egui::Slider::new(&mut edited, low..=high).max_decimals(4))
+                .changed()
+                .then_some(FieldValue::F32(edited))
+        }
+        (FieldValue::F32(current), Row::FloatDrag { min }) => {
+            let mut edited = current.max(*min);
+            ui.add(
+                egui::DragValue::new(&mut edited)
+                    .range(*min..=f32::MAX)
+                    .speed(0.05),
+            )
+            .changed()
+            .then_some(FieldValue::F32(edited))
+        }
+        (FieldValue::F64(current), Row::FloatSlider { min, max }) => {
+            let mut edited = *current;
+            let (low, high) = ascending(*min, *max);
+            ui.add(egui::Slider::new(&mut edited, low as f64..=high as f64).max_decimals(9))
+                .changed()
+                .then_some(FieldValue::F64(edited))
+        }
+        (FieldValue::F64(current), Row::FloatDrag { min }) => {
+            let mut edited = current.max(*min as f64);
+            ui.add(
+                egui::DragValue::new(&mut edited)
+                    .range(*min as f64..=f64::MAX)
+                    .speed(0.05)
+                    .max_decimals(9),
+            )
+            .changed()
+            .then_some(FieldValue::F64(edited))
+        }
+        (FieldValue::I8(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            i8::MIN as f64,
+            i8::MAX as f64,
+        )
+        .map(|edited| FieldValue::I8(edited as i8)),
+        (FieldValue::I16(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            i16::MIN as f64,
+            i16::MAX as f64,
+        )
+        .map(|edited| FieldValue::I16(edited as i16)),
+        (FieldValue::I32(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            i32::MIN as f64,
+            i32::MAX as f64,
+        )
+        .map(|edited| FieldValue::I32(edited as i32)),
+        (FieldValue::I64(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            i64::MIN as f64,
+            i64::MAX as f64,
+        )
+        .map(|edited| FieldValue::I64(edited as i64)),
+        (FieldValue::U8(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            u8::MIN as f64,
+            u8::MAX as f64,
+        )
+        .map(|edited| FieldValue::U8(edited as u8)),
+        (FieldValue::U16(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            u16::MIN as f64,
+            u16::MAX as f64,
+        )
+        .map(|edited| FieldValue::U16(edited as u16)),
+        (FieldValue::U32(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            u32::MIN as f64,
+            u32::MAX as f64,
+        )
+        .map(|edited| FieldValue::U32(edited as u32)),
+        (FieldValue::U64(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            u64::MIN as f64,
+            u64::MAX as f64,
+        )
+        .map(|edited| FieldValue::U64(edited as u64)),
+        (FieldValue::Usize(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            usize::MIN as f64,
+            usize::MAX as f64,
+        )
+        .map(|edited| FieldValue::Usize(edited as usize)),
+        (FieldValue::Isize(current), Row::IntegerSlider { min, max }) => integer_slider(
+            ui,
+            *current as f64,
+            (*min, *max),
+            isize::MIN as f64,
+            isize::MAX as f64,
+        )
+        .map(|edited| FieldValue::Isize(edited as isize)),
+        (FieldValue::I8(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, i8::MIN as f64, i8::MAX as f64)
+                .map(|edited| FieldValue::I8(edited as i8))
+        }
+        (FieldValue::I16(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, i16::MIN as f64, i16::MAX as f64)
+                .map(|edited| FieldValue::I16(edited as i16))
+        }
+        (FieldValue::I32(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, i32::MIN as f64, i32::MAX as f64)
+                .map(|edited| FieldValue::I32(edited as i32))
+        }
+        (FieldValue::I64(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, i64::MIN as f64, i64::MAX as f64)
+                .map(|edited| FieldValue::I64(edited as i64))
+        }
+        (FieldValue::U8(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, u8::MIN as f64, u8::MAX as f64)
+                .map(|edited| FieldValue::U8(edited as u8))
+        }
+        (FieldValue::U16(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, u16::MIN as f64, u16::MAX as f64)
+                .map(|edited| FieldValue::U16(edited as u16))
+        }
+        (FieldValue::U32(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, u32::MIN as f64, u32::MAX as f64)
+                .map(|edited| FieldValue::U32(edited as u32))
+        }
+        (FieldValue::U64(current), Row::IntegerDrag { min }) => {
+            integer_drag(ui, *current as f64, *min, u64::MIN as f64, u64::MAX as f64)
+                .map(|edited| FieldValue::U64(edited as u64))
+        }
+        (FieldValue::Usize(current), Row::IntegerDrag { min }) => integer_drag(
+            ui,
+            *current as f64,
+            *min,
+            usize::MIN as f64,
+            usize::MAX as f64,
+        )
+        .map(|edited| FieldValue::Usize(edited as usize)),
+        (FieldValue::Isize(current), Row::IntegerDrag { min }) => integer_drag(
+            ui,
+            *current as f64,
+            *min,
+            isize::MIN as f64,
+            isize::MAX as f64,
+        )
+        .map(|edited| FieldValue::Isize(edited as isize)),
+        _ => scalar_edit(ui, value),
+    }
+}
+
+/// Two bounds in ascending order, so a swapped decorator pair still draws a
+/// usable slider.
+pub fn ascending(min: f32, max: f32) -> (f32, f32) {
+    if min <= max {
+        (min, max)
+    } else {
+        (max, min)
+    }
+}
+
+/// A whole-number slider over a decorator range, clamped to the kind's own
+/// range so a wide `[Range]` cannot overflow it.
+pub fn integer_slider(
+    ui: &mut egui::Ui,
+    current: f64,
+    range: (f32, f32),
+    kind_min: f64,
+    kind_max: f64,
+) -> Option<f64> {
+    let low = (range.0 as f64).clamp(kind_min, kind_max);
+    let high = (range.1 as f64).clamp(kind_min, kind_max);
+    let (low, high) = if low <= high {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    let mut edited = current.clamp(low, high).round();
+    ui.add(
+        egui::Slider::new(&mut edited, low..=high)
+            .step_by(1.0)
+            .fixed_decimals(0),
+    )
+    .changed()
+    .then_some(edited.round())
+}
+
+/// A whole-number drag value with a decorator floor, clamped to the kind's own
+/// range.
+pub fn integer_drag(
+    ui: &mut egui::Ui,
+    current: f64,
+    floor: f32,
+    kind_min: f64,
+    kind_max: f64,
+) -> Option<f64> {
+    let low = (floor as f64).clamp(kind_min, kind_max);
+    let mut edited = current.clamp(low, kind_max).round();
+    ui.add(
+        egui::DragValue::new(&mut edited)
+            .range(low..=kind_max)
+            .speed(1.0)
+            .fixed_decimals(0),
+    )
+    .changed()
+    .then_some(edited.round())
 }
 
 /// The edit control for one scalar: a checkbox for booleans, a drag value
@@ -2479,11 +3180,19 @@ mod tests {
         let context = egui::Context::default();
         style::apply(&context);
         let mut regions = Vec::new();
+        let mut inspector_session = InspectorSession::default();
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 entities_tab(ui, &snapshot, &mut selection, &mut pending, &mut regions);
                 systems_tab(ui, &snapshot, &mut pending);
-                inspector_tab(ui, &snapshot, &selection, &mut pending, &mut regions);
+                inspector_tab(
+                    ui,
+                    &snapshot,
+                    &selection,
+                    &mut pending,
+                    &mut regions,
+                    &mut inspector_session,
+                );
                 assets_tab(
                     ui,
                     &snapshot,
@@ -2669,6 +3378,7 @@ mod tests {
                         size: 4,
                         align: 4,
                         element_count: 0,
+                        decorators: std::borrow::Cow::Borrowed(&[]),
                     }],
                     values: vec![FieldValue::F32(3.0)],
                 },
@@ -2710,9 +3420,17 @@ mod tests {
         let context = egui::Context::default();
         style::apply(&context);
         let mut regions = Vec::new();
+        let mut inspector_session = InspectorSession::default();
         let _ = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                inspector_tab(ui, &snapshot, &selection, &mut pending, &mut regions);
+                inspector_tab(
+                    ui,
+                    &snapshot,
+                    &selection,
+                    &mut pending,
+                    &mut regions,
+                    &mut inspector_session,
+                );
             });
         });
         assert!(pending.batches.is_empty(), "drawing queues no edits");

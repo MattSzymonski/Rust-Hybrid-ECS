@@ -16,7 +16,23 @@ namespace TracyLive.Loader;
 
 internal sealed record ComponentFieldManifest(
     string Name, int Offset, int Size, string PrimitiveType,
-    ComponentFieldManifest[] Fields, string? Default = null);
+    ComponentFieldManifest[] Fields, ComponentFieldDecoratorManifest[] Decorators,
+    string? Default = null);
+
+/// <summary>
+/// One presentation decorator a field declared, in the editor's vocabulary.
+/// </summary>
+/// <remarks>
+/// One record shape covers the whole vocabulary instead of a polymorphic
+/// union, because the source-generated JSON contract handles a flat record
+/// with unused optional members and nothing else. <see cref="Kind"/> picks
+/// the decorator; the payload members it reads are documented on each kind.
+/// The host refuses a decorator that is missing the payload its kind needs.
+/// </remarks>
+internal sealed record ComponentFieldDecoratorManifest(
+    string Kind, string? Text = null, float? Number = null,
+    float? Min = null, float? Max = null, int? MinLines = null, int? MaxLines = null,
+    int? Lines = null);
 
 internal sealed record ProjectManifest(
     ulong StableIdLow, ulong StableIdHigh, string FullName,
@@ -258,12 +274,64 @@ internal static class ProjectManifestBuilder
                 NativeLayout.SizeOf(valueType),
                 primitive ? valueType.FullName! : "struct",
                 primitive ? [] : DescribeFields(valueType),
+                DescribeDecorators(field),
                 declaredDefault?.Literal);
         })
         .ToArray();
 
+    /// <summary>
+    /// The presentation decorators a field declared, in declaration order.
+    /// </summary>
+    /// <remarks>
+    /// Presentation only: these never enter <see cref="SchemaText"/>, so
+    /// decorating a field can never migrate a component's rows. Read on nested
+    /// fields too, so a decorated nested leaf reaches the Inspector the same
+    /// way a top-level one does.
+    /// </remarks>
+    private static ComponentFieldDecoratorManifest[] DescribeDecorators(FieldInfo field)
+    {
+        List<ComponentFieldDecoratorManifest> decorators = [];
+        foreach (object attribute in field.GetCustomAttributes(inherit: false))
+        {
+            switch (attribute)
+            {
+                case HideInInspectorAttribute:
+                    decorators.Add(new ComponentFieldDecoratorManifest("hide_in_inspector"));
+                    break;
+                case HeaderAttribute header:
+                    decorators.Add(new ComponentFieldDecoratorManifest("header", Text: header.header));
+                    break;
+                case SpaceAttribute space:
+                    decorators.Add(new ComponentFieldDecoratorManifest("space", Number: space.height));
+                    break;
+                case TooltipAttribute tooltip:
+                    decorators.Add(new ComponentFieldDecoratorManifest("tooltip", Text: tooltip.tooltip));
+                    break;
+                case RangeAttribute range:
+                    decorators.Add(new ComponentFieldDecoratorManifest(
+                        "range", Min: range.min, Max: range.max));
+                    break;
+                case TextAreaAttribute area:
+                    decorators.Add(new ComponentFieldDecoratorManifest(
+                        "text_area", MinLines: area.minLines, MaxLines: area.maxLines));
+                    break;
+                case MultilineAttribute multiline:
+                    decorators.Add(new ComponentFieldDecoratorManifest(
+                        "multiline", Lines: multiline.lines));
+                    break;
+                case MinAttribute min:
+                    decorators.Add(new ComponentFieldDecoratorManifest("min", Number: min.min));
+                    break;
+            }
+        }
+        return decorators.ToArray();
+    }
+
     private static string SchemaText(Type type, ComponentFieldManifest[] fields)
     {
+        // Layout only: names, offsets, sizes and types. A field's presentation
+        // decorators and its declared default are deliberately absent, so
+        // changing either never reads as a schema change.
         var text = new StringBuilder(type.FullName).Append('|')
             .Append(NativeLayout.SizeOf(type)).Append('|').Append(NativeLayout.AlignmentOf(type));
         AppendFields(text, fields);

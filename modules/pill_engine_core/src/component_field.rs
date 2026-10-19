@@ -717,6 +717,7 @@ impl World {
                     size: field.size,
                     align: field.align,
                     element_count: field.element_count,
+                    decorators: field.decorators.clone(),
                 });
             }
         }
@@ -1318,6 +1319,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "y",
@@ -1326,6 +1328,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -1353,6 +1356,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "an_int",
@@ -1361,6 +1365,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "a_bool",
@@ -1369,6 +1374,7 @@ mod tests {
             size: 1,
             align: 1,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         // In `#[repr(C)]` the `[i16; 3]` follows the `bool` at offset 8 and
         // only needs 2-byte alignment, so it starts at offset 10.
@@ -1379,6 +1385,7 @@ mod tests {
             size: 6,
             align: 2,
             element_count: 3,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -1405,6 +1412,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "b",
@@ -1413,6 +1421,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -1424,6 +1433,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "inner",
@@ -1432,6 +1442,7 @@ mod tests {
             size: 8,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "probe",
@@ -1440,6 +1451,7 @@ mod tests {
             size: 8,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -1507,6 +1519,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
 
         #[repr(C)]
@@ -1538,6 +1551,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
 
         #[repr(C)]

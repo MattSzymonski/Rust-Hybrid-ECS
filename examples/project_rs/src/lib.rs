@@ -81,11 +81,16 @@ impl Resource for SimulationTime {}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
 #[pill(persistable)]
 pub struct PhysicsState {
+    /// The simulation owns it; the Inspector leaves it out.
+    #[pill(hide_in_inspector)]
     pub delta_time: f32,
+    #[pill(header("Position"))]
     pub position_x: f32,
     pub position_y: f32,
+    #[pill(header("Velocity"), space(10.0))]
     pub velocity_x: f32,
     pub velocity_y: f32,
+    #[pill(tooltip("Radius of the ball in world units"), min(0.0))]
     pub radius: f32,
     pub active: bool,
 }
@@ -101,6 +106,11 @@ pub struct PhysicsState {
 #[pill(persistable)]
 pub struct SplineSample {
     /// Curve parameter this dot samples, running from 0.0 to 1.0.
+    #[pill(
+        header("Spline"),
+        tooltip("Curve parameter this dot samples"),
+        range(0.0, 1.0)
+    )]
     pub t: f32,
 }
 

@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 // External crates
 use pill_core::error::CSharpError;
 use pill_engine::archetype::{FieldPlan, LayoutField};
-use pill_engine::component_registry::ComponentFieldDescriptor;
+use pill_engine::component_registry::{ComponentFieldDescriptor, FieldDecorator};
 use pill_engine::{ComponentId, Engine};
 use serde::Deserialize;
 
@@ -275,8 +275,67 @@ pub(super) struct ManagedFieldManifest {
     /// Literal a newly added or reset field starts from, instead of zero.
     #[serde(default)]
     pub(super) default: Option<String>,
+    /// Presentation decorators the field declares, in declaration order.
+    ///
+    /// Defaulted so a manifest written before decorators existed still parses
+    /// during a reload that straddles the change.
+    #[serde(default)]
+    pub(super) decorations: Vec<ManagedFieldDecorator>,
     /// Nested field descriptions when this field is a struct.
     pub(super) fields: Vec<ManagedFieldManifest>,
+}
+
+/// One presentation decorator a managed field declares.
+///
+/// Mirrors the editor's [`FieldDecorator`](pill_engine::component_registry::FieldDecorator)
+/// vocabulary. The managed side writes one flat record for the whole
+/// vocabulary, so unused payload members arrive as `null` and a variant reads
+/// only the members its kind carries. [`validate_decorations`] refuses a
+/// payload that cannot mean what it says; nothing here affects storage.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum ManagedFieldDecorator {
+    /// Unity's `[HideInInspector]`: the Inspector draws no row for the field.
+    HideInInspector {},
+    /// A separator line with text, drawn above the field.
+    Header {
+        /// Text the line shows.
+        text: String,
+    },
+    /// A vertical gap above the field.
+    Space {
+        /// Height of the gap, in pixels.
+        number: f32,
+    },
+    /// Hover text on the field's label.
+    Tooltip {
+        /// Text shown while the pointer rests on the label.
+        text: String,
+    },
+    /// A slider over the range.
+    Range {
+        /// Lowest value the slider offers.
+        min: f32,
+        /// Highest value the slider offers.
+        max: f32,
+    },
+    /// A multi-line text box.
+    TextArea {
+        /// Rows the box starts with.
+        min_lines: usize,
+        /// Rows the box grows to before it scrolls.
+        max_lines: usize,
+    },
+    /// A fixed-height multi-line text box.
+    Multiline {
+        /// Rows the box shows.
+        lines: usize,
+    },
+    /// A drag value that never goes below the minimum.
+    Min {
+        /// Lowest value the drag value accepts.
+        number: f32,
+    },
 }
 
 /// Reject sibling fields that share any byte range.
@@ -388,6 +447,7 @@ pub(super) fn validate_field_manifest(
         }
         // The depth check runs after the field validates so the error always
         // names a well-formed field.
+        validate_decorations(&field.decorations, &field.name)?;
         if depth >= MAX_FIELD_NESTING_DEPTH {
             return Err(format!(
                 "managed field {} exceeds the maximum nesting depth of {MAX_FIELD_NESTING_DEPTH}",
@@ -400,6 +460,96 @@ pub(super) fn validate_field_manifest(
         }
     }
     Ok(())
+}
+
+/// Reject a presentation decorator that cannot mean what it says.
+///
+/// Presentation only, but a slider whose minimum is above its maximum, or a
+/// text box with zero lines, is a declaration mistake the managed side cannot
+/// see - Unity silently ignores bad ranges, and a silently ignored decorator
+/// is worse than a refused manifest.
+///
+/// # Errors
+///
+/// Returns an error naming the field and the decorator that is out of range.
+pub(super) fn validate_decorations(
+    decorations: &[ManagedFieldDecorator],
+    field_name: &str,
+) -> Result<(), String> {
+    for decoration in decorations {
+        match decoration {
+            ManagedFieldDecorator::HideInInspector {} | ManagedFieldDecorator::Header { .. } => {}
+            ManagedFieldDecorator::Tooltip { .. } => {}
+            ManagedFieldDecorator::Space { number } if !number.is_finite() || *number < 0.0 => {
+                return Err(format!(
+                    "managed field {field_name} declares a space of {number}, which is not a finite, non-negative height"
+                ));
+            }
+            ManagedFieldDecorator::Range { min, max }
+                if !min.is_finite() || !max.is_finite() || min > max =>
+            {
+                return Err(format!(
+                    "managed field {field_name} declares the range {min}..={max}, which needs finite bounds with the minimum first"
+                ));
+            }
+            ManagedFieldDecorator::TextArea {
+                min_lines,
+                max_lines,
+            } if *min_lines == 0 || min_lines > max_lines => {
+                return Err(format!(
+                    "managed field {field_name} declares a text area of {min_lines}..{max_lines} lines, which needs at least one line with the minimum first"
+                ));
+            }
+            ManagedFieldDecorator::Multiline { lines } if *lines == 0 => {
+                return Err(format!(
+                    "managed field {field_name} declares a multiline box of zero lines"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The editor decorators a managed field declares, as the layout carries them.
+///
+/// Payload strings are owned here: a managed declaration's text arrives in the
+/// parsed JSON, not in a static, so the descriptor owns it. An empty list stays
+/// the borrowed empty slice every undecorated field shares.
+pub(super) fn field_decorations(
+    decorations: &[ManagedFieldDecorator],
+) -> std::borrow::Cow<'static, [FieldDecorator]> {
+    if decorations.is_empty() {
+        return std::borrow::Cow::Borrowed(&[]);
+    }
+    std::borrow::Cow::Owned(
+        decorations
+            .iter()
+            .map(|decoration| match decoration {
+                ManagedFieldDecorator::HideInInspector {} => FieldDecorator::HideInInspector,
+                ManagedFieldDecorator::Header { text } => {
+                    FieldDecorator::Header(text.clone().into())
+                }
+                ManagedFieldDecorator::Space { number } => FieldDecorator::Space(*number),
+                ManagedFieldDecorator::Tooltip { text } => {
+                    FieldDecorator::Tooltip(text.clone().into())
+                }
+                ManagedFieldDecorator::Range { min, max } => FieldDecorator::Range {
+                    min: *min,
+                    max: *max,
+                },
+                ManagedFieldDecorator::TextArea {
+                    min_lines,
+                    max_lines,
+                } => FieldDecorator::TextArea {
+                    min_lines: *min_lines,
+                    max_lines: *max_lines,
+                },
+                ManagedFieldDecorator::Multiline { lines } => FieldDecorator::Multiline(*lines),
+                ManagedFieldDecorator::Min { number } => FieldDecorator::Min(*number),
+            })
+            .collect(),
+    )
 }
 
 /// The engine-vocabulary tag one manifest field carries.
@@ -553,6 +703,7 @@ pub(super) fn managed_field_layout(
                 size: field.size,
                 align: 1,
                 element_count: 0,
+                decorators: field_decorations(&field.decorations),
             });
             continue;
         }
@@ -568,6 +719,7 @@ pub(super) fn managed_field_layout(
             size: field.size,
             align: 1,
             element_count: 0,
+            decorators: field_decorations(&field.decorations),
         });
     }
     layout
@@ -716,6 +868,7 @@ pub(super) fn split_manifest_kinds(
                             parse_default_bytes(&field.primitive_type, literal)
                                 .expect("the field default was validated during parsing")
                         }),
+                        decorations: field_decorations(&field.decorations).into_owned(),
                     })
                     .collect();
                 resources.push(ManagedResourceDeclaration {

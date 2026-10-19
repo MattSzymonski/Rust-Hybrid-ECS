@@ -16,15 +16,27 @@ namespace TracyLive;
 /// <summary>
 /// A rigid ball that bounces inside a fixed box, simulated each frame.
 /// </summary>
+/// <remarks>
+/// The field attributes are the Inspector decorators (`Pill`'s Unity
+/// vocabulary): presentation only, so they never reach the schema hash the
+/// host compares against this declaration.
+/// </remarks>
 [StructLayout(LayoutKind.Sequential)]
 public struct PhysicsState
 {
-    public float DeltaTime;
-    public float PositionX;
+    [HideInInspector] public float DeltaTime;
+
+    [Header("Position")] public float PositionX;
+
     public float PositionY;
-    public float VelocityX;
+
+    [Header("Velocity")]
+    [Space(10)] public float VelocityX;
+
     public float VelocityY;
-    public float Radius;
+
+    [Tooltip("Radius of the ball in world units")]
+    [Min(0)] public float Radius;
 
     /// <summary>Rust's `active: bool`; only zero means inactive.</summary>
     public byte Active;
@@ -42,5 +54,8 @@ public struct PhysicsState
 public struct SplineSample
 {
     /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>
+    [Header("Spline")]
+    [Tooltip("Curve parameter this dot samples")]
+    [Range(0f, 1f)]
     public float T;
 }

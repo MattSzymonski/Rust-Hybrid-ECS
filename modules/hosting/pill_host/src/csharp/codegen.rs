@@ -1682,6 +1682,7 @@ mod tests {
             size,
             align,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }
     }
 
@@ -1701,6 +1702,7 @@ mod tests {
             size,
             align,
             element_count,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }
     }
 
@@ -1722,6 +1724,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "y",
@@ -1730,6 +1733,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -2091,6 +2095,7 @@ mod tests {
                     size: 8,
                     align: 8,
                     element_count: 0,
+                    decorators: std::borrow::Cow::Borrowed(&[]),
                 },
                 ComponentFieldDescriptor {
                     name: "y",
@@ -2099,6 +2104,7 @@ mod tests {
                     size: 8,
                     align: 8,
                     element_count: 0,
+                    decorators: std::borrow::Cow::Borrowed(&[]),
                 },
             ],
         }];
@@ -2297,6 +2303,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "g",
@@ -2305,6 +2312,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
         ComponentFieldDescriptor {
             name: "b",
@@ -2313,6 +2321,7 @@ mod tests {
             size: 4,
             align: 4,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
 
@@ -2418,6 +2427,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
             },
             ComponentFieldDescriptor {
                 name: "y",
@@ -2426,6 +2436,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
             },
         ];
         let workspace = temp_workspace("mirror_methods", "pill_spline");
@@ -2524,6 +2535,7 @@ mod tests {
             size: 8,
             align: 8,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
         let workspace = temp_workspace("mirror_method_void", "pill_spline");
         let value_types = [PillValueTypeDescriptor {
@@ -2579,6 +2591,7 @@ mod tests {
             size: 8,
             align: 8,
             element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
         }];
         let workspace = temp_workspace("mirror_changed_flag", "pill_spline");
         let component = exposed("pill_spline.OmoMO", 16, 8);

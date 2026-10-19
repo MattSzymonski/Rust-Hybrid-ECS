@@ -63,6 +63,7 @@ fn the_value_types_are_handed_over_only_for_the_loop() {
         size: 8,
         align: 4,
         element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
     }];
 
     let mut world = World::new();

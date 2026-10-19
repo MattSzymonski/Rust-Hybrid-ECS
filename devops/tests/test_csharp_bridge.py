@@ -477,10 +477,11 @@ BRIDGE_PROBE_PREFIX_EDIT = (
 
 # Adds a field to a project-owned component, changing its layout and therefore
 # the manifest the native component registry was built from. `SplineSample` is
-# the smallest component the project itself declares.
+# the smallest component the project itself declares; the match starts at the
+# field's last decorator so the attributes stay with the field they describe.
 COMPONENT_LAYOUT_EDIT = (
-    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n}",
-    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n\n    /// <summary>Added by the suite; changes the component's layout.</summary>\n    public float Extra;\n}",
+    "    [Range(0f, 1f)]\n    public float T;\n}",
+    "    [Range(0f, 1f)]\n    public float T;\n\n    /// <summary>Added by the suite; changes the component's layout.</summary>\n    public float Extra;\n}",
 )
 
 # The same shape of change, with a declared non-zero default for the added
@@ -488,8 +489,8 @@ COMPONENT_LAYOUT_EDIT = (
 # default, not zero. The sample system below prints the field once after the
 # swap, which is what turns "filled from the default" into an assertion.
 COMPONENT_DEFAULT_FIELD_EDIT = (
-    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n}",
-    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n\n    /// <summary>Added by the suite; its field default must survive the migration.</summary>\n    [EcsFieldDefault(7.5f)]\n    public float Extra;\n}",
+    "    [Range(0f, 1f)]\n    public float T;\n}",
+    "    [Range(0f, 1f)]\n    public float T;\n\n    /// <summary>Added by the suite; its field default must survive the migration.</summary>\n    [EcsFieldDefault(7.5f)]\n    public float Extra;\n}",
 )
 
 # The print witness for COMPONENT_DEFAULT_FIELD_EDIT. A latch static and a
