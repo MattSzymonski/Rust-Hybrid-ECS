@@ -164,10 +164,19 @@ TOOLBOX_MOVED_TOKEN = "[editor] toolbox moved"
 POINTER_DRAG_TOKEN = "[editor] pointer drag injected"
 SCENE_GRID_TOKEN = "[test] scene grid"
 SCENE_GRID_STATE_TOKEN = "[editor] scene grid"
+HOT_PATCH_TOKEN = "[hot]"
 
 # The transform the gizmo drags edit; the field dump resolves the short
 # name, like the native suite's dumps do.
 TRANSFORM_COMPONENT = "TransformComponent"
+
+# One live patch of a named shell function: the host's line names the
+# function it replaced, the milliseconds it took and the route it took. The
+# names are package-qualified, so the pattern only pins the module and the
+# function and leaves the crate prefix free.
+HOT_PATCH_LIVE_PATTERN = (
+    re.escape(HOT_PATCH_TOKEN) + r" \S*::shell::{} LIVE \d+ ms"
+)
 
 # The rows heartbeat's runtime values, in the field order the shell logs them.
 ROWS_PATTERN = (
@@ -2650,25 +2659,57 @@ def main() -> int:
         )
         print("  [OK] dock rearranged, two surfaces")
 
-        # Step 6: a live patch of the shell keeps the frame counter running.
+        # Step 6: body edits patch live. A tab body calls its siblings by bare
+        # name and `run_frame` reads a module constant and calls the menu bar,
+        # so a patch crate only compiles because the crate root re-exports the
+        # shell module: without it the host refuses the patch and reloads,
+        # which is why this step demands LIVE where it used to accept either.
         highest = max(rows_frames(session))
-        cadence = re.search(r"is_multiple_of\((\d+)\)", original_source)
-        assert cadence, "the shell's heartbeat cadence was not found"
-        patched = original_source.replace(
-            cadence.group(0), "is_multiple_of({})".format(int(cadence.group(1)) + 1), 1
+        tab_body = (
+            "    egui::ScrollArea::vertical().show(ui, |ui| {\n"
+            "        for (entity, label) in entity_rows(snapshot) {"
         )
-        session.edit_source(shell_source, patched)
-        session.wait_either(
-            [r"LIVE \d+ ms", re.escape(EXTENSION_RELOAD_TOKEN)], 180
+        assert tab_body in original_source, "the Entities tab body moved; update the step"
+        patched_tab = original_source.replace(
+            tab_body,
+            "    // A patch probe: one statement, inside the tab body only.\n"
+            "    let _hot_body_probe = 0u8;\n" + tab_body,
+            1,
+        )
+        begin = len(session.read_log())
+        session.edit_source(shell_source, patched_tab)
+        session.wait(
+            HOT_PATCH_LIVE_PATTERN.format("entities_tab"),
+            180,
+            "the tab body patched live",
+            begin,
         )
         highest = wait_for_frames_past(session, highest, 120, "frame counter continued")
-        print(f"  [OK] shell patched, frame counter continued past {highest}")
+        print(f"  [OK] tab body patched live, frame counter continued past {highest}")
+
+        # The same for a body in `run_frame`: the heartbeat cadence, a read of
+        # `SLOW_UPDATE_MICROS` and a bare call to the menu bar all sit in it.
+        cadence = re.search(r"is_multiple_of\((\d+)\)", patched_tab)
+        assert cadence, "the shell's heartbeat cadence was not found"
+        patched_frame = patched_tab.replace(
+            cadence.group(0), "is_multiple_of({})".format(int(cadence.group(1)) + 1), 1
+        )
+        begin = len(session.read_log())
+        session.edit_source(shell_source, patched_frame)
+        session.wait(
+            HOT_PATCH_LIVE_PATTERN.format("run_frame"),
+            180,
+            "the frame body patched live",
+            begin,
+        )
+        print("  [OK] frame body patched live")
 
         # Step 7: a structural edit of the shell reloads it; the rearranged
-        # dock (a second surface) must survive the reload. The patch step's
-        # edit may itself have reloaded instead of patching, so both waits
-        # count occurrences rather than assuming how many happened.
-        structural = original_source + (
+        # dock (a second surface) must survive the reload. An item added
+        # outside every hot body cannot be patched at all, so the host reloads
+        # and the waits below count occurrences rather than assuming how many
+        # happened.
+        structural = patched_frame + (
             "\n/// A marker the egui suite adds so the module grows an item and "
             "must reload, not patch.\npub fn egui_suite_marker() -> u32 {\n    1\n}\n"
         )
