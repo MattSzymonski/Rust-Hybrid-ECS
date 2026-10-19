@@ -58,6 +58,7 @@ from core.editor_session import (  # noqa: E402
     EDITOR_COMMAND_REGISTRY_TOKEN,
     EDITOR_DRAG_OUT_BEGAN_TOKEN,
     EDITOR_DRAG_OUT_ENDED_TOKEN,
+    EDITOR_FRAME_REPORT_TOKEN,
     EDITOR_HISTORY_PUSH_TOKEN,
     EDITOR_HISTORY_UNDO_TOKEN,
     EDITOR_PANEL_REGISTRY_TOKEN,
@@ -73,6 +74,7 @@ ENTITY_LIST_TOKEN = "[test] entity"
 ENTITIES_COUNT_TOKEN = "[test] entities"
 SELECTION_CHANGED_TOKEN = "[editor] selection changed"
 WIDGET_ACTIVATED_TOKEN = "[editor] widget activated"
+WIDGET_WHEELED_TOKEN = "[editor] widget wheeled"
 CLIPBOARD_SET_TEXT_TOKEN = "[editor] clipboard set text"
 CLIPBOARD_READ_TEXT_TOKEN = "[editor] clipboard read text"
 CLIPBOARD_COPIED_TOKEN = "[editor] clipboard copied"
@@ -138,6 +140,27 @@ def dump_field(session: EditorSession, entity: str, component: str, field: str) 
         # Poll until the field dump answers with a value.
         time.sleep(0.35)
     raise RuntimeError("the field dump never answered\n" + session.read_log()[-3000:])
+
+
+def focus_widget(session: EditorSession, name: str, timeout: float = 8.0) -> bool:
+    """Focus one named widget; False when it is clipped out of its panel.
+
+    The Inspector clips to its dock and lists components in the archetype's
+    order, which is not stable across builds. A suite that needs a row below
+    the fold focuses a visible one, scrolls, and tries again.
+    """
+    begin = len(session.read_log())
+    session.send(f"activate {name}")
+    try:
+        session.wait(
+            re.escape(WIDGET_ACTIVATED_TOKEN) + rf'\s+name="?{re.escape(name)}"?',
+            timeout,
+            f"{name} focused",
+            begin,
+        )
+        return True
+    except TimeoutError:
+        return False
 
 
 def blur_focused_field(session: EditorSession) -> None:
@@ -244,25 +267,43 @@ def main() -> int:
         )
         begin = len(session.read_log())
         session.send("tab Inspector")
-        session.wait(
+        begin = session.wait(
             re.escape(EDITOR_TAB_SELECTED_TOKEN) + r'\s+title="?Inspector"?',
             30,
             "Inspector tab",
             begin,
+        )
+        # The tab is selected before the shell rebuilds its panels; at a low
+        # paused frame rate the Inspector's hit rects can trail by a frame, so
+        # wait for a fresh frame report before activating a row.
+        session.wait_token(
+            EDITOR_FRAME_REPORT_TOKEN, 20, "a frame after the Inspector tab", begin
         )
 
         # Step 1: widget text. Field x's text is copied through the focused
         # field's own Ctrl+C, and pasted into field y with Ctrl+V.
         field_x = f"inspector.{entity}.{position}.x"
         field_y = f"inspector.{entity}.{position}.y"
+        # The Inspector clips to its dock, and which component leads follows
+        # the archetype: focus a row that is certainly on screen, then scroll
+        # until Position.x's row is.
+        anchors = [
+            f"inspector.{entity}.project::PhysicsState.delta_time",
+            field_x,
+        ]
+        if not any(focus_widget(session, anchor) for anchor in anchors):
+            raise RuntimeError("no Inspector field could be focused")
+        focused = focus_widget(session, field_x)
+        for _ in range(3):
+            if focused:
+                break
+            begin = len(session.read_log())
+            session.send("wheel -8")
+            session.wait_token(WIDGET_WHEELED_TOKEN, 30, "Inspector scrolled", begin)
+            focused = focus_widget(session, field_x)
+        if not focused:
+            raise RuntimeError("Position.x never came on screen")
         begin = len(session.read_log())
-        session.send(f"activate {field_x}")
-        session.wait(
-            re.escape(WIDGET_ACTIVATED_TOKEN) + rf'\s+name="?{re.escape(field_x)}"?',
-            30,
-            "field x focused",
-            begin,
-        )
         session.send("chord ctrl+a")
         session.send("type 424.5")
         session.wait(
