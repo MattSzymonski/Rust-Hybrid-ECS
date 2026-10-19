@@ -99,7 +99,6 @@ GIZMO_DRAG_PRESS_TOKEN = "[editor] gizmo drag press"
 GIZMO_DRAG_STARTED_TOKEN = "[editor] gizmo drag started"
 GIZMO_DRAG_ENDED_TOKEN = "[editor] gizmo drag ended"
 GIZMO_DRAG_RELEASED_TOKEN = "[editor] gizmo drag ended without a move"
-GIZMO_DRAG_MOVED_TOKEN = "[editor] gizmo drag moved"
 GIZMO_HOVER_TOKEN = "[editor] gizmo hover handle"
 GIZMO_HOVER_NONE_TOKEN = "[editor] gizmo hover none"
 GIZMO_GUIDES_TOKEN = "[editor] gizmo guides"
@@ -165,6 +164,7 @@ POINTER_DRAG_TOKEN = "[editor] pointer drag injected"
 SCENE_GRID_TOKEN = "[test] scene grid"
 SCENE_GRID_STATE_TOKEN = "[editor] scene grid"
 HOT_PATCH_TOKEN = "[hot]"
+KEY_INJECTED_TOKEN = "[editor] key injected"
 
 # The transform the gizmo drags edit; the field dump resolves the short
 # name, like the native suite's dumps do.
@@ -950,6 +950,27 @@ def main() -> int:
         assert abs(factor - 1.0) > 0.01, f"the scale drag wrote no change: {factor}"
         scale = field_values(gizmo_entity, "scale")
         print(f"  [OK] scale drag wrote {factor:.3f} (scale now {scale})")
+
+        # Step 3a: a keyboard chord reaches the same handler a real press does -
+        # the E shortcut picks the rotate tool, which the scale tool step left
+        # behind - and the injected chord is logged, so the injection itself is
+        # provable. The next step's `gizmo translate` still changes the tool,
+        # so it logs the way it always did.
+        begin = len(session.read_log())
+        session.send("key e")
+        session.wait(
+            re.escape(KEY_INJECTED_TOKEN) + r'\s+chord="e"',
+            30,
+            "the key chord injected",
+            begin,
+        )
+        session.wait(
+            re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="rotate"',
+            30,
+            "the key shortcut switched the tool",
+            begin,
+        )
+        print("  [OK] a key chord reached the tool shortcut")
 
         # Step 3b: the viewport's interaction states (Stage 28). A drag begins
         # on the press and ends on the release; the hover highlight follows
