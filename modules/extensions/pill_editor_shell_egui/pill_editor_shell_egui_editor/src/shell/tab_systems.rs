@@ -1,0 +1,76 @@
+//! The Systems tab: the engine's pause and single-step controls, then one
+//! row per registered system with its recorded, undoable toggle.
+//!
+//! # Responsibilities
+//!
+//! - Draw [`systems_tab`]: the header's Pause/Resume and Step buttons, then
+//!   the systems' rows.
+//!
+//! # Design
+//!
+//! The tab bodies call their siblings by bare name, which a patch crate
+//! resolves through this file's glob and the crate root's re-export (see the
+//! shell module header): the glob below is what the generated patch crate
+//! replays, so it must stay in the file's top-level `use` lines.
+
+// External crates
+use pill_engine::pill_hot_fn;
+
+// Current crate
+use pill_editor_shell_egui_editor::shell::*;
+
+/// The Systems tab: the engine's pause and single-step controls in a header
+/// row, then one row per registered system - its name and owner, and a
+/// state button (`on`/`off`) that queues the recorded, undoable toggle the
+/// native panel records.
+#[pill_hot_fn]
+pub fn systems_tab(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    pending: &mut PendingEditorCommands,
+) {
+    ui.horizontal(|ui| {
+        let pause_icon = if snapshot.paused {
+            icons::Icon::Play
+        } else {
+            icons::Icon::Pause
+        };
+        if ui
+            .add(icons::IconButton::new(
+                pause_icon,
+                systems::pause_button_label(snapshot.paused),
+            ))
+            .clicked()
+        {
+            pending.push(vec![systems::pause_toggle_command(snapshot.paused)]);
+        }
+        if ui
+            .add(icons::IconButton::new(icons::Icon::SkipForward, "Step"))
+            .clicked()
+        {
+            pending.push(vec![EditorCommand::StepOnce]);
+        }
+        let enabled = snapshot.systems.iter().filter(|row| row.enabled).count();
+        ui.label(
+            egui::RichText::new(format!("{}/{} enabled", enabled, snapshot.systems.len())).weak(),
+        );
+    });
+    ui.separator();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for system in &snapshot.systems {
+            ui.horizontal(|ui| {
+                ui.label(systems::system_row_label(system));
+                if ui
+                    .add(icons::IconButton::new(
+                        icons::Icon::Power,
+                        systems::system_state_label(system.enabled),
+                    ))
+                    .clicked()
+                {
+                    let (command, label) = systems::system_toggle(system.index, !system.enabled);
+                    pending.push_recorded(vec![command], label, None);
+                }
+            });
+        }
+    });
+}

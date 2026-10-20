@@ -784,8 +784,14 @@ pub fn normalized_signature(source: &str, mask: &[bool], declaration_start: usiz
 ///
 /// The block is everything back to the previous item's end - a `}` or `;` at
 /// code level - which is exactly where attributes and doc comments live.
+///
+/// `#[test]` counts as a gate: it expands to `#[cfg(test)]`, so a test
+/// function is absent from every artifact the host loads. A module that keeps
+/// its tests in a file of its own (rather than an inline `mod tests`) puts no
+/// `cfg` in front of them, and registering their addresses would not compile.
 pub fn declaration_is_cfg_gated(source: &str, mask: &[bool], declaration_start: usize) -> bool {
     declaration_has_attribute(source, mask, declaration_start, "#[cfg")
+        || declaration_has_attribute(source, mask, declaration_start, "#[test]")
 }
 
 /// Whether `attribute` appears in the block above this declaration.
@@ -1581,6 +1587,33 @@ fn movement_system(mut query: Query<&mut PhysicsState>) -> Result<(), SystemErro
 
 fn movement_system_extra() {}
 "#;
+
+    /// A `#[test]` function is not in any artifact the host loads.
+    ///
+    /// Tests in a file of their own (`shell/tests.rs`) carry no `cfg` of their
+    /// own - the `#[test]` attribute is the gate - so before this they were
+    /// registered and the generated inventory did not compile outside
+    /// `cargo test`.
+    #[test]
+    fn a_test_function_counts_as_cfg_gated() {
+        let source = "\
+#[test]
+fn a_row_click_moves_the_selection() {}
+
+#[test_case(1)]
+fn a_decorated_case(value: u32) {}
+";
+        let functions = all_functions(source);
+        let by_name = |name: &str| {
+            functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("`{name}` must be scanned: {functions:?}"))
+        };
+        assert!(by_name("a_row_click_moves_the_selection").cfg_gated);
+        // A custom attribute that merely starts with `test` is not `#[test]`.
+        assert!(!by_name("a_decorated_case").cfg_gated);
+    }
 
     /// The ABI entry point is recognized by the attribute that generates it,
     /// not by being called `register`.
