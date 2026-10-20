@@ -14,18 +14,19 @@
 //!
 //! Everything crossing is plain data: no handles, no device objects, no
 //! callbacks - the rule `pill_editor_api` states for the `pill_ui` editor,
-//! kept for this one. Input events transit through the engine's `Input`
-//! resource and the shell converts them itself ([`crate::input`]), so only
-//! geometry and focus cross here.
+//! kept for this one. The shell's input events travel in this resource as
+//! owned [`InputEvent`]s, so the UI reads the events of its own windows and
+//! never the game's (W-0038 Stage 1).
 
 // External crates
 use egui::epaint::ClippedPrimitive;
 use egui::{Context, CursorIcon, FullOutput, OutputCommand, TexturesDelta};
 use pill_core::math::Vector2f;
+use pill_engine_core::input::InputEvent;
 use pill_engine_core::Resource;
 
 /// The geometry and focus the frontend feeds the shell each frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct EguiShellInput {
     /// Logical size (points) of the overlay's client area.
     pub screen_size: Vector2f,
@@ -37,6 +38,12 @@ pub struct EguiShellInput {
     pub time: f64,
     /// The editor's smoothed frame rate, for the shell's overlays.
     pub frames_per_second: f32,
+    /// The events the editor's own windows reported since the last frame,
+    /// in the main window's client coordinates.
+    ///
+    /// The game's window is not in here: its events go to the engine's
+    /// `Input`, which is the whole point of the split.
+    pub events: Vec<InputEvent>,
 }
 
 impl Resource for EguiShellInput {}
@@ -49,6 +56,7 @@ impl Default for EguiShellInput {
             focused: true,
             time: 0.0,
             frames_per_second: 0.0,
+            events: Vec::new(),
         }
     }
 }

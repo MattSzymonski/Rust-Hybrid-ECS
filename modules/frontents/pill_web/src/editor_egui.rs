@@ -339,8 +339,8 @@ impl WebEditorApplication {
         let Some(driver) = driver_slot.as_mut() else {
             return;
         };
-        for event in events {
-            driver.push_input(event);
+        for event in &events {
+            driver.push_input(event.clone());
         }
 
         // Step 3: the resources the executable owns natively - the gizmo's
@@ -385,6 +385,10 @@ impl WebEditorApplication {
                     focused: self.focused,
                     time: now.duration_since(self.started).as_secs_f64(),
                     frames_per_second: self.frames_per_second,
+                    // The browser's window is the whole editor, so every
+                    // event is the shell's as well as the game's (W-0029's
+                    // behaviour; the split rule is W-0038's, Stage 1).
+                    events: events.clone(),
                 };
             }
         }
