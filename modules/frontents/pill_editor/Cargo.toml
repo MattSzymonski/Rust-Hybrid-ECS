@@ -50,7 +50,7 @@ pill_input = { path = "../pill_input", features = ["winit", "gamepad"] }
 # and presents the editor with it (D8, D19). The same wgpu the renderer
 # module uses - a second version in one process would bring a second copy of
 # its global types.
-wgpu = "25.0.0"
+wgpu = "30.0.0"
 pill_ui = { path = "../../pill_ui" }
 pill_ui_wgpu = { path = "../../pill_ui_wgpu" }
 # Docking: the layout model, geometry and actions, shared with the shell

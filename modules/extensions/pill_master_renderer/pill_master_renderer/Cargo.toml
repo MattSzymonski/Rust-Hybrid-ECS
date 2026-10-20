@@ -26,7 +26,7 @@ thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 glam = { version = "0.33", features = ["serde", "bytemuck"] }
 bytemuck = { version = "1.4", features = ["derive"] }
-wgpu = "25.0.0"
+wgpu = "30.0.0"
 # The GPU caches key their slot tables the way the shader assets do.
 indexmap = "2"
 # The renderer contract: the backend trait this crate implements, the frame it
