@@ -378,8 +378,6 @@ struct EditorWindow {
     overlay: Option<OverlaySurface>,
     /// Frames between overlay creation attempts after a failure.
     overlay_retry_frame: u64,
-    /// Whether overlay creation failed and was logged already.
-    overlay_failed_logged: bool,
     /// The editor's fallback context, used while no shell module is loaded.
     fallback_context: egui::Context,
     /// Whether the fallback UI was reported already.
@@ -393,9 +391,6 @@ struct EditorWindow {
     /// position and the pick id. The answer starts a gizmo drag on a handle
     /// or moves the selection - both while the button is held.
     press_pick: Option<PressPick>,
-    /// The pick request an answer is pending for, matched by id when the
-    /// renderer answers frames later.
-    pending_pick: Option<u64>,
     /// The entity the renderer's outline set currently names, so the world
     /// resource is written once per selection change.
     outlined_entity: Option<Entity>,
@@ -672,7 +667,6 @@ impl EditorWindow {
             egui_renderer,
             overlay,
             overlay_retry_frame: 0,
-            overlay_failed_logged: true,
             fallback_context: {
                 // The fallback draws the same theme as the shell, so a
                 // missing shell module does not flip the look.
@@ -684,7 +678,6 @@ impl EditorWindow {
             pending_events: Vec::new(),
             scene_cursor: [None; SCENE_VIEWPORTS],
             press_pick: None,
-            pending_pick: None,
             outlined_entity: None,
             overlay_regions: Vec::new(),
             gizmo_drag: None,
@@ -852,17 +845,7 @@ impl EditorWindow {
     /// pixels, clamped inside it: the dock's rect can overshoot the window
     /// while a split is being dragged.
     fn view_rect_pixels(&self, rect: ShellRect) -> (i32, i32, u32, u32) {
-        let scale = self.scale_factor as f64;
-        let x = (rect.x as f64 * scale).round() as i32;
-        let y = (rect.y as f64 * scale).round() as i32;
-        let width = (rect.width as f64 * scale).round().max(1.0) as i32;
-        let height = (rect.height as f64 * scale).round().max(1.0) as i32;
-        let (client_width, client_height) = (self.size.0 as i32, self.size.1 as i32);
-        let x = x.clamp(0, (client_width - 1).max(0));
-        let y = y.clamp(0, (client_height - 1).max(0));
-        let width = width.min((client_width - x).max(1)) as u32;
-        let height = height.min((client_height - y).max(1)) as u32;
-        (x, y, width, height)
+        scaled_view_rect(rect, self.scale_factor, self.size)
     }
 
     /// Hide one scene view's window: its tab is not shown this pass
@@ -1009,7 +992,6 @@ impl EditorWindow {
             y: physical_y as f32,
             id,
         });
-        self.pending_pick = Some(id);
         info!(
             target: telemetry_target::ENGINE,
             view,
@@ -1304,7 +1286,6 @@ impl EditorWindow {
             };
             let (view, press_x, press_y) = press;
             self.press_pick = None;
-            self.pending_pick = None;
             match result.hit {
                 PickHit::Entity(entity) => {
                     info!(
@@ -2022,7 +2003,6 @@ impl EditorWindow {
         }
         self.cancel_gizmo_drag();
         self.press_pick = None;
-        self.pending_pick = None;
         self.left_down = [false; SCENE_VIEWPORTS];
         self.set_hovered_handle(self.active_view, None);
     }
@@ -3601,14 +3581,11 @@ impl EditorWindow {
                 self.overlay = Some(overlay);
             }
             Err(error) => {
-                if !self.overlay_failed_logged {
-                    self.overlay_failed_logged = true;
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        error = %error,
-                        "[editor] composition overlay still unavailable"
-                    );
-                }
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    error = %error,
+                    "[editor] composition overlay still unavailable"
+                );
             }
         }
     }
@@ -4567,5 +4544,94 @@ fn camera_navigation_name(navigation: CameraNavigation) -> &'static str {
         CameraNavigation::Orbit => "orbit",
         CameraNavigation::Pan => "pan",
         CameraNavigation::Dolly => "dolly",
+    }
+}
+
+/// A shell rectangle in logical points as the child window's own client
+/// pixels: scaled, rounded, kept at least one pixel wide, and clamped inside
+/// the window so a viewport that overhangs an edge never asks for pixels the
+/// window does not have.
+fn scaled_view_rect(
+    rect: ShellRect,
+    scale_factor: f32,
+    window_size: (u32, u32),
+) -> (i32, i32, u32, u32) {
+    let scale = scale_factor as f64;
+    let x = (rect.x as f64 * scale).round() as i32;
+    let y = (rect.y as f64 * scale).round() as i32;
+    let width = (rect.width as f64 * scale).round().max(1.0) as i32;
+    let height = (rect.height as f64 * scale).round().max(1.0) as i32;
+    let (client_width, client_height) = (window_size.0 as i32, window_size.1 as i32);
+    let x = x.clamp(0, (client_width - 1).max(0));
+    let y = y.clamp(0, (client_height - 1).max(0));
+    let width = width.min((client_width - x).max(1)) as u32;
+    let height = height.min((client_height - y).max(1)) as u32;
+    (x, y, width, height)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rectangle inside the window scales with the display and lands where
+    /// the shell drew it.
+    #[test]
+    fn a_view_rect_scales_with_the_display() {
+        let rect = ShellRect {
+            x: 100.0,
+            y: 50.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        assert_eq!(
+            scaled_view_rect(rect, 1.0, (1280, 800)),
+            (100, 50, 300, 200)
+        );
+        assert_eq!(
+            scaled_view_rect(rect, 2.0, (2560, 1600)),
+            (200, 100, 600, 400)
+        );
+        // A fractional scale rounds each edge rather than truncating it.
+        assert_eq!(
+            scaled_view_rect(rect, 1.5, (1920, 1200)),
+            (150, 75, 450, 300)
+        );
+    }
+
+    /// A viewport that overhangs the window's edge is clipped to what the
+    /// window has, and never collapses to zero.
+    #[test]
+    fn a_view_rect_is_clipped_to_the_window() {
+        let overhanging = ShellRect {
+            x: 1200.0,
+            y: 780.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        assert_eq!(
+            scaled_view_rect(overhanging, 1.0, (1280, 800)),
+            (1200, 780, 80, 20)
+        );
+        // A rectangle entirely past the edge keeps one pixel of each side
+        // instead of asking for a zero-sized child window.
+        let past = ShellRect {
+            x: 5000.0,
+            y: 5000.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        assert_eq!(scaled_view_rect(past, 1.0, (1280, 800)), (1279, 799, 1, 1));
+        // A sub-pixel rectangle still reserves one pixel.
+        let tiny = ShellRect {
+            x: 4.0,
+            y: 4.0,
+            width: 0.1,
+            height: 0.1,
+        };
+        assert_eq!(scaled_view_rect(tiny, 1.0, (1280, 800)), (4, 4, 1, 1));
     }
 }
