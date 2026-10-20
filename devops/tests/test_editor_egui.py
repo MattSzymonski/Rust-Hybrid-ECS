@@ -175,7 +175,9 @@ TRANSFORM_COMPONENT = "TransformComponent"
 # names are package-qualified, so the pattern only pins the module and the
 # function and leaves the crate prefix free.
 HOT_PATCH_LIVE_PATTERN = (
-    re.escape(HOT_PATCH_TOKEN) + r" \S*::shell::{} LIVE \d+ ms"
+    # The shell is split file-per-tab (W-0037 Stage 3), so a body's path
+    # carries its module: `...::shell::tab_entities::entities_tab`.
+    re.escape(HOT_PATCH_TOKEN) + r" \S*::shell::(?:\w+::)?{} LIVE \d+ ms"
 )
 
 # The rows heartbeat's runtime values, in the field order the shell logs them.
@@ -569,7 +571,16 @@ def main() -> int:
         / "src"
         / "shell.rs"
     )
-    original_source = shell_source.read_text(encoding="utf-8")
+    # Byte-faithful reads (`newline=""`): `EditorSession.edit_source` writes
+    # the text back as given, so a translated read would rewrite every line's
+    # ending and the host's patch classifier would see a whole-file change
+    # instead of the one body the step edits.
+    with shell_source.open("r", encoding="utf-8", newline="") as file:
+        original_source = file.read()
+    # The Entities tab body lives in its own file, beside the root.
+    tab_entities_source = shell_source.parent / "shell" / "tab_entities.rs"
+    with tab_entities_source.open("r", encoding="utf-8", newline="") as file:
+        original_tab_source = file.read()
     project_source = REPOSITORY_ROOT / "examples" / "italian_brainrot" / "src" / "scene.rs"
     # The Assets step's meta probe: a sourced file with no `.meta` sidecar
     # yet, staged before the editor starts so the res watcher never sees a
@@ -2686,19 +2697,30 @@ def main() -> int:
         # shell module: without it the host refuses the patch and reloads,
         # which is why this step demands LIVE where it used to accept either.
         highest = max(rows_frames(session))
-        tab_body = (
-            "    egui::ScrollArea::vertical().show(ui, |ui| {\n"
-            "        for (entity, label) in entity_rows(snapshot) {"
+        # The anchor carries the file's own line ending: the text is written
+        # back byte for byte, and a translated anchor would either miss or
+        # rewrite every line's ending.
+        newline = "\r\n" if "\r\n" in original_tab_source else "\n"
+        tab_body = newline.join(
+            (
+                "    egui::ScrollArea::vertical().show(ui, |ui| {",
+                "        for (entity, label) in entity_rows(snapshot) {",
+            )
         )
-        assert tab_body in original_source, "the Entities tab body moved; update the step"
-        patched_tab = original_source.replace(
+        assert tab_body in original_tab_source, "the Entities tab body moved; update the step"
+        patched_tab = original_tab_source.replace(
             tab_body,
-            "    // A patch probe: one statement, inside the tab body only.\n"
-            "    let _hot_body_probe = 0u8;\n" + tab_body,
+            newline.join(
+                (
+                    "    // A patch probe: one statement, inside the tab body only.",
+                    "    let _hot_body_probe = 0u8;",
+                    tab_body,
+                )
+            ),
             1,
         )
         begin = len(session.read_log())
-        session.edit_source(shell_source, patched_tab)
+        session.edit_source(tab_entities_source, patched_tab)
         session.wait(
             HOT_PATCH_LIVE_PATTERN.format("entities_tab"),
             180,
@@ -2710,9 +2732,9 @@ def main() -> int:
 
         # The same for a body in `run_frame`: the heartbeat cadence, a read of
         # `SLOW_UPDATE_MICROS` and a bare call to the menu bar all sit in it.
-        cadence = re.search(r"is_multiple_of\((\d+)\)", patched_tab)
+        cadence = re.search(r"is_multiple_of\((\d+)\)", original_source)
         assert cadence, "the shell's heartbeat cadence was not found"
-        patched_frame = patched_tab.replace(
+        patched_frame = original_source.replace(
             cadence.group(0), "is_multiple_of({})".format(int(cadence.group(1)) + 1), 1
         )
         begin = len(session.read_log())
@@ -2759,7 +2781,7 @@ def main() -> int:
         print("  [OK] shell reloaded, dock and counter kept")
 
         # Step 8: a project reload keeps the editor UI and its dock.
-        project_text = project_source.read_text(encoding="utf-8")
+        project_text = project_source.read_bytes().decode("utf-8")
         session.edit_source(
             project_source, project_text + "\n// egui suite: project reload marker\n"
         )

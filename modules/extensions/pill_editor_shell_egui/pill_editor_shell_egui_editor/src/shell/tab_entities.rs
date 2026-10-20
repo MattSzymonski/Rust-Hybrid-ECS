@@ -1,0 +1,99 @@
+//! The Entities tab: the entity rows and their menu.
+//!
+//! # Responsibilities
+//!
+//! - `entity_rows`: the rows the tab lists, from the snapshot's entity list.
+//! - `entities_tab`: the rows, each a selection move, over the tab's empty strip's menu.
+//! - `entity_menu_items`: the row menu's create and delete actions.
+//!
+//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
+//! below are absolute paths, so a patch crate resolves them too.
+
+// Current crate
+use pill_editor_shell_egui_editor::shell::prelude::*;
+use pill_editor_shell_egui_editor::shell::*;
+
+/// One row per live entity: the entity and its label, for the Entities tab.
+pub fn entity_rows(snapshot: &EditorSnapshot) -> Vec<(Entity, String)> {
+    snapshot
+        .entities
+        .iter()
+        .map(|entry| {
+            (
+                entry.entity,
+                format!("{}  ({} components)", entry.display, entry.component_count),
+            )
+        })
+        .collect()
+}
+
+/// The entity menu: New Entity everywhere, Delete Entity for the row under
+/// the pointer. Both edits are recorded, so one undo step reverses them.
+pub fn entity_menu_items(
+    ui: &mut egui::Ui,
+    entity: Option<Entity>,
+    selection: &EditorSelection,
+    pending: &mut PendingEditorCommands,
+) {
+    if ui
+        .add(icons::IconButton::new(icons::Icon::Plus, "New Entity"))
+        .clicked()
+    {
+        let (command, label) = entities::entity_create();
+        pending.push_recorded(vec![command], label, None);
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            "[editor] new entity queued"
+        );
+        ui.close();
+    }
+    if let Some(entity) = entity {
+        if ui
+            .add(icons::IconButton::new(icons::Icon::Trash, "Delete Entity"))
+            .clicked()
+        {
+            let (commands, label) = entities::entity_delete(entity, selection.asset.clone());
+            pending.push_recorded(commands, label, None);
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                entity = %entity,
+                "[editor] delete entity queued"
+            );
+            ui.close();
+        }
+    }
+}
+
+/// The Entities tab: the world's entities; a click selects one, a right
+/// click selects it and opens its menu - the recorded, undoable create and
+/// delete the native Hierarchy carries as buttons.
+#[pill_hot_fn]
+pub fn entities_tab(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    selection: &mut EditorSelection,
+    pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for (entity, label) in entity_rows(snapshot) {
+            let selected = selection.entity == Some(entity);
+            let response = ui.selectable_label(selected, label);
+            if response.clicked() {
+                select_entity(selection, entity);
+            }
+            if response.secondary_clicked() {
+                select_entity(selection, entity);
+            }
+            context_menu("entities", &response, overlay_regions, &mut |ui| {
+                entity_menu_items(ui, Some(entity), selection, pending)
+            });
+        }
+        // The space below the rows creates one entity; there is nothing to
+        // delete away from a row.
+        let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
+        context_menu("entities", &empty, overlay_regions, &mut |ui| {
+            entity_menu_items(ui, None, selection, pending)
+        });
+    });
+}
