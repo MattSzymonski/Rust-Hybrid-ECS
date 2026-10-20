@@ -44,6 +44,13 @@ pub struct EguiShellInput {
     /// The game's window is not in here: its events go to the engine's
     /// `Input`, which is the whole point of the split.
     pub events: Vec<InputEvent>,
+    /// The pointer's last known position in the same coordinates, when it is
+    /// over the editor's windows at all.
+    ///
+    /// egui's button events name their own position, and a frame can carry a
+    /// release with no move before it: this seeds the bridge with the place
+    /// the pointer was last seen (W-0038 Stage 1).
+    pub cursor: Option<Vector2f>,
 }
 
 impl Resource for EguiShellInput {}
@@ -57,6 +64,7 @@ impl Default for EguiShellInput {
             time: 0.0,
             frames_per_second: 0.0,
             events: Vec::new(),
+            cursor: None,
         }
     }
 }

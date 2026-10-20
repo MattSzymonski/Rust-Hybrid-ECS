@@ -52,6 +52,13 @@ pub mod tab_systems;
 
 pub use tab_systems::systems_tab;
 
+/// The [`toasts`] module: the host's notices drawn as a short-lived stack.
+///
+/// Public like every tab module: the build script's function inventory
+/// names each addressable function by its module path, so the module cannot
+/// be private.
+pub mod toasts;
+
 /// The [`menubar`] module: the menu bar: the rows' menus and the actions they run.
 ///
 /// Public like every tab module: the build script's function
@@ -239,6 +246,7 @@ pub use assets_tiles::ASSETS_TILE_LABEL_GAP;
 pub use assets_tiles::ASSETS_TILE_LABEL_HEIGHT;
 pub use assets_tiles::ASSETS_TILE_LABEL_ROWS;
 pub use assets_tiles::ASSETS_TILE_LABEL_SIZE;
+pub use toasts::{draw_toasts, push_notices};
 
 /// The [`tests`] module: the shell's unit tests.
 ///
@@ -266,9 +274,13 @@ pub fn run_frame(
     snapshot: &EditorSnapshot,
     selection: &mut EditorSelection,
     pending: &mut PendingEditorCommands,
+    notices: &EditorNotices,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
+    // The host's notices become toasts before the dock draws, so a reload that
+    // happened this frame is on screen in this frame.
+    push_notices(state, notices);
     // The row heartbeat: the editor suite reads it to prove both tabs see
     // the project's data, that the frame counter - and with it the session
     // resource - survives a reload or patch, and which entity the
@@ -318,6 +330,7 @@ pub fn run_frame(
         browser,
         menubar,
         inspector,
+        toasts,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -358,6 +371,14 @@ pub fn run_frame(
             viewer.snapshot,
         );
         pill_editor_shell_egui_editor::shell::about_window(context, &mark, &mut menubar.about_open);
+        // The toast stack floats over the dock and every viewport it covers,
+        // so its rows join the frame's overlay regions.
+        pill_editor_shell_egui_editor::shell::draw_toasts(
+            toasts,
+            frame_index,
+            context,
+            &mut viewer.overlay_regions,
+        );
     });
     let mut shell_frame = frame_from_output(&context, output);
     shell_frame.scene_rects = viewer.scene_rects;

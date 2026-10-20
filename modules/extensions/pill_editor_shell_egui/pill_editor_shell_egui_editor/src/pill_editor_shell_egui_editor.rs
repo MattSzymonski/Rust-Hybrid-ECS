@@ -37,6 +37,7 @@ extern crate self as pill_editor_shell_egui_editor;
 // External crates
 use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
 use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
+use pill_editor_core_egui::notices::EditorNotices;
 use pill_editor_core_egui::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
@@ -106,6 +107,13 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EditorSelection>().is_none() {
         world.insert_resource(EditorSelection::default());
     }
+    // Step 4b: the host's notices, which the executable rewrites whenever a
+    // reload, a patch or a failure lands (W-0038 Stages 4 and 6). Its type is
+    // shared, so the shell reads what the arriving generation wrote.
+    world.register_resource::<EditorNotices>();
+    if world.get_resource::<EditorNotices>().is_none() {
+        world.insert_resource(EditorNotices::default());
+    }
     // Step 5: the per-frame system that runs the dock. Post-update, like the
     // renderer's frame build: it keeps running while the engine is paused.
     engine.register_post_update_system("egui_shell", egui_shell_update);
@@ -134,27 +142,26 @@ pub fn egui_shell_update(
         ResMut<EguiShellState>,
         ResMut<EguiShellInput>,
         ResMut<EguiShellFrame>,
-        Res<EditorSnapshot>,
-        ResMut<EditorSelection>,
+        // The nested triple keeps this system within the engine's six-parameter
+        // tuple arity.
+        (Res<EditorSnapshot>, ResMut<EditorSelection>, Res<EditorNotices>),
         ResMut<PendingEditorCommands>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
     // is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, snapshot, mut selection, mut pending) = resources;
+    let (mut state, mut input, mut frame, (snapshot, mut selection, notices), mut pending) = resources;
     let (
         Some(mut state),
         Some(input),
         Some(mut frame),
-        Some(snapshot),
-        Some(mut selection),
+        (Some(snapshot), Some(mut selection), Some(notices)),
         Some(mut pending),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
-        snapshot.get(),
-        selection.get_mut(),
+        (snapshot.get(), selection.get_mut(), notices.get()),
         pending.get_mut(),
     )
     else {
@@ -167,5 +174,6 @@ pub fn egui_shell_update(
         snapshot,
         &mut selection,
         &mut pending,
+        notices,
     );
 }

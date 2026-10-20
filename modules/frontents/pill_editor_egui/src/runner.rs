@@ -55,7 +55,9 @@ use pill_editor_core_egui::inspector;
 use pill_editor_core_egui::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
 };
+use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
 use pill_editor_core_egui::preferences::{self, PreferencesView};
+use pill_editor_core_egui::problems::{self as problem_parser, Severity};
 use pill_editor_core_egui::scripted::{AssetEdit, Dump, KeyChord, ScriptedCommand, ToolbarAction};
 use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
@@ -65,7 +67,7 @@ use pill_engine_core::input::{ButtonState, KeyCode, Modifiers as EngineModifiers
 use pill_engine_core::Entity;
 use pill_engine_core::FieldValue;
 use pill_engine_core::InputEvent;
-use pill_host::{HostConfig, RenderingHost};
+use pill_host::{take_notices, HostConfig, HostNotice, RenderingHost};
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::{
     frame_grid, CameraBinding, CameraComponent, FrameDriver, PickHit, PickRequests, PickResults,
@@ -325,6 +327,13 @@ impl ApplicationHandler for EditorApplication {
                     if is_game {
                         editor.pending_events.push(event);
                     } else {
+                        match &event {
+                            InputEvent::CursorMoved { position } => {
+                                editor.shell_cursor = Some(*position);
+                            }
+                            InputEvent::CursorLeft => editor.shell_cursor = None,
+                            _ => {}
+                        }
                         editor.shell_events.push(event);
                     }
                 }
@@ -397,6 +406,13 @@ struct EditorWindow {
     pending_events: Vec<InputEvent>,
     /// The editor's own windows' events, not yet handed to the shell.
     shell_events: Vec<InputEvent>,
+    /// The pointer's last position over the editor's windows, in the main
+    /// window's client pixels; the shell input carries it so a release that
+    /// arrives without a move still has a place to land.
+    shell_cursor: Option<pill_core::math::Vector2f>,
+    /// The notices the host's queue produced: the toast events and the
+    /// Problems rows the shell reads.
+    notices: EditorNotices,
     /// The last pointer position each scene window reported, in its own
     /// client-area physical pixels; `None` before its first move.
     scene_cursor: [Option<(f32, f32)>; SCENE_VIEWPORTS],
@@ -690,6 +706,8 @@ impl EditorWindow {
             reported_fallback: false,
             pending_events: Vec::new(),
             shell_events: Vec::new(),
+            shell_cursor: None,
+            notices: EditorNotices::default(),
             scene_cursor: [None; SCENE_VIEWPORTS],
             press_pick: None,
             outlined_entity: None,
@@ -2929,6 +2947,10 @@ impl EditorWindow {
         // Step 2b: a scripted drag in flight takes its next stage - the
         // press, the move and the release, one per frame.
         self.advance_scripted_drag();
+        // Step 2c: what the host did since the last frame - a reload, a patch,
+        // a failure, a rollback - becomes the notices the shell draws toasts
+        // and Problems rows from (W-0038 Stages 4 and 6).
+        self.fold_host_notices();
         // Step 3: the shell boundary's input resource.
         if let Some(input) = self
             .host
@@ -2959,6 +2981,7 @@ impl EditorWindow {
                 time: self.started.elapsed().as_secs_f64(),
                 frames_per_second: self.fps,
                 events,
+                cursor: self.shell_cursor,
             };
         }
         // Step 3b: apply the engine mutations the shell's assets actions and
@@ -3808,11 +3831,100 @@ impl EditorWindow {
     /// the way a real event arrives - through the shell's own list - while
     /// the game still receives what a user's would.
     fn queue_input(&mut self, event: InputEvent) {
+        if let InputEvent::CursorMoved { position } = event {
+            // The scripted pointer is the shell's pointer too: the seed the
+            // next frame carries has to match what the shell just saw.
+            self.shell_cursor = Some(position);
+        }
         self.host
             .host_mut()
             .engine_mut()
             .push_input_event(event.clone());
         self.shell_events.push(event);
+    }
+
+    /// Fold the host's queued notices into the editor's notice resource.
+    ///
+    /// Every notice becomes a toast line; a failure also becomes Problems rows
+    /// for its module, and a clean reload clears the rows its module left
+    /// behind. The resource is rewritten only when something arrived, so the
+    /// shell's read stays cheap.
+    fn fold_host_notices(&mut self) {
+        let notices = take_notices();
+        if notices.is_empty() {
+            return;
+        }
+        for notice in &notices {
+            let (level, text) = notice_toast(notice);
+            let seq = self.notices.next_event_seq;
+            self.notices.next_event_seq = seq + 1;
+            self.notices.events.push(Notice { seq, level, text });
+            match notice {
+                HostNotice::ModuleFailed { module, output } => {
+                    self.notices.problems.retain(|row| row.module != *module);
+                    let rows = problems_from_build_output(module, output);
+                    // One line per parsed problem (bounded), so the log says
+                    // what the panel holds and where each row would jump to.
+                    for row in rows.iter().take(10) {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            module = row.module.as_str(),
+                            file = row.problem.file.as_deref().unwrap_or(""),
+                            line = row.problem.line.unwrap_or(0),
+                            text = row.problem.message.as_str(),
+                            "[editor] problem"
+                        );
+                    }
+                    self.notices.problems.extend(rows);
+                }
+                HostNotice::Reloaded { module, .. } => {
+                    self.notices.problems.retain(|row| row.module != *module);
+                }
+                HostNotice::PatchFailed { function, detail } => {
+                    self.notices.problems.retain(|row| row.module != *function);
+                    self.notices.problems.push(ProblemRow {
+                        module: function.clone(),
+                        problem: problem_parser::Problem {
+                            severity: Severity::Error,
+                            message: detail.clone(),
+                            file: None,
+                            line: None,
+                            column: None,
+                        },
+                    });
+                }
+                HostNotice::RolledBack {
+                    function,
+                    to_generation,
+                    automatic,
+                } => {
+                    // The running implementation no longer matches the sources
+                    // until the next good edit, so the rollback is a warning.
+                    self.notices.problems.retain(|row| row.module != *function);
+                    let message = if *automatic {
+                        format!("rolled back to generation {to_generation} after repeated panics")
+                    } else {
+                        format!("rolled back to generation {to_generation}")
+                    };
+                    self.notices.problems.push(ProblemRow {
+                        module: function.clone(),
+                        problem: problem_parser::Problem {
+                            severity: Severity::Warning,
+                            message,
+                            file: None,
+                            line: None,
+                            column: None,
+                        },
+                    });
+                }
+                HostNotice::PatchApplied { .. } => {}
+            }
+        }
+        self.notices.revision = self.notices.revision.wrapping_add(1);
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(resource) = world.get_resource_mut::<EditorNotices>() {
+            *resource = self.notices.clone();
+        }
     }
 
     /// Inject a full right click at a point of the window's client area,
@@ -4104,6 +4216,87 @@ impl SceneView {
             surface_id: SCENE_SURFACES[view],
         })
     }
+}
+
+// =============================================================================
+// Host notices to editor notices (W-0038 Stages 4 and 6)
+// =============================================================================
+
+/// The toast a host notice becomes: its level and its one line.
+fn notice_toast(notice: &HostNotice) -> (NoticeLevel, String) {
+    match notice {
+        HostNotice::ModuleFailed { module, .. } => (
+            NoticeLevel::Error,
+            format!("{module}: reload failed; the previous generation still runs"),
+        ),
+        HostNotice::Reloaded { module, build_ms } => {
+            let text = if *build_ms == 0 {
+                format!("{module} reloaded")
+            } else {
+                format!("{module} reloaded in {build_ms} ms")
+            };
+            (NoticeLevel::Note, text)
+        }
+        HostNotice::PatchApplied {
+            function,
+            milliseconds,
+        } => (
+            NoticeLevel::Note,
+            format!("{function} patched live in {milliseconds:.0} ms"),
+        ),
+        HostNotice::PatchFailed { function, detail } => (
+            NoticeLevel::Error,
+            format!("{function} patch failed: {detail}"),
+        ),
+        HostNotice::RolledBack {
+            function,
+            to_generation,
+            automatic,
+        } => {
+            let text = if *automatic {
+                format!(
+                    "{function} rolled back to generation {to_generation} after repeated panics"
+                )
+            } else {
+                format!("{function} rolled back to generation {to_generation}")
+            };
+            (NoticeLevel::Warning, text)
+        }
+    }
+}
+
+/// The Problems rows a module's failed build output becomes.
+///
+/// The build text is parsed for compiler diagnostics; when none is
+/// recognisable - a linker error, a foreign toolchain's wording - the first
+/// non-empty line is kept as one row, so a failure never shows as nothing.
+fn problems_from_build_output(module: &str, output: &str) -> Vec<ProblemRow> {
+    let parsed = problem_parser::parse_build_output(output);
+    if parsed.is_empty() {
+        let message = output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("build failed")
+            .to_string();
+        return vec![ProblemRow {
+            module: module.to_string(),
+            problem: problem_parser::Problem {
+                severity: Severity::Error,
+                message,
+                file: None,
+                line: None,
+                column: None,
+            },
+        }];
+    }
+    parsed
+        .into_iter()
+        .map(|problem| ProblemRow {
+            module: module.to_string(),
+            problem,
+        })
+        .collect()
 }
 
 // =============================================================================
