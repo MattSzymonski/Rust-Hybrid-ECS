@@ -28,6 +28,7 @@ use pill_ui_egui::egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 use crate::assets::AssetDialog;
 use crate::browser::ProjectBrowser;
 use crate::layout::{EditorDock, EditorTab};
+use crate::notices::NoticeLevel;
 
 /// The egui shell's session: the UI context and the dock layout.
 pub struct EguiShellState {
@@ -57,6 +58,8 @@ pub struct EguiShellState {
     pub menubar: MenubarSession,
     /// The Inspector's collapsed component sections and its logged geometry.
     pub inspector: InspectorSession,
+    /// The toasts the host's notices put on screen (W-0038 Stage 4).
+    pub toasts: ToastSession,
 }
 
 /// The floating viewport toolbox's session state (Stage 22): a drag parks
@@ -134,6 +137,37 @@ pub enum HistoryRequest {
     Redo,
 }
 
+/// One toast on screen: a short-lived line about something the host did.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    /// The notice event's id, so a frame never queues the same line twice.
+    pub seq: u64,
+    /// Error, warning or note, picking the stripe's colour.
+    pub level: NoticeLevel,
+    /// The line to show.
+    pub text: String,
+    /// The frame index at which it disappears.
+    pub expires_at_frame: u64,
+}
+
+/// How many toasts show at once; older ones drop off the stack.
+pub const TOASTS_MAX: usize = 5;
+
+/// Frames a toast stays up - about four seconds at 60 fps.
+pub const TOAST_FRAMES: u64 = 240;
+
+/// The toast stack's session state.
+#[derive(Default)]
+pub struct ToastSession {
+    /// The live toasts, oldest first.
+    pub toasts: std::collections::VecDeque<Toast>,
+    /// The newest notice id already queued; `None` until the first event.
+    pub last_seq: Option<u64>,
+    /// The ids whose log line already went out, so a redrawn toast does not
+    /// flood the log.
+    pub logged: Vec<u64>,
+}
+
 /// The Inspector's session state: which component sections are collapsed, and
 /// the geometry its log already reported.
 ///
@@ -176,6 +210,7 @@ impl EguiShellState {
             mark: None,
             menubar: MenubarSession::default(),
             inspector: InspectorSession::default(),
+            toasts: ToastSession::default(),
         }
     }
 

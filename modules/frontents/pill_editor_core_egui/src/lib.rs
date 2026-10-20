@@ -54,6 +54,8 @@ pub mod inspector;
 pub mod layout;
 /// The editor's menu bar: its titles, metrics and the items each menu holds.
 pub mod menubar;
+/// The host's notices as plain data: toast events and Problems rows.
+pub mod notices;
 /// The Preferences tab's shared vocabulary: the file's editable keys.
 pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.

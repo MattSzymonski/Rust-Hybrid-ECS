@@ -34,7 +34,12 @@ pub fn raw_input(shell_input: &EguiShellInput) -> RawInput {
     } else {
         1.0
     };
-    let mut walk = EventWalk::default();
+    let mut walk = EventWalk {
+        modifiers: Modifiers::default(),
+        cursor: shell_input
+            .cursor
+            .map(|position| Pos2::new(position.x / scale, position.y / scale)),
+    };
     let mut events = Vec::new();
     for event in &shell_input.events {
         walk.push(event, scale, &mut events);
@@ -410,6 +415,25 @@ mod tests {
             ..Default::default()
         };
         assert!(raw_input(&shell_input).events.is_empty());
+    }
+
+    #[test]
+    fn a_seeded_cursor_places_a_release_that_has_no_move() {
+        let shell_input = EguiShellInput {
+            scale_factor: 2.0,
+            cursor: Some(Vector2f::new(200.0, 100.0)),
+            events: vec![InputEvent::MouseButton {
+                button: MouseButton::Left,
+                state: ButtonState::Released,
+            }],
+            ..Default::default()
+        };
+        let raw = raw_input(&shell_input);
+        let [Event::PointerButton { pos, pressed, .. }] = raw.events.as_slice() else {
+            panic!("expected one release, got {:?}", raw.events);
+        };
+        assert_eq!(*pos, Pos2::new(100.0, 50.0));
+        assert!(!pressed);
     }
 
     #[test]

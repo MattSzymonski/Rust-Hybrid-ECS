@@ -169,6 +169,11 @@ SCENE_GRID_TOKEN = "[test] scene grid"
 SCENE_GRID_STATE_TOKEN = "[editor] scene grid"
 HOT_PATCH_TOKEN = "[hot]"
 KEY_INJECTED_TOKEN = "[editor] key injected"
+TOAST_TOKEN = "[editor] toast"
+
+# One toast line as the shell logs it: the level, its notice id, the text the
+# executable produced and the row's rectangle (W-0038 Stage 4).
+TOAST_PATTERN = re.escape(TOAST_TOKEN) + r'\s+level={}\s+seq=\d+\s+text="[^"]*"'
 
 # The transform the gizmo drags edit; the field dump resolves the short
 # name, like the native suite's dumps do.
@@ -2760,6 +2765,9 @@ def main() -> int:
             "\n/// A marker the egui suite adds so the module grows an item and "
             "must reload, not patch.\npub fn egui_suite_marker() -> u32 {\n    1\n}\n"
         )
+        # Every byte the reload writes lands after this offset, so the toast
+        # waits below cannot be satisfied by an earlier patch's notice.
+        toast_start = len(session.read_log())
         # Count both tokens BEFORE the edit: the reloaded module's own loaded
         # line is logged before the reload's processed line, so counting the
         # loaded token after waiting for the reload would already include it
@@ -2779,6 +2787,14 @@ def main() -> int:
         # data would be a read through an unloaded image (W-0037 Stage 9).
         session.wait_occurrence(
             re.escape(SHELL_CONTEXT_CLAIMED_TOKEN), claims + 1, 60, "context claim"
+        )
+        # Stage 4: the reload's own notice reaches the toast stack, with the
+        # level the host assigned and the timing its build reported.
+        session.wait(
+            TOAST_PATTERN.format("info") + r'[^\n]*reloaded in \d+ ms',
+            60,
+            "reload toast",
+            toast_start,
         )
         after = session.request(
             "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after shell reload"
@@ -2810,6 +2826,33 @@ def main() -> int:
             session, highest, 120, "frame counter survived the project reload"
         )
         print("  [OK] project reloaded, editor UI kept")
+
+        # Step 8b: a build failure keeps the running generation and says so -
+        # an error toast now, a Problems row once the panel draws them
+        # (W-0038 Stages 4 and 6).
+        failure_start = len(session.read_log())
+        session.edit_source(
+            project_source,
+            project_text
+            + "\n// egui suite: project reload marker\n"
+            + 'compile_error!("egui suite deliberate failure");\n',
+        )
+        session.wait(
+            TOAST_PATTERN.format("error") + r'[^\n]*reload failed',
+            240,
+            "build-failed toast",
+            failure_start,
+        )
+        # Restoring the source builds again; the project comes back and the
+        # failure's rows clear with it.
+        session.edit_source(
+            project_source, project_text + "\n// egui suite: project reload marker\n"
+        )
+        reloads = occurrence_count(session, re.escape(PROJECT_RELOAD_TOKEN))
+        session.wait_occurrence(
+            re.escape(PROJECT_RELOAD_TOKEN), reloads + 1, 240, "recovery reload"
+        )
+        print("  [OK] build-failed toast, then the project recovered")
 
         # Step 9: the second viewport's tab floats into its own egui window;
         # its own scene surface (view=1) goes live at that window's body
