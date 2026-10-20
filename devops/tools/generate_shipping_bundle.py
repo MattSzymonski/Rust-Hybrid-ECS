@@ -97,14 +97,10 @@ EXTENSION_DIRECTORY = Path("modules") / "extensions"
 # `modules/extensions/<extension>/<crate>/`.
 # Suffix of an extension's editor crate, which no shipped build ever links.
 EDITOR_CRATE_SUFFIX = "_editor"
-# An editor build (W-0004 Stage 30, W-0029) also links a shell, and compiles
-# the UI canvas's element id into the web app. `--editor-frontend` picks the
-# shell: the egui shell is an editor-only extension crate and knows nothing
-# about `pill_ui`, while the `pill_ui` posture links the shell next to every
-# selected extension's editor crate.
-EDITOR_SHELL_CRATE_NAME = "pill_editor_shell_editor"
+# An editor build (W-0029) also links the egui shell, an editor-only
+# extension crate, and compiles the UI canvas's element id into the web app.
 EDITOR_EGUI_SHELL_CRATE_NAME = "pill_editor_shell_egui_editor"
-EDITOR_FRONTENDS = ("egui", "pill_ui")
+EDITOR_FRONTENDS = ("egui",)
 DEFAULT_EDITOR_FRONTEND = "egui"
 EDITOR_UI_CANVAS_ID = "pill-editor-ui"
 # The crates a bundle names: the runtime always (the static-link types), and the
@@ -732,10 +728,11 @@ def build_web_app_source(
     """Builds the web app crate's src/lib.rs: the browser entry point.
 
     `editor` emits the editor posture's entry point: the shell draws on a
-    second canvas above the scene's. `editor_frontend` picks the runner, the
-    egui one (W-0029) or the `pill_ui` one (W-0004 Stage 30).
+    second canvas above the scene's. `editor_frontend` names the runner; only
+    the egui one (W-0029) exists since the `pill_ui` posture retired
+    (W-0030 Stage 2).
     """
-    if editor and editor_frontend == "egui":
+    if editor:
         entry = (
             f"    pill_web::editor_egui::run_editor_egui(\n"
             f"        {BUNDLE_CRATE_NAME}::static_project(),\n"
@@ -747,19 +744,6 @@ def build_web_app_source(
             "//! - Run the shipping bundle's project as the egui editor in the\n"
             "//!   page's canvases (W-0029) when the browser has instantiated\n"
             "//!   this module: the scene below, the egui shell's UI above."
-        )
-    elif editor:
-        entry = (
-            f"    pill_web::editor::run_editor(\n"
-            f"        {BUNDLE_CRATE_NAME}::static_project(),\n"
-            f'        "{WEB_CANVAS_ID}",\n'
-            f'        "{EDITOR_UI_CANVAS_ID}",\n'
-            "    );"
-        )
-        responsibilities = (
-            "//! - Run the shipping bundle's project as an editor in the page's\n"
-            "//!   canvases (Stage 30) when the browser has instantiated this\n"
-            "//!   module: the scene below, the shell's UI above."
         )
     else:
         entry = (
@@ -952,18 +936,7 @@ def main() -> int:
     # the shell's own resources exist either way (its `register` tolerates
     # missing panels), and the editor crates fill the panel registry.
     if editor:
-        if editor_frontend == "egui":
-            editor_modules = [EDITOR_EGUI_SHELL_CRATE_NAME]
-        else:
-            editor_modules = [EDITOR_SHELL_CRATE_NAME]
-            editor_modules += [
-                name + EDITOR_CRATE_SUFFIX
-                for name in modules
-                if (
-                    extension_crate_directory(root, name + EDITOR_CRATE_SUFFIX)
-                    / PROJECT_MANIFEST_FILE_NAME
-                ).is_file()
-            ]
+        editor_modules = [EDITOR_EGUI_SHELL_CRATE_NAME]
         missing_editor_crates = [
             name
             for name in editor_modules

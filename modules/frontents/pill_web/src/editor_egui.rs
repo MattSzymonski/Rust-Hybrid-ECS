@@ -379,6 +379,18 @@ impl WebEditorApplication {
         {
             let world = driver.engine_mut().world_mut();
             if let Some(input) = world.get_resource_mut::<EguiShellInput>() {
+                // The pointer's last position is this frame's newest move, or
+                // the one the previous frame left: a release that arrives
+                // without a move still needs a place to land (W-0038 Stage 1).
+                let carried = input.cursor;
+                let cursor = events
+                    .iter()
+                    .rev()
+                    .find_map(|event| match event {
+                        InputEvent::CursorMoved { position } => Some(*position),
+                        _ => None,
+                    })
+                    .or(carried);
                 *input = EguiShellInput {
                     screen_size: logical_size,
                     scale_factor,
@@ -389,6 +401,7 @@ impl WebEditorApplication {
                     // event is the shell's as well as the game's (W-0029's
                     // behaviour; the split rule is W-0038's, Stage 1).
                     events: events.clone(),
+                    cursor,
                 };
             }
         }
