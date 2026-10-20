@@ -42,16 +42,18 @@ const COPY_ROW_ALIGNMENT: usize = 256;
 pub async fn request_device(prefer_software: bool) -> Option<(wgpu::Device, wgpu::Queue)> {
     // The primary backends only, like the renderer: the GL backend is the
     // one backend the plan bans (D19), and it needs no fallback here.
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         flags: wgpu::InstanceFlags::from_build_config(),
         backend_options: wgpu::BackendOptions::default(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: prefer_software,
+            apply_limit_buckets: false,
         })
         .await
         .ok()?;
@@ -62,6 +64,7 @@ pub async fn request_device(prefer_software: bool) -> Option<(wgpu::Device, wgpu
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
         .await
         .ok()?;
@@ -156,14 +159,19 @@ pub async fn render_rgba(
         let _ = sender.send(result);
     });
     device
-        .poll(wgpu::PollType::Wait)
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
         .map_err(|error| error.to_string())?;
     receiver
         .recv()
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| error.to_string())?;
     let rows = tighten_rows(&mapped, padded_row_bytes, row_bytes, height as usize);
     drop(mapped);
     readback.unmap();

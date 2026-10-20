@@ -18,7 +18,7 @@ pill_core = { path = "../pill_core" }
 pill_ui = { path = "../pill_ui" }
 # The same wgpu the renderer uses; a second version in one process would bring
 # a second graphics stack into the build.
-wgpu = "25.0.0"
+wgpu = "30.0.0"
 bytemuck = { version = "1.4", features = ["derive"] }
 
 # `png` encodes and decodes the golden images the `golden` example compares.
