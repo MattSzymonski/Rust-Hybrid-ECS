@@ -42,17 +42,13 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
-/// The `pill_ui` editor posture (W-0004 Stage 30): the scene on one canvas,
-/// the shell's UI on another.
-#[cfg(target_arch = "wasm32")]
-pub mod editor;
-
 /// The egui editor posture (W-0029): the scene on one canvas, the egui
-/// shell's UI on a transparent canvas above it.
+/// shell's UI on a transparent canvas above it. The only editor posture
+/// since the `pill_ui` one retired (W-0030 Stage 2).
 #[cfg(target_arch = "wasm32")]
 pub mod editor_egui;
 
-/// The scripted channel both editor postures drain (`editor_command`).
+/// The scripted channel the editor drains (`editor_command`).
 #[cfg(target_arch = "wasm32")]
 pub mod scripted;
 

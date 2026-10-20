@@ -24,14 +24,14 @@
 #   restore the committed stub afterwards with
 #   `git checkout -- build/pill_shipping_bundle`.
 #
-# USAGE: python devops/tools/build_web.py [--dev] [--editor] [--editor-frontend egui|pill_ui]
+# USAGE: python devops/tools/build_web.py [--dev] [--editor] [--editor-frontend egui]
 #          [--no-wasm-opt] [project_path]
 #          --dev           unoptimized build with debug info (faster to build)
 #          --editor        build the editor posture: the shell compiled into
 #                          the wasm, the two-canvas editor page beside it
 #          --editor-frontend
-#                          which editor shell an --editor build links:
-#                          `egui` (default, W-0029) or `pill_ui` (W-0004 Stage 30)
+#                          which editor shell an --editor build links: only
+#                          `egui` (W-0029) exists since W-0030 Stage 2
 #          --no-wasm-opt   skip wasm-opt in a release build
 #          [project_path]  workspace-relative project directory; defaults to
 #                          the PROJECT_PATH environment variable
@@ -58,7 +58,7 @@ PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "index.html"
 # and the scripted channel's page hook.
 EDITOR_PAGE_TEMPLATE = Path("devops") / "tools" / "web" / "editor.html"
 # The editor shells an `--editor` build can link (the generator's list).
-EDITOR_FRONTENDS = ("egui", "pill_ui")
+EDITOR_FRONTENDS = ("egui",)
 DEFAULT_EDITOR_FRONTEND = "egui"
 WEB_APP_DIRECTORY = Path("build") / "pill_web_app"
 WORKSPACE_LOCK = Path("modules") / "Cargo.lock"
@@ -116,7 +116,7 @@ def main() -> int:
         return 2
     if len(positional) > 1:
         print(
-            "usage: build_web.py [--dev] [--editor] [--editor-frontend egui|pill_ui] "
+            "usage: build_web.py [--dev] [--editor] [--editor-frontend egui] "
             "[--no-wasm-opt] [project_path]",
             file=sys.stderr,
         )
