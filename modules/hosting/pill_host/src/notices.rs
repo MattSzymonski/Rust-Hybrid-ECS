@@ -73,6 +73,13 @@ static NOTICES: Mutex<VecDeque<HostNotice>> = Mutex::new(VecDeque::new());
 
 /// Queue one notice for the frontend's next drain.
 pub(crate) fn push(notice: HostNotice) {
+    // One line per host event: the queue is bounded by real activity, and a
+    // frontend that never drains it needs to be visible from the log alone.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        kind = kind_name(&notice),
+        "[editor] host notice"
+    );
     let mut queue = NOTICES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -80,6 +87,17 @@ pub(crate) fn push(notice: HostNotice) {
         queue.pop_front();
     }
     queue.push_back(notice);
+}
+
+/// The log name of a notice's kind.
+fn kind_name(notice: &HostNotice) -> &'static str {
+    match notice {
+        HostNotice::ModuleFailed { .. } => "module_failed",
+        HostNotice::Reloaded { .. } => "reloaded",
+        HostNotice::PatchApplied { .. } => "patch_applied",
+        HostNotice::PatchFailed { .. } => "patch_failed",
+        HostNotice::RolledBack { .. } => "rolled_back",
+    }
 }
 
 /// Take every queued notice, oldest first.

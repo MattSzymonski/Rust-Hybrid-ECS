@@ -50,6 +50,12 @@ pub fn push_notices(state: &mut EguiShellState, notices: &EditorNotices) {
             text: event.text.clone(),
             expires_at_frame: state.frame_index + TOAST_FRAMES,
         });
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            seq = event.seq,
+            level = event.level.name(),
+            "[editor] toast queued"
+        );
         newest = Some(event.seq);
     }
     state.toasts.last_seq = newest;

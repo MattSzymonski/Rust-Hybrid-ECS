@@ -333,6 +333,7 @@ impl MeshDrawer {
             depth_stencil_attachment: Some(depth_stencil_attachment),
             timestamp_writes: None,
             occlusion_query_set: profiler.and_then(|profiler| profiler.get_occlusion_query_set()),
+            multiview_mask: None,
         });
 
         render_pass.set_viewport(

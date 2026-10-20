@@ -105,12 +105,12 @@ impl RendererPass {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{}_pipeline_layout", pass.name)),
             bind_group_layouts: &[
-                engine_bind_group_layout,
-                camera_bind_group_layout,
-                parameters_layout,
-                textures_layout,
+                Some(engine_bind_group_layout),
+                Some(camera_bind_group_layout),
+                Some(parameters_layout),
+                Some(textures_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // The pipeline is built for the target the pass writes, not for the
@@ -137,8 +137,8 @@ impl RendererPass {
                     format: depth_format,
                     // A translucent pass reads depth and does not write it, so
                     // what is behind it still passes the test a moment later.
-                    depth_write_enabled: pass.depth_write,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(pass.depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -154,8 +154,8 @@ impl RendererPass {
                 None,
                 Some(wgpu::DepthStencilState {
                     format: depth_format,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
@@ -188,7 +188,10 @@ impl RendererPass {
                 vertex: wgpu::VertexState {
                     module: &vertex_module,
                     entry_point: Some("vs_main"),
-                    buffers: &vertex_layouts,
+                    buffers: &vertex_layouts
+                        .into_iter()
+                        .map(Some)
+                        .collect::<Vec<_>>(),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -208,7 +211,7 @@ impl RendererPass {
                 },
                 depth_stencil,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         })

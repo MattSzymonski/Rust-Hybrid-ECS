@@ -865,9 +865,9 @@ impl EditorWindow {
         } else {
             wgpu::Backends::PRIMARY
         };
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::from_env().unwrap_or(default_backends),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(Arc::clone(&window))
@@ -876,6 +876,7 @@ impl EditorWindow {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .map_err(|source| EditorError::AdapterRequest { source })?;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -904,6 +905,7 @@ impl EditorWindow {
         let configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode,
@@ -4993,16 +4995,16 @@ impl EditorWindow {
         // Step 8: acquire the surface image, treating transient failures as
         // a skipped frame.
         let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.configuration);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => return Err(EditorError::OutOfMemory),
-            Err(error) => {
+            error => {
                 warn!(
                     target: telemetry_target::ENGINE,
-                    error = %error,
+                    error = ?error,
                     "[editor] skipping frame: the surface was not acquirable"
                 );
                 return Ok(());
@@ -5027,7 +5029,7 @@ impl EditorWindow {
             Some(self.theme.window),
         );
         self.queue.submit([encoder.finish()]);
-        frame.present();
+        self.queue.present(frame);
         // Step 8b: the overlay and the popups present their own surfaces
         // (Stage 21). The overlay draws after the scene has presented, so its
         // content lands on the newest scene image; the popups are separate

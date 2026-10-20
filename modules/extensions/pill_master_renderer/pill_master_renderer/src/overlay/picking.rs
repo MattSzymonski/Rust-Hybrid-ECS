@@ -162,15 +162,18 @@ impl PickReadback {
                 .map_or(MAPPING_PENDING, |state| state.load(Ordering::Acquire));
             match state {
                 MAPPING_DONE => {
-                    let hits = {
-                        let bytes = readback.buffer.slice(..).get_mapped_range();
-                        (0..readback.requests.len())
-                            .map(|slot| decode_slot(&bytes, slot, &readback.entities))
-                            .collect::<Vec<_>>()
-                    };
-                    readback.buffer.unmap();
-                    for (request, hit) in readback.requests.into_iter().zip(hits) {
-                        self.finished.push(PickResult { request, hit });
+                    match readback.buffer.slice(..).get_mapped_range() {
+                        Ok(bytes) => {
+                            let hits = (0..readback.requests.len())
+                                .map(|slot| decode_slot(&bytes, slot, &readback.entities))
+                                .collect::<Vec<_>>();
+                            drop(bytes);
+                            readback.buffer.unmap();
+                            for (request, hit) in readback.requests.into_iter().zip(hits) {
+                                self.finished.push(PickResult { request, hit });
+                            }
+                        }
+                        Err(_) => readback.buffer.unmap(),
                     }
                 }
                 // A readback the GPU could not deliver answers nothing rather

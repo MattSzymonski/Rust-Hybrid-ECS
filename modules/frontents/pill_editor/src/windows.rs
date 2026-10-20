@@ -498,6 +498,7 @@ impl ToolWindow {
         let configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: gpu.format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.0,
             height: size.1,
             present_mode: wgpu::PresentMode::Fifo,
@@ -548,10 +549,13 @@ impl ToolWindow {
         // (D30): the swapchain follows the window before it is drawn into.
         let size = self.window.inner_size();
         self.reconfigure(device, (size.width, size.height));
-        let frame = self
-            .surface
-            .get_current_texture()
-            .map_err(|error| format!("the window swapchain is unavailable: {error}"))?;
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            error => {
+                return Err(format!("the window swapchain is unavailable: {error:?}"));
+            }
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -569,7 +573,7 @@ impl ToolWindow {
             Some(background),
         );
         queue.submit(Some(encoder.finish()));
-        frame.present();
+        queue.present(frame);
         self.signature = Some(signature);
         Ok(())
     }
