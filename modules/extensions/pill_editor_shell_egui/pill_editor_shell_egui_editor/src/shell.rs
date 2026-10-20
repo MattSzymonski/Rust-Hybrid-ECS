@@ -256,9 +256,9 @@ pub mod tests;
 // module through the crate root's re-export, and a private constant would
 // fail its compile (`error[E0425]`) after which the host reloads.
 
-/// One shell frame: engine input becomes egui input, the dock runs, and the
-/// output becomes the executable's frame. The asset dialog, when one is
-/// open, is drawn over the dock.
+/// One shell frame: the shell's own events become egui input, the dock runs,
+/// and the output becomes the executable's frame. The asset dialog, when one
+/// is open, is drawn over the dock.
 pub fn run_frame(
     state: &mut EguiShellState,
     shell_input: &EguiShellInput,
@@ -266,7 +266,6 @@ pub fn run_frame(
     snapshot: &EditorSnapshot,
     selection: &mut EditorSelection,
     pending: &mut PendingEditorCommands,
-    engine_input: &Input,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
@@ -303,7 +302,7 @@ pub fn run_frame(
     // benchmark measures the D32 UI-redraw case from it; the GPU overlay
     // draw is outside it, as presentation is vsync-bound.
     let ui_started = pill_core::platform::Instant::now();
-    let raw_input = pill_ui_egui::input::raw_input(engine_input, shell_input);
+    let raw_input = pill_ui_egui::input::raw_input(shell_input);
     // The brand mark is uploaded once per session: the context owns the
     // texture, so a shell reload finds it already there.
     let mark = state.mark_texture();

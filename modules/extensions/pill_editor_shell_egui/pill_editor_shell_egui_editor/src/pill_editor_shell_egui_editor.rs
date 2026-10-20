@@ -124,8 +124,9 @@ pub fn register(engine: &mut Engine) -> u32 {
 /// Runs one egui pass: dock and tabs, then the frame the executable draws.
 ///
 /// Runs inside the host's frame, between the executable's input queueing and
-/// its presentation: the executable writes [`EguiShellInput`] before
-/// `run_frame` and drains [`EguiShellFrame`] after it.
+/// its presentation: the executable writes [`EguiShellInput`] - geometry,
+/// focus and the events of the editor's own windows - before `run_frame` and
+/// drains [`EguiShellFrame`] after it.
 #[allow(clippy::type_complexity)]
 #[pill_hot]
 pub fn egui_shell_update(
@@ -133,31 +134,28 @@ pub fn egui_shell_update(
         ResMut<EguiShellState>,
         ResMut<EguiShellInput>,
         ResMut<EguiShellFrame>,
-        // The nested pair keeps this system within the engine's
-        // six-parameter tuple arity.
-        (Res<EditorSnapshot>, ResMut<EditorSelection>),
+        Res<EditorSnapshot>,
+        ResMut<EditorSelection>,
         ResMut<PendingEditorCommands>,
-        Res<pill_engine::Input>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
     // is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, (snapshot, mut selection), mut pending, engine_input) =
-        resources;
+    let (mut state, mut input, mut frame, snapshot, mut selection, mut pending) = resources;
     let (
         Some(mut state),
         Some(input),
         Some(mut frame),
-        (Some(snapshot), Some(mut selection)),
+        Some(snapshot),
+        Some(mut selection),
         Some(mut pending),
-        Some(engine_input),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
-        (snapshot.get(), selection.get_mut()),
+        snapshot.get(),
+        selection.get_mut(),
         pending.get_mut(),
-        engine_input.get(),
     )
     else {
         return;
@@ -169,6 +167,5 @@ pub fn egui_shell_update(
         snapshot,
         &mut selection,
         &mut pending,
-        engine_input,
     );
 }

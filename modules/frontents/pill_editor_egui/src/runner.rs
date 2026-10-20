@@ -314,8 +314,19 @@ impl ApplicationHandler for EditorApplication {
                     None if is_game => editor.game_origin(),
                     None => (0.0, 0.0),
                 };
+                // The focus rule (W-0038 Stage 1): the game's window is the
+                // game's, so its events become the engine's input and the
+                // shell never sees them. The editor's own windows - the main
+                // one and the scene views - are the UI's: their events feed
+                // the shell, and a project system never receives a keystroke
+                // meant for the Inspector.
                 for event in translate_window_event(&other) {
-                    editor.pending_events.push(offset_pointer(event, origin));
+                    let event = offset_pointer(event, origin);
+                    if is_game {
+                        editor.pending_events.push(event);
+                    } else {
+                        editor.shell_events.push(event);
+                    }
                 }
             }
         }
@@ -384,6 +395,8 @@ struct EditorWindow {
     reported_fallback: bool,
     /// The window events not yet pushed into the engine's input.
     pending_events: Vec<InputEvent>,
+    /// The editor's own windows' events, not yet handed to the shell.
+    shell_events: Vec<InputEvent>,
     /// The last pointer position each scene window reported, in its own
     /// client-area physical pixels; `None` before its first move.
     scene_cursor: [Option<(f32, f32)>; SCENE_VIEWPORTS],
@@ -676,6 +689,7 @@ impl EditorWindow {
             },
             reported_fallback: false,
             pending_events: Vec::new(),
+            shell_events: Vec::new(),
             scene_cursor: [None; SCENE_VIEWPORTS],
             press_pick: None,
             outlined_entity: None,
@@ -2923,6 +2937,18 @@ impl EditorWindow {
             .world_mut()
             .get_resource_mut::<EguiShellInput>()
         {
+            // The modifier state opens the frame's stream, so the bridge
+            // starts from what is held rather than from nothing.
+            let mut events = Vec::with_capacity(self.shell_events.len() + 1);
+            events.push(InputEvent::ModifiersChanged {
+                modifiers: EngineModifiers {
+                    shift: self.modifiers.shift,
+                    control: self.modifiers.control,
+                    alt: self.modifiers.alt,
+                    super_key: false,
+                },
+            });
+            events.append(&mut self.shell_events);
             *input = EguiShellInput {
                 screen_size: pill_core::math::Vector2f::new(
                     self.size.0 as f32 / self.scale_factor,
@@ -2932,6 +2958,7 @@ impl EditorWindow {
                 focused: self.focused,
                 time: self.started.elapsed().as_secs_f64(),
                 frames_per_second: self.fps,
+                events,
             };
         }
         // Step 3b: apply the engine mutations the shell's assets actions and
@@ -3741,24 +3768,23 @@ impl EditorWindow {
             alt: chord.alt,
             super_key: chord.super_key,
         };
-        let engine = self.host.host_mut().engine_mut();
-        engine.push_input_event(InputEvent::ModifiersChanged { modifiers: held });
-        engine.push_input_event(InputEvent::Key {
+        self.queue_input(InputEvent::ModifiersChanged { modifiers: held });
+        self.queue_input(InputEvent::Key {
             key: chord.key,
             state: ButtonState::Pressed,
         });
         if let Some(character) = chord.typed_character() {
-            engine.push_input_event(InputEvent::TextInput {
+            self.queue_input(InputEvent::TextInput {
                 text: character.to_string(),
             });
         }
-        engine.push_input_event(InputEvent::Key {
+        self.queue_input(InputEvent::Key {
             key: chord.key,
             state: ButtonState::Released,
         });
         // The chord releases its modifiers as it ends: a later injection must
         // not inherit a held Control from this one.
-        engine.push_input_event(InputEvent::ModifiersChanged {
+        self.queue_input(InputEvent::ModifiersChanged {
             modifiers: EngineModifiers {
                 shift: false,
                 control: false,
@@ -3776,6 +3802,19 @@ impl EditorWindow {
         }
     }
 
+    /// Queue one scripted event: to the engine, and to the shell's list too.
+    ///
+    /// A scripted click or key stands in for a user's, so the UI must see it
+    /// the way a real event arrives - through the shell's own list - while
+    /// the game still receives what a user's would.
+    fn queue_input(&mut self, event: InputEvent) {
+        self.host
+            .host_mut()
+            .engine_mut()
+            .push_input_event(event.clone());
+        self.shell_events.push(event);
+    }
+
     /// Inject a full right click at a point of the window's client area,
     /// through the same engine input seam a real click enters: the shell's
     /// egui pass hit-tests and routes it, so a context menu opens over
@@ -3783,13 +3822,12 @@ impl EditorWindow {
     /// UI's, never the scene's.
     fn inject_rclick(&mut self, x: f32, y: f32) {
         let position = pill_core::math::Vector2f::new(x, y);
-        let engine = self.host.host_mut().engine_mut();
-        engine.push_input_event(InputEvent::CursorMoved { position });
-        engine.push_input_event(InputEvent::MouseButton {
+        self.queue_input(InputEvent::CursorMoved { position });
+        self.queue_input(InputEvent::MouseButton {
             button: MouseButton::Right,
             state: ButtonState::Pressed,
         });
-        engine.push_input_event(InputEvent::MouseButton {
+        self.queue_input(InputEvent::MouseButton {
             button: MouseButton::Right,
             state: ButtonState::Released,
         });
@@ -3809,13 +3847,12 @@ impl EditorWindow {
     /// reports as both edges; the egui bridge forwards them in order.
     fn inject_click(&mut self, x: f32, y: f32) {
         let position = pill_core::math::Vector2f::new(x, y);
-        let engine = self.host.host_mut().engine_mut();
-        engine.push_input_event(InputEvent::CursorMoved { position });
-        engine.push_input_event(InputEvent::MouseButton {
+        self.queue_input(InputEvent::CursorMoved { position });
+        self.queue_input(InputEvent::MouseButton {
             button: MouseButton::Left,
             state: ButtonState::Pressed,
         });
-        engine.push_input_event(InputEvent::MouseButton {
+        self.queue_input(InputEvent::MouseButton {
             button: MouseButton::Left,
             state: ButtonState::Released,
         });
@@ -3887,11 +3924,10 @@ impl EditorWindow {
         let (from, to, stage) = (drag.from, drag.to, drag.stage);
         match stage {
             0 => {
-                let engine = self.host.host_mut().engine_mut();
-                engine.push_input_event(InputEvent::CursorMoved {
+                self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(from.0, from.1),
                 });
-                engine.push_input_event(InputEvent::MouseButton {
+                self.queue_input(InputEvent::MouseButton {
                     button: MouseButton::Left,
                     state: ButtonState::Pressed,
                 });
@@ -3900,8 +3936,7 @@ impl EditorWindow {
                 }
             }
             1 => {
-                let engine = self.host.host_mut().engine_mut();
-                engine.push_input_event(InputEvent::CursorMoved {
+                self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(to.0, to.1),
                 });
                 if let Some(drag) = self.scripted_drag.as_mut() {
@@ -3909,8 +3944,7 @@ impl EditorWindow {
                 }
             }
             _ => {
-                let engine = self.host.host_mut().engine_mut();
-                engine.push_input_event(InputEvent::MouseButton {
+                self.queue_input(InputEvent::MouseButton {
                     button: MouseButton::Left,
                     state: ButtonState::Released,
                 });
