@@ -185,7 +185,7 @@ impl Surface {
         // resize replaces these.
         let width = width.max(1);
         let height = height.max(1);
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             // Vulkan, DX12, Metal or WebGPU, never OpenGL unless `WGPU_BACKEND`
             // asks for it. On Windows wgpu's GL backend leaves a hidden helper
             // window behind whose message handler is code in this DLL; once the
@@ -202,13 +202,14 @@ impl Surface {
                 .difference(wgpu::InstanceFlags::VALIDATION)
                 .with_env(),
             backend_options: wgpu::BackendOptions::default(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let (raw_window_handle, raw_display_handle) = window.to_raw()?;
         // SAFETY: the handles name a live window that outlives the surface,
         // which is this function's own contract with its caller.
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle,
+                raw_display_handle: Some(raw_display_handle),
                 raw_window_handle,
             })
         }
@@ -220,6 +221,7 @@ impl Surface {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| RendererError::AdapterRequest {
@@ -242,6 +244,7 @@ impl Surface {
                 required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
             .map_err(|error| RendererError::DeviceCreation {
@@ -272,6 +275,7 @@ impl Surface {
         let mut configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: color_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             desired_maximum_frame_latency: 2,
@@ -343,7 +347,7 @@ impl Surface {
         // which is this function's own contract with its caller.
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle,
+                raw_display_handle: Some(raw_display_handle),
                 raw_window_handle,
             })
         }
@@ -375,6 +379,7 @@ impl Surface {
         let mut configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: color_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: width.max(1),
             height: height.max(1),
             desired_maximum_frame_latency: 2,
@@ -469,27 +474,26 @@ impl Surface {
     /// for anything else.
     pub fn acquire(&mut self, device: &wgpu::Device) -> Result<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
-            Ok(frame) => Ok(frame),
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Ok(frame),
             // A lost or outdated swapchain is recovered by reconfiguring and
             // retrying once; reporting it and returning left the renderer dead
             // until some later resize event happened to arrive.
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.reconfigure(device)?;
-                self.surface
-                    .get_current_texture()
-                    .map_err(|error| match error {
-                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                            RendererError::SurfaceLost
-                        }
-                        wgpu::SurfaceError::OutOfMemory => RendererError::SurfaceOutOfMemory,
-                        other => RendererError::SurfaceTextureFailed {
-                            detail: other.to_string(),
-                        },
-                    })
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Ok(frame),
+                    wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                        Err(RendererError::SurfaceLost)
+                    }
+                    status => Err(RendererError::SurfaceTextureFailed {
+                        detail: format!("{status:?}"),
+                    }),
+                }
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => Err(RendererError::SurfaceOutOfMemory),
-            Err(other) => Err(RendererError::SurfaceTextureFailed {
-                detail: other.to_string(),
+            other => Err(RendererError::SurfaceTextureFailed {
+                detail: format!("{other:?}"),
             }),
         }
     }
@@ -578,15 +582,19 @@ fn apply_and_probe(
     surface: &wgpu::Surface<'static>,
     device: &wgpu::Device,
     surface_configuration: &wgpu::SurfaceConfiguration,
-) -> std::result::Result<wgpu::SurfaceTexture, wgpu::SurfaceError> {
+) -> std::result::Result<wgpu::SurfaceTexture, String> {
     surface.configure(device, surface_configuration);
-    surface.get_current_texture()
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(frame)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Ok(frame),
+        other => Err(format!("{other:?}")),
+    }
 }
 
 /// Why one configuration attempt failed, or `None` when it succeeded: a
 /// captured error first, else the probe's own failure.
 fn attempt_failure(
-    probe: std::result::Result<wgpu::SurfaceTexture, wgpu::SurfaceError>,
+    probe: std::result::Result<wgpu::SurfaceTexture, String>,
     errors: CapturedErrors,
 ) -> Option<String> {
     let reported = errors
@@ -600,7 +608,7 @@ fn attempt_failure(
             drop(frame);
             reported
         }
-        Err(error) => Some(reported.unwrap_or_else(|| error.to_string())),
+        Err(error) => Some(reported.unwrap_or(error)),
     }
 }
 

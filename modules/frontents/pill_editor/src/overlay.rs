@@ -124,6 +124,7 @@ impl OverlaySurface {
         let configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.0.max(1),
             height: size.1.max(1),
             present_mode: wgpu::PresentMode::Fifo,
@@ -198,10 +199,13 @@ impl OverlaySurface {
         if self.signature == Some(signature) {
             return Ok(false);
         }
-        let frame = self
-            .surface
-            .get_current_texture()
-            .map_err(|error| format!("the overlay swapchain is unavailable: {error}"))?;
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            error => {
+                return Err(format!("the overlay swapchain is unavailable: {error:?}"));
+            }
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -221,7 +225,7 @@ impl OverlaySurface {
             Some(Color::TRANSPARENT),
         );
         queue.submit(Some(encoder.finish()));
-        frame.present();
+        queue.present(frame);
         self.signature = Some(signature);
         self.frames += 1;
         Ok(true)

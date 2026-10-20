@@ -223,8 +223,11 @@ impl RendererShader {
 
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{}_pipeline_layout", name)),
-                bind_group_layouts: &bind_group_layouts,
-                push_constant_ranges: &[],
+                bind_group_layouts: &bind_group_layouts
+                    .iter()
+                    .map(|layout| Some(*layout))
+                    .collect::<Vec<_>>(),
+                immediate_size: 0,
             })
         };
 
@@ -244,7 +247,10 @@ impl RendererShader {
             vertex: wgpu::VertexState {
                 module: &vertex_shader,
                 entry_point: Some("vs_main"),
-                buffers: vertex_layouts, // Specifies structure of vertices that will be passed to the vertex shader
+                buffers: &vertex_layouts
+                    .iter()
+                    .map(|layout| Some((*layout).clone()))
+                    .collect::<Vec<_>>(), // Specifies structure of vertices that will be passed to the vertex shader
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -265,8 +271,8 @@ impl RendererShader {
             },
             depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
                 format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less, // Specifies when to discard a new pixel. Using LESS means pixels will be drawn front to back
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less), // Specifies when to discard a new pixel. Using LESS means pixels will be drawn front to back
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -275,7 +281,7 @@ impl RendererShader {
                 mask: !0, // Specifies which samples should be active
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         };
 

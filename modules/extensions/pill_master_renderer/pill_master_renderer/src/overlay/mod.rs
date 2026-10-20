@@ -439,8 +439,8 @@ impl Overlay {
         let layout = |label: &str, groups: &[&wgpu::BindGroupLayout]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
-                bind_group_layouts: groups,
-                push_constant_ranges: &[],
+                bind_group_layouts: &groups.iter().map(|group| Some(*group)).collect::<Vec<_>>(),
+                immediate_size: 0,
             })
         };
         let camera_pipeline_layout = layout("overlay_camera", &[camera_layout]);
@@ -513,7 +513,11 @@ impl Overlay {
                 vertex: wgpu::VertexState {
                     module: description.module,
                     entry_point: Some(description.vertex),
-                    buffers: description.buffers,
+                    buffers: &description
+                        .buffers
+                        .iter()
+                        .map(|buffer| Some((*buffer).clone()))
+                        .collect::<Vec<_>>(),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -528,7 +532,7 @@ impl Overlay {
                 },
                 depth_stencil: description.depth,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -753,6 +757,7 @@ impl Overlay {
                 label: Some("overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: input.color_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -769,6 +774,7 @@ impl Overlay {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             set_viewport(&mut pass, input.viewport);
             // The grid first: it is the scene's floor, and everything the
@@ -893,6 +899,7 @@ impl Overlay {
             label: Some("overlay_outline_mask"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.targets[target_index].mask_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -902,6 +909,7 @@ impl Overlay {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         set_viewport(&mut pass, input.viewport);
         pass.set_pipeline(&self.outline_mask);
@@ -967,6 +975,7 @@ impl Overlay {
                 label: Some("overlay_pick"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &pick.1,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -983,6 +992,7 @@ impl Overlay {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             set_viewport(&mut pass, input.viewport);
             pass.set_bind_group(0, &input.camera.bind_group, &[]);
@@ -1042,8 +1052,8 @@ fn depth_state(
 ) -> wgpu::DepthStencilState {
     wgpu::DepthStencilState {
         format,
-        depth_write_enabled: write,
-        depth_compare: compare,
+        depth_write_enabled: Some(write),
+        depth_compare: Some(compare),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }

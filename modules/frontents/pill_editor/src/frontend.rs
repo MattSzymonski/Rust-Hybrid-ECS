@@ -70,6 +70,7 @@ pub enum EditorError {
 
     /// A frame failed with the device out of memory, which no retry heals.
     #[message("the editor GPU device ran out of memory")]
+    #[allow(dead_code)] // Nothing constructs it since wgpu 30 dropped `SurfaceError`.
     OutOfMemory,
 }
 

@@ -324,17 +324,18 @@ impl ApplicationHandler for EditorApplication {
                 // meant for the Inspector.
                 for event in translate_window_event(&other) {
                     let event = offset_pointer(event, origin);
-                    if is_game {
-                        editor.pending_events.push(event);
-                    } else {
-                        match &event {
-                            InputEvent::CursorMoved { position } => {
-                                editor.shell_cursor = Some(*position);
+                    match route_event(&event, is_game) {
+                        EventRoute::Game => editor.pending_events.push(event),
+                        EventRoute::Shell => {
+                            match &event {
+                                InputEvent::CursorMoved { position } => {
+                                    editor.shell_cursor = Some(*position);
+                                }
+                                InputEvent::CursorLeft => editor.shell_cursor = None,
+                                _ => {}
                             }
-                            InputEvent::CursorLeft => editor.shell_cursor = None,
-                            _ => {}
+                            editor.shell_events.push(event);
                         }
-                        editor.shell_events.push(event);
                     }
                 }
             }
@@ -3854,6 +3855,11 @@ impl EditorWindow {
         if notices.is_empty() {
             return;
         }
+        info!(
+            target: telemetry_target::ENGINE,
+            count = notices.len(),
+            "[editor] notices drained"
+        );
         for notice in &notices {
             let (level, text) = notice_toast(notice);
             let seq = self.notices.next_event_seq;
@@ -4471,6 +4477,26 @@ impl SceneView {
     }
 }
 
+/// Where one translated window event belongs (W-0038 Stage 1's focus rule).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventRoute {
+    /// The game's window: the project's systems receive it.
+    Game,
+    /// One of the editor's windows: only the shell sees it, so a keystroke
+    /// meant for the Inspector never drives the game.
+    Shell,
+}
+
+/// The focus rule in one place: the game's window feeds the game, every
+/// editor window feeds the shell.
+fn route_event(_event: &InputEvent, is_game_window: bool) -> EventRoute {
+    if is_game_window {
+        EventRoute::Game
+    } else {
+        EventRoute::Shell
+    }
+}
+
 /// Shift a pointer event the scene window reported into the main window's
 /// client coordinates. Only cursor positions move: buttons and wheels carry
 /// no position of their own, and egui reads the cursor's for them.
@@ -4807,6 +4833,23 @@ fn scaled_view_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The focus rule: a key or click from the game's window is the game's,
+    /// and one from any editor window is the shell's alone (W-0038 Stage 1).
+    #[test]
+    fn only_the_game_window_feeds_the_game() {
+        let key = InputEvent::Key {
+            key: KeyCode::KeyA,
+            state: ButtonState::Pressed,
+        };
+        assert_eq!(route_event(&key, true), EventRoute::Game);
+        assert_eq!(route_event(&key, false), EventRoute::Shell);
+        let pointer = InputEvent::CursorMoved {
+            position: pill_core::math::Vector2f::new(4.0, 9.0),
+        };
+        assert_eq!(route_event(&pointer, true), EventRoute::Game);
+        assert_eq!(route_event(&pointer, false), EventRoute::Shell);
+    }
 
     /// A rectangle inside the window scales with the display and lands where
     /// the shell drew it.

@@ -295,7 +295,10 @@ impl Drop for Renderer {
     /// pipelines that are being destroyed, and the surface would be released
     /// under a frame the driver has not presented yet.
     fn drop(&mut self) {
-        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait) {
+        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        }) {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "the GPU did not go idle before the renderer was released: {error}"
@@ -541,7 +544,10 @@ impl PillRenderer for Renderer {
         };
         // Wait for the GPU before the swapchain goes: a frame still in flight
         // may be presenting into it.
-        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait) {
+        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        }) {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
                 "the GPU did not go idle before surface {} was released: {error}", id.0
@@ -984,6 +990,7 @@ impl State {
                     };
                     Some(wgpu::RenderPassColorAttachment {
                         view: target,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load,
@@ -1073,6 +1080,7 @@ impl State {
                         depth_stencil_attachment,
                         timestamp_writes: None,
                         occlusion_query_set: None,
+                        multiview_mask: None,
                     });
                     render_pass.set_pipeline(&pass.pipeline);
                     // A fullscreen pass covers its whole target unless it is
@@ -1181,7 +1189,7 @@ impl State {
         drop(queue_submit_zone);
         self.overlay.after_submit();
         let present_zone = pill_core::profile_scope!("renderer: present");
-        surface_frame.present();
+        self.queue.present(surface_frame);
         drop(present_zone);
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.end_frame();

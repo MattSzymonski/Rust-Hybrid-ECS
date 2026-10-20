@@ -207,7 +207,10 @@ fn take_mapped(buffer: &Buffer, state: &AtomicU8, count: usize) -> Vec<u64> {
     if state.load(Ordering::Acquire) != MAP_DONE {
         return Vec::new();
     }
-    let data = buffer.slice(..).get_mapped_range();
+    let data = match buffer.slice(..).get_mapped_range() {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
+    };
     let values: &[u64] = bytemuck::cast_slice(&data);
     let taken = values[..count.min(values.len())].to_vec();
     drop(data);
@@ -905,7 +908,12 @@ fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) 
     queue.submit(std::iter::once(encoder.finish()));
 
     let state = map_for_reading(&readback);
-    device.poll(PollType::Wait).ok()?;
+    device
+        .poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok()?;
     take_mapped(&readback, &state, 1).first().copied()
 }
 

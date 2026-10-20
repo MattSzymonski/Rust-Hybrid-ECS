@@ -39,7 +39,7 @@ pub(crate) struct CapturedErrors {
 /// refused pipeline or a lost surface. Logged, the frame that provoked one is
 /// lost instead, and the log says why.
 pub(crate) fn report_uncaptured_errors(device: &wgpu::Device) {
-    device.on_uncaptured_error(Box::new(|error| {
+    device.on_uncaptured_error(std::sync::Arc::new(|error| {
         pill_core::error!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
             "GPU error: {error}"
@@ -55,15 +55,15 @@ pub(crate) async fn captured<T>(
     device: &wgpu::Device,
     make: impl FnOnce() -> T,
 ) -> (T, CapturedErrors) {
-    device.push_error_scope(wgpu::ErrorFilter::Validation);
-    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let out_of_memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
     let value = make();
 
     // Scopes are a stack: the one pushed last is the one popped first.
-    let internal = device.pop_error_scope().await;
-    let out_of_memory = device.pop_error_scope().await;
-    let validation = device.pop_error_scope().await;
+    let internal = internal_scope.pop().await;
+    let out_of_memory = out_of_memory_scope.pop().await;
+    let validation = validation_scope.pop().await;
     let errors = CapturedErrors {
         validation,
         out_of_memory,
