@@ -58,6 +58,8 @@ pub mod menubar;
 pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.
 pub mod problems;
+/// The scripted test channel's grammar: one typed parse of the suites' lines.
+pub mod scripted;
 /// The egui shell's long-lived session state.
 pub mod session;
 /// The Systems tab's shared logic: row labels, system toggles and the
