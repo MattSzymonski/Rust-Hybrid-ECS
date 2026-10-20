@@ -212,6 +212,16 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
+    # The browser frontend: the crate only compiles for wasm, so its check is
+    # the wasm target, and the page smoke suite builds a project and draws it
+    # in a headless browser.
+    if has("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**"):
+        selected.append(cargo_check("check pill_web (wasm)",
+                                    ("check", "-p", "pill_web", "--target", "wasm32-unknown-unknown",
+                                     "--offline"),
+                                    "browser frontend changed"))
+        selected.append(suite_check("test_web_smoke.py", "browser frontend changed"))
+
     # Engine core and the shared crates below it: unit tests plus the
     # hot-reload regression net that runs a host against real projects.
     if has("modules/pill_core/**"):
@@ -309,6 +319,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("editor-core", ("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**")),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
                      "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**")),
+    ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
     ("pill-core", ("modules/pill_core/**",)),
     ("host", ("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**")),

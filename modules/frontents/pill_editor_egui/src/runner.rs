@@ -56,6 +56,7 @@ use pill_editor_core_egui::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
 };
 use pill_editor_core_egui::preferences::{self, PreferencesView};
+use pill_editor_core_egui::scripted::{AssetEdit, Dump, KeyChord, ScriptedCommand, ToolbarAction};
 use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
@@ -84,7 +85,6 @@ use winit::window::{Window, WindowId};
 // Current crate
 use crate::frontend::EditorError;
 use crate::overlay::OverlaySurface;
-use crate::scripted::{AssetEdit, Dump, KeyChord, ScriptedCommand, ToolbarAction};
 use crate::test_channel::{self, TestChannel};
 
 // =============================================================================

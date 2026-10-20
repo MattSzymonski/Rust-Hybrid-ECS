@@ -41,7 +41,8 @@ use pill_core::{error, info, warn};
 use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
 use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
-use pill_editor_core_egui::gizmo::GizmoState;
+use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
+use pill_editor_core_egui::scripted::{Dump, ScriptedCommand};
 use pill_editor_core_egui::{entities, systems};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
@@ -428,60 +429,55 @@ impl WebEditorApplication {
 
 /// Apply the command batches the shell queued last frame.
 ///
-/// The scripted lines are the browser's own vocabulary; the application is
-/// the shared core drain ([`pill_editor_core_egui::drain::apply_pending`]),
-/// so the browser applies batches, records history steps, follows a moved or
-/// deleted asset and remaps a restored entity exactly as the native editor
-/// does. The listing flag has no work here: the browser stages no asset panel
-/// yet.
+/// The scripted lines go through the shared grammar
+/// ([`pill_editor_core_egui::scripted`]) and then the shared core drain, so
+/// the browser parses, refuses and applies exactly what the desktop editor
+/// does - including the history recording, the remap and the selection
+/// follow. The listing flag has no work here: the browser stages no asset
+/// panel yet.
 fn apply_pending_commands(
     engine: &mut pill_engine_core::Engine,
     elapsed: std::time::Duration,
     scripted: &[String],
 ) {
-    for line in scripted {
-        let mut parts = line.split_whitespace();
-        match parts.next() {
-            Some("command") => match parts.next() {
-                Some(id) => run_scripted_command(engine, id),
-                None => warn!(
-                    target: telemetry_target::ENGINE,
-                    line,
-                    "[editor] web command needs an id"
-                ),
-            },
-            Some("dump") => {
-                let (entities, systems) = engine
-                    .world()
-                    .get_resource::<EditorSnapshot>()
-                    .map_or((0, 0), |snapshot| {
-                        (snapshot.entities.len(), snapshot.systems.len())
-                    });
-                info!(
-                    target: telemetry_target::ENGINE,
-                    entities,
-                    systems,
-                    "[editor] web rows"
-                );
-            }
-            Some(verb) => warn!(
-                target: telemetry_target::ENGINE,
-                line,
-                verb,
-                "[editor] web command ignored"
-            ),
-            None => {}
-        }
-    }
+    run_scripted_lines(engine, scripted);
     let now_millis = elapsed.as_millis() as u64;
     let _ = drain::apply_pending(engine, now_millis);
 }
 
-/// Run one scripted command id: the native test channel's core verbs, queued
-/// through the same `PendingEditorCommands` the shell uses.
-fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
-    match id {
-        "editor.pause_toggle" => {
+/// Run the scripted lines the page appended, through the shared grammar.
+///
+/// A line the grammar refuses takes the same `[editor] scripted command
+/// rejected` path the desktop editor's channel uses, so a suite that drives
+/// the page sees a refusal instead of a wait.
+fn run_scripted_lines(engine: &mut pill_engine_core::Engine, lines: &[String]) {
+    for line in lines {
+        match ScriptedCommand::parse(line) {
+            Ok(command) => run_scripted(engine, line, command),
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                command = line.as_str(),
+                reason = error.reason.as_str(),
+                "[editor] scripted command rejected"
+            ),
+        }
+    }
+}
+
+/// Run one parsed command the browser posture carries.
+///
+/// The browser has no window chrome, no asset panel and no picking yet, so
+/// the verbs that need them are refused by name: a vocabulary that silently
+/// ignores a line is worse than one that says which verb is missing.
+fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: ScriptedCommand) {
+    match command {
+        ScriptedCommand::Undo => {
+            drain::step_history(engine, HistoryDirection::Undo);
+        }
+        ScriptedCommand::Redo => {
+            drain::step_history(engine, HistoryDirection::Redo);
+        }
+        ScriptedCommand::PauseToggle => {
             let paused = engine.systems_paused();
             if let Some(pending) = engine
                 .world_mut()
@@ -495,7 +491,7 @@ fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
                 "[editor] pause toggled"
             );
         }
-        "editor.step" => {
+        ScriptedCommand::Step => {
             if let Some(pending) = engine
                 .world_mut()
                 .get_resource_mut::<PendingEditorCommands>()
@@ -504,7 +500,7 @@ fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
             }
             info!(target: telemetry_target::ENGINE, "[editor] step queued");
         }
-        "editor.entity_create" => {
+        ScriptedCommand::EntityCreate => {
             let (command, label) = entities::entity_create();
             if let Some(pending) = engine
                 .world_mut()
@@ -514,7 +510,7 @@ fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
             }
             info!(target: telemetry_target::ENGINE, "[editor] new entity queued");
         }
-        "editor.entity_delete" => {
+        ScriptedCommand::EntityDelete => {
             let (entity, asset) = engine
                 .world()
                 .get_resource::<EditorSelection>()
@@ -540,17 +536,119 @@ fn run_scripted_command(engine: &mut pill_engine_core::Engine, id: &str) {
                 "[editor] delete entity queued"
             );
         }
-        "editor.undo" => {
-            drain::step_history(engine, HistoryDirection::Undo);
+        ScriptedCommand::GizmoTool(mode) => {
+            queue_gizmo_tool(engine, Some(mode), None, None);
         }
-        "editor.redo" => {
-            drain::step_history(engine, HistoryDirection::Redo);
+        ScriptedCommand::SnapToggle => {
+            let snap = gizmo_settings(engine).snap;
+            queue_gizmo_tool(engine, None, None, Some(!snap));
         }
-        other => warn!(
-            target: telemetry_target::ENGINE,
-            command = other,
-            "[editor] command not executable in the browser"
-        ),
+        ScriptedCommand::SpaceToggle => {
+            let space = match gizmo_settings(engine).space {
+                GizmoSpace::World => GizmoSpace::Local,
+                GizmoSpace::Local => GizmoSpace::World,
+            };
+            queue_gizmo_tool(engine, None, Some(space), None);
+        }
+        // The page's data channel: the entity and system counts the shell's
+        // tabs list, which is what the browser's probe reads.
+        ScriptedCommand::Dump(Dump::Tabs) => {
+            let (entities, systems) = engine
+                .world()
+                .get_resource::<EditorSnapshot>()
+                .map_or((0, 0), |snapshot| {
+                    (snapshot.entities.len(), snapshot.systems.len())
+                });
+            info!(
+                target: telemetry_target::ENGINE,
+                entities,
+                systems,
+                "[editor] web rows"
+            );
+        }
+        other => refuse_in_browser(line, &other),
+    }
+}
+
+/// Refuse a command this posture has no code for, naming the line and the
+/// verb so the gap is readable in the page's console.
+fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
+    let reason = format!(
+        "'{}' is not available in the browser editor yet (W-0029)",
+        scripted_name(command)
+    );
+    warn!(
+        target: telemetry_target::ENGINE,
+        command = line,
+        reason = reason.as_str(),
+        "[editor] scripted command rejected"
+    );
+}
+
+/// The wire name of one parsed command, for a refusal line.
+fn scripted_name(command: &ScriptedCommand) -> &'static str {
+    match command {
+        ScriptedCommand::Quit => "quit",
+        ScriptedCommand::Undock(_) => "undock",
+        ScriptedCommand::ActivateTab(_) => "tab",
+        ScriptedCommand::Click { .. } => "click",
+        ScriptedCommand::RightClick { .. } => "rclick",
+        ScriptedCommand::Drag { .. } => "drag",
+        ScriptedCommand::GizmoDrag { .. } => "gizmo drag",
+        ScriptedCommand::GizmoPress { .. } => "gizmo press",
+        ScriptedCommand::GizmoRelease => "gizmo release",
+        ScriptedCommand::GizmoTool(_) => "gizmo",
+        ScriptedCommand::Key(_) => "key",
+        ScriptedCommand::Dump(_) => "dump",
+        ScriptedCommand::Browser(_) => "browser",
+        ScriptedCommand::Camera { .. } => "camera",
+        ScriptedCommand::CameraZoom(_) => "camera zoom",
+        ScriptedCommand::Hover { .. } => "hover",
+        ScriptedCommand::SelectAsset(_) => "select asset",
+        ScriptedCommand::SelectEntity(_) => "select entity",
+        ScriptedCommand::Toolbar(_) => "toolbar",
+        ScriptedCommand::DialogSetName(_) => "dialog set name",
+        ScriptedCommand::DialogSubmit => "dialog submit",
+        ScriptedCommand::EditAsset(_) => "edit asset",
+        ScriptedCommand::EditSet { .. } => "edit set",
+        ScriptedCommand::EditArray { .. } => "edit array",
+        ScriptedCommand::EditAssetSettings { .. } => "edit asset-settings",
+        ScriptedCommand::EditSystem { .. } => "edit system",
+        ScriptedCommand::EditPreference { .. } => "edit preference",
+        ScriptedCommand::EditComponent { .. } => "edit add/remove",
+        ScriptedCommand::Undo => "command editor.undo",
+        ScriptedCommand::Redo => "command editor.redo",
+        ScriptedCommand::PauseToggle => "command editor.pause_toggle",
+        ScriptedCommand::Step => "command editor.step",
+        ScriptedCommand::EntityCreate => "command editor.entity_create",
+        ScriptedCommand::EntityDelete => "command editor.entity_delete",
+        ScriptedCommand::SnapToggle => "command editor.tool_snap_toggle",
+        ScriptedCommand::SpaceToggle => "command editor.tool_space_toggle",
+    }
+}
+
+/// The gizmo settings the world holds, defaults when none was registered.
+fn gizmo_settings(engine: &pill_engine_core::Engine) -> GizmoSettings {
+    engine
+        .world()
+        .get_resource::<GizmoState>()
+        .map(|state| state.settings)
+        .unwrap_or_default()
+}
+
+/// Queue one `SetGizmoTool` edit: the same control edit the desktop editor's
+/// menu, shortcuts and scripted channel queue.
+fn queue_gizmo_tool(
+    engine: &mut pill_engine_core::Engine,
+    mode: Option<GizmoMode>,
+    space: Option<GizmoSpace>,
+    snap: Option<bool>,
+) {
+    if let Some(pending) = engine
+        .world_mut()
+        .get_resource_mut::<PendingEditorCommands>()
+    {
+        pending.push(vec![EditorCommand::SetGizmoTool { mode, space, snap }]);
     }
 }
 

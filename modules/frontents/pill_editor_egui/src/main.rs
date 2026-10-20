@@ -35,8 +35,6 @@ mod frontend;
 mod overlay;
 /// The window, the GPU device and the frame loop.
 mod runner;
-/// The scripted channel's grammar: one typed parse of the suites' lines.
-mod scripted;
 /// The devops suite's scripted input channel.
 mod test_channel;
 

@@ -6,16 +6,21 @@
 //! - Parse one scripted line into a [`ScriptedCommand`] ([`ScriptedCommand::parse`]),
 //!   or explain why it cannot run.
 //! - Keep the grammar - the verbs, their arguments and their value forms -
-//!   in this file instead of the runner, so it can be listed and table-tested
+//!   in one file instead of a runner, so it can be listed and table-tested
 //!   without launching an editor.
 //!
 //! # Design
 //!
 //! The vocabulary is the suites' API: `test_editor_egui.py` writes these
 //! lines, so a verb name or an argument order cannot change without the suite
-//! noticing. Parsing yields a value; the runner only dispatches, and its one
-//! refusal path turns a [`ParseError`] into the `[editor] scripted command
-//! rejected` line the Python side raises on.
+//! noticing. The desktop editor and the browser editor both parse with this
+//! module and dispatch the commands their posture can run, so the two
+//! vocabularies cannot drift; a verb a posture cannot run is refused through
+//! the same `[editor] scripted command rejected` line the Python side raises
+//! on.
+//!
+//! The module is UI-free and window-free (it only names the model types),
+//! which is what lets the browser build link it.
 //!
 //! Arguments are whitespace-separated words, except where the trailing value
 //! is free text: `edit set`, `edit array`, `edit asset-settings`,
@@ -31,10 +36,12 @@
 //! the named editing keys listed by [`key_code_name`].
 
 // External crates
-use pill_editor_core_egui::camera::CameraNavigation;
-use pill_editor_core_egui::gizmo::GizmoMode;
-use pill_editor_core_egui::layout::EditorTab;
-use pill_engine_core::input::KeyCode;
+use pill_engine::KeyCode;
+
+// Current crate
+use crate::camera::CameraNavigation;
+use crate::gizmo::GizmoMode;
+use crate::layout::EditorTab;
 
 // =============================================================================
 // The command
