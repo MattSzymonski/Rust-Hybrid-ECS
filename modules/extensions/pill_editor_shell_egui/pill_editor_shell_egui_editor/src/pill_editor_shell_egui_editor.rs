@@ -144,13 +144,18 @@ pub fn egui_shell_update(
         ResMut<EguiShellFrame>,
         // The nested triple keeps this system within the engine's six-parameter
         // tuple arity.
-        (Res<EditorSnapshot>, ResMut<EditorSelection>, Res<EditorNotices>),
+        (
+            Res<EditorSnapshot>,
+            ResMut<EditorSelection>,
+            Res<EditorNotices>,
+        ),
         ResMut<PendingEditorCommands>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
     // is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, (snapshot, mut selection, notices), mut pending) = resources;
+    let (mut state, mut input, mut frame, (snapshot, mut selection, notices), mut pending) =
+        resources;
     let (
         Some(mut state),
         Some(input),

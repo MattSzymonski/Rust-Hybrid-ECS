@@ -3922,8 +3922,12 @@ impl EditorWindow {
         }
         self.notices.revision = self.notices.revision.wrapping_add(1);
         let world = self.host.host_mut().engine_mut().world_mut();
-        if let Some(resource) = world.get_resource_mut::<EditorNotices>() {
-            *resource = self.notices.clone();
+        match world.get_resource_mut::<EditorNotices>() {
+            Some(resource) => *resource = self.notices.clone(),
+            None => warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] notices resource missing"
+            ),
         }
     }
 

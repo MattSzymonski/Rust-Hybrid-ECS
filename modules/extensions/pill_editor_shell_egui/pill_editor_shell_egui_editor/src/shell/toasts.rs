@@ -37,10 +37,7 @@ const TOAST_GAP: f32 = 4.0;
 pub fn push_notices(state: &mut EguiShellState, notices: &EditorNotices) {
     let mut newest = state.toasts.last_seq;
     for event in &notices.events {
-        let fresh = state
-            .toasts
-            .last_seq
-            .is_none_or(|last| event.seq > last);
+        let fresh = state.toasts.last_seq.is_none_or(|last| event.seq > last);
         if !fresh {
             continue;
         }
@@ -68,7 +65,9 @@ pub fn draw_toasts(
     context: &egui::Context,
     regions: &mut Vec<ShellRect>,
 ) {
-    toasts.toasts.retain(|toast| toast.expires_at_frame > frame_index);
+    toasts
+        .toasts
+        .retain(|toast| toast.expires_at_frame > frame_index);
     if toasts.toasts.is_empty() {
         toasts.logged.clear();
         return;
