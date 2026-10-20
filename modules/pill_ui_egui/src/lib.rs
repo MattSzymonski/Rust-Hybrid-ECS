@@ -46,7 +46,17 @@
 //! shared crate (the egui shell's `EguiShellState`, defined in
 //! `pill_editor_core_egui` and re-claimed by every shell generation);
 //! transient state stays inside the frame that made it.
-//! `test_coding_standards.py` flags those calls in reloadable crates.
+//! `test_coding_standards.py` flags those calls in reloadable crates - the
+//! two entry points, the map's own methods and any `dyn Any` - and a line
+//! that deliberately touches the map carries the `egui-state-ok` marker (a
+//! test planting a previous generation's value is the only legitimate use).
+//!
+//! The shell also clears the map on the first frame of every generation
+//! (`pill_editor_shell_egui_editor::shell::claim`): whatever a previous
+//! generation left there would be read through an unloaded image's vtable,
+//! so the claim drops it before the new generation draws. The state that has
+//! to survive a reload is a world resource, which is exactly why the claim
+//! can clear the rest without losing anything.
 
 pub use egui;
 pub use egui_dock;

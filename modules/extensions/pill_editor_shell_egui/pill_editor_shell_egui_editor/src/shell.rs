@@ -33,6 +33,16 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 /// The shared names every shell module globs.
 pub mod prelude;
 
+/// The [`claim`] module: the generation's claim on the shared egui context.
+///
+/// Public like every tab module: the build script's function
+/// inventory names each addressable function by its
+/// module path, so the module cannot be private.
+pub mod claim;
+
+pub use claim::claim_context_once;
+pub use claim::claim_shell_context;
+
 /// The Systems tab: pause/step and the recorded system toggles.
 ///
 /// Public like every tab module: the build script's function inventory
@@ -284,6 +294,10 @@ pub fn run_frame(
             "[editor] egui shell rows"
         );
     }
+    // The first frame of a shell generation owns the shared egui context:
+    // whatever the previous generation left in its temporary data would be a
+    // dangling read once this one draws (claim.rs has the reasoning).
+    claim_shell_context(&state.context);
     // The UI heartbeat: one full shell update (input conversion, the egui
     // dock and its tabs, the frame conversion) in microseconds. The shell
     // benchmark measures the D32 UI-redraw case from it; the GPU overlay
