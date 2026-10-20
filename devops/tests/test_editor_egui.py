@@ -78,6 +78,10 @@ from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E
 # regex suffix at the wait.
 EGUI_EDITOR_BINARY = executable_name("pill_editor_egui")
 EGUI_SHELL_LOADED_TOKEN = "[editor] pill_editor_shell_egui_editor loaded"
+# Every shell generation clears the shared egui context's temporary data
+# before its first draw, so nothing a previous generation created is read
+# through an unloaded image.
+SHELL_CONTEXT_CLAIMED_TOKEN = "[editor] shell context claimed"
 EGUI_ROWS_TOKEN = "[editor] egui shell rows"
 EGUI_DOCK_DUMP_TOKEN = "[editor] egui dock dump"
 EGUI_TAB_UNDOCKED_TOKEN = "[editor] tab undocked"
@@ -2762,12 +2766,19 @@ def main() -> int:
         # and wait for one occurrence that never comes.
         reloads = occurrence_count(session, re.escape(EXTENSION_RELOAD_TOKEN))
         loads = occurrence_count(session, re.escape(EGUI_SHELL_LOADED_TOKEN))
+        claims = occurrence_count(session, re.escape(SHELL_CONTEXT_CLAIMED_TOKEN))
         session.edit_source(shell_source, structural)
         session.wait_occurrence(
             re.escape(EXTENSION_RELOAD_TOKEN), reloads + 1, 180, "shell reload"
         )
         session.wait_occurrence(
             re.escape(EGUI_SHELL_LOADED_TOKEN), loads + 1, 180, "shell reloaded"
+        )
+        # The reloaded generation claims the shared egui context before it
+        # draws: whatever the previous generation left in egui's temporary
+        # data would be a read through an unloaded image (W-0037 Stage 9).
+        session.wait_occurrence(
+            re.escape(SHELL_CONTEXT_CLAIMED_TOKEN), claims + 1, 60, "context claim"
         )
         after = session.request(
             "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after shell reload"

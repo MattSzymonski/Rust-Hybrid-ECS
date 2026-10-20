@@ -161,16 +161,57 @@ TESTS_PLACEMENT_MINIMUM_LINES = 20
 # callbacks through them leaves dangling type IDs, drop code and vtables
 # behind after a reload, so the egui shell keeps its long-lived state in a
 # world resource instead; the contract is documented in `pill_ui_egui`'s
-# crate docs. The patterns are dot-prefixed so an unrelated `metadata::<`,
-# turbofish cannot trip the `data` rule.
+# crate docs. The patterns are dot-prefixed so an unrelated `metadata::<`
+# turbofish cannot trip the `data` rule, and the closure forms require a `|`
+# after the parenthesis so a handle's `.data()` accessor stays legal.
+#
+# The map's own methods are listed as well as its two entry points: a write
+# through a borrow taken elsewhere (`memory.data.insert_temp(..)`) never
+# spells `.data_mut::<`, and those are the forms a refactor produces.
 EGUI_CONTEXT_STORAGE_PATTERNS = (
     (re.compile(r"\.data_mut::<"), "stores a type in egui's Context (IdTypeMap)"),
     (re.compile(r"\.data::<"), "reads a type from egui's Context (IdTypeMap)"),
+    (
+        re.compile(r"\.data_mut\s*\(\s*\|"),
+        "writes egui's Context data map from a closure (IdTypeMap)",
+    ),
+    (
+        re.compile(r"\.data\s*\(\s*\|"),
+        "reads egui's Context data map from a closure (IdTypeMap)",
+    ),
+    (re.compile(r"\.insert_temp\b"), "stores a value in egui's Context (IdTypeMap)"),
+    (
+        re.compile(r"\.insert_persisted\b"),
+        "stores a persisted value in egui's Context (IdTypeMap)",
+    ),
+    (
+        re.compile(r"\.get_temp(?:_mut_or)?\b"),
+        "reads a value from egui's Context (IdTypeMap)",
+    ),
+    (
+        re.compile(r"\.get_persisted(?:_mut_or)?\b"),
+        "reads a persisted value from egui's Context (IdTypeMap)",
+    ),
+    (
+        re.compile(r"\.remove_by_type\b"),
+        "drops a type's values from egui's Context (IdTypeMap)",
+    ),
     (re.compile(r"\.set_request_repaint_callback"), "stores a callback in egui's Context"),
     (re.compile(r"\.on_begin_pass"), "installs an egui plugin callback"),
     (re.compile(r"\.on_end_pass"), "installs an egui plugin callback"),
     (re.compile(r"PaintCallback"), "paints a callback shape carrying user data"),
+    (
+        re.compile(r"\bdyn Any\b"),
+        "erases a value into a trait object whose drop code lives in this "
+        "reloadable image",
+    ),
 )
+
+# A line that deliberately touches the map says so: the marker, on the line
+# itself or the one above, exempts that single line. Only a test planting a
+# previous generation's value uses it - production code in a reloadable crate
+# never does, and the exemption is per line so it cannot cover a module.
+EGUI_STATE_MARKER_PATTERN = re.compile(r"egui-state-ok")
 
 
 # =============================================================================
@@ -520,19 +561,25 @@ def check_egui_context_storage(
 
     The same calls are fine in shared libraries and frontends, which never
     unload; the rule is scoped to `extensions/**` and `examples/**`, where
-    the stored value may outlive the image that stored it.
+    the stored value may outlive the image that stored it. A line carrying
+    `egui-state-ok` - or sitting right below one - is exempt: a test that
+    plants a previous generation's value is the only legitimate user.
     """
     if not is_reloadable_source(display_path):
         return
-    for line_number, line in enumerate(lines, start=1):
+    for index, line in enumerate(lines):
         if COMMENT_LINE_PATTERN.match(line):
+            continue
+        if EGUI_STATE_MARKER_PATTERN.search(line):
+            continue
+        if index > 0 and EGUI_STATE_MARKER_PATTERN.search(lines[index - 1]):
             continue
         for pattern, detail in EGUI_CONTEXT_STORAGE_PATTERNS:
             if pattern.search(line):
                 collector.record(
                     display_path,
                     "egui state",
-                    f"line {line_number}: {detail}; keep long-lived egui state "
+                    f"line {index + 1}: {detail}; keep long-lived egui state "
                     "in a world resource (pill_ui_egui's reload-safety contract)",
                 )
 
@@ -584,6 +631,43 @@ def self_test() -> int:
             "an unrelated metadata turbofish passes",
             "modules/extensions/acme/acme_editor/src/lib.rs",
             "let value = entry.metadata::<Todo>();\n",
+            0,
+        ),
+        (
+            "a closure write to the context map fails",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "context.data_mut(|data| { let _ = data; });\n",
+            1,
+        ),
+        (
+            "a write through a borrowed map fails",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "memory.data.insert_temp(id, 1);\n",
+            1,
+        ),
+        (
+            "a read through a borrowed map fails",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "let row = memory.data.get_temp::<Row>(id);\n",
+            1,
+        ),
+        (
+            "a type-erased value in a reloadable crate fails",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "let held: Box<dyn Any> = Box::new(1u8);\n",
+            1,
+        ),
+        (
+            "a marked plant passes",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "// egui-state-ok: planting a previous generation's value\n"
+            "memory.data.insert_temp(id, 1);\n",
+            0,
+        ),
+        (
+            "a handle's data() accessor passes",
+            "modules/extensions/acme/acme_editor/src/lib.rs",
+            "let shader = handle.data();\n",
             0,
         ),
     )
