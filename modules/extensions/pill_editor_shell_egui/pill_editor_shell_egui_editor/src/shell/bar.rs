@@ -113,6 +113,7 @@ pub fn menu_body(
     let view = menubar::MenuView {
         snapshot: viewer.snapshot,
         selection: viewer.selection,
+        commands: &viewer.snapshot.commands,
     };
     for entry in menubar::entries(menu, &view) {
         match entry {
@@ -127,7 +128,7 @@ pub fn menu_body(
             } => {
                 let response = ui.add_enabled(
                     enabled,
-                    egui::Button::selectable(checked.unwrap_or(false), label),
+                    egui::Button::selectable(checked.unwrap_or(false), label.as_str()),
                 );
                 let key = format!("{}/{}", menu.name(), label);
                 if session
@@ -157,7 +158,7 @@ pub fn menu_body(
                     );
                 }
                 if response.clicked() {
-                    run_menu_action(menu, label, action, session, viewer);
+                    run_menu_action(menu, label.as_str(), action, session, viewer);
                     ui.close();
                 }
             }

@@ -181,6 +181,10 @@ pub struct EditorSnapshot {
     pub undo_depth: usize,
     /// How many steps the redo history holds.
     pub redo_depth: usize,
+    /// Every registered command in registration order (W-0038 Stage 2): the
+    /// menu bar draws a row per command whose menu path names the menu, and
+    /// a spec that is not here has no row.
+    pub commands: Vec<crate::commands::CommandView>,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
 }
@@ -218,6 +222,11 @@ impl EditorSnapshot {
             preferences: crate::preferences::PreferencesView::default(),
             undo_depth: 0,
             redo_depth: 0,
+            commands: engine
+                .world()
+                .get_resource::<crate::commands::CommandRegistry>()
+                .map(crate::commands::CommandRegistry::views)
+                .unwrap_or_default(),
             errors,
         }
     }

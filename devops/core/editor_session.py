@@ -65,6 +65,15 @@ EDITOR_ENGINE_COMMANDS_TOKEN = "[editor] engine commands applied"
 EDITOR_HISTORY_PUSH_TOKEN = "[editor] history push"
 EDITOR_HISTORY_UNDO_TOKEN = "[editor] history undo"
 EDITOR_HISTORY_REDO_TOKEN = "[editor] history redo"
+# The command registry's report after a keybindings file lands: the preset it
+# activated, how many overrides it resolved, and one line per chord two
+# commands answer to (W-0038 Stage 2).
+EDITOR_KEYBINDINGS_APPLIED_TOKEN = "[editor] keybindings applied"
+EDITOR_KEYBINDING_CONFLICT_TOKEN = "[editor] keybinding conflict"
+# A chord the registry resolved, and the same chord when the command it named
+# has no action in the executable yet.
+EDITOR_SHORTCUT_RAN_TOKEN = "[editor] shortcut ran"
+EDITOR_SHORTCUT_INERT_TOKEN = "[editor] shortcut has no action yet"
 # The egui editor's one refusal line for a scripted line it cannot run: an
 # unknown verb, an unknown target, or a missing or malformed argument. A suite
 # typo raises `ScriptedCommandRejected` from the next wait instead of running
@@ -176,6 +185,29 @@ class EditorSession:
         if self._sandbox_override is not None:
             return self._sandbox_override
         return self.run_directory / "{}-appdata".format(self.session)
+
+    @property
+    def editor_state_directory(self) -> Path:
+        """The editor's own state folder inside the sandbox.
+
+        The layout, the preferences and the keybindings live here; a suite
+        that wants a file the editor watches writes it through
+        `write_keybindings` rather than guessing the path itself.
+        """
+        return self.sandbox / "RustHybridEcs"
+
+    def write_keybindings(self, document: Dict) -> None:
+        """Writes the keybindings file the editor watches, creating its folder.
+
+        The editor rereads the file every frame and applies a change without a
+        restart, so a suite can rebind a shortcut mid-run and observe the
+        result. The document is the `KeybindingsFile` shape: an optional
+        `preset` and `overrides` mapping a command id to its chord list.
+        """
+        directory = self.editor_state_directory
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "keybindings.json"
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
     @property
     def process(self) -> Optional[subprocess.Popen]:

@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 // Current crate
 use crate::editor_state::EditorCommand;
+use crate::layout::EditorTab;
 
 // =============================================================================
 // Keys and chords
@@ -408,6 +409,9 @@ pub struct CommandSpec {
     /// Whether the shortcut wins while a text field has focus (a global
     /// binding); everything else yields to the focused field.
     pub global: bool,
+    /// Whether a menu draws a rule above this command's row, grouping it
+    /// with the rows after it.
+    pub separator_before: bool,
 }
 
 impl CommandSpec {
@@ -419,12 +423,19 @@ impl CommandSpec {
             menu_path: Vec::new(),
             shortcuts: BTreeMap::new(),
             global: false,
+            separator_before: false,
         }
     }
 
     /// Adds a menu path.
     pub fn menu(mut self, path: &[&str]) -> Self {
         self.menu_path = path.iter().map(|segment| segment.to_string()).collect();
+        self
+    }
+
+    /// Draws a rule above this command's menu row.
+    pub fn separator(mut self) -> Self {
+        self.separator_before = true;
         self
     }
 
@@ -568,6 +579,37 @@ impl CommandRegistry {
             .filter(|(_, ids)| ids.len() > 1)
             .collect()
     }
+
+    /// The commands as plain data, in registration order: what the frame's
+    /// snapshot carries so menus (and, later, the palette) build rows without
+    /// touching the world.
+    pub fn views(&self) -> Vec<CommandView> {
+        self.commands()
+            .map(|spec| CommandView {
+                id: spec.id.clone(),
+                title: spec.title.clone(),
+                menu_path: spec.menu_path.clone(),
+                separator_before: spec.separator_before,
+            })
+            .collect()
+    }
+}
+
+/// One registered command as the UI sees it.
+///
+/// A copy, not a borrow: menus are built from the frame's snapshot, which
+/// outlives no world access, and a row's label and presence must come from
+/// the registry that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandView {
+    /// Stable identifier (`editor.pause_toggle`).
+    pub id: String,
+    /// The title a menu row shows.
+    pub title: String,
+    /// The menu path; an empty path means palette-only.
+    pub menu_path: Vec<String>,
+    /// Whether a rule is drawn above the row.
+    pub separator_before: bool,
 }
 
 impl pill_engine::Resource for CommandRegistry {}
@@ -586,21 +628,14 @@ pub fn menu_tree(registry: &CommandRegistry) -> BTreeMap<String, Vec<&CommandSpe
 }
 
 /// The built-in commands every editor has (owner `editor`).
+///
+/// This table is what the menu bar draws: a row exists because a command
+/// registers a menu path, its label is the command's title, and the rules
+/// between groups are the specs marked [`CommandSpec::separator`]. Removing
+/// a spec here removes its row (W-0038 Stage 2).
 fn builtin_commands() -> Vec<CommandSpec> {
     use KeymapPreset::{Blender, Godot, Unity, Unreal};
-    vec![
-        CommandSpec::new("editor.pause_toggle", "Pause / Resume Simulation")
-            .menu(&["View", "Pause / Resume Simulation"])
-            .bind(Blender, "space")
-            .bind(Unity, "ctrl+p")
-            .bind(Godot, "f5")
-            .bind(Unreal, "alt+p"),
-        CommandSpec::new("editor.step", "Step One Frame")
-            .menu(&["View", "Step One Frame"])
-            .bind(Blender, "right")
-            .bind(Unity, "f10")
-            .bind(Godot, "f6")
-            .bind(Unreal, "f10"),
+    let mut commands = vec![
         CommandSpec::new("editor.save_layout", "Save Layout")
             .menu(&["Layout", "Save Layout"])
             .bind(Blender, "ctrl+alt+s")
@@ -664,50 +699,93 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Godot, "ctrl+v")
             .bind(Unreal, "ctrl+v"),
         // The transform tools (Stage 20): the chords are the ones Unity and
-        // Unreal already use, and Blender's own grab/rotate/scale keys.
-        CommandSpec::new("editor.tool_translate", "Translate Tool")
-            .menu(&["Tools", "Translate Tool"])
+        // Unreal already use, and Blender's own grab/rotate/scale keys. The
+        // titles are the toolbox's row labels - the View menu, the panel and
+        // the palette show one name per command.
+        CommandSpec::new("editor.tool_translate", "Translate")
+            .menu(&["View", "Translate"])
             .bind(Blender, "g")
             .bind(Unity, "w")
             .bind(Godot, "w")
             .bind(Unreal, "w"),
-        CommandSpec::new("editor.tool_rotate", "Rotate Tool")
-            .menu(&["Tools", "Rotate Tool"])
+        CommandSpec::new("editor.tool_rotate", "Rotate")
+            .menu(&["View", "Rotate"])
             .bind(Blender, "r")
             .bind(Unity, "e")
             .bind(Godot, "e")
             .bind(Unreal, "e"),
-        CommandSpec::new("editor.tool_scale", "Scale Tool")
-            .menu(&["Tools", "Scale Tool"])
+        CommandSpec::new("editor.tool_scale", "Scale")
+            .menu(&["View", "Scale"])
             .bind(Blender, "s")
             .bind(Unity, "r")
             .bind(Godot, "r")
             .bind(Unreal, "r"),
-        CommandSpec::new("editor.tool_snap_toggle", "Toggle Snapping")
-            .menu(&["Tools", "Toggle Snapping"])
+        // Unbound on purpose: the space toggle is a menu, palette and
+        // toolbar command, and the presets have no free chord that would
+        // mean "local" anywhere else either. The row's label carries the
+        // space it would leave the gizmo in, so the shell overrides it.
+        CommandSpec::new("editor.tool_space_toggle", "Local / World Space")
+            .menu(&["View", "Local / World Space"])
+            .separator(),
+        CommandSpec::new("editor.tool_snap_toggle", "Snap")
+            .menu(&["View", "Snap"])
             .bind(Blender, "shift+x")
             .bind(Unity, "ctrl+shift+x")
             .bind(Godot, "ctrl+shift+x")
             .bind(Unreal, "ctrl+shift+x"),
-        // Unbound on purpose: the space toggle is a menu, palette and
-        // toolbar command, and the presets have no free chord that would
-        // mean "local" anywhere else either.
-        CommandSpec::new("editor.tool_space_toggle", "Toggle Local / World Space")
-            .menu(&["Tools", "Toggle Local / World Space"]),
+        CommandSpec::new("editor.grid_toggle", "Grid")
+            .menu(&["View", "Grid"])
+            .separator(),
+        // The simulation controls close the View menu, behind a rule.
+        CommandSpec::new("editor.pause_toggle", "Pause / Resume Simulation")
+            .menu(&["View", "Pause / Resume Simulation"])
+            .separator()
+            .bind(Blender, "space")
+            .bind(Unity, "ctrl+p")
+            .bind(Godot, "f5")
+            .bind(Unreal, "alt+p"),
+        CommandSpec::new("editor.step", "Step One Frame")
+            .menu(&["View", "Step One Frame"])
+            .bind(Blender, "right")
+            .bind(Unity, "f10")
+            .bind(Godot, "f6")
+            .bind(Unreal, "f10"),
         // The Hierarchy's entity actions (Stage 34, parity with the Dioxus
         // editor's New/Delete entity buttons): creation makes one empty
         // entity, deletion clears the selection in the same step. No
         // chords: the menu, the palette and the panel's toolbar carry them.
-        CommandSpec::new("editor.entity_create", "New Entity").menu(&["Entity", "New Entity"]),
+        CommandSpec::new("editor.entity_create", "New Entity").menu(&["Create", "New Entity"]),
         CommandSpec::new("editor.entity_delete", "Delete Entity")
-            .menu(&["Entity", "Delete Entity"]),
+            .menu(&["Edit", "Delete Entity"])
+            .separator(),
+        CommandSpec::new("editor.preferences_open", "Preferences...")
+            .menu(&["Edit", "Preferences..."])
+            .separator(),
         // The Assets dialogs' buttons (Stage 25). They are registered like
         // any other command - the button row runs them by id - with no menu
         // entry of their own: they answer through the dialog they were
         // pressed on, and invoked without one they warn and do nothing.
-        CommandSpec::new("editor.asset.create", "Create Asset"),
+        CommandSpec::new("editor.asset.create", "Create Asset...")
+            .menu(&["File", "Create Asset..."]),
         CommandSpec::new("editor.asset.rename", "Rename Asset"),
-    ]
+        // File's trailing rows: the sidecar write and quitting.
+        CommandSpec::new("editor.asset_write_meta", "Write Asset Meta")
+            .menu(&["File", "Write Asset Meta"]),
+        CommandSpec::new("editor.quit", "Quit Editor")
+            .menu(&["File", "Quit Editor"])
+            .separator(),
+        // Help's one row.
+        CommandSpec::new("editor.about", "About Pill Editor").menu(&["Help", "About Pill Editor"]),
+    ];
+    // Window: one row per dock tab, in strip order; the shell turns each back
+    // into the tab it activates.
+    for tab in EditorTab::ALL {
+        commands.push(
+            CommandSpec::new(&format!("editor.window_{}", tab.name()), tab.title())
+                .menu(&["Window", tab.title()]),
+        );
+    }
+    commands
 }
 
 // =============================================================================
@@ -818,6 +896,13 @@ pub struct GizmoProjectPreferences {
 /// Declared here rather than in an editor frontend: the executable reads the
 /// file at startup and the shell writes it, and both link this crate.
 pub const PREFERENCES_FILE: &str = "preferences.json";
+
+/// The keybindings file's name, next to the layout file (D31).
+///
+/// The executable watches it and applies every change through
+/// [`CommandRegistry::apply_file`]; the preset and the overrides it holds
+/// are what menus, shortcuts and the palette dispatch from.
+pub const KEYBINDINGS_FILE: &str = "keybindings.json";
 
 /// The gizmo settings a project starts a session with (Stage 20).
 ///

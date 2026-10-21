@@ -66,6 +66,9 @@ sys.path.insert(0, str(DEVOPS_ROOT))
 
 from core.editor_session import (  # noqa: E402
     EditorSession,
+    EDITOR_KEYBINDING_CONFLICT_TOKEN,
+    EDITOR_KEYBINDINGS_APPLIED_TOKEN,
+    EDITOR_SHORTCUT_RAN_TOKEN,
     EDITOR_WINDOW_CREATED_TOKEN,
     ScriptedCommandRejected,
     run_directory,
@@ -1001,6 +1004,56 @@ def main() -> int:
             begin,
         )
         print("  [OK] a key chord reached the tool shortcut")
+
+        # Step 3a2: the keybindings file rebinds a shortcut without a restart,
+        # and a chord two commands share is reported by both of their names
+        # (W-0038 Stage 2). The file lands in the editor's state folder; the
+        # watcher applies it on the next frame.
+        begin = len(session.read_log())
+        session.write_keybindings(
+            {
+                "preset": "unity",
+                "overrides": {
+                    "editor.tool_translate": ["t"],
+                    "editor.tool_rotate": ["t"],
+                },
+            }
+        )
+        session.wait(
+            re.escape(EDITOR_KEYBINDINGS_APPLIED_TOKEN) + r"\s+preset=unity\s+overrides=2",
+            30,
+            "the keybindings file applied",
+            begin,
+        )
+        conflict = re.search(
+            re.escape(EDITOR_KEYBINDING_CONFLICT_TOKEN)
+            + r'\s+chord="t"\s+commands="([^"]+)"',
+            session.read_log()[begin:],
+        )
+        assert conflict, "the rebinding reported no conflicting chord"
+        assert "editor.tool_translate" in conflict.group(1)
+        assert "editor.tool_rotate" in conflict.group(1)
+        # The rebound chord resolves through the registry: `t` runs translate
+        # (the first command in registration order wins a shared chord).
+        session.send("key t")
+        session.wait(
+            re.escape(EDITOR_SHORTCUT_RAN_TOKEN) + r'\s+command="editor\.tool_translate"',
+            30,
+            "the rebound chord ran its command",
+            begin,
+        )
+        print("  [OK] a keybindings override rebound a shortcut live")
+
+        # Park the tool on rotate: the next step's `gizmo translate` only logs
+        # a change, and the bound chord has just taken the tool to translate.
+        begin = len(session.read_log())
+        session.send("gizmo rotate")
+        session.wait(
+            re.escape(GIZMO_TOOL_TOKEN) + r'\s+mode="rotate"',
+            30,
+            "the tool parked on rotate for the next step",
+            begin,
+        )
 
         # Step 3b: the viewport's interaction states (Stage 28). A drag begins
         # on the press and ends on the release; the hover highlight follows
