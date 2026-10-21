@@ -97,20 +97,20 @@ pub fn assets_tab(
         ui.label(egui::RichText::new(format!("{} entries", snapshot.assets.len())).weak());
     });
     ui.separator();
-    egui::SidePanel::left("pill_editor_shell_egui.assets_tree")
+    egui::Panel::left("pill_editor_shell_egui.assets_tree")
         .resizable(true)
-        .default_width(ASSETS_TREE_WIDTH)
-        .width_range(ASSETS_TREE_WIDTH_RANGE)
-        .show_inside(ui, |ui| {
+        .default_size(ASSETS_TREE_WIDTH)
+        .size_range(ASSETS_TREE_WIDTH_RANGE)
+        .show(ui, |ui| {
             assets_tree(ui, snapshot, browser, selection, pending);
         });
-    egui::TopBottomPanel::top("pill_editor_shell_egui.assets_path").show_inside(ui, |ui| {
+    egui::Panel::top("pill_editor_shell_egui.assets_path").show(ui, |ui| {
         assets_path_bar(ui, browser);
     });
-    egui::TopBottomPanel::bottom("pill_editor_shell_egui.assets_zoom").show_inside(ui, |ui| {
+    egui::Panel::bottom("pill_editor_shell_egui.assets_zoom").show(ui, |ui| {
         assets_zoom_bar(ui, &snapshot.assets, browser);
     });
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         assets_grid(
             ui,
             snapshot,

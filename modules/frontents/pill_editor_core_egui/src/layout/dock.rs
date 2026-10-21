@@ -22,7 +22,7 @@
 
 // External crates
 use pill_ui_egui::egui::Rect;
-use pill_ui_egui::egui_dock::{DockState, Node, NodeIndex, TabIndex};
+use pill_ui_egui::egui_dock::{DockState, Node, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 /// The fraction of the window's width one side column takes in the default
@@ -241,17 +241,14 @@ fn settle_rect(rect: Rect) -> Rect {
 /// takes the tab's index inside its leaf, and the node index must address the
 /// leaf on its own surface: a floating surface's tree is separate.
 pub fn activate_tab(dock: &mut DockState<EditorTab>, tab: EditorTab) -> bool {
-    let Some((surface, node, _)) = dock.find_tab(&tab) else {
+    let Some(path) = dock.find_tab(&tab) else {
         return false;
     };
-    let Some(index) = dock[surface][node]
-        .get_leaf()
-        .and_then(|leaf| leaf.tabs.iter().position(|candidate| *candidate == tab))
-    else {
+    // A path the dock no longer holds is a no-op, not an error to report.
+    if dock.set_active_tab(path).is_err() {
         return false;
-    };
-    dock.set_active_tab((surface, node, TabIndex(index)));
-    dock.set_focused_node_and_surface((surface, node));
+    }
+    dock.set_focused_node_and_surface(path.node_path());
     true
 }
 
@@ -356,11 +353,11 @@ mod tests {
     fn activating_a_tab_brings_it_to_its_leaf_s_front() {
         let mut dock = EditorDock::new();
         assert!(activate_tab(dock.state_mut(), EditorTab::Systems));
-        let (surface, node, _) = dock
+        let path = dock
             .state()
             .find_tab(&EditorTab::Systems)
             .expect("the systems tab is in the default dock");
-        let leaf = dock.state()[surface][node]
+        let leaf = dock.state()[path.surface][path.node]
             .get_leaf()
             .expect("the tab sits in a leaf");
         let active = leaf.tabs[leaf.active.0];

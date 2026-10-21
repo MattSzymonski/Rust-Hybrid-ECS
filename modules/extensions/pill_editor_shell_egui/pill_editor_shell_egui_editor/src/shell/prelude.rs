@@ -37,7 +37,9 @@ pub use pill_ui_egui::boundary::{
     frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, SCENE_VIEWPORTS,
 };
 pub use pill_ui_egui::egui;
-pub use pill_ui_egui::egui_dock::{DockArea, DockState, NodeIndex, SurfaceIndex, TabViewer};
+pub use pill_ui_egui::egui_dock::{
+    DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
+};
 pub use pill_ui_egui::icons;
 pub use pill_ui_egui::style;
 pub use serde_json::Value as JsonValue;

@@ -121,6 +121,7 @@ impl OverlaySurface {
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(device, &configuration);
         // Step 4: the swapchain became the visual's content inside
@@ -174,17 +175,23 @@ impl OverlaySurface {
         queue: &wgpu::Queue,
         renderer: &mut egui_wgpu::Renderer,
         meshes: &[ClippedPrimitive],
-        textures: TexturesDelta,
+        mut textures: TexturesDelta,
         pixels_per_point: f32,
     ) -> Result<bool, OverlayError> {
         let has_content = !meshes.is_empty();
         if !has_content && !self.drew_content {
+            // Nothing is drawn, so nothing the shell uploaded is used: the
+            // delta is cleared rather than left to panic in epaint's drop.
+            textures.clear();
             return Ok(false);
         }
-        let frame = self
-            .surface
-            .get_current_texture()
-            .map_err(|error| format!("the overlay swapchain is unavailable: {error}"))?;
+        // A suboptimal frame is still drawable; anything else means the
+        // swapchain must be recreated by the frontend, which owns that path.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            other => return Err(format!("the overlay swapchain is unavailable: {other:?}")),
+        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -192,9 +199,12 @@ impl OverlaySurface {
             size_in_pixels: [self.configuration.width, self.configuration.height],
             pixels_per_point: pixels_per_point.max(0.01),
         };
-        // Step 1: apply this frame's texture updates before drawing with them.
-        for (texture_id, image_delta) in &textures.set {
-            renderer.update_texture(device, queue, *texture_id, image_delta);
+        // Step 1: apply this frame's texture updates before drawing with
+        // them. One texture may carry several deltas in one frame.
+        for (texture_id, deltas) in &textures.set {
+            for image_delta in deltas {
+                renderer.update_texture(device, queue, *texture_id, image_delta);
+            }
         }
         // Step 2: record the draw commands. `update_buffers` may produce its
         // own command buffers, which are submitted alongside the pass.
@@ -216,10 +226,12 @@ impl OverlaySurface {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             // The lifetime erasure extends the pass's borrows to `'static`;
             // it stays inside this block, so nothing outlives `view` or the
@@ -231,8 +243,10 @@ impl OverlaySurface {
         for texture_id in &textures.free {
             renderer.free_texture(texture_id);
         }
+        // Every delta is applied: an unapplied one panics in epaint's drop.
+        textures.clear();
         queue.submit(user_buffers.into_iter().chain(Some(encoder.finish())));
-        frame.present();
+        queue.present(frame);
         self.drew_content = has_content;
         self.frames += 1;
         Ok(true)

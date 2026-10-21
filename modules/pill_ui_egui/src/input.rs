@@ -52,7 +52,6 @@ pub fn raw_input(shell_input: &EguiShellInput) -> RawInput {
         )),
         time: Some(shell_input.time),
         focused: shell_input.focused,
-        modifiers: walk.modifiers,
         events,
         ..Default::default()
     }
@@ -116,6 +115,7 @@ impl EventWalk {
                     unit,
                     delta,
                     modifiers: self.modifiers,
+                    phase: egui::TouchPhase::Move,
                 });
             }
             InputEvent::Key { key, state } => {
@@ -142,7 +142,10 @@ impl EventWalk {
             }
             InputEvent::TextInput { text } => out.push(Event::Text(text.clone())),
             InputEvent::ImePreedit { text, .. } => {
-                out.push(Event::Ime(ImeEvent::Preedit(text.clone())));
+                out.push(Event::Ime(ImeEvent::Preedit {
+                    text: text.clone(),
+                    active_range_chars: None,
+                }));
             }
             InputEvent::ImeCommit { text } => out.push(Event::Ime(ImeEvent::Commit(text.clone()))),
             // Raw motion, focus and gamepads steer the game and the editor's
@@ -370,8 +373,6 @@ mod tests {
         assert!(pressed);
         assert!(!released_modifiers.ctrl);
         assert!(!released);
-        // The frame reports the state the stream ended in.
-        assert!(!raw.modifiers.ctrl);
     }
 
     #[test]
@@ -458,7 +459,10 @@ mod tests {
             raw.events,
             vec![
                 Event::Text("zzz".to_owned()),
-                Event::Ime(ImeEvent::Preedit("zo".to_owned())),
+                Event::Ime(ImeEvent::Preedit {
+                    text: "zo".to_owned(),
+                    active_range_chars: None,
+                }),
                 Event::Ime(ImeEvent::Commit("zoo".to_owned())),
             ]
         );

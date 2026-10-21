@@ -15,6 +15,21 @@
 use super::*;
 use pill_engine::Engine;
 
+/// Run one egui pass for its side effects.
+///
+/// epaint 0.36 panics when a `TexturesDelta` with unapplied deltas is
+/// dropped, and a test has no GPU to apply them on: the delta is cleared
+/// instead, the contract epaint asks a caller that ignores it to keep.
+///
+/// The `cfg` gate is the one `#[test]` puts on a test function: it keeps
+/// this helper out of the hot-patch function inventory, which cannot name a
+/// function that is absent from the built artifact.
+#[cfg(test)]
+fn run_pass(context: &egui::Context, pass: &mut dyn FnMut(&mut egui::Ui)) {
+    let mut output = context.run_ui(egui::RawInput::default(), pass);
+    output.textures_delta.clear();
+}
+
 #[test]
 fn entity_rows_list_the_worlds_entities() {
     let mut engine = Engine::new();
@@ -73,8 +88,8 @@ fn the_tab_bodies_draw_without_panicking() {
     style::apply(&context);
     let mut regions = Vec::new();
     let mut inspector_session = InspectorSession::default();
-    let _ = context.run(egui::RawInput::default(), |context| {
-        egui::CentralPanel::default().show(context, |ui| {
+    run_pass(&context, &mut |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             entities_tab(ui, &snapshot, &mut selection, &mut pending, &mut regions);
             systems_tab(ui, &snapshot, &mut pending);
             inspector_tab(
@@ -142,8 +157,8 @@ fn the_browser_draws_its_tree_path_and_tiles() {
     let mut regions = Vec::new();
     let mut caption_rows = 0usize;
     let mut caption_width = 0.0f32;
-    let _ = context.run(egui::RawInput::default(), |context| {
-        egui::CentralPanel::default().show(context, |ui| {
+    run_pass(&context, &mut |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             assets_tree(ui, &snapshot, &mut browser, &mut selection, &mut pending);
             assets_path_bar(ui, &mut browser);
             assets_zoom_bar(ui, &snapshot.assets, &mut browser);
@@ -313,8 +328,8 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     style::apply(&context);
     let mut regions = Vec::new();
     let mut inspector_session = InspectorSession::default();
-    let _ = context.run(egui::RawInput::default(), |context| {
-        egui::CentralPanel::default().show(context, |ui| {
+    run_pass(&context, &mut |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             inspector_tab(
                 ui,
                 &snapshot,

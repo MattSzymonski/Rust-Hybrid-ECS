@@ -457,11 +457,11 @@ mod tests {
         let mut registry = EditorPanelRegistry::default();
         registry.register("module_a", &[spec("tool", "Tool", paint_marker)]);
         let first = registry.panel("tool").expect("first registration");
-        assert_eq!(first as usize, paint_marker as usize);
+        assert!(std::ptr::fn_addr_eq(first, paint_marker as PanelBuildFn));
 
         registry.register("module_a", &[spec("tool", "Tool", paint_other)]);
         let second = registry.panel("tool").expect("second registration");
-        assert_eq!(second as usize, paint_other as usize);
+        assert!(std::ptr::fn_addr_eq(second, paint_other as PanelBuildFn));
         // The old generation is dead, even though its entry still sits in
         // the list until the next prune.
         assert_eq!(registry.list().len(), 1);
@@ -485,10 +485,10 @@ mod tests {
         // kept one is the new build function, the dropped one resolves to
         // nothing instead of lingering with its old pointer.
         registry.register("module_a", &[spec("tool", "Tool", paint_other)]);
-        assert_eq!(
-            registry.panel("tool").expect("kept registration") as usize,
-            paint_other as usize
-        );
+        assert!(std::ptr::fn_addr_eq(
+            registry.panel("tool").expect("kept registration"),
+            paint_other as PanelBuildFn
+        ));
         assert!(registry.panel("body").is_none());
         assert_eq!(registry.list().len(), 1);
     }

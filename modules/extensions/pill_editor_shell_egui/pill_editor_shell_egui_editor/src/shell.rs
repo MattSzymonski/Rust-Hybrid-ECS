@@ -351,32 +351,36 @@ pub fn run_frame(
         frames_per_second: shell_input.frames_per_second,
         tab_redock: None,
     };
-    let output = context.run(raw_input, |context| {
+    let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
         // reports - starts below it.
-        menu_bar(context, menubar, &mark, &mut viewer);
+        menu_bar(ui, menubar, &mark, &mut viewer);
         // Tab bars carry the tabs and their close buttons only: without the
         // collapse chevron and the panel-level close-all ✖, a panel closes
         // exactly when its last tab does.
         DockArea::new(dock.state_mut())
-            .style(style::dock_style(context.style().as_ref()))
+            .style(style::dock_style(ui.ctx().global_style().as_ref()))
             .show_leaf_collapse_buttons(false)
             .show_leaf_close_all_buttons(false)
-            .show(context, &mut viewer);
+            .show_inside(ui, &mut viewer);
         // The create/rename dialog floats over the dock while it is open.
         pill_editor_shell_egui_editor::shell::asset_dialog_window(
-            context,
+            ui.ctx(),
             viewer.asset_dialog,
             viewer.pending,
             viewer.snapshot,
         );
-        pill_editor_shell_egui_editor::shell::about_window(context, &mark, &mut menubar.about_open);
+        pill_editor_shell_egui_editor::shell::about_window(
+            ui.ctx(),
+            &mark,
+            &mut menubar.about_open,
+        );
         // The toast stack floats over the dock and every viewport it covers,
         // so its rows join the frame's overlay regions.
         pill_editor_shell_egui_editor::shell::draw_toasts(
             toasts,
             frame_index,
-            context,
+            ui.ctx(),
             &mut viewer.overlay_regions,
         );
     });
@@ -456,6 +460,11 @@ pub struct EditorTabViewer<'a> {
 impl TabViewer for EditorTabViewer<'_> {
     type Tab = EditorTab;
 
+    /// The dock needs one stable id per tab to key its widgets on.
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("pill_editor_shell_egui.tab", *tab))
+    }
+
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         icons::rich(tab_icon(*tab), (*tab).title()).into()
     }
@@ -514,14 +523,8 @@ impl TabViewer for EditorTabViewer<'_> {
     /// The dock tab's menu. The dock itself offers Eject (into a window)
     /// and Close; a floating window's tab gets Redock, which brings the
     /// surface's tabs back into the dock.
-    fn context_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        _tab: &mut Self::Tab,
-        surface: SurfaceIndex,
-        _node: NodeIndex,
-    ) {
-        if !surface.is_main()
+    fn context_menu(&mut self, ui: &mut egui::Ui, _tab: &mut Self::Tab, path: NodePath) {
+        if !path.surface.is_main()
             && ui
                 .add(icons::IconButton::new(
                     icons::Icon::ArrowSquareOut,
@@ -529,7 +532,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 ))
                 .clicked()
         {
-            self.tab_redock = Some(surface);
+            self.tab_redock = Some(path.surface);
             ui.close();
         }
         // The dock owns this menu's shell, so its drawn content is what is

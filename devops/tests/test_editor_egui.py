@@ -171,9 +171,11 @@ HOT_PATCH_TOKEN = "[hot]"
 KEY_INJECTED_TOKEN = "[editor] key injected"
 TOAST_TOKEN = "[editor] toast"
 
-# One toast line as the shell logs it: the level, its notice id, the text the
-# executable produced and the row's rectangle (W-0038 Stage 4).
-TOAST_PATTERN = re.escape(TOAST_TOKEN) + r'\s+level={}\s+seq=\d+\s+text="[^"]*"'
+# One toast line as the shell logs it, cut after the opening quote of the
+# text: the level (a quoted string field), the notice id and the text the
+# executable produced, whose own pattern each check appends inside the
+# quotes (W-0038 Stage 4).
+TOAST_PREAMBLE = re.escape(TOAST_TOKEN) + r'\s+level="{}"\s+seq=\d+\s+text="'
 
 # The transform the gizmo drags edit; the field dump resolves the short
 # name, like the native suite's dumps do.
@@ -2791,7 +2793,7 @@ def main() -> int:
         # Stage 4: the reload's own notice reaches the toast stack, with the
         # level the host assigned and the timing its build reported.
         session.wait(
-            TOAST_PATTERN.format("info") + r'[^\n]*reloaded in \d+ ms',
+            TOAST_PREAMBLE.format("info") + r'[^"]*reloaded in \d+ ms',
             60,
             "reload toast",
             toast_start,
@@ -2838,7 +2840,7 @@ def main() -> int:
             + 'compile_error!("egui suite deliberate failure");\n',
         )
         session.wait(
-            TOAST_PATTERN.format("error") + r'[^\n]*reload failed',
+            TOAST_PREAMBLE.format("error") + r'[^"]*reload failed',
             240,
             "build-failed toast",
             failure_start,

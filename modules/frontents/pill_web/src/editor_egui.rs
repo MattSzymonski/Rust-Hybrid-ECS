@@ -422,7 +422,7 @@ impl WebEditorApplication {
         }
 
         // Step 6: draw the shell's frame into the UI canvas.
-        draw_ui(&ui_surface, driver.engine());
+        draw_ui(&ui_surface, driver.engine_mut());
         if self.frame_index.is_multiple_of(FRAME_HEARTBEAT_FRAMES) {
             // NOTE: asserted on by the browser suite.
             let (entities, systems) = driver
@@ -688,19 +688,33 @@ fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
 
 /// Draw the shell's frame into the UI canvas: apply its texture deltas, then
 /// draw the meshes over a fully transparent clear.
-fn draw_ui(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, engine: &pill_engine_core::Engine) {
+///
+/// The frame is a world resource, so the delta is cleared here whatever the
+/// path: epaint panics on a delta it is asked to drop unapplied.
+fn draw_ui(
+    ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>,
+    engine: &mut pill_engine_core::Engine,
+) {
+    let Some(frame) = engine.world_mut().get_resource_mut::<EguiShellFrame>() else {
+        return;
+    };
+    draw_ui_frame(ui_surface, &frame);
+    frame.textures.clear();
+}
+
+/// The drawing half of [`draw_ui`], which owns the delta's lifetime.
+fn draw_ui_frame(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, frame: &EguiShellFrame) {
     let mut ui_surface = ui_surface.borrow_mut();
     let Some(ui) = ui_surface.as_mut() else {
         return;
     };
-    let world = engine.world();
-    let Some(frame) = world.get_resource::<EguiShellFrame>() else {
-        return;
-    };
+    // A suboptimal frame is still drawable; anything else is reported and
+    // retried next frame.
     let texture = match ui.surface.get_current_texture() {
-        Ok(texture) => texture,
-        Err(error) => {
-            warn!(target: telemetry_target::RENDERING, error = ?error, "UI canvas surface unavailable");
+        wgpu::CurrentSurfaceTexture::Success(texture)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+        other => {
+            warn!(target: telemetry_target::RENDERING, error = ?other, "UI canvas surface unavailable");
             return;
         }
     };
@@ -711,10 +725,13 @@ fn draw_ui(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, engine: &pill_engi
         size_in_pixels: [ui.configuration.width, ui.configuration.height],
         pixels_per_point: frame.pixels_per_point.max(0.01),
     };
-    // Step 1: the texture updates before anything samples them.
-    for (texture_id, image_delta) in &frame.textures.set {
-        ui.renderer
-            .update_texture(&ui.device, &ui.queue, *texture_id, image_delta);
+    // Step 1: the texture updates before anything samples them. One texture
+    // may carry several deltas in one frame.
+    for (texture_id, deltas) in &frame.textures.set {
+        for image_delta in deltas {
+            ui.renderer
+                .update_texture(&ui.device, &ui.queue, *texture_id, image_delta);
+        }
     }
     // Step 2: the draw commands, its own command buffers submitted with the
     // pass.
@@ -742,10 +759,12 @@ fn draw_ui(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, engine: &pill_engi
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
+                depth_slice: None,
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         // The lifetime erasure extends the pass's borrows to `'static`;
         // it stays inside this block, so nothing outlives `view`.
@@ -759,7 +778,7 @@ fn draw_ui(ui_surface: &Rc<RefCell<Option<EditorUiSurface>>>, engine: &pill_engi
     }
     ui.queue
         .submit(user_buffers.into_iter().chain(Some(encoder.finish())));
-    texture.present();
+    ui.queue.present(texture);
 }
 
 impl EditorUiSurface {
@@ -781,10 +800,11 @@ async fn attach_ui_surface(
     canvas: HtmlCanvasElement,
     laid_out: (u32, u32),
 ) -> Result<EditorUiSurface, String> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         flags: wgpu::InstanceFlags::from_build_config(),
         backend_options: wgpu::BackendOptions::default(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
     let surface = instance
         .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
@@ -794,6 +814,7 @@ async fn attach_ui_surface(
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .map_err(|error| format!("no adapter for the UI canvas: {error}"))?;
@@ -804,6 +825,7 @@ async fn attach_ui_surface(
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
         .await
         .map_err(|error| format!("UI canvas device refused: {error}"))?;
@@ -831,7 +853,7 @@ async fn attach_ui_surface(
         "UI canvas configured"
     );
     surface.configure(&device, &configuration);
-    let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+    let renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
     Ok(EditorUiSurface {
         surface,
         configuration,
