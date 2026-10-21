@@ -76,6 +76,11 @@ MODULES = REPOSITORY / "modules"
 # The shared engine libraries whose subtrees must resolve identically in every
 # posture: the engine's, and the plain draw data the UI library and the
 # renderer contract share.
+#
+# `pill_game_ui` is deliberately absent: projects that draw their own egui link
+# it, modules and the renderer do not, so comparing it against a posture that
+# never loads it reports drift nothing can act on - the same reason `pill_ui`
+# is listed per editor family below rather than here.
 ENGINE_DYLIBS = (
     "pill_core",
     "pill_engine_core",

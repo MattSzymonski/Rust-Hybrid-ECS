@@ -186,6 +186,9 @@ impl UiTextureSet {
     /// holds.
     ///
     /// The patch's pixels are `region.width * region.height * 4` bytes.
+    // Every argument here is one field of the `UiTexture` this builds; a
+    // struct parameter would only move the same eight values one call up.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_patch(
         &mut self,
         id: TextureId,

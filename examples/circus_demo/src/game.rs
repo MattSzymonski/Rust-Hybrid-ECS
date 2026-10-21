@@ -17,6 +17,7 @@ use pill_engine::{
     pill_hot, tracing, Input, KeyCode, PillComponent, Query, Res, ResMut, Resource, SystemError,
     World,
 };
+use pill_game_ui::GameUi;
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 use serde::{Deserialize, Serialize};
 
@@ -253,11 +254,20 @@ fn spawn_pills(world: &mut World, assets: &SceneAssets, count: usize) -> Result<
 
 /// Tunes the curl noise field while its keys are held, and logs the new
 /// values on every frame that changed them.
+///
+/// The overlay has first claim on the keyboard: while it wants it - a field is
+/// focused, or a widget listens for keys - the tuning keys are the UI's, which
+/// is what keeps typing into the overlay from flying the camera and rescaling
+/// the field at the same time.
 #[pill_hot]
 pub(crate) fn demo_control_system(
     input: Res<Input>,
+    game_ui: Res<GameUi>,
     mut demo_state: ResMut<DemoState>,
 ) -> Result<(), SystemError> {
+    if game_ui.get().is_some_and(GameUi::wants_keyboard) {
+        return Ok(());
+    }
     let Some(input) = input.get() else {
         return Ok(());
     };

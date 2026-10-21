@@ -10,6 +10,7 @@
 // External crates
 use glam::{EulerRot, Quat, Vec3};
 use pill_engine::{pill_hot, Input, KeyCode, MouseButton, Query, Res, SystemError, Time};
+use pill_game_ui::GameUi;
 use pill_master_renderer_data::{CameraComponent, TransformComponent};
 
 // Current crate
@@ -44,9 +45,14 @@ pub(crate) fn view_rotation(pitch_yaw_degrees: [f32; 3]) -> Quat {
 }
 
 /// Flies the camera from the keys and turns it from right button drags.
+///
+/// A drag is the camera's unless the overlay claims the pointer: a drag that
+/// starts on a panel belongs to that panel, so the view stays put while the UI
+/// is being used.
 #[pill_hot]
 pub(crate) fn fps_camera_system(
     input: Res<Input>,
+    game_ui: Res<GameUi>,
     time: Res<Time>,
     mut cameras: Query<(
         &mut TransformComponent,
@@ -58,10 +64,11 @@ pub(crate) fn fps_camera_system(
         return Ok(());
     };
     let delta_time = time.delta_seconds();
+    let ui_wants_pointer = game_ui.get().is_some_and(GameUi::wants_pointer);
 
     // The window does not capture the cursor, so the view only follows the
-    // mouse while the right button is held.
-    let mouse_delta = if input.mouse_button_held(MouseButton::Right) {
+    // mouse while the right button is held over the scene.
+    let mouse_delta = if input.mouse_button_held(MouseButton::Right) && !ui_wants_pointer {
         input.mouse_delta()
     } else {
         glam::Vec2::ZERO
