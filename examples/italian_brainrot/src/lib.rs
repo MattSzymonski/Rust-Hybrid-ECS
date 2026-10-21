@@ -103,16 +103,23 @@ mod tests {
         assert_eq!(model_count, 3);
         assert_eq!(camera_count, 1);
 
-        // A second initialization is refused at the asset load: the six
-        // names are taken by the first scene, and `asset_loading` reports
-        // that rather than silently duplicating. What the first scene
-        // built is left untouched.
-        assert_eq!(init(&mut engine), 1);
+        // A second initialization is what a project reload runs, so it
+        // succeeds: `asset_loading` reuses an asset already under its name
+        // instead of adding a duplicate, and the scene builder returns early
+        // on the tag the first pass left. Nothing the first scene built is
+        // duplicated or replaced.
+        assert_eq!(init(&mut engine), 0);
         assert_eq!(
             Query::<&MeshRendererComponent>::new(engine.world_mut())
                 .iter_mut()
                 .count(),
             3
+        );
+        assert_eq!(
+            Query::<&CameraComponent>::new(engine.world_mut())
+                .iter_mut()
+                .count(),
+            1
         );
     }
 }
