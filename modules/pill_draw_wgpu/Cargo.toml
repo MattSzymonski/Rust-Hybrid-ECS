@@ -1,0 +1,24 @@
+[package]
+name = "pill_draw_wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+# `rlib` only: this crate is compiled into each of its users (a renderer's UI
+# pass and its tests), which each own their device and target - no wgpu object
+# ever crosses a DLL boundary (plan decision D8). Nothing loads this crate as
+# a module.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+pill_core = { path = "../pill_core" }
+# The plain draw data this crate paints. It names no UI library: whoever built
+# the lists (a game's egui, a tool) handed them over as `pill_draw` values.
+pill_draw = { path = "../pill_draw" }
+# The same wgpu the renderer uses; a second version in one process would bring
+# a second graphics stack into the build.
+wgpu = "30.0.0"
+bytemuck = { version = "1.4", features = ["derive"] }

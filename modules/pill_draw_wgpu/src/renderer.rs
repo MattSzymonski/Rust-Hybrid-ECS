@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - [`UiRenderer`]: owns the render pipeline, the glyph-atlas texture and
-//!   the registered external textures; uploads atlas changes and draws a
+//! - [`UiRenderer`]: owns the render pipeline, the atlas texture and
+//!   the registered external textures; uploads texture changes and draws a
 //!   [`DrawList`] into any render target.
 //! - Applies the monitor's scale factor, the list's nested clip rectangles
 //!   (as scissor rectangles) and correct sRGB blending.
@@ -21,7 +21,7 @@
 //! and therefore remembering nothing - re-uploads every texture the set
 //! carries instead of drawing with empty textures (W-0028 D3).
 //!
-//! Colour correctness: `pill_ui` colours are sRGB with straight alpha. The
+//! Colour correctness: `pill_draw` colours are sRGB with straight alpha. The
 //! shader converts vertex colours to linear, the textures are created as
 //! `Rgba8UnormSrgb` (so sampling decodes them), and the caller is expected to
 //! pass an sRGB target format - the hardware then encodes linear to sRGB
@@ -34,9 +34,9 @@ use std::collections::HashMap;
 // External crates
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
-use pill_ui::{
-    Atlas, AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture,
-    UiTextureFilter, UiTextureSet, UiVertex,
+use pill_draw::{
+    AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter,
+    UiTextureSet, UiVertex,
 };
 use wgpu::util::DeviceExt;
 
@@ -174,10 +174,10 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
 // UiRenderer
 // =============================================================================
 
-/// GPU resources for drawing `pill_ui` draw lists.
+/// GPU resources for drawing `pill_draw` draw lists.
 ///
 /// One renderer belongs to one device and one target format. The caller
-/// uploads atlas changes once per frame ([`Self::upload_atlas`]) and calls
+/// uploads texture changes once per frame ([`Self::apply_texture_set`]) and calls
 /// [`Self::render`] for each target the list draws into.
 pub struct UiRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -202,9 +202,9 @@ pub struct UiRenderer {
 impl UiRenderer {
     /// Build the pipeline and the atlas texture for `target_format`.
     ///
-    /// `atlas_size` is the [`Atlas`]'s starting size (`Atlas::new` with the
+    /// `atlas_size` is the atlas page the painter starts at (`pill_draw`'s
     /// same numbers); a later page growth recreates the texture inside
-    /// [`Self::upload_atlas`]. Pass an sRGB target format
+    /// `DEFAULT_ATLAS_LENGTH`). Pass an sRGB target format
     /// (`Rgba8UnormSrgb`, or a surface format's sRGB variant); the shader
     /// assumes the target encodes linear light. `queue` initializes the
     /// white texel solid quads sample.
@@ -215,7 +215,7 @@ impl UiRenderer {
         atlas_size: (u32, u32),
     ) -> UiRenderer {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pill_ui globals layout"),
+            label: Some("pill_draw globals layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -228,7 +228,7 @@ impl UiRenderer {
             }],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pill_ui texture layout"),
+            label: Some("pill_draw texture layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -250,13 +250,13 @@ impl UiRenderer {
         });
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pill_ui globals"),
+            label: Some("pill_draw globals"),
             size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_ui globals bind group"),
+            label: Some("pill_draw globals bind group"),
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -265,7 +265,7 @@ impl UiRenderer {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pill_ui sampler"),
+            label: Some("pill_draw sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -275,7 +275,7 @@ impl UiRenderer {
             ..Default::default()
         });
         let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pill_ui nearest sampler"),
+            label: Some("pill_draw nearest sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -286,16 +286,16 @@ impl UiRenderer {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pill_ui shader"),
+            label: Some("pill_draw shader"),
             source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pill_ui pipeline layout"),
+            label: Some("pill_draw pipeline layout"),
             bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pill_ui pipeline"),
+            label: Some("pill_draw pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -345,7 +345,7 @@ impl UiRenderer {
         // The `Solid` texture: one white texel, so a solid quad is the vertex
         // colour times 1. The shader needs no branch for it, and all draws
         // share one pipeline.
-        let solid_texture = create_srgb_texture(device, "pill_ui solid", (1, 1));
+        let solid_texture = create_srgb_texture(device, "pill_draw solid", (1, 1));
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &solid_texture,
@@ -367,7 +367,7 @@ impl UiRenderer {
         );
         let solid_view = solid_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let solid_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_ui solid bind group"),
+            label: Some("pill_draw solid bind group"),
             layout: &texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -403,56 +403,11 @@ impl UiRenderer {
         self.atlas_size
     }
 
-    /// Upload what the atlas changed since the last upload.
-    ///
-    /// The first call uploads the whole image; later calls upload only the
-    /// regions [`Atlas::take_updated_regions`] reports. When the atlas has
-    /// grown a page, the texture is recreated for the new size here and the
-    /// grown image arrives as one whole-image region.
-    pub fn upload_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, atlas: &mut Atlas) {
-        let size = (atlas.width(), atlas.height());
-        if size != self.atlas_size {
-            let (texture, bind_group) =
-                atlas_resources(device, &self.texture_layout, &self.sampler, size);
-            self.atlas_texture = texture;
-            self.atlas_bind_group = bind_group;
-            self.atlas_size = size;
-            self.atlas_uploaded = false;
-        }
-        let regions = atlas.take_updated_regions();
-        if !self.atlas_uploaded {
-            self.atlas_uploaded = true;
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                atlas.pixels(),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(self.atlas_size.0 * 4),
-                    rows_per_image: Some(self.atlas_size.1),
-                },
-                wgpu::Extent3d {
-                    width: self.atlas_size.0,
-                    height: self.atlas_size.1,
-                    depth_or_array_layers: 1,
-                },
-            );
-            return;
-        }
-        for region in regions {
-            upload_atlas_region(queue, &self.atlas_texture, atlas, region);
-        }
-    }
-
     /// Upload the regions of an [`AtlasUpdate`] - the same texture
-    /// [`Self::upload_atlas`] feeds, for a caller that received the atlas's
+    /// [`Self::apply_texture_set`] feeds, for a caller that received the atlas's
     /// changes as owned data across an artifact boundary. An update whose
     /// size differs recreates the texture first, like a growth in
-    /// [`Self::upload_atlas`].
+    /// `DEFAULT_ATLAS_LENGTH`.
     pub fn apply_atlas_update(
         &mut self,
         device: &wgpu::Device,
@@ -552,7 +507,7 @@ impl UiRenderer {
                                 .map(|entry| entry.texture)
                                 .expect("size came from the entry")
                         } else {
-                            create_srgb_texture(device, "pill_ui external", size)
+                            create_srgb_texture(device, "pill_draw external", size)
                         };
                         upload_whole_texture(queue, &created, size, pixels);
                         Some(created)
@@ -573,7 +528,7 @@ impl UiRenderer {
                 if let Some(created) = target {
                     let view = created.create_view(&wgpu::TextureViewDescriptor::default());
                     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("pill_ui external bind group"),
+                        label: Some("pill_draw external bind group"),
                         layout: &self.texture_layout,
                         entries: &[
                             wgpu::BindGroupEntry {
@@ -642,11 +597,11 @@ impl UiRenderer {
             size.0 as usize * size.1 as usize * 4,
             "an external texture needs exactly width * height * 4 bytes"
         );
-        let texture = create_srgb_texture(device, "pill_ui external", size);
+        let texture = create_srgb_texture(device, "pill_draw external", size);
         upload_whole_texture(queue, &texture, size, rgba);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_ui external bind group"),
+            label: Some("pill_draw external bind group"),
             layout: &self.texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -711,14 +666,14 @@ impl UiRenderer {
         let vertices: Vec<GpuVertex> = list.vertices.iter().map(GpuVertex::from).collect();
         let vertex_buffer = (!vertices.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pill_ui vertices"),
+                label: Some("pill_draw vertices"),
                 contents: bytemuck::cast_slice(&vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
         let index_buffer = (!list.indices.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pill_ui indices"),
+                label: Some("pill_draw indices"),
                 contents: bytemuck::cast_slice(&list.indices),
                 usage: wgpu::BufferUsages::INDEX,
             })
@@ -728,7 +683,7 @@ impl UiRenderer {
             wgpu::LoadOp::Clear(linear_clear_value(color))
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("pill_ui"),
+            label: Some("pill_draw"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
@@ -887,10 +842,10 @@ fn atlas_resources(
     sampler: &wgpu::Sampler,
     size: (u32, u32),
 ) -> (wgpu::Texture, wgpu::BindGroup) {
-    let texture = create_srgb_texture(device, "pill_ui atlas", size);
+    let texture = create_srgb_texture(device, "pill_draw atlas", size);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("pill_ui atlas bind group"),
+        label: Some("pill_draw atlas bind group"),
         layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -904,23 +859,6 @@ fn atlas_resources(
         ],
     });
     (texture, bind_group)
-}
-
-/// Upload one dirtied atlas region from the atlas image to the texture.
-fn upload_atlas_region(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    atlas: &Atlas,
-    region: Region,
-) {
-    let row_bytes = region.width as usize * 4;
-    let atlas_stride = atlas.width() as usize * 4;
-    let mut rows = Vec::with_capacity(row_bytes * region.height as usize);
-    for row in 0..region.height as usize {
-        let start = (region.y as usize + row) * atlas_stride + region.x as usize * 4;
-        rows.extend_from_slice(&atlas.pixels()[start..start + row_bytes]);
-    }
-    upload_region_pixels(queue, texture, region, &rows);
 }
 
 /// Upload one region's tightly packed RGBA8 rows to the atlas texture.
@@ -979,7 +917,7 @@ fn srgb_to_linear(value: f32) -> f32 {
     }
 }
 
-/// A `pill_ui` sRGB colour as the linear clear value a render pass wants.
+/// A `pill_draw` sRGB colour as the linear clear value a render pass wants.
 fn linear_clear_value(color: Color) -> wgpu::Color {
     wgpu::Color {
         r: srgb_to_linear(color.r) as f64,
