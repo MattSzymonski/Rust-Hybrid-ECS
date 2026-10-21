@@ -142,6 +142,24 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(verify_check("fmt", "Rust files changed"))
         selected.append(verify_check("coding-standards", "Rust files changed"))
 
+    # The shared draw data every UI producer and the renderer contract name:
+    # its own tests, plus the two crates whose types it defines (the engine
+    # core carries the frame slot, the game UI builds the lists).
+    if has("modules/pill_draw/**"):
+        selected.append(cargo_check("test pill_draw",
+                                    ("test", "-p", "pill_draw", "-p", "pill_engine_core",
+                                     "-p", "pill_game_ui", "--offline"),
+                                    "shared draw data changed"))
+
+    # The UI painter: `pill_draw` lists to wgpu. Its own tests cover the
+    # texture-set and clip paths; the renderer's tests cover what it is handed
+    # each frame, so both run.
+    if has("modules/pill_draw_wgpu/**"):
+        selected.append(cargo_check("test pill_draw_wgpu",
+                                    ("test", "-p", "pill_draw_wgpu", "-p", "pill_master_renderer",
+                                     "--offline"),
+                                    "UI painter changed"))
+
     # The egui editor: the shared model crate, the UI library, the reloadable
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
@@ -280,6 +298,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # beside it so "is this path recognized" and "what does it select" cannot
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
+    ("pill-draw", ("modules/pill_draw/**",)),
     ("pill-draw-wgpu", ("modules/pill_draw_wgpu/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
