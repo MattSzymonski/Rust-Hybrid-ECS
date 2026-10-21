@@ -3400,8 +3400,12 @@ impl EditorWindow {
             overrides,
             "[editor] keybindings applied"
         );
+        // Each problem and each conflicting chord is also a toast (W-0038
+        // Stage 4): a rebinding that silently stops working is exactly what
+        // the overlay is for.
         for problem in problems {
-            warn!(target: telemetry_target::ENGINE, "{}", problem);
+            warn!(target: telemetry_target::ENGINE, "{}", problem.as_str());
+            self.push_toast(NoticeLevel::Warning, problem);
         }
         for (chord, commands) in conflicts {
             warn!(
@@ -3409,6 +3413,10 @@ impl EditorWindow {
                 chord = chord.as_str(),
                 commands = commands.as_str(),
                 "[editor] keybinding conflict"
+            );
+            self.push_toast(
+                NoticeLevel::Warning,
+                format!("Keybinding conflict: {chord} is bound to {commands}"),
             );
         }
     }
@@ -4091,6 +4099,27 @@ impl EditorWindow {
                 HostNotice::PatchApplied { .. } => {}
             }
         }
+        self.notices.revision = self.notices.revision.wrapping_add(1);
+        let world = self.host.host_mut().engine_mut().world_mut();
+        match world.get_resource_mut::<EditorNotices>() {
+            Some(resource) => *resource = self.notices.clone(),
+            None => warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] notices resource missing"
+            ),
+        }
+    }
+
+    /// Queue one toast the editor itself raised, and publish it to the shell.
+    ///
+    /// The host's notices arrive through `fold_host_notices`, which returns
+    /// early when the host said nothing; an editor warning (a keybinding
+    /// conflict, a refused drop) has to reach the same event list and the
+    /// world resource on its own, or the stack would only ever show reloads.
+    fn push_toast(&mut self, level: NoticeLevel, text: String) {
+        let seq = self.notices.next_event_seq;
+        self.notices.next_event_seq = seq + 1;
+        self.notices.events.push(Notice { seq, level, text });
         self.notices.revision = self.notices.revision.wrapping_add(1);
         let world = self.host.host_mut().engine_mut().world_mut();
         match world.get_resource_mut::<EditorNotices>() {

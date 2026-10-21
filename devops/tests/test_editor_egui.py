@@ -187,6 +187,14 @@ TOAST_TOKEN = "[editor] toast"
 # quotes (W-0038 Stage 4).
 TOAST_PREAMBLE = re.escape(TOAST_TOKEN) + r'\s+level="{}"\s+seq=\d+\s+text="'
 
+# A whole toast line, rectangle included: the level, the id, the text and
+# where the row landed, so a check can click the toast itself.
+TOAST_LINE_PATTERN = (
+    re.escape(TOAST_TOKEN)
+    + r'\s+level="(\w+)"\s+seq=\d+\s+text="((?:[^"\\]|\\.)*)"'
+    + r"\s+x=(-?[0-9.]+)\s+y=(-?[0-9.]+)\s+width=([0-9.]+)\s+height=([0-9.]+)"
+)
+
 # The transform the gizmo drags edit; the field dump resolves the short
 # name, like the native suite's dumps do.
 TRANSFORM_COMPONENT = "TransformComponent"
@@ -1048,6 +1056,39 @@ def main() -> int:
             begin,
         )
         print("  [OK] a keybindings override rebound a shortcut live")
+
+        # The conflict is also a warning toast (W-0038 Stage 4), and clicking
+        # that toast never reaches the scene: the row's rectangle joins the
+        # frame's overlay regions.
+        session.wait(
+            re.escape(TOAST_TOKEN)
+            + r'\s+level="warning"[^\n]*text="Keybinding conflict:[^"]*',
+            30,
+            "the conflict raised a warning toast",
+            begin,
+        )
+        toast_rows = [
+            match
+            for match in re.finditer(TOAST_LINE_PATTERN, session.read_log()[begin:])
+            if match.group(1) == "warning" and "Keybinding conflict" in match.group(2)
+        ]
+        assert toast_rows, "the warning toast logged no rectangle"
+        row = toast_rows[-1]
+        toast_center = (
+            float(row.group(3)) + float(row.group(5)) / 2.0,
+            float(row.group(4)) + float(row.group(6)) / 2.0,
+        )
+        pick_start = len(session.read_log())
+        session.send(f"click {toast_center[0]:.0f} {toast_center[1]:.0f}")
+        # The rows heartbeat (every 210 frames) proves a frame handled the
+        # click before the absence of a pick line is read as an answer.
+        session.wait(
+            re.escape(EGUI_ROWS_TOKEN), 30, "a frame ran after the toast click", pick_start
+        )
+        assert "scene pick" not in session.read_log()[pick_start:], (
+            "a click on a toast reached the scene"
+        )
+        print("  [OK] a toast click stayed in the UI")
 
         # Step 3a3: the command palette (W-0038 Stage 3). The scripted channel
         # opens it with a query, the shell filters the registry's commands, and
