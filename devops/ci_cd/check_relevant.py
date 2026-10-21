@@ -109,16 +109,6 @@ def cargo_check(label: str, arguments: Sequence[str], reason: str) -> Check:
     )
 
 
-def golden_check(reason: str) -> Check:
-    """The golden-image comparison of the offscreen `pill_ui_wgpu` scenes."""
-    return Check(
-        label="goldens",
-        command=("cargo", "run", "-p", "pill_ui_wgpu", "--example", "golden", "--offline"),
-        cwd=MODULES,
-        reasons=[reason],
-    )
-
-
 def matches(path: str, pattern: str) -> bool:
     """Whether `path` (posix) falls under a rule glob; `dir/**` is a prefix."""
     if pattern.endswith("/**"):
@@ -165,17 +155,16 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
     # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
-    # input bridge, the tessellator and the texture mirror; the goldens cover
-    # the painter it shares with `pill_ui`, because the converter feeds it the
-    # same draw lists. The engine core carries the frame slot, so a change here
-    # also moves what every module drains.
+    # input bridge, the tessellator and the texture mirror; the painter it
+    # feeds is `pill_draw_wgpu`, whose tests cover the draw lists. The engine
+    # core carries the frame slot, so a change here also moves what every
+    # module drains.
     if has("modules/pill_game_ui/**"):
         selected.append(cargo_check("test pill_game_ui", ("test", "-p", "pill_game_ui", "--offline"),
                                     "pill_game_ui changed"))
         selected.append(cargo_check("test the frame slot",
                                     ("test", "-p", "pill_engine_core", "--offline"),
                                     "pill_game_ui changed"))
-        selected.append(golden_check("pill_game_ui changed"))
 
     # The editor: the shell module, frontend and the editor-side crates.
     # The frontend-facing suites are picked per area; run_all handles the rest.
@@ -291,7 +280,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # beside it so "is this path recognized" and "what does it select" cannot
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("pill-draw-wgpu", ("modules/pill_ui_wgpu/**",)),
+    ("pill-draw-wgpu", ("modules/pill_draw_wgpu/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
                      "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**")),

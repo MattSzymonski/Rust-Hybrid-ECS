@@ -97,34 +97,21 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 
 /// The engine's shared libraries, by file stem: every module, project and
 /// patch imports them, and each exists once per process unless a module needs
-/// the isolated copies (see [`engine_dylib_needs_isolation`]). `pill_ui`
-/// joined them with the UI library (plan decision D17): the editor shell
-/// module and editor crates import it, and a module-world copy differing
-/// from the host's needs the same co-located treatment as the engine's own.
-/// `pill_editor_api` joined with the editor shell (Stage 13): the executable
-/// and the reloadable shell module exchange resources of its types, and both
-/// sides must resolve it to the one copy the process loaded.
-/// `pill_editor_core` joined for the same reason: the shell imports it, and a
-/// host that does not itself map it (the renderer standalone running the
-/// editor crates) must find it staged beside the module - a mapped copy wins
-/// by basename and makes the staging a no-op where the executable links it.
-/// `pill_ui_egui` and `pill_editor_core_egui` are the egui editor's copies of
-/// `pill_ui` and `pill_editor_core` (W-0017). Its frontend and shell will
-/// exchange their types the same way, so they get the same treatment.
-/// `pill_draw` carries the frame's UI draw data that the UI libraries and the
+/// the isolated copies (see [`engine_dylib_needs_isolation`]).
+/// `pill_draw` carries the frame's UI draw data that the UI painters and the
 /// renderer contract share (W-0032); every artifact that builds or draws UI
 /// lists imports it, so it stages like the rest.
 /// `pill_game_ui` is the in-game egui UI (W-0028): a project draws into its
 /// context and the renderer drains its frame, so a project reload must find
 /// the same copy the host loaded - the whole point of the crate being shared.
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 9] = [
+/// `pill_ui_egui` and `pill_editor_core_egui` are the egui editor's shared
+/// copies (W-0017). Its frontend and shell exchange their types the same way,
+/// so they get the same treatment.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_core",
     "pill_engine_core",
     "pill_draw",
-    "pill_ui",
     "pill_game_ui",
-    "pill_editor_core",
-    "pill_editor_api",
     "pill_ui_egui",
     "pill_editor_core_egui",
 ];
@@ -1697,16 +1684,16 @@ mod tests {
 
     use crate::scratch::ScratchDirectory;
 
-    /// The Stage 27 case: the artifact imports a symbol `pill_ui` does not
+    /// The Stage 27 case: the artifact imports a symbol `pill_draw` does not
     /// export while `pill_core`'s copies differ. The message must name
-    /// `pill_ui` and the symbol - the mismatch story must not win and bury
+    /// `pill_draw` and the symbol - the mismatch story must not win and bury
     /// the real answer.
     #[test]
-    fn a_missing_pill_ui_import_wins_over_a_pill_core_mismatch() {
+    fn a_missing_pill_draw_import_wins_over_a_pill_core_mismatch() {
         let unresolved = UnresolvedImport {
-            dll: "pill_ui.dll".to_string(),
-            symbol: "pill_ui_text_metrics_v2".to_string(),
-            path: PathBuf::from("target/hot/pill_ui.dll"),
+            dll: "pill_draw.dll".to_string(),
+            symbol: "pill_draw_frame_take".to_string(),
+            path: PathBuf::from("target/hot/pill_draw.dll"),
         };
         let mismatch = Some((
             PathBuf::from("target/debug/pill_core.dll"),
@@ -1715,8 +1702,8 @@ mod tests {
         let explanation = choose_explanation(Some(unresolved), None, mismatch);
         let error = explanation_error("editor_shell", explanation).expect("an explanation");
         let text = error.to_string();
-        assert!(text.contains("pill_ui.dll"), "{text}");
-        assert!(text.contains("pill_ui_text_metrics_v2"), "{text}");
+        assert!(text.contains("pill_draw.dll"), "{text}");
+        assert!(text.contains("pill_draw_frame_take"), "{text}");
         assert!(
             !text.contains("pill_core"),
             "the mismatch story must not win: {text}"

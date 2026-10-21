@@ -43,10 +43,10 @@ use std::collections::{BTreeMap, HashMap};
 // External crates
 use pill_core::platform::Instant;
 use pill_core::{info, PillStyle};
+use pill_draw_wgpu::UiRenderer;
 use pill_engine::common_components::TransformComponent;
 use pill_engine::AssetManager;
 use pill_renderer_api::{CameraComponent, RawWindowData, SurfaceId, SurfaceOptions};
-use pill_ui_wgpu::UiRenderer;
 
 // Current crate
 use crate::{
@@ -774,11 +774,11 @@ impl State {
                 .textures
                 .textures
                 .iter()
-                .find(|texture| texture.id == pill_ui::TextureId::Atlas)
+                .find(|texture| texture.id == pill_draw::TextureId::Atlas)
                 .map(|texture| (texture.width, texture.height))
                 .unwrap_or((
-                    pill_ui::atlas::DEFAULT_LENGTH,
-                    pill_ui::atlas::DEFAULT_LENGTH,
+                    pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
+                    pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
                 ));
             self.ui_renderer = Some(UiRenderer::new(
                 &self.device,
@@ -1172,7 +1172,7 @@ impl State {
         );
         drop(overlay_zone);
         // The game's UI, over the chain's picture (Stage 12): the frame's
-        // lists for this surface, through the shared `pill_ui_wgpu` backend.
+        // lists for this surface, through the shared `pill_draw_wgpu` backend.
         self.record_ui(surface_id, &mut encoder, &view, (width, height), frame);
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);

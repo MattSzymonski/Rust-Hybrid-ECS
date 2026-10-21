@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - [`request_device`]: a wgpu device for tests and the golden harness,
+//! - [`request_device`]: a wgpu device for tests,
 //!   optionally the platform's software fallback adapter (WARP on Windows,
 //!   lavapipe on Linux) so rendering runs without a GPU.
 //! - [`render_rgba`]: render a [`DrawList`] offscreen and copy the pixels
@@ -11,7 +11,7 @@
 //! # Design
 //!
 //! Both functions are async and never block; the caller supplies the
-//! executor (the tests and the golden harness block on
+//! executor (the tests block on
 //! `pill_core::platform::futures::block_on`). The offscreen target is
 //! `Rgba8UnormSrgb`, the format the renderer's shader is written for, so the
 //! pixels that come back are what a correctly configured surface shows.
@@ -20,7 +20,7 @@
 use std::sync::mpsc;
 
 // External crates
-use pill_ui::{Color, DrawList};
+use pill_draw::{Color, DrawList};
 
 // Current crate
 use crate::renderer::UiRenderer;
@@ -59,7 +59,7 @@ pub async fn request_device(prefer_software: bool) -> Option<(wgpu::Device, wgpu
         .ok()?;
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            label: Some("pill_ui_wgpu offscreen device"),
+            label: Some("pill_draw_wgpu offscreen device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
@@ -93,7 +93,7 @@ pub async fn render_rgba(
 ) -> Result<Vec<u8>, String> {
     let (width, height) = target_size;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("pill_ui offscreen target"),
+        label: Some("pill_draw offscreen target"),
         size: wgpu::Extent3d {
             width,
             height,
@@ -111,14 +111,14 @@ pub async fn render_rgba(
     let row_bytes = width as usize * 4;
     let padded_row_bytes = row_bytes.div_ceil(COPY_ROW_ALIGNMENT) * COPY_ROW_ALIGNMENT;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("pill_ui offscreen readback"),
+        label: Some("pill_draw offscreen readback"),
         size: (padded_row_bytes * height as usize) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("pill_ui offscreen encoder"),
+        label: Some("pill_draw offscreen encoder"),
     });
     renderer.render(
         device,

@@ -20,6 +20,12 @@
 // Region
 // =============================================================================
 
+/// The page size a UI's glyph and icon atlas starts at, in texels.
+///
+/// Producers grow their own atlas from here; a painter asks the frame for the
+/// image it actually got and falls back to this before the first one arrives.
+pub const DEFAULT_ATLAS_LENGTH: u32 = 2048;
+
 /// A rectangle of the atlas, in texels.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Region {

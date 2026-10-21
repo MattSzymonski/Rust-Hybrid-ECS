@@ -10,7 +10,7 @@
 //! # Design
 //!
 //! egui tessellates premultiplied sRGB colour into triangle lists in *points*,
-//! while `pill_draw::Color` is straight alpha and `pill_ui_wgpu` blends
+//! while `pill_draw::Color` is straight alpha and `pill_draw_wgpu` blends
 //! `SrcAlpha`, so the converter unpremultiplies per vertex and per texel (see
 //! the W-0028 Stage 1 decision record, Q2). Vertices are not scaled: the
 //! painter takes the monitor scale and applies it itself, which keeps one
@@ -27,7 +27,7 @@ use pill_draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 
 /// The bit that separates egui's managed texture ids from its user ids.
 ///
-/// `pill_draw::TextureId::Atlas` is reserved for the `pill_ui` glyph atlas, so
+/// `pill_draw::TextureId::Atlas` is reserved for the UI glyph atlas, so
 /// every egui texture arrives as an external and the two id spaces cannot
 /// collide.
 const USER_TEXTURE_CEILING: u64 = 1 << 63;
