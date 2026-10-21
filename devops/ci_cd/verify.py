@@ -87,7 +87,19 @@ HOT_PATCH_FEATURES = "pill_host/hot_patch,pill_engine/hot_patch"
 # so the lane leaves them out; the hot_patch lane runs the whole workspace,
 # them included. The `default-lane-features` step fails if a new member brings
 # hot_patch back.
-DEFAULT_LANE = ["--workspace", "--exclude", "pill_standalone", "--exclude", "pill_editor"]
+DEFAULT_LANE = [
+    "--workspace",
+    "--exclude",
+    "pill_standalone",
+    "--exclude",
+    "pill_editor",
+    # The egui editor frontend links `pill_host` with its default features, so
+    # leaving it in the default lane turns `pill_engine_core/hot_patch` on for
+    # every crate in it - the lane exists to test the plain path, and the
+    # hot_patch lane below covers the other one.
+    "--exclude",
+    "pill_editor_egui",
+]
 
 # The unit-test steps run through nextest when it is installed, and through
 # `cargo test` when it is not, so the gate still runs on a machine that never

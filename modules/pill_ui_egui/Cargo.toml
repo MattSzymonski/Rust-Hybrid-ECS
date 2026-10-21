@@ -58,3 +58,13 @@ epaint = { version = "0.36.2", default-features = false, features = [
 # resolve unifies the two. Pinned here so the module world resolves the same
 # tree the host builds this DLL with.
 bitflags = { version = "2", features = ["serde"] }
+# The same argument for the rest of the editor's shared tree, found by the gate
+# on 2026-10-21 (fourteen drift reports against this crate and
+# `pill_editor_core_egui`, all of them features the host world turns on and a
+# module or project build does not). None of them is used directly.
+arrayvec = { version = "0.7", features = ["std"] }
+hashbrown = { version = "0.17", features = ["inline-more"] }
+kurbo = "0.13"
+read-fonts = "0.41"
+skrifa = "0.44"
+uuid = { version = "1", features = ["std"] }
