@@ -39,8 +39,9 @@ use pill_core::{info, warn};
 use pill_editor_core_egui::assets::{self, AssetDialog};
 use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
 use pill_editor_core_egui::commands::{
-    ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, EditorPreferences,
-    KeymapPreset, PendingEditorCommands, PREFERENCES_FILE,
+    ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, CommandRegistry,
+    EditorPreferences, KeybindingsFile, KeymapPreset, PendingEditorCommands, KEYBINDINGS_FILE,
+    PREFERENCES_FILE,
 };
 use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{
@@ -473,6 +474,12 @@ struct EditorWindow {
     /// The preferences file's text last read; the live reader applies the
     /// history limits and the snapping steps when it changes (Stage 20).
     preferences_text: Option<String>,
+    /// The keybindings file's text last read; a change re-applies the preset
+    /// and the overrides to the command registry (W-0038 Stage 2).
+    keybindings_text: Option<String>,
+    /// Whether the keybindings watcher ran once: the first pass applies the
+    /// editor's default preset even when there is no file to differ from it.
+    keybindings_applied: bool,
     /// The parsed preferences document the snapshot's view and the scripted
     /// dump build on.
     preferences_document: serde_json::Map<String, serde_json::Value>,
@@ -736,6 +743,8 @@ impl EditorWindow {
             asset_detail: None,
             asset_detail_path: None,
             preferences_text: None,
+            keybindings_text: None,
+            keybindings_applied: false,
             preferences_document: serde_json::Map::new(),
             gizmo_project,
             gizmo_persisted: None,
@@ -1562,9 +1571,12 @@ impl EditorWindow {
         }
     }
 
-    /// The tool shortcuts: W/E/R select translate/rotate/scale - the Unity
-    /// preset's bindings, the same ones the native editor defaults to, and
-    /// the same mapping a scripted `key` chord runs.
+    /// The tool shortcuts: a press that the active keymap binds to a tool
+    /// command selects that tool (W-0038 Stage 2).
+    ///
+    /// The registry owns which key means what, so a preset or a keybindings
+    /// override rebinds the editor without a restart; an unbound key falls
+    /// through to the rest of the editor and the game.
     fn gizmo_shortcut(&mut self, event: &winit::event::KeyEvent) {
         if event.state != winit::event::ElementState::Pressed || event.repeat {
             return;
@@ -1575,9 +1587,13 @@ impl EditorWindow {
         let Some(key) = pill_input::winit_events::key_code(code) else {
             return;
         };
-        if let Some(mode) = gizmo_mode_for_key(key) {
-            self.set_gizmo_tool(mode);
-        }
+        let held = EngineModifiers {
+            shift: self.modifiers.shift,
+            control: self.modifiers.control,
+            alt: self.modifiers.alt,
+            super_key: false,
+        };
+        self.run_bound_command(key, held);
     }
 
     /// Switch the gizmo's mode; the shortcuts, the scripted command and
@@ -1599,6 +1615,47 @@ impl EditorWindow {
             mode = gizmo_mode_name(mode),
             "[editor] gizmo tool"
         );
+    }
+
+    /// Runs the command the active keymap binds to a chord, if any, and
+    /// reports whether one ran (W-0038 Stage 2).
+    ///
+    /// The registry is the one source of chords: a preset or a keybindings
+    /// override changes what a key does, without a restart and without a
+    /// second table in the executable. A chord bound to a command this
+    /// executable has not implemented yet resolves and is logged, then does
+    /// nothing - the palette and the clipboard stages give it a body.
+    fn run_bound_command(&mut self, key: KeyCode, modifiers: EngineModifiers) -> bool {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        CommandRegistry::ensure(world);
+        let resolved = world
+            .get_resource::<CommandRegistry>()
+            .and_then(|registry| registry.resolve(key, modifiers))
+            .map(|spec| spec.id.clone());
+        let Some(command) = resolved else {
+            return false;
+        };
+        if let Some(action) = command_action(&command) {
+            info!(
+                target: telemetry_target::ENGINE,
+                command = command.as_str(),
+                "[editor] shortcut ran"
+            );
+            match action {
+                CommandAction::GizmoTool(mode) => self.set_gizmo_tool(mode),
+                CommandAction::Undo => self.scripted_undo(),
+                CommandAction::Redo => self.scripted_redo(),
+                CommandAction::PauseToggle => self.scripted_pause_toggle(),
+                CommandAction::Step => self.scripted_step(),
+            }
+        } else {
+            info!(
+                target: telemetry_target::ENGINE,
+                command = command.as_str(),
+                "[editor] shortcut has no action yet"
+            );
+        }
+        true
     }
 
     /// The first visible scene view, the scripted drag's default target.
@@ -3001,6 +3058,7 @@ impl EditorWindow {
         // frame's edits left.
         self.persist_gizmo_settings();
         self.watch_preferences();
+        self.watch_keybindings();
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -3295,6 +3353,61 @@ impl EditorWindow {
             state.settings.translate_step = steps.translation;
             state.settings.rotate_step_degrees = steps.rotation_degrees;
             state.settings.scale_step = steps.scale;
+        }
+    }
+
+    /// Applies the keybindings file whenever it changes (W-0038 Stage 2).
+    ///
+    /// The registry owns the preset and the overrides; this only reads the
+    /// file, hands it over and reports what came out of it - the preset, the
+    /// number of overrides, every problem the file's text had, and one line
+    /// per chord that two commands now answer to. A missing or malformed file
+    /// is an empty one: the built-ins' own bindings stand.
+    fn watch_keybindings(&mut self) {
+        let directory = layout_directory();
+        let text = std::fs::read_to_string(directory.join(KEYBINDINGS_FILE)).ok();
+        if self.keybindings_applied && text == self.keybindings_text {
+            return;
+        }
+        self.keybindings_applied = true;
+        self.keybindings_text = text;
+        let file = self
+            .keybindings_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<KeybindingsFile>(text).ok())
+            .unwrap_or_else(editor_default_keybindings);
+        let world = self.host.host_mut().engine_mut().world_mut();
+        CommandRegistry::ensure(world);
+        let (problems, preset, overrides, conflicts) = {
+            let Some(registry) = world.get_resource_mut::<CommandRegistry>() else {
+                return;
+            };
+            let problems = registry.apply_file(&file);
+            let preset = registry.preset();
+            let overrides = registry.override_count();
+            let conflicts: Vec<(String, String)> = registry
+                .conflicts()
+                .into_iter()
+                .map(|(chord, ids)| (chord.to_string(), ids.join(",")))
+                .collect();
+            (problems, preset, overrides, conflicts)
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            preset = %preset,
+            overrides,
+            "[editor] keybindings applied"
+        );
+        for problem in problems {
+            warn!(target: telemetry_target::ENGINE, "{}", problem);
+        }
+        for (chord, commands) in conflicts {
+            warn!(
+                target: telemetry_target::ENGINE,
+                chord = chord.as_str(),
+                commands = commands.as_str(),
+                "[editor] keybinding conflict"
+            );
         }
     }
 
@@ -3827,9 +3940,17 @@ impl EditorWindow {
             chord = chord.label().as_str(),
             "[editor] key injected"
         );
-        if let Some(mode) = gizmo_mode_for_key(chord.key) {
-            self.set_gizmo_tool(mode);
-        }
+        // A scripted chord runs what a real press runs: the same
+        // registry-resolved command, with the modifiers the chord named.
+        self.run_bound_command(
+            chord.key,
+            EngineModifiers {
+                shift: chord.shift,
+                control: chord.control,
+                alt: chord.alt,
+                super_key: chord.super_key,
+            },
+        );
     }
 
     /// Queue one scripted event: to the engine, and to the shell's list too.
@@ -4650,14 +4771,49 @@ fn gizmo_mode_name(mode: GizmoMode) -> &'static str {
     }
 }
 
-/// The tool a bare W, E or R picks - the winit shortcut handler and a
-/// scripted `key` chord read this one mapping, so the two cannot drift.
-fn gizmo_mode_for_key(key: KeyCode) -> Option<GizmoMode> {
-    match key {
-        KeyCode::KeyW => Some(GizmoMode::Translate),
-        KeyCode::KeyE => Some(GizmoMode::Rotate),
-        KeyCode::KeyR => Some(GizmoMode::Scale),
+/// What a registry command id does in this executable (W-0038 Stage 2).
+///
+/// The registry owns the ids, the titles and the chords; this maps an id to
+/// the action the menu, the toolbar and the scripted channel already run, so
+/// a rebinding reaches the same code a click does. A command with no action
+/// here is one another stage implements (the palette, the clipboard, the
+/// pop-outs) and stays inert until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandAction {
+    /// Select a gizmo tool.
+    GizmoTool(GizmoMode),
+    /// Step the history back one entry.
+    Undo,
+    /// Step the history forward one entry.
+    Redo,
+    /// Flip the engine's pause flag.
+    PauseToggle,
+    /// Advance exactly one frame.
+    Step,
+}
+
+/// The action a command id runs, if this executable implements it.
+fn command_action(command_id: &str) -> Option<CommandAction> {
+    match command_id {
+        "editor.tool_translate" => Some(CommandAction::GizmoTool(GizmoMode::Translate)),
+        "editor.tool_rotate" => Some(CommandAction::GizmoTool(GizmoMode::Rotate)),
+        "editor.tool_scale" => Some(CommandAction::GizmoTool(GizmoMode::Scale)),
+        "editor.undo" => Some(CommandAction::Undo),
+        "editor.redo" => Some(CommandAction::Redo),
+        "editor.pause_toggle" => Some(CommandAction::PauseToggle),
+        "editor.step" => Some(CommandAction::Step),
         _ => None,
+    }
+}
+
+/// The bindings the editor starts with when there is no keybindings file.
+///
+/// Unity's table, whose W/E/R the editor's tool shortcuts have always used;
+/// the file's own `preset` replaces it as soon as one names a preset.
+fn editor_default_keybindings() -> KeybindingsFile {
+    KeybindingsFile {
+        preset: Some(KeymapPreset::Unity),
+        ..Default::default()
     }
 }
 
