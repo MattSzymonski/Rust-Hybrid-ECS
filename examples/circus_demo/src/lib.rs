@@ -56,22 +56,14 @@ pub fn init(engine: &mut Engine) -> u32 {
         return 1;
     }
 
-    // The tuning overlay's stylesheet is a `.css` asset like the editor's:
-    // register the type once per live generation, and claim the UI context
-    // every generation too - the reload releases exactly the resources the
-    // new generation does not re-register - while the value is inserted only
-    // when no earlier generation left one behind (the shape `DemoState`
-    // uses). Claiming without re-inserting is what keeps the same context,
-    // and the scroll and values inside it, across a project reload.
-    engine
-        .world_mut()
-        .register_imported_asset::<pill_ui::StylesheetAsset>();
-    engine.world_mut().register_resource::<pill_ui::UiContext>();
-    if !engine.world_mut().has_resource::<pill_ui::UiContext>() {
-        engine
-            .world_mut()
-            .insert_resource(pill_ui::UiContext::new());
-    }
+    // The tuning overlay's egui context: installed once and kept across a
+    // project reload, so the reloaded overlay finds the same fonts and the same
+    // widget state (the shape `DemoState` uses). `install` claims both resource
+    // types every generation - the reload releases exactly the resources the
+    // new generation does not re-register - and inserts the values only when no
+    // earlier generation left them behind. The frame slot it installs is also
+    // what tells the renderer that this world's UI is the game's.
+    pill_game_ui::install(engine);
 
     engine.register_system("fps_camera", camera::fps_camera_system);
     engine.register_system("camera_fov", camera::camera_fov_changing_system);

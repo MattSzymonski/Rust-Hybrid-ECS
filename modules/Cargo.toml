@@ -23,6 +23,10 @@ members = [
     # beside `pill_ui`, so the egui editor's world can replace its UI core
     # without touching the `pill_ui` editor's.
     "pill_ui_egui",
+    # The in-game egui UI (W-0028): a third shared dylib, so a project's egui
+    # context outlives a project reload and its frame is neutral data the main
+    # renderer draws.
+    "pill_game_ui",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild

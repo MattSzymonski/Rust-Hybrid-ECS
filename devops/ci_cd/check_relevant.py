@@ -180,6 +180,19 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     "pill_ui_wgpu changed"))
         selected.append(golden_check("pill_ui_wgpu changed"))
 
+    # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
+    # input bridge, the tessellator and the texture mirror; the goldens cover
+    # the painter it shares with `pill_ui`, because the converter feeds it the
+    # same draw lists. The engine core carries the frame slot, so a change here
+    # also moves what every module drains.
+    if has("modules/pill_game_ui/**"):
+        selected.append(cargo_check("test pill_game_ui", ("test", "-p", "pill_game_ui", "--offline"),
+                                    "pill_game_ui changed"))
+        selected.append(cargo_check("test the frame slot",
+                                    ("test", "-p", "pill_engine_core", "--offline"),
+                                    "pill_game_ui changed"))
+        selected.append(golden_check("pill_game_ui changed"))
+
     # The editor: shell module, frontend and the editor-side crates. The
     # frontend-facing suites are picked per area; run_all handles the rest.
     debug_panel = has("modules/extensions/pill_editor_shell/**")
@@ -314,6 +327,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-ui", ("modules/pill_ui/**",)),
     ("pill-ui-wgpu", ("modules/pill_ui_wgpu/**",)),
+    ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("editor-shell", ("modules/extensions/pill_editor_shell/**",)),
     ("editor-frontend", ("modules/frontents/pill_editor/**",)),
     ("editor-core", ("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**")),

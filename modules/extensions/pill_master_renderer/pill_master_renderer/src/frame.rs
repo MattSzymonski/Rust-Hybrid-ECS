@@ -19,9 +19,10 @@
 
 // Standard library
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // External crates
-use pill_core::warn;
+use pill_core::{info, warn};
 use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError};
 pub use pill_renderer_api::frame::{
     CullMode, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
@@ -199,6 +200,10 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
 /// The resources [`rendering_system`] reads besides the frame, the assets and
 /// the rendering manager, grouped into one parameter because a system takes at
 /// most six.
+///
+/// The two UI producers are both here: the slot a game's own UI publishes into
+/// ([`UiFrameSlot`]) and the `pill_ui` context the editors and the older
+/// projects draw with.
 type RenderingExtras<'w> = (
     Res<'w, pill_engine::Time>,
     Res<'w, pill_renderer_api::SurfaceCameras>,
@@ -206,7 +211,36 @@ type RenderingExtras<'w> = (
     Res<'w, pill_renderer_api::SelectionOutlines>,
     ResMut<'w, pill_renderer_api::PickRequests>,
     ResMut<'w, pill_ui::UiContext>,
+    ResMut<'w, pill_engine::ui_frame::UiFrameSlot>,
 );
+
+/// Which producer filled `RenderFrame.ui` on the last frame, so a change is
+/// stated once instead of every frame.
+///
+/// Module state rather than a frame field: the frame is plain data the renderer
+/// contract shares, while the producer is a fact about this renderer's world.
+/// A renderer reload starts the record over, which is what makes the next
+/// frame say which producer is feeding it.
+static UI_PRODUCER: AtomicU8 = AtomicU8::new(PRODUCER_UNSET);
+
+/// Nothing measured yet.
+const PRODUCER_UNSET: u8 = 0;
+/// The game's own egui UI.
+const PRODUCER_GAME: u8 = 1;
+/// The `pill_ui` context.
+const PRODUCER_PILL_UI: u8 = 2;
+/// No producer at all: the frame carries no UI.
+const PRODUCER_NONE: u8 = 3;
+
+/// Record that `producer` filled the frame, naming it when that is news.
+fn note_ui_producer(producer: u8, name: &str) {
+    if UI_PRODUCER.swap(producer, Ordering::Relaxed) != producer {
+        info!(
+            target: pill_core::telemetry::telemetry_target::UI,
+            "[ui] producer={name}"
+        );
+    }
+}
 
 /// Fills the frame from the current world, once per update.
 ///
@@ -220,9 +254,8 @@ pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
-    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests, mut ui): RenderingExtras<
-        '_,
-    >,
+    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests, mut ui, mut ui_slot):
+        RenderingExtras<'_,>,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
     mut objects: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
@@ -329,12 +362,26 @@ pub fn rendering_system(
     frame.grid =
         bindings.and_then(|bindings| pill_renderer_api::frame_grid(bindings, bindings.grid));
 
-    // The game's UI, when the project has a context: drain what its systems
-    // built this update - the draw lists and the glyph-atlas changes. Without
-    // a context the frame carries no UI (Stage 12).
-    match ui.get_mut() {
-        Some(mut ui) => frame.ui = ui.take_frame(),
-        None => frame.ui.clear(),
+    // The frame's UI, from whichever producer this world has. A frame slot
+    // means the project installed its own egui UI, and then that UI is what
+    // the frame carries - including on a frame it drew nothing in, because a
+    // game that owns the UI does not want `pill_ui`'s frame surfacing under it.
+    // Without a slot the frame comes from `pill_ui`'s context (plan decision
+    // D6: the two producers coexist until W-0043 retires the older one). The
+    // choice is stated once, not per frame.
+    match (ui_slot.get_mut(), ui.get_mut()) {
+        (Some(mut slot), _) => {
+            frame.ui = slot.take();
+            note_ui_producer(PRODUCER_GAME, "game");
+        }
+        (None, Some(mut ui)) => {
+            frame.ui = ui.take_frame();
+            note_ui_producer(PRODUCER_PILL_UI, "pill_ui");
+        }
+        (None, None) => {
+            frame.ui.clear();
+            note_ui_producer(PRODUCER_NONE, "none");
+        }
     }
 
     // The last mesh and material pair resolved, with the draw order it gave
@@ -399,7 +446,7 @@ mod tests {
     // `PassKind`, `Shader` and `Texture` are here to build the fixture assets the chain
     // tests need, not by anything in the module itself.
     use crate::{PassKind, RenderPass, RenderingPipeline, Shader, Texture, TextureType};
-    use pill_engine::AssetManager;
+    use pill_engine::{AssetManager, Engine};
 
     #[test]
     fn a_game_with_no_pipeline_runs_the_built_in_pass() {
@@ -651,6 +698,109 @@ mod tests {
         assert!(
             passes.is_empty(),
             "a chain whose only pass is gone resolves to nothing"
+        );
+    }
+
+    /// An engine that can run the rendering system: the frame and the asset
+    /// store inserted, the system registered, and one `pill_ui` context so the
+    /// fallback producer is in contention with a game's.
+    fn renderable_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine.world_mut().insert_resource(RenderFrame::default());
+        engine.world_mut().insert_resource(AssetManager::new());
+        engine
+            .world_mut()
+            .insert_resource(pill_ui::UiContext::default());
+        crate::register(&mut engine);
+        engine
+    }
+
+    /// A frame carrying one filled quad, as a game's UI producer would publish
+    /// it. Built out of `pill_ui`'s re-exports of the draw vocabulary, which is
+    /// the same plain data the slot carries.
+    fn drawn_frame() -> pill_renderer_api::frame::RenderFrame {
+        let mut frame = RenderFrame::default();
+        let mut list = pill_ui::DrawList::new();
+        list.push_fill(
+            pill_ui::Rect::from_min_size(
+                pill_core::math::Vector2f::ZERO,
+                pill_core::math::Vector2f::new(2.0, 2.0),
+            ),
+            pill_ui::Color::WHITE,
+        );
+        frame.ui.draws.push(pill_ui::UiDraw {
+            surface: 0,
+            scale_factor: 1.0,
+            list,
+        });
+        frame
+    }
+
+    #[test]
+    fn a_published_frame_wins_over_the_pill_ui_context() {
+        let mut engine = renderable_engine();
+        engine
+            .world_mut()
+            .insert_resource(pill_engine::ui_frame::UiFrameSlot::new());
+        {
+            let slot = engine
+                .world_mut()
+                .get_resource_mut::<pill_engine::ui_frame::UiFrameSlot>()
+                .expect("inserted above");
+            slot.publish(drawn_frame().ui);
+        }
+        engine.process_frame().expect("the frame runs");
+
+        let frame = engine
+            .world()
+            .get_resource::<RenderFrame>()
+            .expect("inserted above");
+        assert_eq!(
+            frame.ui.draws.len(),
+            1,
+            "the published frame did not reach the renderer"
+        );
+        let slot = engine
+            .world()
+            .get_resource::<pill_engine::ui_frame::UiFrameSlot>()
+            .expect("inserted above");
+        assert!(slot.is_empty(), "the frame was copied rather than drained");
+    }
+
+    #[test]
+    fn a_slot_that_drew_nothing_still_owns_the_frame() {
+        let mut engine = renderable_engine();
+        engine
+            .world_mut()
+            .insert_resource(pill_engine::ui_frame::UiFrameSlot::new());
+        engine.process_frame().expect("the frame runs");
+
+        let frame = engine
+            .world()
+            .get_resource::<RenderFrame>()
+            .expect("inserted above");
+        assert!(
+            frame.ui.is_empty(),
+            "a game that drew nothing does not surface `pill_ui`'s frame"
+        );
+    }
+
+    #[test]
+    fn a_world_with_only_a_pill_ui_context_draws_no_geometry() {
+        let mut engine = renderable_engine();
+        engine.process_frame().expect("the frame runs");
+
+        let frame = engine
+            .world()
+            .get_resource::<RenderFrame>()
+            .expect("inserted above");
+        assert!(
+            frame.ui.draws.is_empty(),
+            "a `pill_ui` context with nothing drawn has no geometry"
+        );
+        assert!(
+            !frame.ui.textures.textures.is_empty(),
+            "its first take still publishes the atlas the next frame will sample"
         );
     }
 }

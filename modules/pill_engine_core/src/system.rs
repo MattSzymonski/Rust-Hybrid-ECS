@@ -344,7 +344,7 @@ macro_rules! impl_system_param_tuple {
     };
 }
 
-// Implement for tuples of different sizes (0 to 6 parameters)
+// Implement for tuples of different sizes (0 to 7 parameters)
 impl SystemParam for () {
     unsafe fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {}
 
@@ -359,6 +359,7 @@ impl_system_param_tuple!(A, B, C);
 impl_system_param_tuple!(A, B, C, D);
 impl_system_param_tuple!(A, B, C, D, E);
 impl_system_param_tuple!(A, B, C, D, E, F1);
+impl_system_param_tuple!(A, B, C, D, E, F1, G);
 
 // =============================================================================
 // SystemParamFunction
@@ -422,6 +423,7 @@ impl_system_param_function!(A, B, C);
 impl_system_param_function!(A, B, C, D);
 impl_system_param_function!(A, B, C, D, E);
 impl_system_param_function!(A, B, C, D, E, F1);
+impl_system_param_function!(A, B, C, D, E, F1, G);
 
 // =============================================================================
 // IntoSystem
