@@ -1,16 +1,16 @@
-"""One driver for the native-editor end-to-end suites.
+"""One driver for the editor end-to-end suites.
 
 RESPONSIBILITIES
   - EditorSession: one editor run for a suite - the machine-global host lock,
     the stray-editor cleanup under it, a per-run folder (log, command file,
     LOCALAPPDATA sandbox), the launch environment and the byte-anchored log
-    waits the nine editor suites are built on.
-  - The shared editor log tokens (*_TOKEN) the suites wait on, as plain
+    waits the editor suite is built on.
+  - The shared editor log tokens (*_TOKEN) the suite waits on, as plain
     substrings, so `test_log_contract.py` checks each against the Rust
     sources that print it.
 
 DESIGN
-  The suites anchor waits on byte offsets into a growing log file: an
+  The suite anchors waits on byte offsets into a growing log file: an
   assertion captures `start = len(read_log())` before it sends a command and
   re-scans only what arrives after. `OutputMonitor` in `suite_common` is a
   pipe-based line monitor with token searches; it cannot serve an offset
@@ -29,7 +29,7 @@ USAGE
   try:
       session.wait(EDITOR_WINDOW_CREATED_TOKEN, 300, "editor started")
       session.send("command editor.pause_toggle")
-      session.wait(EDITOR_COMMAND_EXECUTED_TOKEN, 60, "pause executed")
+      session.wait(EDITOR_SCRIPTED_REJECTED_TOKEN, 60, "no rejection")
   finally:
       session.close()
 """
@@ -60,23 +60,11 @@ EDITOR_VALIDATION_ROOT = REPOSITORY_ROOT / "local" / "editor-validation"
 # printable by a Rust string, which `test_log_contract.py` checks. Suite
 # specific patterns (entity handles, labels, counts) stay in the suites.
 
-EDITOR_SPLINE_CRATE_TOKEN = "[editor] pill_spline_editor loaded"
-EDITOR_SHELL_LOADED_TOKEN = "[editor] pill_editor_shell_editor loaded"
 EDITOR_WINDOW_CREATED_TOKEN = "[editor] window created"
-EDITOR_FRAME_REPORT_TOKEN = "[editor] scene frame report"
-EDITOR_COMMAND_REGISTRY_TOKEN = "[editor] command registry ready"
-EDITOR_PANEL_REGISTRY_TOKEN = "[editor] panel registry ready"
-EDITOR_PANEL_PLACEMENT_TOKEN = "[editor] panel placement"
-EDITOR_TAB_SELECTED_TOKEN = "[editor] tab selected"
-EDITOR_COMMAND_EXECUTED_TOKEN = "[editor] command executed"
 EDITOR_ENGINE_COMMANDS_TOKEN = "[editor] engine commands applied"
 EDITOR_HISTORY_PUSH_TOKEN = "[editor] history push"
 EDITOR_HISTORY_UNDO_TOKEN = "[editor] history undo"
 EDITOR_HISTORY_REDO_TOKEN = "[editor] history redo"
-EDITOR_TEST_QUIT_TOKEN = "[editor] test channel: quit requested"
-EDITOR_QUIT_TOKEN = "[editor] quitting on request"
-EDITOR_DRAG_OUT_BEGAN_TOKEN = "[editor] drag out began"
-EDITOR_DRAG_OUT_ENDED_TOKEN = "[editor] drag out ended"
 # The egui editor's one refusal line for a scripted line it cannot run: an
 # unknown verb, an unknown target, or a missing or malformed argument. A suite
 # typo raises `ScriptedCommandRejected` from the next wait instead of running
@@ -86,7 +74,6 @@ REJECTION_PATTERN = re.compile(
     re.escape(EDITOR_SCRIPTED_REJECTED_TOKEN)
     + r'\s+command="((?:[^"\\]|\\.)*)"\s+reason="((?:[^"\\]|\\.)*)"'
 )
-
 
 class ScriptedCommandRejected(RuntimeError):
     """A scripted line the editor refused, raised before any timeout can hide it."""
@@ -107,7 +94,6 @@ class ScriptedCommandRejected(RuntimeError):
 # per session. Cached so every session of one process agrees on the path.
 _RUN_DIRECTORIES: Dict[str, Path] = {}
 
-
 def run_directory(suite: str) -> Path:
     """The run folder of `suite` for this process; computed once, then cached."""
     if suite not in _RUN_DIRECTORIES:
@@ -116,11 +102,9 @@ def run_directory(suite: str) -> Path:
         )
     return _RUN_DIRECTORIES[suite]
 
-
 # =============================================================================
 # EditorSession
 # =============================================================================
-
 
 class EditorSession:
     """One editor run for a suite, with the paths and waits suites share.
