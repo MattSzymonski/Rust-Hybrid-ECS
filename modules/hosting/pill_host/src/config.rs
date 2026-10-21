@@ -121,11 +121,11 @@ const GENERATED_DIRECTORY: &str = "generated";
 /// loads (after the folder's runtime crates) and no other build ever sees.
 pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 
-/// The editor frontend the `pill_ui` editor and the standalone's editor
+/// The editor frontend the `pill_editor_egui` host and the standalone's editor
 /// posture report as. An editor crate tagged with another name (see
 /// `declared_editor_frontend`) loads only under that other frontend
 /// (W-0017 Stage 6).
-pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "pill_ui";
+pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "egui";
 
 /// Workspace-relative directory holding the generated project member.
 ///
@@ -2486,22 +2486,22 @@ serde = { version = "1", features = ["derive"] }
         seed_extension_crate(&root, "pill_audio", "pill_audio");
         seed_extension_crate(&root, "pill_test", "pill_test");
         seed_extension_crate(&root, "pill_test", "pill_test_editor");
-        seed_extension_crate(&root, "pill_editor_shell", "pill_editor_shell_editor");
+        seed_extension_crate(&root, "pill_gadget_shell", "pill_gadget_shell_editor");
         seed_extension_crate(&root, "_workspace_anchor", "_workspace_anchor_editor");
 
         let (resolved, editor_only) = HostConfig::resolve_editor_crates(
             &["pill_audio".to_string(), "pill_spline".to_string()],
             &root,
-            "pill_ui",
+            "legacy",
         );
         let names: Vec<&str> = resolved
             .iter()
             .map(|crate_config| crate_config.name.as_str())
             .collect();
-        assert_eq!(names, ["pill_spline_editor", "pill_editor_shell_editor"]);
+        assert_eq!(names, ["pill_spline_editor", "pill_gadget_shell_editor"]);
         assert_eq!(
             editor_only,
-            ["pill_editor_shell_editor"],
+            ["pill_gadget_shell_editor"],
             "only a folder whose editor crate is its only crate is optional at first load"
         );
         assert!(resolved
@@ -2513,27 +2513,27 @@ serde = { version = "1", features = ["derive"] }
         );
 
         let (none, none_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "pill_ui");
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy");
         assert_eq!(
             none.iter()
                 .map(|crate_config| crate_config.name.as_str())
                 .collect::<Vec<_>>(),
-            ["pill_editor_shell_editor"],
+            ["pill_gadget_shell_editor"],
             "only the editor-only folder loads when no loaded folder has an editor crate"
         );
-        assert_eq!(none_optional, ["pill_editor_shell_editor"]);
+        assert_eq!(none_optional, ["pill_gadget_shell_editor"]);
 
         // A crate tagged for another editor frontend stays out of this
         // frontend's editor crates and loads under its own (W-0017 Stage 6).
         let tagged = root
-            .join("pill_editor_shell")
-            .join("pill_editor_shell_editor")
+            .join("pill_gadget_shell")
+            .join("pill_gadget_shell_editor")
             .join("Cargo.toml");
         let mut manifest = std::fs::read_to_string(&tagged).expect("seeded manifest");
         manifest.push_str("\n[package.metadata.pill]\neditor_frontend = \"egui\"\n");
         std::fs::write(&tagged, manifest).expect("tag the manifest");
         let (untagged_frontend, untagged_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "pill_ui");
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy");
         assert!(untagged_frontend.is_empty());
         assert!(untagged_optional.is_empty());
         let (tagged_frontend, tagged_optional) =
@@ -2543,10 +2543,10 @@ serde = { version = "1", features = ["derive"] }
                 .iter()
                 .map(|crate_config| crate_config.name.as_str())
                 .collect::<Vec<_>>(),
-            ["pill_editor_shell_editor"],
+            ["pill_gadget_shell_editor"],
             "the tagged crate loads under its own frontend"
         );
-        assert_eq!(tagged_optional, ["pill_editor_shell_editor"]);
+        assert_eq!(tagged_optional, ["pill_gadget_shell_editor"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 

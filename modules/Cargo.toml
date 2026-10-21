@@ -36,7 +36,7 @@ members = [
     # source scanner the host patches through, and the renderer contract. All
     # four are crates, so this is the same scoping rule as the globs below.
     "hosting/*",
-    # The frontends - `pill_standalone`, `pill_web`, `pill_editor` and the
+    # The frontends - `pill_standalone`, `pill_web`, `pill_editor_egui` and the
     # `pill_input` glue they share - live one level down, discovered the same
     # way the extensions are: every path the glob matches must be a crate.
     "frontents/*",

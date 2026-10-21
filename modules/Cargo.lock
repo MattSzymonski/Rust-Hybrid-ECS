@@ -2897,53 +2897,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pill_editor"
-version = "0.1.0"
-dependencies = [
- "miette",
- "pill_core",
- "pill_core_macros",
- "pill_editor_api",
- "pill_editor_core",
- "pill_engine_core",
- "pill_host",
- "pill_input",
- "pill_runtime",
- "pill_ui",
- "pill_ui_wgpu",
- "thiserror 2.0.20",
- "tracing",
- "wgpu",
- "windows 0.58.0",
- "winit",
-]
-
-[[package]]
-name = "pill_editor_api"
-version = "0.1.0"
-dependencies = [
- "pill_core",
- "pill_editor_core",
- "pill_engine_core",
- "pill_ui",
-]
-
-[[package]]
-name = "pill_editor_core"
-version = "0.1.0"
-dependencies = [
- "miette",
- "pill_assets",
- "pill_core",
- "pill_core_macros",
- "pill_engine",
- "pill_master_renderer_data",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "pill_editor_core_egui"
 version = "0.1.0"
 dependencies = [
@@ -2979,18 +2932,6 @@ dependencies = [
  "wgpu",
  "windows 0.58.0",
  "winit",
-]
-
-[[package]]
-name = "pill_editor_shell_editor"
-version = "0.1.0"
-dependencies = [
- "pill_core",
- "pill_editor_api",
- "pill_editor_core",
- "pill_engine",
- "pill_ui",
- "serde_json",
 ]
 
 [[package]]
@@ -3068,7 +3009,6 @@ dependencies = [
  "pill_assets",
  "pill_core",
  "pill_csharp_bridge",
- "pill_editor_core",
  "pill_editor_core_egui",
  "pill_engine",
  "pill_hot_scan",
@@ -3191,19 +3131,6 @@ dependencies = [
  "pill_dummy_color",
  "pill_engine",
  "pill_hot_scan",
- "serde",
-]
-
-[[package]]
-name = "pill_spline_editor"
-version = "0.1.0"
-dependencies = [
- "pill_core",
- "pill_editor_api",
- "pill_editor_core",
- "pill_engine",
- "pill_spline",
- "pill_ui",
  "serde",
 ]
 
