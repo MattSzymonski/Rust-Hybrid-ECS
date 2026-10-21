@@ -25,10 +25,11 @@ pill_core = { path = "../pill_core" }
 # the facade is an `rlib` compiled into every artifact, while this crate is
 # a shared `dylib` (the reason is written out in `pill_ui`'s manifest).
 pill_engine_core = { path = "../pill_engine_core" }
-# egui (plan decisions E1, E3): the newest egui whose stock wgpu renderer
-# (`egui-wgpu` 0.32.3) works with the engine's pinned wgpu 25. `default_fonts`
-# is the one feature this library needs; every consumer names egui through
-# this crate's re-exports.
+# egui (plan decisions E1, E3), on the stack W-0026 moved to: egui 0.36.2,
+# whose `egui-wgpu` 0.36.2 renders through the engine's pinned wgpu 30, with
+# `egui_dock` 0.21.1 as the newest docking release that names this egui.
+# `default_fonts` is the one feature this library needs; every consumer names
+# egui through this crate's re-exports.
 egui = { version = "0.36.2", default-features = false, features = [
     "default_fonts",
 ] }
