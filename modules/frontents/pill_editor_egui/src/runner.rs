@@ -3032,7 +3032,7 @@ impl EditorWindow {
                     target: telemetry_target::ENGINE,
                     "[editor] test deadline reached; quitting"
                 );
-                self.quit = true;
+                self.request_quit();
             }
         }
         Ok(self.quit)
@@ -3687,7 +3687,7 @@ impl EditorWindow {
         match command {
             ScriptedCommand::Quit => {
                 info!(target: telemetry_target::ENGINE, "[editor] quit requested");
-                self.quit = true;
+                self.request_quit();
             }
             ScriptedCommand::Undock(tab) => self.undock_tab(tab),
             ScriptedCommand::ActivateTab(tab) => self.activate_tab(tab),
@@ -4181,8 +4181,27 @@ impl EditorWindow {
                 target: telemetry_target::ENGINE,
                 "[editor] quit requested"
             );
-            self.quit = true;
+            self.request_quit();
         }
+    }
+
+    /// Leave the editor: write the dock layout, then set the quit flag.
+    ///
+    /// Every way out - the menu, the scripted channel, the test deadline -
+    /// comes through here, so the layout a restart loads is always the one
+    /// the last session ended with.
+    fn request_quit(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(state) = world.get_resource::<EguiShellState>() {
+            let surfaces = state.dock.state().surfaces_count();
+            pill_editor_core_egui::layout::save(&state.dock);
+            info!(
+                target: telemetry_target::ENGINE,
+                surfaces,
+                "[editor] layout saved"
+            );
+        }
+        self.quit = true;
     }
 
     /// Log the dock's surfaces and tabs, for the suite's assertions.
@@ -4201,6 +4220,39 @@ impl EditorWindow {
             surfaces,
             "[editor] egui dock dump"
         );
+        // One line per leaf, so a suite can tell a restored layout from the
+        // default: which tabs a group holds and which of them is in front.
+        let leaves: Vec<(usize, usize, String, String)> = state
+            .dock
+            .state()
+            .iter_all_nodes()
+            .filter_map(|(path, node)| match node {
+                pill_ui_egui::egui_dock::Node::Leaf(leaf) => {
+                    let tabs = leaf
+                        .tabs
+                        .iter()
+                        .map(|tab| tab.name())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let active = leaf
+                        .tabs
+                        .get(leaf.active.0)
+                        .map_or_else(String::new, |tab| tab.name().to_string());
+                    Some((path.surface.0, path.node.0, active, tabs))
+                }
+                _ => None,
+            })
+            .collect();
+        for (surface, node, active, tabs) in leaves {
+            info!(
+                target: telemetry_target::ENGINE,
+                surface,
+                node,
+                active = %active,
+                tabs = %tabs,
+                "[editor] egui dock leaf"
+            );
+        }
     }
 }
 

@@ -195,13 +195,16 @@ pub struct InspectorSession {
 impl Resource for EguiShellState {}
 
 impl EguiShellState {
-    /// Session state with the editor's theme and the default dock.
+    /// Session state with the editor's theme and the saved dock.
+    ///
+    /// A document this build cannot use falls back to the default layout and
+    /// logs why (`[editor] layout reset`); a missing one is the first run.
     pub fn new() -> Self {
         let context = Context::default();
         pill_ui_egui::style::apply(&context);
         Self {
             context,
-            dock: EditorDock::new(),
+            dock: crate::layout::load_or_default(),
             frame_index: 0,
             asset_dialog: None,
             preferences_draft: None,

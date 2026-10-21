@@ -35,7 +35,13 @@ use crate::error::LayoutPersistenceError;
 ///
 /// v6 adds the Game tab (`EditorTab::Game`), tabbed with the scene
 /// viewports, so previous documents are rejected and replaced too.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 6;
+///
+/// v7 moves the dock itself: `egui_dock` 0.21 replaced the node model that
+/// 0.17 wrote (positional nodes became a node arena, leaves carry a viewport
+/// rect and a scroll offset, and the document carries the window
+/// translations), so a v6 document has no meaning here and is replaced by
+/// the default layout with one log line.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 7;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
@@ -56,33 +62,50 @@ pub enum LayoutError {
 
 /// Load the saved dock, falling back to the default on any invalid document.
 pub fn load_or_default() -> EditorDock {
-    let path = layout_directory().join(LAYOUT_FILE);
+    load_from_path(&layout_directory().join(LAYOUT_FILE))
+}
+
+/// Load the dock document at `path`, falling back to the default on any
+/// invalid document.
+///
+/// The fallback is the same for every reason - a missing file, a document
+/// from an older or newer schema, a document that does not parse - so the
+/// editor always opens. Each reason is logged once, at info, as
+/// `[editor] layout reset`: a suite tells a reset from a restored layout
+/// without reading the reason, and a person reads the reason.
+fn load_from_path(path: &Path) -> EditorDock {
     // A missing file is the normal first-run state and stays silent.
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return EditorDock::new();
     };
     match serde_json::from_str::<EditorDock>(&contents) {
         Ok(dock) if dock.is_current() => dock,
         Ok(dock) => {
-            warn_about(
-                &path,
-                &LayoutPersistenceError::Validation {
-                    source: LayoutError::UnsupportedVersion(dock.schema_version()),
-                },
+            reset_layout(
+                path,
+                &format!(
+                    "schema {} where this build writes {}",
+                    dock.schema_version(),
+                    LAYOUT_SCHEMA_VERSION
+                ),
             );
             EditorDock::new()
         }
         Err(source) => {
-            warn_about(
-                &path,
-                &LayoutPersistenceError::Invalid {
-                    path: path.display().to_string(),
-                    source,
-                },
-            );
+            reset_layout(path, &format!("unreadable document: {source}"));
             EditorDock::new()
         }
     }
+}
+
+/// Log one replaced dock document.
+fn reset_layout(path: &Path, reason: &str) {
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        path = %path.display(),
+        reason,
+        "[editor] layout reset"
+    );
 }
 
 /// Persist `dock`; a failure leaves the previous document untouched.
@@ -95,16 +118,6 @@ pub fn save(dock: &EditorDock) {
             error.to_plain_message()
         );
     }
-}
-
-/// Log one rejected dock document and continue with the default.
-fn warn_about(path: &Path, error: &LayoutPersistenceError) {
-    pill_core::warn!(
-        target: pill_core::telemetry::telemetry_target::ENGINE,
-        "Ignoring saved dock layout '{}': {}",
-        path.display(),
-        error.to_plain_message()
-    );
 }
 
 /// Serialize and install `dock` at `path`.
@@ -195,4 +208,83 @@ fn editor_state_directory() -> PathBuf {
 #[cfg(target_arch = "wasm32")]
 fn editor_state_directory() -> PathBuf {
     PathBuf::from("editor-state")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::EditorTab;
+
+    /// The default layout as `egui_dock` 0.17 wrote it: a real v6 document
+    /// from the dock this upgrade replaced, not a hand-written sketch.
+    const V6_LAYOUT: &str = include_str!("fixtures/layout_v6.json");
+
+    /// A directory of this test's own under the temp directory.
+    fn scratch_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("pill_layout_test_{name}"));
+        std::fs::create_dir_all(&directory).expect("the temp directory is writable");
+        directory
+    }
+
+    #[test]
+    fn a_stored_v6_document_is_replaced_by_the_default_layout() {
+        // 0.21's node model is not 0.17's. Whether the document cannot be read
+        // at all or parses and then fails the schema check, it must never be
+        // mistaken for this build's own file.
+        if let Ok(dock) = serde_json::from_str::<EditorDock>(V6_LAYOUT) {
+            assert_eq!(dock.schema_version(), 6);
+            assert!(!dock.is_current());
+        }
+        let directory = scratch_directory("v6");
+        let path = directory.join(LAYOUT_FILE);
+        std::fs::write(&path, V6_LAYOUT).expect("the fixture writes");
+
+        let dock = load_from_path(&path);
+
+        assert!(dock.is_current());
+        for tab in EditorTab::ALL {
+            assert!(dock.contains(tab), "{tab:?} is missing from the default");
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_layout_written_by_this_build_loads_back_unchanged() {
+        let directory = scratch_directory("round_trip");
+        let path = directory.join(LAYOUT_FILE);
+        let saved = EditorDock::new();
+        save_to_path(&saved, path.clone()).expect("the layout saves");
+
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.schema_version(), LAYOUT_SCHEMA_VERSION);
+        for tab in EditorTab::ALL {
+            assert_eq!(
+                saved.state().find_tab(&tab),
+                loaded.state().find_tab(&tab),
+                "{tab:?} moved between the file and the load"
+            );
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_document_from_a_newer_schema_is_replaced_too() {
+        let directory = scratch_directory("newer");
+        let path = directory.join(LAYOUT_FILE);
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&EditorDock::new()).expect("serializes"))
+                .expect("the document is JSON");
+        document["schema_version"] = serde_json::Value::from(LAYOUT_SCHEMA_VERSION + 1);
+        std::fs::write(&path, serde_json::to_vec(&document).expect("reserializes"))
+            .expect("the document writes");
+
+        let dock = load_from_path(&path);
+
+        assert!(dock.is_current());
+        for tab in EditorTab::ALL {
+            assert!(dock.contains(tab), "{tab:?} is missing from the default");
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
 }
