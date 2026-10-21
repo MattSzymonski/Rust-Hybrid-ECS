@@ -68,9 +68,28 @@ pub mod bar;
 
 pub use bar::about_window;
 pub use bar::menu_bar;
+
+/// The [`palette`] module: the searchable command popup (W-0038 Stage 3).
+///
+/// Public like every tab module: the build script's function
+/// inventory names each addressable function by its
+/// module path, so the module cannot be private.
+pub mod palette;
+
 pub use bar::menu_body;
 pub use bar::run_menu_action;
 pub use bar::MENU_TITLE_GAP;
+pub use palette::palette_window;
+
+/// The [`tab_console`] module: the Console tab's filters and rows (W-0038
+/// Stage 5).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod tab_console;
+
+pub use tab_console::console_tab;
 
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
@@ -331,6 +350,8 @@ pub fn run_frame(
         menubar,
         inspector,
         toasts,
+        palette,
+        console_filters,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -350,6 +371,7 @@ pub fn run_frame(
         overlay_regions: Vec::new(),
         frames_per_second: shell_input.frames_per_second,
         tab_redock: None,
+        console_filters,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -382,6 +404,14 @@ pub fn run_frame(
             frame_index,
             ui.ctx(),
             &mut viewer.overlay_regions,
+        );
+        // The command palette sits over everything: it is the one surface that
+        // is meant to be read while the pointer is elsewhere.
+        pill_editor_shell_egui_editor::shell::palette_window(
+            ui.ctx(),
+            palette,
+            menubar,
+            &mut viewer,
         );
     });
     let mut shell_frame = frame_from_output(&context, output);
@@ -455,6 +485,9 @@ pub struct EditorTabViewer<'a> {
     /// The surface a tab menu asked to re-dock, drained by `run_frame`
     /// after the dock finishes drawing.
     pub tab_redock: Option<SurfaceIndex>,
+    /// The Console tab's filters (W-0038 Stage 5); the executable applies them
+    /// to the history on its next frame.
+    pub console_filters: &'a mut ConsoleFilterSettings,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -517,6 +550,7 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Preferences => {
                 preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)
             }
+            EditorTab::Console => console_tab(ui, self.snapshot, self.console_filters),
         }
     }
 

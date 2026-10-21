@@ -43,6 +43,7 @@ use pill_editor_core_egui::commands::{
     EditorPreferences, KeybindingsFile, KeymapPreset, PendingEditorCommands, KEYBINDINGS_FILE,
     PREFERENCES_FILE,
 };
+use pill_editor_core_egui::console::{ConsoleChannel, ConsoleLine, ConsoleState};
 use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{
     AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, StandaloneTypeInfo,
@@ -159,13 +160,15 @@ const EDITOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
 /// Run the editor until the last window closes.
 ///
-/// `log_buffer` is the console's capture ring; the egui shell's console
-/// panel reads it once it is ported (follow-up work).
+/// `log_buffer` is the console's capture ring: every frame the editor folds
+/// the lines it has not seen into the Console tab's history (W-0038 Stage 5).
 pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), EditorError> {
-    let _ = log_buffer;
     let event_loop =
         EventLoop::new().map_err(|source| EditorError::EventLoopCreation { source })?;
-    let mut application = EditorApplication { window: None };
+    let mut application = EditorApplication {
+        window: None,
+        log_buffer,
+    };
     event_loop
         .run_app(&mut application)
         .map_err(|source| EditorError::EventLoopRun { source })
@@ -175,6 +178,8 @@ pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), E
 struct EditorApplication {
     /// The window and its host, once the loop resumed.
     window: Option<EditorWindow>,
+    /// The telemetry capture ring the window's Console tab reads.
+    log_buffer: pill_core::telemetry::capture::LogBuffer,
 }
 
 impl ApplicationHandler for EditorApplication {
@@ -183,7 +188,7 @@ impl ApplicationHandler for EditorApplication {
         if self.window.is_some() {
             return;
         }
-        match EditorWindow::open(event_loop) {
+        match EditorWindow::open(event_loop, self.log_buffer.clone()) {
             Ok(window) => {
                 window.window.request_redraw();
                 self.window = Some(window);
@@ -482,6 +487,8 @@ struct EditorWindow {
     /// Whether the keybindings watcher ran once: the first pass applies the
     /// editor's default preset even when there is no file to differ from it.
     keybindings_applied: bool,
+    /// The telemetry capture ring the Console tab reads (W-0038 Stage 5).
+    log_buffer: pill_core::telemetry::capture::LogBuffer,
     /// The parsed preferences document the snapshot's view and the scripted
     /// dump build on.
     preferences_document: serde_json::Map<String, serde_json::Value>,
@@ -540,7 +547,10 @@ struct ScriptedDrag {
 
 impl EditorWindow {
     /// Create the window, the editor's device, the host and the views.
-    fn open(event_loop: &ActiveEventLoop) -> Result<EditorWindow, EditorError> {
+    fn open(
+        event_loop: &ActiveEventLoop,
+        log_buffer: pill_core::telemetry::capture::LogBuffer,
+    ) -> Result<EditorWindow, EditorError> {
         // Step 1: the main window.
         let attributes = Window::default_attributes()
             .with_title("Pill Editor (egui)")
@@ -667,6 +677,12 @@ impl EditorWindow {
         // queue into (the registry, the inbox, the pending batches and the
         // undo history); the shell re-claims the same set on load.
         ensure_command_resources(world);
+        // The Console tab's history and filters: filled each frame from the
+        // telemetry capture ring (W-0038 Stage 5).
+        world.register_resource::<ConsoleState>();
+        if world.get_resource::<ConsoleState>().is_none() {
+            world.insert_resource(ConsoleState::default());
+        }
         // Step 5: the scene views' child windows and their renderer
         // surfaces, each with its own camera (navigation moves the active
         // viewport's). Both start hidden; each shows when the dock shows its
@@ -747,6 +763,7 @@ impl EditorWindow {
             preferences_text: None,
             keybindings_text: None,
             keybindings_applied: false,
+            log_buffer,
             preferences_document: serde_json::Map::new(),
             gizmo_project,
             gizmo_persisted: None,
@@ -3061,6 +3078,7 @@ impl EditorWindow {
         self.persist_gizmo_settings();
         self.watch_preferences();
         self.watch_keybindings();
+        self.publish_console_lines();
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -3419,6 +3437,113 @@ impl EditorWindow {
                 format!("Keybinding conflict: {chord} is bound to {commands}"),
             );
         }
+    }
+
+    /// Fold the capture ring's new lines into the Console's history
+    /// (W-0038 Stage 5).
+    ///
+    /// One owned copy per line, capped by the model: the ring's own strings
+    /// belong to `pill_core`, and the tab must outlive every reload that
+    /// happened while the line was being written.
+    fn publish_console_lines(&mut self) {
+        // The handle is cloned out first: the world borrow below holds `self`
+        // mutably, and the ring is a shared handle rather than the window's.
+        let buffer = self.log_buffer.clone();
+        let world = self.host.host_mut().engine_mut().world_mut();
+        // The tab's filters live in the shell session; applying them here means
+        // this frame's snapshot already shows what the person just chose.
+        let filters = world
+            .get_resource::<EguiShellState>()
+            .map(|state| state.console_filters.clone());
+        if let (Some(filters), Some(state)) = (filters, world.get_resource_mut::<ConsoleState>()) {
+            if state.settings() != filters {
+                state.apply(&filters);
+            }
+        }
+        let Some(state) = world.get_resource_mut::<ConsoleState>() else {
+            return;
+        };
+        let after = state.last_seq;
+        for line in buffer.since(after) {
+            let channel = ConsoleChannel::of_target(&line.target);
+            state.push(ConsoleLine {
+                seq: line.seq,
+                level: line.level,
+                target: line.target,
+                message: line.message,
+                channel,
+            });
+        }
+    }
+
+    /// Run `console filter <level>`: the lowest level the Console tab shows,
+    /// which the next frame applies to the history (W-0038 Stage 5).
+    fn scripted_console_filter(&mut self, level: &str) {
+        let Some(value) = pill_editor_core_egui::console::level_from_name(level) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                level,
+                "[editor] console filter ignored"
+            );
+            return;
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+            state.console_filters.minimum_level = value;
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            level,
+            "[editor] console filter"
+        );
+    }
+
+    /// Run `console search <text>`: the Console tab's substring filter.
+    fn scripted_console_search(&mut self, text: String) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+            state.console_filters.search = text.clone();
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            search = text.as_str(),
+            "[editor] console search"
+        );
+    }
+
+    /// Log the Console tab's filters and the rows they leave, for the suites.
+    fn dump_console(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource::<ConsoleState>() else {
+            return;
+        };
+        let view = state.view();
+        // The per-channel counts are what proves a project's own line reached
+        // the history: the game channel only fills when something outside the
+        // engine logs.
+        let engine = state
+            .lines
+            .iter()
+            .filter(|line| line.channel == ConsoleChannel::Engine)
+            .count();
+        let game = state.lines.len() - engine;
+        let first = view
+            .lines
+            .first()
+            .map(|line| format!("{} {}: {}", line.level_name(), line.target, line.message))
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            level = pill_editor_core_egui::console::level_name(view.minimum_level),
+            channel = view.channel.map_or("both", ConsoleChannel::name),
+            search = view.search.as_str(),
+            total = view.total,
+            visible = view.visible,
+            engine,
+            game,
+            first = first.as_str(),
+            "[test] console"
+        );
     }
 
     /// Run `palette <query>` / `palette run` / `palette close` from the
@@ -3850,6 +3975,8 @@ impl EditorWindow {
             ScriptedCommand::Undock(tab) => self.undock_tab(tab),
             ScriptedCommand::ActivateTab(tab) => self.activate_tab(tab),
             ScriptedCommand::Palette(request) => self.scripted_palette(request),
+            ScriptedCommand::ConsoleFilter(level) => self.scripted_console_filter(&level),
+            ScriptedCommand::ConsoleSearch(text) => self.scripted_console_search(text),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -3876,6 +4003,7 @@ impl EditorWindow {
                 Dump::StandaloneTypes => self.dump_standalone_types(),
                 Dump::Systems => self.dump_systems(),
                 Dump::Preferences => self.dump_preferences(),
+                Dump::Console => self.dump_console(),
                 Dump::Field {
                     entity,
                     component,

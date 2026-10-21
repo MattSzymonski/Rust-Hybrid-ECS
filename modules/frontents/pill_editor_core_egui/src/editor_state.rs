@@ -185,6 +185,8 @@ pub struct EditorSnapshot {
     /// menu bar draws a row per command whose menu path names the menu, and
     /// a spec that is not here has no row.
     pub commands: Vec<crate::commands::CommandView>,
+    /// The Console tab's filters and newest rows (W-0038 Stage 5).
+    pub console: crate::console::ConsoleView,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
 }
@@ -226,6 +228,11 @@ impl EditorSnapshot {
                 .world()
                 .get_resource::<crate::commands::CommandRegistry>()
                 .map(crate::commands::CommandRegistry::views)
+                .unwrap_or_default(),
+            console: engine
+                .world()
+                .get_resource::<crate::console::ConsoleState>()
+                .map(crate::console::ConsoleState::view)
                 .unwrap_or_default(),
             errors,
         }

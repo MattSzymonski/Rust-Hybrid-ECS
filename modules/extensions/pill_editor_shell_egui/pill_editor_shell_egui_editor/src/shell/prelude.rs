@@ -16,6 +16,9 @@
 pub use pill_editor_core_egui::assets::{self, AssetDialog};
 pub use pill_editor_core_egui::browser::{self, ProjectBrowser};
 pub use pill_editor_core_egui::commands::{CommandView, PendingEditorCommands};
+pub use pill_editor_core_egui::console::{
+    self as console, ConsoleChannel, ConsoleFilterSettings, ConsoleLine, ConsoleView,
+};
 pub use pill_editor_core_egui::editor_state::{
     AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
 };
