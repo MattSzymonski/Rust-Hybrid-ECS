@@ -60,6 +60,27 @@ pub struct EguiShellState {
     pub inspector: InspectorSession,
     /// The toasts the host's notices put on screen (W-0038 Stage 4).
     pub toasts: ToastSession,
+    /// The command palette's open state and query (W-0038 Stage 3).
+    pub palette: PaletteState,
+}
+
+/// The command palette's session state (W-0038 Stage 3).
+///
+/// Owned strings, not callbacks: the palette outlives a shell reload, and a
+/// reload must not leave a closure from the old image behind.
+#[derive(Clone, Debug, Default)]
+pub struct PaletteState {
+    /// Whether the palette is on screen.
+    pub open: bool,
+    /// What the query field holds; the filter is a substring match on titles.
+    pub query: String,
+    /// The selected row's index in the filtered list.
+    pub selected: usize,
+    /// A run the scripted channel asked for, drained by the shell's next
+    /// pass so the palette and a click take the same action path.
+    pub run_requested: bool,
+    /// The query the log already reported, so one query logs one line.
+    pub logged_query: Option<String>,
 }
 
 /// The floating viewport toolbox's session state (Stage 22): a drag parks
@@ -214,6 +235,7 @@ impl EguiShellState {
             menubar: MenubarSession::default(),
             inspector: InspectorSession::default(),
             toasts: ToastSession::default(),
+            palette: PaletteState::default(),
         }
     }
 

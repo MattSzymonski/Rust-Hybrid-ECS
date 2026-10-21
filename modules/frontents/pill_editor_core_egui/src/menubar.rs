@@ -188,6 +188,27 @@ pub fn entries(menu: Menu, view: &MenuView<'_>) -> Vec<MenuEntry> {
     entries
 }
 
+/// What running one registered command asks the editor to do.
+///
+/// The palette calls this rather than a menu row's own copy, so a command run
+/// from the palette and the same command run from its menu entry reach one
+/// action.
+pub fn action_for(
+    command: &CommandView,
+    snapshot: &EditorSnapshot,
+    selection: &EditorSelection,
+) -> MenuAction {
+    let view = MenuView {
+        snapshot,
+        selection,
+        commands: std::slice::from_ref(command),
+    };
+    match row(command, &view) {
+        MenuEntry::Action { action, .. } => action,
+        MenuEntry::Separator => MenuAction::Inert,
+    }
+}
+
 /// One row for one registered command: its label, and what a click asks the
 /// editor to do.
 ///

@@ -158,7 +158,7 @@ pub fn menu_body(
                     );
                 }
                 if response.clicked() {
-                    run_menu_action(menu, label.as_str(), action, session, viewer);
+                    run_menu_action(menu.name(), label.as_str(), action, session, viewer);
                     ui.close();
                 }
             }
@@ -177,8 +177,11 @@ pub fn menu_body(
 
 /// Run one menu item through the same calls the tabs, the toolbox and the
 /// scripted channel make.
+///
+/// `menu_name` is the wire name of the menu that asked (`file`, `window`, ...
+/// or `palette`), so one log token covers every surface that runs a command.
 pub fn run_menu_action(
-    menu: menubar::Menu,
+    menu_name: &str,
     label: &str,
     action: menubar::MenuAction,
     session: &mut MenubarSession,
@@ -215,7 +218,7 @@ pub fn run_menu_action(
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
-        menu = menu.name(),
+        menu = menu_name,
         label,
         "[editor] menu action"
     );

@@ -116,6 +116,11 @@ MENU_TITLE_RECT_TOKEN = "[editor] menu item rect"
 MENU_ENTRY_RECT_TOKEN = "[editor] menu entry rect"
 MENU_OPENED_TOKEN = "[editor] menu opened"
 MENU_ACTION_TOKEN = "[editor] menu action"
+PALETTE_OPENED_TOKEN = "[editor] palette opened"
+PALETTE_QUERY_TOKEN = "[editor] palette query"
+PALETTE_RECT_TOKEN = "[editor] palette rect"
+PALETTE_CLOSED_TOKEN = "[editor] palette closed"
+PALETTE_DISMISSED_TOKEN = "[editor] palette dismissed"
 QUIT_REQUESTED_TOKEN = "[editor] quit requested"
 LAYOUT_SAVED_TOKEN = "[editor] layout saved"
 LAYOUT_LEAF_TOKEN = "[editor] egui dock leaf"
@@ -1043,6 +1048,56 @@ def main() -> int:
             begin,
         )
         print("  [OK] a keybindings override rebound a shortcut live")
+
+        # Step 3a3: the command palette (W-0038 Stage 3). The scripted channel
+        # opens it with a query, the shell filters the registry's commands, and
+        # a run takes the menu bar's own action path - the same log token, with
+        # `menu="palette"` naming the surface that asked.
+        begin = len(session.read_log())
+        session.send("palette translate")
+        session.wait(
+            re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="translate"\s+matches=[1-9][0-9]*',
+            30,
+            "the palette filtered the registry's commands",
+            begin,
+        )
+        filtered = re.search(
+            re.escape(PALETTE_QUERY_TOKEN)
+            + r'\s+query="translate"\s+matches=(\d+)\s+first="([^"]+)"',
+            session.read_log()[begin:],
+        )
+        assert filtered, "the palette's filter line carried no match count"
+        assert filtered.group(2) == "Translate", (
+            "the palette's first match was {!r}, not the translate command".format(
+                filtered.group(2)
+            )
+        )
+        session.send("palette run")
+        session.wait(
+            re.escape(MENU_ACTION_TOKEN) + r'\s+menu="palette"\s+label="Translate"',
+            30,
+            "the palette ran its selected command",
+            begin,
+        )
+        session.wait(
+            re.escape(PALETTE_CLOSED_TOKEN), 30, "the palette closed after running", begin
+        )
+        print("  [OK] the palette filtered and ran a command")
+        # A second open, closed without running: the popup must not stay over
+        # the viewport, where every later click would be the UI's.
+        begin = len(session.read_log())
+        session.send("palette scale")
+        session.wait(
+            re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="scale"',
+            30,
+            "the palette reopened on a second query",
+            begin,
+        )
+        session.send("palette close")
+        session.wait(
+            re.escape(PALETTE_DISMISSED_TOKEN), 30, "the palette closed on request", begin
+        )
+        print("  [OK] the palette closed without running")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.
