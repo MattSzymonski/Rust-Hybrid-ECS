@@ -27,19 +27,19 @@ pub const MENU_TITLE_GAP: f32 = 2.0;
 /// Public because a hot patch of [`run_frame`] calls it through the package
 /// path, like every other function a patch can reach.
 pub fn menu_bar(
-    context: &egui::Context,
+    ui: &mut egui::Ui,
     session: &mut MenubarSession,
     mark: &egui::TextureHandle,
     viewer: &mut EditorTabViewer<'_>,
 ) {
-    let style = context.style();
+    let style = ui.ctx().global_style();
     let tint = style.visuals.text_color();
-    egui::TopBottomPanel::top("pill_editor_shell_egui.menu_bar")
-        .exact_height(menubar::MENU_BAR_HEIGHT)
+    egui::Panel::top("pill_editor_shell_egui.menu_bar")
+        .exact_size(menubar::MENU_BAR_HEIGHT)
         .frame(
             egui::Frame::side_top_panel(style.as_ref()).inner_margin(egui::Margin::symmetric(0, 4)),
         )
-        .show(context, |ui| {
+        .show(ui, |ui| {
             let bar = ui.max_rect();
             let mut open_menu: Option<menubar::Menu> = None;
             if session.bar != Some(bar) {

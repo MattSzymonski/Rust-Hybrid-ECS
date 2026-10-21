@@ -167,8 +167,8 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         .into_iter()
         .filter(|clipped| matches!(clipped.primitive, egui::epaint::Primitive::Mesh(_)))
         .collect();
-    let wants_pointer = context.wants_pointer_input();
-    let wants_keyboard = context.wants_keyboard_input();
+    let wants_pointer = context.egui_wants_pointer_input();
+    let wants_keyboard = context.egui_wants_keyboard_input();
     let platform = output.platform_output;
     let mut clipboard_text = None;
     for command in &platform.commands {
@@ -210,12 +210,12 @@ mod tests {
     #[test]
     fn a_frame_reports_meshes_and_drops_callbacks() {
         let context = Context::default();
-        let output = context.run(RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
+        let output = context.run_ui(RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.label("hello");
             });
         });
-        let frame = frame_from_output(&context, output);
+        let mut frame = frame_from_output(&context, output);
         assert!(!frame.meshes.is_empty());
         assert!(frame
             .meshes
@@ -223,6 +223,9 @@ mod tests {
             .all(|clipped| matches!(clipped.primitive, egui::epaint::Primitive::Mesh(_))));
         assert!(frame.pixels_per_point > 0.0);
         assert!(frame.overlay_regions.is_empty());
+        // No GPU here: epaint panics on an unapplied delta, so drop it the
+        // documented way instead of with the frame.
+        frame.textures.clear();
     }
 
     #[test]
@@ -243,10 +246,11 @@ mod tests {
     #[test]
     fn a_frame_exposes_clipboard_commands() {
         let context = Context::default();
-        let output = context.run(RawInput::default(), |context| {
-            context.copy_text("copied".to_owned());
+        let output = context.run_ui(RawInput::default(), |ui| {
+            ui.ctx().copy_text("copied".to_owned());
         });
-        let frame = frame_from_output(&context, output);
+        let mut frame = frame_from_output(&context, output);
         assert_eq!(frame.clipboard_text.as_deref(), Some("copied"));
+        frame.textures.clear();
     }
 }

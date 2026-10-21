@@ -83,7 +83,7 @@ pub fn select_asset(selection: &mut EditorSelection, path: &str) -> bool {
 pub fn apply_tab_redock(dock: &mut DockState<EditorTab>, surface: SurfaceIndex) {
     let tabs: Vec<EditorTab> = dock
         .iter_all_tabs()
-        .filter(|((index, _), _)| *index == surface)
+        .filter(|(path, _)| path.surface == surface)
         .map(|(_, tab)| *tab)
         .collect();
     if tabs.is_empty() {

@@ -548,14 +548,15 @@ impl EditorWindow {
         // draws only through the composition overlay, which is DX12-only,
         // so the editor's instance asks for DX12 alone; the project's
         // renderer keeps its own instance inside the host.
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .map_err(|source| EditorError::AdapterRequest { source })?;
         let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -564,6 +565,7 @@ impl EditorWindow {
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .map_err(|source| EditorError::DeviceRequest { source })?;
         // Step 3: the UI's renderer and the composition overlay, best
@@ -574,7 +576,11 @@ impl EditorWindow {
         // (`DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`). Without the
         // overlay the window shows the game view alone; the failure is
         // logged once and retried rarely.
-        let egui_renderer = egui_wgpu::Renderer::new(&device, EDITOR_FORMAT, None, 1, false);
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            EDITOR_FORMAT,
+            egui_wgpu::RendererOptions::default(),
+        );
         let overlay = match OverlaySurface::new(
             &instance,
             &adapter,
@@ -3583,8 +3589,8 @@ impl EditorWindow {
             ..Default::default()
         };
         let context = self.fallback_context.clone();
-        let output = context.run(raw_input, |context| {
-            egui::CentralPanel::default().show(context, |ui| {
+        let output = context.run_ui(raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.heading("Pill Editor");
                 ui.label(format!(
                     "the shell module ({SHELL_MODULE_NAME}) is not loaded; \

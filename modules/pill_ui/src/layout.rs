@@ -1141,7 +1141,6 @@ mod tests {
             },
         );
         fn walk(node: &PanelNode, index: &mut usize, layout: &PanelLayout, buttons: &mut usize) {
-            let rect = layout.rects[*index];
             if let PanelNode::Button { id, label, .. } = node {
                 let hit = layout
                     .interactive

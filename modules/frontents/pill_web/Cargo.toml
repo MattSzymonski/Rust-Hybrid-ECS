@@ -19,9 +19,9 @@ pill_engine_core = { path = "../../pill_engine_core" }
 # the egui shell writes its frame with, plus egui's own wgpu renderer.
 pill_ui_egui = { path = "../../pill_ui_egui" }
 pill_editor_core_egui = { path = "../../frontents/pill_editor_core_egui" }
-egui-wgpu = "0.32.3"
+egui-wgpu = "0.36.2"
 # The device both UI canvases are drawn through.
-wgpu = "25.0.0"
+wgpu = "30.0.0"
 # The canvas window and the browser's event loop.
 winit = "0.30"
 # The canvas's keyboard and mouse events as engine input events.

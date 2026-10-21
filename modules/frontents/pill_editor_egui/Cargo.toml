@@ -49,11 +49,11 @@ pill_input = { path = "../pill_input", features = ["winit"] }
 # and presents the editor with it (D8, D19). The same wgpu the renderer
 # module uses - a second version in one process would bring a second copy of
 # its global types.
-wgpu = "25.0.0"
+wgpu = "30.0.0"
 # egui's wgpu painter: it draws the shell's frame meshes into the
 # composition overlay's swapchain. Pinned to the egui family's version; it
 # resolves the same `wgpu` 25 the line above pins.
-egui-wgpu = "0.32.3"
+egui-wgpu = "0.36.2"
 # The shared egui stack: the boundary resources both this executable and the
 # reloadable egui shell module speak, and the widget/docking libraries the
 # shell draws with. A shared dylib, like `pill_ui` was, so both sides agree
