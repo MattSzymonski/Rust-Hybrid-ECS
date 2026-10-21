@@ -22,5 +22,11 @@ wgpu = "30.0.0"
 bytemuck = { version = "1.4", features = ["derive"] }
 
 # `png` encodes and decodes the golden images the `golden` example compares.
+# `egui` is W-0028 Stage 1's spike only: the test proves that egui's tessellated
+# output converts into a `pill_draw::DrawList` this crate paints. It is a
+# dev-dependency on purpose - no build of this crate links egui.
 [dev-dependencies]
 png = "0.17"
+egui = { version = "0.36.2", default-features = false, features = [
+    "default_fonts",
+] }
