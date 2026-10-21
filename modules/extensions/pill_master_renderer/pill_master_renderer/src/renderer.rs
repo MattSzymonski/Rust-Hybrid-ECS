@@ -766,11 +766,16 @@ impl State {
             return;
         }
         if self.ui_renderer.is_none() {
+            // The set carries whole images, so its first atlas entry already
+            // names the size the texture must have; before any set arrives the
+            // renderer starts at the atlas' default page.
             let atlas_size = frame
                 .ui
-                .atlas
-                .as_ref()
-                .map(|update| (update.width, update.height))
+                .textures
+                .textures
+                .iter()
+                .find(|texture| texture.id == pill_ui::TextureId::Atlas)
+                .map(|texture| (texture.width, texture.height))
                 .unwrap_or((
                     pill_ui::atlas::DEFAULT_LENGTH,
                     pill_ui::atlas::DEFAULT_LENGTH,
@@ -783,9 +788,7 @@ impl State {
             ));
         }
         let ui_renderer = self.ui_renderer.as_mut().expect("built above");
-        if let Some(update) = &frame.ui.atlas {
-            ui_renderer.apply_atlas_update(&self.device, &self.queue, update);
-        }
+        ui_renderer.apply_texture_set(&self.device, &self.queue, &frame.ui.textures);
         let mut vertices = 0usize;
         let mut draws = 0usize;
         for draw in frame

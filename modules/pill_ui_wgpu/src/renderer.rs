@@ -15,6 +15,12 @@
 //! frame state beyond its GPU resources; everything per-frame comes in
 //! through [`UiRenderer::render`].
 //!
+//! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]): the
+//! renderer remembers the revision it applied per texture and uploads
+//! whenever the carried revision is newer, so an instance rebuilt mid-run -
+//! and therefore remembering nothing - re-uploads every texture the set
+//! carries instead of drawing with empty textures (W-0028 D3).
+//!
 //! Colour correctness: `pill_ui` colours are sRGB with straight alpha. The
 //! shader converts vertex colours to linear, the textures are created as
 //! `Rgba8UnormSrgb` (so sampling decodes them), and the caller is expected to
@@ -29,7 +35,8 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
 use pill_ui::{
-    Atlas, AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiVertex,
+    Atlas, AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture,
+    UiTextureFilter, UiTextureSet, UiVertex,
 };
 use wgpu::util::DeviceExt;
 
@@ -178,12 +185,18 @@ pub struct UiRenderer {
     globals_bind_group: wgpu::BindGroup,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// The sampler [`UiTextureFilter::Nearest`] asks for, beside the linear
+    /// one the crate was built with.
+    nearest_sampler: wgpu::Sampler,
     atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
     atlas_size: (u32, u32),
     atlas_uploaded: bool,
     solid_bind_group: wgpu::BindGroup,
-    externals: HashMap<u64, wgpu::BindGroup>,
+    externals: HashMap<u64, ExternalTexture>,
+    /// The revision this instance applied per texture; a rebuilt instance
+    /// starts empty and therefore re-uploads everything.
+    applied_revisions: HashMap<TextureId, u64>,
 }
 
 impl UiRenderer {
@@ -258,6 +271,16 @@ impl UiRenderer {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("pill_ui nearest sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
@@ -364,12 +387,14 @@ impl UiRenderer {
             globals_bind_group,
             texture_layout,
             sampler,
+            nearest_sampler,
             atlas_texture,
             atlas_bind_group,
             atlas_size,
             atlas_uploaded: false,
             solid_bind_group,
             externals: HashMap::new(),
+            applied_revisions: HashMap::new(),
         }
     }
 
@@ -448,6 +473,158 @@ impl UiRenderer {
         }
     }
 
+    /// Upload every texture in `set` whose carried revision this instance has
+    /// not applied, then free the ones it names.
+    ///
+    /// This is the reload-safe path (W-0028 D3): a rebuilt instance has an
+    /// empty revision table, so the first set it sees uploads every texture
+    /// from the whole images the set carries - no back-channel, no cadence.
+    /// A live instance only uploads what changed.
+    pub fn apply_texture_set(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        set: &UiTextureSet,
+    ) {
+        for texture in &set.textures {
+            if self.applied_revisions.get(&texture.id) == Some(&texture.revision) {
+                continue;
+            }
+            self.apply_texture(device, queue, texture);
+            self.applied_revisions.insert(texture.id, texture.revision);
+        }
+        for id in &set.frees {
+            self.free_texture(id);
+        }
+    }
+
+    /// The revision this instance applied for `id`, or `None` when it has
+    /// never applied it.
+    pub fn applied_revision(&self, id: TextureId) -> Option<u64> {
+        self.applied_revisions.get(&id).copied()
+    }
+
+    /// Upload one texture at its carried revision.
+    ///
+    /// The whole image, when the revision carries one, is the authoritative
+    /// content: it is uploaded whether or not this instance already holds the
+    /// texture, which is what makes a rebuilt instance catch up in one frame.
+    /// Patches are the cheap path for a revision that carries no whole image,
+    /// and only mean anything for a texture the instance already holds - a
+    /// patch for a texture it never applied is reported and skipped rather
+    /// than drawn as garbage.
+    fn apply_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &UiTexture) {
+        let size = (texture.width, texture.height);
+        let sampler = self.sampler_for(texture.filter);
+        match texture.id {
+            TextureId::Atlas => {
+                if size != self.atlas_size {
+                    let (created, bind_group) =
+                        atlas_resources(device, &self.texture_layout, &sampler, size);
+                    self.atlas_texture = created;
+                    self.atlas_bind_group = bind_group;
+                    self.atlas_size = size;
+                    self.atlas_uploaded = false;
+                }
+                match texture.full_image() {
+                    Some(pixels) => {
+                        upload_whole_texture(queue, &self.atlas_texture, size, pixels);
+                        self.atlas_uploaded = true;
+                    }
+                    None if self.atlas_uploaded => {
+                        for (region, pixels) in texture.patches() {
+                            upload_region_pixels(queue, &self.atlas_texture, region, pixels);
+                        }
+                    }
+                    None => report_orphan_patch("atlas"),
+                }
+            }
+            TextureId::External(id) => {
+                let existing_size = self.externals.get(&id).map(|entry| entry.size);
+                let target = match texture.full_image() {
+                    Some(pixels) => {
+                        // Reuse the texture when it is the right size, so a
+                        // live instance does not recreate it every revision.
+                        let reuse = existing_size == Some(size);
+                        let created = if reuse {
+                            self.externals
+                                .remove(&id)
+                                .map(|entry| entry.texture)
+                                .expect("size came from the entry")
+                        } else {
+                            create_srgb_texture(device, "pill_ui external", size)
+                        };
+                        upload_whole_texture(queue, &created, size, pixels);
+                        Some(created)
+                    }
+                    None => match self.externals.get(&id) {
+                        Some(entry) if entry.size == size => {
+                            for (region, pixels) in texture.patches() {
+                                upload_region_pixels(queue, &entry.texture, region, pixels);
+                            }
+                            None
+                        }
+                        _ => {
+                            report_orphan_patch("external");
+                            None
+                        }
+                    },
+                };
+                if let Some(created) = target {
+                    let view = created.create_view(&wgpu::TextureViewDescriptor::default());
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("pill_ui external bind group"),
+                        layout: &self.texture_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&sampler),
+                            },
+                        ],
+                    });
+                    self.externals.insert(
+                        id,
+                        ExternalTexture {
+                            texture: created,
+                            bind_group,
+                            size,
+                        },
+                    );
+                }
+            }
+            TextureId::Solid => {}
+        }
+    }
+
+    /// The sampler a filter mode asks for.
+    fn sampler_for(&self, filter: UiTextureFilter) -> wgpu::Sampler {
+        match filter {
+            UiTextureFilter::Nearest => self.nearest_sampler.clone(),
+            UiTextureFilter::Linear => self.sampler.clone(),
+        }
+    }
+
+    /// Drop a freed texture, so draws naming it are skipped from now on.
+    fn free_texture(&mut self, id: &TextureId) {
+        self.applied_revisions.remove(id);
+        match id {
+            TextureId::Atlas => {
+                // The atlas texture stays allocated (the pipeline's bind group
+                // layout is fixed); dropping the revision makes the next set
+                // that names it upload again.
+                self.atlas_uploaded = false;
+            }
+            TextureId::External(external) => {
+                self.externals.remove(external);
+            }
+            TextureId::Solid => {}
+        }
+    }
+
     /// Register (or replace) the external texture `id` samples.
     ///
     /// `rgba` is `size.0 * size.1 * 4` bytes of sRGB-encoded RGBA8, the same
@@ -466,25 +643,7 @@ impl UiRenderer {
             "an external texture needs exactly width * height * 4 bytes"
         );
         let texture = create_srgb_texture(device, "pill_ui external", size);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size.0 * 4),
-                rows_per_image: Some(size.1),
-            },
-            wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload_whole_texture(queue, &texture, size, rgba);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pill_ui external bind group"),
@@ -500,11 +659,19 @@ impl UiRenderer {
                 },
             ],
         });
-        self.externals.insert(id, bind_group);
+        self.externals.insert(
+            id,
+            ExternalTexture {
+                texture,
+                bind_group,
+                size,
+            },
+        );
     }
 
     /// Forget an external texture; draws naming it are skipped from now on.
     pub fn remove_external(&mut self, id: u64) -> bool {
+        self.applied_revisions.remove(&TextureId::External(id));
         self.externals.remove(&id).is_some()
     }
 
@@ -633,7 +800,7 @@ impl UiRenderer {
         match texture {
             TextureId::Atlas => Some(&self.atlas_bind_group),
             TextureId::Solid => Some(&self.solid_bind_group),
-            TextureId::External(id) => self.externals.get(id),
+            TextureId::External(id) => self.externals.get(id).map(|entry| &entry.bind_group),
         }
     }
 }
@@ -641,6 +808,54 @@ impl UiRenderer {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// One external texture: what it is, how it is bound, and its texel size.
+struct ExternalTexture {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// Report a patch that arrived for a texture the renderer has never applied.
+///
+/// The producer carries the whole image with every changed revision, so this
+/// only fires when a producer patches a texture it never sent; one line says
+/// so instead of drawing with garbage.
+fn report_orphan_patch(kind: &str) {
+    pill_core::warn!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        kind,
+        "a UI texture patch arrived for a texture this renderer never applied"
+    );
+}
+
+/// Upload `pixels` as the whole 2D texture `texture` of `size`.
+fn upload_whole_texture(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    size: (u32, u32),
+    pixels: &[u8],
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(size.0 * 4),
+            rows_per_image: Some(size.1),
+        },
+        wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+    );
+}
 
 /// An `Rgba8UnormSrgb` texture the shader can sample and the queue can
 /// write: sampling decodes sRGB to linear, matching the shader's model.

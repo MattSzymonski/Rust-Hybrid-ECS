@@ -2,7 +2,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Keeps the historical `pill_ui` paths for [`UiFrame`] and [`UiDraw`].
+//! - Keeps the historical `pill_ui` paths for [`UiFrame`], [`UiDraw`] and the
+//!   versioned texture set ([`UiTextureSet`], [`UiTexture`]) the frame
+//!   carries.
 //!
 //! # Design
 //!
@@ -11,3 +13,4 @@
 //! module re-exports them unchanged.
 
 pub use pill_draw::frame::*;
+pub use pill_draw::texture::*;

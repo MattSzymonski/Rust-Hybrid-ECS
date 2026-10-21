@@ -66,6 +66,7 @@ pub use context::UiContext;
 pub use css::{ComputedStyle, NodeFacts, Stylesheet};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 pub use frame::{UiDraw, UiFrame};
+pub use frame::{UiTexture, UiTextureFilter, UiTextureSet, UiTextureUpload};
 pub use gallery::ui_gallery;
 pub use icons::{bundled_svg, IconCache, IconId, EDITOR_ICONS};
 pub use input::UiInput;

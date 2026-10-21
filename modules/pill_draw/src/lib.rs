@@ -6,7 +6,10 @@
 //!   vertices, indices, clips and commands, and the values they carry
 //!   ([`UiVertex`], [`Color`], [`Rect`], [`TextureId`]).
 //! - [`frame`]: a frame of UI output, [`UiFrame`] and [`UiDraw`] - the draw
-//!   lists per surface plus the glyph atlas changes they need.
+//!   lists per surface plus the textures they sample.
+//! - [`texture`]: the versioned texture set ([`UiTextureSet`], [`UiTexture`])
+//!   a backend uploads by revision, so a rebuilt backend re-uploads instead of
+//!   drawing nothing.
 //! - [`atlas`]: the atlas update data ([`AtlasUpdate`], [`Region`]) a
 //!   backend applies to its own texture.
 //!
@@ -25,7 +28,10 @@ pub mod atlas;
 pub mod draw;
 /// A frame of UI output.
 pub mod frame;
+/// The versioned textures a frame carries.
+pub mod texture;
 
 pub use atlas::{AtlasRegionUpdate, AtlasUpdate, Region};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 pub use frame::{UiDraw, UiFrame};
+pub use texture::{UiTexture, UiTextureFilter, UiTextureSet, UiTextureUpload};

@@ -96,6 +96,12 @@ pub struct UiContext {
     /// Whether the last import attempt failed and was reported, so a missing
     /// file logs once instead of every frame.
     stylesheet_import_reported: bool,
+    /// The atlas revision the last frame carried; the texture set uploads by
+    /// revision (W-0028 D3).
+    atlas_revision: u64,
+    /// Whether the atlas was ever carried, so the first frame publishes the
+    /// whole image even when no texel changed yet.
+    atlas_published: bool,
 }
 
 impl Default for UiContext {
@@ -113,6 +119,8 @@ impl Default for UiContext {
             stylesheet_revision: None,
             stylesheet_version: None,
             stylesheet_import_reported: false,
+            atlas_revision: 0,
+            atlas_published: false,
         }
     }
 }
@@ -195,17 +203,37 @@ impl UiContext {
         });
     }
 
-    /// Everything built since the frame began, plus the atlas changes the
-    /// text and icons produced; drains both.
+    /// Everything built since the frame began, plus the textures it samples;
+    /// drains both.
     ///
     /// The renderer's frame builder calls this once per update; without it
     /// the atlas keeps accumulating its dirty list. A nearly full atlas is
     /// grown a page here, between frames, so the size change never lands
     /// under a quad that was already pushed against the old UV scale.
+    ///
+    /// The atlas is carried as the whole image at a new revision whenever a
+    /// texel changed (or on the first take), so a backend that was rebuilt
+    /// mid-run can rebuild its texture from one frame instead of waiting for
+    /// a full image that a patch-only stream would never send (W-0028 D3).
     pub fn take_frame(&mut self) -> UiFrame {
         self.atlas.ensure_headroom();
         let mut frame = std::mem::take(&mut self.frame);
-        frame.atlas = self.atlas.take_update();
+        let changed = self.atlas.take_updated_regions();
+        if !changed.is_empty() || !self.atlas_published {
+            self.atlas_revision += 1;
+            self.atlas_published = true;
+            let width = self.atlas.width();
+            let height = self.atlas.height();
+            let pixels: std::sync::Arc<[u8]> = std::sync::Arc::from(self.atlas.pixels());
+            frame.textures.push_full(
+                pill_draw::TextureId::Atlas,
+                width,
+                height,
+                self.atlas_revision,
+                pill_draw::UiTextureFilter::Nearest,
+                pixels,
+            );
+        }
         frame
     }
 

@@ -188,10 +188,7 @@ impl RendererPass {
                 vertex: wgpu::VertexState {
                     module: &vertex_module,
                     entry_point: Some("vs_main"),
-                    buffers: &vertex_layouts
-                        .into_iter()
-                        .map(Some)
-                        .collect::<Vec<_>>(),
+                    buffers: &vertex_layouts.into_iter().map(Some).collect::<Vec<_>>(),
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

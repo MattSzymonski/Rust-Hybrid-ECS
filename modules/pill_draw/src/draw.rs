@@ -131,7 +131,7 @@ impl Rect {
 // =============================================================================
 
 /// Which texture a draw samples.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TextureId {
     /// The glyph and icon atlas.
     Atlas,
