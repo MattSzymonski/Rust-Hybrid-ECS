@@ -33,6 +33,13 @@ pub struct Region {
     pub height: u32,
 }
 
+impl Region {
+    /// How many texels the region covers.
+    pub fn texels(&self) -> usize {
+        self.width as usize * self.height as usize
+    }
+}
+
 // =============================================================================
 // AtlasUpdate
 // =============================================================================
