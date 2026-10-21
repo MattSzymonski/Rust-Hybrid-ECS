@@ -698,7 +698,7 @@ fn draw_ui(
     let Some(frame) = engine.world_mut().get_resource_mut::<EguiShellFrame>() else {
         return;
     };
-    draw_ui_frame(ui_surface, &frame);
+    draw_ui_frame(ui_surface, frame);
     frame.textures.clear();
 }
 
