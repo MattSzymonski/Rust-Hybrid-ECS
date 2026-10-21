@@ -55,6 +55,8 @@ use crate::layout::EditorTab;
 pub enum ScriptedCommand {
     /// `quit` - leave the editor through its own quit path.
     Quit,
+    /// `palette ...` - what the suite asks of the command palette.
+    Palette(PaletteRequest),
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -204,6 +206,20 @@ pub enum ScriptedCommand {
     SnapToggle,
     /// `command editor.tool_space_toggle` - flip world/local space.
     SpaceToggle,
+}
+
+/// What a `palette` line asks of the command palette (W-0038 Stage 3).
+///
+/// The suite drives the palette's model rather than its pixels: the popup's
+/// own keys (arrows, Enter, Escape) take the same state changes a person's do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaletteRequest {
+    /// Open the palette with this query in the field.
+    Query(String),
+    /// Run the selected row and close.
+    Run,
+    /// Close without running.
+    Close,
 }
 
 /// Which piece of editor state a `dump` logs.
@@ -410,6 +426,25 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::Drag { from, to })
             }
             "gizmo" => gizmo(&mut cursor),
+            // `palette <query>` opens the palette with the query typed in;
+            // `palette run` and `palette close` drive the open palette.
+            "palette" => {
+                let first = cursor.word();
+                let tail = cursor.rest();
+                match (first, tail) {
+                    (Some("run"), "") => Ok(ScriptedCommand::Palette(PaletteRequest::Run)),
+                    (Some("close"), "") => Ok(ScriptedCommand::Palette(PaletteRequest::Close)),
+                    (None, _) => Ok(ScriptedCommand::Palette(PaletteRequest::Query(
+                        String::new(),
+                    ))),
+                    (Some(first), "") => Ok(ScriptedCommand::Palette(PaletteRequest::Query(
+                        first.to_string(),
+                    ))),
+                    (Some(first), tail) => Ok(ScriptedCommand::Palette(PaletteRequest::Query(
+                        format!("{first} {tail}"),
+                    ))),
+                }
+            }
             "key" => {
                 let chord = chord(&mut cursor)?;
                 cursor.finish(verb)?;
@@ -1030,6 +1065,11 @@ impl<'a> Cursor<'a> {
         Ok(unquote(rest))
     }
 
+    /// What is left of the line, trimmed, without consuming it.
+    fn rest(&self) -> &'a str {
+        self.rest.trim()
+    }
+
     /// Refuses whatever is left after a verb took its arguments.
     fn finish(&self, verb: &str) -> Result<(), ParseError> {
         let rest = self.rest.trim();
@@ -1162,6 +1202,28 @@ mod tests {
             Accept {
                 line: "tab inspector",
                 command: ScriptedCommand::ActivateTab(EditorTab::Inspector),
+            },
+            Accept {
+                line: "palette translate",
+                command: ScriptedCommand::Palette(PaletteRequest::Query("translate".to_string())),
+            },
+            Accept {
+                line: "palette pause resume",
+                command: ScriptedCommand::Palette(PaletteRequest::Query(
+                    "pause resume".to_string(),
+                )),
+            },
+            Accept {
+                line: "palette",
+                command: ScriptedCommand::Palette(PaletteRequest::Query(String::new())),
+            },
+            Accept {
+                line: "palette run",
+                command: ScriptedCommand::Palette(PaletteRequest::Run),
+            },
+            Accept {
+                line: "palette close",
+                command: ScriptedCommand::Palette(PaletteRequest::Close),
             },
             Accept {
                 line: "click 640 312",

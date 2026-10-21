@@ -59,7 +59,9 @@ use pill_editor_core_egui::layout::{
 use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
 use pill_editor_core_egui::preferences::{self, PreferencesView};
 use pill_editor_core_egui::problems::{self as problem_parser, Severity};
-use pill_editor_core_egui::scripted::{AssetEdit, Dump, KeyChord, ScriptedCommand, ToolbarAction};
+use pill_editor_core_egui::scripted::{
+    AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
+};
 use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
@@ -3411,6 +3413,41 @@ impl EditorWindow {
         }
     }
 
+    /// Run `palette <query>` / `palette run` / `palette close` from the
+    /// scripted channel (W-0038 Stage 3).
+    ///
+    /// This touches the palette's model state only; the shell's pass draws the
+    /// popup and runs the selected row, so a scripted run and a click take the
+    /// same action path.
+    fn scripted_palette(&mut self, request: PaletteRequest) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+            return;
+        };
+        match request {
+            PaletteRequest::Query(query) => {
+                state.palette.open = true;
+                state.palette.query = query;
+                state.palette.selected = 0;
+                state.palette.logged_query = None;
+                info!(
+                    target: telemetry_target::ENGINE,
+                    query = state.palette.query.as_str(),
+                    "[editor] palette opened"
+                );
+            }
+            PaletteRequest::Run => state.palette.run_requested = true,
+            PaletteRequest::Close => {
+                state.palette.open = false;
+                state.palette.run_requested = false;
+                info!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] palette dismissed"
+                );
+            }
+        }
+    }
+
     /// Run `editor.undo` from the scripted channel: the shared core walk pops
     /// the newest step and queues its inverse - applied, never recorded, the
     /// same walk the browser editor and the native editor take.
@@ -3804,6 +3841,7 @@ impl EditorWindow {
             }
             ScriptedCommand::Undock(tab) => self.undock_tab(tab),
             ScriptedCommand::ActivateTab(tab) => self.activate_tab(tab),
+            ScriptedCommand::Palette(request) => self.scripted_palette(request),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),

@@ -15,7 +15,7 @@
 // External crates
 pub use pill_editor_core_egui::assets::{self, AssetDialog};
 pub use pill_editor_core_egui::browser::{self, ProjectBrowser};
-pub use pill_editor_core_egui::commands::PendingEditorCommands;
+pub use pill_editor_core_egui::commands::{CommandView, PendingEditorCommands};
 pub use pill_editor_core_egui::editor_state::{
     AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
 };
@@ -27,8 +27,8 @@ pub use pill_editor_core_egui::menubar;
 pub use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
 pub use pill_editor_core_egui::preferences;
 pub use pill_editor_core_egui::session::{
-    EguiShellState, InspectorSession, MenubarSession, Toast, ToastSession, ToolboxSession,
-    TOASTS_MAX, TOAST_FRAMES,
+    EguiShellState, InspectorSession, MenubarSession, PaletteState, Toast, ToastSession,
+    ToolboxSession, TOASTS_MAX, TOAST_FRAMES,
 };
 pub use pill_editor_core_egui::systems;
 pub use pill_editor_core_egui::toolbox;
