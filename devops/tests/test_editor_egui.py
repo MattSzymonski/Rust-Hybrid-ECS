@@ -114,6 +114,8 @@ MENU_ENTRY_RECT_TOKEN = "[editor] menu entry rect"
 MENU_OPENED_TOKEN = "[editor] menu opened"
 MENU_ACTION_TOKEN = "[editor] menu action"
 QUIT_REQUESTED_TOKEN = "[editor] quit requested"
+LAYOUT_SAVED_TOKEN = "[editor] layout saved"
+LAYOUT_LEAF_TOKEN = "[editor] egui dock leaf"
 INSPECTOR_SECTION_TOKEN = "[editor] inspector section"
 INSPECTOR_SECTION_RECT_TOKEN = "[editor] inspector section rect"
 INSPECTOR_ADD_RECT_TOKEN = "[editor] inspector add rect"
@@ -196,6 +198,12 @@ ROWS_PATTERN = (
     re.escape(EGUI_ROWS_TOKEN) + r"\s+frames=(\d+)\s+entities=(\d+)\s+systems=(\d+)"
 )
 DOCK_DUMP_PATTERN = re.escape(EGUI_DOCK_DUMP_TOKEN) + r"\s+surfaces=(\d+)"
+# One leaf of the dock dump: the surface and node that hold it, the tab in
+# front and every tab it holds, in draw order.
+DOCK_LEAF_PATTERN = (
+    re.escape(LAYOUT_LEAF_TOKEN)
+    + r"\s+surface=(\d+)\s+node=(\d+)\s+active=([a-z0-9]*)\s+tabs=([a-z0-9,]*)"
+)
 # The scene view rect's runtime values, in the field order the frontend logs
 # them: view, x, y, width, height, visible.
 SCENE_RECT_PATTERN = (
@@ -2894,10 +2902,19 @@ def main() -> int:
         begin = len(session.read_log())
         menu_click(session, "file", "Quit Editor", "Quit Editor")
         session.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the quit reached the frontend", begin)
+        # The quit is where the rearranged dock is written: the undocked tab
+        # and the second viewport each float on a surface of their own
+        # (Stage 4).
+        session.wait(
+            re.escape(LAYOUT_SAVED_TOKEN) + r"\s+surfaces=3\b",
+            30,
+            "the layout saved on quit",
+            begin,
+        )
         status = session.wait_exit(timeout=60)
         assert status == 0, f"editor exited {status} on the menu's quit"
         assert "panic" not in session.read_log(), "a panic was logged"
-        print("  [OK] clean exit, code 0")
+        print("  [OK] clean exit, code 0, the rearranged layout saved")
     finally:
         session.close()
         # The step's files (created, renamed, moved, restored, and their
@@ -2915,6 +2932,61 @@ def main() -> int:
         # come back through undo.
         for meta_path, original in original_metas.items():
             meta_path.write_bytes(original)
+
+    # Step 11: the layout survives a restart (W-0026 Stage 4). The session
+    # above quit through File -> Quit, which wrote the rearranged dock - the
+    # second viewport floating on its own surface, in front - into the
+    # sandbox; a second session on the same sandbox must open with it.
+    restart = EditorSession(
+        "egui",
+        "restart",
+        project=arguments.project,
+        test_seconds=240,
+        binary=binary,
+        sandbox=session.sandbox,
+    )
+    restart.start()
+    try:
+        wait_for_token(
+            restart, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "restart startup"
+        )
+        wait_for_token(
+            restart, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "restart shell load"
+        )
+        restored = restart.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 60, "the restored dock"
+        )
+        assert re.search(r"surfaces=3\b", restored), (
+            "the rearranged dock did not survive the restart: {}".format(restored)
+        )
+        leaves = restart.read_log()
+        floating = [
+            match.group(0)
+            for match in re.finditer(DOCK_LEAF_PATTERN, leaves)
+            if (match.group(1), match.group(3)) in (("1", "entities"), ("2", "scene2"))
+        ]
+        assert len(floating) == 2, (
+            "the floating surfaces did not come back with their tabs: {}".format(
+                leaves[-2000:]
+            )
+        )
+        print("  [OK] the rearranged dock came back after a restart")
+
+        # Leave through the scripted channel's own quit: the first click of a
+        # freshly started session goes to focusing its window, and the menu's
+        # quit path is the main session's check, not this one.
+        begin = len(restart.read_log())
+        restart.send("quit")
+        restart.wait(
+            re.escape(QUIT_REQUESTED_TOKEN), 30, "the restart's quit", begin
+        )
+        restart.wait(
+            re.escape(LAYOUT_SAVED_TOKEN), 30, "the restart's layout save", begin
+        )
+        assert restart.wait_exit(timeout=60) == 0, "the restarted editor did not exit 0"
+        print("  [OK] the restarted editor saved its layout and exited 0")
+    finally:
+        restart.close()
     return 0
 
 
