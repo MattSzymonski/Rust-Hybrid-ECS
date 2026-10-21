@@ -79,20 +79,12 @@ MODULES = REPOSITORY / "modules"
 #
 # `pill_game_ui` is deliberately absent: projects that draw their own egui link
 # it, modules and the renderer do not, so comparing it against a posture that
-# never loads it reports drift nothing can act on - the same reason `pill_ui`
-# is listed per editor family below rather than here.
+# never loads it reports drift nothing can act on - the same reason
+# `pill_ui` is compared per editor family below rather than here.
 ENGINE_DYLIBS = (
     "pill_core",
     "pill_engine_core",
     "pill_draw",
-)
-
-# The native (`pill_ui`) editor's shared dylibs: its UI library, its model and
-# its API. Only the postures that load `pill_ui` editor parts resolve them.
-NATIVE_EDITOR_DYLIBS = (
-    "pill_ui",
-    "pill_editor_core",
-    "pill_editor_api",
 )
 
 # The egui editor's shared dylibs: the egui boundary and its model. Only the
@@ -102,14 +94,12 @@ EGUI_EDITOR_DYLIBS = (
     "pill_editor_core_egui",
 )
 
-# The two editor families are separate: the native editor skips every part
-# tagged `editor_frontend = "egui"` and the egui editor every part tagged
-# `pill_ui`, so neither posture links the other's dylibs. Comparing a family
-# against a posture that never loads it reports drift nothing can act on (the
-# dylib's subtree is pulled in by the host's graph-only entries, not linked).
-NATIVE_DYLIBS = ENGINE_DYLIBS + NATIVE_EDITOR_DYLIBS
+# The editor family is the egui one alone (W-0043 retired the `pill_ui`
+# editor). A posture that never loads its parts would report drift nothing can
+# act on - the dylib's subtree is pulled in by the host's graph-only entries,
+# not linked.
 EGUI_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
-ALL_DYLIBS = ENGINE_DYLIBS + NATIVE_EDITOR_DYLIBS + EGUI_EDITOR_DYLIBS
+ALL_DYLIBS = ENGINE_DYLIBS + EGUI_EDITOR_DYLIBS
 
 # The host postures module and project builds run under: the host's own cargo
 # selection, and the engine features `build_runner::host_engine_features`
@@ -138,12 +128,6 @@ FRONTENDS = {
         ALL_DYLIBS,
     ),
     "editor": (
-        ["--package", "pill_editor"],
-        ["pill_engine/hot_patch"],
-        None,
-        NATIVE_DYLIBS,
-    ),
-    "editor egui": (
         ["--package", "pill_editor_egui"],
         ["pill_engine/hot_patch"],
         None,

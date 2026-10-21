@@ -152,33 +152,17 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(verify_check("fmt", "Rust files changed"))
         selected.append(verify_check("coding-standards", "Rust files changed"))
 
-    # pill_ui: the shared UI dylib. Unit tests always; the goldens and the
-    # GPU-side compile check when drawing could move (layout and text
-    # metrics included: the button-sizing regression lived in layout.rs and
-    # changed widgets.png, which the old painting-files-only trigger would
-    # have missed); one broad editor suite because pill_ui is what the
-    # editor draws, and its panels and dialogs are where a layout change
-    # shows first (the Assets toolbar and the create dialog). The editor
-    # gate covers the remaining suites at milestones; the host-side pill_ui
-    # suite checks the single-dylib identity.
-    matched = has("modules/pill_ui/**")
-    if matched:
-        selected.append(cargo_check("test pill_ui", ("test", "-p", "pill_ui", "--offline"), "pill_ui changed"))
-        selected.append(suite_check("test_pill_ui.py", "pill_ui changed"))
-        if has("modules/pill_ui/src/**", "modules/pill_ui/assets/**"):
-            selected.append(golden_check("pill_ui drawing changed"))
-        if has("modules/pill_ui/src/layout.rs", "modules/pill_ui/src/panel.rs", "modules/pill_ui/src/text.rs"):
-            selected.append(suite_check("test_editor_builtin_panels.py",
-                                        "pill_ui layout is editor-visible"))
-        if has("modules/pill_ui/src/css/**", "modules/pill_ui/src/context.rs", "modules/pill_ui/src/frame.rs"):
-            selected.append(verify_check("check-hot-patch", "pill_ui API surface changed"))
-
-    # pill_ui_wgpu: the offscreen backend and the golden harness itself.
-    if has("modules/pill_ui_wgpu/src/**", "modules/pill_ui_wgpu/examples/**",
-           "modules/pill_ui_wgpu/goldens/**", "modules/pill_ui_wgpu/tests/**"):
-        selected.append(cargo_check("test pill_ui_wgpu", ("test", "-p", "pill_ui_wgpu", "--offline"),
-                                    "pill_ui_wgpu changed"))
-        selected.append(golden_check("pill_ui_wgpu changed"))
+    # The egui editor: the shared model crate, the UI library, the reloadable
+    # shell module and the frontend. Its suites are the crates' own unit
+    # tests plus the egui editor suite; the editor build uplift is added
+    # below, since only that build re-freezes the shared dylibs.
+    if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**"):
+        selected.append(cargo_check("test egui editor crates",
+                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_ui_egui",
+                                     "-p", "pill_editor_shell_egui_editor", "--offline"),
+                                    "egui editor crates changed"))
+        selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
     # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the goldens cover
@@ -193,26 +177,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     "pill_game_ui changed"))
         selected.append(golden_check("pill_game_ui changed"))
 
-    # The editor: shell module, frontend and the editor-side crates. The
-    # frontend-facing suites are picked per area; run_all handles the rest.
-    debug_panel = has("modules/extensions/pill_editor_shell/**")
-    if debug_panel:
-        selected.append(suite_check("test_editor_builtin_panels.py", "editor shell changed"))
-        selected.append(suite_check("test_editor_panels.py", "editor shell panel API changed"))
-        selected.append(suite_check("test_editor_recovery.py", "editor shell state recovery changed"))
-        selected.append(suite_check("test_editor_viewports.py", "editor shell windows changed"))
-    if has("modules/frontents/pill_editor/**"):
-        selected.append(suite_check("test_editor_native.py", "editor frontend changed"))
-        selected.append(suite_check("test_editor_recovery.py", "editor frontend exit path changed"))
-        selected.append(suite_check("test_editor_viewports.py", "editor frontend views changed"))
-    if has("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**"):
-        selected.append(cargo_check("test pill_editor_core",
-                                    ("test", "-p", "pill_editor_core", "-p", "pill_editor_api", "--offline"),
-                                    "editor state changed"))
-        selected.append(suite_check("test_editor_commands.py", "editor command layer changed"))
-        selected.append(suite_check("test_editor_undo.py", "editor history changed"))
-        selected.append(suite_check("test_editor_recovery.py", "editor state persistence changed"))
-        selected.append(suite_check("test_editor_viewports.py", "editor view model changed"))
+    # The editor: the shell module, frontend and the editor-side crates.
+    # The frontend-facing suites are picked per area; run_all handles the rest.
     # The egui editor: the shared model crate, the UI library, the reloadable
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
@@ -239,7 +205,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # hot-reload regression net that runs a host against real projects.
     if has("modules/pill_core/**"):
         selected.append(cargo_check("test pill_core", ("test", "-p", "pill_core", "--offline"), "pill_core changed"))
-        selected.append(suite_check("test_pill_ui.py", "pill_core changed"))
+        selected.append(suite_check("test_editor_revision.py", "pill_core changed"))
     if has("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**"):
         selected.append(cargo_check("test pill_engine_core",
                                     ("test", "-p", "pill_engine_core", "-p", "pill_engine", "--offline"),
@@ -261,7 +227,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(suite_check("test_shipping_smoke.py", "runtime changed"))
 
     # Extensions: reload through the host, so the reload suite is the net.
-    if has("modules/extensions/**") and not debug_panel:
+    if has("modules/extensions/**"):
         selected.append(suite_check("test_hot_reload_suite.py", "extension changed"))
 
     # The renderer's data crate and GPU module: boundaries plus the asset
@@ -325,12 +291,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # beside it so "is this path recognized" and "what does it select" cannot
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("pill-ui", ("modules/pill_ui/**",)),
-    ("pill-ui-wgpu", ("modules/pill_ui_wgpu/**",)),
+    ("pill-draw-wgpu", ("modules/pill_ui_wgpu/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
-    ("editor-shell", ("modules/extensions/pill_editor_shell/**",)),
-    ("editor-frontend", ("modules/frontents/pill_editor/**",)),
-    ("editor-core", ("modules/frontents/pill_editor_core/**", "modules/hosting/pill_editor_api/**")),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
                      "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**")),
     ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
@@ -383,7 +345,7 @@ def select_checks(paths: Sequence[str]) -> List[Check]:
     editor_rows = [check for check in ordered if check.label.startswith("suite:test_editor_")]
     if editor_rows:
         ordered = [check for check in ordered if not check.label.startswith("suite:test_editor_")]
-        uplift = cargo_check("editor build", ("build", "-p", "pill_editor", "--offline"),
+        uplift = cargo_check("editor build", ("build", "-p", "pill_editor_egui", "--offline"),
                              "editor suites selected")
         uplift.reasons = ["editor suites need the frontend built on the current dylibs"]
         ordered.append(uplift)

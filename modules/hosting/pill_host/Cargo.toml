@@ -36,11 +36,6 @@ renderer_data_dependency_graph = { package = "pill_master_renderer_data", path =
 # host's resolved graph must include it for their builds to resolve the same
 # features. Nothing in the host's code names it.
 ui_dependency_graph = { package = "pill_ui", path = "../../pill_ui" }
-# Graph-only, like the renderer crates: the editor shell module and editor
-# crates link the shared `pill_editor_core` dylib, so the host's resolved
-# graph must include it for their builds to resolve the same features.
-# Nothing in the host's code names it.
-editor_core_dependency_graph = { package = "pill_editor_core", path = "../../frontents/pill_editor_core" }
 # Graph-only, like the native editor's crates above: the egui editor's
 # executable, its reloadable shell module and its model crate share the
 # `pill_ui_egui` and `pill_editor_core_egui` dylibs, so the host's resolved

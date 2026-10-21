@@ -47,7 +47,7 @@ from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name
 from core.suite_common import ensure_host_lock, kill_stale_hosts, release_host_lock
 
 # The editor binary every native-editor suite drives.
-EDITOR_BINARY = executable_name("pill_editor")
+EDITOR_BINARY = executable_name("pill_editor_egui")
 
 # Every suite's run artifacts live here, one folder per suite and run.
 EDITOR_VALIDATION_ROOT = REPOSITORY_ROOT / "local" / "editor-validation"
@@ -223,7 +223,7 @@ class EditorSession:
         if not self._binary.is_file():
             raise SystemExit(
                 "editor binary not found at {}; build it with "
-                "`cargo build -p pill_editor` in modules/ first".format(self._binary)
+                "`cargo build -p pill_editor_egui` in modules/ first".format(self._binary)
             )
         # The lock first, then the kills: a concurrent suite's editor is only
         # ever killed by the holder, never by a queued waiter.
