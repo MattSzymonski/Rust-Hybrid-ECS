@@ -127,6 +127,10 @@ pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 /// (W-0017 Stage 6).
 pub(crate) const DEFAULT_EDITOR_FRONTEND: &str = "egui";
 
+/// The editor frontend W-0043 retired. A crate that still tags itself with it
+/// is refused at resolution, because no host would ever load its editor part.
+pub(crate) const RETIRED_EDITOR_FRONTEND: &str = "pill_ui";
+
 /// Workspace-relative directory holding the generated project member.
 ///
 /// Projects live outside the workspace, so the member that builds one as part
@@ -873,7 +877,7 @@ impl HostConfig {
                 }
             }
             let (editor_crates, editor_only) =
-                Self::resolve_editor_crates(&runtime_folders, &extensions_root, editor_frontend);
+                Self::resolve_editor_crates(&runtime_folders, &extensions_root, editor_frontend)?;
             extensions.extend(editor_crates);
             // The editor-only modules may fail their first load without
             // taking the editor down; the embedder surfaces the errors and
@@ -1031,7 +1035,7 @@ impl HostConfig {
         runtime_folders: &[String],
         extensions_root: &Path,
         editor_frontend: &str,
-    ) -> (Vec<ExtensionConfig>, Vec<String>) {
+    ) -> Result<(Vec<ExtensionConfig>, Vec<String>), ConfigError> {
         let editor_crate_of = |folder: &str| format!("{folder}{EDITOR_CRATE_SUFFIX}");
         // The editor frontend a crate's manifest tags itself for, if any:
         // `editor_frontend = "<name>"` in the `[package.metadata.pill]`
@@ -1058,20 +1062,27 @@ impl HostConfig {
             None
         };
         // A crate tagged for another editor frontend stays out; an untagged
-        // one loads under every editor frontend.
-        let loads_editor_crate = |folder: &str| {
+        // one loads under every editor frontend. The retired `pill_ui` tag is
+        // refused rather than skipped: a crate that kept it would silently
+        // never load an editor part again (W-0043).
+        let loads_editor_crate = |folder: &str| -> Result<bool, ConfigError> {
             let directory = extensions_root.join(folder).join(editor_crate_of(folder));
             if !directory.join("Cargo.toml").is_file() {
-                return false;
+                return Ok(false);
             }
             match declared_frontend(&directory) {
-                Some(declared) => declared == editor_frontend,
-                None => true,
+                Some(declared) if declared == RETIRED_EDITOR_FRONTEND => {
+                    Err(ConfigError::RetiredEditorFrontend {
+                        name: editor_crate_of(folder),
+                    })
+                }
+                Some(declared) => Ok(declared == editor_frontend),
+                None => Ok(true),
             }
         };
         let mut folders: Vec<String> = Vec::new();
         for folder in runtime_folders {
-            if !folders.contains(folder) && loads_editor_crate(folder) {
+            if !folders.contains(folder) && loads_editor_crate(folder)? {
                 folders.push(folder.clone());
             }
         }
@@ -1091,7 +1102,7 @@ impl HostConfig {
             if folder.starts_with('_') || folder == "rendering" || folders.contains(&folder) {
                 continue;
             }
-            if !loads_editor_crate(&folder) {
+            if !loads_editor_crate(&folder)? {
                 continue;
             }
             let editor_crate = editor_crate_of(&folder);
@@ -1114,7 +1125,7 @@ impl HostConfig {
             .iter()
             .map(|folder| ExtensionConfig::workspace_member(&editor_crate_of(folder), folder))
             .collect();
-        (crates, editor_only)
+        Ok((crates, editor_only))
     }
 }
 
@@ -2493,7 +2504,8 @@ serde = { version = "1", features = ["derive"] }
             &["pill_audio".to_string(), "pill_spline".to_string()],
             &root,
             "legacy",
-        );
+        )
+        .expect("a seeded tree resolves");
         let names: Vec<&str> = resolved
             .iter()
             .map(|crate_config| crate_config.name.as_str())
@@ -2513,7 +2525,8 @@ serde = { version = "1", features = ["derive"] }
         );
 
         let (none, none_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy");
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy")
+                .expect("a seeded tree resolves");
         assert_eq!(
             none.iter()
                 .map(|crate_config| crate_config.name.as_str())
@@ -2533,11 +2546,13 @@ serde = { version = "1", features = ["derive"] }
         manifest.push_str("\n[package.metadata.pill]\neditor_frontend = \"egui\"\n");
         std::fs::write(&tagged, manifest).expect("tag the manifest");
         let (untagged_frontend, untagged_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy");
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "legacy")
+                .expect("a seeded tree resolves");
         assert!(untagged_frontend.is_empty());
         assert!(untagged_optional.is_empty());
         let (tagged_frontend, tagged_optional) =
-            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "egui");
+            HostConfig::resolve_editor_crates(&["pill_audio".to_string()], &root, "egui")
+                .expect("a seeded tree resolves");
         assert_eq!(
             tagged_frontend
                 .iter()
@@ -2547,6 +2562,35 @@ serde = { version = "1", features = ["derive"] }
             "the tagged crate loads under its own frontend"
         );
         assert_eq!(tagged_optional, ["pill_gadget_shell_editor"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A crate still tagged for the retired `pill_ui` editor is refused: no
+    /// host runs that frontend, so skipping it would silently drop its editor
+    /// part forever (W-0043).
+    #[test]
+    fn refuses_the_retired_editor_frontend_tag() {
+        let root = temp_root().join("retired_frontend");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_extension_crate(&root, "pill_spline", "pill_spline");
+        seed_extension_crate(&root, "pill_spline", "pill_spline_editor");
+        let manifest_path = root
+            .join("pill_spline")
+            .join("pill_spline_editor")
+            .join("Cargo.toml");
+        let mut manifest = std::fs::read_to_string(&manifest_path).expect("seeded manifest");
+        manifest.push_str("\n[package.metadata.pill]\neditor_frontend = \"pill_ui\"\n");
+        std::fs::write(&manifest_path, manifest).expect("tag the manifest");
+
+        let refused = HostConfig::resolve_editor_crates(
+            &["pill_spline".to_string()],
+            &root,
+            DEFAULT_EDITOR_FRONTEND,
+        );
+        assert!(
+            matches!(&refused, Err(ConfigError::RetiredEditorFrontend { name }) if name == "pill_spline_editor"),
+            "{refused:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -556,6 +556,15 @@ pub enum ConfigError {
     )]
     EditorCrateListed { name: String },
 
+    /// An editor crate is tagged for the retired `pill_ui` editor frontend,
+    /// which no host runs any more (W-0043).
+    #[message(
+        "editor crate ",
+        value(name),
+        " is tagged `editor_frontend = \"pill_ui\"`, the retired editor; tag it `egui` or drop the tag"
+    )]
+    RetiredEditorFrontend { name: String },
+
     /// No extension folder holds the configured extension crate.
     #[message(
         "extension ",
