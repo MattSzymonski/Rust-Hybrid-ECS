@@ -1326,15 +1326,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_project_circus_demo"
+name = "host_module_pill_spline"
 version = "0.1.0"
 dependencies = [
- "glam",
+ "pill_engine",
+ "pill_spline",
+]
+
+[[package]]
+name = "host_project_project"
+version = "0.1.0"
+dependencies = [
+ "pill_audio",
  "pill_core",
  "pill_engine",
- "pill_game_ui",
  "pill_master_renderer_data",
+ "pill_spline",
  "serde",
+ "tracing",
 ]
 
 [[package]]
