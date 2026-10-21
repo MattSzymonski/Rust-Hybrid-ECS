@@ -61,6 +61,8 @@ pub enum EditorTab {
     Inspector,
     /// The assets panel's mock: fixed rows until the asset store is ported.
     Assets,
+    /// The engine's and the project's recent log lines (W-0038 Stage 5).
+    Console,
     /// The preferences file's editor-wide rows and the current project's
     /// remembered gizmo choices.
     Preferences,
@@ -68,7 +70,7 @@ pub enum EditorTab {
 
 impl EditorTab {
     /// Every tab, in tab-strip order.
-    pub const ALL: [EditorTab; 8] = [
+    pub const ALL: [EditorTab; 9] = [
         EditorTab::Scene,
         EditorTab::SecondScene,
         EditorTab::Game,
@@ -76,6 +78,7 @@ impl EditorTab {
         EditorTab::Systems,
         EditorTab::Inspector,
         EditorTab::Assets,
+        EditorTab::Console,
         EditorTab::Preferences,
     ];
 
@@ -89,6 +92,7 @@ impl EditorTab {
             EditorTab::Systems => "Systems",
             EditorTab::Inspector => "Inspector",
             EditorTab::Assets => "Assets",
+            EditorTab::Console => "Console",
             EditorTab::Preferences => "Preferences",
         }
     }
@@ -103,6 +107,7 @@ impl EditorTab {
             EditorTab::Systems => "systems",
             EditorTab::Inspector => "inspector",
             EditorTab::Assets => "assets",
+            EditorTab::Console => "console",
             EditorTab::Preferences => "preferences",
         }
     }
@@ -145,7 +150,7 @@ impl EditorDock {
         let [upper, _assets] = tree.split_below(
             NodeIndex::root(),
             1.0 - BOTTOM_ROW_FRACTION,
-            vec![EditorTab::Assets],
+            vec![EditorTab::Assets, EditorTab::Console],
         );
         // The entity column then splits the upper node; the old node keeps
         // the space right of the column. Unlike `split_below`/`split_right`,
@@ -187,6 +192,12 @@ impl EditorDock {
     /// The schema version the document carries.
     pub fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// Stamp the document with `version`: what a migration does before it is
+    /// written back.
+    pub fn set_schema_version(&mut self, version: u32) {
+        self.schema_version = version;
     }
 
     /// Whether `tab` is docked somewhere: the main surface or a window.
@@ -294,7 +305,10 @@ mod tests {
             state[surface][root].is_vertical(),
             "the assets row is not a bottom split"
         );
-        assert_eq!(tabs_at(root.right()), vec![EditorTab::Assets]);
+        assert_eq!(
+            tabs_at(root.right()),
+            vec![EditorTab::Assets, EditorTab::Console]
+        );
         // The node above splits into the entity column and the rest.
         let upper = root.left();
         assert!(

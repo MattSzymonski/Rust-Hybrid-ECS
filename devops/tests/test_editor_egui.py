@@ -121,6 +121,19 @@ PALETTE_QUERY_TOKEN = "[editor] palette query"
 PALETTE_RECT_TOKEN = "[editor] palette rect"
 PALETTE_CLOSED_TOKEN = "[editor] palette closed"
 PALETTE_DISMISSED_TOKEN = "[editor] palette dismissed"
+CONSOLE_DUMP_TOKEN = "[test] console"
+CONSOLE_FILTER_TOKEN = "[editor] console filter"
+CONSOLE_SEARCH_TOKEN = "[editor] console search"
+
+# One console dump: the filters in force, the counts and the first row the
+# filters left (W-0038 Stage 5).
+CONSOLE_DUMP_PATTERN = (
+    re.escape(CONSOLE_DUMP_TOKEN)
+    + r'\s+level="(?P<level>\w+)"\s+channel="(?P<channel>\w+)"'
+    + r'\s+search="(?P<search>(?:[^"\\]|\\.)*)"'
+    + r"\s+total=(?P<total>\d+)\s+visible=(?P<visible>\d+)"
+    + r"\s+engine=(?P<engine>\d+)\s+game=(?P<game>\d+)"
+)
 QUIT_REQUESTED_TOKEN = "[editor] quit requested"
 LAYOUT_SAVED_TOKEN = "[editor] layout saved"
 LAYOUT_LEAF_TOKEN = "[editor] egui dock leaf"
@@ -522,6 +535,12 @@ def wait_for_detail_components(session: EditorSession, target: int, label: str) 
     )
 
 
+def console_dump(session: EditorSession, begin: int):
+    """The newest console dump written since `begin`, or None when none is."""
+    matches = list(re.finditer(CONSOLE_DUMP_PATTERN, session.read_log()[begin:]))
+    return matches[-1] if matches else None
+
+
 def rect_center(rect: tuple) -> tuple:
     """The center of an (x, y, width, height) rectangle."""
     return (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
@@ -576,18 +595,33 @@ def main() -> int:
     if not EditorSession.supported():
         print("SKIP: the egui editor suite needs Windows")
         return 0
-    # A concurrent cargo build rewrites the shared dylibs under the modules
-    # this suite loads, which turns a clean start into a loader failure.
+    # A concurrent cargo build *of this workspace* rewrites the shared dylibs
+    # under the modules this suite loads, which turns a clean start into a
+    # loader failure. Cargo running against another checkout cannot touch this
+    # tree's dylibs, so those processes are ignored: a person may well have a
+    # second project open while this suite runs.
     cargo = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq cargo.exe", "/NH"],
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='cargo.exe'\""
+            " | Select-Object -ExpandProperty CommandLine",
+        ],
         capture_output=True,
         text=True,
     ).stdout
-    if "cargo.exe" in cargo:
+    workspace = str(REPOSITORY_ROOT).lower()
+    running_here = [
+        line
+        for line in cargo.splitlines()
+        if "modules" in line.lower() and workspace in line.lower()
+    ]
+    if running_here:
         raise SystemExit(
-            "a cargo build (cargo.exe) is running; wait for it to finish "
+            "a cargo build of this workspace is running; wait for it to finish "
             "before running the editor suite - it rewrites the shared dylibs "
-            "the modules load against"
+            "the modules load against:\n" + "\n".join(running_here)
         )
     # The default must be the egui binary: EditorSession's own default is the
     # native editor, whose binary is a different build and crashes at startup
@@ -1139,6 +1173,62 @@ def main() -> int:
             re.escape(PALETTE_DISMISSED_TOKEN), 30, "the palette closed on request", begin
         )
         print("  [OK] the palette closed without running")
+
+        # Step 3a4: the Console panel (W-0038 Stage 5). The tab reads the
+        # telemetry capture ring, so the project's own log line is in the game
+        # channel; the filters narrow what it draws.
+        session.send("tab console")
+        begin = len(session.read_log())
+        session.send("dump console")
+        session.wait(re.escape(CONSOLE_DUMP_TOKEN), 30, "the console dump", begin)
+        dump = console_dump(session, begin)
+        assert dump, "the console dump did not parse"
+        assert int(dump.group("game")) >= 1, (
+            "the project's own log line did not reach the game channel: "
+            + dump.group(0)
+        )
+        assert int(dump.group("visible")) >= 1, "the console showed no rows"
+        # A search narrows the rows to the project's lines: the token only
+        # appears in them.
+        begin = len(session.read_log())
+        session.send("console search 12xxsees")
+        session.wait(re.escape(CONSOLE_SEARCH_TOKEN), 30, "the console search applied", begin)
+        # The filter lands on the executable's next frame, so a frame has to
+        # run before the dump can read it.
+        session.wait(re.escape(EGUI_ROWS_TOKEN), 60, "a frame applied the search", begin)
+        begin = len(session.read_log())
+        session.send("dump console")
+        session.wait(re.escape(CONSOLE_DUMP_TOKEN), 30, "the searched console dump", begin)
+        filtered = console_dump(session, begin)
+        assert filtered, "the filtered console dump did not parse"
+        assert filtered.group("search") == "12xxsees", (
+            "the search did not reach the console: " + filtered.group(0)
+        )
+        assert int(filtered.group("visible")) == int(filtered.group("game")), (
+            "the search kept engine rows: " + filtered.group(0)
+        )
+        # A level filter above the project's line leaves nothing.
+        begin = len(session.read_log())
+        session.send("console filter warn")
+        session.wait(re.escape(CONSOLE_FILTER_TOKEN), 30, "the console filter applied", begin)
+        session.wait(re.escape(EGUI_ROWS_TOKEN), 60, "a frame applied the level", begin)
+        begin = len(session.read_log())
+        session.send("dump console")
+        session.wait(re.escape(CONSOLE_DUMP_TOKEN), 30, "the levelled console dump", begin)
+        levelled = console_dump(session, begin)
+        assert levelled, "the level-filtered console dump did not parse"
+        assert levelled.group("level") == "warn", (
+            "the level filter did not reach the console: " + levelled.group(0)
+        )
+        assert int(levelled.group("visible")) == 0, (
+            "a warn filter kept info rows: " + levelled.group(0)
+        )
+        # Back to the unfiltered view, so the rest of the run reads the tab
+        # the way a fresh session would.
+        session.send('console search ""')
+        session.send("console filter info")
+        session.wait(re.escape(CONSOLE_FILTER_TOKEN), 30, "the console filter reset", begin)
+        print("  [OK] the console listed, searched and filtered the log")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.

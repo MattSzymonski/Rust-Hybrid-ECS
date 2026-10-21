@@ -41,7 +41,11 @@ use crate::error::LayoutPersistenceError;
 /// rect and a scroll offset, and the document carries the window
 /// translations), so a v6 document has no meaning here and is replaced by
 /// the default layout with one log line.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 7;
+///
+/// v8 adds the Console tab (W-0038 Stage 5). A v7 document is *migrated*, not
+/// replaced: the tab is appended to the leaf that holds Assets and the
+/// document is stamped v8, so an existing layout survives the upgrade.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 8;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
@@ -80,21 +84,69 @@ fn load_from_path(path: &Path) -> EditorDock {
     };
     match serde_json::from_str::<EditorDock>(&contents) {
         Ok(dock) if dock.is_current() => dock,
-        Ok(dock) => {
-            reset_layout(
-                path,
-                &format!(
-                    "schema {} where this build writes {}",
-                    dock.schema_version(),
-                    LAYOUT_SCHEMA_VERSION
-                ),
-            );
-            EditorDock::new()
-        }
+        Ok(mut dock) => match migrate(&mut dock) {
+            Some(previous) => {
+                // A document this build can upgrade in place: keep the layout
+                // the user arranged and write the stamped version back.
+                save(&dock);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    path = %path.display(),
+                    from = previous,
+                    to = LAYOUT_SCHEMA_VERSION,
+                    "[editor] layout migrated"
+                );
+                dock
+            }
+            None => {
+                reset_layout(
+                    path,
+                    &format!(
+                        "schema {} where this build writes {}",
+                        dock.schema_version(),
+                        LAYOUT_SCHEMA_VERSION
+                    ),
+                );
+                EditorDock::new()
+            }
+        },
         Err(source) => {
             reset_layout(path, &format!("unreadable document: {source}"));
             EditorDock::new()
         }
+    }
+}
+
+/// Upgrade an older document in place, returning the version it came from;
+/// `None` when this build has no rule for that version.
+///
+/// One rule per version bump, each adding what its stage introduced and never
+/// moving what the user arranged. v7 -> v8 appends the Console tab to the leaf
+/// that holds Assets, so the bottom row gains a sibling tab.
+fn migrate(dock: &mut EditorDock) -> Option<u32> {
+    let previous = dock.schema_version();
+    match previous {
+        7 => {
+            let assets_leaf = dock
+                .state_mut()
+                .find_tab(&super::EditorTab::Assets)
+                .map(|path| path.node_path());
+            match assets_leaf {
+                Some(path) => {
+                    if let Ok(leaf) = dock.state_mut().leaf_mut(path) {
+                        leaf.append_tab(super::EditorTab::Console);
+                    }
+                }
+                // A layout without Assets has nowhere to put the tab beside;
+                // the focused leaf is the next best home and keeps the rest.
+                None => dock
+                    .state_mut()
+                    .push_to_focused_leaf(super::EditorTab::Console),
+            }
+            dock.set_schema_version(LAYOUT_SCHEMA_VERSION);
+            Some(previous)
+        }
+        _ => None,
     }
 }
 

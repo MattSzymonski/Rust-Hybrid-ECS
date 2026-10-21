@@ -23,6 +23,9 @@ pub fn tab_icon(tab: EditorTab) -> icons::Icon {
         EditorTab::Systems => icons::Icon::Gear,
         EditorTab::Inspector => icons::Icon::SlidersHorizontal,
         EditorTab::Assets => icons::Icon::FolderOpen,
+        // The vendored set has no terminal mark; the code glyph is the
+        // closest a prompt-in-a-panel gets without adding a glyph.
+        EditorTab::Console => icons::Icon::Code,
         EditorTab::Preferences => icons::Icon::Faders,
     }
 }

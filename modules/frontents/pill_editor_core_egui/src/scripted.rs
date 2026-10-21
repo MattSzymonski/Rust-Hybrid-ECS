@@ -57,6 +57,10 @@ pub enum ScriptedCommand {
     Quit,
     /// `palette ...` - what the suite asks of the command palette.
     Palette(PaletteRequest),
+    /// `console filter <level>` - the lowest level the Console tab shows.
+    ConsoleFilter(String),
+    /// `console search <text>` - the Console tab's substring filter.
+    ConsoleSearch(String),
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -243,6 +247,8 @@ pub enum Dump {
     Systems,
     /// `dump preferences` - the preferences document and the live halves.
     Preferences,
+    /// `dump console` - the Console tab's filters and the rows they leave.
+    Console,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -428,6 +434,24 @@ impl ScriptedCommand {
             "gizmo" => gizmo(&mut cursor),
             // `palette <query>` opens the palette with the query typed in;
             // `palette run` and `palette close` drive the open palette.
+            // `console filter <level>` and `console search <text>` set the
+            // Console tab's filters; the executable applies them next frame.
+            "console" => match cursor.word() {
+                Some("filter") => {
+                    let level = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("console filter needs a level"))?;
+                    cursor.finish("console filter")?;
+                    Ok(ScriptedCommand::ConsoleFilter(level.to_string()))
+                }
+                Some("search") => {
+                    let text = cursor.text("console search needs text")?;
+                    Ok(ScriptedCommand::ConsoleSearch(text))
+                }
+                _ => Err(ParseError::new(
+                    "console needs `filter <level>` or `search <text>`",
+                )),
+            },
             "palette" => {
                 let first = cursor.word();
                 let tail = cursor.rest();
@@ -583,6 +607,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "standalone-types" => Dump::StandaloneTypes,
         "systems" => Dump::Systems,
         "preferences" => Dump::Preferences,
+        "console" => Dump::Console,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1129,18 +1154,11 @@ fn point(cursor: &mut Cursor<'_>, reason: &str) -> Result<(f32, f32), ParseError
 }
 
 /// The tab a scripted name selects.
+///
+/// Every tab answers to the wire name it logs under, so a new tab needs no
+/// entry here.
 fn tab_by_name(name: &str) -> Option<EditorTab> {
-    match name {
-        "scene" => Some(EditorTab::Scene),
-        "scene2" => Some(EditorTab::SecondScene),
-        "game" => Some(EditorTab::Game),
-        "entities" => Some(EditorTab::Entities),
-        "systems" => Some(EditorTab::Systems),
-        "inspector" => Some(EditorTab::Inspector),
-        "assets" => Some(EditorTab::Assets),
-        "preferences" => Some(EditorTab::Preferences),
-        _ => None,
-    }
+    EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
 }
 
 /// The tool a scripted name selects.
@@ -1334,6 +1352,18 @@ mod tests {
             Accept {
                 line: "dump preferences",
                 command: ScriptedCommand::Dump(Dump::Preferences),
+            },
+            Accept {
+                line: "dump console",
+                command: ScriptedCommand::Dump(Dump::Console),
+            },
+            Accept {
+                line: "console filter warn",
+                command: ScriptedCommand::ConsoleFilter("warn".to_string()),
+            },
+            Accept {
+                line: "console search frame heartbeat",
+                command: ScriptedCommand::ConsoleSearch("frame heartbeat".to_string()),
             },
             Accept {
                 line: "dump field 3v0 TransformComponent translation",

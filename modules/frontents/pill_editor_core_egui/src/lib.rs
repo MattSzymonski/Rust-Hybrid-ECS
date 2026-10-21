@@ -36,6 +36,8 @@ pub mod camera;
 pub mod clipboard;
 /// The command registry: named actions, menus and rebindable shortcuts.
 pub mod commands;
+/// The Console tab's history, channels and filters (W-0038 Stage 5).
+pub mod console;
 /// The frame boundary: the pending-command drain and the undo/redo walk.
 pub mod drain;
 /// The editor's snapshots of the engine and the commands it applies to it.
