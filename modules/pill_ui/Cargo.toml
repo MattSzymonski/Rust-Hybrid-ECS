@@ -92,3 +92,11 @@ taffy = "0.14"
 # resolution identical in every build. Neither crate is used directly.
 arrayvec = { version = "0.7", features = ["std"] }
 bitflags = { version = "2", features = ["serde"] }
+# The font stack's three, pinned on 2026-10-21 for the same reason: the
+# windowed host's graph turns them on (through the rendering stack) while a
+# module or project build does not, so `pill_ui.dll` came out with two
+# different symbol hashes and the renderer module failed to load against the
+# host ("built against a different engine dylib"). None is used directly.
+font-types = { version = "0.12", features = ["serde"] }
+read-fonts = { version = "0.41", features = ["experimental_font_api"] }
+skrifa = { version = "0.44", features = ["autohint_shaping"] }

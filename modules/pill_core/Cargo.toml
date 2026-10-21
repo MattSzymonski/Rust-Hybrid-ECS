@@ -98,9 +98,16 @@ serde_core = { version = "1", features = ["alloc"] }
 # `const_new` joined in W-0004 Stage 7: `pill_ui`'s icon tree reaches it
 # through `kurbo`, and the host posture includes `pill_ui` while a module
 # build does not.
+#
+# `serde` joined on 2026-10-21: the windowed host's graph reaches it through
+# the rendering stack, while a module or project build does not, so the two
+# resolved `pill_engine_core` to different symbol hashes and every module
+# failed to load against the host ("built against a different engine dylib").
+# Requesting it here makes every posture resolve the one `smallvec`.
 smallvec = { version = "1", features = [
     "const_generics",
     "const_new",
+    "serde",
     "union",
 ] }
 syn = { version = "3", features = ["full", "visit-mut"] }
