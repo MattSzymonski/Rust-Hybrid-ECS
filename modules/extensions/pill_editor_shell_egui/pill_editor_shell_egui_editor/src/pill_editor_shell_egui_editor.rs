@@ -41,6 +41,7 @@ use pill_editor_core_egui::notices::EditorNotices;
 use pill_editor_core_egui::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
+use pill_ui_egui::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 
 // The build script scans this crate and emits one address entry per function
 // into `function_inventory.rs`; the `include!` is what makes every function
@@ -116,6 +117,22 @@ pub fn register(engine: &mut Engine) -> u32 {
     }
     // Step 5: the per-frame system that runs the dock. Post-update, like the
     // renderer's frame build: it keeps running while the engine is paused.
+    // Step 6: this module's own editor panel (W-0038 Stage 11). The request is
+    // queued rather than registered: the executable binds it to the liveness
+    // marker that dies with this module's image, which is what keeps a stale
+    // draw function from ever being called.
+    world.register_resource::<PanelRegistrations>();
+    if world.get_resource::<PanelRegistrations>().is_none() {
+        world.insert_resource(PanelRegistrations::default());
+    }
+    if let Some(registrations) = world.get_resource_mut::<PanelRegistrations>() {
+        registrations.push(PanelRequest {
+            id: "shell.demo",
+            title: "Demo Panel",
+            source: "pill_editor_shell_egui_editor",
+            draw: shell::demo_panel,
+        });
+    }
     engine.register_post_update_system("egui_shell", egui_shell_update);
     // NOTE: asserted on by the egui editor's end-to-end suite.
     pill_core::info!(
@@ -142,32 +159,43 @@ pub fn egui_shell_update(
         ResMut<EguiShellState>,
         ResMut<EguiShellInput>,
         ResMut<EguiShellFrame>,
-        // The nested triple keeps this system within the engine's six-parameter
+        // The nested tuples keep this system within the engine's six-parameter
         // tuple arity.
         (
             Res<EditorSnapshot>,
             ResMut<EditorSelection>,
             Res<EditorNotices>,
         ),
-        ResMut<PendingEditorCommands>,
+        (
+            ResMut<PendingEditorCommands>,
+            // The panels the loaded modules registered (W-0038 Stage 11) and
+            // the commands they asked for this pass.
+            Res<PanelRegistry>,
+            ResMut<PanelCommands>,
+        ),
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
     // is not an editor's, and there is nothing to do.
-    let (mut state, mut input, mut frame, (snapshot, mut selection, notices), mut pending) =
-        resources;
+    let (
+        mut state,
+        mut input,
+        mut frame,
+        (snapshot, mut selection, notices),
+        (mut pending, panels, mut panel_commands),
+    ) = resources;
     let (
         Some(mut state),
         Some(input),
         Some(mut frame),
         (Some(snapshot), Some(mut selection), Some(notices)),
-        Some(mut pending),
+        (Some(mut pending), Some(panels), Some(mut panel_commands)),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
         (snapshot.get(), selection.get_mut(), notices.get()),
-        pending.get_mut(),
+        (pending.get_mut(), panels.get(), panel_commands.get_mut()),
     )
     else {
         return;
@@ -180,5 +208,7 @@ pub fn egui_shell_update(
         &mut selection,
         &mut pending,
         notices,
+        panels,
+        &mut panel_commands.commands,
     );
 }

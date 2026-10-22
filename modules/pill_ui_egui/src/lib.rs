@@ -67,5 +67,8 @@ pub mod boundary;
 pub mod icons;
 /// The engine-input to egui bridge.
 pub mod input;
+/// The editor panels a module registers (W-0038 Stage 11): ids, draw
+/// functions, liveness markers and the slot a dock tab names.
+pub mod panels;
 /// The editor's egui theme.
 pub mod style;

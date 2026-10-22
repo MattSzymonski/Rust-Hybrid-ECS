@@ -30,8 +30,9 @@ pub use pill_editor_core_egui::menubar;
 pub use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
 pub use pill_editor_core_egui::preferences;
 pub use pill_editor_core_egui::session::{
-    EguiShellState, InspectorSession, MenubarSession, PaletteState, StatisticsSession, Toast,
-    ToastSession, ToolboxSession, TOASTS_MAX, TOAST_FRAMES,
+    EguiShellState, InspectorSession, MenubarSession, PaletteState, PanelBudget, PanelTiming,
+    StatisticsSession, Toast, ToastSession, ToolboxSession, PANEL_BUDGET_FRAMES,
+    PANEL_BUDGET_MICROS, TOASTS_MAX, TOAST_FRAMES,
 };
 pub use pill_editor_core_egui::systems;
 pub use pill_editor_core_egui::toolbox;
@@ -44,5 +45,6 @@ pub use pill_ui_egui::egui_dock::{
     DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
 };
 pub use pill_ui_egui::icons;
+pub use pill_ui_egui::panels::{PanelCommand, PanelContext, PanelDrawFn, PanelRegistry};
 pub use pill_ui_egui::style;
 pub use serde_json::Value as JsonValue;

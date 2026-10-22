@@ -111,6 +111,16 @@ pub mod tab_statistics;
 
 pub use tab_statistics::statistics_tab;
 
+/// The [`tab_demo`] module: the shell module's own editor panel, the reference
+/// a module's panel is written against (W-0038 Stage 11).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod tab_demo;
+
+pub use tab_demo::demo_panel;
+
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
 /// Public like every tab module: the build script's function
@@ -314,9 +324,23 @@ pub fn run_frame(
     selection: &mut EditorSelection,
     pending: &mut PendingEditorCommands,
     notices: &EditorNotices,
+    panels: &PanelRegistry,
+    panel_commands: &mut Vec<PanelCommand>,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
+    // The saved layout's module tabs name panel slots from the run that wrote
+    // them; the ids it carried are what maps them to today's slots (Stage 11).
+    // Once per session: a shell reload must not undo a dock the user moved.
+    if !state.panels_remapped {
+        let ids: Vec<String> = panels
+            .entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        state.dock.remap_panel_slots(&ids);
+        state.panels_remapped = true;
+    }
     // The host's notices become toasts before the dock draws, so a reload that
     // happened this frame is on screen in this frame.
     push_notices(state, notices);
@@ -374,6 +398,7 @@ pub fn run_frame(
         console_filters,
         problem_open,
         stats,
+        panel_budget,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -396,6 +421,9 @@ pub fn run_frame(
         console_filters,
         problem_open,
         stats,
+        panels,
+        panel_budget,
+        panel_commands,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -447,6 +475,22 @@ pub fn run_frame(
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
         pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
+    }
+    // A panel that crossed its budget this frame gets its toast once, named
+    // after the tab so the user can find the panel it belongs to (Stage 11).
+    // After the viewer's last use: its copy of the budget is what drew.
+    for entry in &mut panel_budget.entries {
+        if !entry.warned || entry.toasted {
+            continue;
+        }
+        entry.toasted = true;
+        let title = panels.tab_title(entry.slot);
+        let text = format!(
+            "Panel {} is over its frame budget ({:.1} ms)",
+            title,
+            entry.micros / 1000.0
+        );
+        toasts.push_local(NoticeLevel::Warning, text, frame_index);
     }
     *frame = shell_frame;
     let ui_micros = ui_started.elapsed().as_micros() as u64;
@@ -523,6 +567,15 @@ pub struct EditorTabViewer<'a> {
     /// The timings the Statistics tab reads (W-0038 Stage 7): the shell writes
     /// them around each tab body, the tab only formats them.
     pub stats: &'a mut StatisticsSession,
+    /// The panels the loaded modules registered (W-0038 Stage 11): a module
+    /// tab's title, body and liveness all come from here.
+    pub panels: &'a PanelRegistry,
+    /// Every module panel's build time, written around each panel body and
+    /// read by the tab's badge and by the budget toast.
+    pub panel_budget: &'a mut PanelBudget,
+    /// The commands the module panels asked for this pass, applied by the
+    /// executable at the frame boundary.
+    pub panel_commands: &'a mut Vec<PanelCommand>,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -534,6 +587,17 @@ impl TabViewer for EditorTabViewer<'_> {
     }
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        // A module panel's title is the registry's: it changes when the module
+        // unloads, and it carries the over-budget badge (Stage 11).
+        if let Some(slot) = tab.module_slot() {
+            let title = self.panels.tab_title(slot);
+            let label = if self.panel_budget.is_slow(slot) {
+                format!("{} (slow)", title)
+            } else {
+                title
+            };
+            return icons::rich(tab_icon(*tab), label.as_str()).into();
+        }
         icons::rich(tab_icon(*tab), (*tab).title()).into()
     }
 
@@ -593,6 +657,46 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Problems => problems_tab(ui, self.snapshot, self.problem_open),
             EditorTab::Statistics => {
                 statistics_tab(ui, self.snapshot, self.stats, self.frames_per_second)
+            }
+            EditorTab::Module(slot) => {
+                // The panel belongs to a module: its draw function is called
+                // only while that module's liveness marker is alive, and the
+                // tab says so when it is not (Stage 11).
+                match self.panels.draw_of(slot) {
+                    Some(draw) => {
+                        let mut context = PanelContext {
+                            frames_per_second: self.frames_per_second,
+                            selected_entity: self.selection.entity,
+                            commands: self.panel_commands,
+                        };
+                        let started = pill_core::platform::Instant::now();
+                        draw(ui, &mut context);
+                        let micros = started.elapsed().as_micros() as f32;
+                        let over_budget = self.panel_budget.record(slot, micros);
+                        if over_budget {
+                            pill_core::warn!(
+                                target: pill_core::telemetry::telemetry_target::ECS,
+                                slot,
+                                micros,
+                                budget = PANEL_BUDGET_MICROS,
+                                frames = PANEL_BUDGET_FRAMES,
+                                "[editor] module panel over budget"
+                            );
+                        }
+                    }
+                    None => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(12.0);
+                            ui.strong("Module not loaded");
+                            ui.label(
+                                self.panels
+                                    .get(slot)
+                                    .map(|entry| entry.source.clone())
+                                    .unwrap_or_else(|| "unknown panel".to_string()),
+                            );
+                        });
+                    }
+                }
             }
         }
         self.stats.record(tab, started.elapsed().as_micros() as f64);

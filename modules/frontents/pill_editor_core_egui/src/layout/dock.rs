@@ -70,6 +70,11 @@ pub enum EditorTab {
     /// The preferences file's editor-wide rows and the current project's
     /// remembered gizmo choices.
     Preferences,
+    /// A panel a module registered (W-0038 Stage 11): the payload is the
+    /// panel's slot in the registry, which is stable across that module's
+    /// reload. The tab's title comes from the registry, so a panel whose
+    /// module unloaded reads "module not loaded".
+    Module(u16),
 }
 
 impl EditorTab {
@@ -102,6 +107,9 @@ impl EditorTab {
             EditorTab::Problems => "Problems",
             EditorTab::Statistics => "Statistics",
             EditorTab::Preferences => "Preferences",
+            // A module panel's title belongs to the registry, not here: the
+            // shell asks it, because it changes when the module unloads.
+            EditorTab::Module(_) => "Module",
         }
     }
 
@@ -119,6 +127,15 @@ impl EditorTab {
             EditorTab::Problems => "problems",
             EditorTab::Statistics => "statistics",
             EditorTab::Preferences => "preferences",
+            EditorTab::Module(_) => "module",
+        }
+    }
+
+    /// The panel slot, when this is a module panel's tab.
+    pub fn module_slot(self) -> Option<u16> {
+        match self {
+            EditorTab::Module(slot) => Some(slot),
+            _ => None,
         }
     }
 }
@@ -133,6 +150,11 @@ impl EditorTab {
 pub struct EditorDock {
     /// The schema this document was written with.
     schema_version: u32,
+    /// The panel id each module tab's slot named when the document was
+    /// written (W-0038 Stage 11): a slot means nothing to the next run, the
+    /// id does, so a panel that registers again finds its tab.
+    #[serde(default)]
+    panel_ids: Vec<String>,
     /// The dock's tabs and splits.
     state: DockState<EditorTab>,
 }
@@ -189,6 +211,7 @@ impl EditorDock {
         );
         Self {
             schema_version: super::LAYOUT_SCHEMA_VERSION,
+            panel_ids: Vec::new(),
             state,
         }
     }
@@ -224,6 +247,39 @@ impl EditorDock {
     /// Whether the document was written by this build's schema.
     pub(crate) fn is_current(&self) -> bool {
         self.schema_version == super::LAYOUT_SCHEMA_VERSION
+    }
+
+    /// Record the registry's panel ids, so the module tabs a save writes can be
+    /// found again by id on the next run.
+    pub fn set_panel_ids(&mut self, ids: Vec<String>) {
+        self.panel_ids = ids;
+    }
+
+    /// The panel ids the document carried.
+    pub fn panel_ids(&self) -> &[String] {
+        &self.panel_ids
+    }
+
+    /// Rewrite every module tab's slot from the ids the document carried to
+    /// the slots `ids` assigns today.
+    ///
+    /// A tab whose panel is no longer registered keeps its slot value only
+    /// when that slot still exists; otherwise it points past the registry and
+    /// the shell draws the "module panel" placeholder - the tab is the user's
+    /// and is not taken away without a word.
+    pub fn remap_panel_slots(&mut self, ids: &[String]) {
+        let recorded = std::mem::take(&mut self.panel_ids);
+        for (_path, tab) in self.state.iter_all_tabs_mut() {
+            let Some(slot) = tab.module_slot() else {
+                continue;
+            };
+            let resolved = recorded
+                .get(slot as usize)
+                .and_then(|id| ids.iter().position(|known| known == id))
+                .map_or(u16::MAX, |index| index as u16);
+            *tab = EditorTab::Module(resolved);
+        }
+        self.set_panel_ids(ids.to_vec());
     }
 
     /// A copy with placeholder geometry replaced by finite values.

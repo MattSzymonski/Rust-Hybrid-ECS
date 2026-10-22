@@ -51,7 +51,12 @@ use crate::error::LayoutPersistenceError;
 ///
 /// v10 adds the Statistics tab (W-0038 Stage 7), appended to the leaf that
 /// holds Problems.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 10;
+///
+/// v11 adds module panels (W-0038 Stage 11): the document carries the panel id
+/// each module tab's slot named, so the tab finds its panel again however the
+/// modules register in the next run. Nothing is appended, so a v10 document is
+/// accepted and stamped - its tabs are all built-in ones.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 11;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";

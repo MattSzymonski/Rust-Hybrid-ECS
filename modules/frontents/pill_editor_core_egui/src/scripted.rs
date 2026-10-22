@@ -65,6 +65,13 @@ pub enum ScriptedCommand {
     ProblemOpen(usize),
     /// `safe_mode retry` - press the safe-mode panel's Retry button.
     SafeModeRetry,
+    /// `panel unload <source>` - drop one module's liveness marker, the state
+    /// its unload leaves: its panels read "module not loaded" (W-0038
+    /// Stage 11).
+    PanelUnload(String),
+    /// `panel restore <source>` - bind that module's panels again, the state a
+    /// reload leaves.
+    PanelRestore(String),
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -259,6 +266,8 @@ pub enum Dump {
     Stats,
     /// `dump cadence` - the redraw counters (W-0038 Stage 9).
     Cadence,
+    /// `dump panels` - the module panels and their timings (W-0038 Stage 11).
+    Panels,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -481,6 +490,25 @@ impl ScriptedCommand {
                 }
                 _ => Err(ParseError::new("problem needs `open <index>`")),
             },
+            "panel" => match cursor.word() {
+                Some("unload") => {
+                    let source = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("panel unload needs a module name"))?;
+                    cursor.finish("panel unload")?;
+                    Ok(ScriptedCommand::PanelUnload(source.to_string()))
+                }
+                Some("restore") => {
+                    let source = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("panel restore needs a module name"))?;
+                    cursor.finish("panel restore")?;
+                    Ok(ScriptedCommand::PanelRestore(source.to_string()))
+                }
+                _ => Err(ParseError::new(
+                    "panel needs `unload <module>` or `restore <module>`",
+                )),
+            },
             "palette" => {
                 let first = cursor.word();
                 let tail = cursor.rest();
@@ -640,6 +668,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "problems" => Dump::Problems,
         "stats" => Dump::Stats,
         "cadence" => Dump::Cadence,
+        "panels" => Dump::Panels,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1190,6 +1219,12 @@ fn point(cursor: &mut Cursor<'_>, reason: &str) -> Result<(f32, f32), ParseError
 /// Every tab answers to the wire name it logs under, so a new tab needs no
 /// entry here.
 fn tab_by_name(name: &str) -> Option<EditorTab> {
+    // A module panel's tab is named by its slot: `module:0`. The registry owns
+    // the ids, so the parser only carries the number and the executable
+    // resolves it (W-0038 Stage 11).
+    if let Some(slot) = name.strip_prefix("module:") {
+        return slot.parse().ok().map(EditorTab::Module);
+    }
     EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
 }
 
@@ -1408,6 +1443,14 @@ mod tests {
             Accept {
                 line: "safe_mode retry",
                 command: ScriptedCommand::SafeModeRetry,
+            },
+            Accept {
+                line: "panel unload pill_editor_shell_egui_editor",
+                command: ScriptedCommand::PanelUnload("pill_editor_shell_egui_editor".to_string()),
+            },
+            Accept {
+                line: "dump panels",
+                command: ScriptedCommand::Dump(Dump::Panels),
             },
             Accept {
                 line: "console filter warn",
