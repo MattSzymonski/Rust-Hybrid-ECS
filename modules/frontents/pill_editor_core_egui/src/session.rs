@@ -71,6 +71,14 @@ pub struct EguiShellState {
     /// The per-tab and whole-pass timings the Statistics tab shows
     /// (W-0038 Stage 7).
     pub stats: StatisticsSession,
+    /// Every module panel's build time, and which of them overshoots the
+    /// budget (W-0038 Stage 11).
+    pub panel_budget: PanelBudget,
+    /// Whether this session already mapped the saved layout's module tabs
+    /// from the panel ids it carried to the slots the registry assigns today.
+    /// Once per session, not once per shell generation: a reload must not
+    /// undo a dock the user rearranged.
+    pub panels_remapped: bool,
 }
 
 /// One tab's measured cost, smoothed so a single slow frame does not dominate.
@@ -267,6 +275,122 @@ pub struct ToastSession {
     /// The ids whose log line already went out, so a redrawn toast does not
     /// flood the log.
     pub logged: Vec<u64>,
+    /// How many toasts the shell queued itself, counted up from
+    /// [`ToastSession::LOCAL_SEQ_BASE`] so a local toast can never collide
+    /// with a host notice's id.
+    local_count: u64,
+}
+
+impl ToastSession {
+    /// Where the shell's own toasts start their ids: past any host notice's.
+    pub const LOCAL_SEQ_BASE: u64 = u64::MAX / 2;
+
+    /// Queue one toast the shell itself produced - a panel over its budget,
+    /// rather than something the host reported.
+    pub fn push_local(&mut self, level: NoticeLevel, text: String, frame_index: u64) -> u64 {
+        if self.toasts.len() >= TOASTS_MAX {
+            self.toasts.pop_front();
+        }
+        let seq = Self::LOCAL_SEQ_BASE + self.local_count;
+        self.local_count += 1;
+        self.toasts.push_back(Toast {
+            seq,
+            level,
+            text,
+            expires_at_frame: frame_index + TOAST_FRAMES,
+        });
+        seq
+    }
+}
+
+/// How long one panel may take before the editor says so.
+pub const PANEL_BUDGET_MICROS: f32 = 4000.0;
+
+/// How many frames in a row a panel must overshoot its budget before the
+/// editor says so - a single slow frame (a reload, a texture upload) is not a
+/// slow panel.
+pub const PANEL_BUDGET_FRAMES: u32 = 120;
+
+/// One panel's build time and how long it has been over budget.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelTiming {
+    /// The panel's registry slot.
+    pub slot: u16,
+    /// The panel body's smoothed build time, in microseconds.
+    pub micros: f32,
+    /// Passes the panel body was timed.
+    pub passes: u64,
+    /// Consecutive passes over [`PANEL_BUDGET_MICROS`].
+    pub slow_frames: u32,
+    /// Whether the overshoot was already reported, so one panel warns once.
+    pub warned: bool,
+    /// Whether the warning toast was queued, so a redrawn frame does not
+    /// queue it again.
+    pub toasted: bool,
+}
+
+/// Every module panel's build time (W-0038 Stage 11).
+///
+/// Written by the shell's own pass and read by the tab that draws the narm
+/// and by the suite: the measurement belongs to whoever timed the call, and
+/// a panel cannot inflate its own row by drawing it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelBudget {
+    /// One entry per panel drawn since the session began, in first-drawn order.
+    pub entries: Vec<PanelTiming>,
+}
+
+impl PanelBudget {
+    /// How strongly one pass moves the mean, the same weight the statistics
+    /// use.
+    pub const WEIGHT: f32 = 0.05;
+
+    /// Record one panel body's build time; returns whether this pass is the
+    /// one that reports an overshoot.
+    ///
+    /// The mean is smoothed, but the overshoot count is not: a panel that
+    /// sits just over budget every frame is slow, and a panel that is fast
+    /// again resets the count, so only a sustained overshoot warns.
+    pub fn record(&mut self, slot: u16, micros: f32) -> bool {
+        let index = match self.entries.iter().position(|entry| entry.slot == slot) {
+            Some(index) => index,
+            None => {
+                self.entries.push(PanelTiming {
+                    slot,
+                    ..PanelTiming::default()
+                });
+                self.entries.len() - 1
+            }
+        };
+        let entry = &mut self.entries[index];
+        entry.micros = if entry.passes == 0 {
+            micros
+        } else {
+            entry.micros * (1.0 - Self::WEIGHT) + micros * Self::WEIGHT
+        };
+        entry.passes += 1;
+        if micros > PANEL_BUDGET_MICROS {
+            entry.slow_frames = entry.slow_frames.saturating_add(1);
+        } else {
+            entry.slow_frames = 0;
+        }
+        if entry.slow_frames >= PANEL_BUDGET_FRAMES && !entry.warned {
+            entry.warned = true;
+            return true;
+        }
+        false
+    }
+
+    /// The timing of one slot, when it has been timed.
+    pub fn get(&self, slot: u16) -> Option<&PanelTiming> {
+        self.entries.iter().find(|entry| entry.slot == slot)
+    }
+
+    /// Whether the slot's panel is currently over budget and warned about it:
+    /// what the tab draws its badge from.
+    pub fn is_slow(&self, slot: u16) -> bool {
+        self.get(slot).is_some_and(|entry| entry.warned)
+    }
 }
 
 /// The Inspector's session state: which component sections are collapsed, and
@@ -319,6 +443,8 @@ impl EguiShellState {
             console_filters: crate::console::ConsoleFilterSettings::default(),
             problem_open: None,
             stats: StatisticsSession::default(),
+            panel_budget: PanelBudget::default(),
+            panels_remapped: false,
         }
     }
 

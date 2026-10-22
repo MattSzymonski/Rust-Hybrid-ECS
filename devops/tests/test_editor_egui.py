@@ -131,6 +131,12 @@ CADENCE_DUMP_TOKEN = "[test] cadence"
 REDRAW_ON_DEMAND_TOKEN = "[editor] redraw on demand"
 NO_OVERLAY_TOKEN = "[editor] no overlay posture"
 OVERLAY_POSTURE_TOKEN = "[editor] overlay posture"
+PANELS_DUMP_TOKEN = "[test] panels"
+PANEL_ROW_TOKEN = "[test] panel"
+PANEL_REGISTERED_TOKEN = "[editor] panel registered"
+PANEL_OVER_BUDGET_TOKEN = "[editor] module panel over budget"
+PANEL_UNLOADED_TOKEN = "[editor] panel source unloaded"
+PANEL_RESTORED_TOKEN = "[editor] panel source restored"
 SAFE_MODE_TOKEN = "[editor] safe mode"
 SAFE_MODE_RETRY_TOKEN = "[editor] safe mode retry requested"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
@@ -3470,6 +3476,155 @@ def main() -> int:
         print("  [OK] the no-overlay posture started, docked and edited")
     finally:
         plain.close()
+
+    # Step 14: module panels (W-0038 Stage 11). The shell module registers an
+    # editor panel of its own; the tab docks, the layout remembers it by panel
+    # id, and a panel whose module unloaded reads "module not loaded" rather
+    # than calling into an image that is gone. The deliberately slow body
+    # proves the budget: a badge on the tab and a warning toast.
+    panels = EditorSession(
+        "egui", "panels", project=arguments.project, test_seconds=240, binary=binary
+    )
+    panels.start(
+        extra_env={
+            "PILL_EDITOR_CONTINUOUS_REDRAW": "1",
+            "PILL_TEST_PANEL_SLOW": "1",
+        }
+    )
+    try:
+        wait_for_token(
+            panels, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "panel startup"
+        )
+        wait_for_token(
+            panels,
+            re.escape(PANEL_REGISTERED_TOKEN) + r'\s+id="shell\.demo"',
+            120,
+            "the demo panel registration",
+        )
+        dump = panels.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the panel dump"
+        )
+        row = re.search(
+            re.escape(PANEL_ROW_TOKEN)
+            + r'\s+slot=(\d+)\s+id="shell\.demo"\s+source="[^"]+"\s+alive=true',
+            dump,
+        )
+        assert row is not None, "the demo panel is not registered: {}".format(
+            dump[-800:]
+        )
+        slot = row.group(1)
+        # Docking it draws it every frame, which is what the slow body needs to
+        # cross the 120-frame budget.
+        begin = len(panels.read_log())
+        panels.send("tab module:{}".format(slot))
+        panels.wait(
+            re.escape(PANEL_OVER_BUDGET_TOKEN), 180, "the over-budget panel", begin
+        )
+        dump = panels.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the armed panel dump"
+        )
+        assert re.search(
+            re.escape(PANEL_ROW_TOKEN)
+            + r"\s+slot={}\s+.*?slow=true".format(slot),
+            dump,
+        ), "the panel's budget badge never armed: {}".format(dump[-800:])
+        assert re.search(
+            re.escape(TOAST_TOKEN)
+            + r'\s+level="warning"\s+seq=\d+\s+text="Panel .* over its frame budget',
+            panels.read_log(),
+        ), "the over-budget panel queued no toast"
+        print("  [OK] a slow module panel armed its badge and queued a toast")
+        # The module unloads: its marker is dropped, and its panel reads so.
+        begin = len(panels.read_log())
+        panels.send("panel unload pill_editor_shell_egui_editor")
+        panels.wait(re.escape(PANEL_UNLOADED_TOKEN), 60, "the unload", begin)
+        dump = panels.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the unloaded panel dump"
+        )
+        assert re.search(
+            re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=false".format(slot),
+            dump,
+        ), "the unloaded panel still reads alive: {}".format(dump[-800:])
+        assert "module not loaded" in dump or "Module not loaded" in panels.read_log(), (
+            "the tab did not say the module is gone: {}".format(dump[-800:])
+        )
+        begin = len(panels.read_log())
+        panels.send("panel restore pill_editor_shell_egui_editor")
+        panels.wait(
+            re.escape(PANEL_RESTORED_TOKEN), 60, "the restore", begin
+        )
+        assert re.search(
+            re.escape(PANEL_RESTORED_TOKEN) + r".*?restored=1",
+            panels.read_log()[begin:],
+        ), "the restore registered nothing: {}".format(panels.read_log()[begin:][-400:])
+        dump = panels.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the restored panel dump"
+        )
+        assert re.search(
+            re.escape(PANEL_ROW_TOKEN) + r"\s+slot={}\s+.*?alive=true".format(slot),
+            dump,
+        ), "the restored panel did not come back: {}".format(dump[-800:])
+        print("  [OK] a panel outlived its module's unload and came back")
+        # Float the tab and leave: the layout writes the panel id beside it.
+        panels.send("undock module:{}".format(slot))
+        dock = panels.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 60, "the panel dock"
+        )
+        surfaces = re.search(DOCK_DUMP_PATTERN, dock)
+        assert surfaces and int(surfaces.group(1)) >= 2, dock[-600:]
+        assert any(
+            "module" in match.group(4)
+            for match in re.finditer(DOCK_LEAF_PATTERN, dock)
+        ), "the panel tab never reached the dock: {}".format(dock[-600:])
+        begin = len(panels.read_log())
+        panels.send("quit")
+        panels.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the panel quit", begin)
+        panels.wait(re.escape(LAYOUT_SAVED_TOKEN), 30, "the panel layout", begin)
+        assert panels.wait_exit(timeout=60) == 0, "the panel editor did not exit 0"
+    finally:
+        panels.close()
+
+    # The layout remembered the panel by id, not by slot: a second session on
+    # the same sandbox opens with the module tab still there.
+    panels_restart = EditorSession(
+        "egui",
+        "panels-restart",
+        project=arguments.project,
+        test_seconds=180,
+        binary=binary,
+        sandbox=panels.sandbox,
+    )
+    panels_restart.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
+    try:
+        wait_for_token(
+            panels_restart,
+            re.escape(EGUI_SHELL_LOADED_TOKEN),
+            120,
+            "the panel restart",
+        )
+        dump = panels_restart.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 60, "the restored panel dock"
+        )
+        assert any(
+            "module" in match.group(4)
+            for match in re.finditer(DOCK_LEAF_PATTERN, dump)
+        ), "the module tab did not survive the restart: {}".format(dump[-800:])
+        restored = panels_restart.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the restart's panels"
+        )
+        assert re.search(
+            re.escape(PANEL_ROW_TOKEN) + r'\s+slot=\d+\s+id="shell\.demo"\s+.*?alive=true',
+            restored,
+        ), "the restarted editor did not register the panel: {}".format(
+            restored[-800:]
+        )
+        print("  [OK] the module tab and its panel survived a restart")
+        begin = len(panels_restart.read_log())
+        panels_restart.send("quit")
+        panels_restart.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the restart's quit", begin)
+        assert panels_restart.wait_exit(timeout=60) == 0, "the restarted panel editor did not exit 0"
+    finally:
+        panels_restart.close()
 
     # Stage 8: safe mode. The editor starts against a shell whose source does
     # not compile: it shows the build errors with their `file:line` and a

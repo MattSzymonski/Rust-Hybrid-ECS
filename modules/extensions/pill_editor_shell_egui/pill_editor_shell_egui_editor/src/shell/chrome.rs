@@ -29,6 +29,9 @@ pub fn tab_icon(tab: EditorTab) -> icons::Icon {
         EditorTab::Problems => icons::Icon::XCircle,
         EditorTab::Statistics => icons::Icon::Gear,
         EditorTab::Preferences => icons::Icon::Faders,
+        // A module panel is somebody else's: the puzzle-piece reading of the
+        // set is the grid, which is as close as a generic "extension" gets.
+        EditorTab::Module(_) => icons::Icon::GridFour,
     }
 }
 

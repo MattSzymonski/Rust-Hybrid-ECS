@@ -83,6 +83,9 @@ use pill_ui_egui::boundary::{
     frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, SCENE_VIEWPORTS,
 };
 use pill_ui_egui::egui;
+use pill_ui_egui::panels::{
+    ModuleLiveness, PanelCommand, PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
@@ -718,6 +721,14 @@ struct EditorWindow {
     /// The snapshot the last frame published, with its frame index cleared:
     /// what a change is measured against (W-0038 Stage 9).
     last_snapshot: Option<EditorSnapshot>,
+    /// One liveness marker per module that registered a panel (W-0038
+    /// Stage 11). The executable owns the strong handle, so a module reload -
+    /// which the registry is told about - is what makes its panels read
+    /// "module not loaded"; the module itself only queues requests.
+    panel_markers: std::collections::HashMap<String, Arc<ModuleLiveness>>,
+    /// The newest request per panel id, kept so a panel can be registered
+    /// again after an unload without the module running.
+    panel_requests: Vec<PanelRequest>,
 }
 
 /// A scripted left-button drag in flight: where the press lands, where the
@@ -871,6 +882,22 @@ impl EditorWindow {
         if world.get_resource::<ConsoleState>().is_none() {
             world.insert_resource(ConsoleState::default());
         }
+        // The module panels (W-0038 Stage 11): the registry, the queue modules
+        // register through and the commands a panel asked for. All three exist
+        // before any module loads, so a module's `register` has somewhere to
+        // put its request and the shell has something to draw from.
+        world.register_resource::<PanelRegistry>();
+        if world.get_resource::<PanelRegistry>().is_none() {
+            world.insert_resource(PanelRegistry::default());
+        }
+        world.register_resource::<PanelRegistrations>();
+        if world.get_resource::<PanelRegistrations>().is_none() {
+            world.insert_resource(PanelRegistrations::default());
+        }
+        world.register_resource::<PanelCommands>();
+        if world.get_resource::<PanelCommands>().is_none() {
+            world.insert_resource(PanelCommands::default());
+        }
         // Step 5: the scene views' child windows and their renderer
         // surfaces, each with its own camera (navigation moves the active
         // viewport's). Both start hidden; each shows when the dock shows its
@@ -993,6 +1020,8 @@ impl EditorWindow {
             last_demand: FrameDemand::default(),
             last_snapshot: None,
             snapshot_changed_field: None,
+            panel_markers: std::collections::HashMap::new(),
+            panel_requests: Vec::new(),
         };
         editor.place_views();
         info!(
@@ -3292,6 +3321,11 @@ impl EditorWindow {
         self.watch_keybindings();
         self.publish_console_lines();
         self.drain_problem_open();
+        // Step 3d: the panels the loaded modules asked to register, then what
+        // the panels drawn last frame asked for (W-0038 Stage 11). The sync is
+        // before the snapshot so a tab's title is never a frame stale.
+        self.sync_panels();
+        self.apply_panel_commands();
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -3367,6 +3401,90 @@ impl EditorWindow {
     /// The wake the last frame left for the loop.
     fn next_wake(&self) -> FrameWake {
         self.next_wake
+    }
+
+    /// Drain the module panels' registration requests (W-0038 Stage 11).
+    ///
+    /// A request names a draw function that lives in the requesting module's
+    /// image, so it is bound here, in the executable, to that module's
+    /// liveness marker: the registry hands the function out only while the
+    /// marker is alive, and a reload drops the marker (see
+    /// [`Self::fold_host_notices`]).
+    fn sync_panels(&mut self) {
+        let requests = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<PanelRegistrations>()
+                .map(|registrations| registrations.drain())
+                .unwrap_or_default()
+        };
+        if requests.is_empty() {
+            return;
+        }
+        for request in requests {
+            let marker = self
+                .panel_markers
+                .entry(request.source.to_string())
+                .or_insert_with(ModuleLiveness::new);
+            let slot = {
+                let world = self.host.host_mut().engine_mut().world_mut();
+                match world.get_resource_mut::<PanelRegistry>() {
+                    Some(registry) => registry.register(
+                        request.id,
+                        request.title,
+                        request.source,
+                        request.draw,
+                        marker,
+                    ),
+                    None => continue,
+                }
+            };
+            info!(
+                target: telemetry_target::ENGINE,
+                id = request.id,
+                slot,
+                source = request.source,
+                "[editor] panel registered"
+            );
+            match self
+                .panel_requests
+                .iter_mut()
+                .find(|known| known.id == request.id)
+            {
+                Some(known) => *known = request,
+                None => self.panel_requests.push(request),
+            }
+        }
+    }
+
+    /// Apply what the module panels asked for (W-0038 Stage 11).
+    ///
+    /// The same contract `EditorCommand` follows: a panel queues a request, the
+    /// executable applies it at the frame boundary, so a panel from a module
+    /// never leaves the world half-edited.
+    fn apply_panel_commands(&mut self) {
+        let commands = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<PanelCommands>()
+                .map(|queue| queue.drain())
+                .unwrap_or_default()
+        };
+        for command in commands {
+            match command {
+                PanelCommand::SelectEntity(entity) => {
+                    let world = self.host.host_mut().engine_mut().world_mut();
+                    if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
+                        selection.entity = Some(entity);
+                    }
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        entity = %entity,
+                        "[editor] panel selected an entity"
+                    );
+                }
+            }
+        }
     }
 
     /// Capture the editor snapshot the shell's tabs read, when the shell
@@ -3857,6 +3975,105 @@ impl EditorWindow {
             repaint = self.last_demand.repaint_requested,
             animating = self.last_demand.animating,
             "[test] cadence"
+        );
+    }
+
+    /// Log the module panels, for the suites (W-0038 Stage 11).
+    fn dump_panels(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(registry) = world.get_resource::<PanelRegistry>() else {
+            return;
+        };
+        let budget = world
+            .get_resource::<EguiShellState>()
+            .map(|state| state.panel_budget.clone())
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            count = registry.len(),
+            live = registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.alive())
+                .count(),
+            "[test] panels"
+        );
+        for (slot, entry) in registry.entries().iter().enumerate() {
+            let timing = budget.get(slot as u16);
+            info!(
+                target: telemetry_target::ENGINE,
+                slot,
+                id = entry.id.as_str(),
+                source = entry.source.as_str(),
+                alive = entry.alive(),
+                epoch = entry.epoch,
+                micros = timing.map(|timing| timing.micros).unwrap_or(0.0),
+                passes = timing.map(|timing| timing.passes).unwrap_or(0),
+                slow = budget.is_slow(slot as u16),
+                title = registry.tab_title(slot as u16).as_str(),
+                "[test] panel"
+            );
+        }
+    }
+
+    /// `panel unload <source>`: drop one module's liveness marker.
+    ///
+    /// This is the state a module's unload leaves the registry in - the marker
+    /// is what the unload would drop - so the tab reads "module not loaded"
+    /// and the panel's draw function is no longer handed out.
+    fn scripted_panel_unload(&mut self, source: &str) {
+        let dropped = self.panel_markers.remove(source).is_some();
+        info!(
+            target: telemetry_target::ENGINE,
+            source,
+            dropped,
+            "[editor] panel source unloaded"
+        );
+    }
+
+    /// `panel restore <source>`: bind that module's panels again.
+    ///
+    /// The requests the executable kept are registered against a fresh marker,
+    /// which is what a reload's re-registration does.
+    fn scripted_panel_restore(&mut self, source: &str) {
+        if self.panel_markers.contains_key(source) {
+            info!(
+                target: telemetry_target::ENGINE,
+                source,
+                restored = 0,
+                "[editor] panel source restored"
+            );
+            return;
+        }
+        let marker = ModuleLiveness::new();
+        let kept: Vec<PanelRequest> = self
+            .panel_requests
+            .iter()
+            .copied()
+            .filter(|request| request.source == source)
+            .collect();
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let mut restored = 0;
+        if let Some(registry) = world.get_resource_mut::<PanelRegistry>() {
+            for request in &kept {
+                registry.register(
+                    request.id,
+                    request.title,
+                    request.source,
+                    request.draw,
+                    &marker,
+                );
+                restored += 1;
+            }
+        }
+        if restored > 0 {
+            self.panel_markers.insert(source.to_string(), marker);
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            source,
+            restored,
+            "[editor] panel source restored"
         );
     }
 
@@ -4511,6 +4728,8 @@ impl EditorWindow {
             ScriptedCommand::ConsoleSearch(text) => self.scripted_console_search(text),
             ScriptedCommand::ProblemOpen(index) => self.scripted_problem_open(index),
             ScriptedCommand::SafeModeRetry => self.retry_shell_module(),
+            ScriptedCommand::PanelUnload(source) => self.scripted_panel_unload(&source),
+            ScriptedCommand::PanelRestore(source) => self.scripted_panel_restore(&source),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -4541,6 +4760,7 @@ impl EditorWindow {
                 Dump::Problems => self.dump_problems(),
                 Dump::Stats => self.dump_stats(),
                 Dump::Cadence => self.dump_cadence(),
+                Dump::Panels => self.dump_panels(),
                 Dump::Field {
                     entity,
                     component,
@@ -4723,6 +4943,17 @@ impl EditorWindow {
                 }
                 HostNotice::Reloaded { module, .. } => {
                     self.notices.problems.retain(|row| row.module != *module);
+                    // The swap means the old image is gone: its panels' draw
+                    // functions are stale addresses. Dropping the marker makes
+                    // them read "module not loaded" until the new generation's
+                    // request arrives this same frame (W-0038 Stage 11).
+                    if self.panel_markers.remove(module).is_some() {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            module = module.as_str(),
+                            "[editor] panel source reloaded"
+                        );
+                    }
                 }
                 HostNotice::PatchFailed { function, detail } => {
                     self.notices.problems.retain(|row| row.module != *function);
@@ -4993,6 +5224,16 @@ impl EditorWindow {
                 tab = tab.name(),
                 "[editor] tab activated"
             );
+        } else if tab.module_slot().is_some() {
+            // A module panel starts outside the dock: the layout is the user's,
+            // and a panel that registers later joins the focused leaf rather
+            // than rewriting their arrangement (W-0038 Stage 11).
+            state.dock.state_mut().push_to_focused_leaf(tab);
+            info!(
+                target: telemetry_target::ENGINE,
+                tab = tab.name(),
+                "[editor] module tab docked"
+            );
         } else {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -5044,8 +5285,24 @@ impl EditorWindow {
     /// comes through here, so the layout a restart loads is always the one
     /// the last session ended with.
     fn request_quit(&mut self) {
+        // The dock's module tabs name slots; the ids they stood for are what
+        // the next run needs (W-0038 Stage 11), so they are written first.
+        let panel_ids: Vec<String> = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource::<PanelRegistry>()
+                .map(|registry| {
+                    registry
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let world = self.host.host_mut().engine_mut().world_mut();
-        if let Some(state) = world.get_resource::<EguiShellState>() {
+        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+            state.dock.set_panel_ids(panel_ids);
             let surfaces = state.dock.state().surfaces_count();
             pill_editor_core_egui::layout::save(&state.dock);
             info!(
