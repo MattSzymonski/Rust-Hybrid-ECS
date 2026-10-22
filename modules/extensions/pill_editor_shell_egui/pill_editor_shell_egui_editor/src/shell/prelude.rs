@@ -21,6 +21,7 @@ pub use pill_editor_core_egui::console::{
 };
 pub use pill_editor_core_egui::editor_state::{
     AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
+    ResourceFieldView, ResourceView,
 };
 pub use pill_editor_core_egui::entities;
 pub use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSpace};

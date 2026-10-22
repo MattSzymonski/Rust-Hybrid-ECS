@@ -4137,6 +4137,110 @@ impl EditorWindow {
         );
     }
 
+    /// `select resource <name>`: the recorded selection a resource row makes
+    /// (W-0038 Stage 14).
+    fn scripted_select_resource(&mut self, name: &str) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() else {
+            return;
+        };
+        pending.push_recorded(
+            vec![EditorCommand::SelectResource {
+                resource: Some(name.to_string()),
+            }],
+            format!("select resource {name}"),
+            None,
+        );
+        info!(
+            target: telemetry_target::ENGINE,
+            resource = name,
+            "[editor] resource selection queued"
+        );
+    }
+
+    /// `edit resource <field> <value>`: one recorded `SetResourceField`.
+    fn scripted_edit_resource(&mut self, resource: &str, field: &str, value_text: &str) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let current = world.get_resource::<GizmoState>().and_then(|state| {
+            pill_editor_core_egui::gizmo::resource_field_value(&state.settings, resource, field)
+                .ok()
+        });
+        let Some(current) = current else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                resource,
+                field,
+                "[editor] resource edit: not an editable field"
+            );
+            return;
+        };
+        let value = match inspector::parse_field_value(value_text, &current) {
+            Ok(value) => value,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    field,
+                    message = message.as_str(),
+                    "[editor] resource edit: value not understood"
+                );
+                return;
+            }
+        };
+        let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() else {
+            return;
+        };
+        pending.push_recorded(
+            vec![EditorCommand::SetResourceField {
+                resource: resource.to_string(),
+                field: field.to_string(),
+                value,
+            }],
+            format!("set {resource}.{field}"),
+            Some(format!("resource.{resource}.{field}")),
+        );
+        info!(
+            target: telemetry_target::ENGINE,
+            resource,
+            field,
+            value = value_text,
+            "[editor] resource edit queued"
+        );
+    }
+
+    /// Log the editable resources and their values, for the suites
+    /// (W-0038 Stage 14).
+    fn dump_resources(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let resources = world
+            .get_resource::<EditorSnapshot>()
+            .map(|snapshot| snapshot.resources.clone())
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            count = resources.len(),
+            "[test] resources"
+        );
+        for view in &resources {
+            info!(
+                target: telemetry_target::ENGINE,
+                name = view.name.as_str(),
+                label = view.label.as_str(),
+                fields = view.fields.len(),
+                "[test] resource"
+            );
+            for field in &view.fields {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    resource = view.name.as_str(),
+                    field = field.field.as_str(),
+                    label = field.label.as_str(),
+                    value = inspector::value_text(&field.value).as_str(),
+                    "[test] resource field"
+                );
+            }
+        }
+    }
+
     /// Log the panel windows on screen, for the suites (W-0038 Stage 13).
     fn dump_windows(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -4946,6 +5050,7 @@ impl EditorWindow {
                 Dump::Cadence => self.dump_cadence(),
                 Dump::Panels => self.dump_panels(),
                 Dump::Windows => self.dump_windows(),
+                Dump::Resources => self.dump_resources(),
                 Dump::Field {
                     entity,
                     component,
@@ -4960,6 +5065,12 @@ impl EditorWindow {
             ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
             ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
+            ScriptedCommand::SelectResource(name) => self.scripted_select_resource(&name),
+            ScriptedCommand::EditResource {
+                resource,
+                field,
+                value,
+            } => self.scripted_edit_resource(&resource, &field, &value),
             ScriptedCommand::Toolbar(action) => self.scripted_toolbar(action),
             ScriptedCommand::DialogSetName(text) => self.scripted_dialog_set_name(&text),
             ScriptedCommand::DialogSubmit => self.scripted_dialog_submit(),

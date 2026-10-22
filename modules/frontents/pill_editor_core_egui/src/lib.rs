@@ -64,6 +64,8 @@ pub mod notices;
 pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.
 pub mod problems;
+/// The world resources the Inspector can show and edit (W-0038 Stage 14).
+pub mod resources;
 /// The scripted test channel's grammar: one typed parse of the suites' lines.
 pub mod scripted;
 /// The egui shell's long-lived session state.

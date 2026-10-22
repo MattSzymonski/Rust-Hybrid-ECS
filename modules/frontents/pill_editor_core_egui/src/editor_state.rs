@@ -136,6 +136,10 @@ pub struct EditorSelection {
     pub entity: Option<Entity>,
     /// The selected asset's project-relative path, when one is.
     pub asset: Option<String>,
+    /// The selected world resource's stable name, when one is (W-0038
+    /// Stage 14). A resource selection is exclusive with the other two: the
+    /// Inspector shows one thing at a time.
+    pub resource: Option<String>,
 }
 
 impl pill_engine::Resource for EditorSelection {}
@@ -192,6 +196,30 @@ pub struct EditorSnapshot {
     pub problems: Vec<crate::notices::ProblemRow>,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
+    /// The editable world resources and their field values (W-0038 Stage 14).
+    pub resources: Vec<ResourceView>,
+}
+
+/// One editable resource, as the Inspector's resource section shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResourceView {
+    /// The resource's stable name, the key a write addresses.
+    pub name: String,
+    /// The section's label.
+    pub label: String,
+    /// The editable fields, in row order.
+    pub fields: Vec<ResourceFieldView>,
+}
+
+/// One editable field of a resource.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceFieldView {
+    /// The field's name, the key a write addresses.
+    pub field: String,
+    /// The row's label.
+    pub label: String,
+    /// The value, as the row's widget shows it.
+    pub value: FieldValue,
 }
 
 impl pill_engine::Resource for EditorSnapshot {}
@@ -243,7 +271,43 @@ impl EditorSnapshot {
                 .map(|notices| notices.problems.clone())
                 .unwrap_or_default(),
             errors,
+            resources: Self::capture_resources(engine),
         }
+    }
+
+    /// The editable resources' values, read through their curated tables.
+    ///
+    /// The engine keeps no resource reflection, so a resource that is not in
+    /// [`crate::resources::EDITABLE_RESOURCES`] is not captured at all - there
+    /// is nothing to read it through.
+    fn capture_resources(engine: &Engine) -> Vec<ResourceView> {
+        let world = engine.world();
+        let Some(settings) = world
+            .get_resource::<crate::gizmo::GizmoState>()
+            .map(|state| state.settings)
+        else {
+            return Vec::new();
+        };
+        crate::resources::EDITABLE_RESOURCES
+            .iter()
+            .map(|entry| ResourceView {
+                name: entry.name.to_string(),
+                label: entry.label.to_string(),
+                fields: entry
+                    .fields
+                    .iter()
+                    .filter_map(|(field, label)| {
+                        crate::gizmo::resource_field_value(&settings, entry.name, field)
+                            .ok()
+                            .map(|value| ResourceFieldView {
+                                field: field.to_string(),
+                                label: label.to_string(),
+                                value,
+                            })
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// The entity tier - the only expensive one: one row per live entity,
@@ -601,6 +665,28 @@ pub enum EditorCommand {
         /// The selected asset's path, when one is.
         asset: Option<String>,
     },
+    /// Select one world resource for the Inspector (W-0038 Stage 14).
+    ///
+    /// Its own command rather than a third field of [`EditorCommand::SetSelection`]:
+    /// selecting a resource clears the entity and asset slots, and an undo of
+    /// one selection must not resurrect an unrelated one.
+    SelectResource {
+        /// The resource's stable name, `None` to clear the selection.
+        resource: Option<String>,
+    },
+    /// Restore all three selection slots as one recorded step.
+    ///
+    /// The inverse a resource selection applies: picking a resource clears the
+    /// entity and asset slots, so undoing it has to bring them back rather than
+    /// leave the Inspector pointing at nothing.
+    RestoreSelection {
+        /// The entity slot to restore.
+        entity: Option<Entity>,
+        /// The asset slot to restore.
+        asset: Option<String>,
+        /// The resource slot to restore.
+        resource: Option<String>,
+    },
     /// Write preferences file values (Stage 20): one `(key, text)` pair per
     /// edited row, applied as a read-modify-write of the preferences
     /// document so keys other writers own survive. A pair whose text is
@@ -713,6 +799,8 @@ impl EditorCommand {
                 | EditorCommand::SetAssetSettings { .. }
                 | EditorCommand::SetResourceField { .. }
                 | EditorCommand::SetSelection { .. }
+                | EditorCommand::SelectResource { .. }
+                | EditorCommand::RestoreSelection { .. }
         )
     }
 
@@ -762,7 +850,9 @@ impl EditorCommand {
             | EditorCommand::WriteAssetMeta { .. }
             | EditorCommand::SetAssetSettings { .. }
             | EditorCommand::SetResourceField { .. }
-            | EditorCommand::SetSelection { .. } => {}
+            | EditorCommand::SetSelection { .. }
+            | EditorCommand::SelectResource { .. }
+            | EditorCommand::RestoreSelection { .. } => {}
         }
         identifiers
     }
@@ -809,7 +899,9 @@ impl EditorCommand {
             | EditorCommand::MoveAssetFile { .. }
             | EditorCommand::WriteAssetMeta { .. }
             | EditorCommand::SetAssetSettings { .. }
-            | EditorCommand::SetResourceField { .. } => {}
+            | EditorCommand::SetResourceField { .. }
+            | EditorCommand::SelectResource { .. }
+            | EditorCommand::RestoreSelection { .. } => {}
         }
     }
 
@@ -904,6 +996,71 @@ impl EditorCommand {
     /// Apply one command; the message is empty on success.
     fn apply_one(engine: &mut Engine, command: &EditorCommand) -> Result<CommandOutcome, String> {
         match command {
+            EditorCommand::SelectResource { resource } => {
+                let world = engine.world_mut();
+                if world.get_resource::<EditorSelection>().is_none() {
+                    world.insert_resource(EditorSelection::default());
+                }
+                let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
+                    return Err(format!("{command:?}: the selection could not be claimed"));
+                };
+                let previous = selection.resource.clone();
+                // One thing at a time in the Inspector: picking a resource
+                // drops the entity and asset halves, and their undo restores
+                // them through their own commands.
+                let previous_entity = selection.entity;
+                let previous_asset = selection.asset.clone();
+                selection.resource = resource.clone();
+                if resource.is_some() {
+                    selection.entity = None;
+                    selection.asset = None;
+                }
+                // NOTE: asserted on by the egui editor's suite: the selection a
+                // resource row makes, and the one its undo restores.
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    resource = resource.as_deref().unwrap_or("none"),
+                    "[editor] resource selected"
+                );
+                Ok(CommandOutcome::inverse(EditorCommand::RestoreSelection {
+                    entity: previous_entity,
+                    asset: previous_asset,
+                    resource: previous,
+                }))
+            }
+
+            EditorCommand::RestoreSelection {
+                entity,
+                asset,
+                resource,
+            } => {
+                let world = engine.world_mut();
+                if world.get_resource::<EditorSelection>().is_none() {
+                    world.insert_resource(EditorSelection::default());
+                }
+                let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
+                    return Err(format!("{command:?}: the selection could not be claimed"));
+                };
+                let previous = EditorCommand::RestoreSelection {
+                    entity: selection.entity,
+                    asset: selection.asset.clone(),
+                    resource: selection.resource.clone(),
+                };
+                selection.entity = *entity;
+                selection.asset = asset.clone();
+                selection.resource = resource.clone();
+                // NOTE: asserted on by the egui editor's suite: an undone
+                // resource selection brings the entity slot back, not just an
+                // empty resource slot.
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    entity = entity.map(|entity| entity.to_string()).unwrap_or_else(|| "none".to_string()).as_str(),
+                    resource = resource.as_deref().unwrap_or("none"),
+                    "[editor] selection restored"
+                );
+                Ok(CommandOutcome::inverse(previous))
+            }
+
             EditorCommand::SetField {
                 entity,
                 component,

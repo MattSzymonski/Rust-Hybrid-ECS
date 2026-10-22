@@ -37,6 +37,16 @@ pub fn inspector_tab(
     session: &mut InspectorSession,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // A selected resource takes the tab: one selection shows one thing
+        // (W-0038 Stage 14).
+        if let Some(view) = selection
+            .resource
+            .as_deref()
+            .and_then(|name| snapshot.resources.iter().find(|view| view.name == name))
+        {
+            resource_section(ui, view, pending);
+            return;
+        }
         match snapshot.detail.as_ref() {
             Some(detail) => {
                 inspector_header(ui, snapshot, detail, pending, overlay_regions, session);

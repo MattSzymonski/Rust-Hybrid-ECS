@@ -144,6 +144,16 @@ pub use spline_tool::{
     SPLINE_COMPONENT, SPLINE_PANEL_ID,
 };
 
+/// The [`resource_section`] module: the Inspector's rows for one editable
+/// world resource (W-0038 Stage 14).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod resource_section;
+
+pub use resource_section::{queue_edit as queue_resource_edit, resource_section};
+
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
 /// Public like every tab module: the build script's function
