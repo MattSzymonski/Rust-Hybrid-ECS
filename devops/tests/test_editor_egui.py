@@ -127,6 +127,8 @@ PROBLEM_ROW_TOKEN = "[test] problem row"
 PROBLEM_OPENED_TOKEN = "[editor] problem opened"
 STATS_DUMP_TOKEN = "[test] stats"
 STATS_TAB_TOKEN = "[test] stats tab"
+SAFE_MODE_TOKEN = "[editor] safe mode"
+SAFE_MODE_RETRY_TOKEN = "[editor] safe mode retry requested"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
 CONSOLE_SEARCH_TOKEN = "[editor] console search"
 
@@ -3348,6 +3350,78 @@ def main() -> int:
         print("  [OK] the restarted editor saved its layout and exited 0")
     finally:
         restart.close()
+
+    # Stage 8: safe mode. The editor starts against a shell whose source does
+    # not compile: it shows the build errors with their `file:line` and a
+    # Retry, and once the source is fixed Retry loads the shell - all without
+    # restarting the process.
+    shell_source = (
+        REPOSITORY_ROOT
+        / "modules"
+        / "extensions"
+        / "pill_editor_shell_egui"
+        / "pill_editor_shell_egui_editor"
+        / "src"
+        / "shell.rs"
+    )
+    shell_text = shell_source.read_bytes().decode("utf-8")
+    safe = EditorSession(
+        "egui", "safe", project=arguments.project, test_seconds=300, binary=binary
+    )
+    session.edit_source(
+        shell_source, shell_text + '\ncompile_error!("egui suite: broken shell");\n'
+    )
+    # A staged DLL from the good build would load over the broken source and
+    # there would be no safe mode to test: remove it so the failed build is the
+    # only generation the editor can find. The retry below rebuilds it.
+    staged_shell = MODULES_ROOT / "target" / "hot" / "pill_editor_shell_egui_editor.dll"
+    staged_shell.unlink(missing_ok=True)
+    try:
+        safe.start()
+        try:
+            wait_for_token(
+                safe, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "safe-mode startup"
+            )
+            safe_begin = len(safe.read_log())
+            safe.wait(re.escape(SAFE_MODE_TOKEN), 240, "the safe-mode panel", safe_begin)
+            rows = safe.request(
+                "dump problems",
+                re.escape(PROBLEMS_DUMP_TOKEN),
+                60,
+                "the safe-mode problems",
+            )
+            assert re.search(r"count=[1-9][0-9]*", rows), (
+                "safe mode reported no build error: {}".format(rows)
+            )
+            located = re.search(
+                re.escape(PROBLEM_ROW_TOKEN)
+                + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
+                safe.read_log()[safe_begin:],
+            )
+            assert located and located.group(1).endswith("shell.rs"), (
+                "the safe-mode panel did not name the shell's source: {}".format(located)
+            )
+            print("  [OK] safe mode showed the shell's error with its location")
+            # Fix the source, then press the panel's Retry through the same
+            # path the button calls.
+            session.edit_source(shell_source, shell_text)
+            retry_begin = len(safe.read_log())
+            safe.send("safe_mode retry")
+            safe.wait(
+                re.escape(SAFE_MODE_RETRY_TOKEN), 60, "the safe-mode retry", retry_begin
+            )
+            safe.wait(
+                re.escape(EGUI_SHELL_LOADED_TOKEN),
+                480,
+                "the shell loaded after the retry",
+                retry_begin,
+            )
+            print("  [OK] Retry loaded the fixed shell without a restart")
+        finally:
+            safe.close()
+    finally:
+        # A failed step must not leave a compile error behind for the next run.
+        session.edit_source(shell_source, shell_text)
     return 0
 
 
