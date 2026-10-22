@@ -40,7 +40,8 @@ pub use pill_editor_core_egui::systems;
 pub use pill_editor_core_egui::toolbox;
 pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
 pub use pill_ui_egui::boundary::{
-    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, SCENE_VIEWPORTS,
+    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
+    SCENE_VIEWS_MAX,
 };
 pub use pill_ui_egui::egui;
 pub use pill_ui_egui::egui_dock::{

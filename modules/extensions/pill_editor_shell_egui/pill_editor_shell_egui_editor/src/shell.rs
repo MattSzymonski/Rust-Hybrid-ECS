@@ -475,7 +475,7 @@ pub fn run_frame(
         toolbox,
         browser,
         inspector,
-        scene_rects: [None; SCENE_VIEWPORTS],
+        scene_rects: vec![None; dock.scene_view_count()],
         game_rect: None,
         overlay_regions: Vec::new(),
         frames_per_second: shell_input.frames_per_second,
@@ -587,6 +587,31 @@ pub fn run_frame(
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
         pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
+    }
+    // The Window menu's "New Scene View" (W-0038 Stage 21): docked here for
+    // the same reason, and activated through the executable's own path so the
+    // new tab is at the front of its group the moment it appears.
+    if std::mem::take(&mut menubar.new_scene_view) {
+        let tab = dock.next_scene_view();
+        if dock.contains(tab) {
+            // Already docked: the command brought it back rather than adding.
+            menubar.pending_tab = Some(tab);
+        } else if dock.can_open_scene_view() {
+            dock.state_mut().push_to_focused_leaf(tab);
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                tab = tab.name().as_str(),
+                view = tab.scene_view().unwrap_or_default(),
+                "[editor] scene view added"
+            );
+            menubar.pending_tab = Some(tab);
+        } else {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                limit = pill_ui_egui::boundary::SCENE_VIEWS_MAX,
+                "[editor] scene view refused: the view limit is reached"
+            );
+        }
     }
     // The answer has been read by the pass that needed it; the next one must
     // not act on it again (W-0038 Stage 13).
@@ -713,9 +738,10 @@ pub struct EditorTabViewer<'a> {
     /// tree's open folders and the tile size.
     pub browser: &'a mut ProjectBrowser,
     /// The scene viewports' body rectangles this pass, in logical points,
-    /// one slot per scene tab; the frontend places each viewport's child
-    /// window at its slot.
-    pub scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
+    /// one slot per view index; the frontend places each viewport's child
+    /// window at its slot. Sized from the dock before the pass, so a view
+    /// the person added has its slot already (W-0038 Stage 21).
+    pub scene_rects: Vec<Option<ShellRect>>,
     /// The game viewport's body rectangle this pass, in logical points; the
     /// frontend places the primary surface's child window at it.
     pub game_rect: Option<ShellRect>,
@@ -788,7 +814,7 @@ impl TabViewer for EditorTabViewer<'_> {
             };
             return icons::rich(tab_icon(*tab), label.as_str()).into();
         }
-        icons::rich(tab_icon(*tab), (*tab).title()).into()
+        icons::rich(tab_icon(*tab), (*tab).title().as_str()).into()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
@@ -797,17 +823,14 @@ impl TabViewer for EditorTabViewer<'_> {
         let started = pill_core::platform::Instant::now();
         let tab = *tab;
         match tab {
-            EditorTab::Scene => {
-                self.scene_rects[0] = Some(scene_body_rect(ui));
+            EditorTab::Scene(view) => {
+                let view = view as usize;
+                if let Some(slot) = self.scene_rects.get_mut(view) {
+                    *slot = Some(scene_body_rect(ui));
+                }
                 scene_context_menu(self, ui);
                 scene_overlay(ui, self.frames_per_second, &mut self.overlay_regions);
-                toolbox_overlay(self, ui, 0);
-            }
-            EditorTab::SecondScene => {
-                self.scene_rects[1] = Some(scene_body_rect(ui));
-                scene_context_menu(self, ui);
-                scene_overlay(ui, self.frames_per_second, &mut self.overlay_regions);
-                toolbox_overlay(self, ui, 1);
+                toolbox_overlay(self, ui, view);
             }
             EditorTab::Game => {
                 // The game viewport is the primary surface's child window: a
@@ -954,16 +977,13 @@ impl TabViewer for EditorTabViewer<'_> {
     /// The scene and game tabs keep their bodies transparent: the scene and
     /// game child windows show through them from under the overlay.
     fn clear_background(&self, tab: &Self::Tab) -> bool {
-        !matches!(
-            tab,
-            EditorTab::Scene | EditorTab::SecondScene | EditorTab::Game
-        )
+        !matches!(tab, EditorTab::Scene(_) | EditorTab::Game)
     }
 
     /// The scene and game tabs' bodies are viewports; they never scroll.
     fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
         match tab {
-            EditorTab::Scene | EditorTab::SecondScene | EditorTab::Game => [false, false],
+            EditorTab::Scene(_) | EditorTab::Game => [false, false],
             _ => [true, true],
         }
     }

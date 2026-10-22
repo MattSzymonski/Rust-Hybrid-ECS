@@ -24,8 +24,8 @@ use crate::error::LayoutPersistenceError;
 /// documents written by the two-tab build are rejected and replaced by the
 /// new default.
 ///
-/// v3 adds the second viewport tab (`EditorTab::SecondScene`), so documents
-/// written before it are rejected and replaced by the new default.
+/// v3 adds the second viewport tab (the scene view later numbered 1), so
+/// documents written before it are rejected and replaced by the new default.
 ///
 /// v4 adds the Inspector tab (`EditorTab::Inspector`) and its slot in the
 /// default layout, so previous documents are rejected and replaced too.
@@ -56,7 +56,12 @@ use crate::error::LayoutPersistenceError;
 /// each module tab's slot named, so the tab finds its panel again however the
 /// modules register in the next run. Nothing is appended, so a v10 document is
 /// accepted and stamped - its tabs are all built-in ones.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 11;
+///
+/// v12 opens the scene views (W-0038 Stage 21): `EditorTab::Scene` carries the
+/// view's index, so a layout may hold any number of them. Nothing is
+/// appended, so a v11 document is accepted and stamped - its `Scene` and
+/// `SecondScene` tabs read as views 0 and 1.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 12;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";

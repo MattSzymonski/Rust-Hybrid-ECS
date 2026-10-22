@@ -16,8 +16,8 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 /// The icon a dock tab's title carries: the view or panel the tab shows.
 pub fn tab_icon(tab: EditorTab) -> icons::Icon {
     match tab {
-        EditorTab::Scene => icons::Icon::Cube,
-        EditorTab::SecondScene => icons::Icon::CubeTransparent,
+        EditorTab::Scene(0) => icons::Icon::Cube,
+        EditorTab::Scene(_) => icons::Icon::CubeTransparent,
         EditorTab::Game => icons::Icon::MonitorPlay,
         EditorTab::Entities => icons::Icon::TreeStructure,
         EditorTab::Systems => icons::Icon::Gear,

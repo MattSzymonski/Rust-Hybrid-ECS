@@ -776,13 +776,19 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .separator(),
         // Help's one row.
         CommandSpec::new("editor.about", "About Pill Editor").menu(&["Help", "About Pill Editor"]),
+        // One more scene view, ahead of the Window menu's tab rows (W-0038
+        // Stage 21): no chord, because the menu and the palette carry it.
+        CommandSpec::new("editor.scene_new_view", "New Scene View")
+            .menu(&["Window", "New Scene View"])
+            .separator(),
     ];
     // Window: one row per dock tab, in strip order; the shell turns each back
-    // into the tab it activates.
+    // into the tab it activates. A scene view's title is its number.
     for tab in EditorTab::ALL {
+        let title = tab.title();
         commands.push(
-            CommandSpec::new(&format!("editor.window_{}", tab.name()), tab.title())
-                .menu(&["Window", tab.title()]),
+            CommandSpec::new(&format!("editor.window_{}", tab.name()), title.as_str())
+                .menu(&["Window", title.as_str()]),
         );
     }
     commands

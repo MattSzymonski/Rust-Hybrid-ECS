@@ -257,6 +257,8 @@ pub enum ScriptedCommand {
     Undo,
     /// `command editor.redo` - redo one step.
     Redo,
+    /// `command editor.scene_new_view` - dock one more scene view.
+    NewSceneView,
     /// `command editor.pause_toggle` - flip the engine's pause flag.
     PauseToggle,
     /// `command editor.step` - run one frame while paused.
@@ -1039,6 +1041,8 @@ fn command(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
         "editor.copy" => ScriptedCommand::Copy,
         "editor.cut" => ScriptedCommand::Cut,
         "editor.paste" => ScriptedCommand::Paste,
+        // One more scene view, the Window menu's own row (W-0038 Stage 21).
+        "editor.scene_new_view" => ScriptedCommand::NewSceneView,
         other => {
             return Err(ParseError::new(format!(
                 "command '{other}' is not executable in the egui editor"
@@ -1414,6 +1418,19 @@ fn tab_by_name(name: &str) -> Option<EditorTab> {
     if let Some(slot) = name.strip_prefix("module:") {
         return slot.parse().ok().map(EditorTab::Module);
     }
+    // A scene view is `scene`, `scene2`, `scene3`: one past the view's own
+    // index, because a person counts views from one (W-0038 Stage 21).
+    if let Some(count) = name.strip_prefix("scene") {
+        if count.is_empty() {
+            return Some(EditorTab::Scene(0));
+        }
+        return count
+            .parse::<u16>()
+            .ok()
+            .and_then(|count| count.checked_sub(1))
+            .and_then(|index| u8::try_from(index).ok())
+            .map(EditorTab::Scene);
+    }
     EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
 }
 
@@ -1476,6 +1493,22 @@ mod tests {
             Accept {
                 line: "tab inspector",
                 command: ScriptedCommand::ActivateTab(EditorTab::Inspector),
+            },
+            Accept {
+                line: "tab scene",
+                command: ScriptedCommand::ActivateTab(EditorTab::Scene(0)),
+            },
+            Accept {
+                line: "tab scene2",
+                command: ScriptedCommand::ActivateTab(EditorTab::Scene(1)),
+            },
+            Accept {
+                line: "tab scene3",
+                command: ScriptedCommand::ActivateTab(EditorTab::Scene(2)),
+            },
+            Accept {
+                line: "command editor.scene_new_view",
+                command: ScriptedCommand::NewSceneView,
             },
             Accept {
                 line: "palette translate",
