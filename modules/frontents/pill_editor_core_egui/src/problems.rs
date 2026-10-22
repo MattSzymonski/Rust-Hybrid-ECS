@@ -28,6 +28,17 @@ pub enum Severity {
     Note,
 }
 
+impl Severity {
+    /// The wire name the panel's rows and the suites use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        }
+    }
+}
+
 /// One problem parsed from a build's output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Problem {

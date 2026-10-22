@@ -3079,6 +3079,7 @@ impl EditorWindow {
         self.watch_preferences();
         self.watch_keybindings();
         self.publish_console_lines();
+        self.drain_problem_open();
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -3435,6 +3436,111 @@ impl EditorWindow {
             self.push_toast(
                 NoticeLevel::Warning,
                 format!("Keybinding conflict: {chord} is bound to {commands}"),
+            );
+        }
+    }
+
+    /// Open the Problems row a click asked for (W-0038 Stage 6).
+    ///
+    /// The `code_editor_command` preference names the program and its flags;
+    /// the row's `file:line` goes last as one argument, which is the form VS
+    /// Code, CLion and every other editor's command line accepts. A missing
+    /// or empty preference falls back to `code`.
+    fn drain_problem_open(&mut self) {
+        let request = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<EguiShellState>()
+                .and_then(|state| state.problem_open.take())
+        };
+        let Some(index) = request else {
+            return;
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            index,
+            problems = self.notices.problems.len(),
+            "[editor] problem open requested"
+        );
+        let Some(problem) = self.notices.problems.get(index).cloned() else {
+            return;
+        };
+        let Some(file) = problem.problem.file.clone() else {
+            return;
+        };
+        let target = match problem.problem.line {
+            Some(line) => format!("{file}:{line}"),
+            None => file,
+        };
+        let command = self
+            .preferences_text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<EditorPreferences>(text).ok())
+            .and_then(|preferences| preferences.code_editor_command)
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(|| "code".to_string());
+        let mut parts = split_command(&command).into_iter();
+        let Some(program) = parts.next() else {
+            return;
+        };
+        match std::process::Command::new(&program)
+            .args(parts)
+            .arg(&target)
+            .spawn()
+        {
+            Ok(_child) => info!(
+                target: telemetry_target::ENGINE,
+                command = command.as_str(),
+                target = target.as_str(),
+                "[editor] problem opened"
+            ),
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                command = command.as_str(),
+                error = %error,
+                "[editor] problem open failed"
+            ),
+        }
+    }
+
+    /// Run `problem open <index>`: the same request a click on the row makes.
+    ///
+    /// The request is drained at once rather than on the next frame: a suite
+    /// that sends this line waits for the editor it launches, and one frame of
+    /// delay would make the assertion race the spawn.
+    fn scripted_problem_open(&mut self, index: usize) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let found = world
+            .get_resource_mut::<EguiShellState>()
+            .map(|state| {
+                state.problem_open = Some(index);
+            })
+            .is_some();
+        info!(
+            target: telemetry_target::ENGINE,
+            index,
+            found,
+            "[editor] problem open scripted"
+        );
+        self.drain_problem_open();
+    }
+
+    /// Log the Problems rows, for the suites.
+    fn dump_problems(&mut self) {
+        info!(
+            target: telemetry_target::ENGINE,
+            count = self.notices.problems.len(),
+            "[test] problems"
+        );
+        for row in self.notices.problems.iter().take(10) {
+            info!(
+                target: telemetry_target::ENGINE,
+                module = row.module.as_str(),
+                severity = row.problem.severity.name(),
+                file = row.problem.file.as_deref().unwrap_or(""),
+                line = row.problem.line.unwrap_or(0),
+                text = row.problem.message.as_str(),
+                "[test] problem row"
             );
         }
     }
@@ -3977,6 +4083,7 @@ impl EditorWindow {
             ScriptedCommand::Palette(request) => self.scripted_palette(request),
             ScriptedCommand::ConsoleFilter(level) => self.scripted_console_filter(&level),
             ScriptedCommand::ConsoleSearch(text) => self.scripted_console_search(text),
+            ScriptedCommand::ProblemOpen(index) => self.scripted_problem_open(index),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -4004,6 +4111,7 @@ impl EditorWindow {
                 Dump::Systems => self.dump_systems(),
                 Dump::Preferences => self.dump_preferences(),
                 Dump::Console => self.dump_console(),
+                Dump::Problems => self.dump_problems(),
                 Dump::Field {
                     entity,
                     component,
@@ -4985,6 +5093,32 @@ enum CommandAction {
     PauseToggle,
     /// Advance exactly one frame.
     Step,
+}
+
+/// Split a command line into a program and its arguments.
+///
+/// Whitespace separates the parts, except inside one pair of double quotes:
+/// a program path with a space in it (`"C:\Program Files\...\python.exe"`)
+/// has to stay one argument, or the spawn looks for `C:\Program`.
+fn split_command(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in text.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            whitespace if whitespace.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 /// The action a command id runs, if this executable implements it.

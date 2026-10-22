@@ -91,6 +91,16 @@ pub mod tab_console;
 
 pub use tab_console::console_tab;
 
+/// The [`tab_problems`] module: build errors and warnings, grouped by module
+/// (W-0038 Stage 6).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod tab_problems;
+
+pub use tab_problems::problems_tab;
+
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
 /// Public like every tab module: the build script's function
@@ -352,6 +362,7 @@ pub fn run_frame(
         toasts,
         palette,
         console_filters,
+        problem_open,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -372,6 +383,7 @@ pub fn run_frame(
         frames_per_second: shell_input.frames_per_second,
         tab_redock: None,
         console_filters,
+        problem_open,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -488,6 +500,9 @@ pub struct EditorTabViewer<'a> {
     /// The Console tab's filters (W-0038 Stage 5); the executable applies them
     /// to the history on its next frame.
     pub console_filters: &'a mut ConsoleFilterSettings,
+    /// The Problems row a click asked to open (W-0038 Stage 6); the executable
+    /// drains it and launches the configured code editor.
+    pub problem_open: &'a mut Option<usize>,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -551,6 +566,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)
             }
             EditorTab::Console => console_tab(ui, self.snapshot, self.console_filters),
+            EditorTab::Problems => problems_tab(ui, self.snapshot, self.problem_open),
         }
     }
 

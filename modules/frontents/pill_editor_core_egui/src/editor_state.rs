@@ -187,6 +187,9 @@ pub struct EditorSnapshot {
     pub commands: Vec<crate::commands::CommandView>,
     /// The Console tab's filters and newest rows (W-0038 Stage 5).
     pub console: crate::console::ConsoleView,
+    /// Build errors and warnings, grouped by the module that reported them
+    /// (W-0038 Stage 6).
+    pub problems: Vec<crate::notices::ProblemRow>,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
 }
@@ -233,6 +236,11 @@ impl EditorSnapshot {
                 .world()
                 .get_resource::<crate::console::ConsoleState>()
                 .map(crate::console::ConsoleState::view)
+                .unwrap_or_default(),
+            problems: engine
+                .world()
+                .get_resource::<crate::notices::EditorNotices>()
+                .map(|notices| notices.problems.clone())
                 .unwrap_or_default(),
             errors,
         }

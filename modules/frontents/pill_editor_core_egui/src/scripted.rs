@@ -61,6 +61,8 @@ pub enum ScriptedCommand {
     ConsoleFilter(String),
     /// `console search <text>` - the Console tab's substring filter.
     ConsoleSearch(String),
+    /// `problem open <index>` - open a Problems row, as a click would.
+    ProblemOpen(usize),
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -249,6 +251,8 @@ pub enum Dump {
     Preferences,
     /// `dump console` - the Console tab's filters and the rows they leave.
     Console,
+    /// `dump problems` - the Problems rows and their locations.
+    Problems,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -452,6 +456,16 @@ impl ScriptedCommand {
                     "console needs `filter <level>` or `search <text>`",
                 )),
             },
+            // `problem open <index>` opens a Problems row the way a click
+            // does; the executable spawns the configured editor.
+            "problem" => match cursor.word() {
+                Some("open") => {
+                    let index = number(&mut cursor, "problem open needs a row index")?;
+                    cursor.finish("problem open")?;
+                    Ok(ScriptedCommand::ProblemOpen(index))
+                }
+                _ => Err(ParseError::new("problem needs `open <index>`")),
+            },
             "palette" => {
                 let first = cursor.word();
                 let tail = cursor.rest();
@@ -608,6 +622,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "systems" => Dump::Systems,
         "preferences" => Dump::Preferences,
         "console" => Dump::Console,
+        "problems" => Dump::Problems,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1356,6 +1371,14 @@ mod tests {
             Accept {
                 line: "dump console",
                 command: ScriptedCommand::Dump(Dump::Console),
+            },
+            Accept {
+                line: "dump problems",
+                command: ScriptedCommand::Dump(Dump::Problems),
+            },
+            Accept {
+                line: "problem open 0",
+                command: ScriptedCommand::ProblemOpen(0),
             },
             Accept {
                 line: "console filter warn",

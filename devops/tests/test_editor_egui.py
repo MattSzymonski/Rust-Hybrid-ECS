@@ -122,6 +122,9 @@ PALETTE_RECT_TOKEN = "[editor] palette rect"
 PALETTE_CLOSED_TOKEN = "[editor] palette closed"
 PALETTE_DISMISSED_TOKEN = "[editor] palette dismissed"
 CONSOLE_DUMP_TOKEN = "[test] console"
+PROBLEMS_DUMP_TOKEN = "[test] problems"
+PROBLEM_ROW_TOKEN = "[test] problem row"
+PROBLEM_OPENED_TOKEN = "[editor] problem opened"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
 CONSOLE_SEARCH_TOKEN = "[editor] console search"
 
@@ -384,14 +387,24 @@ def toolbox_row(session: EditorSession, view: int, item: str) -> tuple:
 
 
 def toolbox_click(session: EditorSession, view: int, item: str, label: str) -> None:
-    """Clicks one toolbox row at its logged center and waits for its token."""
-    x, y = rect_center(toolbox_row(session, view, item))
-    session.request(
-        f"click {x:.0f} {y:.0f}",
-        re.escape(TOOLBOX_CLICK_TOKEN) + rf'\s+view={view}\s+item="{item}"',
-        30,
-        label,
-    )
+    """Clicks one toolbox row at its logged center and waits for its token.
+
+    Like a menu item, a toolbox row's click is delivered on one frame and can
+    be swallowed while the panel is moving or the pointer is settling, so a
+    miss is retried once with the row's rectangle read again.
+    """
+    pattern = re.escape(TOOLBOX_CLICK_TOKEN) + rf'\s+view={view}\s+item="{item}"'
+    for attempt in (1, 2):
+        x, y = rect_center(toolbox_row(session, view, item))
+        begin = len(session.read_log())
+        session.send(f"click {x:.0f} {y:.0f}")
+        try:
+            session.wait(pattern, 30, label, begin)
+            return
+        except TimeoutError:
+            if attempt == 2:
+                raise
+            print("  [RETRY] the toolbox row {!r} click missed; retrying once".format(item))
 
 
 def menu_title_rect(session: EditorSession, name: str) -> tuple:
@@ -417,32 +430,47 @@ def menu_click(session: EditorSession, menu: str, label: str, action_label: str)
 
     Every menu is opened fresh: a click on an item closes its menu, so a
     recorded rectangle from an earlier opening would address a closed popup.
+
+    A synthetic click is delivered on one frame, and a frame that is still
+    laying the popup out swallows it: the click is retried once, with the
+    rectangle read again, before the absence counts as a failure.
     """
-    center = rect_center(menu_title_rect(session, menu))
-    session.request(
-        f"click {center[0]:.0f} {center[1]:.0f}",
-        re.escape(MENU_OPENED_TOKEN) + rf'\s+menu="{menu}"',
-        30,
-        f"the {menu} menu opened",
-    )
-    found = [
-        match
-        for match in re.finditer(MENU_ENTRY_RECT_PATTERN, session.read_log())
-        if match.group(1) == menu and match.group(2) == label
-    ]
-    assert found, f"the {menu} menu did not list {label!r}: " + session.read_log()[-600:]
-    entry = found[-1]
-    x = float(entry.group(3)) + float(entry.group(5)) / 2.0
-    y = float(entry.group(4)) + float(entry.group(6)) / 2.0
-    begin = len(session.read_log())
-    session.send(f"click {x:.0f} {y:.0f}")
-    session.wait(
-        re.escape(MENU_ACTION_TOKEN)
-        + rf'\s+menu="{menu}"\s+label="{re.escape(action_label)}"',
-        30,
-        f"the {menu} menu ran {action_label!r}",
-        begin,
-    )
+    for attempt in (1, 2):
+        center = rect_center(menu_title_rect(session, menu))
+        session.request(
+            f"click {center[0]:.0f} {center[1]:.0f}",
+            re.escape(MENU_OPENED_TOKEN) + rf'\s+menu="{menu}"',
+            30,
+            f"the {menu} menu opened",
+        )
+        found = [
+            match
+            for match in re.finditer(MENU_ENTRY_RECT_PATTERN, session.read_log())
+            if match.group(1) == menu and match.group(2) == label
+        ]
+        assert found, f"the {menu} menu did not list {label!r}: " + session.read_log()[-600:]
+        entry = found[-1]
+        x = float(entry.group(3)) + float(entry.group(5)) / 2.0
+        y = float(entry.group(4)) + float(entry.group(6)) / 2.0
+        begin = len(session.read_log())
+        session.send(f"click {x:.0f} {y:.0f}")
+        try:
+            session.wait(
+                re.escape(MENU_ACTION_TOKEN)
+                + rf'\s+menu="{menu}"\s+label="{re.escape(action_label)}"',
+                30,
+                f"the {menu} menu ran {action_label!r}",
+                begin,
+            )
+            return
+        except TimeoutError:
+            if attempt == 2:
+                raise
+            print(
+                "  [RETRY] the {} menu's {!r} click missed; retrying once".format(
+                    menu, label
+                )
+            )
 
 
 def logged_scene_rect(session: EditorSession, view: int) -> tuple:
@@ -539,6 +567,22 @@ def console_dump(session: EditorSession, begin: int):
     """The newest console dump written since `begin`, or None when none is."""
     matches = list(re.finditer(CONSOLE_DUMP_PATTERN, session.read_log()[begin:]))
     return matches[-1] if matches else None
+
+
+def wait_for_stub_record(session: EditorSession, timeout: float = 30.0) -> str:
+    """Waits for the stub editor to record its arguments, and returns them."""
+    record = session.stub_editor_record
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if record.is_file():
+            text = record.read_text(encoding="utf-8").strip()
+            if text:
+                print("  [OK] the stub editor recorded {}".format(text))
+                return text
+        time.sleep(0.2)
+    raise TimeoutError(
+        "the stub code editor recorded nothing at {}".format(record)
+    )
 
 
 def rect_center(rect: tuple) -> tuple:
@@ -3077,8 +3121,11 @@ def main() -> int:
         print("  [OK] project reloaded, editor UI kept")
 
         # Step 8b: a build failure keeps the running generation and says so -
-        # an error toast now, a Problems row once the panel draws them
-        # (W-0038 Stages 4 and 6).
+        # an error toast now, and a Problems row with the compiler's own
+        # `file:line` (W-0038 Stages 4 and 6). The configured code editor is
+        # a stub that records the argument it was opened with, so the click's
+        # effect is a file this suite can read.
+        session.write_stub_editor()
         failure_start = len(session.read_log())
         session.edit_source(
             project_source,
@@ -3092,6 +3139,41 @@ def main() -> int:
             "build-failed toast",
             failure_start,
         )
+        # The same failure is a Problems row with the file and line the
+        # compiler printed (W-0038 Stage 6), and a click on that row runs the
+        # configured code editor command - here a stub that records its
+        # arguments - with `file:line` as the last argument.
+        problems_begin = len(session.read_log())
+        session.send("tab problems")
+        session.send("dump problems")
+        session.wait(
+            re.escape(PROBLEMS_DUMP_TOKEN) + r"\s+count=([1-9][0-9]*)",
+            60,
+            "the Problems rows",
+            problems_begin,
+        )
+        row = re.search(
+            re.escape(PROBLEM_ROW_TOKEN)
+            + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
+            session.read_log()[problems_begin:],
+        )
+        assert row, "the Problems panel showed no located error row"
+        assert row.group(1).endswith(project_source.name), (
+            "the Problems row pointed at {!r}, not the edited source".format(row.group(1))
+        )
+        open_begin = len(session.read_log())
+        session.send("problem open 0")
+        session.wait(
+            re.escape(PROBLEM_OPENED_TOKEN), 60, "the row opened in the editor", open_begin
+        )
+        recorded = wait_for_stub_record(session)
+        # The log escapes a Windows path's backslashes; the stub writes what
+        # it was given, so the expectation is unescaped before the compare.
+        expected = row.group(1).replace("\\\\", "\\") + ":" + row.group(2)
+        assert expected in recorded, (
+            "the stub editor was opened with {!r}, not {!r}".format(recorded, expected)
+        )
+        print("  [OK] the Problems panel located the error and opened it")
         # Restoring the source builds again; the project comes back and the
         # failure's rows clear with it.
         session.edit_source(
@@ -3101,7 +3183,16 @@ def main() -> int:
         session.wait_occurrence(
             re.escape(PROJECT_RELOAD_TOKEN), reloads + 1, 240, "recovery reload"
         )
+        cleared_begin = len(session.read_log())
+        session.send("dump problems")
+        session.wait(
+            re.escape(PROBLEMS_DUMP_TOKEN) + r"\s+count=0",
+            60,
+            "the Problems rows cleared",
+            cleared_begin,
+        )
         print("  [OK] build-failed toast, then the project recovered")
+
 
         # Step 9: the second viewport's tab floats into its own egui window;
         # its own scene surface (view=1) goes live at that window's body
