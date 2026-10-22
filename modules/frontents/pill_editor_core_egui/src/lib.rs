@@ -30,6 +30,8 @@ pub mod brand;
 /// The Assets tab's project browser: the open folder and the listing math
 /// the tree and the grid share.
 pub mod browser;
+/// The redraw cadence: when the editor owes a frame (W-0038 Stage 9).
+pub mod cadence;
 /// The scene viewports' orbit cameras and their navigation gestures.
 pub mod camera;
 /// The clipboard payload documents the copy and paste commands share.

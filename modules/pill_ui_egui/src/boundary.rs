@@ -24,6 +24,7 @@ use egui::{Context, CursorIcon, FullOutput, OutputCommand, TexturesDelta};
 use pill_core::math::Vector2f;
 use pill_engine_core::input::InputEvent;
 use pill_engine_core::Resource;
+use std::time::Duration;
 
 /// The geometry and focus the frontend feeds the shell each frame.
 #[derive(Clone, Debug)]
@@ -132,6 +133,10 @@ pub struct EguiShellFrame {
     /// it through the same path a window close takes; a browser frontend
     /// ignores it (a page cannot close itself safely).
     pub quit_requested: bool,
+    /// When egui asked for the next pass: `Some(Duration::ZERO)` draws again
+    /// at once, `None` means no pass was requested. The frontend's redraw
+    /// cadence honours it (W-0038 Stage 9).
+    pub repaint_after: Option<Duration>,
 }
 
 impl Resource for EguiShellFrame {}
@@ -152,6 +157,7 @@ impl Default for EguiShellFrame {
             ime_allowed: false,
             ime_rect: None,
             quit_requested: false,
+            repaint_after: None,
         }
     }
 }
@@ -162,6 +168,14 @@ impl Default for EguiShellFrame {
 /// is arbitrary user data; they are dropped here so only meshes cross.
 pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFrame {
     let pixels_per_point = output.pixels_per_point;
+    // The earliest deadline any viewport named; `Duration::MAX` is egui's
+    // "no pass requested".
+    let repaint_after = output
+        .viewport_output
+        .values()
+        .map(|viewport| viewport.repaint_delay)
+        .filter(|delay| *delay != Duration::MAX)
+        .min();
     let meshes = context
         .tessellate(output.shapes, pixels_per_point)
         .into_iter()
@@ -199,6 +213,7 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         ime_rect: None,
         // Only the shell's menu can ask to quit; it sets the flag itself.
         quit_requested: false,
+        repaint_after,
     }
 }
 
