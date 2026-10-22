@@ -362,6 +362,7 @@ pub fn run_frame(
     notices: &EditorNotices,
     panels: &PanelRegistry,
     panel_commands: &mut Vec<PanelCommand>,
+    clipboard: &mut pill_editor_core_egui::clipboard::EditorClipboard,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
@@ -490,6 +491,7 @@ pub fn run_frame(
             .as_ref()
             .map(|(slot, window)| (*slot, window.as_str())),
         panel_window_ping_used: false,
+        clipboard,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -751,6 +753,9 @@ pub struct EditorTabViewer<'a> {
     pub panel_window_ping: Option<(u16, &'a str)>,
     /// Whether the pinged panel drew this pass, so the request is spent.
     pub panel_window_ping_used: bool,
+    /// The shell's side of the OS clipboard (W-0038 Stage 17): the request
+    /// the executable carries out, and the text it read back.
+    pub clipboard: &'a mut pill_editor_core_egui::clipboard::EditorClipboard,
 }
 
 impl TabViewer for EditorTabViewer<'_> {

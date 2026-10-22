@@ -44,6 +44,11 @@ pub fn raw_input(shell_input: &EguiShellInput) -> RawInput {
     for event in &shell_input.events {
         walk.push(event, scale, &mut events);
     }
+    // The OS clipboard's text, when the frame carried a paste chord: egui
+    // only pastes from this event (W-0038 Stage 17).
+    if let Some(text) = shell_input.paste_text.as_ref() {
+        events.push(Event::Paste(text.clone()));
+    }
 
     RawInput {
         screen_rect: Some(Rect::from_min_size(

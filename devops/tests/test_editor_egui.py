@@ -74,6 +74,7 @@ from core.editor_session import (  # noqa: E402
     run_directory,
 )
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E402
+from core import win_clipboard  # noqa: E402
 
 # The suite tokens: the stable halves of the lines this suite asserts on, so
 # `test_log_contract.py` checks each against the Rust sources. Patterns that
@@ -146,6 +147,11 @@ SELECTION_DUMP_TOKEN = "[test] selection"
 SELECTED_ENTITY_TOKEN = "[test] selected entity"
 MIXED_ROW_TOKEN = "[editor] inspector row kind=mixed"
 SELECTION_EDIT_TOKEN = "[editor] selection field edit queued"
+CLIPBOARD_WRITTEN_TOKEN = "[editor] clipboard written"
+CLIPBOARD_PASTED_TOKEN = "[editor] clipboard pasted"
+# The registered name the showcase component's payload carries (W-0038
+# Stage 17): the paste's registry check compares full type names.
+SHOWCASE_TYPE_NAME = "italian_brainrot::ShowcaseComponent"
 WINDOWS_DUMP_TOKEN = "[test] windows"
 WINDOW_ROW_TOKEN = "[test] window"
 SAFE_MODE_TOKEN = "[editor] safe mode"
@@ -1638,6 +1644,74 @@ def main() -> int:
             begin,
         )
         print("  [OK] a plain click reset the selection")
+
+        # Step 3a10: the clipboard (W-0038 Stage 17). A copy leaves the
+        # editor under its registered format, which another process reads back
+        # here; a component payload written from outside pastes onto the
+        # selection in one undo step; and a second editor instance pastes the
+        # entity copy, which is what "across editor instances" means.
+        win_clipboard.clear()
+        begin = len(session.read_log())
+        session.send("command editor.copy")
+        session.wait(
+            re.escape(CLIPBOARD_WRITTEN_TOKEN), 30, "the clipboard write", begin
+        )
+        payload = json.loads(win_clipboard.read_payload())
+        assert payload.get("kind") == "entity", (
+            "the registered format does not carry an entity payload: {}".format(payload)
+        )
+        assert payload.get("pill") == 1, "the payload's version is not 1"
+        print("  [OK] the copy reached the OS clipboard as an entity payload")
+
+        component_payload = {
+            "pill": 1,
+            "kind": "component",
+            "component": {"type": SHOWCASE_TYPE_NAME, "fields": [["frame", "7.25f"]]},
+        }
+        win_clipboard.write_payload(json.dumps(component_payload))
+        begin = len(session.read_log())
+        session.send("command editor.paste")
+        session.wait(
+            re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="component"',
+            30,
+            "the component paste",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send(
+            "dump field {} {} frame".format(prior_entity, SHOWCASE_COMPONENT)
+        )
+        session.wait(re.escape(FIELD_TOKEN), 30, "the pasted field", begin)
+        assert "7.25" in session.read_log()[begin:], (
+            "the component paste did not apply: {}".format(
+                session.read_log()[begin:][-600:]
+            )
+        )
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the paste's undo", begin)
+        begin = len(session.read_log())
+        session.send(
+            "dump field {} {} frame".format(prior_entity, SHOWCASE_COMPONENT)
+        )
+        session.wait(re.escape(FIELD_TOKEN), 30, "the restored pasted field", begin)
+        assert "7.25" not in session.read_log()[begin:], (
+            "one undo did not take the whole component paste back: {}".format(
+                session.read_log()[begin:][-600:]
+            )
+        )
+        print("  [OK] a component paste applied and undid in one step")
+
+        # The entity copy is taken here and pasted by the restart session
+        # below: the clipboard is the OS's, so the paste crosses a process
+        # boundary and the two editors never have to run at once.
+        win_clipboard.clear()
+        begin = len(session.read_log())
+        session.send("command editor.copy")
+        session.wait(
+            re.escape(CLIPBOARD_WRITTEN_TOKEN), 30, "the second clipboard write", begin
+        )
+        print("  [OK] an entity copy sits on the OS clipboard for the next editor")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.
@@ -3669,6 +3743,67 @@ def main() -> int:
             )
         )
         print("  [OK] the rearranged dock came back after a restart")
+
+        # The clipboard crossed the process boundary (W-0038 Stage 17): the
+        # session above copied an entity onto the OS clipboard, and this
+        # editor - a different process - pastes it as one recorded step.
+        entities_here = len(
+            re.findall(
+                re.escape(ENTITY_ROW_TOKEN),
+                restart.request(
+                    "dump entities",
+                    re.escape(ENTITIES_DUMP_TOKEN),
+                    60,
+                    "the restarted editor's entity list",
+                ),
+            )
+        )
+        begin = len(restart.read_log())
+        restart.send("command editor.paste")
+        restart.wait(
+            re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="entity"',
+            60,
+            "the pasted entity",
+            begin,
+        )
+        pasted = len(
+            re.findall(
+                re.escape(ENTITY_ROW_TOKEN),
+                restart.request(
+                    "dump entities",
+                    re.escape(ENTITIES_DUMP_TOKEN),
+                    60,
+                    "the entity list after the paste",
+                ),
+            )
+        )
+        assert pasted == entities_here + 1, (
+            "the paste did not add exactly one entity: {} vs {}".format(
+                pasted, entities_here
+            )
+        )
+        begin = len(restart.read_log())
+        restart.send("command editor.undo")
+        restart.wait(
+            re.escape(HISTORY_UNDO_TOKEN), 30, "the pasted entity's undo", begin
+        )
+        restored = len(
+            re.findall(
+                re.escape(ENTITY_ROW_TOKEN),
+                restart.request(
+                    "dump entities",
+                    re.escape(ENTITIES_DUMP_TOKEN),
+                    60,
+                    "the entity list after the undo",
+                ),
+            )
+        )
+        assert restored == entities_here, (
+            "the undo did not remove the pasted entity: {} vs {}".format(
+                restored, entities_here
+            )
+        )
+        print("  [OK] an entity copied in one editor pasted into another")
 
         # Leave through the scripted channel's own quit: the first click of a
         # freshly started session goes to focusing its window, and the menu's

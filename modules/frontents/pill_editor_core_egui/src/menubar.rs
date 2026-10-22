@@ -165,6 +165,9 @@ pub enum MenuAction {
     About,
     /// Quit the editor.
     Quit,
+    /// Copy, cut or paste (W-0038 Stage 17): the shell queues the request the
+    /// executable's OS clipboard bridge carries out.
+    Clipboard(crate::clipboard::ClipboardAction),
 }
 
 /// The entries of `menu`: one row per registered command whose menu path
@@ -250,6 +253,20 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
                 commands: vec![step],
             }
         }
+        // The clipboard rows (W-0038 Stage 17): Copy and Cut need a selection
+        // with something to carry, Paste is always offered - whether the
+        // clipboard holds a payload is the executable's answer, and a refusal
+        // there is a toast rather than a greyed row nobody can explain.
+        "editor.copy" | "editor.cut" => {
+            let action = if command.id == "editor.copy" {
+                crate::clipboard::ClipboardAction::Copy
+            } else {
+                crate::clipboard::ClipboardAction::Cut
+            };
+            enabled = view.selection.primary().is_some() || view.selection.asset.is_some();
+            MenuAction::Clipboard(action)
+        }
+        "editor.paste" => MenuAction::Clipboard(crate::clipboard::ClipboardAction::Paste),
         "editor.asset.create" => MenuAction::CreateAsset,
         "editor.asset_write_meta" => {
             // The toolbar's rule: only a sourced file without a sidecar can
@@ -462,8 +479,11 @@ mod tests {
         assert_eq!(rows[1].1, false, "no redo history yet");
         assert_eq!(rows[5].1, false, "nothing selected to delete");
         assert_eq!(rows[6].1, true, "the preferences tab always opens");
-        // Copy, cut and paste are registered with no action here yet.
-        assert_eq!((rows[2].1, rows[3].1, rows[4].1), (false, false, false));
+        // Copy and cut need something to carry; paste is always offered, because
+        // whether the clipboard holds a payload is the executable's answer
+        // (W-0038 Stage 17).
+        assert_eq!((rows[2].1, rows[3].1), (false, false));
+        assert_eq!(rows[4].1, true, "paste is offered with nothing selected");
 
         snapshot.undo_depth = 2;
         snapshot.redo_depth = 1;
@@ -479,6 +499,8 @@ mod tests {
         assert_eq!(rows[0].1, true);
         assert_eq!(rows[1].1, true);
         assert_eq!(rows[5].1, true);
+        // A selection is something to copy and cut.
+        assert_eq!((rows[2].1, rows[3].1), (true, true));
         match &enabled[6] {
             MenuEntry::Action {
                 action: MenuAction::Queue { label, commands },

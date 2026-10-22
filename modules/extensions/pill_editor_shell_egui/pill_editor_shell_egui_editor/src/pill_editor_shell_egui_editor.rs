@@ -178,6 +178,8 @@ pub fn egui_shell_update(
             // the commands they asked for this pass.
             Res<PanelRegistry>,
             ResMut<PanelCommands>,
+            // The shell's side of the OS clipboard (W-0038 Stage 17).
+            ResMut<pill_editor_core_egui::clipboard::EditorClipboard>,
         ),
     ),
 ) {
@@ -188,20 +190,25 @@ pub fn egui_shell_update(
         mut input,
         mut frame,
         (snapshot, mut selection, notices),
-        (mut pending, panels, mut panel_commands),
+        (mut pending, panels, mut panel_commands, mut clipboard),
     ) = resources;
     let (
         Some(mut state),
         Some(input),
         Some(mut frame),
         (Some(snapshot), Some(mut selection), Some(notices)),
-        (Some(mut pending), Some(panels), Some(mut panel_commands)),
+        (Some(mut pending), Some(panels), Some(mut panel_commands), Some(mut clipboard)),
     ) = (
         state.get_mut(),
         input.get_mut(),
         frame.get_mut(),
         (snapshot.get(), selection.get_mut(), notices.get()),
-        (pending.get_mut(), panels.get(), panel_commands.get_mut()),
+        (
+            pending.get_mut(),
+            panels.get(),
+            panel_commands.get_mut(),
+            clipboard.get_mut(),
+        ),
     )
     else {
         return;
@@ -216,5 +223,6 @@ pub fn egui_shell_update(
         notices,
         panels,
         &mut panel_commands.commands,
+        &mut clipboard,
     );
 }

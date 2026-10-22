@@ -52,6 +52,14 @@ pub struct EguiShellInput {
     /// release with no move before it: this seeds the bridge with the place
     /// the pointer was last seen (W-0038 Stage 1).
     pub cursor: Option<Vector2f>,
+    /// The OS clipboard's text, carried when the frame's events include a paste
+    /// chord (W-0038 Stage 17).
+    ///
+    /// egui pastes text only from an [`egui::Event::Paste`], and only the
+    /// frontend can read the OS clipboard, so it reads it once per paste chord
+    /// and the bridge appends the event: without this a focused text field
+    /// would ignore Ctrl+V.
+    pub paste_text: Option<String>,
 }
 
 impl Resource for EguiShellInput {}
@@ -66,6 +74,7 @@ impl Default for EguiShellInput {
             frames_per_second: 0.0,
             events: Vec::new(),
             cursor: None,
+            paste_text: None,
         }
     }
 }
