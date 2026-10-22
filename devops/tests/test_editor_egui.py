@@ -129,6 +129,8 @@ STATS_DUMP_TOKEN = "[test] stats"
 STATS_TAB_TOKEN = "[test] stats tab"
 CADENCE_DUMP_TOKEN = "[test] cadence"
 REDRAW_ON_DEMAND_TOKEN = "[editor] redraw on demand"
+NO_OVERLAY_TOKEN = "[editor] no overlay posture"
+OVERLAY_POSTURE_TOKEN = "[editor] overlay posture"
 SAFE_MODE_TOKEN = "[editor] safe mode"
 SAFE_MODE_RETRY_TOKEN = "[editor] safe mode retry requested"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
@@ -3407,6 +3409,67 @@ def main() -> int:
         )
     finally:
         cadence.close()
+
+    # Step 13: the no-overlay posture (W-0038 Stage 10). `PILL_EDITOR_NO_OVERLAY`
+    # puts the UI on the window's own surface instead of the composition
+    # overlay; the editor must still start, dock and edit, and the warning must
+    # be said once rather than every frame.
+    plain = EditorSession(
+        "egui", "no-overlay", project=arguments.project, test_seconds=180, binary=binary
+    )
+    plain.start(
+        extra_env={
+            "PILL_EDITOR_NO_OVERLAY": "1",
+            "PILL_EDITOR_CONTINUOUS_REDRAW": "1",
+        }
+    )
+    try:
+        wait_for_token(
+            plain, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "no-overlay startup"
+        )
+        wait_for_token(
+            plain, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "the shell in that posture"
+        )
+        log = plain.read_log()
+        assert NO_OVERLAY_TOKEN in log, (
+            "the editor never reported the no-overlay posture: {}".format(log[-800:])
+        )
+        assert log.count(NO_OVERLAY_TOKEN) == 1, (
+            "the no-overlay warning repeated {} times".format(
+                log.count(NO_OVERLAY_TOKEN)
+            )
+        )
+        assert re.search(re.escape(OVERLAY_POSTURE_TOKEN) + r"\s+window_surface=true", log), (
+            "the posture line did not name the window surface: {}".format(log[-800:])
+        )
+        # Docks: a tab is activated and undocked, and the dock reports the
+        # second surface it became.
+        plain.send("tab statistics")
+        plain.send("undock statistics")
+        dock = plain.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 60, "the dock in that posture"
+        )
+        surfaces = re.search(DOCK_DUMP_PATTERN, dock)
+        assert surfaces and int(surfaces.group(1)) >= 2, (
+            "the undocked tab did not become a surface: {}".format(dock[-600:])
+        )
+        assert "statistics" in dock, "the dock never named the undocked tab"
+        # Edits: a preference row goes through the same queued path a click
+        # takes, and reads back through the dump.
+        begin = len(plain.read_log())
+        plain.send("edit preference snapping_steps.rotation_degrees 9.5")
+        plain.wait(
+            re.escape(PREFERENCES_SAVED_TOKEN), 60, "the edit saved", begin
+        )
+        begin = len(plain.read_log())
+        plain.send("dump preferences")
+        plain.wait(re.escape(PREFERENCES_DUMP_TOKEN), 60, "the edit read back", begin)
+        assert re.search(
+            r'snapping_rotation_degrees="9\.5"', plain.read_log()[begin:]
+        ), plain.read_log()[begin:][-600:]
+        print("  [OK] the no-overlay posture started, docked and edited")
+    finally:
+        plain.close()
 
     # Stage 8: safe mode. The editor starts against a shell whose source does
     # not compile: it shows the build errors with their `file:line` and a

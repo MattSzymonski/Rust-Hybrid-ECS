@@ -92,12 +92,90 @@ use winit::window::{Window, WindowId};
 
 // Current crate
 use crate::frontend::EditorError;
+use crate::overlay::OverlayMode;
 use crate::overlay::OverlaySurface;
 use crate::test_channel::{self, TestChannel};
 
 // =============================================================================
 // Constants
 // =============================================================================
+
+/// The environment variable that forces the window-surface posture.
+pub const NO_OVERLAY_ENV: &str = "PILL_EDITOR_NO_OVERLAY";
+
+/// Whether [`NO_OVERLAY_ENV`] asks for the window-surface posture.
+///
+/// The switch, like the continuous-redraw one, is on for anything but an empty
+/// string or `0`, so `PILL_EDITOR_NO_OVERLAY=1` in a shell is enough.
+fn no_overlay_requested() -> bool {
+    std::env::var(NO_OVERLAY_ENV)
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+}
+
+/// Build the UI's surface in the posture the editor starts in.
+///
+/// The composition overlay is the normal one and the window surface is the
+/// fallback: a refusal is logged once and the editor keeps running, with the
+/// UI on the window's own surface (W-0038 Stage 10).
+fn create_overlay(
+    no_overlay: bool,
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    window: Arc<Window>,
+    size: (u32, u32),
+    scale_factor: f32,
+) -> Option<OverlaySurface> {
+    if no_overlay {
+        warn!(
+            target: telemetry_target::ENGINE,
+            variable = NO_OVERLAY_ENV,
+            "[editor] no overlay posture: the UI is drawn on the window surface"
+        );
+        return create_window_overlay(instance, adapter, device, window, size);
+    }
+    match OverlaySurface::new(
+        instance,
+        adapter,
+        device,
+        Arc::clone(&window),
+        EDITOR_FORMAT,
+        size,
+        scale_factor,
+    ) {
+        Ok(overlay) => Some(overlay),
+        Err(error) => {
+            warn!(
+                target: telemetry_target::ENGINE,
+                error = %error,
+                "[editor] composition overlay unavailable; drawing the UI on the window surface"
+            );
+            create_window_overlay(instance, adapter, device, window, size)
+        }
+    }
+}
+
+/// Build the window-surface overlay, logging the refusal that stops it.
+fn create_window_overlay(
+    instance: &wgpu::Instance,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    window: Arc<Window>,
+    size: (u32, u32),
+) -> Option<OverlaySurface> {
+    match OverlaySurface::new_window(instance, adapter, device, window, EDITOR_FORMAT, size) {
+        Ok(overlay) => Some(overlay),
+        Err(error) => {
+            warn!(
+                target: telemetry_target::ENGINE,
+                error = %error,
+                "[editor] window surface overlay unavailable; the UI will not be drawn"
+            );
+            None
+        }
+    }
+}
 
 /// The shell module's crate name - the editor-only module's convention.
 const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
@@ -498,6 +576,9 @@ struct EditorWindow {
     /// The composition overlay the UI is presented through; `None` until it
     /// is created, and left `None` when the platform refuses it.
     overlay: Option<OverlaySurface>,
+    /// `PILL_EDITOR_NO_OVERLAY` asked for the window-surface posture, so the
+    /// composition overlay is never retried (W-0038 Stage 10).
+    no_overlay: bool,
     /// Frames between overlay creation attempts after a failure.
     overlay_retry_frame: u64,
     /// The editor's fallback context, used while no shell module is loaded.
@@ -709,25 +790,23 @@ impl EditorWindow {
             EDITOR_FORMAT,
             egui_wgpu::RendererOptions::default(),
         );
-        let overlay = match OverlaySurface::new(
+        let no_overlay = no_overlay_requested();
+        let overlay = create_overlay(
+            no_overlay,
             &instance,
             &adapter,
             &device,
             Arc::clone(&window),
-            EDITOR_FORMAT,
             size,
             scale_factor,
-        ) {
-            Ok(overlay) => Some(overlay),
-            Err(error) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    error = %error,
-                    "[editor] composition overlay unavailable; the UI will not be drawn"
-                );
-                None
-            }
-        };
+        );
+        if let Some(overlay) = &overlay {
+            info!(
+                target: telemetry_target::ENGINE,
+                window_surface = matches!(overlay.mode(), OverlayMode::Window),
+                "[editor] overlay posture"
+            );
+        }
         // Step 4: the game viewport's window first - it carries the primary
         // surface, so the project renders through its own camera into a
         // child window the Game tab shows through. A refusal leaves the
@@ -836,6 +915,7 @@ impl EditorWindow {
             camera_dirty: [true; SCENE_VIEWPORTS],
             egui_renderer,
             overlay,
+            no_overlay,
             overlay_retry_frame: 0,
             fallback_context: {
                 // The fallback draws the same theme as the shell, so a
@@ -4340,8 +4420,15 @@ impl EditorWindow {
         self.window.set_cursor(shape);
     }
 
-    /// Try to create the overlay again, at most every 120 frames.
+    /// Try to create the composition overlay again, at most every 120 frames.
+    ///
+    /// The window posture is not retried: it was either asked for
+    /// (`PILL_EDITOR_NO_OVERLAY`) or already taken as the fallback, and a
+    /// composition overlay is the posture that failed (W-0038 Stage 10).
     fn retry_overlay(&mut self) {
+        if self.no_overlay {
+            return;
+        }
         if self.frame_index < self.overlay_retry_frame + 120 {
             return;
         }
