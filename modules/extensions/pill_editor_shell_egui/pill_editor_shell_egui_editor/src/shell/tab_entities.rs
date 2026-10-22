@@ -76,12 +76,20 @@ pub fn entities_tab(
     overlay_regions: &mut Vec<ShellRect>,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // The list's own order, which a Shift-click reads to select a range.
+        let rows: Vec<Entity> = entity_rows(snapshot)
+            .into_iter()
+            .map(|(entity, _label)| entity)
+            .collect();
         for (entity, label) in entity_rows(snapshot) {
-            let selected = selection.entity == Some(entity);
+            let selected = selection.contains(entity);
             let response = ui.selectable_label(selected, label);
             if response.clicked() {
-                select_entity(selection, entity);
+                let click = ui.input(|input| click_from_modifiers(&input.modifiers));
+                select_entity_click(selection, entity, click, &rows);
             }
+            // A right click picks the row it opens the menu for, without
+            // disturbing a set the person is about to edit.
             if response.secondary_clicked() {
                 select_entity(selection, entity);
             }

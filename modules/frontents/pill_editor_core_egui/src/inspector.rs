@@ -30,7 +30,7 @@ use pill_ui_egui::icons::Icon;
 use serde_json::Value as JsonValue;
 
 // Current crate
-use crate::editor_state::{ComponentView, EditorCommand};
+use crate::editor_state::{ComponentView, EditorCommand, EntityDetail};
 
 /// The name after the last `::`, for labels and history entries.
 pub fn short_component_name(name: &str) -> &str {
@@ -424,6 +424,57 @@ pub fn field_coalesce_key(entity: Entity, component: &str, field: &str) -> Strin
     format!("inspector.{entity}.{component}.{field}")
 }
 
+/// The selected entities one component's edit reaches (W-0038 Stage 16): the
+/// primary first, then every other selected entity whose detail carries the
+/// component.
+///
+/// A selection whose entities do not all carry a component edits the ones that
+/// do - writing to an entity without it would fail the command and put an
+/// error in the Console for a row that showed nothing.
+pub fn selection_targets(
+    details: &[EntityDetail],
+    primary: Entity,
+    component: &str,
+) -> Vec<Entity> {
+    let mut targets = vec![primary];
+    for detail in details {
+        if detail.entity == primary {
+            continue;
+        }
+        if detail
+            .components
+            .iter()
+            .any(|view| view.type_name == component)
+        {
+            targets.push(detail.entity);
+        }
+    }
+    targets
+}
+
+/// One recorded batch writing `value` into `field` on every target, with its
+/// label and coalesce key.
+///
+/// The label names the primary's component and field, so a step reads the same
+/// whether one entity or ten were written; the coalesce key is the primary's,
+/// so a drag across a multi-selection collapses into one undo step.
+pub fn selection_field_edit(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    field: &str,
+    value: FieldValue,
+) -> (Vec<EditorCommand>, String, String) {
+    let mut commands = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (command, _step_label) = field_edit(*target, component, field, value.clone());
+        commands.push(command);
+    }
+    let (_command, label) = field_edit(primary, component, field, value);
+    let key = field_coalesce_key(primary, component, field);
+    (commands, label, key)
+}
+
 /// Element `index` of an array value, when it is one and the index fits.
 pub fn element_field(value: &FieldValue, index: usize) -> Option<FieldValue> {
     let FieldValue::Array(elements) = value else {
@@ -648,6 +699,72 @@ pub fn settings_coalesce_key(asset_path: &str, key_text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A detail whose components are named by their short names, enough to
+    /// answer which entities carry a component.
+    fn detail(entity: Entity, components: &[&str]) -> EntityDetail {
+        EntityDetail {
+            entity,
+            components: components
+                .iter()
+                .map(|name| ComponentView {
+                    type_name: name.to_string(),
+                    persistable: true,
+                    editable: true,
+                    fields: Vec::new(),
+                    values: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A multi-selection edits the entities that carry the component, and skips
+    /// the ones that do not (W-0038 Stage 16).
+    #[test]
+    fn selection_targets_skip_entities_without_the_component() {
+        let primary = Entity::from_raw(1, 0);
+        let carrier = Entity::from_raw(2, 0);
+        let other = Entity::from_raw(3, 0);
+        let details = vec![
+            detail(primary, &["Transform"]),
+            detail(carrier, &["Transform", "Health"]),
+            detail(other, &["Health"]),
+        ];
+        assert_eq!(
+            selection_targets(&details, primary, "Transform"),
+            vec![primary, carrier]
+        );
+        assert_eq!(
+            selection_targets(&details, primary, "Health"),
+            vec![primary, carrier, other]
+        );
+    }
+
+    /// One row's commit over a multi-selection is one recorded batch: one
+    /// command per target, named and coalesced by the primary.
+    #[test]
+    fn a_selection_field_edit_batches_every_target() {
+        let primary = Entity::from_raw(1, 0);
+        let second = Entity::from_raw(2, 0);
+        let (commands, label, key) = selection_field_edit(
+            &[primary, second],
+            primary,
+            "Transform",
+            "speed",
+            FieldValue::F32(2.5),
+        );
+        assert_eq!(commands.len(), 2);
+        assert_eq!(label, "set Transform.speed");
+        assert_eq!(key, field_coalesce_key(primary, "Transform", "speed"));
+        let entities: Vec<Entity> = commands
+            .iter()
+            .map(|command| match command {
+                EditorCommand::SetField { entity, .. } => *entity,
+                other => panic!("a selection edit queued {other:?}"),
+            })
+            .collect();
+        assert_eq!(entities, vec![primary, second]);
+    }
 
     #[test]
     fn labels_shorten_the_component_name() {

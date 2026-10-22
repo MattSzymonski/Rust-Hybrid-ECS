@@ -48,7 +48,8 @@ use pill_editor_core_egui::commands::{
 use pill_editor_core_egui::console::{ConsoleChannel, ConsoleLine, ConsoleState};
 use pill_editor_core_egui::drain::{self, HistoryDirection};
 use pill_editor_core_egui::editor_state::{
-    AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, StandaloneTypeInfo,
+    AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, SelectionClick,
+    StandaloneTypeInfo,
 };
 use pill_editor_core_egui::entities;
 use pill_editor_core_egui::gizmo::{
@@ -606,9 +607,9 @@ struct EditorWindow {
     /// position and the pick id. The answer starts a gizmo drag on a handle
     /// or moves the selection - both while the button is held.
     press_pick: Option<PressPick>,
-    /// The entity the renderer's outline set currently names, so the world
+    /// The entities the renderer's outline set currently names, so the world
     /// resource is written once per selection change.
-    outlined_entity: Option<Entity>,
+    outlined_entities: Vec<Entity>,
     /// The overlay chips' rectangles the shell reported last frame, in
     /// logical points: clicks inside them are the UI's, not the scene's.
     overlay_regions: Vec<ShellRect>,
@@ -958,7 +959,7 @@ impl EditorWindow {
             notices: EditorNotices::default(),
             scene_cursor: [None; SCENE_VIEWPORTS],
             press_pick: None,
-            outlined_entity: None,
+            outlined_entities: Vec::new(),
             overlay_regions: Vec::new(),
             gizmo_drag: None,
             gizmo_geometry: GizmoGeometry::default(),
@@ -1602,8 +1603,8 @@ impl EditorWindow {
                         "[editor] scene pick entity"
                     );
                     if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
-                        if selection.entity != Some(entity) {
-                            selection.entity = Some(entity);
+                        if selection.primary() != Some(entity) || selection.entities().len() != 1 {
+                            selection.select_only(entity);
                             info!(
                                 target: telemetry_target::ENGINE,
                                 entity = %entity,
@@ -1618,7 +1619,7 @@ impl EditorWindow {
                         "[editor] scene pick nothing"
                     );
                     if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
-                        selection.entity = None;
+                        selection.clear_entities();
                     }
                 }
                 PickHit::Handle(handle) => {
@@ -1663,28 +1664,31 @@ impl EditorWindow {
     }
 
     /// Publish the shared selection as the renderer's outline set (Stage
-    /// 13): the orange outline drawn around the selected entity, whether
-    /// the Entities tab or a scene pick moved the selection. One resource
-    /// write per change, before the frame that draws it.
+    /// 13): the orange outline drawn around every selected entity, whether
+    /// the Entities tab or a scene pick moved the selection (W-0038 Stage 16
+    /// outlines the whole set). One resource write per change, before the
+    /// frame that draws it.
     fn publish_selection_outline(&mut self) {
         let world = self.host.host_mut().engine_mut().world_mut();
-        let selected = world
+        let selected: Vec<Entity> = world
             .get_resource::<EditorSelection>()
-            .and_then(|selection| selection.entity);
-        if selected == self.outlined_entity {
+            .map(|selection| selection.entities().to_vec())
+            .unwrap_or_default();
+        if selected == self.outlined_entities {
             return;
         }
-        self.outlined_entity = selected;
+        self.outlined_entities = selected.clone();
         if world.get_resource::<SelectionOutlines>().is_none() {
             world.insert_resource(SelectionOutlines::default());
         }
         if let Some(outlines) = world.get_resource_mut::<SelectionOutlines>() {
-            outlines.entities = selected.into_iter().collect();
+            outlines.entities = selected.clone();
         }
-        match selected {
+        match selected.last() {
             Some(entity) => info!(
                 target: telemetry_target::ENGINE,
                 entity = %entity,
+                count = selected.len(),
                 "[editor] outline set"
             ),
             None => info!(
@@ -1716,7 +1720,7 @@ impl EditorWindow {
                 .unwrap_or_default();
             let selected = world
                 .get_resource::<EditorSelection>()
-                .and_then(|selection| selection.entity);
+                .and_then(|selection| selection.primary());
             match selected.and_then(|entity| {
                 read_transform(world, entity).map(|transform| (entity, transform))
             }) {
@@ -2012,7 +2016,7 @@ impl EditorWindow {
                 .unwrap_or_default();
             let selected = world
                 .get_resource::<EditorSelection>()
-                .and_then(|selection| selection.entity);
+                .and_then(|selection| selection.primary());
             let Some(entity) = selected else {
                 return;
             };
@@ -2456,7 +2460,7 @@ impl EditorWindow {
                 .unwrap_or_default();
             let selected = world
                 .get_resource::<EditorSelection>()
-                .and_then(|selection| selection.entity);
+                .and_then(|selection| selection.primary());
             let Some(entity) = selected else {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -2872,6 +2876,20 @@ impl EditorWindow {
     /// A screen-space click cannot re-select an entity a gizmo drag moved;
     /// the handle a pick logged still resolves here.
     fn scripted_select_entity(&mut self, handle: &str) {
+        // A plain click is the reset shape of the same rule, so the two scripted
+        // verbs and the pointer path share one path (W-0038 Stage 16).
+        self.scripted_select_extend(handle, SelectionClick::Reset);
+    }
+
+    /// The scripted selection extension (`select add` / `select range`): the
+    /// set a Ctrl- or Shift-click on the Entities list produces, recorded as
+    /// the same single `SetSelection` step the row click queues (W-0038
+    /// Stage 16).
+    ///
+    /// The click rule itself lives in the core's `EditorSelection::clicked`, so
+    /// the pointer path and this channel cannot disagree about what a click
+    /// means; what the modifiers do is the shell's `click_from_modifiers`.
+    fn scripted_select_extend(&mut self, handle: &str, click: SelectionClick) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = resolve_display_entity(world, handle) else {
             warn!(
@@ -2881,24 +2899,61 @@ impl EditorWindow {
             );
             return;
         };
-        let asset = world
-            .get_resource::<EditorSelection>()
-            .and_then(|selection| selection.asset.clone());
+        // The Entities list's row order, which a range click reads.
+        let rows: Vec<Entity> = world
+            .get_resource::<EditorSnapshot>()
+            .map(|snapshot| snapshot.entities.iter().map(|row| row.entity).collect())
+            .unwrap_or_default();
+        let Some(selection) = world.get_resource::<EditorSelection>() else {
+            return;
+        };
+        let entities = selection.clicked(click, entity, &rows);
+        let asset = selection.asset.clone();
+        let count = entities.len();
+        let label = match click {
+            SelectionClick::Reset if count <= 1 => "select entity",
+            _ => "select entities",
+        };
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(
-                vec![EditorCommand::SetSelection {
-                    entity: Some(entity),
-                    asset,
-                }],
-                "select entity",
+                vec![EditorCommand::SetSelection { entities, asset }],
+                label,
                 Some("editor.selection".to_string()),
             );
         }
         info!(
             target: telemetry_target::ENGINE,
             entity = %entity,
+            count,
             "[editor] selection changed"
         );
+    }
+
+    /// Log the selected entities, primary last (`dump selection`).
+    fn dump_selection(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let (entities, asset) = world
+            .get_resource::<EditorSelection>()
+            .map(|selection| (selection.entities().to_vec(), selection.asset.clone()))
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            count = entities.len(),
+            asset = asset.as_deref().unwrap_or("none"),
+            primary = entities
+                .last()
+                .map(|entity| entity.to_string())
+                .unwrap_or_else(|| "none".to_string())
+                .as_str(),
+            "[test] selection"
+        );
+        for entity in &entities {
+            info!(
+                target: telemetry_target::ENGINE,
+                entity = %entity,
+                "[test] selected entity"
+            );
+        }
     }
 
     /// One Assets toolbar button, driven by the scripted channel: the same
@@ -2917,10 +2972,11 @@ impl EditorWindow {
                 .and_then(|selection| selection.asset.clone());
             (rows, types, selected)
         };
-        let selection = EditorSelection {
-            asset: selected,
-            ..EditorSelection::default()
-        };
+        // A view of the selection for the shared asset helpers: only the asset
+        // half is theirs, and the entity set is empty because nothing here
+        // acts on entities.
+        let mut selection = EditorSelection::default();
+        selection.asset = selected;
         match action {
             ToolbarAction::Create => {
                 let world = self.host.host_mut().engine_mut().world_mut();
@@ -3079,6 +3135,67 @@ impl EditorWindow {
                 None
             }
         }
+    }
+
+    /// One scripted whole-field edit over the whole selection (`edit selection
+    /// <component> <field> <value>`): the recorded batch an Inspector row
+    /// queues when several entities are selected (W-0038 Stage 16).
+    ///
+    /// The value parses against the primary's field, and the write reaches
+    /// every selected entity whose detail carries the component, so an
+    /// `EditorCommand::SetField` step is recorded once for the set and undoes
+    /// in one step.
+    fn scripted_edit_selection(&mut self, component_text: &str, field: &str, value_text: &str) {
+        let (primary, details) = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let Some(primary) = world
+                .get_resource::<EditorSelection>()
+                .and_then(|selection| selection.primary())
+            else {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] selection edit needs a selected entity"
+                );
+                return;
+            };
+            let details = world
+                .get_resource::<EditorSnapshot>()
+                .map(|snapshot| snapshot.selected_details.clone())
+                .unwrap_or_default();
+            (primary, details)
+        };
+        let Some((entity, component, current)) =
+            self.resolve_edit_target(&primary.to_string(), component_text, field)
+        else {
+            return;
+        };
+        let value = match inspector::parse_field_value(value_text, &current) {
+            Ok(value) => value,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    field,
+                    message = message.as_str(),
+                    "[editor] inspector value not understood"
+                );
+                return;
+            }
+        };
+        let targets = inspector::selection_targets(&details, entity, &component);
+        let (commands, label, coalesce) =
+            inspector::selection_field_edit(&targets, entity, &component, field, value);
+        let written = commands.len();
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push_recorded(commands, label, Some(coalesce));
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            component = component.as_str(),
+            field,
+            entities = written,
+            "[editor] selection field edit queued"
+        );
     }
 
     /// One scripted whole-field edit (`edit set <entity> <component>
@@ -3469,7 +3586,7 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = world
             .get_resource::<EditorSelection>()
-            .and_then(|selection| selection.entity)
+            .and_then(|selection| selection.primary())
         else {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -3519,7 +3636,7 @@ impl EditorWindow {
                 PanelCommand::SelectEntity(entity) => {
                     let world = self.host.host_mut().engine_mut().world_mut();
                     if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
-                        selection.entity = Some(entity);
+                        selection.select_only(entity);
                     }
                     info!(
                         target: telemetry_target::ENGINE,
@@ -3686,10 +3803,23 @@ impl EditorWindow {
         let selected = engine
             .world()
             .get_resource::<EditorSelection>()
-            .and_then(|selection| selection.entity);
+            .and_then(|selection| selection.primary());
+        let selected_entities: Vec<Entity> = engine
+            .world()
+            .get_resource::<EditorSelection>()
+            .map(|selection| selection.entities().to_vec())
+            .unwrap_or_default();
         let mut snapshot = EditorSnapshot::capture_list(engine, self.frame_index, &[], Vec::new());
         snapshot.detail =
             selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
+        // Every selected entity's detail (Stage 16): a shared-field edit
+        // writes only the entities a component exists on, and a row's mixed
+        // marker reads them.
+        snapshot.selected_details = selected_entities
+            .iter()
+            .take(pill_editor_core_egui::editor_state::SELECTED_DETAILS_MAX)
+            .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
+            .collect();
         snapshot.assets = self.asset_entries.clone();
         snapshot.standalone_types = self.standalone_types.clone();
         snapshot.asset_detail = self.asset_detail.clone();
@@ -4713,7 +4843,7 @@ impl EditorWindow {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
                 .get_resource::<EditorSelection>()
-                .map(|selection| (selection.entity, selection.asset.clone()))
+                .map(|selection| (selection.primary(), selection.asset.clone()))
                 .unwrap_or((None, None))
         };
         let Some(entity) = entity else {
@@ -5124,6 +5254,7 @@ impl EditorWindow {
                 Dump::Windows => self.dump_windows(),
                 Dump::Resources => self.dump_resources(),
                 Dump::Entities => self.dump_entities(),
+                Dump::Selection => self.dump_selection(),
                 Dump::Field {
                     entity,
                     component,
@@ -5138,6 +5269,12 @@ impl EditorWindow {
             ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
             ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
+            ScriptedCommand::SelectAdd(handle) => {
+                self.scripted_select_extend(&handle, SelectionClick::Add)
+            }
+            ScriptedCommand::SelectRange(handle) => {
+                self.scripted_select_extend(&handle, SelectionClick::Range)
+            }
             ScriptedCommand::SelectResource(name) => self.scripted_select_resource(&name),
             ScriptedCommand::EditResource {
                 resource,
@@ -5161,6 +5298,11 @@ impl EditorWindow {
                 index,
                 value,
             } => self.scripted_edit_array(&entity, &component, &field, index, &value),
+            ScriptedCommand::EditSelection {
+                component,
+                field,
+                value,
+            } => self.scripted_edit_selection(&component, &field, &value),
             ScriptedCommand::EditAssetSettings { path, key, value } => {
                 self.scripted_asset_settings(&path, &key, &value)
             }

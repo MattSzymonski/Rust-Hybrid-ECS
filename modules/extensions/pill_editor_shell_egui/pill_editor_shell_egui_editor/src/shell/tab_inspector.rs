@@ -52,7 +52,7 @@ pub fn inspector_tab(
                 inspector_header(ui, snapshot, detail, pending, overlay_regions, session);
                 entity_inspector(ui, snapshot, detail, pending, overlay_regions, session);
             }
-            None => match selection.entity {
+            None => match selection.primary() {
                 Some(entity) => {
                     ui.label(format!("entity {entity} is not alive"));
                 }
@@ -283,10 +283,31 @@ pub fn entity_inspector(
             continue;
         }
         for row in inspector::rows(component) {
-            inspector_field_row(ui, detail.entity, component, &row, pending, session);
+            let targets = inspector_targets(snapshot, detail.entity, &component.type_name);
+            inspector_field_row(
+                ui,
+                detail.entity,
+                component,
+                &row,
+                &targets,
+                &snapshot.selected_details,
+                pending,
+                session,
+            );
         }
         ui.add_space(6.0);
     }
+}
+
+/// The selected entities one component's edit reaches: the primary first, then
+/// every other selected entity whose detail carries the component (W-0038
+/// Stage 16).
+pub fn inspector_targets(
+    snapshot: &EditorSnapshot,
+    primary: Entity,
+    component: &str,
+) -> Vec<Entity> {
+    inspector::selection_targets(&snapshot.selected_details, primary, component)
 }
 
 /// One component section's header bar: the foldout caret, the component's
