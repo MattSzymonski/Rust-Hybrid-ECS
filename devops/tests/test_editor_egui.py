@@ -152,6 +152,10 @@ CLIPBOARD_PASTED_TOKEN = "[editor] clipboard pasted"
 DROP_PREVIEW_TOKEN = "[editor] drop preview"
 FILES_DROPPED_TOKEN = "[editor] files dropped"
 DROP_REFUSED_FOLDER_TOKEN = "[editor] drop refused: folder"
+DRAG_OUT_PREPARED_TOKEN = "[editor] drag out prepared"
+# No pointer button is held during an automated run, so the drag has to end
+# before OLE's loop: that refusal is the deterministic half of drag-out.
+DRAG_OUT_NO_BUTTON_TOKEN = "[editor] drag out skipped: no button held"
 RECOVERED_STATE_TOKEN = "[editor] recovered editor state after an unclean exit"
 # The registered name the showcase component's payload carries (W-0038
 # Stage 17): the paste's registry check compares full type names.
@@ -1770,6 +1774,23 @@ def main() -> int:
             begin,
         )
         print("  [OK] a dropped folder is refused with a toast")
+
+        # Step 3a12: the drag-out smoke test (W-0038 Stage 19). Dropping into
+        # Explorer needs a person, so what this checks is everything up to
+        # OLE: the asset's path resolves to a file and becomes a data object.
+        # The drag then ends without entering OLE's loop, because no button is
+        # held - the same rule the drop source applies to a released button.
+        drag_source = REPOSITORY_ROOT / "local" / "temp" / "s19_drag.png"
+        drag_source.write_bytes(b"\x89PNG\r\n\x1a\ndrag probe\n")
+        begin = len(session.read_log())
+        session.send("drag out {}".format(drag_source))
+        session.wait(
+            re.escape(DRAG_OUT_PREPARED_TOKEN), 60, "the drag-out hand-off", begin
+        )
+        session.wait(
+            re.escape(DRAG_OUT_NO_BUTTON_TOKEN), 60, "the drag-out refusal", begin
+        )
+        print("  [OK] an asset reached OLE's data object, and the drag ends safely")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.

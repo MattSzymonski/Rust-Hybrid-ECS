@@ -30,6 +30,7 @@ use crate::frontend::EditorError;
 
 /// The editor's errors, with their stable diagnostic codes.
 mod clipboard;
+mod drag_out;
 mod frontend;
 /// The composition overlay over the editor window: a DirectComposition
 /// visual on Windows, its wgpu surface, and the egui-wgpu draw path.

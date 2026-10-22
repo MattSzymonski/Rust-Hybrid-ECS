@@ -84,6 +84,7 @@ fn the_tab_bodies_draw_without_panicking() {
     let mut pending = PendingEditorCommands::default();
     let mut draft: Option<preferences::PreferencesDraft> = None;
     let mut browser = ProjectBrowser::default();
+    let mut drag_out: Option<String> = None;
     let context = egui::Context::default();
     style::apply(&context);
     let mut regions = Vec::new();
@@ -108,6 +109,7 @@ fn the_tab_bodies_draw_without_panicking() {
                 &mut pending,
                 &mut regions,
                 &mut browser,
+                &mut drag_out,
             );
             preferences_tab(ui, &snapshot, &mut draft, &mut pending);
             scene_overlay(ui, 120.0, &mut regions);
@@ -152,6 +154,7 @@ fn the_browser_draws_its_tree_path_and_tiles() {
     let mut selection = EditorSelection::default();
     let mut dialog: Option<AssetDialog> = None;
     let mut pending = PendingEditorCommands::default();
+    let mut drag_out: Option<String> = None;
     let context = egui::Context::default();
     style::apply(&context);
     let mut regions = Vec::new();
@@ -170,6 +173,7 @@ fn the_browser_draws_its_tree_path_and_tiles() {
                 &mut dialog,
                 &mut pending,
                 &mut regions,
+                &mut drag_out,
             );
             let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
             let job = tile_name_job(

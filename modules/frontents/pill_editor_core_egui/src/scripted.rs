@@ -281,6 +281,10 @@ pub enum ScriptedCommand {
     Drop(String),
     /// `hover file <path>` - the same path as a drag preview.
     HoverFile(String),
+    /// `drag out <path>` - hand one file to the OS drag (W-0038 Stage 19).
+    /// With no mouse button held the drag ends at once, which is what makes it
+    /// safe to smoke-test from the scripted channel.
+    DragOut(String),
 }
 
 /// What a `palette` line asks of the command palette (W-0038 Stage 3).
@@ -515,11 +519,24 @@ impl ScriptedCommand {
                 cursor.finish(verb)?;
                 Ok(ScriptedCommand::RightClick { x, y })
             }
+            // `drag x1 y1 x2 y2` is a pointer gesture; `drag out <path>` hands
+            // one file to the OS drag (W-0038 Stage 19), which ends at once
+            // when no mouse button is held - safe to drive from the file.
             "drag" => {
-                let from = point(&mut cursor, "drag needs x1 y1 x2 y2")?;
-                let to = point(&mut cursor, "drag needs x1 y1 x2 y2")?;
-                cursor.finish(verb)?;
-                Ok(ScriptedCommand::Drag { from, to })
+                let drag_out = {
+                    let rest = cursor.rest();
+                    rest == "out" || rest.starts_with("out ")
+                };
+                if drag_out {
+                    cursor.word();
+                    let path = cursor.text("drag out needs a path")?;
+                    Ok(ScriptedCommand::DragOut(path))
+                } else {
+                    let from = point(&mut cursor, "drag needs x1 y1 x2 y2")?;
+                    let to = point(&mut cursor, "drag needs x1 y1 x2 y2")?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::Drag { from, to })
+                }
             }
             "gizmo" => gizmo(&mut cursor),
             // `palette <query>` opens the palette with the query typed in;
@@ -1500,6 +1517,10 @@ mod tests {
                     from: (10.0, 20.0),
                     to: (40.0, 60.0),
                 },
+            },
+            Accept {
+                line: "drag out local/temp/shot.png",
+                command: ScriptedCommand::DragOut("local/temp/shot.png".to_string()),
             },
             Accept {
                 line: "gizmo drag x 12 -4",

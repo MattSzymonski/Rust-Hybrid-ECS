@@ -432,6 +432,9 @@ pub fn run_frame(
     // that id means. Kept until the pinged panel is drawn - a request must not
     // be dropped by a frame where that tab was not on screen.
     let panel_window_ping = state.panel_window_ping.clone();
+    // A tile drag that left the windows hands its path to the executable
+    // (W-0038 Stage 19), through the frame the frontend drains.
+    let mut drag_out: Option<String> = None;
     let panel_answer =
         state
             .panel_windows
@@ -492,6 +495,7 @@ pub fn run_frame(
             .map(|(slot, window)| (*slot, window.as_str())),
         panel_window_ping_used: false,
         clipboard,
+        drag_out: &mut drag_out,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -610,6 +614,9 @@ pub fn run_frame(
         toasts.push_local(NoticeLevel::Warning, text, frame_index);
     }
     *frame = shell_frame;
+    // The tile drag's path travels in the frame the executable drains (W-0038
+    // Stage 19): the shell cannot start an OLE drag itself.
+    frame.drag_out = drag_out;
     let ui_micros = ui_started.elapsed().as_micros() as u64;
     // The Statistics tab's top row: the pass this frame actually took
     // (W-0038 Stage 7). Recorded before the frame's own logging so the tab and
@@ -756,6 +763,9 @@ pub struct EditorTabViewer<'a> {
     /// The shell's side of the OS clipboard (W-0038 Stage 17): the request
     /// the executable carries out, and the text it read back.
     pub clipboard: &'a mut pill_editor_core_egui::clipboard::EditorClipboard,
+    /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
+    /// executable starts an OLE drag with it.
+    pub drag_out: &'a mut Option<String>,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -829,6 +839,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 self.pending,
                 &mut self.overlay_regions,
                 self.browser,
+                self.drag_out,
             ),
             EditorTab::Preferences => {
                 preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)

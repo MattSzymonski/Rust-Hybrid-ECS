@@ -41,6 +41,7 @@ pub fn assets_tab(
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
     browser: &mut ProjectBrowser,
+    drag_out: &mut Option<String>,
 ) {
     // A folder that vanished (deleted, renamed, or the project reloaded onto
     // another tree) falls back to its nearest ancestor, so the grid never
@@ -119,6 +120,7 @@ pub fn assets_tab(
             dialog,
             pending,
             overlay_regions,
+            drag_out,
         );
     });
 }
@@ -266,6 +268,7 @@ pub fn assets_grid(
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
+    drag_out: &mut Option<String>,
 ) {
     let cell = egui::vec2(
         browser.tile_size + ASSETS_TILE_GAP,
@@ -289,6 +292,7 @@ pub fn assets_grid(
                 dialog: &mut *dialog,
                 pending: &mut *pending,
                 overlay_regions: &mut *overlay_regions,
+                drag_out: &mut *drag_out,
             };
             for row in entries.chunks(columns) {
                 ui.horizontal(|ui| {

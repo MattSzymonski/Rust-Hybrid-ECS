@@ -5345,6 +5345,61 @@ impl EditorWindow {
         );
     }
 
+    /// Hand one asset to the OS as a file drag (W-0038 Stage 19).
+    ///
+    /// The shell reports the asset's project-relative path; the target needs a
+    /// file on disk, so it is resolved through the host's asset directory
+    /// first. The drag itself blocks in OLE's modal loop, which is why nothing
+    /// else happens on this thread until the person drops or cancels.
+    fn start_drag_out(&mut self, path: &str) {
+        let Some(root) = self
+            .host
+            .host_mut()
+            .asset_directory()
+            .map(|directory| directory.to_path_buf())
+        else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                path,
+                "[editor] drag out refused: no asset directory"
+            );
+            return;
+        };
+        // The listing's paths are relative to `res`; the file on disk is not.
+        // An absolute path is already what the OS needs (the scripted channel
+        // names one), so only a relative path is resolved through the root.
+        let relative = path.strip_prefix("res/").unwrap_or(path);
+        let absolute = if std::path::Path::new(relative).is_absolute() {
+            std::path::PathBuf::from(relative)
+        } else {
+            root.join(relative)
+        };
+        match crate::drag_out::start(&absolute.to_string_lossy()) {
+            crate::drag_out::DragOutOutcome::Dropped(effect) => info!(
+                target: telemetry_target::ENGINE,
+                path = %absolute.display(),
+                effect = effect.0,
+                "[editor] drag out finished"
+            ),
+            crate::drag_out::DragOutOutcome::Cancelled => info!(
+                target: telemetry_target::ENGINE,
+                path = %absolute.display(),
+                "[editor] drag out cancelled"
+            ),
+            // A drag needs the pointer's button down; without it the modal
+            // loop would never see the input that ends it.
+            crate::drag_out::DragOutOutcome::NoButtonHeld => info!(
+                target: telemetry_target::ENGINE,
+                path = %absolute.display(),
+                "[editor] drag out skipped: no button held"
+            ),
+            crate::drag_out::DragOutOutcome::Failed => {}
+        }
+        // A drag is a frame's worth of interaction of its own: the frame after
+        // it owes a redraw, so the editor visibly settles.
+        self.demand.input = true;
+    }
+
     /// Apply the shell's IME state to the main window (W-0038 Stage 22).
     ///
     /// egui decides when a text field wants the input method and where its
@@ -5409,6 +5464,7 @@ impl EditorWindow {
             overlay_regions,
             ime_allowed,
             ime_rect,
+            drag_out,
             // The menu bar's quit is drained at the frame boundary (Step 7b),
             // not while the frame is presented.
             quit_requested: _,
@@ -5452,6 +5508,12 @@ impl EditorWindow {
         // candidate window, and the caret's rectangle places it. A text field
         // that loses focus turns it off again.
         self.apply_ime(ime_allowed, ime_rect);
+        // A tile dragged past the window edge (W-0038 Stage 19): the OS gets
+        // the file through an OLE drag, and the editor's thread runs the modal
+        // loop until the drop ends.
+        if let Some(path) = drag_out {
+            self.start_drag_out(&path);
+        }
         if let Some(text) = clipboard_text {
             // egui's own copy (a text field's selection) leaves under the same
             // registered format the structured copy uses (W-0038 Stage 17).
@@ -5763,6 +5825,7 @@ impl EditorWindow {
             ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
             ScriptedCommand::Drop(path) => self.drop_files(vec![std::path::PathBuf::from(path)]),
             ScriptedCommand::HoverFile(path) => self.preview_drop(std::path::Path::new(&path)),
+            ScriptedCommand::DragOut(path) => self.start_drag_out(&path),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
             ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
             ScriptedCommand::SelectAdd(handle) => {
