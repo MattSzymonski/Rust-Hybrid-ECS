@@ -127,6 +127,8 @@ PROBLEM_ROW_TOKEN = "[test] problem row"
 PROBLEM_OPENED_TOKEN = "[editor] problem opened"
 STATS_DUMP_TOKEN = "[test] stats"
 STATS_TAB_TOKEN = "[test] stats tab"
+CADENCE_DUMP_TOKEN = "[test] cadence"
+REDRAW_ON_DEMAND_TOKEN = "[editor] redraw on demand"
 SAFE_MODE_TOKEN = "[editor] safe mode"
 SAFE_MODE_RETRY_TOKEN = "[editor] safe mode retry requested"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
@@ -755,7 +757,7 @@ def main() -> int:
             },
         },
     )
-    session.start()
+    session.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
     try:
         # Step 1: startup, all the way to both tabs reporting rows.
         wait_for_token(session, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "startup")
@@ -3308,7 +3310,7 @@ def main() -> int:
         binary=binary,
         sandbox=session.sandbox,
     )
-    restart.start()
+    restart.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
     try:
         wait_for_token(
             restart, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "restart startup"
@@ -3351,6 +3353,61 @@ def main() -> int:
     finally:
         restart.close()
 
+    # Step 12: the redraw cadence (W-0038 Stage 9). Without the continuous
+    # switch, a paused idle editor sleeps between frames: two dumps three
+    # seconds apart must not advance by the display's frame rate. Every other
+    # session runs with the switch, so the older steps keep their pace.
+    cadence = EditorSession(
+        "egui", "cadence", project=arguments.project, test_seconds=180, binary=binary
+    )
+    cadence.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "0"})
+    try:
+        wait_for_token(
+            cadence, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "cadence startup"
+        )
+        assert REDRAW_ON_DEMAND_TOKEN in cadence.read_log(), (
+            "the editor never reported its redraw posture"
+        )
+        begin = len(cadence.read_log())
+        cadence.send("command editor.pause_toggle")
+        cadence.wait(
+            re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=true",
+            60,
+            "the project paused for the cadence step",
+            begin,
+        )
+        cadence_frames = []
+        for index in range(2):
+            begin = len(cadence.read_log())
+            cadence.send("dump cadence")
+            cadence.wait(re.escape(CADENCE_DUMP_TOKEN), 60, "the cadence dump", begin)
+            dump = re.search(
+                re.escape(CADENCE_DUMP_TOKEN)
+                + r"\s+continuous=(?:true|false)\s+frames=(\d+)",
+                cadence.read_log()[begin:],
+            )
+            assert dump is not None, "the cadence dump carried no frame count"
+            cadence_frames.append(int(dump.group(1)))
+            if index == 0:
+                # The second dump is the one an idle stretch separates from
+                # the first; the suite's own sleep is that stretch.
+                time.sleep(3.0)
+        idle_frames = cadence_frames[1] - cadence_frames[0]
+        # A continuous loop draws at the display's pace - well over a hundred
+        # frames in three seconds - while the idle poll owes twelve plus
+        # whatever the host's own log lines changed.
+        assert idle_frames <= 45, (
+            "the editor drew {} frames in three idle seconds; the loop is not "
+            "waiting (frames={})".format(idle_frames, cadence_frames)
+        )
+        print(
+            "  [OK] the paused editor waited ({} frames in three seconds)".format(
+                idle_frames
+            )
+        )
+    finally:
+        cadence.close()
+
     # Stage 8: safe mode. The editor starts against a shell whose source does
     # not compile: it shows the build errors with their `file:line` and a
     # Retry, and once the source is fixed Retry loads the shell - all without
@@ -3377,13 +3434,16 @@ def main() -> int:
     staged_shell = MODULES_ROOT / "target" / "hot" / "pill_editor_shell_egui_editor.dll"
     staged_shell.unlink(missing_ok=True)
     try:
-        safe.start()
+        safe.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
         try:
             wait_for_token(
                 safe, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "safe-mode startup"
             )
-            safe_begin = len(safe.read_log())
-            safe.wait(re.escape(SAFE_MODE_TOKEN), 240, "the safe-mode panel", safe_begin)
+            # The panel is drawn once, and the host's build failing can make it
+            # appear before this suite reads `window created` - so the search
+            # starts at the log's beginning rather than at a later anchor.
+            safe.wait(re.escape(SAFE_MODE_TOKEN), 240, "the safe-mode panel")
+            rows_begin = len(safe.read_log())
             rows = safe.request(
                 "dump problems",
                 re.escape(PROBLEMS_DUMP_TOKEN),
@@ -3396,7 +3456,7 @@ def main() -> int:
             located = re.search(
                 re.escape(PROBLEM_ROW_TOKEN)
                 + r'\s+module="[^"]*"\s+severity="error"\s+file="([^"]+)"\s+line=([1-9][0-9]*)',
-                safe.read_log()[safe_begin:],
+                safe.read_log()[rows_begin:],
             )
             assert located and located.group(1).endswith("shell.rs"), (
                 "the safe-mode panel did not name the shell's source: {}".format(located)

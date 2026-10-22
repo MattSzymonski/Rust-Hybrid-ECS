@@ -257,6 +257,8 @@ pub enum Dump {
     Problems,
     /// `dump stats` - the Statistics tab's frame and per-tab timings.
     Stats,
+    /// `dump cadence` - the redraw counters (W-0038 Stage 9).
+    Cadence,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -637,6 +639,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "console" => Dump::Console,
         "problems" => Dump::Problems,
         "stats" => Dump::Stats,
+        "cadence" => Dump::Cadence,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1393,6 +1396,10 @@ mod tests {
             Accept {
                 line: "dump stats",
                 command: ScriptedCommand::Dump(Dump::Stats),
+            },
+            Accept {
+                line: "dump cadence",
+                command: ScriptedCommand::Dump(Dump::Cadence),
             },
             Accept {
                 line: "problem open 0",

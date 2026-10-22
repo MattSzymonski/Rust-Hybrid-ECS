@@ -30,6 +30,7 @@
 
 // Standard library
 use std::sync::Arc;
+use std::time::Duration;
 
 // External crates
 use pill_core::platform::futures::block_on;
@@ -37,6 +38,7 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_core_egui::assets::{self, AssetDialog};
+use pill_editor_core_egui::cadence::{Cadence, FrameDemand, FrameWake};
 use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
 use pill_editor_core_egui::commands::{
     ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, CommandRegistry,
@@ -84,7 +86,7 @@ use pill_ui_egui::egui;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowId};
 
@@ -168,6 +170,7 @@ pub fn run(log_buffer: pill_core::telemetry::capture::LogBuffer) -> Result<(), E
     let mut application = EditorApplication {
         window: None,
         log_buffer,
+        timer: WakeTimer::new(),
     };
     event_loop
         .run_app(&mut application)
@@ -180,6 +183,58 @@ struct EditorApplication {
     window: Option<EditorWindow>,
     /// The telemetry capture ring the window's Console tab reads.
     log_buffer: pill_core::telemetry::capture::LogBuffer,
+    /// The loop's timed wake, when the last frame asked for one
+    /// (W-0038 Stage 9).
+    timer: WakeTimer,
+}
+
+/// The loop's timed wake: the moment the next frame is owed.
+///
+/// `std::time::Instant` is the type `ControlFlow::WaitUntil` takes; this
+/// frontend is native-only, so the platform clock's web-safety rule does not
+/// reach here (the deadline itself is never compared across targets).
+#[allow(clippy::disallowed_types)]
+struct WakeTimer {
+    /// When the loop must wake, when it is waiting for a deadline.
+    deadline: Option<std::time::Instant>,
+}
+
+#[allow(clippy::disallowed_types)]
+impl WakeTimer {
+    /// A timer with nothing scheduled.
+    fn new() -> Self {
+        Self { deadline: None }
+    }
+
+    /// Schedule the next wake `after` from now.
+    fn schedule(&mut self, after: Duration) {
+        self.deadline = Some(std::time::Instant::now() + after);
+    }
+
+    /// Forget any scheduled wake: something asked for a frame now.
+    fn clear(&mut self) {
+        self.deadline = None;
+    }
+
+    /// Whether the deadline has passed, clearing it when it has.
+    fn take_due(&mut self) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if std::time::Instant::now() >= deadline {
+            self.deadline = None;
+            return true;
+        }
+        false
+    }
+
+    /// What the loop should do until the next event.
+    fn control_flow(&self) -> ControlFlow {
+        match self.deadline {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        }
+    }
 }
 
 impl ApplicationHandler for EditorApplication {
@@ -228,6 +283,7 @@ impl ApplicationHandler for EditorApplication {
         if !is_main && child_view.is_none() && !is_game {
             return;
         }
+        let redraw_request = matches!(event, WindowEvent::RedrawRequested);
         match event {
             WindowEvent::CloseRequested => {
                 if is_main {
@@ -243,7 +299,19 @@ impl ApplicationHandler for EditorApplication {
                         if should_exit {
                             event_loop.exit();
                         } else {
-                            editor.window.request_redraw();
+                            match editor.next_wake() {
+                                FrameWake::Immediate => {
+                                    self.timer.clear();
+                                    editor.window.request_redraw();
+                                }
+                                FrameWake::After(delay) => {
+                                    // The loop sleeps instead of drawing:
+                                    // input still wakes it, and the deadline
+                                    // covers the host's own changes.
+                                    self.timer.schedule(delay);
+                                }
+                            }
+                            event_loop.set_control_flow(self.timer.control_flow());
                         }
                     }
                     Err(error) => {
@@ -257,6 +325,7 @@ impl ApplicationHandler for EditorApplication {
                 }
             }
             WindowEvent::Resized(size) => {
+                editor.demand.resized = true;
                 if let Some(view) = child_view {
                     editor.resize_scene(view, size.width, size.height);
                 } else if is_game {
@@ -266,6 +335,7 @@ impl ApplicationHandler for EditorApplication {
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                editor.demand.resized = true;
                 if is_main {
                     editor.scale_factor = editor.window.scale_factor() as f32;
                     let size = editor.window.inner_size();
@@ -346,8 +416,31 @@ impl ApplicationHandler for EditorApplication {
                         }
                     }
                 }
+                // Input is why a waiting loop wakes (W-0038 Stage 9): the
+                // event itself asks for the frame that consumes it.
+                editor.demand.input = true;
             }
         }
+        // A frame is owed as soon as anything here happened; a redraw request
+        // already is one.
+        if editor.demand.any() && !redraw_request {
+            self.timer.clear();
+            editor.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    /// The loop is about to sleep: wake the editor when its deadline passed.
+    ///
+    /// The timed wake is what keeps an idle editor's Console tab and notices
+    /// current without drawing frames the display never sees.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.timer.take_due() {
+            if let Some(editor) = &mut self.window {
+                editor.window.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(self.timer.control_flow());
     }
 }
 
@@ -528,6 +621,22 @@ struct EditorWindow {
     test_seconds: Option<f64>,
     /// A quit the scripted channel or the deadline asked for.
     quit: bool,
+    /// When the loop draws next (W-0038 Stage 9).
+    cadence: Cadence,
+    /// What has asked for the next frame since the last one ran.
+    demand: FrameDemand,
+    /// The decision the last frame left for the loop.
+    next_wake: FrameWake,
+    /// egui's own repaint request from the last shell pass.
+    repaint_after: Option<Duration>,
+    /// What asked for the last frame, kept for the cadence dump.
+    last_demand: FrameDemand,
+    /// The snapshot field whose change last asked for a frame, so the log
+    /// names a churning reason once rather than every frame.
+    snapshot_changed_field: Option<String>,
+    /// The snapshot the last frame published, with its frame index cleared:
+    /// what a change is measured against (W-0038 Stage 9).
+    last_snapshot: Option<EditorSnapshot>,
 }
 
 /// A scripted left-button drag in flight: where the press lands, where the
@@ -781,6 +890,29 @@ impl EditorWindow {
             scripted_drag: None,
             test_seconds: test_channel::seconds_from_environment(),
             quit: false,
+            cadence: {
+                let cadence = Cadence::from_environment();
+                if cadence.continuous() {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        variable = pill_editor_core_egui::cadence::CONTINUOUS_REDRAW_ENV,
+                        "[editor] redraw continuous"
+                    );
+                } else {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        idle_poll_ms = pill_editor_core_egui::cadence::IDLE_POLL.as_millis() as u64,
+                        "[editor] redraw on demand"
+                    );
+                }
+                cadence
+            },
+            demand: FrameDemand::default(),
+            next_wake: FrameWake::Immediate,
+            repaint_after: None,
+            last_demand: FrameDemand::default(),
+            last_snapshot: None,
+            snapshot_changed_field: None,
         };
         editor.place_views();
         info!(
@@ -3114,7 +3246,47 @@ impl EditorWindow {
                 self.request_quit();
             }
         }
+        // Step 10: what the loop does next (W-0038 Stage 9) - draw again at
+        // once when anything asked for a frame, or sleep for the idle poll
+        // and let this frame's evidence expire.
+        self.decide_next_wake();
         Ok(self.quit)
+    }
+
+    /// Decide when the loop draws next, from what asked for this frame.
+    ///
+    /// The demand is cleared here rather than at the start of the next frame:
+    /// an event that arrives between the two sets it again, and the loop
+    /// already knows to draw at once.
+    fn decide_next_wake(&mut self) {
+        let demand = FrameDemand {
+            animating: self.animating(),
+            repaint_requested: self.repaint_after.is_some(),
+            ..self.demand
+        };
+        self.cadence.record_frame(demand);
+        self.last_demand = demand;
+        self.next_wake = self.cadence.decide(demand);
+        if !matches!(self.next_wake, FrameWake::Immediate) {
+            self.cadence.record_wait();
+        }
+        self.demand = FrameDemand::default();
+        self.repaint_after = None;
+    }
+
+    /// Whether something is moving, so the next frame is already owed.
+    ///
+    /// A paused project stops animating; a camera navigation and a scripted
+    /// drag still move something, and a toast's countdown changes the frame's
+    /// pixels as it expires.
+    fn animating(&self) -> bool {
+        let running = !self.host.host().engine().systems_paused();
+        running || self.camera_drag.is_some() || self.scripted_drag.is_some()
+    }
+
+    /// The wake the last frame left for the loop.
+    fn next_wake(&self) -> FrameWake {
+        self.next_wake
     }
 
     /// Capture the editor snapshot the shell's tabs read, when the shell
@@ -3153,6 +3325,39 @@ impl EditorWindow {
             .unwrap_or((0, 0));
         snapshot.undo_depth = undo_depth;
         snapshot.redo_depth = redo_depth;
+        // The redraw cadence's change detector (Stage 9): the frame index is
+        // this frame's, so it is cleared on both sides before comparing - what
+        // is compared is the data the tabs draw, not when it was captured.
+        let mut compared = snapshot.clone();
+        compared.revision = 0;
+        // The two tiers a frame itself feeds: its own log lines reach the
+        // console, so treating them as a reason to draw would make every frame
+        // owe the next one. They are bounded-latency data instead - the idle
+        // poll draws them within its interval - which is what keeps an idle
+        // editor idle while its console still fills.
+        compared.console = pill_editor_core_egui::console::ConsoleView::default();
+        compared.problems.clear();
+        self.demand.snapshot = self
+            .last_snapshot
+            .as_ref()
+            .is_some_and(|previous| previous != &compared);
+        if self.demand.snapshot {
+            // Which fields moved is the answer to "why is the editor drawing
+            // every frame?"; one line per new combination keeps the log
+            // honest without streaming.
+            if let Some(previous) = &self.last_snapshot {
+                let fields = snapshot_fields_changed(previous, &compared);
+                if self.snapshot_changed_field.as_deref() != Some(fields.as_str()) {
+                    self.snapshot_changed_field = Some(fields.clone());
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        fields = fields.as_str(),
+                        "[editor] snapshot changed"
+                    );
+                }
+            }
+        }
+        self.last_snapshot = Some(compared);
         if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {
             *resource = snapshot;
         }
@@ -3551,6 +3756,30 @@ impl EditorWindow {
         }
     }
 
+    /// Log the redraw counters, for the suites (W-0038 Stage 9).
+    ///
+    /// Two dumps separated by an idle stretch tell the posture apart: with the
+    /// loop waiting, the frame count grows by the idle poll's pace, not by the
+    /// display's.
+    fn dump_cadence(&mut self) {
+        let paused = self.host.host().engine().systems_paused();
+        info!(
+            target: telemetry_target::ENGINE,
+            continuous = self.cadence.continuous(),
+            frames = self.cadence.frames(),
+            demanded = self.cadence.demanded(),
+            waits = self.cadence.waits(),
+            paused,
+            input = self.last_demand.input,
+            scripted = self.last_demand.scripted,
+            snapshot = self.last_demand.snapshot,
+            resized = self.last_demand.resized,
+            repaint = self.last_demand.repaint_requested,
+            animating = self.last_demand.animating,
+            "[test] cadence"
+        );
+    }
+
     /// Log the Problems rows, for the suites.
     fn dump_problems(&mut self) {
         info!(
@@ -3920,7 +4149,11 @@ impl EditorWindow {
             // The menu bar's quit is drained at the frame boundary (Step 7b),
             // not while the frame is presented.
             quit_requested: _,
+            // egui's own cadence: the redraw decision at the end of the frame
+            // honours it (W-0038 Stage 9).
+            repaint_after,
         } = frame;
+        self.repaint_after = repaint_after;
         // Each scene viewport follows its dock rectangle, so the viewports
         // track the layout when the user drags a splitter; a viewport whose
         // tab is not shown hides its window.
@@ -4164,6 +4397,9 @@ impl EditorWindow {
             return;
         };
         for line in channel.poll() {
+            // A scripted line arrives between frames; the loop must not stay
+            // asleep over it (W-0038 Stage 9).
+            self.demand.scripted = true;
             match ScriptedCommand::parse(&line) {
                 Ok(command) => self.run_scripted(&line, command),
                 Err(error) => self.reject_scripted(&line, &error.reason),
@@ -4217,6 +4453,7 @@ impl EditorWindow {
                 Dump::Console => self.dump_console(),
                 Dump::Problems => self.dump_problems(),
                 Dump::Stats => self.dump_stats(),
+                Dump::Cadence => self.dump_cadence(),
                 Dump::Field {
                     entity,
                     component,
@@ -5198,6 +5435,66 @@ enum CommandAction {
     PauseToggle,
     /// Advance exactly one frame.
     Step,
+}
+
+/// The snapshot fields that differ between two captures, comma-joined.
+///
+/// The redraw cadence treats any change as a reason to draw, so this answers
+/// the question that follows: which fields moved. A field that changes on its
+/// own - a timer, a counter, an unordered collection - would keep the editor
+/// drawing forever, and naming it in the log is how that is caught rather
+/// than suspected.
+fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) -> String {
+    let mut changed: Vec<&str> = Vec::new();
+    if previous.entities != current.entities {
+        changed.push("entities");
+    }
+    if previous.detail != current.detail {
+        changed.push("detail");
+    }
+    if previous.systems != current.systems {
+        changed.push("systems");
+    }
+    if previous.components != current.components {
+        changed.push("components");
+    }
+    if previous.assets != current.assets {
+        changed.push("assets");
+    }
+    if previous.standalone_types != current.standalone_types {
+        changed.push("standalone_types");
+    }
+    if previous.asset_detail != current.asset_detail {
+        changed.push("asset_detail");
+    }
+    if previous.paused != current.paused {
+        changed.push("paused");
+    }
+    if previous.gizmo != current.gizmo {
+        changed.push("gizmo");
+    }
+    if previous.grid_enabled != current.grid_enabled {
+        changed.push("grid_enabled");
+    }
+    if previous.preferences != current.preferences {
+        changed.push("preferences");
+    }
+    if previous.undo_depth != current.undo_depth || previous.redo_depth != current.redo_depth {
+        changed.push("history");
+    }
+    if previous.commands != current.commands {
+        changed.push("commands");
+    }
+    if previous.console != current.console {
+        changed.push("console");
+    }
+    if previous.problems != current.problems {
+        changed.push("problems");
+    }
+    if previous.errors != current.errors {
+        changed.push("errors");
+    }
+    changed.join(",")
 }
 
 /// Split a command line into a program and its arguments.
