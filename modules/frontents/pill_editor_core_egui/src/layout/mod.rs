@@ -16,8 +16,13 @@
 
 mod dock;
 mod persistence;
+mod recovery;
 
 pub use dock::{activate_tab, EditorDock, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION};
 pub use persistence::{
     layout_directory, load_or_default, save, LayoutError, LAYOUT_SCHEMA_VERSION,
+};
+pub use recovery::{
+    read as read_recovery, recovery_path, remove as remove_recovery, write as write_recovery,
+    RecoveryDocument, RECOVERY_FILE, RECOVERY_VERSION,
 };

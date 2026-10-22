@@ -232,6 +232,11 @@ const GIZMO_DASH: f32 = 0.05;
 /// the listing at once instead of waiting for the cadence.
 const ASSET_REFRESH_FRAMES: u64 = 120;
 
+/// Frames between recovery-document writes when nothing it watches changed
+/// (W-0038 Stage 20): a slow cadence that still lands an arrangement the key
+/// cannot see, without rewriting the file every frame.
+const RECOVERY_AUTOSAVE_FRAMES: u64 = 120;
+
 /// How many asset rows the listing keeps.
 const ASSET_ROWS_MAX: usize = 256;
 
@@ -684,6 +689,17 @@ struct EditorWindow {
     /// The file a drag from the OS is carrying over the editor, if one is
     /// (W-0038 Stage 18): the drop preview's subject.
     drop_preview: Option<std::path::PathBuf>,
+    /// The recovery document a previous run left behind (W-0038 Stage 20),
+    /// applied on the first frame the shell's session exists.
+    recovered: Option<pill_editor_core_egui::layout::RecoveryDocument>,
+    /// The state the last recovery write captured, so an unchanged editor
+    /// does not rewrite the document every frame.
+    last_recovery_key: Option<String>,
+    /// Whether the main window currently takes IME input (W-0038 Stage 22),
+    /// and the caret rectangle it was last given.
+    ime_allowed: bool,
+    /// The IME candidate window's anchor, in logical points.
+    ime_rect: Option<(f32, f32, f32, f32)>,
     /// The selected asset's detail for the Inspector's asset section.
     asset_detail: Option<AssetDetail>,
     /// The path `asset_detail` was captured for, so the capture follows the
@@ -1015,6 +1031,10 @@ impl EditorWindow {
             standalone_types: Vec::new(),
             asset_listing_dirty: true,
             drop_preview: None,
+            recovered: pill_editor_core_egui::layout::read_recovery(),
+            last_recovery_key: None,
+            ime_allowed: false,
+            ime_rect: None,
             asset_detail: None,
             asset_detail_path: None,
             preferences_text: None,
@@ -1827,6 +1847,90 @@ impl EditorWindow {
             NoticeLevel::Note,
             format!("importing {} file(s) into {folder}", sources.len()),
         );
+    }
+
+    /// Apply the recovery document a previous run left behind (W-0038 Stage
+    /// 20).
+    ///
+    /// It is applied on the first frame the shell's session exists, because
+    /// the dock lives there: the shell builds its own default-or-saved dock
+    /// when it loads, and the recovered arrangement replaces it before that
+    /// frame draws. The selection follows as display handles resolved against
+    /// the live table - a recovered run spawns the same entities, and one that
+    /// does not simply selects less.
+    fn apply_recovered_state(&mut self) {
+        let Some(recovered) = self.recovered.take() else {
+            return;
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(session) = world.get_resource_mut::<EguiShellState>() else {
+            // The shell has not claimed its session yet: try again next frame.
+            self.recovered = Some(recovered);
+            return;
+        };
+        let surfaces = recovered.dock.state().surfaces_count();
+        session.dock = recovered.dock.clone();
+        let selection = world
+            .get_resource::<EditorSelection>()
+            .cloned()
+            .unwrap_or_default();
+        let entities: Vec<Entity> = recovered
+            .entities
+            .iter()
+            .filter_map(|handle| resolve_display_entity(world, handle))
+            .collect();
+        let restored = entities.len();
+        let mut selection = selection;
+        selection.set_entities(entities);
+        selection.asset = recovered.asset.clone();
+        selection.resource = recovered.resource.clone();
+        if let Some(resource) = world.get_resource_mut::<EditorSelection>() {
+            *resource = selection;
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            surfaces,
+            entities = restored,
+            "[editor] recovered editor state after an unclean exit"
+        );
+    }
+
+    /// Write the recovery document when the arrangement or the selection
+    /// changed, and on a slow cadence so a change the key cannot see still
+    /// lands (W-0038 Stage 20).
+    fn autosave_recovery(&mut self) {
+        if !(self.frame_index.is_multiple_of(RECOVERY_AUTOSAVE_FRAMES)
+            || self.last_recovery_key.is_none())
+        {
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(session) = world.get_resource::<EguiShellState>() else {
+            return;
+        };
+        let selection = world
+            .get_resource::<EditorSelection>()
+            .cloned()
+            .unwrap_or_default();
+        let key = format!(
+            "{}|{}|{}|{}",
+            session.dock.state().surfaces_count(),
+            session.dock.panel_ids().len(),
+            selection
+                .entities()
+                .iter()
+                .map(|entity| entity.to_string())
+                .collect::<Vec<String>>()
+                .join(","),
+            selection.asset.as_deref().unwrap_or("")
+        );
+        if self.last_recovery_key.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let document =
+            pill_editor_core_egui::layout::RecoveryDocument::capture(&session.dock, &selection);
+        self.last_recovery_key = Some(key);
+        pill_editor_core_egui::layout::write_recovery(&document);
     }
 
     /// Publish the shared selection as the renderer's outline set (Stage
@@ -3616,6 +3720,11 @@ impl EditorWindow {
         // Step 3d: the panels the loaded modules asked to register, then what
         // the panels drawn last frame asked for (W-0038 Stage 11). The sync is
         // before the snapshot so a tab's title is never a frame stale.
+        // The recovery document a killed run left behind is applied before the
+        // dock is read (W-0038 Stage 20), and the current state is written
+        // back once its arrangement or selection changed.
+        self.apply_recovered_state();
+        self.autosave_recovery();
         self.sync_panels();
         self.apply_panel_commands();
         // The clipboard the shell queued last frame (W-0038 Stage 17): the OS
@@ -5236,6 +5345,45 @@ impl EditorWindow {
         );
     }
 
+    /// Apply the shell's IME state to the main window (W-0038 Stage 22).
+    ///
+    /// egui decides when a text field wants the input method and where its
+    /// caret is; this executable is what owns the window, so it is the only
+    /// place that can pass those decisions to the platform. The rect is in
+    /// logical points, which is the window's IME coordinate space.
+    fn apply_ime(&mut self, allowed: bool, rect: Option<pill_ui_egui::boundary::ShellRect>) {
+        let window = self.window.clone();
+        if allowed != self.ime_allowed {
+            window.set_ime_allowed(allowed);
+            self.ime_allowed = allowed;
+            info!(
+                target: telemetry_target::ENGINE,
+                allowed,
+                "[editor] ime allowed changed"
+            );
+        }
+        if !allowed {
+            return;
+        }
+        if let Some(rect) = rect {
+            if self.ime_rect != Some((rect.x, rect.y, rect.width, rect.height)) {
+                self.ime_rect = Some((rect.x, rect.y, rect.width, rect.height));
+                window.set_ime_cursor_area(
+                    winit::dpi::LogicalPosition::new(rect.x as f64, rect.y as f64),
+                    winit::dpi::LogicalSize::new(rect.width as f64, rect.height as f64),
+                );
+                info!(
+                    target: telemetry_target::ENGINE,
+                    x = rect.x,
+                    y = rect.y,
+                    width = rect.width,
+                    height = rect.height,
+                    "[editor] ime cursor area"
+                );
+            }
+        }
+    }
+
     /// Draw the shell's frame through the overlay; without a shell module,
     /// draw the runner's own fallback.
     fn present_ui(&mut self) {
@@ -5259,8 +5407,8 @@ impl EditorWindow {
             scene_rects,
             game_rect,
             overlay_regions,
-            ime_allowed: _,
-            ime_rect: _,
+            ime_allowed,
+            ime_rect,
             // The menu bar's quit is drained at the frame boundary (Step 7b),
             // not while the frame is presented.
             quit_requested: _,
@@ -5300,13 +5448,25 @@ impl EditorWindow {
             self.claimed_keyboard = wants_keyboard;
         }
         self.apply_cursor_icon(cursor_icon);
-        if clipboard_text.is_some() {
-            // The OS clipboard write needs the platform half back
-            // (follow-up work); note it rather than dropping it silently.
-            info!(
-                target: telemetry_target::ENGINE,
-                "[editor] UI clipboard write requested; the platform half is not ported yet"
-            );
+        // An IME the shell asked for (W-0038 Stage 22): the window takes the
+        // candidate window, and the caret's rectangle places it. A text field
+        // that loses focus turns it off again.
+        self.apply_ime(ime_allowed, ime_rect);
+        if let Some(text) = clipboard_text {
+            // egui's own copy (a text field's selection) leaves under the same
+            // registered format the structured copy uses (W-0038 Stage 17).
+            match crate::clipboard::write(&text) {
+                Ok(()) => info!(
+                    target: telemetry_target::ENGINE,
+                    bytes = text.len(),
+                    "[editor] clipboard written"
+                ),
+                Err(message) => warn!(
+                    target: telemetry_target::ENGINE,
+                    message = message.as_str(),
+                    "[editor] clipboard write failed"
+                ),
+            }
         }
         // Step 3: draw through the overlay; retry a missing overlay rarely,
         // so a transient compositor failure heals.
@@ -6161,6 +6321,9 @@ impl EditorWindow {
                 "[editor] layout saved"
             );
         }
+        // The run is ending on purpose: there is nothing left to recover
+        // (W-0038 Stage 20).
+        pill_editor_core_egui::layout::remove_recovery();
         self.quit = true;
     }
 

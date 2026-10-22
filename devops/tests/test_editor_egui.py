@@ -152,6 +152,7 @@ CLIPBOARD_PASTED_TOKEN = "[editor] clipboard pasted"
 DROP_PREVIEW_TOKEN = "[editor] drop preview"
 FILES_DROPPED_TOKEN = "[editor] files dropped"
 DROP_REFUSED_FOLDER_TOKEN = "[editor] drop refused: folder"
+RECOVERED_STATE_TOKEN = "[editor] recovered editor state after an unclean exit"
 # The registered name the showcase component's payload carries (W-0038
 # Stage 17): the paste's registry check compares full type names.
 SHOWCASE_TYPE_NAME = "italian_brainrot::ShowcaseComponent"
@@ -3875,8 +3876,108 @@ def main() -> int:
         )
         assert restart.wait_exit(timeout=60) == 0, "the restarted editor did not exit 0"
         print("  [OK] the restarted editor saved its layout and exited 0")
+        # A clean exit leaves nothing to recover (W-0038 Stage 20).
+        recovery_file = restart.editor_state_directory / "editor_egui_recovery.json"
+        assert not recovery_file.exists(), (
+            "a clean exit left a recovery document behind: {}".format(recovery_file)
+        )
+        print("  [OK] a clean exit removed the recovery document")
     finally:
         restart.close()
+
+    # Step 11b: recovery after an unclean exit (W-0038 Stage 20). A killed
+    # editor leaves its dock and selection in the recovery document; the next
+    # run applies them and says so, and its own clean exit removes the file.
+    recovered = EditorSession(
+        "egui",
+        "recovery",
+        project=arguments.project,
+        test_seconds=180,
+        binary=binary,
+    )
+    recovered.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
+    try:
+        wait_for_token(
+            recovered, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "recovery startup"
+        )
+        wait_for_token(
+            recovered, re.escape(EGUI_SHELL_LOADED_TOKEN), 120, "recovery shell load"
+        )
+        # The document exists from the first frames; a change the autosave
+        # watches (here an undock) rewrites it, which is what the survivor must
+        # see, so the step waits for that write rather than for the file.
+        recovery_file = recovered.editor_state_directory / "editor_egui_recovery.json"
+        deadline = time.time() + 30
+        while time.time() < deadline and not recovery_file.exists():
+            time.sleep(0.25)
+        assert recovery_file.exists(), (
+            "the running editor never wrote its recovery document: {}".format(
+                recovery_file
+            )
+        )
+        written_before = recovery_file.stat().st_mtime_ns
+        recovered.send("undock entities")
+        wait_for_token(
+            recovered, re.escape(EGUI_TAB_UNDOCKED_TOKEN), 60, "the recovery undock"
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline and recovery_file.stat().st_mtime_ns == written_before:
+            time.sleep(0.25)
+        assert recovery_file.stat().st_mtime_ns != written_before, (
+            "the undock did not reach the recovery document"
+        )
+        print("  [OK] the autosave recorded the rearranged dock")
+
+        # The unclean exit: the process is killed, so nothing removes the file.
+        process = recovered.process
+        assert process is not None, "the recovery session did not start"
+        process.kill()
+        process.wait(timeout=60)
+        recovered.close()
+        assert recovery_file.exists(), (
+            "the killed editor's recovery document went away: {}".format(recovery_file)
+        )
+
+        survivor = EditorSession(
+            "egui",
+            "recovered",
+            project=arguments.project,
+            test_seconds=180,
+            binary=binary,
+            sandbox=recovered.sandbox,
+        )
+        survivor.start(extra_env={"PILL_EDITOR_CONTINUOUS_REDRAW": "1"})
+        try:
+            wait_for_token(
+                survivor,
+                re.escape(RECOVERED_STATE_TOKEN),
+                120,
+                "the recovered state",
+            )
+            restored = survivor.request(
+                "dump tabs", DOCK_DUMP_PATTERN, 60, "the recovered dock"
+            )
+            assert re.search(r"surfaces=2\b", restored), (
+                "the rearranged dock did not come back from the recovery document: {}".format(
+                    restored
+                )
+            )
+            begin = len(survivor.read_log())
+            survivor.send("quit")
+            survivor.wait(
+                re.escape(QUIT_REQUESTED_TOKEN), 30, "the survivor's quit", begin
+            )
+            assert survivor.wait_exit(timeout=60) == 0, (
+                "the recovering editor did not exit 0"
+            )
+        finally:
+            survivor.close()
+        assert not recovery_file.exists(), (
+            "the recovering editor's clean exit left the document behind"
+        )
+        print("  [OK] a killed editor's dock came back, and its clean exit cleared it")
+    finally:
+        recovered.close()
 
     # Step 12: the redraw cadence (W-0038 Stage 9). Without the continuous
     # switch, a paused idle editor sleeps between frames: two dumps three
