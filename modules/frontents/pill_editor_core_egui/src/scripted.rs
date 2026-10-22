@@ -276,6 +276,11 @@ pub enum ScriptedCommand {
     Cut,
     /// `command editor.paste` - read the OS clipboard and apply it.
     Paste,
+    /// `drop <path>` - hand one path to the drop handler as the OS would
+    /// (W-0038 Stage 18).
+    Drop(String),
+    /// `hover file <path>` - the same path as a drag preview.
+    HoverFile(String),
 }
 
 /// What a `palette` line asks of the command palette (W-0038 Stage 3).
@@ -621,6 +626,37 @@ impl ScriptedCommand {
                 cursor.finish(verb)?;
                 Ok(ScriptedCommand::Key(chord))
             }
+            // The OS drop, driven from the file: winit's own events cannot be
+            // synthesised from here, and this calls the handler they call
+            // (W-0038 Stage 18).
+            "drop" => {
+                let path = cursor.text("drop needs a path")?;
+                Ok(ScriptedCommand::Drop(path))
+            }
+            "hover" => match cursor.word() {
+                Some("file") => {
+                    let path = cursor.text("hover file needs a path")?;
+                    Ok(ScriptedCommand::HoverFile(path))
+                }
+                // The view index was the word just read, so the numbers that
+                // follow it are the pointer position.
+                other => {
+                    let view = match other {
+                        Some(text) => text.parse::<usize>().map_err(|_| {
+                            ParseError::new(format!(
+                                "hover needs a view index, an x and a y, got '{text}'"
+                            ))
+                        })?,
+                        None => {
+                            return Err(ParseError::new("hover needs a view, an x and a y"));
+                        }
+                    };
+                    let x = number(&mut cursor, "hover needs an x")?;
+                    let y = number(&mut cursor, "hover needs a y")?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::Hover { view, x, y })
+                }
+            },
             "dump" => {
                 let dump = dump(&mut cursor)?;
                 Ok(ScriptedCommand::Dump(dump))
@@ -630,13 +666,6 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::Browser(folder))
             }
             "camera" => camera(&mut cursor),
-            "hover" => {
-                let view = number(&mut cursor, "hover needs a view, an x and a y")?;
-                let x = number(&mut cursor, "hover needs a view, an x and a y")?;
-                let y = number(&mut cursor, "hover needs a view, an x and a y")?;
-                cursor.finish(verb)?;
-                Ok(ScriptedCommand::Hover { view, x, y })
-            }
             "select" => match cursor.word() {
                 Some("asset") => {
                     let path = cursor.text("select asset needs a path")?;

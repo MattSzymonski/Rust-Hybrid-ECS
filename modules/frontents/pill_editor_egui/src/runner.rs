@@ -456,6 +456,35 @@ impl ApplicationHandler for EditorApplication {
                 if let WindowEvent::KeyboardInput { event, .. } = &other {
                     editor.gizmo_shortcut(event);
                 }
+                // A file dragged in from the OS (W-0038 Stage 18): every
+                // editor window reports it - the scene views must not swallow
+                // the drop - and the executable is what turns it into an
+                // import. These events carry no pointer or key state, so they
+                // are handled here and the rest of the walk is skipped.
+                let mut handled = false;
+                match &other {
+                    WindowEvent::HoveredFile(path) => {
+                        editor.preview_drop(path);
+                        handled = true;
+                    }
+                    WindowEvent::HoveredFileCancelled => {
+                        editor.cancel_drop_preview();
+                        handled = true;
+                    }
+                    WindowEvent::DroppedFile(path) => {
+                        editor.drop_files(vec![path.clone()]);
+                        handled = true;
+                    }
+                    _ => {}
+                }
+                if handled {
+                    if editor.demand.any() {
+                        self.timer.clear();
+                        editor.window.request_redraw();
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                    }
+                    return;
+                }
                 // A release over the editor's own UI still finishes a gizmo
                 // drag or a navigation that left its viewport's window: no
                 // pointer capture is platform-independent, so the release
@@ -652,6 +681,9 @@ struct EditorWindow {
     /// Whether a file command changed the tree: the next frame's listing
     /// refresh walks it at once.
     asset_listing_dirty: bool,
+    /// The file a drag from the OS is carrying over the editor, if one is
+    /// (W-0038 Stage 18): the drop preview's subject.
+    drop_preview: Option<std::path::PathBuf>,
     /// The selected asset's detail for the Inspector's asset section.
     asset_detail: Option<AssetDetail>,
     /// The path `asset_detail` was captured for, so the capture follows the
@@ -982,6 +1014,7 @@ impl EditorWindow {
             asset_entries: Vec::new(),
             standalone_types: Vec::new(),
             asset_listing_dirty: true,
+            drop_preview: None,
             asset_detail: None,
             asset_detail_path: None,
             preferences_text: None,
@@ -1668,6 +1701,132 @@ impl EditorWindow {
                 }
             }
         }
+    }
+
+    /// Show what a drag from the OS is carrying (W-0038 Stage 18): a toast
+    /// naming the file and the folder it would land in, once per path, so the
+    /// person sees where a drop goes before letting go.
+    fn preview_drop(&mut self, path: &std::path::Path) {
+        if self.drop_preview.as_deref() == Some(path) {
+            return;
+        }
+        self.drop_preview = Some(path.to_path_buf());
+        let folder = self.drop_folder();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        info!(
+            target: telemetry_target::ENGINE,
+            path = %path.display(),
+            folder = folder.as_str(),
+            "[editor] drop preview"
+        );
+        self.push_toast(NoticeLevel::Note, format!("drop {name} into {folder}"));
+    }
+
+    /// A drag that left every window: the preview goes away.
+    fn cancel_drop_preview(&mut self) {
+        if self.drop_preview.take().is_some() {
+            info!(
+                target: telemetry_target::ENGINE,
+                "[editor] drop preview cancelled"
+            );
+        }
+    }
+
+    /// The Assets folder a drop lands in, as the grid shows it: the session's
+    /// open folder, or the asset root itself.
+    fn drop_folder(&mut self) -> String {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let folder = world
+            .get_resource::<pill_editor_core_egui::session::EguiShellState>()
+            .map(|state| state.browser.folder.clone())
+            .unwrap_or_default();
+        if folder.is_empty() {
+            "res".to_string()
+        } else {
+            format!("res/{folder}")
+        }
+    }
+
+    /// Import the paths a drop delivered (W-0038 Stage 18).
+    ///
+    /// A folder is refused by name - the import copies files, and a directory
+    /// would need a recursive walk with its own refusals - and the refusal is
+    /// a toast as well as a log line. Files become one recorded
+    /// `ImportFiles` step, so undo takes them off the disk again.
+    fn drop_files(&mut self, paths: Vec<std::path::PathBuf>) {
+        self.drop_preview = None;
+        let Some(asset_root) = self
+            .host
+            .host_mut()
+            .asset_directory()
+            .map(|directory| directory.to_path_buf())
+        else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] drop refused: the host knows no asset directory"
+            );
+            self.push_toast(
+                NoticeLevel::Warning,
+                "drop refused: no asset directory".to_string(),
+            );
+            return;
+        };
+        let folder = self.drop_folder();
+        let sub_folder = folder.strip_prefix("res/").unwrap_or("").to_string();
+        let destination = if sub_folder.is_empty() {
+            asset_root.clone()
+        } else {
+            asset_root.join(&sub_folder)
+        };
+        let mut sources = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    path = %path.display(),
+                    "[editor] drop refused: folder"
+                );
+                self.push_toast(
+                    NoticeLevel::Warning,
+                    format!(
+                        "{} is a folder; drop its files instead",
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.display().to_string())
+                    ),
+                );
+                continue;
+            }
+            sources.push(path.display().to_string());
+        }
+        if sources.is_empty() {
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push_recorded(
+                vec![EditorCommand::ImportFiles {
+                    sources: sources.clone(),
+                    destination: destination.display().to_string(),
+                }],
+                "import files",
+                None,
+            );
+        }
+        self.asset_listing_dirty = true;
+        info!(
+            target: telemetry_target::ENGINE,
+            count = sources.len(),
+            folder = folder.as_str(),
+            "[editor] files dropped"
+        );
+        self.push_toast(
+            NoticeLevel::Note,
+            format!("importing {} file(s) into {folder}", sources.len()),
+        );
     }
 
     /// Publish the shared selection as the renderer's outline set (Stage
@@ -5442,6 +5601,8 @@ impl EditorWindow {
             }
             ScriptedCommand::CameraZoom(lines) => self.zoom_camera(self.active_view, lines),
             ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
+            ScriptedCommand::Drop(path) => self.drop_files(vec![std::path::PathBuf::from(path)]),
+            ScriptedCommand::HoverFile(path) => self.preview_drop(std::path::Path::new(&path)),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
             ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
             ScriptedCommand::SelectAdd(handle) => {

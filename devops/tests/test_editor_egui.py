@@ -149,6 +149,9 @@ MIXED_ROW_TOKEN = "[editor] inspector row kind=mixed"
 SELECTION_EDIT_TOKEN = "[editor] selection field edit queued"
 CLIPBOARD_WRITTEN_TOKEN = "[editor] clipboard written"
 CLIPBOARD_PASTED_TOKEN = "[editor] clipboard pasted"
+DROP_PREVIEW_TOKEN = "[editor] drop preview"
+FILES_DROPPED_TOKEN = "[editor] files dropped"
+DROP_REFUSED_FOLDER_TOKEN = "[editor] drop refused: folder"
 # The registered name the showcase component's payload carries (W-0038
 # Stage 17): the paste's registry check compares full type names.
 SHOWCASE_TYPE_NAME = "italian_brainrot::ShowcaseComponent"
@@ -1712,6 +1715,60 @@ def main() -> int:
             re.escape(CLIPBOARD_WRITTEN_TOKEN), 30, "the second clipboard write", begin
         )
         print("  [OK] an entity copy sits on the OS clipboard for the next editor")
+
+        # Step 3a11: an OS drop into Assets (W-0038 Stage 18). winit's drop
+        # events cannot be synthesised from the command file, so the paths go to
+        # the same handler they call: the preview names the folder, the file is
+        # copied into it as one recorded step, and undo takes it off the disk.
+        # A folder is refused by name instead of being copied.
+        drop_source = REPOSITORY_ROOT / "local" / "temp" / "s18_dropped.png"
+        drop_source.parent.mkdir(parents=True, exist_ok=True)
+        drop_source.write_bytes(b"\x89PNG\r\n\x1a\ndrop probe\n")
+        begin = len(session.read_log())
+        session.send("hover file {}".format(drop_source))
+        session.wait(
+            re.escape(DROP_PREVIEW_TOKEN), 30, "the drop preview", begin
+        )
+        begin = len(session.read_log())
+        session.send("drop {}".format(drop_source))
+        session.wait(
+            re.escape(FILES_DROPPED_TOKEN) + r"\s+count=1\b",
+            30,
+            "the dropped file",
+            begin,
+        )
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="import files"',
+            30,
+            "the import step",
+            begin,
+        )
+        time.sleep(0.5)
+        imported = list(asset_root.rglob("s18_dropped.png"))
+        assert len(imported) == 1, (
+            "the dropped file was not copied into the project: {}".format(imported)
+        )
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the import's undo", begin)
+        time.sleep(0.5)
+        assert not imported[0].exists(), (
+            "the undo left the imported file on disk: {}".format(imported[0])
+        )
+        print("  [OK] a dropped file was imported and undone")
+
+        begin = len(session.read_log())
+        session.send("drop {}".format(drop_source.parent))
+        session.wait(
+            re.escape(DROP_REFUSED_FOLDER_TOKEN), 30, "the folder refusal", begin
+        )
+        session.wait(
+            re.escape(TOAST_TOKEN) + r'.*is a folder',
+            30,
+            "the refusal toast",
+            begin,
+        )
+        print("  [OK] a dropped folder is refused with a toast")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.
