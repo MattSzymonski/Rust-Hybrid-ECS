@@ -27,6 +27,7 @@ pub fn tab_icon(tab: EditorTab) -> icons::Icon {
         // closest a prompt-in-a-panel gets without adding a glyph.
         EditorTab::Console => icons::Icon::Code,
         EditorTab::Problems => icons::Icon::XCircle,
+        EditorTab::Statistics => icons::Icon::Gear,
         EditorTab::Preferences => icons::Icon::Faders,
     }
 }

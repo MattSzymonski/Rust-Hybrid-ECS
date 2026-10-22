@@ -68,6 +68,80 @@ pub struct EguiShellState {
     /// The Problems row a click asked to open, drained by the executable
     /// (W-0038 Stage 6).
     pub problem_open: Option<usize>,
+    /// The per-tab and whole-pass timings the Statistics tab shows
+    /// (W-0038 Stage 7).
+    pub stats: StatisticsSession,
+}
+
+/// One tab's measured cost, smoothed so a single slow frame does not dominate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabTiming {
+    /// Which tab.
+    pub tab: EditorTab,
+    /// The exponentially weighted mean of one body pass, in microseconds.
+    pub micros: f64,
+    /// How many passes were measured.
+    pub passes: u64,
+}
+
+/// The timings the Statistics tab reads (W-0038 Stage 7).
+///
+/// Written by the shell's own pass, read by the tab: the measurement is the
+/// shell's, so the tab cannot inflate what it reports by drawing itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatisticsSession {
+    /// One entry per tab drawn since the session began, in first-drawn order.
+    pub tabs: Vec<TabTiming>,
+    /// The whole shell pass's smoothed time, in microseconds.
+    pub shell_micros: f64,
+    /// Completed shell passes.
+    pub shell_passes: u64,
+    /// The editor's smoothed frame rate, as the shell measured it.
+    pub frames_per_second: f32,
+}
+
+impl StatisticsSession {
+    /// How strongly one pass moves the mean: a twentieth, so about twenty
+    /// passes settle a value without hiding a real regression for long.
+    const WEIGHT: f64 = 0.05;
+
+    /// Fold one tab body's time into its entry.
+    pub fn record(&mut self, tab: EditorTab, micros: f64) {
+        match self.tabs.iter_mut().find(|entry| entry.tab == tab) {
+            Some(entry) => {
+                entry.micros = smoothing(entry.micros, micros, Self::WEIGHT);
+                entry.passes += 1;
+            }
+            None => self.tabs.push(TabTiming {
+                tab,
+                micros,
+                passes: 1,
+            }),
+        }
+    }
+
+    /// Fold one whole shell pass's time in.
+    pub fn record_shell(&mut self, micros: u64) {
+        self.shell_micros = smoothing(self.shell_micros, micros as f64, Self::WEIGHT);
+        self.shell_passes += 1;
+    }
+
+    /// One tab's smoothed time, or zero when it was never drawn.
+    pub fn tab_micros(&self, tab: EditorTab) -> f64 {
+        self.tabs
+            .iter()
+            .find(|entry| entry.tab == tab)
+            .map_or(0.0, |entry| entry.micros)
+    }
+}
+
+/// One step of an exponential moving average, seeded by the first sample.
+fn smoothing(current: f64, sample: f64, weight: f64) -> f64 {
+    if current <= 0.0 {
+        sample
+    } else {
+        current * (1.0 - weight) + sample * weight
+    }
 }
 
 /// The command palette's session state (W-0038 Stage 3).
@@ -244,6 +318,7 @@ impl EguiShellState {
             palette: PaletteState::default(),
             console_filters: crate::console::ConsoleFilterSettings::default(),
             problem_open: None,
+            stats: StatisticsSession::default(),
         }
     }
 

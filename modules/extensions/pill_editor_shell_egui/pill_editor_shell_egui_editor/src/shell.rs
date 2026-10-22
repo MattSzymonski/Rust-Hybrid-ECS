@@ -101,6 +101,16 @@ pub mod tab_problems;
 
 pub use tab_problems::problems_tab;
 
+/// The [`tab_statistics`] module: frame, pass and per-tab timings (W-0038
+/// Stage 7).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod tab_statistics;
+
+pub use tab_statistics::statistics_tab;
+
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
 /// Public like every tab module: the build script's function
@@ -363,6 +373,7 @@ pub fn run_frame(
         palette,
         console_filters,
         problem_open,
+        stats,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -384,6 +395,7 @@ pub fn run_frame(
         tab_redock: None,
         console_filters,
         problem_open,
+        stats,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -438,6 +450,11 @@ pub fn run_frame(
     }
     *frame = shell_frame;
     let ui_micros = ui_started.elapsed().as_micros() as u64;
+    // The Statistics tab's top row: the pass this frame actually took
+    // (W-0038 Stage 7). Recorded before the frame's own logging so the tab and
+    // the log line below never disagree.
+    stats.record_shell(ui_micros);
+    stats.frames_per_second = shell_input.frames_per_second;
     // The periodic heartbeat, plus any update that runs past the D32 UI
     // budget: the suites prove the counter advances, and the benchmark gets
     // samples even when 210 frames take longer than its measurement window.
@@ -503,6 +520,9 @@ pub struct EditorTabViewer<'a> {
     /// The Problems row a click asked to open (W-0038 Stage 6); the executable
     /// drains it and launches the configured code editor.
     pub problem_open: &'a mut Option<usize>,
+    /// The timings the Statistics tab reads (W-0038 Stage 7): the shell writes
+    /// them around each tab body, the tab only formats them.
+    pub stats: &'a mut StatisticsSession,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -518,6 +538,10 @@ impl TabViewer for EditorTabViewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        // Every tab body is timed, because the Statistics tab's whole point is
+        // that its rows are measurements rather than estimates (Stage 7).
+        let started = pill_core::platform::Instant::now();
+        let tab = *tab;
         match tab {
             EditorTab::Scene => {
                 self.scene_rects[0] = Some(scene_body_rect(ui));
@@ -567,7 +591,11 @@ impl TabViewer for EditorTabViewer<'_> {
             }
             EditorTab::Console => console_tab(ui, self.snapshot, self.console_filters),
             EditorTab::Problems => problems_tab(ui, self.snapshot, self.problem_open),
+            EditorTab::Statistics => {
+                statistics_tab(ui, self.snapshot, self.stats, self.frames_per_second)
+            }
         }
+        self.stats.record(tab, started.elapsed().as_micros() as f64);
     }
 
     /// The dock tab's menu. The dock itself offers Eject (into a window)

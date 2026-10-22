@@ -253,6 +253,8 @@ pub enum Dump {
     Console,
     /// `dump problems` - the Problems rows and their locations.
     Problems,
+    /// `dump stats` - the Statistics tab's frame and per-tab timings.
+    Stats,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -623,6 +625,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "preferences" => Dump::Preferences,
         "console" => Dump::Console,
         "problems" => Dump::Problems,
+        "stats" => Dump::Stats,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1375,6 +1378,10 @@ mod tests {
             Accept {
                 line: "dump problems",
                 command: ScriptedCommand::Dump(Dump::Problems),
+            },
+            Accept {
+                line: "dump stats",
+                command: ScriptedCommand::Dump(Dump::Stats),
             },
             Accept {
                 line: "problem open 0",
