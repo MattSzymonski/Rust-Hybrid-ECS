@@ -51,6 +51,46 @@ pub fn claim_shell_context(context: &egui::Context) -> bool {
     claim_context_once(&CONTEXT_CLAIMED, context)
 }
 
+/// Whether this generation has cleared the popped-out windows' contexts.
+static POPOUTS_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claim every popped-out tab's context for this shell generation (W-0038
+/// Stage 23).
+///
+/// A popped-out window runs its own context, and that context is exactly as
+/// long-lived as the main one - so the same rule applies to each of them. The
+/// flag is one per generation, not one per context: clearing every popout
+/// context on the generation's first frame costs a handful of map clears
+/// once, and needs no bookkeeping across reloads. Returns how many contexts
+/// were cleared, which is zero on every frame after the first.
+pub fn claim_popout_contexts(
+    contexts: &std::collections::BTreeMap<pill_editor_core_egui::layout::EditorTab, egui::Context>,
+) -> usize {
+    if POPOUTS_CLAIMED.swap(true, Ordering::AcqRel) {
+        return 0;
+    }
+    let mut cleared = 0;
+    for context in contexts.values() {
+        let entries = context.memory_mut(|memory| {
+            let entries = memory.data.len();
+            memory.data.clear();
+            entries
+        });
+        if entries > 0 {
+            cleared += 1;
+        }
+    }
+    if !contexts.is_empty() {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            windows = contexts.len(),
+            cleared,
+            "[editor] popout contexts claimed"
+        );
+    }
+    cleared
+}
+
 /// The once-per-generation rule, with its flag passed in.
 ///
 /// Split out so a test can run the rule against its own flag: two tests

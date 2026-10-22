@@ -41,6 +41,7 @@ pub mod prelude;
 pub mod claim;
 
 pub use claim::claim_context_once;
+pub use claim::claim_popout_contexts;
 pub use claim::claim_shell_context;
 
 /// The Systems tab: pause/step and the recorded system toggles.
@@ -366,6 +367,7 @@ pub fn run_frame(
     panels: &PanelRegistry,
     panel_commands: &mut Vec<PanelCommand>,
     clipboard: &mut pill_editor_core_egui::clipboard::EditorClipboard,
+    popout_inputs: &pill_ui_egui::boundary::EguiPopoutInputs,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
@@ -464,6 +466,7 @@ pub fn run_frame(
         panel_budget,
         panel_windows: windows,
         panel_window_ping: window_ping,
+        popout_contexts,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -582,10 +585,17 @@ pub fn run_frame(
         );
     });
     let mut shell_frame = frame_from_output(&context, output);
-    shell_frame.scene_rects = viewer.scene_rects;
-    shell_frame.game_rect = viewer.game_rect;
+    shell_frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
+    shell_frame.game_rect = viewer.game_rect.take();
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
     shell_frame.quit_requested = std::mem::take(&mut menubar.quit_requested);
+    // One more pass per popped-out tab (W-0038 Stage 23): each runs its own
+    // context, so its window has its own widget state, its own input record
+    // and its own frame. The dock no longer holds these tabs, so nothing draws
+    // them twice.
+    claim_popout_contexts(popout_contexts);
+    shell_frame.popout_frames =
+        run_popout_passes(dock, popout_contexts, popout_inputs, &mut viewer);
     // A tab menu's re-dock runs after the dock finished drawing: changing
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
@@ -667,6 +677,56 @@ pub fn run_frame(
 // =============================================================================
 // The tab viewer and the tabs
 // =============================================================================
+
+/// Run one egui pass per popped-out tab (W-0038 Stage 23).
+///
+/// Each popped-out window has its own context, so it draws independently of
+/// the dock pass that ran a moment earlier in the main window: same data, same
+/// viewer code, its own widget state and its own input record. The tab body is
+/// the `TabViewer::ui` implementation the dock calls, which is what keeps a
+/// tab looking and behaving the same in a window as it does in the dock.
+///
+/// `dock.popouts()` holds tabs that are *not* in the dock tree, so nothing is
+/// drawn twice. The viewer's viewport rectangles are reset per pass: a popped
+/// out Scene tab reports its rectangle in its own window's coordinates, and
+/// the frontend places that view's surface there.
+pub fn run_popout_passes(
+    dock: &pill_editor_core_egui::layout::EditorDock,
+    contexts: &mut std::collections::BTreeMap<EditorTab, egui::Context>,
+    inputs: &pill_ui_egui::boundary::EguiPopoutInputs,
+    viewer: &mut EditorTabViewer<'_>,
+) -> Vec<pill_ui_egui::boundary::PopoutFrame> {
+    let mut frames = Vec::new();
+    for tab in dock.popouts().iter().copied() {
+        let name = tab.name();
+        let context = contexts
+            .entry(tab)
+            .or_insert_with(|| {
+                let context = egui::Context::default();
+                pill_ui_egui::style::apply(&context);
+                context
+            })
+            .clone();
+        // A window the frontend has not reported yet gets a default record:
+        // an empty event list, so the pass draws without interaction.
+        let input = inputs.by_tab.get(&name).cloned().unwrap_or_default();
+        let raw_input = pill_ui_egui::input::raw_input(&input);
+        viewer.scene_rects = vec![None; dock.scene_view_count()];
+        let output = context.run_ui(raw_input, |ui| {
+            let mut popout_tab = tab;
+            <EditorTabViewer<'_> as TabViewer>::ui(viewer, ui, &mut popout_tab);
+        });
+        let mut frame = pill_ui_egui::boundary::frame_from_output(&context, output);
+        frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
+        frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
+        frames.push(pill_ui_egui::boundary::PopoutFrame {
+            tab: name,
+            title: format!("Pill Editor - {}", tab.title()),
+            frame: Box::new(frame),
+        });
+    }
+    frames
+}
 
 /// What module panels read this pass (W-0038 Stages 12 and 13).
 ///

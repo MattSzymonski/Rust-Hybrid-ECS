@@ -40,7 +40,7 @@ use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
 use pill_editor_core_egui::notices::EditorNotices;
 use pill_editor_core_egui::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
-use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
+use pill_ui_egui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
 use pill_ui_egui::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 
 // The build script scans this crate and emits one address entry per function
@@ -95,6 +95,12 @@ pub fn register(engine: &mut Engine) -> u32 {
     world.register_resource::<EguiShellFrame>();
     if world.get_resource::<EguiShellFrame>().is_none() {
         world.insert_resource(EguiShellFrame::default());
+    }
+    // The popped-out windows' input, one record per tab (W-0038 Stage 23):
+    // the frontend fills it, the shell reads it when it runs that tab's pass.
+    world.register_resource::<EguiPopoutInputs>();
+    if world.get_resource::<EguiPopoutInputs>().is_none() {
+        world.insert_resource(EguiPopoutInputs::default());
     }
     // Step 4: the data the tabs read and the selection they write, re-claimed
     // so a reload keeps which entity was selected. The executable refreshes
@@ -181,6 +187,8 @@ pub fn egui_shell_update(
             // The shell's side of the OS clipboard (W-0038 Stage 17).
             ResMut<pill_editor_core_egui::clipboard::EditorClipboard>,
         ),
+        // Each popped-out window's input (W-0038 Stage 23).
+        Res<EguiPopoutInputs>,
     ),
 ) {
     // The resources are this crate's own registrations; a world without them
@@ -191,6 +199,7 @@ pub fn egui_shell_update(
         mut frame,
         (snapshot, mut selection, notices),
         (mut pending, panels, mut panel_commands, mut clipboard),
+        popout_inputs,
     ) = resources;
     let (
         Some(mut state),
@@ -198,6 +207,7 @@ pub fn egui_shell_update(
         Some(mut frame),
         (Some(snapshot), Some(mut selection), Some(notices)),
         (Some(mut pending), Some(panels), Some(mut panel_commands), Some(mut clipboard)),
+        Some(popout_inputs),
     ) = (
         state.get_mut(),
         input.get_mut(),
@@ -209,6 +219,7 @@ pub fn egui_shell_update(
             panel_commands.get_mut(),
             clipboard.get_mut(),
         ),
+        popout_inputs.get(),
     )
     else {
         return;
@@ -224,5 +235,6 @@ pub fn egui_shell_update(
         panels,
         &mut panel_commands.commands,
         &mut clipboard,
+        popout_inputs,
     );
 }

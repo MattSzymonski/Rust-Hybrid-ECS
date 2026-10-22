@@ -79,6 +79,20 @@ impl Default for EguiShellInput {
     }
 }
 
+/// One input record per popped-out tab's window (W-0038 Stage 23).
+///
+/// A popped-out window's events must not reach the main window's pass - its
+/// coordinates are its own client area's - so the frontend keeps them apart
+/// and the shell reads the tab's record when it runs that tab's pass. A tab
+/// with no record (a window the frontend has not made yet) gets a default.
+#[derive(Clone, Debug, Default)]
+pub struct EguiPopoutInputs {
+    /// Each popped-out tab's input, keyed by the tab's wire name.
+    pub by_tab: std::collections::BTreeMap<String, EguiShellInput>,
+}
+
+impl Resource for EguiPopoutInputs {}
+
 /// How many scene viewports a layout opens with: the two the default dock
 /// carries. The shell may report more - a view the person added (W-0038
 /// Stage 21) - and the frontend opens one for each it does.
@@ -156,6 +170,22 @@ pub struct EguiShellFrame {
     /// at once, `None` means no pass was requested. The frontend's redraw
     /// cadence honours it (W-0038 Stage 9).
     pub repaint_after: Option<Duration>,
+    /// One frame per tab popped out into its own OS window (W-0038 Stage 23):
+    /// the shell runs a pass of its own context for each, and the frontend
+    /// paints it into that tab's window. A tab that appears here has its
+    /// window created; one that disappears is closed.
+    pub popout_frames: Vec<PopoutFrame>,
+}
+
+/// One popped-out tab's frame: which tab it draws, and the pass's output.
+///
+pub struct PopoutFrame {
+    /// The tab's wire name, which is also its window's identity.
+    pub tab: String,
+    /// The window's title, as the shell wants it shown.
+    pub title: String,
+    /// The pass's output, in the same shape the main window's frame takes.
+    pub frame: Box<EguiShellFrame>,
 }
 
 impl Resource for EguiShellFrame {}
@@ -178,6 +208,7 @@ impl Default for EguiShellFrame {
             drag_out: None,
             quit_requested: false,
             repaint_after: None,
+            popout_frames: Vec::new(),
         }
     }
 }
@@ -237,6 +268,8 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         // Only the shell's menu can ask to quit; it sets the flag itself.
         quit_requested: false,
         repaint_after,
+        // A popped-out tab's pass is its own; this frame is the main window's.
+        popout_frames: Vec::new(),
     }
 }
 

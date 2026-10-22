@@ -61,7 +61,11 @@ use crate::error::LayoutPersistenceError;
 /// view's index, so a layout may hold any number of them. Nothing is
 /// appended, so a v11 document is accepted and stamped - its `Scene` and
 /// `SecondScene` tabs read as views 0 and 1.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 12;
+///
+/// v13 adds pop-out windows (W-0038 Stage 23): the document names the tabs
+/// that live in their own OS windows, so a restart puts them back there.
+/// Nothing is appended, so a v12 document is accepted and stamped.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 13;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";

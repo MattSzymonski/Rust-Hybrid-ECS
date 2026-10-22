@@ -82,7 +82,8 @@ use pill_runtime::{
     SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
 };
 use pill_ui_egui::boundary::{
-    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
+    frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellRect,
+    DEFAULT_SCENE_VIEWS,
 };
 use pill_ui_egui::egui;
 use pill_ui_egui::panels::{
@@ -190,6 +191,11 @@ const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
 
 /// The scene view's initial size in logical pixels.
 const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
+
+/// A popped-out tab window's initial size in logical pixels (W-0038 Stage
+/// 23): tall and narrow enough for the Inspector and the Assets panel, and
+/// the person resizes it from there.
+const POPOUT_INITIAL_SIZE: LogicalSize<f64> = LogicalSize::new(520.0, 720.0);
 
 /// The scene views' surface ids: view `n` draws through surface `n + 1`, so
 /// each view keeps its surface however many views the person opens. Surface
@@ -371,8 +377,33 @@ impl ApplicationHandler for EditorApplication {
             .game_surface
             .as_ref()
             .is_some_and(|game| game.window.id() == window_id);
-        if !is_main && child_view.is_none() && !is_game {
+        // A popped-out tab's window (W-0038 Stage 23): its events are its own
+        // pass's, never the main window's - a click in it lands at that
+        // window's coordinates.
+        let popout_tab = editor
+            .popouts
+            .iter()
+            .find(|(_tab, popout)| popout.window.id() == window_id)
+            .map(|(tab, _popout)| tab.clone());
+        if !is_main && child_view.is_none() && !is_game && popout_tab.is_none() {
             return;
+        }
+        // A popped-out window only needs its own resize and close handling
+        // here; its redraws ride the main window's frame.
+        if let Some(tab) = &popout_tab {
+            match &event {
+                WindowEvent::Resized(size) => {
+                    if let Some(popout) = editor.popouts.get_mut(tab) {
+                        popout
+                            .surface
+                            .resize(&editor.device, (size.width, size.height));
+                    }
+                }
+                WindowEvent::CloseRequested => {
+                    editor.close_popout(tab);
+                }
+                _ => {}
+            }
         }
         let redraw_request = matches!(event, WindowEvent::RedrawRequested);
         match event {
@@ -519,9 +550,15 @@ impl ApplicationHandler for EditorApplication {
                 // shell never sees them. The editor's own windows - the main
                 // one and the scene views - are the UI's: their events feed
                 // the shell, and a project system never receives a keystroke
-                // meant for the Inspector.
+                // meant for the Inspector. A popped-out tab's window is its
+                // own pass's (W-0038 Stage 23): its events go to that tab's
+                // record and no further.
                 for event in translate_window_event(&other) {
                     let event = offset_pointer(event, origin);
+                    if let Some(tab) = &popout_tab {
+                        editor.popout_event(tab, event);
+                        continue;
+                    }
                     match route_event(&event, is_game) {
                         EventRoute::Game => editor.pending_events.push(event),
                         EventRoute::Shell => {
@@ -594,6 +631,10 @@ struct EditorWindow {
     /// the primary surface, so the project's renderer presents the game
     /// view there. `None` leaves the primary on the main window.
     game_surface: Option<SurfaceWindow>,
+    /// One window per popped-out tab (W-0038 Stage 23), keyed by the tab's
+    /// wire name: each carries its own swapchain and its own egui renderer,
+    /// because the UI that draws into it is a pass of its own.
+    popouts: std::collections::BTreeMap<String, PopoutWindow>,
     /// The editor's cameras, one per scene viewport: navigation moves the
     /// active viewport's camera only, and every scene ray projects through
     /// its own view's camera.
@@ -993,6 +1034,7 @@ impl EditorWindow {
             host,
             views,
             game_surface,
+            popouts: std::collections::BTreeMap::new(),
             cameras,
             active_view: 0,
             left_down: vec![false; DEFAULT_SCENE_VIEWS],
@@ -3745,6 +3787,11 @@ impl EditorWindow {
                 paste_text: paste_text.flatten(),
             };
         }
+        // Step 3a2: each popped-out window's own input record (W-0038 Stage
+        // 23): its geometry, focus and frame rate this frame. Its events are
+        // appended as its window reports them and cleared when the frame
+        // that read them is presented, so a record never replays an event.
+        self.publish_popout_geometry();
         // Step 3b: apply the engine mutations the shell's assets actions and
         // the scripted channel queued - the frame boundary the
         // `EditorCommand` contract names. A failed command never aborts the
@@ -5517,6 +5564,259 @@ impl EditorWindow {
         }
     }
 
+    /// Reconcile the popped-out windows with the shell's frames and paint them
+    /// (W-0038 Stage 23).
+    ///
+    /// The shell reports one frame per popped-out tab, so the frames *are* the
+    /// window set: a tab that appears gets a window, a tab that disappears has
+    /// its window closed, and each remaining frame is painted into its own
+    /// swapchain through its own renderer. The pass ran in the shell, so
+    /// nothing here touches egui's context.
+    fn present_popouts(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        frames: &mut [pill_ui_egui::boundary::PopoutFrame],
+    ) {
+        for frame in frames.iter() {
+            if self.popouts.contains_key(&frame.tab) {
+                continue;
+            }
+            self.open_popout(event_loop, &frame.tab, &frame.title);
+        }
+        // A tab that redocked (or was closed) loses its window.
+        let live: Vec<String> = frames.iter().map(|frame| frame.tab.clone()).collect();
+        let stale: Vec<String> = self
+            .popouts
+            .keys()
+            .filter(|tab| !live.contains(tab))
+            .cloned()
+            .collect();
+        for tab in stale {
+            if self.popouts.remove(&tab).is_some() {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    tab = tab.as_str(),
+                    "[editor] popout closed"
+                );
+            }
+        }
+        for frame in frames.iter_mut() {
+            let Some(popout) = self.popouts.get_mut(&frame.tab) else {
+                continue;
+            };
+            let textures = std::mem::take(&mut frame.frame.textures);
+            if let Err(error) = popout.surface.render(
+                &self.device,
+                &self.queue,
+                &mut popout.renderer,
+                &frame.frame.meshes,
+                textures,
+                frame.frame.pixels_per_point,
+            ) {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    tab = frame.tab.as_str(),
+                    error = %error,
+                    "[editor] popout frame failed"
+                );
+            }
+        }
+    }
+
+    /// Append one event to `tab`'s input record, the window's own cursor kept
+    /// alongside it.
+    fn popout_event(&mut self, tab: &str, event: InputEvent) {
+        let cursor = match &event {
+            InputEvent::CursorMoved { position } => Some(*position),
+            InputEvent::CursorLeft => None,
+            _ => None,
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(inputs) = world.get_resource_mut::<EguiPopoutInputs>() else {
+            return;
+        };
+        let record = inputs.by_tab.entry(tab.to_string()).or_default();
+        match &event {
+            InputEvent::CursorMoved { .. } => record.cursor = cursor,
+            InputEvent::CursorLeft => record.cursor = None,
+            _ => {}
+        }
+        record.events.push(event);
+    }
+
+    /// Close `tab`'s window and redock its tab: a window close is a redock,
+    /// so the tab is never lost by closing it.
+    fn close_popout(&mut self, tab: &str) {
+        if self.popouts.remove(tab).is_none() {
+            return;
+        }
+        // The tab comes back through the dock's own rule, matched by wire name
+        // (the shell owns the tab enum; this side only knows the name).
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+            if let Some(editor_tab) = editor_tab_by_name(tab) {
+                state.dock.redock(editor_tab);
+            }
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            tab,
+            "[editor] popout closed"
+        );
+    }
+
+    /// `popout <tab>` / `popout <tab> redock` (W-0038 Stage 23): the same dock
+    /// move the tab menu makes, driven from the scripted channel.
+    fn scripted_popout(&mut self, tab: EditorTab, redock: bool) {
+        if tab == EditorTab::Game {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] popout refused: the game view is the primary surface's window"
+            );
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] popout needs the shell module's state"
+            );
+            return;
+        };
+        let moved = if redock {
+            state.dock.redock(tab)
+        } else {
+            state.dock.pop_out(tab)
+        };
+        if moved {
+            info!(
+                target: telemetry_target::ENGINE,
+                tab = tab.name().as_str(),
+                redock,
+                "[editor] popout moved"
+            );
+        } else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                tab = tab.name().as_str(),
+                redock,
+                "[editor] popout unchanged: the tab cannot move"
+            );
+        }
+    }
+
+    /// Clear every popped-out window's event list once the frame that read it
+    /// has been presented, so no event is replayed into a second pass.
+    fn clear_popout_events(&mut self) {
+        if self.popouts.is_empty() {
+            return;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(inputs) = world.get_resource_mut::<EguiPopoutInputs>() {
+            for record in inputs.by_tab.values_mut() {
+                record.events.clear();
+            }
+        }
+    }
+
+    /// Open one popped-out tab's window: a plain top-level window with its own
+    /// swapchain and its own egui renderer.
+    fn open_popout(&mut self, event_loop: &ActiveEventLoop, tab: &str, title: &str) {
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(POPOUT_INITIAL_SIZE);
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => window,
+            Err(error) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    tab,
+                    error = %error,
+                    "[editor] popout window refused"
+                );
+                return;
+            }
+        };
+        let window = Arc::new(window);
+        let size = window.inner_size();
+        let surface = match OverlaySurface::new_window(
+            &self.instance,
+            &self.adapter,
+            &self.device,
+            Arc::clone(&window),
+            EDITOR_FORMAT,
+            (size.width.max(1), size.height.max(1)),
+        ) {
+            Ok(surface) => surface,
+            Err(error) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    tab,
+                    error = %error,
+                    "[editor] popout surface refused"
+                );
+                return;
+            }
+        };
+        let renderer = egui_wgpu::Renderer::new(
+            &self.device,
+            EDITOR_FORMAT,
+            egui_wgpu::RendererOptions::default(),
+        );
+        info!(
+            target: telemetry_target::ENGINE,
+            tab,
+            width = size.width,
+            height = size.height,
+            "[editor] popout opened"
+        );
+        self.popouts.insert(
+            tab.to_string(),
+            PopoutWindow {
+                window,
+                surface,
+                renderer,
+            },
+        );
+    }
+
+    /// Refresh each popped-out window's input record: its geometry and frame
+    /// rate this frame. Its events were appended as its window reported them.
+    fn publish_popout_geometry(&mut self) {
+        if self.popouts.is_empty() {
+            return;
+        }
+        let geometry: Vec<(String, f32, f32, f32, bool)> = self
+            .popouts
+            .iter()
+            .map(|(tab, popout)| {
+                let scale_factor = popout.window.scale_factor() as f32;
+                let size = popout.window.inner_size();
+                (
+                    tab.clone(),
+                    size.width as f32 / scale_factor.max(0.01),
+                    size.height as f32 / scale_factor.max(0.01),
+                    scale_factor,
+                    popout.window.has_focus(),
+                )
+            })
+            .collect();
+        let time = self.started.elapsed().as_secs_f64();
+        let frames_per_second = self.fps;
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(inputs) = world.get_resource_mut::<EguiPopoutInputs>() else {
+            return;
+        };
+        for (tab, width, height, scale_factor, focused) in geometry {
+            let record = inputs.by_tab.entry(tab).or_default();
+            record.screen_size = pill_core::math::Vector2f::new(width.max(1.0), height.max(1.0));
+            record.scale_factor = scale_factor;
+            record.focused = focused;
+            record.time = time;
+            record.frames_per_second = frames_per_second;
+        }
+    }
+
     /// Draw the shell's frame through the overlay; without a shell module,
     /// draw the runner's own fallback.
     fn present_ui(&mut self, event_loop: &ActiveEventLoop) {
@@ -5549,6 +5849,9 @@ impl EditorWindow {
             // egui's own cadence: the redraw decision at the end of the frame
             // honours it (W-0038 Stage 9).
             repaint_after,
+            // One frame per popped-out tab (W-0038 Stage 23): each paints into
+            // its own window, below.
+            mut popout_frames,
         } = frame;
         self.repaint_after = repaint_after;
         // Each scene viewport follows its dock rectangle, so the viewports
@@ -5612,6 +5915,10 @@ impl EditorWindow {
                 ),
             }
         }
+        // Step 2b: the popped-out windows (W-0038 Stage 23) - create the ones
+        // the shell reported for the first time, close the ones it stopped
+        // reporting, and paint each frame into its own swapchain.
+        self.present_popouts(event_loop, &mut popout_frames);
         // Step 3: draw through the overlay; retry a missing overlay rarely,
         // so a transient compositor failure heals.
         if self.overlay.is_none() {
@@ -5634,6 +5941,9 @@ impl EditorWindow {
                 "[editor] overlay frame failed"
             );
         }
+        // The popped-out windows' events have been through their passes: the
+        // next frame starts with none.
+        self.clear_popout_events();
     }
 
     /// The safe-mode pass, used while no shell module is loaded (W-0038
@@ -5965,6 +6275,7 @@ impl EditorWindow {
             ScriptedCommand::Paste => self.scripted_clipboard(ClipboardAction::Paste),
             ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
             ScriptedCommand::NewSceneView => self.scripted_new_scene_view(),
+            ScriptedCommand::Popout { tab, redock } => self.scripted_popout(tab, redock),
             ScriptedCommand::Step => self.scripted_step(),
             ScriptedCommand::EntityCreate => self.scripted_entity_create(),
             ScriptedCommand::EntityDelete => self.scripted_entity_delete(),
@@ -6662,6 +6973,22 @@ fn problems_from_build_output(module: &str, output: &str) -> Vec<ProblemRow> {
 // SurfaceWindow
 // =============================================================================
 
+/// One popped-out tab's window (W-0038 Stage 23): the window, its own
+/// swapchain and its own egui renderer.
+///
+/// A pop-out is a plain top-level window, not a child: the point of popping a
+/// panel out is putting it on another monitor, where a child window cannot go.
+struct PopoutWindow {
+    /// The window the pass is presented into.
+    window: Arc<Window>,
+    /// The window's swapchain, in the opaque window posture.
+    surface: OverlaySurface,
+    /// egui's renderer for this window. Its textures belong to this renderer,
+    /// which is why each pop-out owns one: two renderers cannot share a
+    /// texture namespace across swapchains.
+    renderer: egui_wgpu::Renderer,
+}
+
 /// One view surface's window: a child of the main window when the platform
 /// allows one, the detached top-level fallback otherwise.
 struct SurfaceWindow {
@@ -6865,6 +7192,24 @@ fn offset_pointer(event: InputEvent, (dx, dy): (f32, f32)) -> InputEvent {
 /// The tab's display name for log lines.
 fn tab_name(tab: EditorTab) -> String {
     tab.name()
+}
+
+/// The tab whose wire name is `name`, for the frontend's side of a pop-out
+/// move (W-0038 Stage 23): the shell owns the enum, this side only knows the
+/// name a window carries.
+fn editor_tab_by_name(name: &str) -> Option<EditorTab> {
+    if let Some(rest) = name.strip_prefix("scene") {
+        if rest.is_empty() {
+            return Some(EditorTab::Scene(0));
+        }
+        return rest
+            .parse::<u16>()
+            .ok()
+            .and_then(|count| count.checked_sub(1))
+            .and_then(|index| u8::try_from(index).ok())
+            .map(EditorTab::Scene);
+    }
+    EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
 }
 
 // =============================================================================

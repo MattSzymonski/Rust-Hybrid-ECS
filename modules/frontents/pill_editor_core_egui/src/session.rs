@@ -84,6 +84,12 @@ pub struct EguiShellState {
     /// A window the scripted channel asked a panel to open: the panel's slot
     /// and the window id it should choose (W-0038 Stage 13).
     pub panel_window_ping: Option<(u16, String)>,
+    /// One egui context per popped-out tab (W-0038 Stage 23). A popped-out
+    /// window runs its own pass, so it owns its own context - the main one is
+    /// running the dock in the same frame. The map lives in the session for
+    /// the same reason the main context does: a shell reload must find each
+    /// window's widget state where it left it.
+    pub popout_contexts: std::collections::BTreeMap<EditorTab, Context>,
 }
 
 /// How many panel windows one session may have open at once.
@@ -586,6 +592,7 @@ impl EguiShellState {
             panels_remapped: false,
             panel_windows: PanelWindowSession::default(),
             panel_window_ping: None,
+            popout_contexts: std::collections::BTreeMap::new(),
         }
     }
 
