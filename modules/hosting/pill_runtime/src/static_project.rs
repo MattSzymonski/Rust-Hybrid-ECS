@@ -329,9 +329,16 @@ fn initialize_linked(
     // than merely equivalent to them.
     // The failure, if any, is also recorded in the world's registration-error
     // slot, which is checked below; the direct error would duplicate it.
+    //
+    // The resolver is held across the entry point, exactly like
+    // `run_artifact_init` holds it in the DLL wrappers: a linked project
+    // registers its own components from `init`, and a value-type field only
+    // expands into editable rows while a resolver is installed.
+    let previous = pill_engine::component_registry::install_value_type_layouts(engine.world_mut());
     let _ = pill_engine::component_registry::register_all_components(engine.world_mut());
-
     let status = register_scoped(engine, scope, init);
+    let registration_error = engine.world_mut().take_registration_error();
+    pill_engine::component_registry::restore_value_type_layouts(engine.world_mut(), previous);
 
     // The generated wrappers read the world's registration-error slot once more
     // after the user's function, because resource guards are raised from that
@@ -340,7 +347,7 @@ fn initialize_linked(
     // forgotten.
     if status != 0 {
         Err(status)
-    } else if engine.world_mut().take_registration_error().is_some() {
+    } else if registration_error.is_some() {
         Err(u32::MAX)
     } else {
         Ok(())

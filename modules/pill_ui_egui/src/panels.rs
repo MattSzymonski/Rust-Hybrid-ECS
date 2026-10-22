@@ -306,6 +306,11 @@ impl PanelCommands {
     pub fn drain(&mut self) -> Vec<PanelCommand> {
         std::mem::take(&mut self.commands)
     }
+
+    /// Queue one command, as a panel body does through its `PanelContext`.
+    pub fn push(&mut self, command: PanelCommand) {
+        self.commands.push(command);
+    }
 }
 
 impl PanelRegistry {

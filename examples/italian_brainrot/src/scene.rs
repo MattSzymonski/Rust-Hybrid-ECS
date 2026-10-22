@@ -6,7 +6,7 @@
 //! - Spawn one model variant per tagged shape, each guarded by its tag so a
 //!   reload re-runs the system without stacking duplicates.
 
-use crate::{asset_loading::SceneAssets, ShowcaseComponent, TagAlphaComponent};
+use crate::{asset_loading::SceneAssets, ShowcaseComponent, ShowcasePoint, TagAlphaComponent};
 use pill_engine::{Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
@@ -67,6 +67,18 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
                 frame: 0.0,
                 lean: index as f32 * 0.5 - 0.5,
                 scale: 1.0 + index as f32 * 0.5,
+                // A distinct pair per model, so the collection rows open on
+                // different numbers too.
+                points: [
+                    ShowcasePoint {
+                        x: index as f32,
+                        y: index as f32 + 0.5,
+                    },
+                    ShowcasePoint {
+                        x: index as f32 + 1.0,
+                        y: index as f32 + 1.5,
+                    },
+                ],
             })
             .with(TagAlphaComponent)
             .build()

@@ -2505,25 +2505,11 @@ fn module_init_export(
                 // `&mut Engine` is unique.
                 let api = unsafe { &*api };
                 let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-                if let Err(_error) =
-                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
-                {
-                    // The engine logged the first-class diagnostic; fail the
-                    // init so the host rolls the reload back instead of running
-                    // with a half-registered component set.
-                    return u32::MAX;
-                }
-                let status = #init_fn(engine);
-                // That drain runs before the user's own registration code, so a
-                // guard raised from there - a shared resource name claimed by
-                // two types, or one registered with two layouts - is recorded
-                // after it has been read. Read the slot once more, so such a
-                // conflict fails the init instead of being recorded and
-                // forgotten.
-                if engine.world_mut().take_registration_error().is_some() {
-                    return u32::MAX;
-                }
-                status
+                // Register this artifact and run its init with the artifact's
+                // value types installed for the whole entry point, so a
+                // `struct:`-tagged field expands into editable rows even when
+                // the artifact registers components itself.
+                ::pill_engine::component_registry::run_artifact_init(engine, #init_fn)
             }));
             result.unwrap_or(u32::MAX)
         }

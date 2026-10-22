@@ -638,6 +638,14 @@ impl World {
 // Nested field expansion
 // =============================================================================
 
+/// How many elements of an `array:struct:` field expand into leaf rows.
+///
+/// A control-point array of a few dozen entries becomes a few dozen rows,
+/// which is what an editor wants to show; a fixed-capacity buffer of thousands
+/// would only bloat every layout, so the rest stays reachable through the
+/// field's own accessors.
+pub const MAX_EXPANDED_ELEMENTS: usize = 64;
+
 impl World {
     /// Record a component's editor field layout, expanding nested struct
     /// fields into dotted leaf rows.
@@ -692,6 +700,39 @@ impl World {
         changed: &mut bool,
     ) {
         for field in fields {
+            // An array of structs (`array:struct:<path>`) becomes one dotted
+            // row per leaf per element - `points[0].x` - so the editor's generic
+            // field API addresses a single control point the same way it
+            // addresses a plain float (W-0038 Stage 15). The element count is
+            // the field's own; a cap keeps a huge array from flooding a layout.
+            if let Some(path) = field.type_tag.strip_prefix("array:struct:") {
+                if let Some(nested) = self.resolve_nested_layout(path) {
+                    let elements = field.element_count.min(MAX_EXPANDED_ELEMENTS);
+                    let stride = if field.element_count == 0 {
+                        0
+                    } else {
+                        field.size / field.element_count
+                    };
+                    if elements > 0 {
+                        *changed = true;
+                        for index in 0..elements {
+                            let element = if prefix.is_empty() {
+                                format!("{}[{}]", field.name, index)
+                            } else {
+                                format!("{}.{}[{}]", prefix, field.name, index)
+                            };
+                            self.expand_fields_into(
+                                &nested,
+                                &element,
+                                base_offset + field.offset + index * stride,
+                                out,
+                                changed,
+                            );
+                        }
+                        continue;
+                    }
+                }
+            }
             let nested = field
                 .type_tag
                 .strip_prefix("struct:")
@@ -1454,6 +1495,93 @@ mod tests {
             decorators: std::borrow::Cow::Borrowed(&[]),
         },
     ];
+
+    /// A component carrying an array of value types: the shape a spline's
+    /// control points have.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct PointArray {
+        lead: f32,
+        points: [ProbeVector; 2],
+    }
+    impl Component for PointArray {}
+
+    static POINT_ARRAY_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "lead",
+            type_tag: "f32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+        ComponentFieldDescriptor {
+            name: "points",
+            type_tag: "array:struct:ProbeVector",
+            offset: 4,
+            size: 16,
+            align: 4,
+            element_count: 2,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+    ];
+
+    /// An `array:struct:` field expands into one dotted row per leaf per
+    /// element, with the element stride composed from the array's own size, and
+    /// a single element's leaf reads and writes like any scalar field
+    /// (W-0038 Stage 15).
+    #[test]
+    fn struct_arrays_expand_into_editable_element_rows() {
+        let mut world = World::new();
+        world.replace_value_type_layout_resolver(Some(probe_value_types));
+        world.register_component_with_layout::<PointArray>(POINT_ARRAY_FIELDS);
+        world.replace_value_type_layout_resolver(None);
+
+        let layout = world
+            .component_field_layout(ComponentId::of::<PointArray>())
+            .expect("PointArray registered with a layout");
+        let names: Vec<&str> = layout.iter().map(|field| field.name).collect();
+        assert_eq!(
+            names,
+            [
+                "lead",
+                "points[0].x",
+                "points[0].y",
+                "points[1].x",
+                "points[1].y"
+            ]
+        );
+        assert_eq!(layout[1].offset, 4, "first element starts after `lead`");
+        assert_eq!(layout[3].offset, 12, "the second element is one stride on");
+
+        let entity = world
+            .create_entity()
+            .with(PointArray {
+                lead: 1.0,
+                points: [
+                    ProbeVector { x: 2.0, y: 3.0 },
+                    ProbeVector { x: 4.0, y: 5.0 },
+                ],
+            })
+            .build()
+            .expect("entity builds");
+        let component = world
+            .entity_component_names(entity)
+            .and_then(|names| names.into_iter().find(|name| name.ends_with("PointArray")))
+            .expect("the entity carries PointArray");
+        let read = world
+            .read_component_field(entity, &component, "points[1].y")
+            .expect("the element's leaf reads");
+        assert!(matches!(read, FieldValue::F32(value) if value == 5.0));
+        world
+            .write_component_field(entity, &component, "points[0].x", FieldValue::F32(9.5))
+            .expect("the element's leaf writes");
+        let read = world
+            .read_component_field(entity, &component, "points[0].x")
+            .expect("the element's leaf reads back");
+        assert!(matches!(read, FieldValue::F32(value) if value == 9.5));
+    }
 
     fn nested_world() -> World {
         let mut world = World::new();

@@ -46,6 +46,29 @@ pub struct ShowcaseComponent {
     /// A drag value with a floor and no ceiling.
     #[pill(min(0.0))]
     pub scale: f32,
+    /// A pair of points: the collection field the Inspector expands into one
+    /// row per leaf (`points[0].x`), which is how a struct-array element is
+    /// edited (W-0038 Stage 15). The values mean nothing to the scene.
+    pub points: [ShowcasePoint; SHOWCASE_POINTS],
+}
+
+/// How many showcase points the collection field holds.
+pub const SHOWCASE_POINTS: usize = 2;
+
+/// One element of [`ShowcaseComponent::points`]: a value type with a declared
+/// layout, so the engine can expand the array into editable leaf rows.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ShowcasePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+pill_engine::pill_value_type! {
+    ShowcasePoint {
+        x: f32,
+        y: f32,
+    }
 }
 
 /// Registers the renderer, loads the bundled assets, and creates the scene.
