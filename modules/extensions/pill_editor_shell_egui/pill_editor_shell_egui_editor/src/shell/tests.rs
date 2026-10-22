@@ -101,16 +101,16 @@ fn the_tab_bodies_draw_without_panicking() {
                 &mut regions,
                 &mut inspector_session,
             );
-            assets_tab(
-                ui,
-                &snapshot,
-                &mut selection,
-                &mut dialog,
-                &mut pending,
-                &mut regions,
-                &mut browser,
-                &mut drag_out,
-            );
+            {
+                let mut writes = AssetTileWrites {
+                    selection: &mut selection,
+                    dialog: &mut dialog,
+                    pending: &mut pending,
+                    overlay_regions: &mut regions,
+                    drag_out: &mut drag_out,
+                };
+                assets_tab(ui, &snapshot, &mut browser, &mut writes);
+            }
             preferences_tab(ui, &snapshot, &mut draft, &mut pending);
             scene_overlay(ui, 120.0, &mut regions);
         });
@@ -165,16 +165,16 @@ fn the_browser_draws_its_tree_path_and_tiles() {
             assets_tree(ui, &snapshot, &mut browser, &mut selection, &mut pending);
             assets_path_bar(ui, &mut browser);
             assets_zoom_bar(ui, &snapshot.assets, &mut browser);
-            assets_grid(
-                ui,
-                &snapshot,
-                &mut browser,
-                &mut selection,
-                &mut dialog,
-                &mut pending,
-                &mut regions,
-                &mut drag_out,
-            );
+            {
+                let mut writes = AssetTileWrites {
+                    selection: &mut selection,
+                    dialog: &mut dialog,
+                    pending: &mut pending,
+                    overlay_regions: &mut regions,
+                    drag_out: &mut drag_out,
+                };
+                assets_grid(ui, &snapshot, &mut browser, &mut writes);
+            }
             let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
             let job = tile_name_job(
                 "a_name_that_is_much_too_long_for_a_tile.png",

@@ -147,12 +147,10 @@ impl Cadence {
     /// Decide when to draw next.
     ///
     /// A continuous cadence always draws at once. Otherwise the frame's own
-    /// evidence decides: an urgent reason draws now, egui's repaint request
-    /// draws when it asked to, and no reason at all sleeps for [`IDLE_POLL`].
+    /// evidence decides: an urgent reason or egui's own repaint request draws
+    /// now, and no reason at all sleeps for [`IDLE_POLL`].
     pub fn decide(&self, demand: FrameDemand) -> FrameWake {
-        if self.continuous || demand.urgent() {
-            FrameWake::Immediate
-        } else if demand.repaint_requested {
+        if self.continuous || demand.urgent() || demand.repaint_requested {
             FrameWake::Immediate
         } else {
             FrameWake::After(IDLE_POLL)

@@ -402,6 +402,9 @@ impl WebEditorApplication {
                     // behaviour; the split rule is W-0038's, Stage 1).
                     events: events.clone(),
                     cursor,
+                    // A page has no OS clipboard the editor can write; the
+                    // clipboard verbs are native (see the dispatch below).
+                    paste_text: None,
                 };
             }
         }
@@ -655,6 +658,15 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::EntityDelete => "command editor.entity_delete",
         ScriptedCommand::SnapToggle => "command editor.tool_snap_toggle",
         ScriptedCommand::SpaceToggle => "command editor.tool_space_toggle",
+        // The native-only verbs (W-0038): a page has no OS clipboard, no OLE
+        // drag and one fixed scene view, so these parse but cannot run here.
+        ScriptedCommand::Copy => "command editor.copy",
+        ScriptedCommand::Cut => "command editor.cut",
+        ScriptedCommand::Paste => "command editor.paste",
+        ScriptedCommand::NewSceneView => "command editor.scene_new_view",
+        ScriptedCommand::Drop(_) => "drop",
+        ScriptedCommand::HoverFile(_) => "hover file",
+        ScriptedCommand::DragOut(_) => "drag out",
     }
 }
 

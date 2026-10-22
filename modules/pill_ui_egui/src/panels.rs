@@ -35,19 +35,13 @@ use pill_engine_core::{Entity, Resource};
 /// so the moment the module's image goes away the strong count reaches zero
 /// and every panel it registered is known to be dead. A unit struct on
 /// purpose - it carries no state, only a lifetime.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ModuleLiveness(());
 
 impl ModuleLiveness {
     /// A marker for one registering crate.
     pub fn new() -> Arc<ModuleLiveness> {
         Arc::new(ModuleLiveness(()))
-    }
-}
-
-impl Default for ModuleLiveness {
-    fn default() -> Self {
-        ModuleLiveness(())
     }
 }
 

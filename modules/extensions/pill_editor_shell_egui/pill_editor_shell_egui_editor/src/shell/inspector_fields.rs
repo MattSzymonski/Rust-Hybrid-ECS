@@ -17,6 +17,9 @@ use pill_editor_shell_egui_editor::shell::*;
 /// separator line or gap a field's decorators declared, a single widget, a
 /// vector row (side-by-side fields with axis labels in the gizmo's colours),
 /// or a read-only value.
+// The parameters are the borrows one row draws from; a grouping struct would
+// have to be rebuilt for every row of every component.
+#[allow(clippy::too_many_arguments)]
 pub fn inspector_field_row(
     ui: &mut egui::Ui,
     entity: Entity,
