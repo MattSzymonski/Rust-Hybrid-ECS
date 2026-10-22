@@ -42,20 +42,44 @@ use winit::window::Window;
 /// keeps running without the UI layer.
 pub type OverlayError = String;
 
+/// Where the UI's pixels go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayMode {
+    /// The composition visual above the scene: transparent where the shell
+    /// drew nothing, so the scene shows through the UI's gaps.
+    Composition,
+    /// The window's own surface, with no composition (`PILL_EDITOR_NO_OVERLAY`
+    /// or a failed overlay): the UI is opaque, and a scene child window -
+    /// always above its parent - hides whatever the UI draws under it.
+    Window,
+}
+
+/// The colour the window posture clears to: the shell's own background, so an
+/// uncovered region of the window is not black.
+const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.09,
+    g: 0.10,
+    b: 0.12,
+    a: 1.0,
+};
+
 // =============================================================================
 // OverlaySurface
 // =============================================================================
 
 /// The composition overlay over the editor window.
 pub struct OverlaySurface {
+    /// The posture this surface was created in.
+    mode: OverlayMode,
     /// The DirectComposition tree the surface is set on; kept alive (and
-    /// committed) for the surface's whole life.
+    /// committed) for the surface's whole life. Only the composition posture
+    /// has one.
     #[cfg(windows)]
-    composition: composition::CompositionTree,
+    composition: Option<composition::CompositionTree>,
     /// The overlay's swapchain, drawn through the composition visual.
     surface: wgpu::Surface<'static>,
     /// The swapchain's configuration: the window's client area in physical
-    /// pixels, the editor's format, premultiplied composition.
+    /// pixels, the editor's format, the posture's composition mode.
     configuration: wgpu::SurfaceConfiguration,
     /// Whether the last frame drew content, so the first blank frame after
     /// content clears the swapchain and later blanks cost no GPU work.
@@ -128,13 +152,74 @@ impl OverlaySurface {
         // `configure`; the tree only shows it once committed.
         composition.commit()?;
         Ok(OverlaySurface {
+            mode: OverlayMode::Composition,
             #[cfg(windows)]
-            composition,
+            composition: Some(composition),
             surface,
             configuration,
             drew_content: false,
             frames: 0,
         })
+    }
+
+    /// Create the overlay in the window posture: the UI's frames go to the
+    /// window's own surface, with no composition and no transparency.
+    ///
+    /// This is the posture `PILL_EDITOR_NO_OVERLAY` asks for, and the one a
+    /// failed composition overlay falls back to. It needs nothing the format
+    /// does not already offer, so it works on every backend.
+    pub fn new_window(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        window: Arc<Window>,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) -> Result<OverlaySurface, OverlayError> {
+        // Step 1: a plain surface on the window.
+        let surface = instance
+            .create_surface(window)
+            .map_err(|error| format!("the window surface was refused: {error}"))?;
+        let capabilities = surface.get_capabilities(adapter);
+        if !capabilities.formats.contains(&format) {
+            return Err(format!(
+                "the window surface does not offer the editor's format {format:?}"
+            ));
+        }
+        // Step 2: the first composition mode the platform offers that is not
+        // transparent: the window posture draws an opaque UI.
+        let alpha_mode = capabilities
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|mode| *mode != wgpu::CompositeAlphaMode::PreMultiplied)
+            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
+        let configuration = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.0.max(1),
+            height: size.1.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        surface.configure(device, &configuration);
+        Ok(OverlaySurface {
+            mode: OverlayMode::Window,
+            #[cfg(windows)]
+            composition: None,
+            surface,
+            configuration,
+            drew_content: false,
+            frames: 0,
+        })
+    }
+
+    /// The posture this surface draws in.
+    pub fn mode(&self) -> OverlayMode {
+        self.mode
     }
 
     /// Resize the swapchain to `size` physical pixels (the window's client
@@ -149,11 +234,13 @@ impl OverlaySurface {
         self.configuration.height = height;
         self.surface.configure(device, &self.configuration);
         #[cfg(windows)]
-        if let Err(error) = self.composition.commit() {
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ECS,
-                "[editor] overlay commit failed after resize: {error}"
-            );
+        if let Some(composition) = &self.composition {
+            if let Err(error) = composition.commit() {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "[editor] overlay commit failed after resize: {error}"
+                );
+            }
         }
     }
 
@@ -220,10 +307,15 @@ impl OverlaySurface {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Fully transparent: the visual is composited over the
-                        // scene, so whatever the meshes leave out must show
-                        // the scene through.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        // The composition posture clears to fully transparent -
+                        // the visual is composited over the scene, so whatever
+                        // the meshes leave out must show the scene through. The
+                        // window posture owns every pixel of its surface, so it
+                        // clears to the shell's background instead.
+                        load: wgpu::LoadOp::Clear(match self.mode {
+                            OverlayMode::Composition => wgpu::Color::TRANSPARENT,
+                            OverlayMode::Window => WINDOW_CLEAR,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
