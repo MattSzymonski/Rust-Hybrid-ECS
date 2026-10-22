@@ -82,7 +82,7 @@ use pill_runtime::{
     SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
 };
 use pill_ui_egui::boundary::{
-    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, SCENE_VIEWPORTS,
+    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
 };
 use pill_ui_egui::egui;
 use pill_ui_egui::panels::{
@@ -191,9 +191,12 @@ const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
 /// The scene view's initial size in logical pixels.
 const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
 
-/// The scene views' surface ids; the game view is the renderer's primary
-/// surface, shown by the main window itself. One per scene tab.
-const SCENE_SURFACES: [SurfaceId; SCENE_VIEWPORTS] = [SurfaceId(1), SurfaceId(2)];
+/// The scene views' surface ids: view `n` draws through surface `n + 1`, so
+/// each view keeps its surface however many views the person opens. Surface
+/// 0 is the renderer's primary, which the game window carries.
+fn scene_surface(view: usize) -> SurfaceId {
+    SurfaceId(1 + view as u32)
+}
 
 /// The scene view's rectangle before the shell's first scene rect arrives:
 /// the dock's default layout's center, in logical pixels. The shell's
@@ -382,7 +385,7 @@ impl ApplicationHandler for EditorApplication {
                 if !is_main {
                     return;
                 }
-                match editor.frame() {
+                match editor.frame(event_loop) {
                     Ok(should_exit) => {
                         if should_exit {
                             event_loop.exit();
@@ -582,10 +585,11 @@ struct EditorWindow {
     adapter: wgpu::Adapter,
     /// The host: the project, its extensions and the shell module.
     host: RenderingHost,
-    /// The scene views' child windows, one per scene tab: the Scene tab's,
-    /// then the second viewport's. A slot is `None` when its window could
-    /// not be created.
-    views: [Option<SceneView>; SCENE_VIEWPORTS],
+    /// The scene views' child windows, one per scene tab, in view-index
+    /// order: each has its own camera and renderer surface (W-0038 Stage
+    /// 21). A slot is `None` when its window could not be created, and the
+    /// vector grows when the dock reports a view it does not hold yet.
+    views: Vec<Option<SceneView>>,
     /// The game viewport's window, when one could be created: it carries
     /// the primary surface, so the project's renderer presents the game
     /// view there. `None` leaves the primary on the main window.
@@ -593,14 +597,14 @@ struct EditorWindow {
     /// The editor's cameras, one per scene viewport: navigation moves the
     /// active viewport's camera only, and every scene ray projects through
     /// its own view's camera.
-    cameras: [OrbitCamera; SCENE_VIEWPORTS],
+    cameras: Vec<OrbitCamera>,
     /// The viewport the last scene click activated; camera navigation and
     /// the gizmo read it.
     active_view: usize,
     /// Whether each scene view's left button is down: a pick answers a frame
     /// or two after the press, and a handle grab only starts a drag while
     /// the button is still held.
-    left_down: [bool; SCENE_VIEWPORTS],
+    left_down: Vec<bool>,
     /// The camera navigation drag in flight, when one is.
     camera_drag: Option<CameraDrag>,
     /// The keyboard modifiers held, as of the last modifiers event.
@@ -609,7 +613,7 @@ struct EditorWindow {
     keymap: KeymapPreset,
     /// Whether each view's published camera binding is stale: navigation
     /// marks it and the next frame re-publishes the surface camera.
-    camera_dirty: [bool; SCENE_VIEWPORTS],
+    camera_dirty: Vec<bool>,
     /// egui's own renderer on the editor's device.
     egui_renderer: egui_wgpu::Renderer,
     /// The composition overlay the UI is presented through; `None` until it
@@ -637,7 +641,7 @@ struct EditorWindow {
     notices: EditorNotices,
     /// The last pointer position each scene window reported, in its own
     /// client-area physical pixels; `None` before its first move.
-    scene_cursor: [Option<(f32, f32)>; SCENE_VIEWPORTS],
+    scene_cursor: Vec<Option<(f32, f32)>>,
     /// The scene left press waiting for its pick answer: the view, the press
     /// position and the pick id. The answer starts a gizmo drag on a handle
     /// or moves the selection - both while the button is held.
@@ -958,15 +962,15 @@ impl EditorWindow {
         // surfaces, each with its own camera (navigation moves the active
         // viewport's). Both start hidden; each shows when the dock shows its
         // tab.
-        let cameras = [OrbitCamera::default(); SCENE_VIEWPORTS];
-        let mut views: [Option<SceneView>; SCENE_VIEWPORTS] = [None, None];
-        for (view, slot) in views.iter_mut().enumerate() {
+        let cameras = vec![OrbitCamera::default(); DEFAULT_SCENE_VIEWS];
+        let mut views: Vec<Option<SceneView>> = (0..DEFAULT_SCENE_VIEWS).map(|_| None).collect();
+        for view in 0..DEFAULT_SCENE_VIEWS {
             let Some(mut scene) = SceneView::open(event_loop, &window, view) else {
                 continue;
             };
             let scene_size = scene.window.size();
             scene.attach(&mut host, &cameras[view], scene_size);
-            *slot = Some(scene);
+            views[view] = Some(scene);
         }
         // The scene grid (Stage 23): the editor's view-bound viewports draw
         // it, so it starts on; the toolbox's grid row and the viewport menu
@@ -991,11 +995,11 @@ impl EditorWindow {
             game_surface,
             cameras,
             active_view: 0,
-            left_down: [false; SCENE_VIEWPORTS],
+            left_down: vec![false; DEFAULT_SCENE_VIEWS],
             camera_drag: None,
             modifiers: Modifiers::default(),
             keymap: KeymapPreset::default(),
-            camera_dirty: [true; SCENE_VIEWPORTS],
+            camera_dirty: vec![true; DEFAULT_SCENE_VIEWS],
             egui_renderer,
             overlay,
             no_overlay,
@@ -1012,7 +1016,7 @@ impl EditorWindow {
             shell_events: Vec::new(),
             shell_cursor: None,
             notices: EditorNotices::default(),
-            scene_cursor: [None; SCENE_VIEWPORTS],
+            scene_cursor: vec![None; DEFAULT_SCENE_VIEWS],
             press_pick: None,
             outlined_entities: Vec::new(),
             overlay_regions: Vec::new(),
@@ -1172,11 +1176,46 @@ impl EditorWindow {
         }
     }
 
+    /// Open the scene views the dock reports that this editor does not hold
+    /// yet (W-0038 Stage 21).
+    ///
+    /// The shell reports one slot per view index the dock carries, so a view
+    /// the person just added is the list's last slot. Each new view gets its
+    /// own window, surface and camera here - the same three the startup views
+    /// get - and starts hidden: the placement that follows this frame shows
+    /// it.
+    fn ensure_scene_views(&mut self, count: usize, event_loop: &ActiveEventLoop) {
+        let wanted = count.min(pill_ui_egui::boundary::SCENE_VIEWS_MAX);
+        while self.views.len() < wanted {
+            let view = self.views.len();
+            self.cameras.push(OrbitCamera::default());
+            self.left_down.push(false);
+            self.camera_dirty.push(true);
+            self.scene_cursor.push(None);
+            let opened = SceneView::open(event_loop, &self.window, view);
+            if let Some(mut scene) = opened {
+                let size = scene.window.size();
+                scene.attach(&mut self.host, &self.cameras[view], size);
+                info!(
+                    target: telemetry_target::ENGINE,
+                    view,
+                    surface = scene.surface_id.0,
+                    "[editor] scene view opened"
+                );
+                self.views.push(Some(scene));
+            } else {
+                // A view without a window keeps its slots: the dock still
+                // holds its tab, and the tab shows the UI's chips alone.
+                self.views.push(None);
+            }
+        }
+    }
+
     /// Place the first scene view at the dock's default layout's center
     /// inside the client area, until the shell's first scene rect arrives;
     /// the other views stay hidden until their tabs show.
     fn place_views(&mut self) {
-        let Some(scene) = &mut self.views[0] else {
+        let Some(Some(scene)) = self.views.first_mut() else {
             return;
         };
         let (width, height) = (self.size.0 as i32, self.size.1 as i32);
@@ -1581,7 +1620,7 @@ impl EditorWindow {
             world.insert_resource(PickRequests::default());
         }
         let requests = world.get_resource_mut::<PickRequests>()?;
-        Some(requests.request(SCENE_SURFACES[view], x, y))
+        Some(requests.request(scene_surface(view), x, y))
     }
 
     /// Apply the answers to scene picks (Stage 13, Stage 15): an entity
@@ -2633,7 +2672,7 @@ impl EditorWindow {
         }
         self.cancel_gizmo_drag();
         self.press_pick = None;
-        self.left_down = [false; SCENE_VIEWPORTS];
+        self.left_down.fill(false);
         self.set_hovered_handle(self.active_view, None);
     }
 
@@ -3610,8 +3649,10 @@ impl EditorWindow {
 
     /// Run one world frame: input, the shell's pass, the overlay draw.
     ///
-    /// Returns whether the run should end.
-    fn frame(&mut self) -> Result<bool, EditorError> {
+    /// Returns whether the run should end. The event loop is what a scene
+    /// view the dock opened this frame needs: a child window is created
+    /// through it.
+    fn frame(&mut self, event_loop: &ActiveEventLoop) -> Result<bool, EditorError> {
         self.frame_index += 1;
         // Step 1: the frame rate heartbeat, for the person reading the log.
         let now = Instant::now();
@@ -3753,7 +3794,7 @@ impl EditorWindow {
         // quit - taken through the same paths the scripted channel uses.
         self.drain_menu_requests();
         // Step 8: draw the shell frame through the overlay.
-        self.present_ui();
+        self.present_ui(event_loop);
         // Step 9: the scripted channel, then the auto-quit deadline.
         self.poll_test_channel();
         if let Some(seconds) = self.test_seconds {
@@ -5400,6 +5441,44 @@ impl EditorWindow {
         self.demand.input = true;
     }
 
+    /// Dock one more scene view, the Window menu's own request (W-0038 Stage
+    /// 21): the tab goes in exactly where the menu would put it, and the
+    /// executable's activation path brings it to the front.
+    fn scripted_new_scene_view(&mut self) {
+        let next = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            match world.get_resource::<EguiShellState>() {
+                Some(state) => Some((
+                    state.dock.next_scene_view(),
+                    state.dock.can_open_scene_view(),
+                )),
+                None => None,
+            }
+        };
+        let Some((tab, fits)) = next else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] scene view needs the shell module's state"
+            );
+            return;
+        };
+        if !fits {
+            warn!(
+                target: telemetry_target::ENGINE,
+                limit = pill_ui_egui::boundary::SCENE_VIEWS_MAX,
+                "[editor] scene view refused: the view limit is reached"
+            );
+            return;
+        }
+        self.activate_tab(tab);
+        info!(
+            target: telemetry_target::ENGINE,
+            tab = tab.name().as_str(),
+            view = tab.scene_view().unwrap_or_default(),
+            "[editor] scene view added"
+        );
+    }
+
     /// Apply the shell's IME state to the main window (W-0038 Stage 22).
     ///
     /// egui decides when a text field wants the input method and where its
@@ -5441,7 +5520,7 @@ impl EditorWindow {
 
     /// Draw the shell's frame through the overlay; without a shell module,
     /// draw the runner's own fallback.
-    fn present_ui(&mut self) {
+    fn present_ui(&mut self, event_loop: &ActiveEventLoop) {
         // Step 1: take the shell frame, falling back to the runner's own
         // minimal pass while no shell module is loaded.
         let frame = {
@@ -5475,10 +5554,14 @@ impl EditorWindow {
         self.repaint_after = repaint_after;
         // Each scene viewport follows its dock rectangle, so the viewports
         // track the layout when the user drags a splitter; a viewport whose
-        // tab is not shown hides its window.
-        for (view, rect) in scene_rects.iter().enumerate() {
-            match rect {
-                Some(rect) => self.place_view_rect(view, *rect),
+        // tab is not shown hides its window. The list is one slot per view
+        // the dock holds, so a view the person just added opens here - on the
+        // frame its tab first drew - and a view whose tab was closed keeps
+        // its window hidden rather than dropped.
+        self.ensure_scene_views(scene_rects.len(), event_loop);
+        for view in 0..self.views.len() {
+            match scene_rects.get(view).copied().flatten() {
+                Some(rect) => self.place_view_rect(view, rect),
                 None => self.hide_view(view),
             }
         }
@@ -5882,6 +5965,7 @@ impl EditorWindow {
             ScriptedCommand::Cut => self.scripted_clipboard(ClipboardAction::Cut),
             ScriptedCommand::Paste => self.scripted_clipboard(ClipboardAction::Paste),
             ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
+            ScriptedCommand::NewSceneView => self.scripted_new_scene_view(),
             ScriptedCommand::Step => self.scripted_step(),
             ScriptedCommand::EntityCreate => self.scripted_entity_create(),
             ScriptedCommand::EntityDelete => self.scripted_entity_delete(),
@@ -6307,6 +6391,16 @@ impl EditorWindow {
                 tab = tab.name(),
                 "[editor] module tab docked"
             );
+        } else if tab.scene_view().is_some() {
+            // A scene view's tab is docked the moment it is asked for
+            // (W-0038 Stage 21): a view the person added has no other way in.
+            state.dock.state_mut().push_to_focused_leaf(tab);
+            pill_editor_core_egui::layout::activate_tab(state.dock.state_mut(), tab);
+            info!(
+                target: telemetry_target::ENGINE,
+                tab = tab.name(),
+                "[editor] scene tab docked"
+            );
         } else {
             warn!(
                 target: telemetry_target::ENGINE,
@@ -6467,7 +6561,7 @@ impl SceneView {
             .ok()?;
         Some(SceneView {
             window,
-            surface_id: SCENE_SURFACES[view],
+            surface_id: scene_surface(view),
         })
     }
 }
@@ -6720,6 +6814,7 @@ impl SceneView {
                 host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
                 info!(
                     target: telemetry_target::ENGINE,
+                    surface = self.surface_id.0,
                     detached = self.window.detached,
                     "[editor] scene surface attached"
                 );
@@ -6769,7 +6864,7 @@ fn offset_pointer(event: InputEvent, (dx, dy): (f32, f32)) -> InputEvent {
 }
 
 /// The tab's display name for log lines.
-fn tab_name(tab: EditorTab) -> &'static str {
+fn tab_name(tab: EditorTab) -> String {
     tab.name()
 }
 

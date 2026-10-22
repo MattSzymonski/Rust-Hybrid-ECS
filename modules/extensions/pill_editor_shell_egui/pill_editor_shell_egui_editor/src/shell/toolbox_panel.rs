@@ -33,7 +33,10 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         grid: viewer.snapshot.grid_enabled,
     };
     let mut origin = toolbox::clamped_origin(
-        viewer.toolbox.origins[view].unwrap_or_else(|| toolbox::default_origin(viewport)),
+        viewer
+            .toolbox
+            .origin(view)
+            .unwrap_or_else(|| toolbox::default_origin(viewport)),
         viewport,
     );
     // The handle is the one part of the panel a press drags; a click on
@@ -46,7 +49,7 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     );
     if response.dragged() {
         origin = toolbox::clamped_origin(origin + response.drag_delta(), viewport);
-        viewer.toolbox.origins[view] = Some(origin);
+        viewer.toolbox.set_origin(view, origin);
     }
     if response.drag_stopped() {
         pill_core::info!(
@@ -97,8 +100,8 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
         }
     }
     viewer.overlay_regions.push(shell_rect(panel));
-    if viewer.toolbox.logged[view] != Some(panel) {
-        viewer.toolbox.logged[view] = Some(panel);
+    if viewer.toolbox.logged(view) != Some(panel) {
+        viewer.toolbox.set_logged(view, panel);
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             view,

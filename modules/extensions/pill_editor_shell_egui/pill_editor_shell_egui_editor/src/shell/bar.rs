@@ -213,6 +213,9 @@ pub fn run_menu_action(
             .history_requests
             .push(pill_editor_core_egui::session::HistoryRequest::Redo),
         menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
+        // The dock is borrowed by the `DockArea` while this menu draws, so the
+        // new view is docked after the pass (W-0038 Stage 21).
+        menubar::MenuAction::NewSceneView => session.new_scene_view = true,
         menubar::MenuAction::About => session.about_open = true,
         menubar::MenuAction::Quit => session.quit_requested = true,
         // The clipboard (W-0038 Stage 17): the shell builds the payload and

@@ -41,14 +41,13 @@ pub const INSPECTOR_COLUMN_FRACTION: f32 = 0.4;
 ///
 /// The enum is serialized into the saved layout, so adding a tab is a
 /// schema change (`LAYOUT_SCHEMA_VERSION`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum EditorTab {
-    /// The first scene view's placeholder: the shell measures this tab's
-    /// body and draws nothing, so the scene's child window shows through.
-    Scene,
-    /// The second scene view's placeholder: like [`EditorTab::Scene`], with
-    /// its own child window and renderer surface.
-    SecondScene,
+    /// A scene view's placeholder: the shell measures this tab's body and
+    /// draws nothing, so that view's child window shows through. The payload
+    /// is the view's index, which is what pairs the tab with a child window,
+    /// a renderer surface and a camera (W-0038 Stage 21).
+    Scene(u8),
     /// The game viewport's placeholder: like the scene tabs, but its child
     /// window carries the primary surface, so it shows the project through
     /// the project's own camera.
@@ -77,11 +76,60 @@ pub enum EditorTab {
     Module(u16),
 }
 
+impl<'de> Deserialize<'de> for EditorTab {
+    /// Reads the current form (`{"Scene": 2}`) and the one every document
+    /// before v12 wrote (a bare `"Scene"`, `"SecondScene"`), because the
+    /// layout's migrations carry old documents forward instead of replacing
+    /// them. Only JSON is read: the layout file is the only format.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(name) = value.as_str() {
+            return match name {
+                // The two viewports every document before v12 had.
+                "Scene" => Ok(EditorTab::Scene(0)),
+                "SecondScene" => Ok(EditorTab::Scene(1)),
+                "Game" => Ok(EditorTab::Game),
+                "Entities" => Ok(EditorTab::Entities),
+                "Systems" => Ok(EditorTab::Systems),
+                "Inspector" => Ok(EditorTab::Inspector),
+                "Assets" => Ok(EditorTab::Assets),
+                "Console" => Ok(EditorTab::Console),
+                "Problems" => Ok(EditorTab::Problems),
+                "Statistics" => Ok(EditorTab::Statistics),
+                "Preferences" => Ok(EditorTab::Preferences),
+                other => Err(D::Error::custom(format!("unknown editor tab {other}"))),
+            };
+        }
+        let Some((name, index)) = value
+            .as_object()
+            .and_then(|object| object.iter().next())
+            .and_then(|(name, index)| Some((name.as_str(), index.as_u64()?)))
+        else {
+            return Err(D::Error::custom(
+                "an editor tab is a name, or a name with an index",
+            ));
+        };
+        let index = u16::try_from(index)
+            .map_err(|_| D::Error::custom(format!("editor tab {name} is out of range")))?;
+        match name {
+            "Scene" => Ok(EditorTab::Scene(index as u8)),
+            "Module" => Ok(EditorTab::Module(index)),
+            other => Err(D::Error::custom(format!(
+                "editor tab {other} takes no index"
+            ))),
+        }
+    }
+}
+
 impl EditorTab {
     /// Every tab, in tab-strip order.
     pub const ALL: [EditorTab; 11] = [
-        EditorTab::Scene,
-        EditorTab::SecondScene,
+        EditorTab::Scene(0),
+        EditorTab::Scene(1),
         EditorTab::Game,
         EditorTab::Entities,
         EditorTab::Systems,
@@ -93,41 +141,53 @@ impl EditorTab {
         EditorTab::Preferences,
     ];
 
-    /// The tab's display title.
-    pub fn title(self) -> &'static str {
+    /// The view index, when this is a scene view's tab.
+    pub fn scene_view(self) -> Option<u8> {
         match self {
-            EditorTab::Scene => "Scene",
-            EditorTab::SecondScene => "Scene 2",
-            EditorTab::Game => "Game",
-            EditorTab::Entities => "Entities",
-            EditorTab::Systems => "Systems",
-            EditorTab::Inspector => "Inspector",
-            EditorTab::Assets => "Assets",
-            EditorTab::Console => "Console",
-            EditorTab::Problems => "Problems",
-            EditorTab::Statistics => "Statistics",
-            EditorTab::Preferences => "Preferences",
-            // A module panel's title belongs to the registry, not here: the
-            // shell asks it, because it changes when the module unloads.
-            EditorTab::Module(_) => "Module",
+            EditorTab::Scene(index) => Some(index),
+            _ => None,
         }
     }
 
-    /// The wire name the logs and the scripted channel use.
-    pub fn name(self) -> &'static str {
+    /// The tab's display title.
+    ///
+    /// A title, not a `&'static str`: the scene views are numbered, so the
+    /// second and later ones build their own name.
+    pub fn title(self) -> String {
         match self {
-            EditorTab::Scene => "scene",
-            EditorTab::SecondScene => "scene2",
-            EditorTab::Game => "game",
-            EditorTab::Entities => "entities",
-            EditorTab::Systems => "systems",
-            EditorTab::Inspector => "inspector",
-            EditorTab::Assets => "assets",
-            EditorTab::Console => "console",
-            EditorTab::Problems => "problems",
-            EditorTab::Statistics => "statistics",
-            EditorTab::Preferences => "preferences",
-            EditorTab::Module(_) => "module",
+            EditorTab::Scene(0) => "Scene".to_string(),
+            EditorTab::Scene(index) => format!("Scene {}", index as u16 + 1),
+            EditorTab::Game => "Game".to_string(),
+            EditorTab::Entities => "Entities".to_string(),
+            EditorTab::Systems => "Systems".to_string(),
+            EditorTab::Inspector => "Inspector".to_string(),
+            EditorTab::Assets => "Assets".to_string(),
+            EditorTab::Console => "Console".to_string(),
+            EditorTab::Problems => "Problems".to_string(),
+            EditorTab::Statistics => "Statistics".to_string(),
+            EditorTab::Preferences => "Preferences".to_string(),
+            // A module panel's title belongs to the registry, not here: the
+            // shell asks it, because it changes when the module unloads.
+            EditorTab::Module(_) => "Module".to_string(),
+        }
+    }
+
+    /// The wire name the logs and the scripted channel use: `scene`, then
+    /// `scene2` for the second view and on.
+    pub fn name(self) -> String {
+        match self {
+            EditorTab::Scene(0) => "scene".to_string(),
+            EditorTab::Scene(index) => format!("scene{}", index as u16 + 1),
+            EditorTab::Game => "game".to_string(),
+            EditorTab::Entities => "entities".to_string(),
+            EditorTab::Systems => "systems".to_string(),
+            EditorTab::Inspector => "inspector".to_string(),
+            EditorTab::Assets => "assets".to_string(),
+            EditorTab::Console => "console".to_string(),
+            EditorTab::Problems => "problems".to_string(),
+            EditorTab::Statistics => "statistics".to_string(),
+            EditorTab::Preferences => "preferences".to_string(),
+            EditorTab::Module(_) => "module".to_string(),
         }
     }
 
@@ -172,8 +232,8 @@ impl EditorDock {
     /// a bottom row across the window.
     pub fn new() -> Self {
         let mut state = DockState::new(vec![
-            EditorTab::Scene,
-            EditorTab::SecondScene,
+            EditorTab::Scene(0),
+            EditorTab::Scene(1),
             EditorTab::Game,
         ]);
         let tree = state.main_surface_mut();
@@ -242,6 +302,38 @@ impl EditorDock {
     pub fn contains(&self, tab: EditorTab) -> bool {
         // `DockState::find_tab` reports the surface and node holding the tab.
         self.state.find_tab(&tab).is_some()
+    }
+
+    /// The tab a new scene view takes: one past the highest view index the
+    /// dock holds today (W-0038 Stage 21).
+    ///
+    /// Highest plus one rather than "one per view", so a view the user closed
+    /// in the middle never hands its index to a second tab - the closed
+    /// view's child window and camera are gone, and a new tab taking the
+    /// index would find them in the frontend's list.
+    pub fn next_scene_view(&self) -> EditorTab {
+        let highest = self
+            .state
+            .iter_all_tabs()
+            .filter_map(|(_path, tab)| tab.scene_view())
+            .max();
+        EditorTab::Scene(highest.map_or(0, |index| index.saturating_add(1)))
+    }
+
+    /// How many scene view slots the dock needs: one past its highest view
+    /// index, so a view whose tab is not shown keeps its slot.
+    pub fn scene_view_count(&self) -> usize {
+        self.state
+            .iter_all_tabs()
+            .filter_map(|(_path, tab)| tab.scene_view())
+            .max()
+            .map_or(0, |index| index as usize + 1)
+    }
+
+    /// Whether one more scene view fits: each view is a child window and a
+    /// renderer surface, so the frontend's limit is the dock's too.
+    pub fn can_open_scene_view(&self) -> bool {
+        self.scene_view_count() < pill_ui_egui::boundary::SCENE_VIEWS_MAX
     }
 
     /// Whether the document was written by this build's schema.
@@ -401,7 +493,7 @@ mod tests {
         );
         assert_eq!(
             tabs_at(rest.left()),
-            vec![EditorTab::Scene, EditorTab::SecondScene, EditorTab::Game]
+            vec![EditorTab::Scene(0), EditorTab::Scene(1), EditorTab::Game]
         );
         // The right column stacks the inspector above the systems list,
         // with the preferences form tabbed beside the list.
@@ -456,8 +548,51 @@ mod tests {
 
     #[test]
     fn activating_a_tab_the_dock_lacks_reports_it() {
-        let mut state = DockState::new(vec![EditorTab::Scene]);
+        let mut state = DockState::new(vec![EditorTab::Scene(0)]);
         assert!(!activate_tab(&mut state, EditorTab::Systems));
-        assert!(activate_tab(&mut state, EditorTab::Scene));
+        assert!(activate_tab(&mut state, EditorTab::Scene(0)));
+    }
+
+    #[test]
+    fn a_new_scene_view_takes_the_next_index() {
+        let dock = EditorDock::new();
+        assert_eq!(dock.next_scene_view(), EditorTab::Scene(2));
+        let mut dock = dock;
+        dock.state_mut().push_to_focused_leaf(EditorTab::Scene(2));
+        assert_eq!(dock.next_scene_view(), EditorTab::Scene(3));
+        assert_eq!(dock.scene_view_count(), 3);
+    }
+
+    #[test]
+    fn a_second_view_survives_as_its_own_tab_and_title() {
+        let dock = EditorDock::new();
+        assert!(dock.contains(EditorTab::Scene(0)));
+        assert!(dock.contains(EditorTab::Scene(1)));
+        assert_eq!(EditorTab::Scene(0).title(), "Scene");
+        assert_eq!(EditorTab::Scene(1).title(), "Scene 2");
+        assert_eq!(EditorTab::Scene(2).title(), "Scene 3");
+        assert_eq!(EditorTab::Scene(0).name(), "scene");
+        assert_eq!(EditorTab::Scene(1).name(), "scene2");
+        assert_eq!(EditorTab::Scene(2).name(), "scene3");
+    }
+
+    #[test]
+    fn a_v11_document_reads_its_two_scene_tabs_as_views() {
+        // What every document before v12 wrote: bare variant names, which the
+        // migration then carries forward instead of dropping the layout.
+        let tab: EditorTab = serde_json::from_str("\"Scene\"").expect("the legacy scene tab");
+        assert_eq!(tab, EditorTab::Scene(0));
+        let tab: EditorTab =
+            serde_json::from_str("\"SecondScene\"").expect("the legacy second tab");
+        assert_eq!(tab, EditorTab::Scene(1));
+        let tab: EditorTab = serde_json::from_str("\"Systems\"").expect("a legacy unit tab");
+        assert_eq!(tab, EditorTab::Systems);
+        let tab: EditorTab = serde_json::from_str("{\"Scene\":3}").expect("an indexed scene tab");
+        assert_eq!(tab, EditorTab::Scene(3));
+        let tab: EditorTab = serde_json::from_str("{\"Module\":2}").expect("an indexed panel tab");
+        assert_eq!(tab, EditorTab::Module(2));
+        // An unknown name is a refusal, not a silently dropped tab.
+        assert!(serde_json::from_str::<EditorTab>("\"Nonsense\"").is_err());
+        assert!(serde_json::from_str::<EditorTab>("{\"Game\":1}").is_err());
     }
 }

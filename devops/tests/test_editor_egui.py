@@ -90,6 +90,8 @@ EGUI_ROWS_TOKEN = "[editor] egui shell rows"
 EGUI_DOCK_DUMP_TOKEN = "[editor] egui dock dump"
 EGUI_TAB_UNDOCKED_TOKEN = "[editor] tab undocked"
 SCENE_SURFACE_TOKEN = "[editor] scene surface attached"
+SCENE_VIEW_ADDED_TOKEN = "[editor] scene view added"
+SCENE_VIEW_OPENED_TOKEN = "[editor] scene view opened"
 SCENE_SURFACE_RESIZED_TOKEN = "[editor] scene surface resized"
 FRAME_HEARTBEAT_TOKEN = "[editor] frame heartbeat"
 PROJECT_RELOAD_TOKEN = "hot reload complete"
@@ -805,14 +807,14 @@ def main() -> int:
         wait_for_token(session, re.escape(EDITOR_WINDOW_CREATED_TOKEN), 120, "startup")
         wait_for_token(
             session,
-            re.escape(SCENE_SURFACE_TOKEN) + r"\s+detached=false",
+            re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=1\s+detached=false",
             120,
             "scene surface",
         )
         # Both scene viewports attach at startup: the Scene tab's surface
         # and the second viewport's.
         session.wait_occurrence(
-            re.escape(SCENE_SURFACE_TOKEN) + r"\s+detached=false",
+            re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=\d+\s+detached=false",
             2,
             30,
             "second scene surface",
@@ -3118,6 +3120,78 @@ def main() -> int:
         )
         print("  [OK] camera navigation moved the active viewport only")
 
+        # Step 4e2: any number of scene views (W-0038 Stage 21). The Window
+        # menu's "New Scene View" docks one more, and the frontend opens a
+        # child window, a renderer surface and a camera for it - the same
+        # three the two startup views get. The third view's camera then
+        # moves on its own: the three cameras are independent.
+        begin = len(session.read_log())
+        session.send("command editor.scene_new_view")
+        session.wait(
+            re.escape(SCENE_VIEW_ADDED_TOKEN) + r'\s+tab="scene3"\s+view=2\b',
+            30,
+            "the third scene view",
+            begin,
+        )
+        session.wait(
+            re.escape(SCENE_VIEW_OPENED_TOKEN) + r"\s+view=2\s+surface=3",
+            60,
+            "the third view's child window",
+            begin,
+        )
+        session.wait(
+            re.escape(SCENE_SURFACE_TOKEN) + r"\s+surface=3\b",
+            60,
+            "the third view's surface",
+            begin,
+        )
+        session.send("dump scenes")
+        session.wait(
+            re.escape(SCENE_VIEW_RECT_TOKEN) + r"\s+view=2\b",
+            30,
+            "the third view's rectangle",
+            begin,
+        )
+        session.wait(
+            re.escape(TOOLBOX_RECT_TOKEN) + r"\s+view=2\b",
+            30,
+            "the third view's toolbox",
+            begin,
+        )
+        third_rect = logged_scene_rect(session, 2)
+        assert third_rect[4], "the third viewport did not become visible"
+        print("  [OK] a third scene view opened its own window and toolbox")
+
+        # The third viewport becomes the active one, so navigation may move
+        # it; the other two keep their cameras.
+        before_third = viewport_cameras()
+        begin = len(session.read_log())
+        session.send(f"click {third_rect[0] + 6} {third_rect[1] + 6}")
+        session.wait(
+            re.escape(ACTIVE_VIEWPORT_TOKEN) + r"\s+view=2",
+            30,
+            "the third viewport activated",
+            begin,
+        )
+        session.send("camera orbit -40 15")
+        session.wait(
+            re.escape(CAMERA_GESTURE_TOKEN) + r'\s+view=2\s+navigation="orbit"',
+            30,
+            "the third viewport's orbit",
+            begin,
+        )
+        after_third = viewport_cameras()
+        assert len(after_third) >= 3, (
+            "the viewport dump does not list three views: {}".format(after_third)
+        )
+        assert after_third[2] != before_third[2], (
+            "the third viewport's camera did not move"
+        )
+        assert after_third[0] == before_third[0] and after_third[1] == before_third[1], (
+            "the third viewport's navigation moved another view's camera"
+        )
+        print("  [OK] three scene views hold three independent cameras")
+
         # Back to the first viewport's tab: the steps below read the primary
         # scene's viewport and its dock.
         begin = len(session.read_log())
@@ -3138,7 +3212,7 @@ def main() -> int:
         session.wait(re.escape(SCENE_GRID_TOKEN), 30, "the grid dumped", step_begin)
         on_line = session.find(SCENE_GRID_PATTERN, step_begin)
         assert on_line, session.read_log()[begin:][-400:]
-        assert on_line.group(1) == "true" and on_line.group(3) == "1,2", on_line.group(0)
+        assert on_line.group(1) == "true" and on_line.group(3) == "1,2,3", on_line.group(0)
         print(f"  [OK] the grid is on over the scene viewports ({on_line.group(3)})")
         begin = len(session.read_log())
         toolbox_click(session, 0, "grid", "the toolbox turned the grid off")
@@ -3822,6 +3896,22 @@ def main() -> int:
             )
         )
         print("  [OK] the rearranged dock came back after a restart")
+
+        # The third scene view came back too (W-0038 Stage 21): the layout
+        # carried its tab, so this process opened a window and a surface for
+        # it before it drew anything.
+        begin = len(restart.read_log())
+        restart.send("dump scenes")
+        restart.wait(
+            re.escape(SCENE_VIEW_RECT_TOKEN) + r"\s+view=2\b",
+            60,
+            "the third view after the restart",
+            begin,
+        )
+        assert "scene3" in restart.read_log(), (
+            "the third scene view's tab did not survive the restart"
+        )
+        print("  [OK] the third scene view survived the restart")
 
         # The clipboard crossed the process boundary (W-0038 Stage 17): the
         # session above copied an entity onto the OS clipboard, and this

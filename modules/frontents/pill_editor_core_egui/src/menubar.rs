@@ -161,6 +161,9 @@ pub enum MenuAction {
     Redo,
     /// Bring a dock tab to the front.
     ActivateTab(EditorTab),
+    /// Dock one more scene view, with its own camera and toolbox (W-0038
+    /// Stage 21).
+    NewSceneView,
     /// Open the About window.
     About,
     /// Quit the editor.
@@ -277,6 +280,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
             MenuAction::WriteAssetMeta
         }
         "editor.preferences_open" => MenuAction::ActivateTab(EditorTab::Preferences),
+        "editor.scene_new_view" => MenuAction::NewSceneView,
         "editor.quit" => MenuAction::Quit,
         "editor.about" => MenuAction::About,
         "editor.tool_translate" => {
@@ -580,12 +584,19 @@ mod tests {
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let menu = entries(Menu::Window, &view_over(&snapshot, &selection, &commands));
-        let expected: Vec<String> = EditorTab::ALL
-            .iter()
-            .map(|tab| tab.title().to_string())
-            .collect();
+        // The new-view row comes first (W-0038 Stage 21), then one row per
+        // tab in strip order.
+        let mut expected: Vec<String> = vec!["New Scene View".to_string()];
+        expected.extend(EditorTab::ALL.iter().map(|tab| tab.title()));
         assert_eq!(labels(&menu), expected);
-        for (entry, tab) in menu.iter().zip(EditorTab::ALL.iter()) {
+        assert!(matches!(
+            menu[0],
+            MenuEntry::Action {
+                action: MenuAction::NewSceneView,
+                ..
+            }
+        ));
+        for (entry, tab) in menu.iter().skip(1).zip(EditorTab::ALL.iter()) {
             match entry {
                 MenuEntry::Action {
                     action: MenuAction::ActivateTab(activated),

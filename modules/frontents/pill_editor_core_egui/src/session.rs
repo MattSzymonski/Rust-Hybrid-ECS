@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use pill_engine::Resource;
-use pill_ui_egui::boundary::SCENE_VIEWPORTS;
+use pill_ui_egui::boundary::SCENE_VIEWS_MAX;
 use pill_ui_egui::egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 
 // Current crate
@@ -285,19 +285,48 @@ pub struct PaletteState {
 pub struct ToolboxSession {
     /// Per-scene-view panel origins in logical points; `None` until a drag
     /// parks that view's toolbox, so the default anchor keeps following the
-    /// viewport until the user moves it.
-    pub origins: [Option<Pos2>; SCENE_VIEWPORTS],
+    /// viewport until the user moves it. One slot per view index, however
+    /// many views the person opened (W-0038 Stage 21).
+    pub origins: Vec<Option<Pos2>>,
     /// Per-scene-view panel rectangles whose rows the log already reported,
     /// so the rect lines appear once per placement and once per drag.
-    pub logged: [Option<Rect>; SCENE_VIEWPORTS],
+    pub logged: Vec<Option<Rect>>,
 }
 
 impl Default for ToolboxSession {
     fn default() -> Self {
         Self {
-            origins: [None; SCENE_VIEWPORTS],
-            logged: [None; SCENE_VIEWPORTS],
+            origins: vec![None; SCENE_VIEWS_MAX],
+            logged: vec![None; SCENE_VIEWS_MAX],
         }
+    }
+}
+
+impl ToolboxSession {
+    /// The placed origin of `view`'s toolbox.
+    pub fn origin(&self, view: usize) -> Option<Pos2> {
+        self.origins.get(view).copied().flatten()
+    }
+
+    /// Park `view`'s toolbox at `origin`.
+    pub fn set_origin(&mut self, view: usize, origin: Pos2) {
+        if self.origins.len() <= view {
+            self.origins.resize(view + 1, None);
+        }
+        self.origins[view] = Some(origin);
+    }
+
+    /// The rectangle of `view`'s toolbox the log already reported.
+    pub fn logged(&self, view: usize) -> Option<Rect> {
+        self.logged.get(view).copied().flatten()
+    }
+
+    /// Record `view`'s toolbox rectangle as logged.
+    pub fn set_logged(&mut self, view: usize, rect: Rect) {
+        if self.logged.len() <= view {
+            self.logged.resize(view + 1, None);
+        }
+        self.logged[view] = Some(rect);
     }
 }
 
@@ -317,6 +346,10 @@ pub struct MenubarSession {
     pub history_requests: Vec<HistoryRequest>,
     /// The dock tab the Window menu asked for, drained by the executable.
     pub pending_tab: Option<EditorTab>,
+    /// Whether the Window menu asked for one more scene view (W-0038 Stage
+    /// 21); the shell docks it after the pass, because the dock is borrowed
+    /// by the `DockArea` while the menu draws.
+    pub new_scene_view: bool,
     /// Whether the About window is open.
     pub about_open: bool,
     /// The menu whose dropdown is open, while one is; the log reports each
@@ -338,6 +371,7 @@ impl Default for MenubarSession {
             about_open: false,
             open: None,
             quit_requested: false,
+            new_scene_view: false,
         }
     }
 }

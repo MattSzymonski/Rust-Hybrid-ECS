@@ -79,9 +79,14 @@ impl Default for EguiShellInput {
     }
 }
 
-/// The scene viewports the shell and the frontend share: one per scene
-/// tab, so two today.
-pub const SCENE_VIEWPORTS: usize = 2;
+/// How many scene viewports a layout opens with: the two the default dock
+/// carries. The shell may report more - a view the person added (W-0038
+/// Stage 21) - and the frontend opens one for each it does.
+pub const DEFAULT_SCENE_VIEWS: usize = 2;
+
+/// The most scene views one editor opens: each view is a child window and a
+/// renderer surface, so a layout that named thousands is trimmed to this.
+pub const SCENE_VIEWS_MAX: usize = 8;
 
 /// A logical-pixel rectangle crossing the boundary (IME placement).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -121,10 +126,11 @@ pub struct EguiShellFrame {
     /// Text egui asked to copy to the clipboard.
     pub clipboard_text: Option<String>,
     /// The scene viewports' body rectangles (logical points), one slot per
-    /// scene tab: the frontend places the slot's child window here, so each
-    /// viewport follows the dock layout. A slot the shell leaves `None`
-    /// hides that viewport's window - its tab is not shown.
-    pub scene_rects: [Option<ShellRect>; SCENE_VIEWPORTS],
+    /// view index: the frontend places that view's child window here, so
+    /// each viewport follows the dock layout. A slot the shell leaves `None`
+    /// hides that viewport's window - its tab is not shown - and the list is
+    /// only as long as the highest view index the dock holds.
+    pub scene_rects: Vec<Option<ShellRect>>,
     /// The game viewport's body rectangle (logical points): the frontend
     /// places the primary surface's child window here, so the game view
     /// follows the dock layout. `None` hides that window - the Game tab is
@@ -164,7 +170,7 @@ impl Default for EguiShellFrame {
             wants_keyboard: false,
             cursor_icon: CursorIcon::Default,
             clipboard_text: None,
-            scene_rects: [None; SCENE_VIEWPORTS],
+            scene_rects: Vec::new(),
             game_rect: None,
             overlay_regions: Vec::new(),
             ime_allowed: false,
@@ -213,8 +219,9 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         cursor_icon: platform.cursor_icon,
         clipboard_text,
         // The shell fills the scene rectangles after its dock pass runs;
-        // `frame_from_output` only knows egui's own output.
-        scene_rects: [None; SCENE_VIEWPORTS],
+        // `frame_from_output` only knows egui's own output, and the list's
+        // length is the number of views the dock holds.
+        scene_rects: Vec::new(),
         // Same for the game rectangle: the shell records it as it draws
         // the Game tab.
         game_rect: None,
