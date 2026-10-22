@@ -181,6 +181,12 @@ ASSET_META_QUEUED_TOKEN = "[editor] asset meta queued"
 ENGINE_COMMANDS_APPLIED_TOKEN = "[editor] engine commands applied"
 HISTORY_PUSH_TOKEN = "[editor] history push"
 HISTORY_UNDO_TOKEN = "[editor] history undo"
+RESOURCES_DUMP_TOKEN = "[test] resources"
+RESOURCE_FIELD_TOKEN = "[test] resource field"
+RESOURCE_SELECTED_TOKEN = "[editor] resource selected"
+SELECTION_RESTORED_TOKEN = "[editor] selection restored"
+RESOURCE_EDIT_TOKEN = "[editor] resource edit queued"
+GIZMO_RESOURCE_NAME = "pill_editor_core::gizmo::GizmoState"
 HISTORY_REDO_TOKEN = "[editor] history redo"
 ASSETS_DUMP_TOKEN = "[test] assets"
 ASSET_ROW_TOKEN = "[test] asset"
@@ -1322,6 +1328,87 @@ def main() -> int:
         print(
             "  [OK] the Statistics tab timed {} drawn tabs".format(len(measured))
         )
+
+        # Step 3a7: world resources (W-0038 Stage 14). The Inspector lists the
+        # editable resources, a selection of one is recorded, and a field edit
+        # applies and undoes like any other edit.
+        begin = len(session.read_log())
+        session.send("select resource {}".format(GIZMO_RESOURCE_NAME))
+        session.wait(
+            re.escape(RESOURCE_SELECTED_TOKEN)
+            + r'\s+resource="{}'.format(re.escape(GIZMO_RESOURCE_NAME)),
+            30,
+            "the resource selection",
+            begin,
+        )
+        dump = session.request(
+            "dump resources", re.escape(RESOURCES_DUMP_TOKEN), 30, "the resources"
+        )
+        assert re.search(r"count=1\b", dump), (
+            "the editable resources did not list: {}".format(dump[-600:])
+        )
+        assert re.search(
+            re.escape(RESOURCE_FIELD_TOKEN)
+            + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"',
+            dump,
+        ), "the seeded scale step is not the resource's value: {}".format(dump[-800:])
+        begin = len(session.read_log())
+        session.send(
+            "edit resource {} settings.scale_step 0.25".format(GIZMO_RESOURCE_NAME)
+        )
+        session.wait(
+            re.escape(RESOURCE_EDIT_TOKEN), 30, "the resource edit", begin
+        )
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN)
+            + r'\s+label="set {}\.settings\.scale_step"'.format(
+                re.escape(GIZMO_RESOURCE_NAME)
+            ),
+            30,
+            "the resource edit recorded a step",
+            begin,
+        )
+        dump = session.request(
+            "dump resources", re.escape(RESOURCES_DUMP_TOKEN), 30, "the edited resource"
+        )
+        assert re.search(
+            re.escape(RESOURCE_FIELD_TOKEN)
+            + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.25"',
+            dump,
+        ), "the resource edit did not apply: {}".format(dump[-800:])
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(HISTORY_UNDO_TOKEN)
+            + r'\s+label="set {}\.settings\.scale_step"'.format(
+                re.escape(GIZMO_RESOURCE_NAME)
+            ),
+            30,
+            "the resource edit's undo",
+            begin,
+        )
+        dump = session.request(
+            "dump resources", re.escape(RESOURCES_DUMP_TOKEN), 30, "the restored resource"
+        )
+        assert re.search(
+            re.escape(RESOURCE_FIELD_TOKEN)
+            + r'\s+resource="[^"]+"\s+field="settings\.scale_step"\s+label="Scale step"\s+value="0\.1"',
+            dump,
+        ), "the undo did not restore the resource field: {}".format(dump[-800:])
+        print("  [OK] a resource field edit applied and undid")
+        # The selection itself is a recorded command: undoing it restores the
+        # whole selection, entity slot included, rather than leaving the
+        # Inspector on nothing.
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(SELECTION_RESTORED_TOKEN)
+            + r'\s+entity="(?!none)[^"]+"\s+resource="none"',
+            30,
+            "the resource selection's undo",
+            begin,
+        )
+        print("  [OK] a resource selection round-trips through undo")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.

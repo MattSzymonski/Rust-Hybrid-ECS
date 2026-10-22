@@ -72,8 +72,7 @@ pub enum ScriptedCommand {
     /// `panel restore <source>` - bind that module's panels again, the state a
     /// reload leaves.
     PanelRestore(String),
-    /// `panel window <slot> <id>` - ask the panel in that slot to open the
-    /// window it calls `id`, as clicking its own button would (W-0038
+    /// `panel window <slot> <id>` - ask the panel in that slot to open the    /// window it calls `id`, as clicking its own button would (W-0038
     /// Stage 13).
     PanelWindow {
         /// The panel's registry slot.
@@ -150,6 +149,18 @@ pub enum ScriptedCommand {
     SelectAsset(String),
     /// `select entity <handle>` - move the shared selection onto an entity.
     SelectEntity(String),
+    /// `select resource <name>` - move the shared selection onto an editable
+    /// world resource (W-0038 Stage 14).
+    SelectResource(String),
+    /// `edit resource <field> <value>` - one recorded resource field edit.
+    EditResource {
+        /// The resource's stable name.
+        resource: String,
+        /// The field's name within the resource.
+        field: String,
+        /// The new value, as the field's kind parses it.
+        value: String,
+    },
     /// `toolbar <create|rename|delete|meta>` - press one Assets toolbar button.
     Toolbar(ToolbarAction),
     /// `dialog set name <text>` - type into the open asset dialog's name field.
@@ -279,6 +290,9 @@ pub enum Dump {
     Panels,
     /// `dump windows` - the panel windows on screen (W-0038 Stage 13).
     Windows,
+    /// `dump resources` - the editable world resources and their values
+    /// (W-0038 Stage 14).
+    Resources,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -581,6 +595,13 @@ impl ScriptedCommand {
                     cursor.finish(verb)?;
                     Ok(ScriptedCommand::SelectEntity(handle.to_string()))
                 }
+                Some("resource") => {
+                    let name = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("select resource needs a resource name"))?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::SelectResource(name.to_string()))
+                }
                 _ => Err(ParseError::new("unknown select target")),
             },
             "toolbar" => {
@@ -692,6 +713,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "cadence" => Dump::Cadence,
         "panels" => Dump::Panels,
         "windows" => Dump::Windows,
+        "resources" => Dump::Resources,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -800,6 +822,20 @@ fn edit(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
             let value = cursor.text("edit preference needs a key and a value")?;
             Ok(ScriptedCommand::EditPreference {
                 key: key.to_string(),
+                value,
+            })
+        }
+        Some("resource") => {
+            let resource = cursor
+                .word()
+                .ok_or_else(|| ParseError::new("edit resource needs a resource name"))?;
+            let field = cursor
+                .word()
+                .ok_or_else(|| ParseError::new("edit resource needs a field"))?;
+            let value = cursor.text("edit resource needs a value")?;
+            Ok(ScriptedCommand::EditResource {
+                resource: resource.to_string(),
+                field: field.to_string(),
                 value,
             })
         }

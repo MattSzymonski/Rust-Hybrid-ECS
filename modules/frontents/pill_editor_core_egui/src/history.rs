@@ -208,6 +208,18 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
             EditorCommand::SetSelection { entity, asset } => {
                 entity.map(|_| 16).unwrap_or(0) + asset.as_ref().map(String::len).unwrap_or(0)
             }
+            EditorCommand::SelectResource { resource } => {
+                resource.as_ref().map(String::len).unwrap_or(0)
+            }
+            EditorCommand::RestoreSelection {
+                entity,
+                asset,
+                resource,
+            } => {
+                entity.map(|_| 16).unwrap_or(0)
+                    + asset.as_ref().map(String::len).unwrap_or(0)
+                    + resource.as_ref().map(String::len).unwrap_or(0)
+            }
         };
         bytes += strings;
     }
