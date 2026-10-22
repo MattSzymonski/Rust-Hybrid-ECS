@@ -708,11 +708,9 @@ impl World {
             if let Some(path) = field.type_tag.strip_prefix("array:struct:") {
                 if let Some(nested) = self.resolve_nested_layout(path) {
                     let elements = field.element_count.min(MAX_EXPANDED_ELEMENTS);
-                    let stride = if field.element_count == 0 {
-                        0
-                    } else {
-                        field.size / field.element_count
-                    };
+                    // A zero-length array has no stride to compute; every
+                    // other count divides the field's whole size evenly.
+                    let stride = field.size.checked_div(field.element_count).unwrap_or(0);
                     if elements > 0 {
                         *changed = true;
                         for index in 0..elements {

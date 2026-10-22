@@ -629,6 +629,8 @@ def wait_for_stub_record(session: EditorSession, timeout: float = 30.0) -> str:
             if text:
                 print("  [OK] the stub editor recorded {}".format(text))
                 return text
+        # The stub is a separate process writing a file: poll rather than
+        # busy-wait, so the CPU stays free for the editor under test.
         time.sleep(0.2)
     raise TimeoutError(
         "the stub code editor recorded nothing at {}".format(record)
@@ -1750,6 +1752,8 @@ def main() -> int:
             "the import step",
             begin,
         )
+        # The import is a file copy the editor does on its own thread; poll
+        # the tree rather than assume the copy finished with the log line.
         time.sleep(0.5)
         imported = list(asset_root.rglob("s18_dropped.png"))
         assert len(imported) == 1, (
@@ -1758,6 +1762,8 @@ def main() -> int:
         begin = len(session.read_log())
         session.send("command editor.undo")
         session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the import's undo", begin)
+        # The undo deletes the copied file on its own turn; give the removal
+        # the moment it needs before the assertion below reads the tree.
         time.sleep(0.5)
         assert not imported[0].exists(), (
             "the undo left the imported file on disk: {}".format(imported[0])
@@ -4020,6 +4026,8 @@ def main() -> int:
         recovery_file = recovered.editor_state_directory / "editor_egui_recovery.json"
         deadline = time.time() + 30
         while time.time() < deadline and not recovery_file.exists():
+            # The editor writes the document on its own cadence; poll the
+            # file system until it appears or the deadline passes.
             time.sleep(0.25)
         assert recovery_file.exists(), (
             "the running editor never wrote its recovery document: {}".format(
@@ -4033,6 +4041,8 @@ def main() -> int:
         )
         deadline = time.time() + 30
         while time.time() < deadline and recovery_file.stat().st_mtime_ns == written_before:
+            # The autosave also fires on change; wait for a newer mtime so the
+            # comparison below cannot read the previous write.
             time.sleep(0.25)
         assert recovery_file.stat().st_mtime_ns != written_before, (
             "the undock did not reach the recovery document"
@@ -4327,6 +4337,8 @@ def main() -> int:
             )
             if drawn is not None and int(drawn.group(1)) > 0:
                 break
+            # The panel's draw line arrives on its own frame; poll the log
+            # until it appears or the loop's deadline ends it.
             time.sleep(0.5)
         assert drawn is not None and int(drawn.group(1)) > 0, (
             "the Spline Tool never drew: {}".format(dump[-800:])

@@ -352,6 +352,9 @@ pub mod tests;
 /// One shell frame: the shell's own events become egui input, the dock runs,
 /// and the output becomes the executable's frame. The asset dialog, when one
 /// is open, is drawn over the dock.
+// The executable hands the pass its world borrows; there is no smaller shape
+// that does not mean building a struct per frame.
+#[allow(clippy::too_many_arguments)]
 pub fn run_frame(
     state: &mut EguiShellState,
     shell_input: &EguiShellInput,
@@ -854,16 +857,18 @@ impl TabViewer for EditorTabViewer<'_> {
                 &mut self.overlay_regions,
                 self.inspector,
             ),
-            EditorTab::Assets => assets_tab(
-                ui,
-                self.snapshot,
-                self.selection,
-                self.asset_dialog,
-                self.pending,
-                &mut self.overlay_regions,
-                self.browser,
-                self.drag_out,
-            ),
+            EditorTab::Assets => {
+                // One bundle of the handles the panel writes through, the
+                // same shape a grid tile takes (see `AssetTileWrites`).
+                let mut writes = AssetTileWrites {
+                    selection: self.selection,
+                    dialog: self.asset_dialog,
+                    pending: self.pending,
+                    overlay_regions: &mut self.overlay_regions,
+                    drag_out: self.drag_out,
+                };
+                assets_tab(ui, self.snapshot, self.browser, &mut writes);
+            }
             EditorTab::Preferences => {
                 preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)
             }

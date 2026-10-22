@@ -3871,7 +3871,7 @@ impl EditorWindow {
             let marker = self
                 .panel_markers
                 .entry(request.source.to_string())
-                .or_insert_with(ModuleLiveness::new);
+                .or_default();
             let slot = {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 match world.get_resource_mut::<PanelRegistry>() {
@@ -5447,13 +5447,12 @@ impl EditorWindow {
     fn scripted_new_scene_view(&mut self) {
         let next = {
             let world = self.host.host_mut().engine_mut().world_mut();
-            match world.get_resource::<EguiShellState>() {
-                Some(state) => Some((
+            world.get_resource::<EguiShellState>().map(|state| {
+                (
                     state.dock.next_scene_view(),
                     state.dock.can_open_scene_view(),
-                )),
-                None => None,
-            }
+                )
+            })
         };
         let Some((tab, fits)) = next else {
             warn!(

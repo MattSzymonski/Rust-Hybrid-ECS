@@ -36,18 +36,14 @@ pub const ASSETS_TREE_CARET_SIZE: f32 = 10.0;
 pub fn assets_tab(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
-    selection: &mut EditorSelection,
-    dialog: &mut Option<AssetDialog>,
-    pending: &mut PendingEditorCommands,
-    overlay_regions: &mut Vec<ShellRect>,
     browser: &mut ProjectBrowser,
-    drag_out: &mut Option<String>,
+    writes: &mut AssetTileWrites<'_>,
 ) {
     // A folder that vanished (deleted, renamed, or the project reloaded onto
     // another tree) falls back to its nearest ancestor, so the grid never
     // lists a path the listing no longer holds.
     browser.settle(&snapshot.assets);
-    let selected_row = assets::selected_row(selection, &snapshot.assets);
+    let selected_row = assets::selected_row(writes.selection, &snapshot.assets);
     let selected_is_file = selected_row.is_some_and(|row| row.kind != "folder");
     let missing_meta =
         selected_row.is_some_and(|row| row.kind != "folder" && !row.standalone && !row.has_meta);
@@ -61,8 +57,8 @@ pub fn assets_tab(
             .clicked()
         {
             assets::open_create(
-                dialog,
-                selection,
+                writes.dialog,
+                writes.selection,
                 &snapshot.assets,
                 &snapshot.standalone_types,
             );
@@ -72,7 +68,7 @@ pub fn assets_tab(
                 .add(icons::IconButton::new(icons::Icon::Trash, "Delete Asset"))
                 .clicked()
             {
-                assets::delete_selection(pending, selection, &snapshot.assets);
+                assets::delete_selection(writes.pending, writes.selection, &snapshot.assets);
             }
             if ui
                 .add(icons::IconButton::new(
@@ -81,7 +77,7 @@ pub fn assets_tab(
                 ))
                 .clicked()
             {
-                assets::open_rename(dialog, selection, &snapshot.assets);
+                assets::open_rename(writes.dialog, writes.selection, &snapshot.assets);
             }
         }
         if missing_meta
@@ -92,7 +88,7 @@ pub fn assets_tab(
                 ))
                 .clicked()
         {
-            assets::write_meta_selection(pending, selection, &snapshot.assets);
+            assets::write_meta_selection(writes.pending, writes.selection, &snapshot.assets);
         }
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("{} entries", snapshot.assets.len())).weak());
@@ -103,7 +99,7 @@ pub fn assets_tab(
         .default_size(ASSETS_TREE_WIDTH)
         .size_range(ASSETS_TREE_WIDTH_RANGE)
         .show(ui, |ui| {
-            assets_tree(ui, snapshot, browser, selection, pending);
+            assets_tree(ui, snapshot, browser, writes.selection, writes.pending);
         });
     egui::Panel::top("pill_editor_shell_egui.assets_path").show(ui, |ui| {
         assets_path_bar(ui, browser);
@@ -112,16 +108,7 @@ pub fn assets_tab(
         assets_zoom_bar(ui, &snapshot.assets, browser);
     });
     egui::CentralPanel::default().show(ui, |ui| {
-        assets_grid(
-            ui,
-            snapshot,
-            browser,
-            selection,
-            dialog,
-            pending,
-            overlay_regions,
-            drag_out,
-        );
+        assets_grid(ui, snapshot, browser, writes);
     });
 }
 
@@ -264,11 +251,7 @@ pub fn assets_grid(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     browser: &mut ProjectBrowser,
-    selection: &mut EditorSelection,
-    dialog: &mut Option<AssetDialog>,
-    pending: &mut PendingEditorCommands,
-    overlay_regions: &mut Vec<ShellRect>,
-    drag_out: &mut Option<String>,
+    writes: &mut AssetTileWrites<'_>,
 ) {
     let cell = egui::vec2(
         browser.tile_size + ASSETS_TILE_GAP,
@@ -287,34 +270,27 @@ pub fn assets_grid(
             if entries.is_empty() {
                 ui.label(egui::RichText::new("This folder is empty").weak());
             }
-            let mut writes = AssetTileWrites {
-                selection: &mut *selection,
-                dialog: &mut *dialog,
-                pending: &mut *pending,
-                overlay_regions: &mut *overlay_regions,
-                drag_out: &mut *drag_out,
-            };
             for row in entries.chunks(columns) {
                 ui.horizontal(|ui| {
                     for entry in row {
-                        asset_tile(ui, entry, cell, browser, snapshot, &mut writes);
+                        asset_tile(ui, entry, cell, browser, snapshot, writes);
                     }
                 });
             }
             let empty = ui.allocate_response(empty_area(ui), egui::Sense::click_and_drag());
             if let Some(dragged) = empty.dnd_release_payload::<String>() {
                 if let Some(to) = assets::drop_destination(&dragged, &folder) {
-                    assets::queue_move(pending, &dragged, &to);
+                    assets::queue_move(writes.pending, &dragged, &to);
                 }
             }
-            context_menu("assets", &empty, overlay_regions, &mut |ui| {
+            context_menu("assets", &empty, writes.overlay_regions, &mut |ui| {
                 if ui
                     .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
                     .clicked()
                 {
                     assets::open_create(
-                        dialog,
-                        selection,
+                        writes.dialog,
+                        writes.selection,
                         &snapshot.assets,
                         &snapshot.standalone_types,
                     );
