@@ -72,6 +72,15 @@ pub enum ScriptedCommand {
     /// `panel restore <source>` - bind that module's panels again, the state a
     /// reload leaves.
     PanelRestore(String),
+    /// `panel window <slot> <id>` - ask the panel in that slot to open the
+    /// window it calls `id`, as clicking its own button would (W-0038
+    /// Stage 13).
+    PanelWindow {
+        /// The panel's registry slot.
+        slot: u16,
+        /// The window id the panel chooses.
+        id: String,
+    },
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -268,6 +277,8 @@ pub enum Dump {
     Cadence,
     /// `dump panels` - the module panels and their timings (W-0038 Stage 11).
     Panels,
+    /// `dump windows` - the panel windows on screen (W-0038 Stage 13).
+    Windows,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
         /// The entity's display handle.
@@ -505,6 +516,17 @@ impl ScriptedCommand {
                     cursor.finish("panel restore")?;
                     Ok(ScriptedCommand::PanelRestore(source.to_string()))
                 }
+                Some("window") => {
+                    let slot = number(&mut cursor, "panel window needs a slot and a window id")?;
+                    let id = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("panel window needs a window id"))?;
+                    cursor.finish("panel window")?;
+                    Ok(ScriptedCommand::PanelWindow {
+                        slot,
+                        id: id.to_string(),
+                    })
+                }
                 _ => Err(ParseError::new(
                     "panel needs `unload <module>` or `restore <module>`",
                 )),
@@ -669,6 +691,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "stats" => Dump::Stats,
         "cadence" => Dump::Cadence,
         "panels" => Dump::Panels,
+        "windows" => Dump::Windows,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1451,6 +1474,17 @@ mod tests {
             Accept {
                 line: "dump panels",
                 command: ScriptedCommand::Dump(Dump::Panels),
+            },
+            Accept {
+                line: "dump windows",
+                command: ScriptedCommand::Dump(Dump::Windows),
+            },
+            Accept {
+                line: "panel window 0 demo.confirm",
+                command: ScriptedCommand::PanelWindow {
+                    slot: 0,
+                    id: "demo.confirm".to_string(),
+                },
             },
             Accept {
                 line: "console filter warn",

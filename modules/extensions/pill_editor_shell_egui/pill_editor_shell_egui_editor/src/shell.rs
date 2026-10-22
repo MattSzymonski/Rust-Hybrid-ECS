@@ -121,6 +121,29 @@ pub mod tab_demo;
 
 pub use tab_demo::demo_panel;
 
+/// The [`panel_windows`] module: the windows and modals module panels ask the
+/// shell for (W-0038 Stage 13).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod panel_windows;
+
+pub use panel_windows::{panel_windows, PanelFeed};
+
+/// The [`spline_tool`] module: the Spline Tool panel and its re-seed modal
+/// (W-0038 Stages 12 and 13).
+///
+/// Public like every tab module: the build script's function inventory names
+/// each addressable function by its module path, so the module cannot be
+/// private.
+pub mod spline_tool;
+
+pub use spline_tool::{
+    reseed_command, reseed_window, spline_tool_panel, Reseed, RESEED_POINTS, RESEED_WINDOW,
+    SPLINE_COMPONENT, SPLINE_PANEL_ID,
+};
+
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
 ///
 /// Public like every tab module: the build script's function
@@ -385,6 +408,26 @@ pub fn run_frame(
     // asset dialog are separate fields, borrowed apart so the dock's layout
     // borrow and the dialog's state borrow coexist.
     let context = state.context.clone();
+    // What the module panels read this pass (Stages 12 and 13): only built when
+    // a panel is registered, so a build with none costs nothing.
+    let panel_feed = panel_feed(snapshot, panels);
+    // The answer the last pass's modal took, for exactly one pass.
+    let mut panel_feed = panel_feed;
+    panel_feed.frames_per_second = shell_input.frames_per_second;
+    // A window the scripted channel asked for: the panel itself decides what
+    // that id means. Kept until the pinged panel is drawn - a request must not
+    // be dropped by a frame where that tab was not on screen.
+    let panel_window_ping = state.panel_window_ping.clone();
+    let panel_answer =
+        state
+            .panel_windows
+            .answer
+            .as_ref()
+            .map(|answer| pill_ui_egui::panels::PanelAnswer {
+                window: answer.window.clone(),
+                accepted: answer.accepted,
+            });
+    let mut panel_window_requests: Vec<(u16, PanelCommand)> = Vec::new();
     let EguiShellState {
         dock,
         asset_dialog,
@@ -399,6 +442,8 @@ pub fn run_frame(
         problem_open,
         stats,
         panel_budget,
+        panel_windows: windows,
+        panel_window_ping: window_ping,
         ..
     } = state;
     // Named through the package path, not as a file-local item: a hot patch
@@ -424,6 +469,14 @@ pub fn run_frame(
         panels,
         panel_budget,
         panel_commands,
+        panel_entities: panel_feed.entities.as_slice(),
+        panel_detail: panel_feed.detail.as_ref(),
+        panel_answer: panel_answer.as_ref(),
+        panel_window_requests: &mut panel_window_requests,
+        panel_window_ping: panel_window_ping
+            .as_ref()
+            .map(|(slot, window)| (*slot, window.as_str())),
+        panel_window_ping_used: false,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -465,6 +518,46 @@ pub fn run_frame(
             menubar,
             &mut viewer,
         );
+        // The windows the module panels asked for (Stage 13): applied here so
+        // one a panel opens this frame is drawn in this frame, then drawn by
+        // the panel that owns them.
+        for (slot, request) in viewer.panel_window_requests.drain(..) {
+            let source = panels
+                .get(slot)
+                .map(|entry| entry.source.clone())
+                .unwrap_or_default();
+            match request {
+                PanelCommand::OpenWindow(request) => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        slot,
+                        window = request.id.as_str(),
+                        modal = request.modal,
+                        "[editor] panel window opened"
+                    );
+                    windows.open(&source, slot, &request)
+                }
+                PanelCommand::CloseWindow(id) => {
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        slot,
+                        window = id.as_str(),
+                        "[editor] panel window closed"
+                    );
+                    windows.close(&source, &id)
+                }
+                _ => {}
+            }
+        }
+        pill_editor_shell_egui_editor::shell::panel_windows(
+            ui.ctx(),
+            windows,
+            panels,
+            &mut *viewer.panel_budget,
+            &panel_feed,
+            &mut *viewer.panel_commands,
+            &mut viewer.overlay_regions,
+        );
     });
     let mut shell_frame = frame_from_output(&context, output);
     shell_frame.scene_rects = viewer.scene_rects;
@@ -475,6 +568,15 @@ pub fn run_frame(
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
         pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
+    }
+    // The answer has been read by the pass that needed it; the next one must
+    // not act on it again (W-0038 Stage 13).
+    if panel_answer.is_some() {
+        windows.answer = None;
+    }
+    // The pinged panel drew this pass, so its window request is spent.
+    if viewer.panel_window_ping_used {
+        *window_ping = None;
     }
     // A panel that crossed its budget this frame gets its toast once, named
     // after the tab so the user can find the panel it belongs to (Stage 11).
@@ -515,6 +617,51 @@ pub fn run_frame(
 // =============================================================================
 // The tab viewer and the tabs
 // =============================================================================
+
+/// What module panels read this pass (W-0038 Stages 12 and 13).
+///
+/// Built only when a panel is registered: the rows are a copy of the snapshot
+/// the tabs already read, and an editor with no module panels should not pay
+/// for them.
+pub fn panel_feed(snapshot: &EditorSnapshot, panels: &PanelRegistry) -> PanelFeed {
+    let mut feed = PanelFeed {
+        entities: Vec::new(),
+        detail: None,
+        frames_per_second: 0.0,
+    };
+    if panels.is_empty() {
+        return feed;
+    }
+    feed.entities = snapshot
+        .entities
+        .iter()
+        .map(|entry| PanelEntityRow {
+            entity: entry.entity,
+            display: entry.display.clone(),
+            archetype: entry.archetype_label.clone(),
+        })
+        .collect();
+    feed.detail = snapshot.detail.as_ref().map(|detail| PanelEntityDetail {
+        entity: detail.entity,
+        components: detail
+            .components
+            .iter()
+            .map(|component| PanelComponentValues {
+                component: component.type_name.clone(),
+                fields: component
+                    .fields
+                    .iter()
+                    .zip(component.values.iter())
+                    .map(|(field, value)| PanelFieldValue {
+                        name: field.name.to_string(),
+                        value: inspector::value_text(value),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    });
+    feed
+}
 
 /// Draws the dock's tabs; the tab bodies come from the tab functions.
 ///
@@ -576,6 +723,21 @@ pub struct EditorTabViewer<'a> {
     /// The commands the module panels asked for this pass, applied by the
     /// executable at the frame boundary.
     pub panel_commands: &'a mut Vec<PanelCommand>,
+    /// The world's entities, as module panels see them (W-0038 Stage 12).
+    pub panel_entities: &'a [PanelEntityRow],
+    /// The selected entity's components, as module panels see them.
+    pub panel_detail: Option<&'a PanelEntityDetail>,
+    /// The answer a modal window took, for the pass that follows it
+    /// (W-0038 Stage 13).
+    pub panel_answer: Option<&'a pill_ui_egui::panels::PanelAnswer>,
+    /// The windows the panels asked to open or close this pass, with the slot
+    /// that asked: applied after the dock, before the windows draw.
+    pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
+    /// The slot a scripted window request named, and the window id it wants
+    /// that panel to open (W-0038 Stage 13).
+    pub panel_window_ping: Option<(u16, &'a str)>,
+    /// Whether the pinged panel drew this pass, so the request is spent.
+    pub panel_window_ping_used: bool,
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -664,14 +826,38 @@ impl TabViewer for EditorTabViewer<'_> {
                 // tab says so when it is not (Stage 11).
                 match self.panels.draw_of(slot) {
                     Some(draw) => {
+                        let requested_window = self
+                            .panel_window_ping
+                            .filter(|(pinged, _)| *pinged == slot)
+                            .map(|(_, window)| window);
+                        if requested_window.is_some() {
+                            self.panel_window_ping_used = true;
+                        }
                         let mut context = PanelContext {
                             frames_per_second: self.frames_per_second,
                             selected_entity: self.selection.entity,
+                            entities: self.panel_entities,
+                            detail: self.panel_detail,
+                            window: None,
+                            requested_window,
+                            answer: self.panel_answer,
                             commands: self.panel_commands,
                         };
                         let started = pill_core::platform::Instant::now();
                         draw(ui, &mut context);
                         let micros = started.elapsed().as_micros() as f32;
+                        // The window requests belong to this panel, and only
+                        // this arm knows which slot asked.
+                        let mut kept = Vec::with_capacity(context.commands.len());
+                        for command in context.commands.drain(..) {
+                            match command {
+                                PanelCommand::OpenWindow(_) | PanelCommand::CloseWindow(_) => {
+                                    self.panel_window_requests.push((slot, command))
+                                }
+                                other => kept.push(other),
+                            }
+                        }
+                        *context.commands = kept;
                         let over_budget = self.panel_budget.record(slot, micros);
                         if over_budget {
                             pill_core::warn!(

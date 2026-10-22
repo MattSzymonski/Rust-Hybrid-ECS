@@ -137,6 +137,12 @@ PANEL_REGISTERED_TOKEN = "[editor] panel registered"
 PANEL_OVER_BUDGET_TOKEN = "[editor] module panel over budget"
 PANEL_UNLOADED_TOKEN = "[editor] panel source unloaded"
 PANEL_RESTORED_TOKEN = "[editor] panel source restored"
+PANEL_WINDOW_OPENED_TOKEN = "[editor] panel window opened"
+PANEL_WINDOW_REQUESTED_TOKEN = "[editor] panel window requested"
+PANEL_MODAL_ANSWERED_TOKEN = "[editor] panel modal answered"
+PANEL_LOG_TOKEN = "[editor] panel log"
+WINDOWS_DUMP_TOKEN = "[test] windows"
+WINDOW_ROW_TOKEN = "[test] window"
 SAFE_MODE_TOKEN = "[editor] safe mode"
 SAFE_MODE_RETRY_TOKEN = "[editor] safe mode retry requested"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
@@ -3554,7 +3560,7 @@ def main() -> int:
             re.escape(PANEL_RESTORED_TOKEN), 60, "the restore", begin
         )
         assert re.search(
-            re.escape(PANEL_RESTORED_TOKEN) + r".*?restored=1",
+            re.escape(PANEL_RESTORED_TOKEN) + r".*?restored=[1-9][0-9]*",
             panels.read_log()[begin:],
         ), "the restore registered nothing: {}".format(panels.read_log()[begin:][-400:])
         dump = panels.request(
@@ -3565,6 +3571,134 @@ def main() -> int:
             dump,
         ), "the restored panel did not come back: {}".format(dump[-800:])
         print("  [OK] a panel outlived its module's unload and came back")
+
+        # Stages 12 and 13: the shell module's other two panels - the Spline
+        # Tool, and the windows and modals a panel asks the shell for. The
+        # demo panel's confirmation is driven through `panel window`, which
+        # reaches the same code its own button does, and answered with Enter.
+        dump = panels.request(
+            "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the spline panel"
+        )
+        spline = re.search(
+            re.escape(PANEL_ROW_TOKEN)
+            + r'\s+slot=(\d+)\s+id="shell\.spline_tool"',
+            dump,
+        )
+        assert spline is not None, (
+            "the Spline Tool did not register: {}".format(dump[-800:])
+        )
+        spline_slot = spline.group(1)
+        panels.send("tab module:{}".format(spline_slot))
+        # The tab has to be drawn before its panel has a timing: the dump that
+        # reads it is retried for a couple of frames rather than racing the
+        # activation.
+        drawn = None
+        for _attempt in range(6):
+            dump = panels.request(
+                "dump panels", re.escape(PANELS_DUMP_TOKEN), 60, "the drawn spline panel"
+            )
+            drawn = re.search(
+                re.escape(PANEL_ROW_TOKEN)
+                + r"\s+slot={}\s+.*?passes=(\d+)".format(spline_slot),
+                dump,
+            )
+            if drawn is not None and int(drawn.group(1)) > 0:
+                break
+            time.sleep(0.5)
+        assert drawn is not None and int(drawn.group(1)) > 0, (
+            "the Spline Tool never drew: {}".format(dump[-800:])
+        )
+        print("  [OK] the Spline Tool registered and drew")
+        # The confirmation lives on the demo panel's tab, so that tab comes to
+        # the front first: `panel window` stands in for clicking the panel's
+        # own button, and a button is only clickable while its tab is shown.
+        panels.send("tab module:{}".format(slot))
+        begin = len(panels.read_log())
+        panels.send("panel window {} demo.confirm".format(slot))
+        panels.wait(
+            re.escape(PANEL_WINDOW_REQUESTED_TOKEN), 60, "the window request", begin
+        )
+        panels.wait(
+            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            60,
+            "the panel window",
+            begin,
+        )
+        dump = panels.request(
+            "dump windows", re.escape(WINDOWS_DUMP_TOKEN), 60, "the panel windows"
+        )
+        assert re.search(r"count=1\b", dump), (
+            "the panel window is not on screen: {}".format(dump[-600:])
+        )
+        assert re.search(
+            re.escape(WINDOW_ROW_TOKEN) + r'\s+id="demo\.confirm".*?modal=true', dump
+        ), "the window is not modal: {}".format(dump[-600:])
+        begin = len(panels.read_log())
+        panels.send("key Enter")
+        panels.wait(
+            re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=true',
+            60,
+            "the modal answer",
+            begin,
+        )
+        panels.wait(
+            re.escape(PANEL_LOG_TOKEN) + r'\s+text="demo confirmed"',
+            60,
+            "the panel's confirmation",
+            begin,
+        )
+        dump = panels.request(
+            "dump windows", re.escape(WINDOWS_DUMP_TOKEN), 60, "the closed window"
+        )
+        assert re.search(r"count=0\b", dump), (
+            "the answered modal is still on screen: {}".format(dump[-600:])
+        )
+        print("  [OK] a modal window opened, took Enter and closed")
+        # A window dies with its module: open it again, unload the source, and
+        # the shell drops it rather than drawing through a dead image.
+        begin = len(panels.read_log())
+        panels.send("panel window {} demo.confirm".format(slot))
+        panels.wait(
+            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            60,
+            "the reopened window",
+            begin,
+        )
+        begin = len(panels.read_log())
+        panels.send("panel unload pill_editor_shell_egui_editor")
+        panels.wait(re.escape(PANEL_UNLOADED_TOKEN), 60, "the second unload", begin)
+        dump = panels.request(
+            "dump windows", re.escape(WINDOWS_DUMP_TOKEN), 60, "the unloaded windows"
+        )
+        assert re.search(r"count=0\b", dump), (
+            "an unloaded module's window is still on screen: {}".format(dump[-600:])
+        )
+        begin = len(panels.read_log())
+        panels.send("panel restore pill_editor_shell_egui_editor")
+        panels.wait(
+            re.escape(PANEL_RESTORED_TOKEN),
+            60,
+            "the second restore",
+            begin,
+        )
+        begin = len(panels.read_log())
+        panels.send("panel window {} demo.confirm".format(slot))
+        panels.wait(
+            re.escape(PANEL_WINDOW_OPENED_TOKEN) + r'\s+slot=\d+\s+window="demo\.confirm"',
+            60,
+            "the re-registered window",
+            begin,
+        )
+        print("  [OK] a module's window closes on its unload and reopens after")
+        begin = len(panels.read_log())
+        panels.send("key Escape")
+        panels.wait(
+            re.escape(PANEL_MODAL_ANSWERED_TOKEN) + r'\s+window="[^"]+"\s+accepted=false',
+            60,
+            "the dismiss",
+            begin,
+        )
+        print("  [OK] Escape dismisses a modal")
         # Float the tab and leave: the layout writes the panel id beside it.
         panels.send("undock module:{}".format(slot))
         dock = panels.request(

@@ -27,11 +27,21 @@ pub const PANEL_SLOW_ENV: &str = "PILL_TEST_PANEL_SLOW";
 /// How many times the budget the slow posture burns.
 const SLOW_MULTIPLE: f32 = 3.0;
 
+/// The demo panel's confirmation window id.
+pub const DEMO_CONFIRM_WINDOW: &str = "demo.confirm";
+
 /// The module's demo panel.
 ///
 /// Public because the function inventory names it by path, and a private `fn`
 /// would fail the build of the generated wrapper crate.
 pub fn demo_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
+    // The confirmation's own body: the shell draws its buttons and reads Enter
+    // and Escape, the answer comes back on the pass after (W-0038 Stage 13).
+    if context.window == Some(DEMO_CONFIRM_WINDOW) {
+        ui.label("Confirm the demo action?");
+        ui.monospace("Enter applies it, Escape dismisses.");
+        return;
+    }
     ui.vertical(|ui| {
         ui.heading("Demo Panel");
         ui.label("Registered by the egui shell module itself.");
@@ -47,9 +57,35 @@ pub fn demo_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
              dock keeps its tab, and a module that unloads reads ",
         );
         ui.monospace("module not loaded");
+        ui.separator();
+        if ui.button("Confirm...").clicked()
+            || context.requested_window == Some(DEMO_CONFIRM_WINDOW)
+        {
+            context
+                .commands
+                .push(PanelCommand::OpenWindow(demo_confirm_window()));
+        }
+        if let Some(answer) = context.answer {
+            if answer.window == DEMO_CONFIRM_WINDOW && answer.accepted {
+                context
+                    .commands
+                    .push(PanelCommand::Log("demo confirmed".to_string()));
+            }
+        }
     });
     if slow_requested() {
         burn_micros(PANEL_BUDGET_MICROS * SLOW_MULTIPLE);
+    }
+}
+
+/// The confirmation the demo panel asks for: a modal window.
+pub fn demo_confirm_window() -> PanelWindowRequest {
+    PanelWindowRequest {
+        id: DEMO_CONFIRM_WINDOW.to_string(),
+        title: "Demo confirmation".to_string(),
+        width: 320.0,
+        height: 120.0,
+        modal: true,
     }
 }
 

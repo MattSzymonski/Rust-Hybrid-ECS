@@ -1,0 +1,165 @@
+//! The windows module panels ask the shell for (W-0038 Stage 13).
+//!
+//! # Responsibilities
+//!
+//! - [`panel_windows`]: draw every window a panel opened, by calling that
+//!   panel's own draw function with the window's id, so a panel's dialog body
+//!   and its tab body are the same code.
+//! - Answer a modal with Enter or Escape and leave the answer for the panel.
+//! - Close the windows of a module whose panels are gone, every frame, so a
+//!   window from an unloaded image is never drawn.
+//! - Publish each window's rectangle into the frame's overlay regions: a click
+//!   on a window is the UI's, never a scene pick.
+//!
+//! # Design
+//!
+//! The shell owns the window (position, lifetime, modality) and the panel owns
+//! the content. Windows live in [`PanelWindowSession`], a session resource, so
+//! a shell reload keeps them open; only the owning module's unload closes them,
+//! and the panel's own next draw re-opens what it still wants - which is what
+//! makes "closes on reload, reopens when registered again" fall out of the
+//! ownership rather than needing a rule.
+
+// Current crate
+use pill_editor_shell_egui_editor::shell::prelude::*;
+
+/// The dim a modal puts over the editor behind it.
+#[allow(dead_code)]
+const MODAL_DIM: egui::Color32 = egui::Color32::from_black_alpha(120);
+
+/// The panel data every window draw reads, gathered once per pass.
+pub struct PanelFeed {
+    /// The world's entities, as the panels see them.
+    pub entities: Vec<PanelEntityRow>,
+    /// The selected entity's components, when one is selected.
+    pub detail: Option<PanelEntityDetail>,
+    /// The editor's smoothed frame rate.
+    pub frames_per_second: f32,
+}
+
+/// Draw every open panel window and publish its rectangle.
+///
+/// `commands` collects what the windows ask for; the caller applies the window
+/// ones (which need the slot this function knows) and forwards the rest.
+pub fn panel_windows(
+    context: &egui::Context,
+    windows: &mut PanelWindowSession,
+    registry: &PanelRegistry,
+    budget: &mut PanelBudget,
+    feed: &PanelFeed,
+    commands: &mut Vec<PanelCommand>,
+    regions: &mut Vec<ShellRect>,
+) {
+    // A window from a module whose panels are gone has nothing to draw with:
+    // the draw function's image is unmapped (Stage 11's rule), so the window
+    // goes with it.
+    windows.windows.retain(|window| registry.alive(window.slot));
+    if windows.windows.is_empty() {
+        return;
+    }
+    let snapshot = windows.windows.clone();
+    for window in &snapshot {
+        let Some(draw) = registry.draw_of(window.slot) else {
+            continue;
+        };
+        let answer = windows
+            .answer
+            .as_ref()
+            .map(|answer| pill_ui_egui::panels::PanelAnswer {
+                window: answer.window.clone(),
+                accepted: answer.accepted,
+            });
+        let mut body = |ui: &mut egui::Ui, commands: &mut Vec<PanelCommand>| {
+            let mut panel_context = PanelContext {
+                frames_per_second: feed.frames_per_second,
+                selected_entity: feed.detail.as_ref().map(|detail| detail.entity),
+                entities: feed.entities.as_slice(),
+                detail: feed.detail.as_ref(),
+                window: Some(window.id.as_str()),
+                requested_window: None,
+                answer: answer.as_ref(),
+                commands,
+            };
+            let started = pill_core::platform::Instant::now();
+            draw(ui, &mut panel_context);
+            let micros = started.elapsed().as_micros() as f32;
+            budget.record(window.slot, micros);
+        };
+        if window.modal {
+            // A modal covers the editor and takes its input: egui's own modal
+            // layer dims what is behind it and swallows the clicks, so the
+            // dock cannot be used while it is open.
+            let modal = egui::Modal::new(egui::Id::new(("pill_editor.panel_modal", &window.id)))
+                .show(context, |ui| {
+                    ui.set_width(window.width);
+                    ui.heading(window.title.as_str());
+                    ui.separator();
+                    body(ui, commands);
+                    ui.separator();
+                    let accepted = ui
+                        .horizontal(|ui| {
+                            let accept = ui.button("Apply").clicked();
+                            let cancel = ui.button("Cancel").clicked();
+                            (accept, cancel)
+                        })
+                        .inner;
+                    let keys = ui.input(|input| {
+                        (
+                            input.key_pressed(egui::Key::Enter),
+                            input.key_pressed(egui::Key::Escape),
+                        )
+                    });
+                    if accepted.0 || keys.0 {
+                        return Some(true);
+                    }
+                    if accepted.1 || keys.1 {
+                        return Some(false);
+                    }
+                    None
+                })
+                .inner;
+            if let Some(accepted) = modal {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    window = window.id.as_str(),
+                    accepted,
+                    "[editor] panel modal answered"
+                );
+                windows.answer = Some(PanelWindowAnswer {
+                    window: window.id.clone(),
+                    source: window.source.clone(),
+                    accepted,
+                });
+                windows.close(&window.source, &window.id);
+            }
+            // A modal blocks the editor's input for as long as it is open, so
+            // what lies behind it cannot be clicked while it is up; the
+            // region list already carries every chip the dock drew, and a
+            // modal covers them.
+            continue;
+        }
+        let mut open = true;
+        let response = egui::Window::new(window.title.as_str())
+            .id(egui::Id::new(("pill_editor.panel_window", &window.id)))
+            .open(&mut open)
+            .default_width(window.width)
+            .default_height(window.height)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.set_width(window.width);
+                body(ui, commands);
+            });
+        if let Some(response) = response {
+            let rect = response.response.rect;
+            regions.push(ShellRect {
+                x: rect.min.x,
+                y: rect.min.y,
+                width: rect.width(),
+                height: rect.height(),
+            });
+        }
+        if !open {
+            windows.close(&window.source, &window.id);
+        }
+    }
+}
