@@ -215,6 +215,27 @@ pub fn run_menu_action(
         menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
         menubar::MenuAction::About => session.about_open = true,
         menubar::MenuAction::Quit => session.quit_requested = true,
+        // The clipboard (W-0038 Stage 17): the shell builds the payload and
+        // queues the request; the executable's OS bridge carries it out.
+        menubar::MenuAction::Clipboard(action) => {
+            let summary = pill_editor_core_egui::clipboard::queue_action(
+                viewer.clipboard,
+                action,
+                viewer.selection,
+                viewer.snapshot,
+                viewer.pending,
+            );
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                action = match action {
+                    pill_editor_core_egui::clipboard::ClipboardAction::Copy => "copy",
+                    pill_editor_core_egui::clipboard::ClipboardAction::Cut => "cut",
+                    pill_editor_core_egui::clipboard::ClipboardAction::Paste => "paste",
+                },
+                payload = summary.as_deref().unwrap_or("nothing"),
+                "[editor] clipboard queued"
+            );
+        }
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,

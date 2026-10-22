@@ -269,6 +269,13 @@ pub enum ScriptedCommand {
     SnapToggle,
     /// `command editor.tool_space_toggle` - flip world/local space.
     SpaceToggle,
+    /// `command editor.copy` - put the selection on the OS clipboard
+    /// (W-0038 Stage 17).
+    Copy,
+    /// `command editor.cut` - copy the selection and delete it.
+    Cut,
+    /// `command editor.paste` - read the OS clipboard and apply it.
+    Paste,
 }
 
 /// What a `palette` line asks of the command palette (W-0038 Stage 3).
@@ -983,6 +990,9 @@ fn command(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
         "editor.tool_scale" => ScriptedCommand::GizmoTool(GizmoMode::Scale),
         "editor.tool_snap_toggle" => ScriptedCommand::SnapToggle,
         "editor.tool_space_toggle" => ScriptedCommand::SpaceToggle,
+        "editor.copy" => ScriptedCommand::Copy,
+        "editor.cut" => ScriptedCommand::Cut,
+        "editor.paste" => ScriptedCommand::Paste,
         other => {
             return Err(ParseError::new(format!(
                 "command '{other}' is not executable in the egui editor"

@@ -40,6 +40,7 @@ use pill_core::{info, warn};
 use pill_editor_core_egui::assets::{self, AssetDialog};
 use pill_editor_core_egui::cadence::{Cadence, FrameDemand, FrameWake};
 use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
+use pill_editor_core_egui::clipboard::{self, ClipboardAction, ClipboardRequest, EditorClipboard};
 use pill_editor_core_egui::commands::{
     ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, CommandRegistry,
     EditorPreferences, KeybindingsFile, KeymapPreset, PendingEditorCommands, KEYBINDINGS_FILE,
@@ -898,6 +899,12 @@ impl EditorWindow {
         world.register_resource::<PanelCommands>();
         if world.get_resource::<PanelCommands>().is_none() {
             world.insert_resource(PanelCommands::default());
+        }
+        // The shell's side of the OS clipboard (W-0038 Stage 17): the shell
+        // queues a request, this executable's Win32 bridge carries it out.
+        world.register_resource::<EditorClipboard>();
+        if world.get_resource::<EditorClipboard>().is_none() {
+            world.insert_resource(EditorClipboard::default());
         }
         // Step 5: the scene views' child windows and their renderer
         // surfaces, each with its own camera (navigation moves the active
@@ -3412,6 +3419,14 @@ impl EditorWindow {
                 },
             });
             events.append(&mut self.shell_events);
+            // A paste chord in this frame's events carries the OS clipboard's
+            // text into egui, so a focused text field pastes (W-0038 Stage 17).
+            let paste_text = paste_chord(&events).then(|| {
+                crate::clipboard::read()
+                    .ok()
+                    .flatten()
+                    .filter(|text| !text.is_empty())
+            });
             *input = EguiShellInput {
                 screen_size: pill_core::math::Vector2f::new(
                     self.size.0 as f32 / self.scale_factor,
@@ -3423,6 +3438,7 @@ impl EditorWindow {
                 frames_per_second: self.fps,
                 events,
                 cursor: self.shell_cursor,
+                paste_text: paste_text.flatten(),
             };
         }
         // Step 3b: apply the engine mutations the shell's assets actions and
@@ -3443,6 +3459,10 @@ impl EditorWindow {
         // before the snapshot so a tab's title is never a frame stale.
         self.sync_panels();
         self.apply_panel_commands();
+        // The clipboard the shell queued last frame (W-0038 Stage 17): the OS
+        // half is this executable's, applied here like every other queued
+        // request.
+        self.apply_clipboard();
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -3618,8 +3638,163 @@ impl EditorWindow {
         }
     }
 
-    /// Apply what the module panels asked for (W-0038 Stage 11).
+    /// One scripted clipboard command (`command editor.copy/cut/paste`): the
+    /// same request the Edit menu's rows queue, so the test channel drives the
+    /// menu's own path (W-0038 Stage 17).
+    fn scripted_clipboard(&mut self, action: ClipboardAction) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let selection = world
+            .get_resource::<EditorSelection>()
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = world
+            .get_resource::<EditorSnapshot>()
+            .cloned()
+            .unwrap_or_default();
+        let summary = match world.get_resource_mut::<EditorClipboard>() {
+            Some(clipboard) => clipboard::queue_request(clipboard, action, &selection, &snapshot),
+            None => None,
+        };
+        // The cut's delete is queued from its own borrow: the two resources
+        // cannot be held mutably at once.
+        if action == ClipboardAction::Cut {
+            if let (Some((commands, label)), Some(pending)) = (
+                clipboard::cut_commands(&selection),
+                world.get_resource_mut::<PendingEditorCommands>(),
+            ) {
+                pending.push_recorded(commands, label, None);
+            }
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            action = match action {
+                ClipboardAction::Copy => "copy",
+                ClipboardAction::Cut => "cut",
+                ClipboardAction::Paste => "paste",
+            },
+            payload = summary.as_deref().unwrap_or("nothing"),
+            "[editor] clipboard queued"
+        );
+    }
+
+    /// Carry out the clipboard request the shell queued (W-0038 Stage 17).
     ///
+    /// A write puts the payload on the OS clipboard; a read decodes what it
+    /// carries and applies the paste as one recorded step. What could not be
+    /// pasted - an unregistered component, a field this build no longer
+    /// carries - is named in a notice, because a paste that quietly dropped
+    /// half an entity is worse than one that says what it left behind.
+    fn apply_clipboard(&mut self) {
+        let request = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<EditorClipboard>()
+                .and_then(|clipboard| clipboard.take_request())
+        };
+        let Some(request) = request else {
+            return;
+        };
+        match request {
+            ClipboardRequest::Write(text) => match crate::clipboard::write(&text) {
+                Ok(()) => info!(
+                    target: telemetry_target::ENGINE,
+                    bytes = text.len(),
+                    writer = crate::clipboard::process_id(),
+                    "[editor] clipboard written"
+                ),
+                Err(message) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        message = message.as_str(),
+                        "[editor] clipboard write failed"
+                    );
+                    self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
+                }
+            },
+            ClipboardRequest::Read => self.apply_paste(),
+        }
+    }
+
+    /// Read the OS clipboard and apply what it carries, as one recorded step.
+    fn apply_paste(&mut self) {
+        let text = match crate::clipboard::read() {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                self.push_toast(
+                    NoticeLevel::Warning,
+                    "clipboard: the clipboard is empty".to_string(),
+                );
+                return;
+            }
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    message = message.as_str(),
+                    "[editor] clipboard read failed"
+                );
+                self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
+                return;
+            }
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(clipboard) = world.get_resource_mut::<EditorClipboard>() {
+            clipboard.text = text.clone();
+        }
+        let payload = match clipboard::decode(&text) {
+            Ok(payload) => payload,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    message = message.as_str(),
+                    "[editor] clipboard payload refused"
+                );
+                self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
+                return;
+            }
+        };
+        let selection = world
+            .get_resource::<EditorSelection>()
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = world
+            .get_resource::<EditorSnapshot>()
+            .cloned()
+            .unwrap_or_default();
+        let plan = match clipboard::paste_plan(&payload, &selection, &snapshot) {
+            Ok(plan) => plan,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    message = message.as_str(),
+                    "[editor] clipboard paste refused"
+                );
+                self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
+                return;
+            }
+        };
+        if !plan.commands.is_empty() {
+            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                pending.push_recorded(plan.commands, plan.label.clone(), None);
+            }
+        }
+        if !plan.note.is_empty() {
+            self.push_toast(NoticeLevel::Warning, format!("clipboard: {}", plan.note));
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            kind = payload.kind(),
+            label = plan.label.as_str(),
+            skipped = plan.skipped.len(),
+            reader = crate::clipboard::process_id(),
+            "[editor] clipboard pasted"
+        );
+        if !plan.skipped.is_empty() {
+            let message = format!("skipped {}", plan.skipped.join(", "));
+            self.push_toast(NoticeLevel::Warning, format!("clipboard: {message}"));
+        }
+    }
+
+    /// Apply what the module panels asked for (W-0038 Stage 11).    ///
     /// The same contract `EditorCommand` follows: a panel queues a request, the
     /// executable applies it at the frame boundary, so a panel from a module
     /// never leaves the world half-edited.
@@ -5319,6 +5494,9 @@ impl EditorWindow {
             } => self.scripted_component_edit(&entity, &component, add),
             ScriptedCommand::Undo => self.scripted_undo(),
             ScriptedCommand::Redo => self.scripted_redo(),
+            ScriptedCommand::Copy => self.scripted_clipboard(ClipboardAction::Copy),
+            ScriptedCommand::Cut => self.scripted_clipboard(ClipboardAction::Cut),
+            ScriptedCommand::Paste => self.scripted_clipboard(ClipboardAction::Paste),
             ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
             ScriptedCommand::Step => self.scripted_step(),
             ScriptedCommand::EntityCreate => self.scripted_entity_create(),
@@ -5910,6 +6088,18 @@ impl SceneView {
 // =============================================================================
 // Host notices to editor notices (W-0038 Stages 4 and 6)
 // =============================================================================
+
+/// Whether one frame's shell events carry a paste chord.
+///
+/// The clipboard commands stay un-global while a widget holds the focus, so
+/// this is what makes Ctrl+V reach a text field: the chord is recognised here
+/// and the OS clipboard's text rides the frame's input (W-0038 Stage 17).
+fn paste_chord(events: &[InputEvent]) -> bool {
+    events.iter().any(|event| match event {
+        InputEvent::Key { key, state } => *key == KeyCode::KeyV && *state == ButtonState::Pressed,
+        _ => false,
+    })
+}
 
 /// The toast a host notice becomes: its level and its one line.
 fn notice_toast(notice: &HostNotice) -> (NoticeLevel, String) {

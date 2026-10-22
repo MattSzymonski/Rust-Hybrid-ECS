@@ -153,7 +153,7 @@ pub enum SelectionClick {
 /// primary, which is what the gizmo acts on, what the scene outlines most
 /// brightly and what the Inspector edits first. Ctrl extends the set, Shift
 /// extends it over the Entities list's range, and a plain click replaces it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EditorSelection {
     /// The selected entities, in the order they were selected; the last is
     /// the primary.
