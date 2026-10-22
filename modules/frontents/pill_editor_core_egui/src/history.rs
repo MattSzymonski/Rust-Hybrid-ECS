@@ -205,18 +205,18 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                 field,
                 value,
             } => resource.len() + field.len() + field_value_bytes(value),
-            EditorCommand::SetSelection { entity, asset } => {
-                entity.map(|_| 16).unwrap_or(0) + asset.as_ref().map(String::len).unwrap_or(0)
+            EditorCommand::SetSelection { entities, asset } => {
+                entities.len() * 16 + asset.as_ref().map(String::len).unwrap_or(0)
             }
             EditorCommand::SelectResource { resource } => {
                 resource.as_ref().map(String::len).unwrap_or(0)
             }
             EditorCommand::RestoreSelection {
-                entity,
+                entities,
                 asset,
                 resource,
             } => {
-                entity.map(|_| 16).unwrap_or(0)
+                entities.len() * 16
                     + asset.as_ref().map(String::len).unwrap_or(0)
                     + resource.as_ref().map(String::len).unwrap_or(0)
             }

@@ -45,7 +45,7 @@ pub fn entity_delete(
     (
         vec![
             EditorCommand::SetSelection {
-                entity: None,
+                entities: Vec::new(),
                 asset,
             },
             EditorCommand::DestroyEntity { entity },
@@ -84,7 +84,7 @@ mod tests {
             commands,
             vec![
                 EditorCommand::SetSelection {
-                    entity: None,
+                    entities: Vec::new(),
                     asset: Some("textures/x.png".to_string())
                 },
                 EditorCommand::DestroyEntity { entity }

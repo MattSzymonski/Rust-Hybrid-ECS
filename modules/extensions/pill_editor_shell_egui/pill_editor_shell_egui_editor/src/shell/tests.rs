@@ -247,7 +247,7 @@ fn a_row_click_moves_the_shared_selection() {
         .expect("entity builds");
     let mut selection = EditorSelection::default();
     assert!(select_entity(&mut selection, entity));
-    assert_eq!(selection.entity, Some(entity));
+    assert_eq!(selection.primary(), Some(entity));
     // A second click on the selected row is not a change.
     assert!(!select_entity(&mut selection, entity));
 }
@@ -310,7 +310,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
     snapshot.detail = Some(detail);
     let mut selection = EditorSelection::default();
-    selection.entity = Some(entity);
+    selection.select_only(entity);
     selection.asset = Some("textures/rock.png".to_string());
     snapshot.asset_detail = Some(pill_editor_core_egui::editor_state::AssetDetail {
         path: "textures/rock.png".to_string(),

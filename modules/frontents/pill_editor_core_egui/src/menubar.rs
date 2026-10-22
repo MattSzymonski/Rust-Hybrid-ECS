@@ -232,7 +232,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
             enabled = view.snapshot.redo_depth > 0;
             MenuAction::Redo
         }
-        "editor.entity_delete" => match view.selection.entity {
+        "editor.entity_delete" => match view.selection.primary() {
             Some(entity) => {
                 let (commands, label) =
                     entities::entity_delete(entity, view.selection.asset.clone());
@@ -473,7 +473,7 @@ mod tests {
             .create_entity()
             .build()
             .expect("entity builds");
-        selection.entity = Some(entity);
+        selection.select_only(entity);
         let enabled = entries(Menu::Edit, &view_over(&snapshot, &selection, &commands));
         let rows = actions(&enabled);
         assert_eq!(rows[0].1, true);

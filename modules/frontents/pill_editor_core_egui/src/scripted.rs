@@ -149,6 +149,12 @@ pub enum ScriptedCommand {
     SelectAsset(String),
     /// `select entity <handle>` - move the shared selection onto an entity.
     SelectEntity(String),
+    /// `select add <handle>` - extend the selection as a Ctrl-click does
+    /// (W-0038 Stage 16).
+    SelectAdd(String),
+    /// `select range <handle>` - extend the selection over the Entities list's
+    /// range from the primary, as a Shift-click does (W-0038 Stage 16).
+    SelectRange(String),
     /// `select resource <name>` - move the shared selection onto an editable
     /// world resource (W-0038 Stage 14).
     SelectResource(String),
@@ -202,6 +208,17 @@ pub enum ScriptedCommand {
         /// The element's index.
         index: usize,
         /// The new element value.
+        value: String,
+    },
+    /// `edit selection <component> <field> <value>` - one recorded field edit
+    /// written to every selected entity that carries the component, as the
+    /// Inspector's row queues it (W-0038 Stage 16).
+    EditSelection {
+        /// The component's registered name, or its suffix.
+        component: String,
+        /// The field's name.
+        field: String,
+        /// The new value, as the field's kind parses it.
         value: String,
     },
     /// `edit asset-settings <path> <key> <value>` - one import-settings edit.
@@ -304,6 +321,9 @@ pub enum Dump {
     /// `dump entities` - the entity list with each row's component names
     /// (W-0038 Stage 15): what a collection test needs to find its subject.
     Entities,
+    /// `dump selection` - the selected entities, primary last (W-0038
+    /// Stage 16).
+    Selection,
     /// `dump resources` - the editable world resources and their values
     /// (W-0038 Stage 14).
     Resources,
@@ -622,6 +642,20 @@ impl ScriptedCommand {
                     cursor.finish(verb)?;
                     Ok(ScriptedCommand::SelectEntity(handle.to_string()))
                 }
+                Some("add") => {
+                    let handle = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("select add needs a handle"))?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::SelectAdd(handle.to_string()))
+                }
+                Some("range") => {
+                    let handle = cursor
+                        .word()
+                        .ok_or_else(|| ParseError::new("select range needs a handle"))?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::SelectRange(handle.to_string()))
+                }
                 Some("resource") => {
                     let name = cursor
                         .word()
@@ -742,6 +776,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "windows" => Dump::Windows,
         "resources" => Dump::Resources,
         "entities" => Dump::Entities,
+        "selection" => Dump::Selection,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -816,6 +851,17 @@ fn edit(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
                 component: component.to_string(),
                 field: field.to_string(),
                 index,
+                value,
+            })
+        }
+        Some("selection") => {
+            let reason = "edit selection needs a component, a field and a value";
+            let component = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let field = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let value = cursor.text("edit selection needs a value")?;
+            Ok(ScriptedCommand::EditSelection {
+                component: component.to_string(),
+                field: field.to_string(),
                 value,
             })
         }

@@ -531,7 +531,7 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
             let (entity, asset) = engine
                 .world()
                 .get_resource::<EditorSelection>()
-                .map(|selection| (selection.entity, selection.asset.clone()))
+                .map(|selection| (selection.primary(), selection.asset.clone()))
                 .unwrap_or((None, None));
             let Some(entity) = entity else {
                 info!(
@@ -606,6 +606,15 @@ fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
 fn scripted_name(command: &ScriptedCommand) -> &'static str {
     match command {
         ScriptedCommand::Quit => "quit",
+        ScriptedCommand::Palette(_) => "palette",
+        ScriptedCommand::ConsoleFilter(_) => "console filter",
+        ScriptedCommand::ConsoleSearch(_) => "console search",
+        ScriptedCommand::ProblemOpen(_) => "problem open",
+        ScriptedCommand::SafeModeRetry => "safe_mode retry",
+        ScriptedCommand::PanelUnload(_) => "panel unload",
+        ScriptedCommand::PanelRestore(_) => "panel restore",
+        ScriptedCommand::PanelWindow { .. } => "panel window",
+        ScriptedCommand::PanelField { .. } => "panel field",
         ScriptedCommand::Undock(_) => "undock",
         ScriptedCommand::ActivateTab(_) => "tab",
         ScriptedCommand::Click { .. } => "click",
@@ -623,6 +632,11 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::Hover { .. } => "hover",
         ScriptedCommand::SelectAsset(_) => "select asset",
         ScriptedCommand::SelectEntity(_) => "select entity",
+        ScriptedCommand::SelectAdd(_) => "select add",
+        ScriptedCommand::SelectRange(_) => "select range",
+        ScriptedCommand::SelectResource(_) => "select resource",
+        ScriptedCommand::EditResource { .. } => "edit resource",
+        ScriptedCommand::EditSelection { .. } => "edit selection",
         ScriptedCommand::Toolbar(_) => "toolbar",
         ScriptedCommand::DialogSetName(_) => "dialog set name",
         ScriptedCommand::DialogSubmit => "dialog submit",
@@ -678,9 +692,19 @@ fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
     let selected = engine
         .world()
         .get_resource::<EditorSelection>()
-        .and_then(|selection| selection.entity);
+        .and_then(|selection| selection.primary());
+    let selected_entities: Vec<pill_engine_core::Entity> = engine
+        .world()
+        .get_resource::<EditorSelection>()
+        .map(|selection| selection.entities().to_vec())
+        .unwrap_or_default();
     let mut snapshot = EditorSnapshot::capture_list(engine, frame_index, &[], Vec::new());
     snapshot.detail = selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
+    snapshot.selected_details = selected_entities
+        .iter()
+        .take(pill_editor_core_egui::editor_state::SELECTED_DETAILS_MAX)
+        .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
+        .collect();
     if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {
         *resource = snapshot;
     }

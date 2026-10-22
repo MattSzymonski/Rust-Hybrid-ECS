@@ -65,6 +65,12 @@ pub struct EntityDetail {
     pub components: Vec<ComponentView>,
 }
 
+/// How many selected entities the snapshot captures a detail for (W-0038
+/// Stage 16). A selection past this size still edits the primary and the
+/// entities it has details for; the cap keeps a Ctrl+A over a large scene from
+/// rebuilding hundreds of component views every frame.
+pub const SELECTED_DETAILS_MAX: usize = 64;
+
 /// One row of the Systems tab.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SystemSummary {
@@ -125,21 +131,128 @@ pub struct AssetDetail {
     pub settings: Option<serde_json::Value>,
 }
 
+/// What a click on an entity row means (W-0038 Stage 16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionClick {
+    /// Replace the selection with the clicked entity.
+    Reset,
+    /// Add the clicked entity to the selection (Ctrl).
+    Add,
+    /// Select every row between the primary and the clicked one (Shift).
+    Range,
+}
+
 /// The editor's shared selection, read by every data panel and the scene.
 ///
-/// One entity slot and one asset slot: the Hierarchy selects entities, the
-/// Assets panel selects files, and the Inspector follows whichever entity
-/// slot holds while the asset slot drives the assets panel's detail.
+/// One entity set, one asset slot and one resource slot: the Hierarchy and the
+/// viewports select entities, the Assets panel selects files, and the
+/// Inspector follows whichever slot holds - a resource selection is exclusive
+/// with the other two.
+///
+/// The entity slot is a **set** (W-0038 Stage 16): the last entity in it is the
+/// primary, which is what the gizmo acts on, what the scene outlines most
+/// brightly and what the Inspector edits first. Ctrl extends the set, Shift
+/// extends it over the Entities list's range, and a plain click replaces it.
 #[derive(Default)]
 pub struct EditorSelection {
-    /// The selected entity, when one is.
-    pub entity: Option<Entity>,
+    /// The selected entities, in the order they were selected; the last is
+    /// the primary.
+    entities: Vec<Entity>,
     /// The selected asset's project-relative path, when one is.
     pub asset: Option<String>,
     /// The selected world resource's stable name, when one is (W-0038
     /// Stage 14). A resource selection is exclusive with the other two: the
     /// Inspector shows one thing at a time.
     pub resource: Option<String>,
+}
+
+impl EditorSelection {
+    /// The set a click produces, given the list's own row order.
+    ///
+    /// Pure so the shell (which reads the modifiers) and the scripted channel
+    /// (which names the mode) share one rule for what a click means. A range
+    /// click needs the primary as its anchor and both rows present in `rows`;
+    /// without them it behaves like a plain click.
+    pub fn clicked(&self, click: SelectionClick, entity: Entity, rows: &[Entity]) -> Vec<Entity> {
+        match click {
+            SelectionClick::Reset => vec![entity],
+            SelectionClick::Add => {
+                let mut entities: Vec<Entity> = self
+                    .entities
+                    .iter()
+                    .copied()
+                    .filter(|selected| *selected != entity)
+                    .collect();
+                entities.push(entity);
+                entities
+            }
+            SelectionClick::Range => {
+                let anchor = self.primary();
+                let indices = anchor
+                    .and_then(|anchor| rows.iter().position(|row| *row == anchor))
+                    .zip(rows.iter().position(|row| *row == entity));
+                match indices {
+                    Some((anchor_index, entity_index)) => {
+                        let (first, last) = if anchor_index <= entity_index {
+                            (anchor_index, entity_index)
+                        } else {
+                            (entity_index, anchor_index)
+                        };
+                        rows[first..=last].to_vec()
+                    }
+                    // A range needs an anchor the list shows; without one the
+                    // click is a plain one.
+                    None => vec![entity],
+                }
+            }
+        }
+    }
+
+    /// The entity the gizmo acts on and the Inspector edits first: the one
+    /// selected last.
+    pub fn primary(&self) -> Option<Entity> {
+        self.entities.last().copied()
+    }
+
+    /// Every selected entity, in selection order.
+    pub fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
+
+    /// Whether `entity` is selected.
+    pub fn contains(&self, entity: Entity) -> bool {
+        self.entities.contains(&entity)
+    }
+
+    /// Replace the whole entity selection.
+    pub fn set_entities(&mut self, entities: Vec<Entity>) {
+        self.entities = entities;
+    }
+
+    /// Select exactly one entity.
+    pub fn select_only(&mut self, entity: Entity) {
+        self.entities.clear();
+        self.entities.push(entity);
+    }
+
+    /// Add one entity to the selection, making it the primary.
+    ///
+    /// Adding an entity that is already selected only makes it primary, so a
+    /// Ctrl-click on a selected row does not lose the rest of the set.
+    pub fn add_entity(&mut self, entity: Entity) {
+        self.entities.retain(|selected| *selected != entity);
+        self.entities.push(entity);
+    }
+
+    /// Deselect one entity without disturbing the others.
+    pub fn remove_entity(&mut self, entity: Entity) {
+        self.entities.retain(|selected| *selected != entity);
+    }
+
+    /// Drop the entity selection.
+    pub fn clear_entities(&mut self) {
+        self.entities.clear();
+    }
 }
 
 impl pill_engine::Resource for EditorSelection {}
@@ -156,6 +269,12 @@ pub struct EditorSnapshot {
     pub entities: Vec<EntityListEntry>,
     /// Detail of the selected entity, if the selection is still alive.
     pub detail: Option<EntityDetail>,
+    /// The detail of every selected entity, in selection order (W-0038
+    /// Stage 16). The Inspector draws the primary's rows and reads this to
+    /// find which other selected entities a component edit can reach, and
+    /// which rows the selection disagrees on. Bounded by
+    /// [`SELECTED_DETAILS_MAX`].
+    pub selected_details: Vec<EntityDetail>,
     /// Registered systems with owner labels.
     pub systems: Vec<SystemSummary>,
     /// Registered components with a usable field layout (the Inspector's
@@ -236,6 +355,7 @@ impl EditorSnapshot {
             revision,
             entities: Self::capture_entities(engine),
             detail: None,
+            selected_details: Vec::new(),
             systems: Self::capture_systems(engine, extension_names),
             components: Self::capture_components(engine),
             assets: Vec::new(),
@@ -660,8 +780,9 @@ pub enum EditorCommand {
     /// carries the previous pair, so undo goes back one selection at a
     /// time.
     SetSelection {
-        /// The selected entity, when one is.
-        entity: Option<Entity>,
+        /// The selected entities, in selection order (the last is primary);
+        /// empty selects none.
+        entities: Vec<Entity>,
         /// The selected asset's path, when one is.
         asset: Option<String>,
     },
@@ -680,8 +801,8 @@ pub enum EditorCommand {
     /// entity and asset slots, so undoing it has to bring them back rather than
     /// leave the Inspector pointing at nothing.
     RestoreSelection {
-        /// The entity slot to restore.
-        entity: Option<Entity>,
+        /// The entity slots to restore.
+        entities: Vec<Entity>,
         /// The asset slot to restore.
         asset: Option<String>,
         /// The resource slot to restore.
@@ -879,9 +1000,12 @@ impl EditorCommand {
                     *old = assigned;
                 }
             }
-            EditorCommand::SetSelection { entity, .. } => {
-                if *entity == Some(previous) {
-                    *entity = Some(assigned);
+            EditorCommand::SetSelection { entities, .. }
+            | EditorCommand::RestoreSelection { entities, .. } => {
+                for entity in entities.iter_mut() {
+                    if *entity == previous {
+                        *entity = assigned;
+                    }
                 }
             }
             EditorCommand::CreateEntity { .. }
@@ -900,8 +1024,7 @@ impl EditorCommand {
             | EditorCommand::WriteAssetMeta { .. }
             | EditorCommand::SetAssetSettings { .. }
             | EditorCommand::SetResourceField { .. }
-            | EditorCommand::SelectResource { .. }
-            | EditorCommand::RestoreSelection { .. } => {}
+            | EditorCommand::SelectResource { .. } => {}
         }
     }
 
@@ -1008,11 +1131,11 @@ impl EditorCommand {
                 // One thing at a time in the Inspector: picking a resource
                 // drops the entity and asset halves, and their undo restores
                 // them through their own commands.
-                let previous_entity = selection.entity;
+                let previous_entities = selection.entities().to_vec();
                 let previous_asset = selection.asset.clone();
                 selection.resource = resource.clone();
                 if resource.is_some() {
-                    selection.entity = None;
+                    selection.clear_entities();
                     selection.asset = None;
                 }
                 // NOTE: asserted on by the egui editor's suite: the selection a
@@ -1023,14 +1146,14 @@ impl EditorCommand {
                     "[editor] resource selected"
                 );
                 Ok(CommandOutcome::inverse(EditorCommand::RestoreSelection {
-                    entity: previous_entity,
+                    entities: previous_entities,
                     asset: previous_asset,
                     resource: previous,
                 }))
             }
 
             EditorCommand::RestoreSelection {
-                entity,
+                entities,
                 asset,
                 resource,
             } => {
@@ -1042,11 +1165,11 @@ impl EditorCommand {
                     return Err(format!("{command:?}: the selection could not be claimed"));
                 };
                 let previous = EditorCommand::RestoreSelection {
-                    entity: selection.entity,
+                    entities: selection.entities().to_vec(),
                     asset: selection.asset.clone(),
                     resource: selection.resource.clone(),
                 };
-                selection.entity = *entity;
+                selection.set_entities(entities.clone());
                 selection.asset = asset.clone();
                 selection.resource = resource.clone();
                 // NOTE: asserted on by the egui editor's suite: an undone
@@ -1054,8 +1177,13 @@ impl EditorCommand {
                 // empty resource slot.
                 pill_core::info!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
-                    entity = entity.map(|entity| entity.to_string()).unwrap_or_else(|| "none".to_string()).as_str(),
+                    entity = selection
+                        .primary()
+                        .map(|entity| entity.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                        .as_str(),
                     resource = resource.as_deref().unwrap_or("none"),
+                    entities = selection.entities().len(),
                     "[editor] selection restored"
                 );
                 Ok(CommandOutcome::inverse(previous))
@@ -1586,36 +1714,37 @@ impl EditorCommand {
                 }))
             }
 
-            EditorCommand::SetSelection { entity, asset } => {
+            EditorCommand::SetSelection { entities, asset } => {
                 let world = engine.world_mut();
                 if world.get_resource::<EditorSelection>().is_none() {
                     world.insert_resource(EditorSelection::default());
                 }
                 // A selection that names an entity the world no longer
-                // carries lands on no entity (Stage 28: a recovered
-                // selection from before a crash is checked here exactly
-                // like one the history trapped across a destroy); the
-                // asset half still applies.
-                let entity = match entity {
-                    Some(entity) if !world.is_entity_valid(*entity) => {
+                // carries drops that entity (Stage 28: a recovered selection
+                // from before a crash is checked here exactly like one the
+                // history trapped across a destroy); the asset half still
+                // applies.
+                let mut taken = Vec::with_capacity(entities.len());
+                for entity in entities {
+                    if world.is_entity_valid(*entity) {
+                        taken.push(*entity);
+                    } else {
                         // NOTE: asserted on by the editor's recovery suite.
                         pill_core::info!(
                             target: pill_core::telemetry::telemetry_target::ENGINE,
                             entity = %entity,
                             "[editor] selection command dropped; the entity no longer exists"
                         );
-                        None
                     }
-                    other => *other,
-                };
+                }
                 let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
                     return Err(format!("{command:?}: the selection could not be claimed"));
                 };
                 let previous = EditorCommand::SetSelection {
-                    entity: selection.entity,
+                    entities: selection.entities().to_vec(),
                     asset: selection.asset.clone(),
                 };
-                selection.entity = entity;
+                selection.set_entities(taken);
                 selection.asset = asset.clone();
                 Ok(CommandOutcome::inverse(previous))
             }
@@ -1861,6 +1990,39 @@ impl EditorCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A click replaces the selection, Ctrl adds to it, and Shift covers the
+    /// rows between the anchor and the clicked row (W-0038 Stage 16).
+    #[test]
+    fn selection_clicks_reset_add_and_range() {
+        let rows: Vec<Entity> = (1..=4).map(|id| Entity::from_raw(id, 0)).collect();
+        let (a, b, c, d) = (rows[0], rows[1], rows[2], rows[3]);
+
+        let selection = EditorSelection::default();
+        assert_eq!(selection.clicked(SelectionClick::Reset, b, &rows), vec![b]);
+
+        // Ctrl adds, and re-adding an entity already selected only makes it
+        // primary rather than duplicating it.
+        let mut selection = EditorSelection::default();
+        selection.set_entities(vec![a]);
+        let added = selection.clicked(SelectionClick::Add, c, &rows);
+        assert_eq!(added, vec![a, c]);
+        selection.set_entities(added);
+        assert_eq!(selection.clicked(SelectionClick::Add, a, &rows), vec![c, a]);
+
+        // Shift ranges over the list's own order, in either direction.
+        let mut selection = EditorSelection::default();
+        selection.set_entities(vec![a, b]);
+        assert_eq!(
+            selection.clicked(SelectionClick::Range, d, &rows),
+            vec![b, c, d]
+        );
+        assert_eq!(selection.clicked(SelectionClick::Range, b, &rows), vec![b]);
+
+        // A range with no anchor the list shows is a plain click.
+        let empty = EditorSelection::default();
+        assert_eq!(empty.clicked(SelectionClick::Range, c, &rows), vec![c]);
+    }
 
     /// A plain component with a field layout, so entity create and field
     /// writes have something to target.
@@ -2525,7 +2687,7 @@ mod tests {
         let failures = EditorCommand::apply(
             &mut engine,
             &[EditorCommand::SetSelection {
-                entity: Some(entity),
+                entities: vec![entity],
                 asset: Some("textures/x.png".to_string()),
             }],
         );
@@ -2543,7 +2705,7 @@ mod tests {
             .world()
             .get_resource::<EditorSelection>()
             .expect("the delete wrote the selection resource");
-        assert_eq!(selection.entity, None, "the delete clears the selection");
+        assert_eq!(selection.primary(), None, "the delete clears the selection");
 
         // The undo restores the entity under a fresh handle, and the batch's
         // own selection command follows it there.
@@ -2561,7 +2723,7 @@ mod tests {
             .get_resource::<EditorSelection>()
             .expect("selection resource");
         assert_eq!(
-            selection.entity,
+            selection.primary(),
             Some(*restored),
             "the selection must follow the restored entity to its fresh handle"
         );

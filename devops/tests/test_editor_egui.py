@@ -142,6 +142,10 @@ PANEL_WINDOW_REQUESTED_TOKEN = "[editor] panel window requested"
 PANEL_MODAL_ANSWERED_TOKEN = "[editor] panel modal answered"
 PANEL_LOG_TOKEN = "[editor] panel log"
 PANEL_FIELD_QUEUED_TOKEN = "[editor] panel field queued"
+SELECTION_DUMP_TOKEN = "[test] selection"
+SELECTED_ENTITY_TOKEN = "[test] selected entity"
+MIXED_ROW_TOKEN = "[editor] inspector row kind=mixed"
+SELECTION_EDIT_TOKEN = "[editor] selection field edit queued"
 WINDOWS_DUMP_TOKEN = "[test] windows"
 WINDOW_ROW_TOKEN = "[test] window"
 SAFE_MODE_TOKEN = "[editor] safe mode"
@@ -1485,6 +1489,155 @@ def main() -> int:
             )
         )
         print("  [OK] a struct-array element edited and undid")
+
+        # Step 3a9: the multi-selection (W-0038 Stage 16). Ctrl adds, Shift
+        # ranges, a plain click resets, and a field edit over the set is one
+        # recorded step that undoes in one.
+        dump = session.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 30, "the entity list"
+        )
+        showcase_entities = [
+            match.group(1)
+            for match in re.finditer(
+                re.escape(ENTITY_ROW_TOKEN)
+                + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                dump,
+            )
+            if SHOWCASE_COMPONENT in match.group(2)
+        ]
+        assert len(showcase_entities) >= 3, (
+            "fewer than three entities carry the showcase component: {}".format(
+                showcase_entities
+            )
+        )
+        first, second, third = showcase_entities[:3]
+        # What was selected before this step: the viewport steps after it drag
+        # the selection's gizmo, so the step puts the selection back.
+        prior = session.request(
+            "dump selection", re.escape(SELECTION_DUMP_TOKEN), 30, "the prior selection"
+        )
+        prior_match = re.search(r'primary="([^"]+)"', prior)
+        assert prior_match is not None, "the prior selection did not read back: {}".format(
+            prior[-400:]
+        )
+        prior_entity = prior_match.group(1)
+        begin = len(session.read_log())
+        session.send("select entity {}".format(first))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+            30,
+            "the first selection",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("select add {}".format(second))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=2\b',
+            30,
+            "the Ctrl add",
+            begin,
+        )
+        third_add_begin = len(session.read_log())
+        session.send("select add {}".format(third))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=3\b',
+            30,
+            "the second Ctrl add",
+            third_add_begin,
+        )
+        begin = len(session.read_log())
+        session.send("dump selection")
+        session.wait(
+            re.escape(SELECTION_DUMP_TOKEN) + r'\s+count=3\b',
+            30,
+            "the selected set",
+            begin,
+        )
+        selection_log = session.read_log()[begin:]
+        assert selection_log.count(SELECTED_ENTITY_TOKEN) >= 3, (
+            "the dump did not name all three entities: {}".format(selection_log[-600:])
+        )
+        assert re.search(
+            r'primary="{}"'.format(re.escape(third)), selection_log
+        ), "the last entity added is not the primary: {}".format(selection_log[-600:])
+        print("  [OK] Ctrl extended the selection to three entities")
+
+        # The Inspector marks the rows the selection disagrees on: the
+        # showcase component's values differ per model, so the frame after the
+        # third entity joined the set draws a mixed row.
+        session.wait(
+            re.escape(MIXED_ROW_TOKEN), 30, "the mixed inspector row", third_add_begin
+        )
+        print("  [OK] the Inspector marked a mixed row")
+
+        # One edit over the set: three entities, one recorded step.
+        originals = {}
+        for entity in (first, second, third):
+            log = session.request(
+                "dump field {} {} scale".format(entity, SHOWCASE_COMPONENT),
+                re.escape(FIELD_TOKEN),
+                30,
+                "the original scale",
+            )
+            match = re.search(r"value=(?:F32\()?(-?[0-9.]+)", log)
+            assert match is not None, "a scale did not read back: {}".format(log[-400:])
+            originals[entity] = float(match.group(1))
+        begin = len(session.read_log())
+        session.send("edit selection {} scale 2.5".format(SHOWCASE_COMPONENT))
+        session.wait(
+            re.escape(SELECTION_EDIT_TOKEN)
+            + r'\s+component="[^"]*{}"\s+field="scale"\s+entities=3\b'.format(
+                re.escape(SHOWCASE_COMPONENT)
+            ),
+            30,
+            "the selection edit",
+            begin,
+        )
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN)
+            + r'\s+label="set {}\.scale"'.format(re.escape(SHOWCASE_COMPONENT)),
+            30,
+            "the selection edit recorded one step",
+            begin,
+        )
+        for entity in (first, second, third):
+            log = session.request(
+                "dump field {} {} scale".format(entity, SHOWCASE_COMPONENT),
+                re.escape(FIELD_TOKEN),
+                30,
+                "the edited scale",
+            )
+            assert "2.5" in log, (
+                "the selection edit missed {}: {}".format(entity, log[-400:])
+            )
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the selection undo", begin)
+        for entity in (first, second, third):
+            log = session.request(
+                "dump field {} {} scale".format(entity, SHOWCASE_COMPONENT),
+                re.escape(FIELD_TOKEN),
+                30,
+                "the restored scale",
+            )
+            match = re.search(r"value=(?:F32\()?(-?[0-9.]+)", log)
+            assert match is not None and float(match.group(1)) == originals[entity], (
+                "one undo did not restore {}: {}".format(entity, log[-400:])
+            )
+        print("  [OK] a shared-field edit across three entities undid in one step")
+
+        # A plain click resets the set - and puts the selection back where the
+        # step found it, so the viewport steps after this one drag the same
+        # entity.
+        begin = len(session.read_log())
+        session.send("select entity {}".format(prior_entity))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+            30,
+            "the resetting click",
+            begin,
+        )
+        print("  [OK] a plain click reset the selection")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.
@@ -3215,10 +3368,12 @@ def main() -> int:
         # back byte for byte, and a translated anchor would either miss or
         # rewrite every line's ending.
         newline = "\r\n" if "\r\n" in original_tab_source else "\n"
+        # Two lines inside the tab's row loop: the loop header and the first
+        # statement of its body, so the probe lands where a statement is legal.
         tab_body = newline.join(
             (
-                "    egui::ScrollArea::vertical().show(ui, |ui| {",
                 "        for (entity, label) in entity_rows(snapshot) {",
+                "            let selected = selection.contains(entity);",
             )
         )
         assert tab_body in original_tab_source, "the Entities tab body moved; update the step"
@@ -3226,9 +3381,10 @@ def main() -> int:
             tab_body,
             newline.join(
                 (
-                    "    // A patch probe: one statement, inside the tab body only.",
-                    "    let _hot_body_probe = 0u8;",
-                    tab_body,
+                    "        for (entity, label) in entity_rows(snapshot) {",
+                    "            // A patch probe: one statement, inside the tab body only.",
+                    "            let _hot_body_probe = 0u8;",
+                    "            let selected = selection.contains(entity);",
                 )
             ),
             1,

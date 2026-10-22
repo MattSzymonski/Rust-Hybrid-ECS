@@ -181,6 +181,7 @@ pub use views::SLOW_UPDATE_MICROS;
 pub mod chrome;
 
 pub use chrome::apply_tab_redock;
+pub use chrome::click_from_modifiers;
 pub use chrome::context_menu;
 pub use chrome::empty_area;
 pub use chrome::gizmo_mode_label;
@@ -190,7 +191,9 @@ pub use chrome::mark_menu_region;
 pub use chrome::remember_moved_rect;
 pub use chrome::select_asset;
 pub use chrome::select_entity;
+pub use chrome::select_entity_click;
 pub use chrome::tab_icon;
+pub use chrome::SelectionClick;
 pub use chrome::SPACE_ROWS;
 pub use chrome::TOOL_ROWS;
 
@@ -845,7 +848,7 @@ impl TabViewer for EditorTabViewer<'_> {
                         }
                         let mut context = PanelContext {
                             frames_per_second: self.frames_per_second,
-                            selected_entity: self.selection.entity,
+                            selected_entity: self.selection.primary(),
                             entities: self.panel_entities,
                             detail: self.panel_detail,
                             window: None,

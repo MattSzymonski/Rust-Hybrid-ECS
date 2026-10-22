@@ -52,17 +52,58 @@ pub fn gizmo_space_label(space: GizmoSpace) -> &'static str {
     }
 }
 
-/// Move the shared selection onto `entity`, logging the same token the
+/// What a click on an entity row means (W-0038 Stage 16).
+pub use pill_editor_core_egui::editor_state::SelectionClick;
+
+/// The meaning of a click made with these modifiers.
+pub fn click_from_modifiers(modifiers: &egui::Modifiers) -> SelectionClick {
+    if modifiers.shift {
+        SelectionClick::Range
+    } else if modifiers.command || modifiers.ctrl {
+        SelectionClick::Add
+    } else {
+        SelectionClick::Reset
+    }
+}
+
+/// Move the shared selection onto `entity` alone, logging the same token the
 /// scene's picks log when it actually changed - so a suite can watch either
 /// path move the selection. Returns whether the selection moved.
 pub fn select_entity(selection: &mut EditorSelection, entity: Entity) -> bool {
-    if selection.entity == Some(entity) {
+    select_entity_click(selection, entity, SelectionClick::Reset, &[])
+}
+
+/// Move the shared entity selection for one click on a row.
+///
+/// `rows` is the list's own order, which only a range click reads: a range is
+/// every row between the primary and the clicked one, so a Shift-click selects
+/// what the list shows between them rather than an arbitrary set. Returns
+/// whether the selection changed.
+pub fn select_entity_click(
+    selection: &mut EditorSelection,
+    entity: Entity,
+    click: SelectionClick,
+    rows: &[Entity],
+) -> bool {
+    let before = selection.entities().to_vec();
+    let clicked = selection.clicked(click, entity, rows);
+    selection.set_entities(clicked);
+    report_selection_change(selection, &before, entity)
+}
+
+/// Log and report a selection move the click helpers made.
+pub fn report_selection_change(
+    selection: &EditorSelection,
+    before: &[Entity],
+    entity: Entity,
+) -> bool {
+    if selection.entities() == before {
         return false;
     }
-    selection.entity = Some(entity);
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
         entity = %entity,
+        count = selection.entities().len(),
         "[editor] selection changed"
     );
     true

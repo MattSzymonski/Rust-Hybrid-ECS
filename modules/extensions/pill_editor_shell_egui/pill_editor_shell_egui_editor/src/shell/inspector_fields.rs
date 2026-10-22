@@ -22,6 +22,8 @@ pub fn inspector_field_row(
     entity: Entity,
     component: &ComponentView,
     row: &inspector::FieldRow,
+    targets: &[Entity],
+    details: &[EntityDetail],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
 ) {
@@ -61,6 +63,17 @@ pub fn inspector_field_row(
                 return;
             };
             let tooltip = tooltip.as_deref();
+            if row_is_mixed(details, type_name, *index, value)
+                && remember_inspector_row(session, type_name, "mixed", &[field.as_str()])
+            {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    entities = targets.len(),
+                    "[editor] inspector row kind=mixed"
+                );
+            }
             if remember_inspector_row(
                 session,
                 type_name,
@@ -87,45 +100,44 @@ pub fn inspector_field_row(
                         inspector::FieldWidget::MultilineText { lines } => Some(*lines),
                         _ => None,
                     };
-                    inspector_row(ui, field, tooltip, &mut |ui| {
-                        let text_edit = match lines {
-                            Some(lines) => egui::TextEdit::multiline(&mut edited)
-                                .desired_rows(lines)
-                                .desired_width(f32::INFINITY),
-                            None => {
-                                egui::TextEdit::singleline(&mut edited).desired_width(f32::INFINITY)
+                    inspector_row(
+                        ui,
+                        &row_label(field, details, type_name, *index, value),
+                        tooltip,
+                        &mut |ui| {
+                            let text_edit = match lines {
+                                Some(lines) => egui::TextEdit::multiline(&mut edited)
+                                    .desired_rows(lines)
+                                    .desired_width(f32::INFINITY),
+                                None => egui::TextEdit::singleline(&mut edited)
+                                    .desired_width(f32::INFINITY),
+                            };
+                            let response = ui.add(text_edit);
+                            if response.lost_focus() && edited != *current {
+                                let committed = FieldValue::Text(edited.clone());
+                                queue_field_edit(
+                                    pending, targets, entity, type_name, field, committed,
+                                );
                             }
-                        };
-                        let response = ui.add(text_edit);
-                        if response.lost_focus() && edited != *current {
-                            let committed = FieldValue::Text(edited.clone());
-                            let (command, label) =
-                                inspector::field_edit(entity, type_name, field, committed);
-                            pending.push_recorded(
-                                vec![command],
-                                label,
-                                Some(inspector::field_coalesce_key(entity, type_name, field)),
-                            );
-                        }
-                    });
+                        },
+                    );
                 }
                 other => {
-                    inspector_row(ui, field, tooltip, &mut |ui| match scalar_edit_decorated(
-                        ui, other, widget,
-                    ) {
-                        Some(edited) => {
-                            let (command, label) =
-                                inspector::field_edit(entity, type_name, field, edited);
-                            pending.push_recorded(
-                                vec![command],
-                                label,
-                                Some(inspector::field_coalesce_key(entity, type_name, field)),
-                            );
-                        }
-                        None => {
-                            ui.label(format_field_value(other));
-                        }
-                    });
+                    inspector_row(
+                        ui,
+                        &row_label(field, details, type_name, *index, other),
+                        tooltip,
+                        &mut |ui| match scalar_edit_decorated(ui, other, widget) {
+                            Some(edited) => {
+                                queue_field_edit(
+                                    pending, targets, entity, type_name, field, edited,
+                                );
+                            }
+                            None => {
+                                ui.label(format_field_value(other));
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -139,6 +151,21 @@ pub fn inspector_field_row(
             let Some(FieldValue::Array(values)) = component.values.get(*index) else {
                 return;
             };
+            if row_is_mixed(
+                details,
+                type_name,
+                *index,
+                &FieldValue::Array(values.clone()),
+            ) && remember_inspector_row(session, type_name, "mixed", &[field.as_str()])
+            {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    entities = targets.len(),
+                    "[editor] inspector row kind=mixed"
+                );
+            }
             if remember_inspector_row(
                 session,
                 type_name,
@@ -178,21 +205,14 @@ pub fn inspector_field_row(
                                     .small(),
                             );
                             if let Some(edited) = scalar_edit(ui, element) {
-                                let (command, label) = inspector::element_edit(
+                                queue_element_edit(
+                                    pending,
+                                    targets,
                                     entity,
                                     type_name,
                                     field,
                                     element_index,
                                     edited,
-                                );
-                                pending.push_recorded(
-                                    vec![command],
-                                    label,
-                                    Some(inspector::field_coalesce_key(
-                                        entity,
-                                        type_name,
-                                        &format!("{field}[{element_index}]"),
-                                    )),
                                 );
                             }
                         },
@@ -230,9 +250,93 @@ pub fn inspector_field_row(
     }
 }
 
-/// Note one Inspector row's signature, answering whether it is new, so a
-/// panel that redraws every frame does not flood the log with the same row.
+/// The label a row draws, marked when the selection disagrees on its value
+/// (W-0038 Stage 16).
+pub fn row_label(
+    field: &str,
+    details: &[EntityDetail],
+    component: &str,
+    index: usize,
+    value: &FieldValue,
+) -> String {
+    if row_is_mixed(details, component, index, value) {
+        format!("{field} (mixed)")
+    } else {
+        field.to_string()
+    }
+}
+
+/// Queue one field edit for **every** selected entity the component exists on,
+/// as one recorded step (W-0038 Stage 16).
 ///
+/// `targets` is [`super::tab_inspector::inspector_targets`]'s answer: the
+/// primary first, then the other selected entities carrying the component. One
+/// batch means one undo step however many entities the row wrote, and the
+/// coalesce key is the primary's, so a drag across a multi-selection still
+/// collapses into the same single step.
+pub fn queue_field_edit(
+    pending: &mut PendingEditorCommands,
+    targets: &[Entity],
+    entity: Entity,
+    type_name: &str,
+    field: &str,
+    value: FieldValue,
+) {
+    let (commands, label, key) =
+        inspector::selection_field_edit(targets, entity, type_name, field, value);
+    pending.push_recorded(commands, label, Some(key));
+}
+
+/// Queue one array-element edit for every target, as one recorded step.
+pub fn queue_element_edit(
+    pending: &mut PendingEditorCommands,
+    targets: &[Entity],
+    entity: Entity,
+    type_name: &str,
+    field: &str,
+    index: usize,
+    value: FieldValue,
+) {
+    let mut commands = Vec::with_capacity(targets.len());
+    let mut label = String::new();
+    for target in targets {
+        let (command, step_label) =
+            inspector::element_edit(*target, type_name, field, index, value.clone());
+        if label.is_empty() {
+            label = step_label;
+        }
+        commands.push(command);
+    }
+    pending.push_recorded(
+        commands,
+        label,
+        Some(inspector::field_coalesce_key(
+            entity,
+            type_name,
+            &format!("{field}[{index}]"),
+        )),
+    );
+}
+
+/// Whether the selected entities disagree on this row's value.
+pub fn row_is_mixed(
+    details: &[EntityDetail],
+    component: &str,
+    index: usize,
+    value: &FieldValue,
+) -> bool {
+    details.iter().any(|detail| {
+        detail
+            .components
+            .iter()
+            .find(|view| view.type_name == component)
+            .and_then(|view| view.values.get(index))
+            .is_some_and(|other| other != value)
+    })
+}
+
+/// Note one Inspector row's signature, answering whether it is new, so a
+/// panel that redraws every frame does not flood the log with the same row.///
 /// The signature is built here from the component, the row's kind and its
 /// distinguishing parts, so no call site joins a `|`-string by hand.
 pub fn remember_inspector_row(
