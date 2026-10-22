@@ -141,6 +141,7 @@ PANEL_WINDOW_OPENED_TOKEN = "[editor] panel window opened"
 PANEL_WINDOW_REQUESTED_TOKEN = "[editor] panel window requested"
 PANEL_MODAL_ANSWERED_TOKEN = "[editor] panel modal answered"
 PANEL_LOG_TOKEN = "[editor] panel log"
+PANEL_FIELD_QUEUED_TOKEN = "[editor] panel field queued"
 WINDOWS_DUMP_TOKEN = "[test] windows"
 WINDOW_ROW_TOKEN = "[test] window"
 SAFE_MODE_TOKEN = "[editor] safe mode"
@@ -185,6 +186,9 @@ RESOURCES_DUMP_TOKEN = "[test] resources"
 RESOURCE_FIELD_TOKEN = "[test] resource field"
 RESOURCE_SELECTED_TOKEN = "[editor] resource selected"
 SELECTION_RESTORED_TOKEN = "[editor] selection restored"
+ENTITIES_DUMP_TOKEN = "[test] entities"
+ENTITY_ROW_TOKEN = "[test] entity"
+SHOWCASE_COMPONENT = "ShowcaseComponent"
 RESOURCE_EDIT_TOKEN = "[editor] resource edit queued"
 GIZMO_RESOURCE_NAME = "pill_editor_core::gizmo::GizmoState"
 HISTORY_REDO_TOKEN = "[editor] history redo"
@@ -1409,6 +1413,78 @@ def main() -> int:
             begin,
         )
         print("  [OK] a resource selection round-trips through undo")
+
+        # Step 3a8: collection fields (W-0038 Stage 15). An array of structs
+        # expands to one row per leaf, so an element of a collection field is
+        # an ordinary field - it edits, records and undoes exactly like a float.
+        dump = session.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 30, "the entity list"
+        )
+        showcase_row = next(
+            (
+                match
+                for match in re.finditer(
+                    re.escape(ENTITY_ROW_TOKEN)
+                    + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                    dump,
+                )
+                if SHOWCASE_COMPONENT in match.group(2)
+            ),
+            None,
+        )
+        assert showcase_row is not None, (
+            "no entity carries the showcase component: {}".format(dump[-800:])
+        )
+        showcase_entity = showcase_row.group(1)
+        leaf = "points[0].x"
+        begin = len(session.read_log())
+        session.send(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        session.wait(re.escape(FIELD_TOKEN), 30, "the collection leaf", begin)
+        before = re.search(r"value=(?:F32\()?(-?[0-9.]+)", session.read_log()[begin:])
+        assert before is not None, (
+            "the element's leaf did not read back: {}".format(
+                session.read_log()[begin:][-600:]
+            )
+        )
+        original = float(before.group(1))
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} {} {} 2.5".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN)
+            + r'\s+label="set {}[^"]*"'.format(re.escape(SHOWCASE_COMPONENT)),
+            30,
+            "the collection edit recorded a step",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        session.wait(re.escape(FIELD_TOKEN), 30, "the edited leaf", begin)
+        assert "2.5" in session.read_log()[begin:], (
+            "the collection edit did not apply: {}".format(
+                session.read_log()[begin:][-600:]
+            )
+        )
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the collection undo", begin)
+        begin = len(session.read_log())
+        session.send(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        session.wait(re.escape(FIELD_TOKEN), 30, "the restored leaf", begin)
+        restored = re.search(r"value=(?:F32\()?(-?[0-9.]+)", session.read_log()[begin:])
+        assert restored is not None and float(restored.group(1)) == original, (
+            "the undo did not restore the element: {}".format(
+                session.read_log()[begin:][-600:]
+            )
+        )
+        print("  [OK] a struct-array element edited and undid")
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.
@@ -3696,6 +3772,90 @@ def main() -> int:
             "the Spline Tool never drew: {}".format(dump[-800:])
         )
         print("  [OK] the Spline Tool registered and drew")
+
+        # Stage 12: a control point is a leaf of the spline's struct array, and
+        # a panel row writes it through the panel contract - a queued
+        # `SetField`, applied at the frame boundary as a recorded edit. The row
+        # itself is a drag value the test channel cannot press, so the write is
+        # queued where the row puts it (`panel field`); the row-to-command
+        # mapping is the shell crate's `spline_tool` unit tests, and what this
+        # proves is the rest of the path: the queue, the recorded step and the
+        # undo, on a real entity of a real project.
+        dump = panels.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 60, "the entities"
+        )
+        showcase_row = next(
+            (
+                match
+                for match in re.finditer(
+                    re.escape(ENTITY_ROW_TOKEN)
+                    + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                    dump,
+                )
+                if SHOWCASE_COMPONENT in match.group(2)
+            ),
+            None,
+        )
+        assert showcase_row is not None, (
+            "no entity carries the showcase component: {}".format(dump[-800:])
+        )
+        showcase_entity = showcase_row.group(1)
+        panels.send("select entity {}".format(showcase_entity))
+        leaf = "points[1].y"
+        before = panels.request(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf),
+            re.escape(FIELD_TOKEN),
+            60,
+            "the panel element's value",
+        )
+        original = re.search(r"value=(?:F32\()?(-?[0-9.]+)", before)
+        assert original is not None, (
+            "the panel element did not read back: {}".format(before[-600:])
+        )
+        begin = len(panels.read_log())
+        panels.send("panel field {} {} 4.5".format(SHOWCASE_COMPONENT, leaf))
+        panels.wait(
+            re.escape(PANEL_FIELD_QUEUED_TOKEN), 60, "the panel's queued field write", begin
+        )
+        queued = panels.read_log()[begin:]
+        assert re.search(
+            r'component="[^"]*{}"\s+field="{}"\s+value="4\.5"'.format(
+                re.escape(SHOWCASE_COMPONENT), re.escape(leaf)
+            ),
+            queued,
+        ), "the panel queued a different write: {}".format(queued[-600:])
+        panels.wait(
+            re.escape(HISTORY_PUSH_TOKEN)
+            + r'\s+label="set {}[^"]*"'.format(re.escape(SHOWCASE_COMPONENT)),
+            60,
+            "the panel edit recorded a step",
+            begin,
+        )
+        begin = len(panels.read_log())
+        panels.send(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        panels.wait(re.escape(FIELD_TOKEN), 60, "the panel-edited leaf", begin)
+        assert "4.5" in panels.read_log()[begin:], (
+            "the panel's write did not apply: {}".format(
+                panels.read_log()[begin:][-600:]
+            )
+        )
+        begin = len(panels.read_log())
+        panels.send("command editor.undo")
+        panels.wait(re.escape(HISTORY_UNDO_TOKEN), 60, "the panel write's undo", begin)
+        begin = len(panels.read_log())
+        panels.send(
+            "dump field {} {} {}".format(showcase_entity, SHOWCASE_COMPONENT, leaf)
+        )
+        panels.wait(re.escape(FIELD_TOKEN), 60, "the restored panel leaf", begin)
+        restored = re.search(r"value=(?:F32\()?(-?[0-9.]+)", panels.read_log()[begin:])
+        assert restored is not None and float(restored.group(1)) == float(
+            original.group(1)
+        ), "the undo did not restore the panel's element: {}".format(
+            panels.read_log()[begin:][-600:]
+        )
+        print("  [OK] a panel row's control-point write applied and undid")
         # The confirmation lives on the demo panel's tab, so that tab comes to
         # the front first: `panel window` stands in for clicking the panel's
         # own button, and a button is only clickable while its tab is shown.

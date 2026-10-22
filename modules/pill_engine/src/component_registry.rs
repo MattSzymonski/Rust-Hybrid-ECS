@@ -34,7 +34,7 @@ use std::hash::{Hash, Hasher};
 
 // Current crate
 use crate::error::WorldError;
-use crate::World;
+use crate::{Engine, World};
 
 /// Field layouts, the layout trait and the value-type resolver, which are the
 /// same for every DLL.
@@ -304,12 +304,63 @@ pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor>
 /// only the 128-type ceiling) so the generated `init` can fail the reload
 /// transactionally instead of running with a half-registered component set.
 pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
-    let previous = world.replace_value_type_layout_resolver(Some(resolve_value_type_layout));
+    let previous = install_value_type_layouts(world);
     for descriptor in inventory::iter::<PillComponentDescriptor> {
         (descriptor.register)(world);
     }
-    world.replace_value_type_layout_resolver(previous);
+    restore_value_type_layouts(world, previous);
     world.take_registration_error().map_or(Ok(()), Err)
+}
+
+/// Install this artifact's value types as the world's field-layout resolver,
+/// returning the resolver that was installed before.
+///
+/// A caller that registers components outside `register_all_components` - a
+/// project's own `init`, the `__pill_register_<Type>` calls the derives
+/// generate, or the runtime running a linked entry point - installs this around
+/// the whole entry point and restores it with [`restore_value_type_layouts`],
+/// or a `struct:`-tagged field (a value type, or an array of one) cannot expand
+/// into editable rows.
+pub fn install_value_type_layouts(world: &mut World) -> Option<ValueTypeLayoutResolver> {
+    world.replace_value_type_layout_resolver(Some(resolve_value_type_layout))
+}
+
+/// Put back the resolver [`install_value_type_layouts`] replaced.
+pub fn restore_value_type_layouts(world: &mut World, previous: Option<ValueTypeLayoutResolver>) {
+    world.replace_value_type_layout_resolver(previous);
+}
+
+/// Register this artifact's components and run its `init`, with the artifact's
+/// value types installed as the world's field-layout resolver for the whole
+/// entry point.
+///
+/// `register_all_components` installs the resolver around its own loop, but a
+/// project or module also registers components from its own `init` - the
+/// `__pill_register_<Type>` calls the derives generate - and a `struct:`-tagged
+/// field (a value type, or an array of one) can only expand into editable rows
+/// while a resolver is installed. Holding it for the whole entry point is what
+/// makes a control-point array editable in the editor.
+///
+/// The previous resolver is restored before returning, on every path, so no
+/// resolver is left pointing into this DLL after it unloads.
+pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
+    let previous = engine
+        .world_mut()
+        .replace_value_type_layout_resolver(Some(resolve_value_type_layout));
+    let mut status = match register_all_components(engine.world_mut()) {
+        Ok(()) => init(engine),
+        // The failure was logged; a half-registered artifact must not run.
+        Err(_error) => u32::MAX,
+    };
+    // A guard raised from the user's own registration code is recorded after
+    // the drain above read the slot, so it is read once more here.
+    if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
+        status = u32::MAX;
+    }
+    engine
+        .world_mut()
+        .replace_value_type_layout_resolver(previous);
+    status
 }
 
 /// The layout of the value type a `struct:<path>` field tag names, among the

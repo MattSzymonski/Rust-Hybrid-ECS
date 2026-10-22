@@ -3457,6 +3457,50 @@ impl EditorWindow {
         }
     }
 
+    /// Queue the component-field write a module panel's own row would queue
+    /// (`panel field <component> <field> <value>`).
+    ///
+    /// The row is a drag value the test channel cannot press, so the write is
+    /// injected where the row puts it: the shared `PanelCommands` queue, applied
+    /// by [`Self::apply_panel_commands`] at the next frame boundary. What a test
+    /// drives is therefore the panel contract itself - the queue, the recorded
+    /// field edit and its undo step - not a second write path.
+    fn scripted_panel_field(&mut self, component: &str, field: &str, value: &str) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(entity) = world
+            .get_resource::<EditorSelection>()
+            .and_then(|selection| selection.entity)
+        else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                component,
+                field,
+                "[editor] panel field needs a selected entity"
+            );
+            return;
+        };
+        let mut queued = false;
+        if let Some(commands) = world.get_resource_mut::<PanelCommands>() {
+            commands.push(PanelCommand::SetField {
+                entity,
+                component: component.to_string(),
+                field: field.to_string(),
+                value: value.to_string(),
+            });
+            queued = true;
+        }
+        if queued {
+            info!(
+                target: telemetry_target::ENGINE,
+                entity = %entity,
+                component,
+                field,
+                value,
+                "[editor] panel field queued"
+            );
+        }
+    }
+
     /// Apply what the module panels asked for (W-0038 Stage 11).
     ///
     /// The same contract `EditorCommand` follows: a panel queues a request, the
@@ -4205,6 +4249,29 @@ impl EditorWindow {
             value = value_text,
             "[editor] resource edit queued"
         );
+    }
+
+    /// Log the entity list and each row's component names, for the suites
+    /// (W-0038 Stage 15): a collection test finds its subject this way.
+    fn dump_entities(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let entities = world
+            .get_resource::<EditorSnapshot>()
+            .map(|snapshot| snapshot.entities.clone())
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            count = entities.len(),
+            "[test] entities"
+        );
+        for entry in &entities {
+            info!(
+                target: telemetry_target::ENGINE,
+                display = entry.display.as_str(),
+                components = entry.archetype_label.as_str(),
+                "[test] entity"
+            );
+        }
     }
 
     /// Log the editable resources and their values, for the suites
@@ -5018,6 +5085,11 @@ impl EditorWindow {
             ScriptedCommand::PanelUnload(source) => self.scripted_panel_unload(&source),
             ScriptedCommand::PanelRestore(source) => self.scripted_panel_restore(&source),
             ScriptedCommand::PanelWindow { slot, id } => self.scripted_panel_window(slot, &id),
+            ScriptedCommand::PanelField {
+                component,
+                field,
+                value,
+            } => self.scripted_panel_field(&component, &field, &value),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -5051,6 +5123,7 @@ impl EditorWindow {
                 Dump::Panels => self.dump_panels(),
                 Dump::Windows => self.dump_windows(),
                 Dump::Resources => self.dump_resources(),
+                Dump::Entities => self.dump_entities(),
                 Dump::Field {
                     entity,
                     component,

@@ -152,6 +152,17 @@ pub enum ScriptedCommand {
     /// `select resource <name>` - move the shared selection onto an editable
     /// world resource (W-0038 Stage 14).
     SelectResource(String),
+    /// `panel field <component> <field> <value>` - queue the component-field
+    /// write a module panel's own row would queue, against the selected entity
+    /// (W-0038 Stage 12).
+    PanelField {
+        /// The component's registered name, or its `::Name` suffix.
+        component: String,
+        /// The field's name.
+        field: String,
+        /// The new value, as the field's kind parses it.
+        value: String,
+    },
     /// `edit resource <field> <value>` - one recorded resource field edit.
     EditResource {
         /// The resource's stable name.
@@ -290,6 +301,9 @@ pub enum Dump {
     Panels,
     /// `dump windows` - the panel windows on screen (W-0038 Stage 13).
     Windows,
+    /// `dump entities` - the entity list with each row's component names
+    /// (W-0038 Stage 15): what a collection test needs to find its subject.
+    Entities,
     /// `dump resources` - the editable world resources and their values
     /// (W-0038 Stage 14).
     Resources,
@@ -541,8 +555,21 @@ impl ScriptedCommand {
                         id: id.to_string(),
                     })
                 }
+                // The write a panel's own row queues, driven from the test
+                // channel instead of the pointer (W-0038 Stage 12).
+                Some("field") => {
+                    let reason = "panel field needs a component, a field and a value";
+                    let component = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+                    let field = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+                    let value = cursor.text("panel field needs a value")?;
+                    Ok(ScriptedCommand::PanelField {
+                        component: component.to_string(),
+                        field: field.to_string(),
+                        value,
+                    })
+                }
                 _ => Err(ParseError::new(
-                    "panel needs `unload <module>` or `restore <module>`",
+                    "panel needs `unload <module>`, `restore <module>`, `window <slot> <id>` or `field <component> <field> <value>`",
                 )),
             },
             "palette" => {
@@ -714,6 +741,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "panels" => Dump::Panels,
         "windows" => Dump::Windows,
         "resources" => Dump::Resources,
+        "entities" => Dump::Entities,
         "field" => {
             let reason = "dump field needs an entity, a component and a field";
             let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -1520,6 +1548,14 @@ mod tests {
                 command: ScriptedCommand::PanelWindow {
                     slot: 0,
                     id: "demo.confirm".to_string(),
+                },
+            },
+            Accept {
+                line: "panel field Spline control_points[0].x 2.5",
+                command: ScriptedCommand::PanelField {
+                    component: "Spline".to_string(),
+                    field: "control_points[0].x".to_string(),
+                    value: "2.5".to_string(),
                 },
             },
             Accept {
