@@ -45,7 +45,10 @@ use crate::error::LayoutPersistenceError;
 /// v8 adds the Console tab (W-0038 Stage 5). A v7 document is *migrated*, not
 /// replaced: the tab is appended to the leaf that holds Assets and the
 /// document is stamped v8, so an existing layout survives the upgrade.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 8;
+///
+/// v9 adds the Problems tab (W-0038 Stage 6), appended to the leaf that holds
+/// Console by the same migration rule.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 9;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
@@ -122,31 +125,40 @@ fn load_from_path(path: &Path) -> EditorDock {
 ///
 /// One rule per version bump, each adding what its stage introduced and never
 /// moving what the user arranged. v7 -> v8 appends the Console tab to the leaf
-/// that holds Assets, so the bottom row gains a sibling tab.
+/// that holds Assets; v8 -> v9 appends the Problems tab beside the Console.
 fn migrate(dock: &mut EditorDock) -> Option<u32> {
     let previous = dock.schema_version();
     match previous {
-        7 => {
-            let assets_leaf = dock
-                .state_mut()
-                .find_tab(&super::EditorTab::Assets)
-                .map(|path| path.node_path());
-            match assets_leaf {
-                Some(path) => {
-                    if let Ok(leaf) = dock.state_mut().leaf_mut(path) {
-                        leaf.append_tab(super::EditorTab::Console);
-                    }
-                }
-                // A layout without Assets has nowhere to put the tab beside;
-                // the focused leaf is the next best home and keeps the rest.
-                None => dock
-                    .state_mut()
-                    .push_to_focused_leaf(super::EditorTab::Console),
-            }
+        7 | 8 => {
+            // Each version adds the tab its stage introduced, beside the tab
+            // it belongs next to.
+            let (anchor, tab) = if previous == 7 {
+                (super::EditorTab::Assets, super::EditorTab::Console)
+            } else {
+                (super::EditorTab::Console, super::EditorTab::Problems)
+            };
+            append_beside(dock, anchor, tab);
             dock.set_schema_version(LAYOUT_SCHEMA_VERSION);
             Some(previous)
         }
         _ => None,
+    }
+}
+
+/// Append `tab` to the leaf that holds `anchor`, or to the focused leaf when
+/// the anchor is not docked - an unusual layout keeps the rest of itself.
+fn append_beside(dock: &mut EditorDock, anchor: super::EditorTab, tab: super::EditorTab) {
+    let leaf = dock
+        .state_mut()
+        .find_tab(&anchor)
+        .map(|path| path.node_path());
+    match leaf {
+        Some(path) => {
+            if let Ok(node) = dock.state_mut().leaf_mut(path) {
+                node.append_tab(tab);
+            }
+        }
+        None => dock.state_mut().push_to_focused_leaf(tab),
     }
 }
 

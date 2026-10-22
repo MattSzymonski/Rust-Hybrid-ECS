@@ -65,6 +65,9 @@ pub struct EguiShellState {
     /// The Console tab's filters (W-0038 Stage 5): the tab edits these, and
     /// the executable applies them to the history on the next frame.
     pub console_filters: crate::console::ConsoleFilterSettings,
+    /// The Problems row a click asked to open, drained by the executable
+    /// (W-0038 Stage 6).
+    pub problem_open: Option<usize>,
 }
 
 /// The command palette's session state (W-0038 Stage 3).
@@ -240,6 +243,7 @@ impl EguiShellState {
             toasts: ToastSession::default(),
             palette: PaletteState::default(),
             console_filters: crate::console::ConsoleFilterSettings::default(),
+            problem_open: None,
         }
     }
 

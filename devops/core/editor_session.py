@@ -38,6 +38,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -208,6 +209,47 @@ class EditorSession:
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "keybindings.json"
         path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    def write_preferences(self, document: Dict) -> None:
+        """Writes the preferences file the editor watches.
+
+        The editor applies the keys it knows on the next frame; the rest sit
+        in the document for the Preferences tab. A suite uses this to point
+        `code_editor_command` at a stub before clicking a Problems row.
+        """
+        directory = self.editor_state_directory
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "preferences.json"
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    @property
+    def stub_editor_record(self) -> Path:
+        """The file the stub code editor appends each argument line to."""
+        return self.sandbox / "stub-editor.txt"
+
+    def write_stub_editor(self) -> Path:
+        """Writes a stub code editor and points `code_editor_command` at it.
+
+        The editor launches whatever the preference names, so the suite has to
+        provide a program whose effect it can read. This one appends its
+        argument - the row's `file:line` - to `stub-editor.txt` and exits.
+        """
+        stub = self.sandbox / "stub_editor.py"
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        stub.write_text(
+            "import pathlib\n"
+            "import sys\n"
+            "record = pathlib.Path(__file__).with_name('stub-editor.txt')\n"
+            "record.write_text(' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        # A record left by an earlier phase would satisfy the next wait before
+        # the editor ever ran the command.
+        self.stub_editor_record.unlink(missing_ok=True)
+        self.write_preferences(
+            {"code_editor_command": '"{}" "{}"'.format(sys.executable, stub)}
+        )
+        return stub
 
     @property
     def process(self) -> Optional[subprocess.Popen]:

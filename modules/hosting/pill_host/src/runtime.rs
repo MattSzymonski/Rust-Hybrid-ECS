@@ -2661,6 +2661,14 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
                 // rollback route, so the records are dropped only on a real swap.
                 if replaced {
                     forget_prologue_records(host);
+                    // The editor's side of the swap, mirroring the extension
+                    // reload's: a toast, and the project's problem list
+                    // clears. Without it a fixed compile error stayed in the
+                    // Problems panel until the next module reload.
+                    notices::push(HostNotice::Reloaded {
+                        module: host.module_config.name.clone(),
+                        build_ms: analytics::module_build_ms(&host.module_config.name).unwrap_or(0),
+                    });
                 }
                 // The project now runs the sources on disk, so the patch classifier's
                 // baseline has to say so too. Skipping this is what makes one refused
