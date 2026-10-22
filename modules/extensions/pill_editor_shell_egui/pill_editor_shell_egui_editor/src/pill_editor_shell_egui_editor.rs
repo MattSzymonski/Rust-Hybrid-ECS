@@ -132,6 +132,12 @@ pub fn register(engine: &mut Engine) -> u32 {
             source: "pill_editor_shell_egui_editor",
             draw: shell::demo_panel,
         });
+        registrations.push(PanelRequest {
+            id: shell::SPLINE_PANEL_ID,
+            title: "Spline Tool",
+            source: "pill_editor_shell_egui_editor",
+            draw: shell::spline_tool_panel,
+        });
     }
     engine.register_post_update_system("egui_shell", egui_shell_update);
     // NOTE: asserted on by the egui editor's end-to-end suite.

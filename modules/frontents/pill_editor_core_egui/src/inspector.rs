@@ -458,6 +458,31 @@ pub fn parse_field_value(text: &str, current: &FieldValue) -> Result<FieldValue,
     Ok(parsed)
 }
 
+/// One field value in the text form the Inspector's widgets show and commit
+/// (W-0038 Stage 12): what a module panel displays and what it writes back
+/// through `PanelCommand::SetField`.
+pub fn value_text(value: &FieldValue) -> String {
+    match value {
+        FieldValue::F32(value) => format!("{value}"),
+        FieldValue::F64(value) => format!("{value}"),
+        FieldValue::I8(value) => format!("{value}"),
+        FieldValue::I16(value) => format!("{value}"),
+        FieldValue::I32(value) => format!("{value}"),
+        FieldValue::I64(value) => format!("{value}"),
+        FieldValue::U8(value) => format!("{value}"),
+        FieldValue::U16(value) => format!("{value}"),
+        FieldValue::U32(value) => format!("{value}"),
+        FieldValue::U64(value) => format!("{value}"),
+        FieldValue::Usize(value) => format!("{value}"),
+        FieldValue::Isize(value) => format!("{value}"),
+        FieldValue::Bool(value) => format!("{value}"),
+        FieldValue::Text(value) => value.clone(),
+        FieldValue::Array(elements) => format!("[{}]", elements.len()),
+        FieldValue::List { element_count, .. } => format!("[{element_count}]"),
+        other => format!("{other:?}"),
+    }
+}
+
 /// One segment of a settings key path: an object key or an array index.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SettingsKey {

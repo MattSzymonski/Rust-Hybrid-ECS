@@ -3483,8 +3483,145 @@ impl EditorWindow {
                         "[editor] panel selected an entity"
                     );
                 }
+                // The recorded edit path every inspector row takes, so a
+                // panel's write is one undo step like any other (W-0038
+                // Stages 12 and 13).
+                PanelCommand::SetField {
+                    entity,
+                    component,
+                    field,
+                    value,
+                } => self.panel_field_write(entity, &component, &field, &value),
+                PanelCommand::SetArrayElement {
+                    entity,
+                    component,
+                    field,
+                    index,
+                    value,
+                } => self.panel_element_write(entity, &component, &field, index, &value),
+                // The windows belong to the shell, which applies these while
+                // it draws; the executable has nothing to do with them.
+                PanelCommand::OpenWindow(_) | PanelCommand::CloseWindow(_) => {}
+                PanelCommand::Log(text) => info!(
+                    target: telemetry_target::ENGINE,
+                    text = text.as_str(),
+                    "[editor] panel log"
+                ),
             }
         }
+    }
+
+    /// Write one component field from a panel, recorded.
+    fn panel_field_write(
+        &mut self,
+        entity: Entity,
+        component: &str,
+        field: &str,
+        value_text: &str,
+    ) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(component) = resolve_component_name(world, component) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                component,
+                "[editor] panel field write: no such component"
+            );
+            return;
+        };
+        let current = match world.read_component_field(entity, &component, field) {
+            Ok(current) => current,
+            Err(_) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    component = component.as_str(),
+                    field,
+                    "[editor] panel field write: no such field"
+                );
+                return;
+            }
+        };
+        let value = match inspector::parse_field_value(value_text, &current) {
+            Ok(value) => value,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    field,
+                    message = message.as_str(),
+                    "[editor] panel field write: value not understood"
+                );
+                return;
+            }
+        };
+        let (edit, label) = inspector::field_edit(entity, &component, field, value);
+        let coalesce = inspector::field_coalesce_key(entity, &component, field);
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push_recorded(vec![edit], label, Some(coalesce));
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            component = component.as_str(),
+            field,
+            value = value_text,
+            "[editor] panel wrote a field"
+        );
+    }
+
+    /// Write one array element from a panel, recorded.
+    fn panel_element_write(
+        &mut self,
+        entity: Entity,
+        component: &str,
+        field: &str,
+        index: usize,
+        value_text: &str,
+    ) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(component) = resolve_component_name(world, component) else {
+            return;
+        };
+        let Ok(current) = world.read_component_field(entity, &component, field) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                component = component.as_str(),
+                field,
+                "[editor] panel element write: no such field"
+            );
+            return;
+        };
+        let Some(element) = inspector::element_field(&current, index) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                field,
+                index,
+                "[editor] panel element write: no such element"
+            );
+            return;
+        };
+        let value = match inspector::parse_field_value(value_text, &element) {
+            Ok(value) => value,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    field,
+                    message = message.as_str(),
+                    "[editor] panel element write: value not understood"
+                );
+                return;
+            }
+        };
+        let (edit, label) = inspector::element_edit(entity, &component, field, index, value);
+        let coalesce = inspector::field_coalesce_key(entity, &component, field);
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push_recorded(vec![edit], label, Some(coalesce));
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            component = component.as_str(),
+            field,
+            index,
+            value = value_text,
+            "[editor] panel wrote an array element"
+        );
     }
 
     /// Capture the editor snapshot the shell's tabs read, when the shell
@@ -3976,6 +4113,52 @@ impl EditorWindow {
             animating = self.last_demand.animating,
             "[test] cadence"
         );
+    }
+
+    /// `panel window <slot> <id>`: ask a panel to open one of its windows.
+    ///
+    /// The panel decides what the id means, so this drives the same code its
+    /// button does (W-0038 Stage 13).
+    fn scripted_panel_window(&mut self, slot: u16, id: &str) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] panel window request needs the shell module's state"
+            );
+            return;
+        };
+        state.panel_window_ping = Some((slot, id.to_string()));
+        info!(
+            target: telemetry_target::ENGINE,
+            slot,
+            window = id,
+            "[editor] panel window requested"
+        );
+    }
+
+    /// Log the panel windows on screen, for the suites (W-0038 Stage 13).
+    fn dump_windows(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let windows = world
+            .get_resource::<EguiShellState>()
+            .map(|state| state.panel_windows.windows.clone())
+            .unwrap_or_default();
+        info!(
+            target: telemetry_target::ENGINE,
+            count = windows.len(),
+            "[test] windows"
+        );
+        for window in &windows {
+            info!(
+                target: telemetry_target::ENGINE,
+                id = window.id.as_str(),
+                source = window.source.as_str(),
+                slot = window.slot,
+                modal = window.modal,
+                "[test] window"
+            );
+        }
     }
 
     /// Log the module panels, for the suites (W-0038 Stage 11).
@@ -4730,6 +4913,7 @@ impl EditorWindow {
             ScriptedCommand::SafeModeRetry => self.retry_shell_module(),
             ScriptedCommand::PanelUnload(source) => self.scripted_panel_unload(&source),
             ScriptedCommand::PanelRestore(source) => self.scripted_panel_restore(&source),
+            ScriptedCommand::PanelWindow { slot, id } => self.scripted_panel_window(slot, &id),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -4761,6 +4945,7 @@ impl EditorWindow {
                 Dump::Stats => self.dump_stats(),
                 Dump::Cadence => self.dump_cadence(),
                 Dump::Panels => self.dump_panels(),
+                Dump::Windows => self.dump_windows(),
                 Dump::Field {
                     entity,
                     component,

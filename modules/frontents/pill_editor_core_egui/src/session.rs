@@ -79,6 +79,111 @@ pub struct EguiShellState {
     /// Once per session, not once per shell generation: a reload must not
     /// undo a dock the user rearranged.
     pub panels_remapped: bool,
+    /// The windows the module panels asked for (W-0038 Stage 13).
+    pub panel_windows: PanelWindowSession,
+    /// A window the scripted channel asked a panel to open: the panel's slot
+    /// and the window id it should choose (W-0038 Stage 13).
+    pub panel_window_ping: Option<(u16, String)>,
+}
+
+/// How many panel windows one session may have open at once.
+pub const PANEL_WINDOWS_MAX: usize = 8;
+
+/// One window a panel asked the shell for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelWindowState {
+    /// The window's identity within its panel.
+    pub id: String,
+    /// The title its bar shows.
+    pub title: String,
+    /// The crate that asked for it: its panels' markers decide its lifetime.
+    pub source: String,
+    /// The registry slot of the panel that draws it.
+    pub slot: u16,
+    /// How wide it opens, in logical points.
+    pub width: f32,
+    /// How tall it opens, in logical points.
+    pub height: f32,
+    /// Whether it takes the editor's input until answered.
+    pub modal: bool,
+}
+
+/// The answer a modal window took: Enter accepts, Escape dismisses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelWindowAnswer {
+    /// The window that was answered.
+    pub window: String,
+    /// The crate that owns it.
+    pub source: String,
+    /// Whether the answer was Enter rather than Escape.
+    pub accepted: bool,
+}
+
+/// The windows the module panels asked for (W-0038 Stage 13).
+///
+/// Session-scoped like the dock: a shell reload keeps every window open, and
+/// only the owning module's unload closes its windows - which is exactly why
+/// the source is recorded on each of them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PanelWindowSession {
+    /// The open windows, oldest first.
+    pub windows: Vec<PanelWindowState>,
+    /// The answer this frame owes the modal that asked for it; the panel reads
+    /// it on its next draw and the shell clears it afterwards.
+    pub answer: Option<PanelWindowAnswer>,
+}
+
+impl PanelWindowSession {
+    /// Open a window, replacing one with the same id.
+    pub fn open(
+        &mut self,
+        source: &str,
+        slot: u16,
+        request: &pill_ui_egui::panels::PanelWindowRequest,
+    ) {
+        if let Some(existing) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.id == request.id)
+        {
+            existing.title = request.title.clone();
+            existing.width = request.width;
+            existing.height = request.height;
+            existing.modal = request.modal;
+            existing.slot = slot;
+            return;
+        }
+        if self.windows.len() >= PANEL_WINDOWS_MAX {
+            self.windows.remove(0);
+        }
+        self.windows.push(PanelWindowState {
+            id: request.id.clone(),
+            title: request.title.clone(),
+            source: source.to_string(),
+            slot,
+            width: request.width,
+            height: request.height,
+            modal: request.modal,
+        });
+    }
+
+    /// Close one window of one source.
+    pub fn close(&mut self, source: &str, id: &str) {
+        self.windows
+            .retain(|window| !(window.source == source && window.id == id));
+    }
+
+    /// Close every window a source opened; returns how many went.
+    pub fn close_source(&mut self, source: &str) -> usize {
+        let before = self.windows.len();
+        self.windows.retain(|window| window.source != source);
+        before - self.windows.len()
+    }
+
+    /// Whether a modal window is on screen: the editor's input belongs to it.
+    pub fn modal(&self) -> Option<&PanelWindowState> {
+        self.windows.iter().find(|window| window.modal)
+    }
 }
 
 /// One tab's measured cost, smoothed so a single slow frame does not dominate.
@@ -445,6 +550,8 @@ impl EguiShellState {
             stats: StatisticsSession::default(),
             panel_budget: PanelBudget::default(),
             panels_remapped: false,
+            panel_windows: PanelWindowSession::default(),
+            panel_window_ping: None,
         }
     }
 

@@ -64,6 +64,99 @@ pub type PanelDrawFn = fn(&mut egui::Ui, &mut PanelContext<'_>);
 pub enum PanelCommand {
     /// Make this entity the editor's selection.
     SelectEntity(Entity),
+    /// Write one component field through the editor's recorded edit path, so
+    /// the change is one undo step (W-0038 Stages 12 and 13). The value is
+    /// text, parsed against the field's current value exactly as the
+    /// Inspector's own rows parse it.
+    SetField {
+        /// The entity to edit.
+        entity: Entity,
+        /// The component's registered type name.
+        component: String,
+        /// The field's name.
+        field: String,
+        /// The new value, as the Inspector would have typed it.
+        value: String,
+    },
+    /// Write one element of an array field, recorded the same way.
+    SetArrayElement {
+        /// The entity to edit.
+        entity: Entity,
+        /// The component's registered type name.
+        component: String,
+        /// The array field's name.
+        field: String,
+        /// The element's index.
+        index: usize,
+        /// The new element value, as the Inspector would have typed it.
+        value: String,
+    },
+    /// Ask the shell to show a window of this panel's (W-0038 Stage 13).
+    OpenWindow(PanelWindowRequest),
+    /// Close one of this panel's windows.
+    CloseWindow(String),
+    /// Write a line the editor's log shows. A module's only way to say what
+    /// it did without owning a log of its own.
+    Log(String),
+}
+
+/// One window a panel asks the shell for.
+///
+/// The shell owns the window - its position, its lifetime and its closing on
+/// the module's unload - so a module's request is plain data and its content
+/// is drawn by the same panel that asked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelWindowRequest {
+    /// The window's identity within its panel.
+    pub id: String,
+    /// The title the shell draws in the window's bar.
+    pub title: String,
+    /// The window's first width in logical points.
+    pub width: f32,
+    /// The window's first height in logical points.
+    pub height: f32,
+    /// Whether the window is modal: a modal takes the editor's input until it
+    /// is answered, and the shell answers it with Enter or Escape.
+    pub modal: bool,
+}
+
+/// One row of the world's entities, as a panel sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelEntityRow {
+    /// The entity's handle.
+    pub entity: Entity,
+    /// The list label the Entities tab shows.
+    pub display: String,
+    /// The joined component type names, which is how a panel finds the
+    /// entities it cares about without naming a crate's type.
+    pub archetype: String,
+}
+
+/// One component of the selected entity, as a panel sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelComponentValues {
+    /// The component's registered type name.
+    pub component: String,
+    /// The component's fields, in layout order, rendered as text.
+    pub fields: Vec<PanelFieldValue>,
+}
+
+/// One field value, rendered for a panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelFieldValue {
+    /// The field's name.
+    pub name: String,
+    /// The value, in the Inspector's text form.
+    pub value: String,
+}
+
+/// The selected entity's components, as a panel sees them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelEntityDetail {
+    /// The entity the detail describes.
+    pub entity: Entity,
+    /// The entity's components, in layout order.
+    pub components: Vec<PanelComponentValues>,
 }
 
 /// What a panel reads and writes while it draws.
@@ -76,9 +169,31 @@ pub struct PanelContext<'a> {
     pub frames_per_second: f32,
     /// The selected entity, when one is.
     pub selected_entity: Option<Entity>,
+    /// The world's entities, when a panel asked for them.
+    pub entities: &'a [PanelEntityRow],
+    /// The selected entity's components, when there is a selection.
+    pub detail: Option<&'a PanelEntityDetail>,
+    /// The window this draw is for: `Some` when the panel is drawing one of
+    /// its own windows, `None` when it is drawing its docked tab.
+    pub window: Option<&'a str>,
+    /// A window id the editor asked this panel to open - the scripted channel's
+    /// stand-in for clicking the panel's own button (W-0038 Stage 13).
+    pub requested_window: Option<&'a str>,
+    /// The answer a modal window took, once: the panel acts on it and the
+    /// shell forgets it.
+    pub answer: Option<&'a PanelAnswer>,
     /// The commands this panel asks for; the executable applies them at the
     /// frame boundary.
     pub commands: &'a mut Vec<PanelCommand>,
+}
+
+/// The answer a modal window took, as the panel that asked reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelAnswer {
+    /// The window that was answered.
+    pub window: String,
+    /// Whether the answer was Enter rather than Escape.
+    pub accepted: bool,
 }
 
 /// One registered panel.
