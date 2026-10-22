@@ -3984,14 +3984,18 @@ impl EditorWindow {
         }
     }
 
-    /// The runner's own minimal pass, used while no shell module is loaded.
+    /// The safe-mode pass, used while no shell module is loaded (W-0038
+    /// Stage 8): the build errors that stopped it, with their `file:line`, and
+    /// a Retry that asks the host to rebuild the module. The scene keeps
+    /// rendering behind this panel - the editor's own frame is untouched.
     fn fallback_frame(&mut self) -> EguiShellFrame {
         if !self.reported_fallback {
             self.reported_fallback = true;
             info!(
                 target: telemetry_target::ENGINE,
                 module = SHELL_MODULE_NAME,
-                "[editor] shell module missing; drawing the fallback UI"
+                problems = self.notices.problems.len(),
+                "[editor] safe mode"
             );
         }
         let logical_width = self.size.0 as f32 / self.scale_factor;
@@ -4004,16 +4008,89 @@ impl EditorWindow {
             ..Default::default()
         };
         let context = self.fallback_context.clone();
+        let mut retry = false;
+        let problems: Vec<(String, String, String)> = self
+            .notices
+            .problems
+            .iter()
+            .map(|row| {
+                let location = match (&row.problem.file, row.problem.line) {
+                    (Some(file), Some(line)) => format!("{file}:{line}"),
+                    (Some(file), None) => file.clone(),
+                    _ => "-".to_string(),
+                };
+                (
+                    row.module.clone(),
+                    location,
+                    format!("{} {}", row.problem.severity.name(), row.problem.message),
+                )
+            })
+            .collect();
         let output = context.run_ui(raw_input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                ui.heading("Pill Editor");
+                ui.heading("Pill Editor - safe mode");
                 ui.label(format!(
-                    "the shell module ({SHELL_MODULE_NAME}) is not loaded; \
-                     the dock and panels are unavailable"
+                    "the shell module ({SHELL_MODULE_NAME}) is not loaded; the scene \
+                     keeps rendering behind this panel"
                 ));
+                ui.separator();
+                if problems.is_empty() {
+                    ui.weak("no build error was reported");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (module, location, text) in &problems {
+                                ui.label(egui::RichText::new(module).strong());
+                                ui.label(
+                                    egui::RichText::new(format!("  {location}  {text}"))
+                                        .monospace(),
+                                );
+                            }
+                        });
+                }
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Retry"))
+                    .on_hover_text("rebuild and load the shell module")
+                    .clicked()
+                {
+                    retry = true;
+                }
             });
         });
+        if retry {
+            self.retry_shell_module();
+        }
         frame_from_output(&context, output)
+    }
+
+    /// Ask the host to rebuild the shell module, and say how it went.
+    ///
+    /// `retry_extension` runs the same load a first start would, or asks a
+    /// loaded generation to rebuild as if its sources were saved, so a fix
+    /// made while the editor was in safe mode lands without a restart.
+    fn retry_shell_module(&mut self) {
+        let outcome = self.host.host_mut().retry_extension(SHELL_MODULE_NAME);
+        match outcome {
+            Ok(()) => {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    module = SHELL_MODULE_NAME,
+                    "[editor] safe mode retry requested"
+                );
+                // The next frame looks the shell up again; a generation that
+                // loaded in the meantime takes over without another step.
+                self.reported_fallback = false;
+            }
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                module = SHELL_MODULE_NAME,
+                error = error.as_str(),
+                "[editor] safe mode retry failed"
+            ),
+        }
     }
 
     /// Set the cursor shape egui asked for, when it maps onto one.
@@ -4110,6 +4187,7 @@ impl EditorWindow {
             ScriptedCommand::ConsoleFilter(level) => self.scripted_console_filter(&level),
             ScriptedCommand::ConsoleSearch(text) => self.scripted_console_search(text),
             ScriptedCommand::ProblemOpen(index) => self.scripted_problem_open(index),
+            ScriptedCommand::SafeModeRetry => self.retry_shell_module(),
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),

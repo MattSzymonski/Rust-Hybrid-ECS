@@ -63,6 +63,8 @@ pub enum ScriptedCommand {
     ConsoleSearch(String),
     /// `problem open <index>` - open a Problems row, as a click would.
     ProblemOpen(usize),
+    /// `safe_mode retry` - press the safe-mode panel's Retry button.
+    SafeModeRetry,
     /// `undock <tab>` - float a dock tab into its own window.
     Undock(EditorTab),
     /// `tab <tab>` - bring a dock tab to the front.
@@ -460,6 +462,15 @@ impl ScriptedCommand {
             },
             // `problem open <index>` opens a Problems row the way a click
             // does; the executable spawns the configured editor.
+            // `safe_mode retry` presses the safe-mode panel's Retry button,
+            // which the executable draws only while no shell is loaded.
+            "safe_mode" => match cursor.word() {
+                Some("retry") => {
+                    cursor.finish("safe_mode retry")?;
+                    Ok(ScriptedCommand::SafeModeRetry)
+                }
+                _ => Err(ParseError::new("safe_mode needs `retry`")),
+            },
             "problem" => match cursor.word() {
                 Some("open") => {
                     let index = number(&mut cursor, "problem open needs a row index")?;
@@ -1386,6 +1397,10 @@ mod tests {
             Accept {
                 line: "problem open 0",
                 command: ScriptedCommand::ProblemOpen(0),
+            },
+            Accept {
+                line: "safe_mode retry",
+                command: ScriptedCommand::SafeModeRetry,
             },
             Accept {
                 line: "console filter warn",
