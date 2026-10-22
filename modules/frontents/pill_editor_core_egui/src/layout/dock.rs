@@ -65,6 +65,8 @@ pub enum EditorTab {
     Console,
     /// Build errors and warnings, grouped by module (W-0038 Stage 6).
     Problems,
+    /// Frame, pass and per-tab timings (W-0038 Stage 7).
+    Statistics,
     /// The preferences file's editor-wide rows and the current project's
     /// remembered gizmo choices.
     Preferences,
@@ -72,7 +74,7 @@ pub enum EditorTab {
 
 impl EditorTab {
     /// Every tab, in tab-strip order.
-    pub const ALL: [EditorTab; 10] = [
+    pub const ALL: [EditorTab; 11] = [
         EditorTab::Scene,
         EditorTab::SecondScene,
         EditorTab::Game,
@@ -82,6 +84,7 @@ impl EditorTab {
         EditorTab::Assets,
         EditorTab::Console,
         EditorTab::Problems,
+        EditorTab::Statistics,
         EditorTab::Preferences,
     ];
 
@@ -97,6 +100,7 @@ impl EditorTab {
             EditorTab::Assets => "Assets",
             EditorTab::Console => "Console",
             EditorTab::Problems => "Problems",
+            EditorTab::Statistics => "Statistics",
             EditorTab::Preferences => "Preferences",
         }
     }
@@ -113,6 +117,7 @@ impl EditorTab {
             EditorTab::Assets => "assets",
             EditorTab::Console => "console",
             EditorTab::Problems => "problems",
+            EditorTab::Statistics => "statistics",
             EditorTab::Preferences => "preferences",
         }
     }
@@ -155,7 +160,12 @@ impl EditorDock {
         let [upper, _assets] = tree.split_below(
             NodeIndex::root(),
             1.0 - BOTTOM_ROW_FRACTION,
-            vec![EditorTab::Assets, EditorTab::Console, EditorTab::Problems],
+            vec![
+                EditorTab::Assets,
+                EditorTab::Console,
+                EditorTab::Problems,
+                EditorTab::Statistics,
+            ],
         );
         // The entity column then splits the upper node; the old node keeps
         // the space right of the column. Unlike `split_below`/`split_right`,
@@ -312,7 +322,12 @@ mod tests {
         );
         assert_eq!(
             tabs_at(root.right()),
-            vec![EditorTab::Assets, EditorTab::Console, EditorTab::Problems]
+            vec![
+                EditorTab::Assets,
+                EditorTab::Console,
+                EditorTab::Problems,
+                EditorTab::Statistics
+            ]
         );
         // The node above splits into the entity column and the rest.
         let upper = root.left();

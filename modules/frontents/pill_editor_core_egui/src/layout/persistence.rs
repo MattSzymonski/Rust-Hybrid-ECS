@@ -48,7 +48,10 @@ use crate::error::LayoutPersistenceError;
 ///
 /// v9 adds the Problems tab (W-0038 Stage 6), appended to the leaf that holds
 /// Console by the same migration rule.
-pub const LAYOUT_SCHEMA_VERSION: u32 = 9;
+///
+/// v10 adds the Statistics tab (W-0038 Stage 7), appended to the leaf that
+/// holds Problems.
+pub const LAYOUT_SCHEMA_VERSION: u32 = 10;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
@@ -123,26 +126,26 @@ fn load_from_path(path: &Path) -> EditorDock {
 /// Upgrade an older document in place, returning the version it came from;
 /// `None` when this build has no rule for that version.
 ///
-/// One rule per version bump, each adding what its stage introduced and never
-/// moving what the user arranged. v7 -> v8 appends the Console tab to the leaf
-/// that holds Assets; v8 -> v9 appends the Problems tab beside the Console.
+/// One entry per version bump: the tab that stage added, and the tab it is
+/// appended beside. A document several versions old gets every missing tab in
+/// one pass, chained in strip order, and nothing the user arranged moves.
 fn migrate(dock: &mut EditorDock) -> Option<u32> {
+    const CHAIN: [(u32, super::EditorTab, super::EditorTab); 3] = [
+        (7, super::EditorTab::Assets, super::EditorTab::Console),
+        (8, super::EditorTab::Console, super::EditorTab::Problems),
+        (9, super::EditorTab::Problems, super::EditorTab::Statistics),
+    ];
     let previous = dock.schema_version();
-    match previous {
-        7 | 8 => {
-            // Each version adds the tab its stage introduced, beside the tab
-            // it belongs next to.
-            let (anchor, tab) = if previous == 7 {
-                (super::EditorTab::Assets, super::EditorTab::Console)
-            } else {
-                (super::EditorTab::Console, super::EditorTab::Problems)
-            };
-            append_beside(dock, anchor, tab);
-            dock.set_schema_version(LAYOUT_SCHEMA_VERSION);
-            Some(previous)
-        }
-        _ => None,
+    if !(7..LAYOUT_SCHEMA_VERSION).contains(&previous) {
+        return None;
     }
+    for (version, anchor, tab) in CHAIN {
+        if previous <= version && !dock.contains(tab) {
+            append_beside(dock, anchor, tab);
+        }
+    }
+    dock.set_schema_version(LAYOUT_SCHEMA_VERSION);
+    Some(previous)
 }
 
 /// Append `tab` to the leaf that holds `anchor`, or to the focused leaf when

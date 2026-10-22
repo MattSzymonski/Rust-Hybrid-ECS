@@ -125,6 +125,8 @@ CONSOLE_DUMP_TOKEN = "[test] console"
 PROBLEMS_DUMP_TOKEN = "[test] problems"
 PROBLEM_ROW_TOKEN = "[test] problem row"
 PROBLEM_OPENED_TOKEN = "[editor] problem opened"
+STATS_DUMP_TOKEN = "[test] stats"
+STATS_TAB_TOKEN = "[test] stats tab"
 CONSOLE_FILTER_TOKEN = "[editor] console filter"
 CONSOLE_SEARCH_TOKEN = "[editor] console search"
 
@@ -1273,6 +1275,35 @@ def main() -> int:
         session.send("console filter info")
         session.wait(re.escape(CONSOLE_FILTER_TOKEN), 30, "the console filter reset", begin)
         print("  [OK] the console listed, searched and filtered the log")
+
+        # Step 3a5: the Statistics tab (W-0038 Stage 7). The shell times every
+        # tab body and its own pass, so the tab's rows are measurements - and
+        # the tabs this suite has opened already must have non-zero times.
+        stats_begin = len(session.read_log())
+        session.send("tab statistics")
+        session.send("dump stats")
+        session.wait(re.escape(STATS_DUMP_TOKEN), 30, "the statistics dump", stats_begin)
+        measured = {
+            match.group(1): float(match.group(2))
+            for match in re.finditer(
+                re.escape(STATS_TAB_TOKEN)
+                + r'\s+name="(\w+)"\s+us=([0-9.]+)\s+passes=\d+',
+                session.read_log()[stats_begin:],
+            )
+        }
+        assert measured, "the Statistics tab measured no tab body"
+        # The console tab was actively drawn for the whole console step, so it
+        # is the one row whose non-zero time is guaranteed; a dock leaf draws
+        # only its active tab, so the others depend on activation order.
+        assert measured.get("console", 0.0) > 0.0, (
+            "the Statistics tab showed no time for the console tab: {}".format(measured)
+        )
+        assert len(measured) >= 4, (
+            "the Statistics tab measured too few tabs: {}".format(measured)
+        )
+        print(
+            "  [OK] the Statistics tab timed {} drawn tabs".format(len(measured))
+        )
 
         # Park the tool on rotate: the next step's `gizmo translate` only logs
         # a change, and the bound chord has just taken the tool to translate.

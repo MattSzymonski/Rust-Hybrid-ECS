@@ -3525,6 +3525,32 @@ impl EditorWindow {
         self.drain_problem_open();
     }
 
+    /// Log the Statistics tab's numbers, for the suites.
+    fn dump_stats(&mut self) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(state) = world.get_resource::<EguiShellState>() else {
+            return;
+        };
+        let stats = &state.stats;
+        info!(
+            target: telemetry_target::ENGINE,
+            fps = stats.frames_per_second,
+            shell_us = stats.shell_micros,
+            passes = stats.shell_passes,
+            tabs = stats.tabs.len(),
+            "[test] stats"
+        );
+        for entry in &stats.tabs {
+            info!(
+                target: telemetry_target::ENGINE,
+                name = entry.tab.name(),
+                us = entry.micros,
+                passes = entry.passes,
+                "[test] stats tab"
+            );
+        }
+    }
+
     /// Log the Problems rows, for the suites.
     fn dump_problems(&mut self) {
         info!(
@@ -4112,6 +4138,7 @@ impl EditorWindow {
                 Dump::Preferences => self.dump_preferences(),
                 Dump::Console => self.dump_console(),
                 Dump::Problems => self.dump_problems(),
+                Dump::Stats => self.dump_stats(),
                 Dump::Field {
                     entity,
                     component,
