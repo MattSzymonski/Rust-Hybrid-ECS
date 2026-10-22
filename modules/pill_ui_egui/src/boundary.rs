@@ -138,6 +138,10 @@ pub struct EguiShellFrame {
     pub ime_allowed: bool,
     /// Where the IME candidate window should appear, logical points.
     pub ime_rect: Option<ShellRect>,
+    /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
+    /// frontend starts an OLE drag with it, so a file can be dragged into
+    /// Explorer.
+    pub drag_out: Option<String>,
     /// The shell's menu asked the editor to quit. The winit frontend honours
     /// it through the same path a window close takes; a browser frontend
     /// ignores it (a page cannot close itself safely).
@@ -165,6 +169,7 @@ impl Default for EguiShellFrame {
             overlay_regions: Vec::new(),
             ime_allowed: false,
             ime_rect: None,
+            drag_out: None,
             quit_requested: false,
             repaint_after: None,
         }
@@ -220,6 +225,8 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         // frontend reads off the frame's focus state for now.
         ime_allowed: wants_keyboard,
         ime_rect: None,
+        // Only the shell asks for a drag out; it records the path itself.
+        drag_out: None,
         // Only the shell's menu can ask to quit; it sets the flag itself.
         quit_requested: false,
         repaint_after,

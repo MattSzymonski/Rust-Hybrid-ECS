@@ -44,6 +44,9 @@ pub struct AssetTileWrites<'a> {
     pub pending: &'a mut PendingEditorCommands,
     /// The regions an open menu marks so a click inside is never a scene pick.
     pub overlay_regions: &'a mut Vec<ShellRect>,
+    /// The asset path a drag handed to the OS (W-0038 Stage 19): the shell
+    /// reports it, the executable starts the OLE drag.
+    pub drag_out: &'a mut Option<String>,
 }
 
 /// One grid tile: the row's duotone icon and its name, the selection and
@@ -126,6 +129,22 @@ pub fn asset_tile(
         }
     }
     response.dnd_set_drag_payload(row.path.clone());
+    // A file dragged past the window edge is the OS's (W-0038 Stage 19): the
+    // tile reports the path once, and the executable starts an OLE drag with
+    // it. The pointer's release never arrives once it leaves the windows, so
+    // "button still down, no pointer position" is what a drag out looks like.
+    if response.dragged() && writes.drag_out.is_none() && !browser::is_folder(row) {
+        let left_window =
+            ui.input(|input| input.pointer.any_down() && input.pointer.hover_pos().is_none());
+        if left_window {
+            *writes.drag_out = Some(row.path.clone());
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                path = row.path.as_str(),
+                "[editor] drag out requested"
+            );
+        }
+    }
     response.on_hover_text(row.path.as_str());
 }
 
