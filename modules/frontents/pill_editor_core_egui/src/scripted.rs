@@ -259,6 +259,14 @@ pub enum ScriptedCommand {
     Redo,
     /// `command editor.scene_new_view` - dock one more scene view.
     NewSceneView,
+    /// `popout <tab>` - move a tab into its own OS window (W-0038 Stage 23);
+    /// `popout <tab> redock` puts it back in the dock.
+    Popout {
+        /// The tab to move.
+        tab: EditorTab,
+        /// Whether to put it back instead.
+        redock: bool,
+    },
     /// `command editor.pause_toggle` - flip the engine's pause flag.
     PauseToggle,
     /// `command editor.step` - run one frame while paused.
@@ -508,6 +516,22 @@ impl ScriptedCommand {
                 let tab = tab(&mut cursor, "tab needs a tab name")?;
                 cursor.finish(verb)?;
                 Ok(ScriptedCommand::ActivateTab(tab))
+            }
+            // `popout <tab>` moves a tab into its own OS window, and
+            // `popout <tab> redock` brings it back (W-0038 Stage 23).
+            "popout" => {
+                let tab = tab(&mut cursor, "popout needs a tab name")?;
+                let redock = match cursor.word() {
+                    Some("redock") => true,
+                    Some(other) => {
+                        return Err(ParseError::new(format!(
+                            "popout takes a tab name and optionally 'redock', not '{other}'"
+                        )))
+                    }
+                    None => false,
+                };
+                cursor.finish(verb)?;
+                Ok(ScriptedCommand::Popout { tab, redock })
             }
             "click" => {
                 let x = number(&mut cursor, "click needs an x and a y")?;
@@ -1509,6 +1533,20 @@ mod tests {
             Accept {
                 line: "command editor.scene_new_view",
                 command: ScriptedCommand::NewSceneView,
+            },
+            Accept {
+                line: "popout inspector",
+                command: ScriptedCommand::Popout {
+                    tab: EditorTab::Inspector,
+                    redock: false,
+                },
+            },
+            Accept {
+                line: "popout inspector redock",
+                command: ScriptedCommand::Popout {
+                    tab: EditorTab::Inspector,
+                    redock: true,
+                },
             },
             Accept {
                 line: "palette translate",

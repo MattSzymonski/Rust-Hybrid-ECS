@@ -41,7 +41,7 @@ pub const INSPECTOR_COLUMN_FRACTION: f32 = 0.4;
 ///
 /// The enum is serialized into the saved layout, so adding a tab is a
 /// schema change (`LAYOUT_SCHEMA_VERSION`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum EditorTab {
     /// A scene view's placeholder: the shell measures this tab's body and
     /// draws nothing, so that view's child window shows through. The payload
@@ -215,6 +215,11 @@ pub struct EditorDock {
     /// id does, so a panel that registers again finds its tab.
     #[serde(default)]
     panel_ids: Vec<String>,
+    /// The tabs popped out into their own OS windows (W-0038 Stage 23). A
+    /// popped-out tab is *not* in the dock tree; redocking puts it back in the
+    /// focused leaf.
+    #[serde(default)]
+    popouts: Vec<EditorTab>,
     /// The dock's tabs and splits.
     state: DockState<EditorTab>,
 }
@@ -272,6 +277,7 @@ impl EditorDock {
         Self {
             schema_version: super::LAYOUT_SCHEMA_VERSION,
             panel_ids: Vec::new(),
+            popouts: Vec::new(),
             state,
         }
     }
@@ -350,6 +356,49 @@ impl EditorDock {
     /// The panel ids the document carried.
     pub fn panel_ids(&self) -> &[String] {
         &self.panel_ids
+    }
+
+    /// The tabs popped out into their own OS windows.
+    pub fn popouts(&self) -> &[EditorTab] {
+        &self.popouts
+    }
+
+    /// Whether `tab` is currently popped out.
+    pub fn is_popped_out(&self, tab: EditorTab) -> bool {
+        self.popouts.contains(&tab)
+    }
+
+    /// Pop `tab` out into its own window: it leaves the dock tree, so the dock
+    /// draws it nowhere, and joins `popouts` so the next save remembers it.
+    /// Returns whether the tab was docked and moved.
+    pub fn pop_out(&mut self, tab: EditorTab) -> bool {
+        if self.popouts.contains(&tab) {
+            return false;
+        }
+        // The last tab is never popped out: an empty dock has no focused leaf
+        // for a redock to return to.
+        if self.state.iter_all_tabs().count() <= 1 {
+            return false;
+        }
+        let Some(path) = self.state.find_tab(&tab) else {
+            return false;
+        };
+        if self.state.remove_tab(path).is_none() {
+            return false;
+        }
+        self.popouts.push(tab);
+        true
+    }
+
+    /// Put a popped-out `tab` back into the focused leaf.
+    /// Returns whether it was popped out.
+    pub fn redock(&mut self, tab: EditorTab) -> bool {
+        let Some(index) = self.popouts.iter().position(|popped| *popped == tab) else {
+            return false;
+        };
+        self.popouts.remove(index);
+        self.state.push_to_focused_leaf(tab);
+        true
     }
 
     /// Rewrite every module tab's slot from the ids the document carried to
