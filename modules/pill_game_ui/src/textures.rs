@@ -163,7 +163,7 @@ impl TextureMirror {
             };
             let pixels: Arc<[u8]> = Arc::from(entry.pixels.as_slice());
             set.push_full(
-                TextureId::External(external_id(texture_id)),
+                TextureId(external_id(texture_id)),
                 entry.width,
                 entry.height,
                 entry.revision,
@@ -172,7 +172,7 @@ impl TextureMirror {
             );
         }
         for texture_id in self.freed.drain(..) {
-            set.push_free(TextureId::External(external_id(texture_id)));
+            set.push_free(TextureId(external_id(texture_id)));
         }
     }
 }
@@ -257,10 +257,10 @@ mod tests {
         let texture = &set.textures[0];
         assert_eq!(
             texture.id,
-            TextureId::External(external_id(EguiTextureId::Managed(0)))
+            TextureId(external_id(EguiTextureId::Managed(0)))
         );
         assert_eq!((texture.width, texture.height), (2, 2));
-        assert_eq!(texture.full_image().map(<[u8]>::len), Some(16));
+        assert_eq!(texture.pixels.len(), 16);
         assert_eq!(texture.filter, UiTextureFilter::Nearest);
 
         // The same mirror, carried again with nothing changed: nothing.
@@ -286,9 +286,8 @@ mod tests {
         mirror.carry(&mut second);
         let texture = &second.textures[0];
         assert!(texture.revision > revision, "the patch bumps the revision");
-        let full = texture
-            .full_image()
-            .expect("a patched texture still carries its image");
+        // A patched texture still carries its whole image.
+        let full = &texture.pixels;
         // The patch landed at (1, 1): row 1, columns 1 and 2 are white.
         let at = |x: usize, y: usize| full[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4].to_vec();
         assert_eq!(at(1, 1), vec![255, 255, 255, 255]);
@@ -313,7 +312,7 @@ mod tests {
         assert!(mirror.is_empty());
         let mut set = UiTextureSet::new();
         mirror.carry(&mut set);
-        assert_eq!(set.frees, vec![TextureId::External(3)]);
+        assert_eq!(set.frees, vec![TextureId(3)]);
         assert!(set.textures.is_empty());
     }
 

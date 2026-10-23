@@ -8,7 +8,7 @@ workspace = true
 
 # The plain draw data the UI library produces and the renderer contract
 # carries (`pill_renderer_api::RenderFrame.ui`): draw lists, the per-surface
-# UI frame, and the atlas update data. Split out of `pill_ui` so
+# UI frame, its textures and the slot it travels through. Split out of `pill_ui` so
 # `pill_renderer_api` can name the frame's UI type without depending on the
 # UI library (W-0032); a shared `dylib`, like the other cross-artifact type
 # crates, so the data has one identity across every artifact that builds or

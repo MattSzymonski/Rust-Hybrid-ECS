@@ -80,18 +80,21 @@ impl UiFrameSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::draw::{Color, DrawList, Rect};
+    use crate::draw::{Color, DrawList, Rect, TextureId};
     use crate::frame::UiDraw;
 
     /// A frame carrying one draw list, so emptiness is observable.
     fn drawn_frame() -> UiFrame {
         let mut frame = UiFrame::default();
         let mut list = DrawList::new();
-        list.push_fill(
+        list.push_quad(
+            TextureId(1),
             Rect::from_min_size(
                 pill_core::math::Vector2f::ZERO,
                 pill_core::math::Vector2f::new(2.0, 2.0),
             ),
+            pill_core::math::Vector2f::ZERO,
+            pill_core::math::Vector2f::new(1.0, 1.0),
             Color::WHITE,
         );
         frame.draws.push(UiDraw {

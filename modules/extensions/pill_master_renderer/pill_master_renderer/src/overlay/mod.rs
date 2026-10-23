@@ -1620,12 +1620,7 @@ mod tests {
             eprintln!("no wgpu adapter on this machine; the label render test is skipped");
             return;
         };
-        let mut painter = UiRenderer::new(
-            &device,
-            &queue,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            (64, 64),
-        );
+        let mut painter = UiRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
         painter.apply_texture_set(&device, &queue, &font::texture_set());
 
         // `|` lights its glyph's middle column, so the text covers x 4..6 and
