@@ -143,12 +143,11 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
         selected.append(verify_check("coding-standards", "Rust files changed"))
 
     # The shared draw data every UI producer and the renderer contract name:
-    # its own tests, plus the two crates whose types it defines (the engine
-    # core carries the frame slot, the game UI builds the lists).
+    # its own tests (the frame slot's among them), plus the game UI, which
+    # builds the lists and publishes them into the slot.
     if has("modules/pill_draw/**"):
         selected.append(cargo_check("test pill_draw",
-                                    ("test", "-p", "pill_draw", "-p", "pill_engine_core",
-                                     "-p", "pill_game_ui", "--offline"),
+                                    ("test", "-p", "pill_draw", "-p", "pill_game_ui", "--offline"),
                                     "shared draw data changed"))
 
     # The UI painter: `pill_draw` lists to wgpu. Its own tests cover the
@@ -174,14 +173,14 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
-    # feeds is `pill_draw_wgpu`, whose tests cover the draw lists. The engine
-    # core carries the frame slot, so a change here also moves what every
+    # feeds is `pill_draw_wgpu`, whose tests cover the draw lists. The slot it
+    # publishes into is `pill_draw`'s, so a change here also moves what every
     # module drains.
     if has("modules/pill_game_ui/**"):
         selected.append(cargo_check("test pill_game_ui", ("test", "-p", "pill_game_ui", "--offline"),
                                     "pill_game_ui changed"))
         selected.append(cargo_check("test the frame slot",
-                                    ("test", "-p", "pill_engine_core", "--offline"),
+                                    ("test", "-p", "pill_draw", "--offline"),
                                     "pill_game_ui changed"))
 
     # The editor: the shell module, frontend and the editor-side crates.

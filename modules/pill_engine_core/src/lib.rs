@@ -161,9 +161,6 @@ pub mod system;
 /// `Res<Input>`.
 pub mod input;
 
-/// The neutral frame a UI producer publishes and a renderer drains.
-pub mod ui_frame;
-
 /// Frame timing maintained by the engine and read through `Res<Time>`.
 pub mod time;
 
