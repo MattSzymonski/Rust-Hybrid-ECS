@@ -71,7 +71,7 @@ egui-wgpu = "0.36.2"
 # reloadable egui shell module speak, and the widget/docking libraries the
 # shell draws with. A shared dylib, like `pill_ui` was, so both sides agree
 # on the resource types' identity across a reload.
-pill_ui_egui = { path = "../../pill_ui_egui" }
+pill_editor_ui = { path = "../../pill_editor_ui" }
 # The egui editor's model: the docking layout, the shared selection and the
 # editor snapshot the shell's tabs read. A shared dylib like the boundary,
 # consumed by both the executable's fallback UI and the reloadable shell.

@@ -16,7 +16,7 @@
 //! marker that dies with this module's image. It holds no state of its own: a
 //! panel that kept a counter would need somewhere to keep it that survives a
 //! reload, and a world resource is the only such place - the egui context is
-//! never one (see the reload-safety contract in `pill_ui_egui`).
+//! never one (see the reload-safety contract in `pill_editor_ui`).
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;

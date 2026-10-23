@@ -44,10 +44,10 @@ use pill_editor_core_egui::editor_state::{EditorCommand, EditorSelection, Editor
 use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
 use pill_editor_core_egui::scripted::{Dump, ScriptedCommand};
 use pill_editor_core_egui::{entities, systems};
+use pill_editor_ui::boundary::{EguiShellFrame, EguiShellInput};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject};
-use pill_ui_egui::boundary::{EguiShellFrame, EguiShellInput};
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};

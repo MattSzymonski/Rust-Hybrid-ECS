@@ -38,19 +38,19 @@ pub use pill_editor_core_egui::session::{
 };
 pub use pill_editor_core_egui::systems;
 pub use pill_editor_core_egui::toolbox;
-pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
-pub use pill_ui_egui::boundary::{
+pub use pill_editor_ui::boundary::{
     frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
     SCENE_VIEWS_MAX,
 };
-pub use pill_ui_egui::egui;
-pub use pill_ui_egui::egui_dock::{
+pub use pill_editor_ui::egui;
+pub use pill_editor_ui::egui_dock::{
     DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
 };
-pub use pill_ui_egui::icons;
-pub use pill_ui_egui::panels::{
+pub use pill_editor_ui::icons;
+pub use pill_editor_ui::panels::{
     PanelCommand, PanelComponentValues, PanelContext, PanelDrawFn, PanelEntityDetail,
     PanelEntityRow, PanelFieldValue, PanelRegistry, PanelWindowRequest,
 };
-pub use pill_ui_egui::style;
+pub use pill_editor_ui::style;
+pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
 pub use serde_json::Value as JsonValue;

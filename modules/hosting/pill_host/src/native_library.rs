@@ -104,7 +104,7 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// `pill_game_ui` is the in-game egui UI (W-0028): a project draws into its
 /// context and the renderer drains its frame, so a project reload must find
 /// the same copy the host loaded - the whole point of the crate being shared.
-/// `pill_ui_egui` and `pill_editor_core_egui` are the egui editor's shared
+/// `pill_editor_ui` and `pill_editor_core_egui` are the egui editor's shared
 /// copies (W-0017). Its frontend and shell exchange their types the same way,
 /// so they get the same treatment.
 pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
@@ -112,7 +112,7 @@ pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_engine_core",
     "pill_draw",
     "pill_game_ui",
-    "pill_ui_egui",
+    "pill_editor_ui",
     "pill_editor_core_egui",
 ];
 

@@ -65,7 +65,7 @@ pub fn panel_windows(
         let answer = windows
             .answer
             .as_ref()
-            .map(|answer| pill_ui_egui::panels::PanelAnswer {
+            .map(|answer| pill_editor_ui::panels::PanelAnswer {
                 window: answer.window.clone(),
                 accepted: answer.accepted,
             });

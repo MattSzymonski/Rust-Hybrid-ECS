@@ -34,7 +34,7 @@ pill_renderer_api = { path = "../../hosting/pill_renderer_api" }
 # The egui UI library: the dock model names `egui_dock` through its
 # re-exports, so the shell, the frontend and this crate resolve one pinned
 # copy of egui (W-0017, plan decision E3).
-pill_ui_egui = { path = "../../pill_ui_egui" }
+pill_editor_ui = { path = "../../pill_editor_ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -18,7 +18,7 @@ members = [
     "pill_draw_wgpu",
     # The egui editor's own UI library (W-0017): a shared dylib so the egui
     # editor's world can replace its UI core across a reload.
-    "pill_ui_egui",
+    "pill_editor_ui",
     # The in-game egui UI (W-0028): a third shared dylib, so a project's egui
     # context outlives a project reload and its frame is neutral data the main
     # renderer draws.

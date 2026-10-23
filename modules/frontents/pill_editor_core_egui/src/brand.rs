@@ -7,7 +7,7 @@
 //! - Holds no drawing code: the shell decides where the mark sits and what
 //!   colour it takes.
 //!
-//! The source is `modules/pill_ui_egui/assets/pill_mark.svg` (500x500, one
+//! The source is `modules/pill_editor_ui/assets/pill_mark.svg` (500x500, one
 //! white path of three subpaths). egui has no SVG renderer in this crate
 //! graph, so the path was flattened and rasterised offline - even-odd fill,
 //! 8x8 supersampling per texel, the path's bounding box
@@ -17,7 +17,7 @@
 //! is pinned by this module's tests.
 
 // External crates
-use pill_ui_egui::egui;
+use pill_editor_ui::egui;
 
 /// The mark's resolution, in texels: square, one byte of coverage each.
 pub const MARK_SIDE: usize = 48;
