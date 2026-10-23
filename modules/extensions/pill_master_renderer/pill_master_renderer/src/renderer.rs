@@ -709,15 +709,7 @@ impl State {
             depth_format,
             &camera_bind_group_layout,
         )?;
-        let mut ui_renderer = UiRenderer::new(
-            &device,
-            &queue,
-            surface.format(),
-            (
-                pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
-                pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
-            ),
-        );
+        let mut ui_renderer = UiRenderer::new(&device, surface.format());
         ui_renderer.apply_texture_set(&device, &queue, &overlay::font::texture_set());
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);

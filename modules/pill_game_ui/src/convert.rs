@@ -15,21 +15,14 @@
 //! the W-0028 Stage 1 decision record, Q2). Vertices are not scaled: the
 //! painter takes the monitor scale and applies it itself, which keeps one
 //! `pixels_per_point` per frame (D8).
-//!
-//! The vertex's `local` and `shape` fields stay zeroed - egui emits its own
-//! antialiasing - and the shader reads a zero radius and softness as "a plain
-//! quad", so no rounded-corner work is undone twice.
 
 // External crates
 use egui::{ClippedPrimitive, Color32, TextureId as EguiTextureId};
 use pill_core::math::Vector2f;
 use pill_draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 
-/// The bit that separates egui's managed texture ids from its user ids.
-///
-/// `pill_draw::TextureId::Atlas` is reserved for the UI glyph atlas, so
-/// every egui texture arrives as an external and the two id spaces cannot
-/// collide.
+/// The bit that separates egui's managed texture ids from its user ids, so
+/// the two id spaces cannot collide in one `pill_draw::TextureId`.
 const USER_TEXTURE_CEILING: u64 = 1 << 63;
 
 /// Append `primitives` to `list` and return how many draws it added.
@@ -53,8 +46,6 @@ pub fn convert(primitives: &[ClippedPrimitive], list: &mut DrawList) -> usize {
                 position: Vector2f::new(vertex.pos.x, vertex.pos.y),
                 uv: Vector2f::new(vertex.uv.x, vertex.uv.y),
                 color: straight_color(vertex.color),
-                local: Vector2f::new(0.0, 0.0),
-                shape: [0.0; 4],
             });
         }
         let first_index = list.indices.len() as u32;
@@ -65,7 +56,7 @@ pub fn convert(primitives: &[ClippedPrimitive], list: &mut DrawList) -> usize {
             max: Vector2f::new(primitive.clip_rect.max.x, primitive.clip_rect.max.y),
         });
         list.commands.push(DrawCommand::Draw {
-            texture: TextureId::External(external_id(mesh.texture_id)),
+            texture: TextureId(external_id(mesh.texture_id)),
             first_index,
             index_count: mesh.indices.len() as u32,
         });
@@ -128,7 +119,7 @@ mod tests {
                     max: Vector2f::new(10.0, 10.0),
                 }),
                 DrawCommand::Draw {
-                    texture: TextureId::External(USER_TEXTURE_CEILING),
+                    texture: TextureId(USER_TEXTURE_CEILING),
                     first_index: 0,
                     index_count: 3,
                 },
@@ -154,7 +145,7 @@ mod tests {
                 first_index,
                 index_count,
             } => {
-                assert_eq!(*texture, TextureId::External(5));
+                assert_eq!(*texture, TextureId(5));
                 assert_eq!(*first_index, 3);
                 assert_eq!(*index_count, 3);
             }

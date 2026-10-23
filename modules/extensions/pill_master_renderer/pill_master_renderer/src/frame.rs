@@ -709,11 +709,14 @@ mod tests {
     fn drawn_frame() -> pill_renderer_api::frame::RenderFrame {
         let mut frame = RenderFrame::default();
         let mut list = pill_draw::DrawList::new();
-        list.push_fill(
+        list.push_quad(
+            pill_draw::TextureId(1),
             pill_draw::Rect::from_min_size(
                 pill_core::math::Vector2f::ZERO,
                 pill_core::math::Vector2f::new(2.0, 2.0),
             ),
+            pill_core::math::Vector2f::ZERO,
+            pill_core::math::Vector2f::new(1.0, 1.0),
             pill_draw::Color::WHITE,
         );
         frame.ui.draws.push(pill_draw::UiDraw {

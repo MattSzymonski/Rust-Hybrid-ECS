@@ -283,7 +283,7 @@ mod tests {
                 .textures
                 .textures
                 .iter()
-                .any(|texture| texture.id == pill_draw::TextureId::External(1 << 63)),
+                .any(|texture| texture.id == pill_draw::TextureId(1 << 63)),
             "the font atlas was not carried"
         );
         let ui = engine

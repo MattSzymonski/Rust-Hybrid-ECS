@@ -116,7 +116,7 @@ pub(super) struct Atlas {
 /// Reserved out of the game UI's external range: `pill_game_ui` numbers
 /// egui's managed textures `1 << 63 | id`, and egui never reaches the id that
 /// would make this one.
-pub(crate) const FONT_TEXTURE: TextureId = TextureId::External(u64::MAX);
+pub(crate) const FONT_TEXTURE: TextureId = TextureId(u64::MAX);
 
 /// The atlas's width and height in texels: every glyph's cell, in rows of
 /// [`ATLAS_COLUMNS`].
@@ -239,7 +239,7 @@ mod tests {
         let set = texture_set();
         let texture = &set.textures[0];
         assert_eq!((texture.width, texture.height), atlas_size());
-        let pixels = texture.full_image().expect("the whole image");
+        let pixels = &texture.pixels;
         let lit = atlas
             .texels
             .iter()

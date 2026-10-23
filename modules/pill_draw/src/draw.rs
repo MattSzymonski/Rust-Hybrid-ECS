@@ -1,4 +1,4 @@
-//! What a panel wants drawn, as plain data.
+//! What a UI wants drawn, as plain data.
 //!
 //! # Responsibilities
 //!
@@ -16,9 +16,10 @@
 //! draws. Clips nest: [`DrawList::push_clip`] intersects the given rectangle
 //! with the current clip, and every draw between a push and its matching
 //! [`DrawList::pop_clip`] belongs clipped to it.
-
-// Standard library
-use std::ops::Range;
+//!
+//! Every draw samples a texture its producer carried in the frame's texture
+//! set; a solid fill samples a white texel of one, the way egui's own
+//! tessellation does.
 
 // External crates
 use pill_core::math::Vector2f;
@@ -41,12 +42,8 @@ pub struct Color {
 }
 
 impl Color {
-    /// Fully transparent black.
-    pub const TRANSPARENT: Color = Color::rgba(0.0, 0.0, 0.0, 0.0);
     /// Opaque white.
     pub const WHITE: Color = Color::rgba(1.0, 1.0, 1.0, 1.0);
-    /// Opaque black.
-    pub const BLACK: Color = Color::rgba(0.0, 0.0, 0.0, 1.0);
 
     /// A colour from straight alpha components in `0.0..=1.0`.
     pub const fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
@@ -110,14 +107,6 @@ impl Rect {
         self.max.y - self.min.y
     }
 
-    /// Whether `point` lies inside, edges included.
-    pub fn contains(&self, point: Vector2f) -> bool {
-        point.x >= self.min.x
-            && point.x <= self.max.x
-            && point.y >= self.min.y
-            && point.y <= self.max.y
-    }
-
     /// The overlap of two rectangles, or `None` when they do not overlap.
     pub fn intersection(&self, other: &Rect) -> Option<Rect> {
         let min = Vector2f::new(self.min.x.max(other.min.x), self.min.y.max(other.min.y));
@@ -130,20 +119,13 @@ impl Rect {
 // Texture and vertex types
 // =============================================================================
 
-/// Which texture a draw samples.
+/// Which texture a draw samples: the number its producer carried it under in
+/// the frame's texture set.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum TextureId {
-    /// The glyph and icon atlas.
-    Atlas,
-    /// No texture: the vertex colour fills the shape.
-    Solid,
-    /// A texture the caller registered with the backend under this number.
-    External(u64),
-}
+pub struct TextureId(pub u64);
 
 /// One vertex: a position in logical pixels, a texture coordinate in
-/// `0.0..=1.0`, a colour multiplied into the sampled texel, and the shape
-/// data the rounded-corner shader needs.
+/// `0.0..=1.0`, and a colour multiplied into the sampled texel.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct UiVertex {
     /// Position in logical pixels, y down.
@@ -152,12 +134,6 @@ pub struct UiVertex {
     pub uv: Vector2f,
     /// The vertex colour.
     pub color: Color,
-    /// Position within the quad, `(0, 0)` at its top-left corner: the space
-    /// a backend evaluates rounded corners and soft edges in.
-    pub local: Vector2f,
-    /// The quad's shape: `[half_width, half_height, corner_radius,
-    /// edge_softness]`. Zero radius and softness is a plain rectangle.
-    pub shape: [f32; 4],
 }
 
 /// One ordered draw operation.
@@ -235,51 +211,6 @@ impl DrawList {
         self.commands.push(DrawCommand::PopClip);
     }
 
-    /// A solid-coloured rectangle.
-    pub fn push_fill(&mut self, rect: Rect, color: Color) {
-        self.push_rounded_fill(rect, color, 0.0);
-    }
-
-    /// A solid-coloured rectangle with rounded corners.
-    ///
-    /// The rounding is shape data, not extra geometry: a backend with the
-    /// rounded shader draws it directly. The radius is clamped to the
-    /// rectangle's half extent, beyond which it is a capsule.
-    pub fn push_rounded_fill(&mut self, rect: Rect, color: Color, corner_radius: f32) {
-        let shape = self.shape(rect, corner_radius, 0.0);
-        self.push_shaped_quad(
-            TextureId::Solid,
-            rect,
-            Vector2f::ZERO,
-            Vector2f::ZERO,
-            color,
-            shape,
-        );
-    }
-
-    /// A solid rectangle whose edge fades over `softness` pixels: full
-    /// colour `softness` inside the boundary, nothing at and beyond it - the
-    /// primitive behind `box-shadow`. `rect` is the visible outer extent.
-    pub fn push_soft_fill(&mut self, rect: Rect, color: Color, corner_radius: f32, softness: f32) {
-        let shape = self.shape(rect, corner_radius, softness);
-        self.push_shaped_quad(
-            TextureId::Solid,
-            rect,
-            Vector2f::ZERO,
-            Vector2f::ZERO,
-            color,
-            shape,
-        );
-    }
-
-    /// The shape array for a quad: half extents, clamped radius, softness.
-    fn shape(&self, rect: Rect, corner_radius: f32, softness: f32) -> [f32; 4] {
-        let half_width = rect.width() * 0.5;
-        let half_height = rect.height() * 0.5;
-        let radius = corner_radius.clamp(0.0, half_width.min(half_height));
-        [half_width, half_height, radius, softness.max(0.0)]
-    }
-
     /// A rectangle textured from `rect`'s corner-to-corner UV range.
     ///
     /// Vertices are appended in top-left, top-right, bottom-right,
@@ -293,53 +224,20 @@ impl DrawList {
         uv_max: Vector2f,
         color: Color,
     ) {
-        let shape = self.shape(rect, 0.0, 0.0);
-        self.push_shaped_quad(texture, rect, uv_min, uv_max, color, shape);
-    }
-
-    /// The one vertex writer: appends the quad's four vertices (top-left,
-    /// top-right, bottom-right, bottom-left), its indices and the draw
-    /// command.
-    fn push_shaped_quad(
-        &mut self,
-        texture: TextureId,
-        rect: Rect,
-        uv_min: Vector2f,
-        uv_max: Vector2f,
-        color: Color,
-        shape: [f32; 4],
-    ) {
-        let width = rect.width();
-        let height = rect.height();
         let base = self.vertices.len() as u32;
-        self.vertices.push(UiVertex {
-            position: Vector2f::new(rect.min.x, rect.min.y),
-            uv: Vector2f::new(uv_min.x, uv_min.y),
-            color,
-            local: Vector2f::new(0.0, 0.0),
-            shape,
-        });
-        self.vertices.push(UiVertex {
-            position: Vector2f::new(rect.max.x, rect.min.y),
-            uv: Vector2f::new(uv_max.x, uv_min.y),
-            color,
-            local: Vector2f::new(width, 0.0),
-            shape,
-        });
-        self.vertices.push(UiVertex {
-            position: Vector2f::new(rect.max.x, rect.max.y),
-            uv: Vector2f::new(uv_max.x, uv_max.y),
-            color,
-            local: Vector2f::new(width, height),
-            shape,
-        });
-        self.vertices.push(UiVertex {
-            position: Vector2f::new(rect.min.x, rect.max.y),
-            uv: Vector2f::new(uv_min.x, uv_max.y),
-            color,
-            local: Vector2f::new(0.0, height),
-            shape,
-        });
+        let corners = [
+            (rect.min.x, rect.min.y, uv_min.x, uv_min.y),
+            (rect.max.x, rect.min.y, uv_max.x, uv_min.y),
+            (rect.max.x, rect.max.y, uv_max.x, uv_max.y),
+            (rect.min.x, rect.max.y, uv_min.x, uv_max.y),
+        ];
+        for (x, y, u, v) in corners {
+            self.vertices.push(UiVertex {
+                position: Vector2f::new(x, y),
+                uv: Vector2f::new(u, v),
+                color,
+            });
+        }
 
         let first_index = self.indices.len() as u32;
         self.indices
@@ -368,78 +266,6 @@ impl DrawList {
             index_count,
         });
     }
-
-    /// The index range of the `command`-th [`DrawCommand::Draw`], for
-    /// introspection and tests.
-    pub fn draw_range(&self, command: usize) -> Option<Range<u32>> {
-        let mut seen = 0usize;
-        for entry in &self.commands {
-            if let DrawCommand::Draw {
-                first_index,
-                index_count,
-                ..
-            } = entry
-            {
-                if seen == command {
-                    return Some(*first_index..first_index + index_count);
-                }
-                seen += 1;
-            }
-        }
-        None
-    }
-
-    /// Shift every vertex and clip rectangle by `offset`.
-    ///
-    /// A list is painted at the origin; a caller that puts it into a
-    /// sub-region - an editor panel at its dock rectangle - translates it
-    /// after painting instead of painting in a translated space. Draw
-    /// commands carry no positions, so only the vertices and the push-clip
-    /// rectangles move.
-    pub fn translate(&mut self, offset: Vector2f) {
-        for vertex in &mut self.vertices {
-            vertex.position += offset;
-        }
-        for command in &mut self.commands {
-            if let DrawCommand::PushClip(rect) = command {
-                rect.min += offset;
-                rect.max += offset;
-            }
-        }
-    }
-
-    /// Append `other`'s work after this list's own, renumbering vertex
-    /// indices and draw ranges.
-    ///
-    /// `other` must have its clips balanced (every push matched by a pop),
-    /// which every list produced by the UI core's paint pass is; an
-    /// unbalanced list would leave this list's clip state wrong.
-    pub fn append(&mut self, other: DrawList) {
-        debug_assert!(
-            other.clip_depth == 0,
-            "append needs a list with balanced clips"
-        );
-        let vertex_base = self.vertices.len() as u32;
-        let index_base = self.indices.len() as u32;
-        self.vertices.extend(other.vertices);
-        self.indices
-            .extend(other.indices.into_iter().map(|index| index + vertex_base));
-        for command in other.commands {
-            self.commands.push(match command {
-                DrawCommand::Draw {
-                    texture,
-                    first_index,
-                    index_count,
-                } => DrawCommand::Draw {
-                    texture,
-                    first_index: first_index + index_base,
-                    index_count,
-                },
-                DrawCommand::PushClip(rect) => DrawCommand::PushClip(rect),
-                DrawCommand::PopClip => DrawCommand::PopClip,
-            });
-        }
-    }
 }
 
 // =============================================================================
@@ -454,16 +280,28 @@ mod tests {
         Rect::from_min_size(Vector2f::new(min_x, min_y), Vector2f::new(size, size))
     }
 
+    /// `push_quad` onto `list` with the whole texture and white colour.
+    fn push(list: &mut DrawList, texture: u64, rect: Rect) {
+        list.push_quad(
+            TextureId(texture),
+            rect,
+            Vector2f::ZERO,
+            Vector2f::new(1.0, 1.0),
+            Color::WHITE,
+        );
+    }
+
     #[test]
     fn a_quad_adds_four_vertices_and_six_indices() {
         let mut list = DrawList::new();
-        list.push_fill(quad_rect(0.0, 0.0, 10.0), Color::WHITE);
+        push(&mut list, 1, quad_rect(0.0, 0.0, 10.0));
         assert_eq!(list.vertices.len(), 4);
         assert_eq!(list.indices, [0, 1, 2, 0, 2, 3]);
+        assert_eq!(list.vertices[2].uv, Vector2f::new(1.0, 1.0));
         assert_eq!(
             list.commands,
             [DrawCommand::Draw {
-                texture: TextureId::Solid,
+                texture: TextureId(1),
                 first_index: 0,
                 index_count: 6,
             }]
@@ -474,49 +312,36 @@ mod tests {
     #[test]
     fn consecutive_quads_of_one_texture_share_a_command() {
         let mut list = DrawList::new();
-        list.push_quad(
-            TextureId::Atlas,
-            quad_rect(0.0, 0.0, 8.0),
-            Vector2f::ZERO,
-            Vector2f::new(0.1, 0.1),
-            Color::WHITE,
-        );
-        list.push_quad(
-            TextureId::Atlas,
-            quad_rect(8.0, 0.0, 8.0),
-            Vector2f::ZERO,
-            Vector2f::new(0.1, 0.1),
-            Color::WHITE,
-        );
+        push(&mut list, 3, quad_rect(0.0, 0.0, 8.0));
+        push(&mut list, 3, quad_rect(8.0, 0.0, 8.0));
         assert_eq!(list.vertices.len(), 8);
-        assert_eq!(list.commands.len(), 1);
-        assert_eq!(list.draw_range(0), Some(0..12));
+        assert_eq!(
+            list.commands,
+            [DrawCommand::Draw {
+                texture: TextureId(3),
+                first_index: 0,
+                index_count: 12,
+            }]
+        );
     }
 
     #[test]
     fn a_texture_change_or_a_clip_change_starts_a_new_command() {
         let mut list = DrawList::new();
-        list.push_fill(quad_rect(0.0, 0.0, 8.0), Color::WHITE);
-        list.push_quad(
-            TextureId::External(7),
-            quad_rect(8.0, 0.0, 8.0),
-            Vector2f::ZERO,
-            Vector2f::new(1.0, 1.0),
-            Color::WHITE,
-        );
+        push(&mut list, 1, quad_rect(0.0, 0.0, 8.0));
+        push(&mut list, 7, quad_rect(8.0, 0.0, 8.0));
         list.push_clip(quad_rect(0.0, 0.0, 100.0));
-        list.push_quad(
-            TextureId::External(7),
-            quad_rect(16.0, 0.0, 8.0),
-            Vector2f::ZERO,
-            Vector2f::new(1.0, 1.0),
-            Color::WHITE,
-        );
+        push(&mut list, 7, quad_rect(16.0, 0.0, 8.0));
         assert_eq!(list.commands.len(), 4);
-        assert_eq!(list.draw_range(0), Some(0..6));
-        assert_eq!(list.draw_range(1), Some(6..12));
-        assert_eq!(list.draw_range(2), Some(12..18));
         assert!(matches!(list.commands[2], DrawCommand::PushClip(_)));
+        assert!(matches!(
+            list.commands[3],
+            DrawCommand::Draw {
+                first_index: 12,
+                index_count: 6,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -533,13 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn rectangles_normalize_and_contain() {
+    fn rectangles_normalize_and_intersect() {
         let rect = Rect::new(Vector2f::new(10.0, 10.0), Vector2f::new(0.0, 0.0));
         assert_eq!(rect.min, Vector2f::ZERO);
         assert_eq!(rect.max, Vector2f::new(10.0, 10.0));
-        assert!(rect.contains(Vector2f::new(5.0, 5.0)));
-        assert!(rect.contains(Vector2f::new(0.0, 0.0)));
-        assert!(!rect.contains(Vector2f::new(10.5, 5.0)));
 
         let other = Rect::from_min_size(Vector2f::new(5.0, 5.0), Vector2f::new(10.0, 10.0));
         assert_eq!(
@@ -551,43 +373,5 @@ mod tests {
         );
         let apart = Rect::from_min_size(Vector2f::new(50.0, 50.0), Vector2f::new(1.0, 1.0));
         assert_eq!(rect.intersection(&apart), None);
-    }
-
-    #[test]
-    fn translate_shifts_vertices_and_clip_rectangles() {
-        let mut list = DrawList::new();
-        let rect = quad_rect(0.0, 0.0, 10.0);
-        list.push_clip(rect);
-        list.push_fill(rect, Color::WHITE);
-        list.pop_clip();
-        list.translate(Vector2f::new(100.0, 50.0));
-        for vertex in &list.vertices {
-            assert!(vertex.position.x >= 100.0);
-            assert!(vertex.position.y >= 50.0);
-        }
-        let Some(DrawCommand::PushClip(clip)) = list.commands.first() else {
-            panic!("the push-clip survives the shift");
-        };
-        assert_eq!(clip.min, Vector2f::new(100.0, 50.0));
-        assert_eq!(clip.max, Vector2f::new(110.0, 60.0));
-    }
-
-    #[test]
-    fn append_renumbers_indices_and_draw_ranges() {
-        let mut first = DrawList::new();
-        first.push_fill(quad_rect(0.0, 0.0, 10.0), Color::WHITE);
-        let mut second = DrawList::new();
-        second.push_fill(quad_rect(20.0, 0.0, 10.0), Color::BLACK);
-        let second_vertices = second.vertices.len() as u32;
-        first.append(second);
-        // Both quads' indices now address the merged vertex array.
-        assert_eq!(first.vertices.len(), 8);
-        assert_eq!(first.indices.len(), 12);
-        for index in &first.indices {
-            assert!(*index < first.vertices.len() as u32);
-        }
-        // The second quad's draw range starts after the first quad's.
-        assert_eq!(first.draw_range(1), Some(6..(6 + 6)));
-        assert_eq!(second_vertices, 4);
     }
 }

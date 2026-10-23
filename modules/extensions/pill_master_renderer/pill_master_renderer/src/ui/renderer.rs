@@ -2,9 +2,9 @@
 //!
 //! # Responsibilities
 //!
-//! - [`UiRenderer`]: owns the render pipeline, the atlas texture and
-//!   the registered external textures; uploads texture changes and draws a
-//!   surface's [`DrawList`]s into its target.
+//! - [`UiRenderer`]: owns the render pipeline and the textures the frames
+//!   carried; uploads texture changes and draws a surface's [`DrawList`]s
+//!   into its target.
 //! - Applies each list's scale factor, its nested clip rectangles (as scissor
 //!   rectangles) and correct sRGB blending.
 //!
@@ -18,10 +18,11 @@
 //! per submission (see [`StreamBuffer`]).
 //!
 //! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]): the
-//! renderer remembers the revision it applied per texture and uploads
-//! whenever the carried revision is newer, so an instance rebuilt mid-run -
-//! and therefore remembering nothing - re-uploads every texture the set
-//! carries instead of drawing with empty textures (W-0028 D3).
+//! painter remembers the revision it applied per texture and uploads the
+//! whole image whenever the carried revision differs, so an instance rebuilt
+//! mid-run - and therefore remembering nothing - re-uploads every texture the
+//! set carries instead of drawing with empty textures (W-0028 D3). A draw
+//! naming a texture the painter does not hold is skipped.
 //!
 //! Colour correctness: `pill_draw` colours are sRGB with straight alpha. The
 //! shader converts vertex colours to linear, the textures are created as
@@ -37,8 +38,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
 use pill_draw::{
-    DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter, UiTextureSet,
-    UiVertex,
+    DrawCommand, DrawList, Rect, TextureId, UiTexture, UiTextureFilter, UiTextureSet, UiVertex,
 };
 
 // Current crate
@@ -64,16 +64,12 @@ struct VertexIn {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) local: vec2<f32>,
-    @location(4) shape: vec4<f32>,
 };
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) local: vec2<f32>,
-    @location(3) shape: vec4<f32>,
 };
 
 // The sRGB to linear-light transfer function, per channel.
@@ -90,44 +86,16 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.position = vec4<f32>(normalized.x * 2.0 - 1.0, 1.0 - normalized.y * 2.0, 0.0, 1.0);
     out.uv = in.uv;
     out.color = in.color;
-    out.local = in.local;
-    out.shape = in.shape;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // The sampled texel is linear already (the texture decodes sRGB); the
+    // vertex colour is decoded here, and the sRGB target encodes the result.
     let texel = textureSample(ui_texture, ui_sampler, in.uv);
-    var coverage = 1.0;
-    let radius = in.shape.z;
-    let softness = in.shape.w;
-    // The signed distance to the rounded rectangle's edge, from the
-    // interpolated quad-local position and the shape's half extents. Both
-    // this and the derivative below are evaluated in uniform control flow:
-    // WGSL requires `fwidth` to stay outside of non-uniform branches (the
-    // WebGL2 backend rejects the shader otherwise), while native backends
-    // happen to tolerate it.
-    let half = in.shape.xy;
-    let point = in.local - half;
-    let offset = abs(point) - half + vec2<f32>(radius);
-    let distance =
-        length(max(offset, vec2<f32>(0.0))) + min(max(offset.x, offset.y), 0.0) - radius;
-    let edge_width = max(fwidth(distance), 0.0001);
-    if (radius > 0.0 || softness > 0.0) {
-        if (softness > 0.0) {
-            // A soft shape (a shadow): full `softness` pixels inside the
-            // edge, nothing at and beyond it.
-            let falloff = clamp(-distance / softness, 0.0, 1.0);
-            coverage = falloff * falloff * (3.0 - 2.0 * falloff);
-        } else {
-            // A rounded fill: antialias the one-pixel boundary.
-            coverage = 1.0 - smoothstep(0.0, edge_width, distance);
-        }
-    }
-    // Both the sampled texel and the vertex colour are linear light already;
-    // the sRGB target encodes the result.
     let linear = srgb_to_linear(in.color.rgb) * texel.rgb;
-    return vec4<f32>(linear, in.color.a * texel.a * coverage);
+    return vec4<f32>(linear, in.color.a * texel.a);
 }
 "#;
 
@@ -144,8 +112,6 @@ struct GpuVertex {
     position: [f32; 2],
     uv: [f32; 2],
     color: [f32; 4],
-    local: [f32; 2],
-    shape: [f32; 4],
 }
 
 impl GpuVertex {
@@ -164,19 +130,15 @@ impl GpuVertex {
                 vertex.color.b,
                 vertex.color.a,
             ],
-            local: [vertex.local.x, vertex.local.y],
-            shape: vertex.shape,
         }
     }
 }
 
 /// The vertex layout matching [`GpuVertex`].
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
     0 => Float32x2,
     1 => Float32x2,
-    2 => Float32x4,
-    3 => Float32x2,
-    4 => Float32x4
+    2 => Float32x4
 ];
 
 // =============================================================================
@@ -187,45 +149,30 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
 ///
 /// One renderer belongs to one device and one target format. The caller
 /// uploads texture changes once per frame ([`Self::apply_texture_set`]) and calls
-/// [`Self::render`] for each target the list draws into.
+/// [`Self::render`] once per surface.
 pub struct UiRenderer {
     pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     texture_layout: wgpu::BindGroupLayout,
+    /// The sampler [`UiTextureFilter::Linear`] asks for.
     sampler: wgpu::Sampler,
-    /// The sampler [`UiTextureFilter::Nearest`] asks for, beside the linear
-    /// one the crate was built with.
+    /// The sampler [`UiTextureFilter::Nearest`] asks for.
     nearest_sampler: wgpu::Sampler,
-    atlas_texture: wgpu::Texture,
-    atlas_bind_group: wgpu::BindGroup,
-    atlas_size: (u32, u32),
-    atlas_uploaded: bool,
-    solid_bind_group: wgpu::BindGroup,
-    externals: HashMap<u64, ExternalTexture>,
-    /// The revision this instance applied per texture; a rebuilt instance
-    /// starts empty and therefore re-uploads everything.
-    applied_revisions: HashMap<TextureId, u64>,
+    /// Every texture a set carried and has not freed, with the revision
+    /// applied; a rebuilt instance starts empty and so re-uploads everything.
+    textures: HashMap<TextureId, PainterTexture>,
     /// Every list of the surface being drawn: its vertices, then its indices.
     vertices: StreamBuffer,
     indices: StreamBuffer,
 }
 
 impl UiRenderer {
-    /// Build the pipeline and the atlas texture for `target_format`.
+    /// Build the pipeline for `target_format`.
     ///
-    /// `atlas_size` is the atlas page the painter starts at (`pill_draw`'s
-    /// same numbers); a later page growth recreates the texture inside
-    /// `DEFAULT_ATLAS_LENGTH`). Pass an sRGB target format
-    /// (`Rgba8UnormSrgb`, or a surface format's sRGB variant); the shader
-    /// assumes the target encodes linear light. `queue` initializes the
-    /// white texel solid quads sample.
-    pub fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        target_format: wgpu::TextureFormat,
-        atlas_size: (u32, u32),
-    ) -> UiRenderer {
+    /// Pass an sRGB target format (`Rgba8UnormSrgb`, or a surface format's
+    /// sRGB variant); the shader assumes the target encodes linear light.
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> UiRenderer {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pill_draw globals layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -351,48 +298,6 @@ impl UiRenderer {
             cache: None,
         });
 
-        let (atlas_texture, atlas_bind_group) =
-            atlas_resources(device, &texture_layout, &sampler, atlas_size);
-
-        // The `Solid` texture: one white texel, so a solid quad is the vertex
-        // colour times 1. The shader needs no branch for it, and all draws
-        // share one pipeline.
-        let solid_texture = create_srgb_texture(device, "pill_draw solid", (1, 1));
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &solid_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        let solid_view = solid_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let solid_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_draw solid bind group"),
-            layout: &texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&solid_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
         UiRenderer {
             pipeline,
             globals_buffer,
@@ -400,13 +305,7 @@ impl UiRenderer {
             texture_layout,
             sampler,
             nearest_sampler,
-            atlas_texture,
-            atlas_bind_group,
-            atlas_size,
-            atlas_uploaded: false,
-            solid_bind_group,
-            externals: HashMap::new(),
-            applied_revisions: HashMap::new(),
+            textures: HashMap::new(),
             vertices: StreamBuffer::new("pill_draw vertices", wgpu::BufferUsages::VERTEX),
             indices: StreamBuffer::new("pill_draw indices", wgpu::BufferUsages::INDEX),
         }
@@ -415,10 +314,10 @@ impl UiRenderer {
     /// Upload every texture in `set` whose carried revision this instance has
     /// not applied, then free the ones it names.
     ///
-    /// This is the reload-safe path (W-0028 D3): a rebuilt instance has an
-    /// empty revision table, so the first set it sees uploads every texture
-    /// from the whole images the set carries - no back-channel, no cadence.
-    /// A live instance only uploads what changed.
+    /// This is the reload-safe path (W-0028 D3): a rebuilt instance holds no
+    /// textures, so the first set it sees uploads every texture from the whole
+    /// images the set carries - no back-channel, no cadence. A live instance
+    /// only uploads what changed.
     pub fn apply_texture_set(
         &mut self,
         device: &wgpu::Device,
@@ -426,136 +325,53 @@ impl UiRenderer {
         set: &UiTextureSet,
     ) {
         for texture in &set.textures {
-            if self.applied_revisions.get(&texture.id) == Some(&texture.revision) {
-                continue;
+            let applied = self.textures.get(&texture.id).map(|entry| entry.revision);
+            if applied != Some(texture.revision) {
+                self.apply_texture(device, queue, texture);
             }
-            self.apply_texture(device, queue, texture);
-            self.applied_revisions.insert(texture.id, texture.revision);
         }
         for id in &set.frees {
-            self.free_texture(id);
+            self.textures.remove(id);
         }
     }
 
-    /// Upload one texture at its carried revision.
-    ///
-    /// The whole image, when the revision carries one, is the authoritative
-    /// content: it is uploaded whether or not this instance already holds the
-    /// texture, which is what makes a rebuilt instance catch up in one frame.
-    /// Patches are the cheap path for a revision that carries no whole image,
-    /// and only mean anything for a texture the instance already holds - a
-    /// patch for a texture it never applied is reported and skipped rather
-    /// than drawn as garbage.
+    /// Upload one texture's whole image at its carried revision, reusing the
+    /// GPU texture when its size is unchanged.
     fn apply_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &UiTexture) {
         let size = (texture.width, texture.height);
-        let sampler = self.sampler_for(texture.filter);
-        match texture.id {
-            TextureId::Atlas => {
-                if size != self.atlas_size {
-                    let (created, bind_group) =
-                        atlas_resources(device, &self.texture_layout, &sampler, size);
-                    self.atlas_texture = created;
-                    self.atlas_bind_group = bind_group;
-                    self.atlas_size = size;
-                    self.atlas_uploaded = false;
-                }
-                match texture.full_image() {
-                    Some(pixels) => {
-                        upload_whole_texture(queue, &self.atlas_texture, size, pixels);
-                        self.atlas_uploaded = true;
-                    }
-                    None if self.atlas_uploaded => {
-                        for (region, pixels) in texture.patches() {
-                            upload_region_pixels(queue, &self.atlas_texture, region, pixels);
-                        }
-                    }
-                    None => report_orphan_patch("atlas"),
-                }
-            }
-            TextureId::External(id) => {
-                let existing_size = self.externals.get(&id).map(|entry| entry.size);
-                let target = match texture.full_image() {
-                    Some(pixels) => {
-                        // Reuse the texture when it is the right size, so a
-                        // live instance does not recreate it every revision.
-                        let reuse = existing_size == Some(size);
-                        let created = if reuse {
-                            self.externals
-                                .remove(&id)
-                                .map(|entry| entry.texture)
-                                .expect("size came from the entry")
-                        } else {
-                            create_srgb_texture(device, "pill_draw external", size)
-                        };
-                        upload_whole_texture(queue, &created, size, pixels);
-                        Some(created)
-                    }
-                    None => match self.externals.get(&id) {
-                        Some(entry) if entry.size == size => {
-                            for (region, pixels) in texture.patches() {
-                                upload_region_pixels(queue, &entry.texture, region, pixels);
-                            }
-                            None
-                        }
-                        _ => {
-                            report_orphan_patch("external");
-                            None
-                        }
-                    },
-                };
-                if let Some(created) = target {
-                    let view = created.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("pill_draw external bind group"),
-                        layout: &self.texture_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&view),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&sampler),
-                            },
-                        ],
-                    });
-                    self.externals.insert(
-                        id,
-                        ExternalTexture {
-                            texture: created,
-                            bind_group,
-                            size,
-                        },
-                    );
-                }
-            }
-            TextureId::Solid => {}
-        }
-    }
-
-    /// The sampler a filter mode asks for.
-    fn sampler_for(&self, filter: UiTextureFilter) -> wgpu::Sampler {
-        match filter {
-            UiTextureFilter::Nearest => self.nearest_sampler.clone(),
-            UiTextureFilter::Linear => self.sampler.clone(),
-        }
-    }
-
-    /// Drop a freed texture, so draws naming it are skipped from now on.
-    fn free_texture(&mut self, id: &TextureId) {
-        self.applied_revisions.remove(id);
-        match id {
-            TextureId::Atlas => {
-                // The atlas texture stays allocated (the pipeline's bind group
-                // layout is fixed); dropping the revision makes the next set
-                // that names it upload again.
-                self.atlas_uploaded = false;
-            }
-            TextureId::External(external) => {
-                self.externals.remove(external);
-            }
-            TextureId::Solid => {}
-        }
+        let created = match self.textures.remove(&texture.id) {
+            Some(entry) if entry.size == size => entry.texture,
+            _ => create_srgb_texture(device, "pill_draw texture", size),
+        };
+        upload_whole_texture(queue, &created, size, &texture.pixels);
+        let sampler = match texture.filter {
+            UiTextureFilter::Nearest => &self.nearest_sampler,
+            UiTextureFilter::Linear => &self.sampler,
+        };
+        let view = created.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pill_draw texture bind group"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        self.textures.insert(
+            texture.id,
+            PainterTexture {
+                texture: created,
+                bind_group,
+                size,
+                revision: texture.revision,
+            },
+        );
     }
 
     /// Draw `lists` into `target`, in order, over what it already holds.
@@ -658,7 +474,8 @@ impl UiRenderer {
                         first_index,
                         index_count,
                     } => {
-                        let Some(bind_group) = self.bind_group_for(texture) else {
+                        // A texture the painter does not hold draws nothing.
+                        let Some(entry) = self.textures.get(texture) else {
                             continue;
                         };
                         let Some(scissor) = physical_scissor(&clip, *scale_factor, target_size)
@@ -666,22 +483,12 @@ impl UiRenderer {
                             continue;
                         };
                         pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-                        pass.set_bind_group(1, bind_group, &[]);
+                        pass.set_bind_group(1, &entry.bind_group, &[]);
                         let first = index_offset + first_index;
                         pass.draw_indexed(first..first + index_count, base_vertex, 0..1);
                     }
                 }
             }
-        }
-    }
-
-    /// The bind group a draw samples from, or nothing for an unregistered
-    /// external texture (the draw is skipped).
-    fn bind_group_for(&self, texture: &TextureId) -> Option<&wgpu::BindGroup> {
-        match texture {
-            TextureId::Atlas => Some(&self.atlas_bind_group),
-            TextureId::Solid => Some(&self.solid_bind_group),
-            TextureId::External(id) => self.externals.get(id).map(|entry| &entry.bind_group),
         }
     }
 }
@@ -690,24 +497,13 @@ impl UiRenderer {
 // Free Functions
 // =============================================================================
 
-/// One external texture: what it is, how it is bound, and its texel size.
-struct ExternalTexture {
+/// One texture the painter holds: the image, how it is bound, its texel size
+/// and the revision it was uploaded at.
+struct PainterTexture {
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     size: (u32, u32),
-}
-
-/// Report a patch that arrived for a texture the renderer has never applied.
-///
-/// The producer carries the whole image with every changed revision, so this
-/// only fires when a producer patches a texture it never sent; one line says
-/// so instead of drawing with garbage.
-fn report_orphan_patch(kind: &str) {
-    pill_core::warn!(
-        target: pill_core::telemetry::telemetry_target::ECS,
-        kind,
-        "a UI texture patch arrived for a texture this renderer never applied"
-    );
+    revision: u64,
 }
 
 /// Upload `pixels` as the whole 2D texture `texture` of `size`.
@@ -755,63 +551,6 @@ fn create_srgb_texture(device: &wgpu::Device, label: &str, size: (u32, u32)) -> 
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
-}
-
-/// The atlas texture at `size` and the bind group sampling it.
-///
-/// The atlas grows in pages, so the pair is rebuilt when its size changes;
-/// both the constructor and the upload path make it through here, keeping
-/// the bind group's layout and sampler in one place.
-fn atlas_resources(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    size: (u32, u32),
-) -> (wgpu::Texture, wgpu::BindGroup) {
-    let texture = create_srgb_texture(device, "pill_draw atlas", size);
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("pill_draw atlas bind group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    (texture, bind_group)
-}
-
-/// Upload one region's tightly packed RGBA8 rows to the atlas texture.
-fn upload_region_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, region: Region, rows: &[u8]) {
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: region.x,
-                y: region.y,
-                z: 0,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        rows,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(region.width * 4),
-            rows_per_image: Some(region.height),
-        },
-        wgpu::Extent3d {
-            width: region.width,
-            height: region.height,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 /// A logical-pixel clip as the scissor rectangle a render pass wants, in
@@ -883,13 +622,11 @@ mod tests {
 
     #[test]
     fn gpu_vertex_matches_the_declared_layout() {
-        assert_eq!(std::mem::size_of::<GpuVertex>(), 56);
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 32);
         let vertex = UiVertex {
             position: Vector2f::new(1.0, 2.0),
             uv: Vector2f::new(0.25, 0.75),
             color: Color::rgba(0.1, 0.2, 0.3, 0.4),
-            local: Vector2f::new(3.0, 4.0),
-            shape: [5.0, 6.0, 7.0, 8.0],
         };
         let gpu = GpuVertex::scaled(&vertex, 2.0);
         assert_eq!(
@@ -899,7 +636,5 @@ mod tests {
         );
         assert_eq!(gpu.uv, [0.25, 0.75]);
         assert_eq!(gpu.color, [0.1, 0.2, 0.3, 0.4]);
-        assert_eq!(gpu.local, [3.0, 4.0]);
-        assert_eq!(gpu.shape, [5.0, 6.0, 7.0, 8.0]);
     }
 }

@@ -3,8 +3,7 @@
 //! # Responsibilities
 //!
 //! - [`UiRenderer`]: draws a [`pill_draw::DrawList`] with wgpu - one pipeline,
-//!   an atlas texture uploaded from whole `pill_draw` textures and their
-//!   patches, scissor clipping, and the external textures the set carries.
+//!   the textures the frames carry as whole images, and scissor clipping.
 //!
 //! # Design
 //!
@@ -17,7 +16,7 @@
 //! This was the `pill_draw_wgpu` crate until this renderer became its only
 //! user; it now lives beside the overlay pass it draws after.
 
-/// The draw-list renderer: pipeline, atlas uploads, clips, textures.
+/// The draw-list renderer: pipeline, texture uploads, clips.
 mod renderer;
 
 pub(crate) use renderer::UiRenderer;
