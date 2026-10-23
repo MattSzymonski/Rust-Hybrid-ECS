@@ -155,9 +155,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
     if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**"):
+           "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_editor_ui",
+                                    ("test", "-p", "pill_editor_core_egui",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
@@ -181,9 +181,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
     if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**"):
+           "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_editor_ui",
+                                    ("test", "-p", "pill_editor_core_egui",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
@@ -291,7 +291,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-draw", ("modules/pill_draw/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-                     "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**")),
+                     "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
     ("pill-core", ("modules/pill_core/**",)),

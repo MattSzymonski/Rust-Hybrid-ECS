@@ -23,14 +23,14 @@
 //! the history records them - the same split the Assets pipeline follows.
 
 // External crates
-use pill_editor_ui::egui::Color32;
-use pill_editor_ui::icons::Icon;
+use egui::Color32;
 use pill_engine::component_registry::FieldDecorator;
 use pill_engine::{Entity, FieldValue};
 use serde_json::Value as JsonValue;
 
 // Current crate
 use crate::editor_state::{ComponentView, EditorCommand, EntityDetail};
+use crate::icons::Icon;
 
 /// The name after the last `::`, for labels and history entries.
 pub fn short_component_name(name: &str) -> &str {

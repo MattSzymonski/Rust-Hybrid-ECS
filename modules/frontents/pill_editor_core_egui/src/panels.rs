@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Weak};
 
-use pill_engine_core::{Entity, Resource};
+use pill_engine::{Entity, Resource};
 
 /// What a module holds to keep its panels alive.
 ///

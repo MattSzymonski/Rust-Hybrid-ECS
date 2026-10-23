@@ -20,12 +20,12 @@
 // External crates
 use std::collections::BTreeMap;
 
-use pill_editor_ui::boundary::SCENE_VIEWS_MAX;
-use pill_editor_ui::egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
+use egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 use pill_engine::Resource;
 
 // Current crate
 use crate::assets::AssetDialog;
+use crate::boundary::SCENE_VIEWS_MAX;
 use crate::browser::ProjectBrowser;
 use crate::layout::{EditorDock, EditorTab};
 use crate::notices::NoticeLevel;
@@ -141,12 +141,7 @@ pub struct PanelWindowSession {
 
 impl PanelWindowSession {
     /// Open a window, replacing one with the same id.
-    pub fn open(
-        &mut self,
-        source: &str,
-        slot: u16,
-        request: &pill_editor_ui::panels::PanelWindowRequest,
-    ) {
+    pub fn open(&mut self, source: &str, slot: u16, request: &crate::panels::PanelWindowRequest) {
         if let Some(existing) = self
             .windows
             .iter_mut()
@@ -571,7 +566,7 @@ impl EguiShellState {
     /// logs why (`[editor] layout reset`); a missing one is the first run.
     pub fn new() -> Self {
         let context = Context::default();
-        pill_editor_ui::style::apply(&context);
+        crate::style::apply(&context);
         Self {
             context,
             dock: crate::layout::load_or_default(),

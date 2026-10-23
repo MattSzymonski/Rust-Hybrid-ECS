@@ -14,6 +14,10 @@
 
 // External crates
 pub use pill_editor_core_egui::assets::{self, AssetDialog};
+pub use pill_editor_core_egui::boundary::{
+    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
+    SCENE_VIEWS_MAX,
+};
 pub use pill_editor_core_egui::browser::{self, ProjectBrowser};
 pub use pill_editor_core_egui::commands::{CommandView, PendingEditorCommands};
 pub use pill_editor_core_egui::console::{
@@ -23,12 +27,21 @@ pub use pill_editor_core_egui::editor_state::{
     AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
     ResourceFieldView, ResourceView,
 };
+pub use pill_editor_core_egui::egui;
+pub use pill_editor_core_egui::egui_dock::{
+    DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
+};
 pub use pill_editor_core_egui::entities;
 pub use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSpace};
+pub use pill_editor_core_egui::icons;
 pub use pill_editor_core_egui::inspector;
 pub use pill_editor_core_egui::layout::EditorTab;
 pub use pill_editor_core_egui::menubar;
 pub use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
+pub use pill_editor_core_egui::panels::{
+    PanelCommand, PanelComponentValues, PanelContext, PanelDrawFn, PanelEntityDetail,
+    PanelEntityRow, PanelFieldValue, PanelRegistry, PanelWindowRequest,
+};
 pub use pill_editor_core_egui::preferences;
 pub use pill_editor_core_egui::session::{
     EguiShellState, InspectorSession, MenubarSession, PaletteState, PanelBudget, PanelTiming,
@@ -36,21 +49,8 @@ pub use pill_editor_core_egui::session::{
     ToastSession, ToolboxSession, PANEL_BUDGET_FRAMES, PANEL_BUDGET_MICROS, PANEL_WINDOWS_MAX,
     TOASTS_MAX, TOAST_FRAMES,
 };
+pub use pill_editor_core_egui::style;
 pub use pill_editor_core_egui::systems;
 pub use pill_editor_core_egui::toolbox;
-pub use pill_editor_ui::boundary::{
-    frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
-    SCENE_VIEWS_MAX,
-};
-pub use pill_editor_ui::egui;
-pub use pill_editor_ui::egui_dock::{
-    DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
-};
-pub use pill_editor_ui::icons;
-pub use pill_editor_ui::panels::{
-    PanelCommand, PanelComponentValues, PanelContext, PanelDrawFn, PanelEntityDetail,
-    PanelEntityRow, PanelFieldValue, PanelRegistry, PanelWindowRequest,
-};
-pub use pill_editor_ui::style;
 pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
 pub use serde_json::Value as JsonValue;

@@ -1,8 +1,18 @@
-//! The editor's UI-independent core: the dock layout model and the editor's
-//! view of the engine.
+//! The egui editor's shared core: its UI library, the dock layout model and
+//! the editor's view of the engine.
 //!
 //! # Responsibilities
 //!
+//! - Re-export `egui` and `egui_dock` as the one copy the egui editor's world
+//!   shares: its frontend, its reloadable shell module and this crate all
+//!   name them through here.
+//! - Carry the shell boundary: [`boundary::EguiShellInput`] and
+//!   [`boundary::EguiShellFrame`], the plain data the frontend and the shell
+//!   exchange through world resources (plan decision E7), and the module
+//!   panels a dock tab names ([`panels`]).
+//! - Provide the engine-input to egui bridge ([`input`]), the editor's egui
+//!   style ([`style`]) and Phosphor's vendored icon fonts with the painting
+//!   of the chrome's icons ([`icons`]).
 //! - Own the dock layout: the tab set, the default layout and versioned
 //!   persistence through `egui_dock`'s state ([`layout`]).
 //! - Own the editor's snapshots of the engine and the commands it applies at
@@ -17,14 +27,54 @@
 //!
 //! # Design
 //!
-//! Nothing here depends on a window or a GPU, and egui enters only as
-//! `egui_dock`'s state types: the shell owns the egui `Context`, this crate
-//! stays UI-thin (W-0017 Stage 5). The crate is a shared `dylib` (see its
-//! manifest) because its values cross between the editor executable and the
-//! reloadable egui shell module.
+//! Nothing here depends on a window or a GPU: the frontend owns the device
+//! and draws the shell's frame with `egui-wgpu`, and the shell owns the egui
+//! `Context` (`test_engine_layout.py` checks that no windowing or GPU crate is
+//! reachable). The crate is a shared `dylib` (see its manifest) because its
+//! values - the boundary types, the layout, the commands - cross between the
+//! editor executable and the reloadable egui shell module, and one compiled
+//! copy per process gives them one identity (plan decision E3).
+//!
+//! The egui editor's module world (this crate plus the shell) and host world
+//! (this crate plus the frontend and `egui-wgpu`) must resolve `egui`,
+//! `egui_dock` and `epaint` identically; the manifest's pin block requests
+//! the union.
+//!
+//! # The reload-safety contract
+//!
+//! egui's `Context` can keep arbitrary typed values and callbacks alive past
+//! the frame that stored them. Reloadable crates (`extensions/**`,
+//! `examples/**`) must never store their own types or closures in it: after a
+//! reload, the stored value's drop code or vtable points into the unloaded
+//! image. The APIs that keep boxed `Any`/`Fn` values inside the context are:
+//!
+//! - `Context::data` and `Context::data_mut` (the `IdTypeMap` behind them)
+//! - `Context::set_request_repaint_callback`
+//! - `Context::on_begin_pass` and `Context::on_end_pass` (plugins)
+//! - any shape carrying `egui::PaintCallback`
+//!
+//! Long-lived egui state therefore lives in a world resource defined by this
+//! crate (the egui shell's [`session::EguiShellState`], re-claimed by every
+//! shell generation); transient state stays inside the frame that made it.
+//! `test_coding_standards.py` flags those calls in reloadable crates - the two
+//! entry points, the map's own methods and any `dyn Any` - and a line that
+//! deliberately touches the map carries the `egui-state-ok` marker (a test
+//! planting a previous generation's value is the only legitimate use).
+//!
+//! The shell also clears the map on the first frame of every generation
+//! (`pill_editor_shell_egui_editor::shell::claim`): whatever a previous
+//! generation left there would be read through an unloaded image's vtable, so
+//! the claim drops it before the new generation draws. The state that has to
+//! survive a reload is a world resource, which is exactly why the claim can
+//! clear the rest without losing anything.
+
+pub use egui;
+pub use egui_dock;
 
 /// The Assets pipeline: the dialogs' state and the recorded file batches.
 pub mod assets;
+/// The plain data crossing the frontend/shell boundary.
+pub mod boundary;
 /// The editor's brand mark: the pill logotype as baked coverage.
 pub mod brand;
 /// The Assets tab's project browser: the open folder and the listing math
@@ -52,6 +102,10 @@ pub mod error;
 pub mod gizmo;
 /// The undo and redo history of editor edits.
 pub mod history;
+/// Phosphor's icons: the fonts, the glyphs and the duotone painting.
+pub mod icons;
+/// The engine-input to egui bridge.
+pub mod input;
 /// The Inspector's editing helpers: field edits and asset settings rows.
 pub mod inspector;
 /// The `egui_dock` layout: tab set, default layout and persistence.
@@ -60,6 +114,9 @@ pub mod layout;
 pub mod menubar;
 /// The host's notices as plain data: toast events and Problems rows.
 pub mod notices;
+/// The editor panels a module registers (W-0038 Stage 11): ids, draw
+/// functions, liveness markers and the slot a dock tab names.
+pub mod panels;
 /// The Preferences tab's shared vocabulary: the file's editable keys.
 pub mod preferences;
 /// Build diagnostics: the problems the Problems panel shows.
@@ -70,6 +127,8 @@ pub mod resources;
 pub mod scripted;
 /// The egui shell's long-lived session state.
 pub mod session;
+/// The editor's egui theme.
+pub mod style;
 /// The Systems tab's shared logic: row labels, system toggles and the
 /// pause/step controls.
 pub mod systems;
