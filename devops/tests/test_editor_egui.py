@@ -236,6 +236,13 @@ GIZMO_PREFERENCES_WRITTEN_TOKEN = "[editor] gizmo preferences written"
 HISTORY_TRIMMED_TOKEN = "[editor] history trimmed"
 GAME_VIEW_RECT_TOKEN = "[editor] game view rect"
 TAB_ACTIVATED_TOKEN = "[editor] tab activated"
+POPOUT_MOVED_TOKEN = "[editor] popout moved"
+POPOUT_OPENED_TOKEN = "[editor] popout opened"
+POPOUT_CLOSED_TOKEN = "[editor] popout closed"
+POPOUT_PRESENTED_TOKEN = "[editor] popout presented"
+POPOUT_CLAIMED_TOKEN = "[editor] popout contexts claimed"
+DOCK_POPOUT_TOKEN = "[editor] egui dock popout"
+SCENE_VIEW_REBOUND_TOKEN = "[editor] scene view rebound"
 TOOLBOX_RECT_TOKEN = "[editor] toolbox rect"
 TOOLBOX_ITEM_TOKEN = "[editor] toolbox item"
 TOOLBOX_CLICK_TOKEN = "[editor] toolbox click"
@@ -3591,6 +3598,119 @@ def main() -> int:
         )
         print("  [OK] dock rearranged, two surfaces")
 
+        # Step 5b: a tab pops out into its own window (W-0038 Stage 23). The
+        # window draws the tab in its own egui context, so the tab leaves the
+        # dock's tree and keeps drawing; closing it or asking for a redock
+        # brings it back. The window survives a shell reload, which Step 7
+        # checks by reloading the shell while one is open.
+        begin = len(session.read_log())
+        session.send("popout inspector")
+        session.wait(
+            re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="inspector"\s+redock=false',
+            30,
+            "the Inspector popped out",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_OPENED_TOKEN) + r'\s+tab="inspector"',
+            60,
+            "the pop-out window opened",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="inspector"',
+            60,
+            "the pop-out window presented a frame",
+            begin,
+        )
+        popout_dump = session.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump with a pop-out"
+        )
+        assert re.search(
+            re.escape(DOCK_POPOUT_TOKEN) + r'\s+tab="inspector"', popout_dump
+        ), "the dock did not report the popped-out tab: {}".format(popout_dump[-600:])
+        held = [
+            tabs
+            for tabs in re.findall(DOCK_LEAF_PATTERN, popout_dump)
+            if "inspector" in tabs[3].split(",")
+        ]
+        assert not held, "the popped-out tab stayed in the dock's tree: {}".format(held)
+        print("  [OK] the Inspector left the dock for its own window")
+
+        # The way back: the same dock rule, driven from the scripted channel.
+        begin = len(session.read_log())
+        session.send("popout inspector redock")
+        session.wait(
+            re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="inspector"\s+redock=true',
+            30,
+            "the Inspector redocked",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="inspector"',
+            60,
+            "the pop-out window closed",
+            begin,
+        )
+        back = session.request("dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after redock")
+        assert any(
+            "inspector" in tabs[3].split(",")
+            for tabs in re.findall(DOCK_LEAF_PATTERN, back)
+        ), "the redocked tab did not return to the dock: {}".format(back[-600:])
+        print("  [OK] the Inspector came back to the dock")
+
+        # A scene view popped out needs a window of its own: a child window
+        # can never leave the editor's monitor, so the frontend rebuilds the
+        # view on a top-level window placed at the pop-out's own rectangle
+        # (W-0038 Stage 23). Redocking gives it back its child window.
+        begin = len(session.read_log())
+        session.send("popout scene")
+        session.wait(
+            re.escape(SCENE_VIEW_REBOUND_TOKEN) + r"\s+surface=\d+\s+popped=true",
+            60,
+            "the popped-out scene view moved to a top-level window",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="scene"',
+            60,
+            "the scene pop-out presented a frame",
+            begin,
+        )
+        session.send("popout scene redock")
+        session.wait(
+            re.escape(SCENE_VIEW_REBOUND_TOKEN) + r"\s+surface=\d+\s+popped=false",
+            60,
+            "the scene view went back to its child window",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="scene"',
+            60,
+            "the scene pop-out closed",
+            begin,
+        )
+        print("  [OK] the scene view followed its pop-out and came back")
+
+        # One pop-out stays open across Step 7's shell reload: a generation
+        # that does not know it must clear the window's egui data, or the new
+        # shell reads a value the unloaded image created.
+        begin = len(session.read_log())
+        session.send("popout assets")
+        session.wait(
+            re.escape(POPOUT_MOVED_TOKEN) + r'\s+tab="assets"\s+redock=false',
+            30,
+            "the Assets tab popped out",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="assets"',
+            60,
+            "the Assets pop-out presented a frame",
+            begin,
+        )
+        print("  [OK] a pop-out is open for the reload to keep")
+
         # Step 6: body edits patch live. A tab body calls its siblings by bare
         # name and `run_frame` reads a module constant and calls the menu bar,
         # so a patch crate only compiles because the crate root re-exports the
@@ -3700,6 +3820,53 @@ def main() -> int:
             session, highest, 120, "frame counter survived the reload"
         )
         print("  [OK] shell reloaded, dock and counter kept")
+
+        # The pop-out that was open across the reload kept its window: the
+        # new generation cleared its context before drawing into it, and the
+        # dock model still lists the tab as popped out. The claim line is the
+        # first one in the log - the generation before the reload had already
+        # claimed, so it never logged - which is why it is waited for by
+        # occurrence rather than by offset.
+        session.wait_occurrence(
+            re.escape(POPOUT_CLAIMED_TOKEN) + r"\s+windows=1\b",
+            1,
+            60,
+            "the reloaded shell claimed the pop-out's context",
+        )
+        survived = session.request(
+            "dump tabs", DOCK_DUMP_PATTERN, 30, "dock dump after the reload"
+        )
+        assert re.search(
+            re.escape(DOCK_POPOUT_TOKEN) + r'\s+tab="assets"', survived
+        ), "the reload lost the popped-out tab: {}".format(survived[-600:])
+
+        # A window the reloaded generation opens presents like any other: the
+        # pop-out machinery is the new image's code, not the old one's.
+        begin = len(session.read_log())
+        session.send("popout systems")
+        session.wait(
+            re.escape(POPOUT_OPENED_TOKEN) + r'\s+tab="systems"',
+            60,
+            "the reloaded shell opened a pop-out window",
+            begin,
+        )
+        session.wait(
+            re.escape(POPOUT_PRESENTED_TOKEN) + r'\s+tab="systems"',
+            60,
+            "the reloaded shell's pop-out presented a frame",
+            begin,
+        )
+        # Both pop-outs come home, so the steps after this one see the dock
+        # the earlier steps built.
+        session.send("popout systems redock")
+        session.send("popout assets redock")
+        session.wait(
+            re.escape(POPOUT_CLOSED_TOKEN) + r'\s+tab="assets"',
+            60,
+            "the surviving pop-out redocked",
+            begin,
+        )
+        print("  [OK] the pop-out survived the reload and redocked")
 
         # Step 8: a project reload keeps the editor UI and its dock.
         project_text = project_source.read_bytes().decode("utf-8")

@@ -659,11 +659,13 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::SnapToggle => "command editor.tool_snap_toggle",
         ScriptedCommand::SpaceToggle => "command editor.tool_space_toggle",
         // The native-only verbs (W-0038): a page has no OS clipboard, no OLE
-        // drag and one fixed scene view, so these parse but cannot run here.
+        // drag, one fixed scene view and no second OS window to pop a tab
+        // into, so these parse but cannot run here.
         ScriptedCommand::Copy => "command editor.copy",
         ScriptedCommand::Cut => "command editor.cut",
         ScriptedCommand::Paste => "command editor.paste",
         ScriptedCommand::NewSceneView => "command editor.scene_new_view",
+        ScriptedCommand::Popout { .. } => "popout",
         ScriptedCommand::Drop(_) => "drop",
         ScriptedCommand::HoverFile(_) => "hover file",
         ScriptedCommand::DragOut(_) => "drag out",

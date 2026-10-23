@@ -1271,6 +1271,78 @@ impl EditorWindow {
         scene.window.place(left, top, width, height);
     }
 
+    /// Give a popped-out scene view its top-level window, placed at the
+    /// pop-out's screen position (W-0038 Stage 23). The first call replaces its
+    /// child window with a top-level one - a child can never reach another
+    /// monitor - and later calls just follow the pop-out as it moves.
+    fn pop_view_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        view: usize,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) {
+        let needs_window = self
+            .views
+            .get(view)
+            .and_then(|scene| scene.as_ref())
+            .is_some_and(|scene| !scene.popped);
+        if needs_window {
+            let title = format!("Pill Editor Scene {} (popped out)", view + 1);
+            match SurfaceWindow::open_top_level(event_loop, &title) {
+                Ok(window) => {
+                    let host = &mut self.host;
+                    if let Some(Some(scene)) = self.views.get_mut(view) {
+                        scene.rebind_window(host, window, true);
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        view,
+                        error = %error,
+                        "[editor] popped-out scene window refused"
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(Some(scene)) = self.views.get_mut(view) {
+            scene.window.place_screen(x, y, width, height);
+        }
+    }
+
+    /// Give a scene view its child window back when its tab returns to the
+    /// dock. A view the platform forced to a detached window is left alone:
+    /// that window is its dock window, not a pop-out's.
+    fn ensure_view_docked(&mut self, event_loop: &ActiveEventLoop, view: usize) {
+        let popped = self
+            .views
+            .get(view)
+            .and_then(|scene| scene.as_ref())
+            .is_some_and(|scene| scene.popped);
+        if !popped {
+            return;
+        }
+        let title = format!("Pill Editor Scene {}", view + 1);
+        match SurfaceWindow::open(event_loop, &self.window, &title, "scene") {
+            Ok(window) => {
+                let host = &mut self.host;
+                if let Some(Some(scene)) = self.views.get_mut(view) {
+                    scene.rebind_window(host, window, false);
+                }
+            }
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                view,
+                error = %error,
+                "[editor] scene view redock refused"
+            ),
+        }
+    }
+
     /// Place one scene view at the dock's scene rectangle, in logical
     /// points, converted to the client area's physical pixels.
     fn place_view_rect(&mut self, view: usize, rect: ShellRect) {
@@ -5600,12 +5672,47 @@ impl EditorWindow {
                 );
             }
         }
+        for frame in frames.iter() {
+            let Some(popout) = self.popouts.get(&frame.tab) else {
+                continue;
+            };
+            // A popped-out Scene tab reports its viewport in the pop-out's own
+            // coordinates; the view's window follows it onto that window's
+            // screen position, which is what lets it cross monitors.
+            if frame.frame.scene_rects.iter().all(|rect| rect.is_none()) {
+                continue;
+            }
+            let scale_factor = popout.window.scale_factor() as f32;
+            let origin = popout
+                .window
+                .inner_position()
+                .unwrap_or(PhysicalPosition::new(0, 0));
+            let placements: Vec<(usize, i32, i32, u32, u32)> = frame
+                .frame
+                .scene_rects
+                .iter()
+                .enumerate()
+                .filter_map(|(view, rect)| {
+                    let rect = (*rect)?;
+                    Some((
+                        view,
+                        origin.x + (rect.x * scale_factor) as i32,
+                        origin.y + (rect.y * scale_factor) as i32,
+                        (rect.width * scale_factor).max(1.0) as u32,
+                        (rect.height * scale_factor).max(1.0) as u32,
+                    ))
+                })
+                .collect();
+            for (view, x, y, width, height) in placements {
+                self.pop_view_window(event_loop, view, x, y, width, height);
+            }
+        }
         for frame in frames.iter_mut() {
             let Some(popout) = self.popouts.get_mut(&frame.tab) else {
                 continue;
             };
             let textures = std::mem::take(&mut frame.frame.textures);
-            if let Err(error) = popout.surface.render(
+            match popout.surface.render(
                 &self.device,
                 &self.queue,
                 &mut popout.renderer,
@@ -5613,12 +5720,25 @@ impl EditorWindow {
                 textures,
                 frame.frame.pixels_per_point,
             ) {
-                warn!(
+                Ok(drew) => {
+                    // The suite's observation point that the window is live,
+                    // logged once so a broken painter shows up as a missing
+                    // line rather than a silently painted-over window.
+                    if drew && !popout.presented {
+                        popout.presented = true;
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            tab = frame.tab.as_str(),
+                            "[editor] popout presented"
+                        );
+                    }
+                }
+                Err(error) => warn!(
                     target: telemetry_target::ENGINE,
                     tab = frame.tab.as_str(),
                     error = %error,
                     "[editor] popout frame failed"
-                );
+                ),
             }
         }
     }
@@ -5776,6 +5896,7 @@ impl EditorWindow {
                 window,
                 surface,
                 renderer,
+                presented: false,
             },
         );
     }
@@ -5863,7 +5984,12 @@ impl EditorWindow {
         self.ensure_scene_views(scene_rects.len(), event_loop);
         for view in 0..self.views.len() {
             match scene_rects.get(view).copied().flatten() {
-                Some(rect) => self.place_view_rect(view, rect),
+                Some(rect) => {
+                    // A view whose tab is back in the dock needs its child
+                    // window again (W-0038 Stage 23).
+                    self.ensure_view_docked(event_loop, view);
+                    self.place_view_rect(view, rect);
+                }
                 None => self.hide_view(view),
             }
         }
@@ -6843,6 +6969,16 @@ impl EditorWindow {
                 "[editor] egui dock leaf"
             );
         }
+        // Popped-out tabs are not in the tree, so they get their own lines:
+        // a suite reads which tabs left the dock and which came back.
+        let popouts: Vec<String> = state.dock.popouts().iter().map(|tab| tab.name()).collect();
+        for tab in popouts {
+            info!(
+                target: telemetry_target::ENGINE,
+                tab = tab.as_str(),
+                "[editor] egui dock popout"
+            );
+        }
     }
 }
 
@@ -6852,6 +6988,12 @@ struct SceneView {
     window: SurfaceWindow,
     /// The renderer surface id the scene draws through.
     surface_id: SurfaceId,
+    /// Whether `window` was created for a popped-out tab (W-0038 Stage 23):
+    /// a top-level window the view follows to another monitor, rather than
+    /// the child window the dock places. A detached window the *platform*
+    /// forced is not a popped-out one, which is why the flag exists apart from
+    /// `SurfaceWindow::detached`.
+    popped: bool,
 }
 
 impl SceneView {
@@ -6872,6 +7014,7 @@ impl SceneView {
         Some(SceneView {
             window,
             surface_id: scene_surface(view),
+            popped: false,
         })
     }
 }
@@ -6987,6 +7130,9 @@ struct PopoutWindow {
     /// which is why each pop-out owns one: two renderers cannot share a
     /// texture namespace across swapchains.
     renderer: egui_wgpu::Renderer,
+    /// Whether a frame has reached the swapchain yet: the first success logs
+    /// the suite's `[editor] popout presented` line.
+    presented: bool,
 }
 
 /// One view surface's window: a child of the main window when the platform
@@ -7110,6 +7256,52 @@ impl SurfaceWindow {
         self.placed = Some((x, y, width, height));
     }
 
+    /// Place a popped-out view's top-level window at a screen position
+    /// (W-0038 Stage 23): the pop-out owns its screen rectangle, so the view
+    /// window follows it there, on whatever monitor that is.
+    fn place_screen(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        if !self.visible {
+            self.window.set_visible(true);
+            self.visible = true;
+        }
+        if self.placed == Some((x, y, width, height)) {
+            return;
+        }
+        self.window.set_outer_position(PhysicalPosition::new(x, y));
+        // The client origin is what a pointer event from this window is
+        // relative to; decorations make it differ from the outer position, so
+        // it is read back once the move was applied.
+        if let Ok(inner) = self.window.inner_position() {
+            self.origin = (inner.x, inner.y);
+        }
+        let _ = self
+            .window
+            .request_inner_size(PhysicalSize::new(width.max(1), height.max(1)));
+        self.placed = Some((x, y, width, height));
+    }
+
+    /// Create a top-level window for a popped-out scene view (W-0038 Stage
+    /// 23): decorated, so the person can move and close it like any window.
+    fn open_top_level(
+        event_loop: &ActiveEventLoop,
+        title: &str,
+    ) -> Result<SurfaceWindow, EditorError> {
+        let attributes = Window::default_attributes()
+            .with_title(title)
+            .with_inner_size(INITIAL_SCENE_SIZE)
+            .with_visible(false);
+        let window = event_loop
+            .create_window(attributes)
+            .map_err(|source| EditorError::WindowCreation { source })?;
+        Ok(SurfaceWindow {
+            window: Arc::new(window),
+            detached: true,
+            visible: false,
+            placed: None,
+            origin: (0, 0),
+        })
+    }
+
     /// Hide the window: the dock no longer shows its tab, so nothing may
     /// paint in its rectangle.
     fn hide(&mut self) {
@@ -7128,6 +7320,36 @@ impl SurfaceWindow {
 
 impl SceneView {
     /// Attach the scene window to the renderer and publish its camera.
+    /// Move the view onto `window` and re-attach its renderer surface to it
+    /// (W-0038 Stage 23): a popped-out view needs a top-level window, and a
+    /// redocked one needs a child of the editor window again. The surface's
+    /// previous window is dropped by the host when the new one replaces it.
+    fn rebind_window(&mut self, host: &mut RenderingHost, window: SurfaceWindow, popped: bool) {
+        self.window = window;
+        self.popped = popped;
+        let size = self.window.size();
+        match host.attach_surface(
+            self.surface_id,
+            Arc::clone(&self.window.window),
+            size.0,
+            size.1,
+            SurfaceOptions::default(),
+        ) {
+            Ok(()) => info!(
+                target: telemetry_target::ENGINE,
+                surface = self.surface_id.0,
+                popped,
+                "[editor] scene view rebound"
+            ),
+            Err(error) => warn!(
+                target: telemetry_target::ENGINE,
+                surface = self.surface_id.0,
+                error = %error,
+                "[editor] scene view rebind refused"
+            ),
+        }
+    }
+
     fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, size: (u32, u32)) {
         match host.attach_surface(
             self.surface_id,

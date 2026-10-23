@@ -158,8 +158,11 @@ pub enum Icon {
     XCircle,
     /// A floppy disk: save.
     FloppyDisk,
-    /// A box with an arrow: move a tab back into the dock.
+    /// A box with an arrow leaving it: pop a tab out into its own window.
     ArrowSquareOut,
+    /// A box with an arrow entering it: move a popped-out tab back into the
+    /// dock.
+    ArrowSquareIn,
     /// A closed folder: a folder row of the project browser.
     Folder,
     /// A right-pointing chevron: a closed tree row.
@@ -178,7 +181,7 @@ pub enum Icon {
 
 impl Icon {
     /// Every icon, in declaration order.
-    pub const ALL: [Icon; 36] = [
+    pub const ALL: [Icon; 37] = [
         Icon::Cube,
         Icon::CubeTransparent,
         Icon::MonitorPlay,
@@ -208,6 +211,7 @@ impl Icon {
         Icon::XCircle,
         Icon::FloppyDisk,
         Icon::ArrowSquareOut,
+        Icon::ArrowSquareIn,
         Icon::Folder,
         Icon::CaretRight,
         Icon::CaretDown,
@@ -250,6 +254,7 @@ impl Icon {
             Icon::XCircle => 0xe4f8,
             Icon::FloppyDisk => 0xe248,
             Icon::ArrowSquareOut => 0xe5de,
+            Icon::ArrowSquareIn => 0xe5dc,
             Icon::Folder => 0xe24a,
             Icon::CaretRight => 0xe13a,
             Icon::CaretDown => 0xe136,
@@ -292,6 +297,7 @@ impl Icon {
             Icon::XCircle => "x-circle",
             Icon::FloppyDisk => "floppy-disk",
             Icon::ArrowSquareOut => "arrow-square-out",
+            Icon::ArrowSquareIn => "arrow-square-in",
             Icon::Folder => "folder",
             Icon::CaretRight => "caret-right",
             Icon::CaretDown => "caret-down",
