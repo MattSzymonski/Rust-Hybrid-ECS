@@ -4,16 +4,18 @@
 //!
 //! - [`UiRenderer`]: owns the render pipeline, the atlas texture and
 //!   the registered external textures; uploads texture changes and draws a
-//!   [`DrawList`] into any render target.
-//! - Applies the monitor's scale factor, the list's nested clip rectangles
-//!   (as scissor rectangles) and correct sRGB blending.
+//!   surface's [`DrawList`]s into its target.
+//! - Applies each list's scale factor, its nested clip rectangles (as scissor
+//!   rectangles) and correct sRGB blending.
 //!
 //! # Design
 //!
-//! The renderer is an `rlib` compiled into its user, which owns the device,
-//! queue and target (plan decision D8). It keeps no camera, no window and no
-//! frame state beyond its GPU resources; everything per-frame comes in
-//! through [`UiRenderer::render`].
+//! The painter uses the renderer module's device, queue and target (plan
+//! decision D8). It keeps no camera, no window and no frame state beyond its
+//! GPU resources; everything per-frame comes in through
+//! [`UiRenderer::render`], once per surface: every list for that surface goes
+//! into one pair of reused buffers, since a buffer can only be written once
+//! per submission (see [`StreamBuffer`]).
 //!
 //! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]): the
 //! renderer remembers the revision it applied per texture and uploads
@@ -35,20 +37,22 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
 use pill_draw::{
-    Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter,
-    UiTextureSet, UiVertex,
+    DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter, UiTextureSet,
+    UiVertex,
 };
-use wgpu::util::DeviceExt;
+
+// Current crate
+use crate::stream_buffer::StreamBuffer;
 
 // =============================================================================
 // Shader
 // =============================================================================
 
-/// The whole pipeline in one WGSL source: logical pixels to clip space in
+/// The whole pipeline in one WGSL source: physical pixels to clip space in
 /// the vertex stage, linear light out of the fragment stage.
 const UI_SHADER: &str = r#"
 struct Globals {
-    // Physical target size in .xy and the monitor scale factor in .z.
+    // Physical target size in .xy; .zw unused.
     viewport: vec4<f32>,
 };
 
@@ -81,8 +85,7 @@ fn srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
-    let physical = in.position * globals.viewport.z;
-    let normalized = physical / globals.viewport.xy;
+    let normalized = in.position / globals.viewport.xy;
     var out: VertexOut;
     out.position = vec4<f32>(normalized.x * 2.0 - 1.0, 1.0 - normalized.y * 2.0, 0.0, 1.0);
     out.uv = in.uv;
@@ -132,8 +135,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 // GpuVertex
 // =============================================================================
 
-/// One vertex as the GPU sees it: position, texture coordinate, colour -
-/// `f32` components in a fixed layout the pipeline declares.
+/// One vertex as the GPU sees it: position in physical pixels, texture
+/// coordinate, colour - `f32` components in a fixed layout the pipeline
+/// declares.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct GpuVertex {
@@ -144,10 +148,15 @@ struct GpuVertex {
     shape: [f32; 4],
 }
 
-impl From<&UiVertex> for GpuVertex {
-    fn from(vertex: &UiVertex) -> GpuVertex {
+impl GpuVertex {
+    /// `vertex` with its logical position scaled to physical pixels, so lists
+    /// of different scale factors can share one buffer and one pass.
+    fn scaled(vertex: &UiVertex, scale_factor: f32) -> GpuVertex {
         GpuVertex {
-            position: [vertex.position.x, vertex.position.y],
+            position: [
+                vertex.position.x * scale_factor,
+                vertex.position.y * scale_factor,
+            ],
             uv: [vertex.uv.x, vertex.uv.y],
             color: [
                 vertex.color.r,
@@ -197,6 +206,9 @@ pub struct UiRenderer {
     /// The revision this instance applied per texture; a rebuilt instance
     /// starts empty and therefore re-uploads everything.
     applied_revisions: HashMap<TextureId, u64>,
+    /// Every list of the surface being drawn: its vertices, then its indices.
+    vertices: StreamBuffer,
+    indices: StreamBuffer,
 }
 
 impl UiRenderer {
@@ -395,6 +407,8 @@ impl UiRenderer {
             solid_bind_group,
             externals: HashMap::new(),
             applied_revisions: HashMap::new(),
+            vertices: StreamBuffer::new("pill_draw vertices", wgpu::BufferUsages::VERTEX),
+            indices: StreamBuffer::new("pill_draw indices", wgpu::BufferUsages::INDEX),
         }
     }
 
@@ -544,14 +558,12 @@ impl UiRenderer {
         }
     }
 
-    /// Draw `list` into `target`.
+    /// Draw `lists` into `target`, in order, over what it already holds.
     ///
-    /// `target_size` is the target in physical pixels and `scale_factor` the
-    /// monitor scale the list's logical pixels are in. `clear` clears the
-    /// target first (the colour is converted from sRGB to linear the way a
-    /// clear value must be); `None` loads whatever is already there, for a UI
-    /// pass drawn over a scene.
-    #[allow(clippy::too_many_arguments)]
+    /// `target_size` is the target in physical pixels; each list comes with
+    /// the monitor scale its logical pixels are in. Call this once per
+    /// surface with every list for it: the lists share one upload, because
+    /// the painter's buffers can be written only once per submission.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -559,43 +571,43 @@ impl UiRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         target_size: (u32, u32),
-        scale_factor: f32,
-        list: &DrawList,
-        clear: Option<Color>,
+        lists: &[(&DrawList, f32)],
     ) {
-        if list.is_empty() && clear.is_none() {
+        if lists.iter().all(|(list, _)| list.is_empty()) {
             return;
         }
 
         queue.write_buffer(
             &self.globals_buffer,
             0,
-            bytemuck::cast_slice(&[
-                target_size.0 as f32,
-                target_size.1 as f32,
-                scale_factor,
-                0.0,
-            ]),
+            bytemuck::cast_slice(&[target_size.0 as f32, target_size.1 as f32, 0.0, 0.0]),
         );
-        let vertices: Vec<GpuVertex> = list.vertices.iter().map(GpuVertex::from).collect();
-        let vertex_buffer = (!vertices.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pill_draw vertices"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
-        let index_buffer = (!list.indices.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("pill_draw indices"),
-                contents: bytemuck::cast_slice(&list.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            })
-        });
+        // One upload for the surface: each list's vertices after the previous
+        // list's, its indices unchanged and offset by `base_vertex` per draw.
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut placements = Vec::with_capacity(lists.len());
+        for (list, scale_factor) in lists {
+            placements.push((vertices.len() as i32, indices.len() as u32));
+            vertices.extend(
+                list.vertices
+                    .iter()
+                    .map(|vertex| GpuVertex::scaled(vertex, *scale_factor)),
+            );
+            indices.extend_from_slice(&list.indices);
+        }
+        let vertex_buffer = self
+            .vertices
+            .write(device, queue, bytemuck::cast_slice(&vertices))
+            .cloned();
+        let index_buffer = self
+            .indices
+            .write(device, queue, bytemuck::cast_slice(&indices))
+            .cloned();
+        let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else {
+            return;
+        };
 
-        let load = clear.map_or(wgpu::LoadOp::Load, |color| {
-            wgpu::LoadOp::Clear(linear_clear_value(color))
-        });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("pill_draw"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -603,7 +615,7 @@ impl UiRenderer {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load,
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -612,52 +624,52 @@ impl UiRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else {
-            return;
-        };
-
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-        // The list's clips nest; the innermost one is the pass's scissor and
-        // the stack restores the previous one on every pop.
-        let full_clip = Rect::new(
-            Vector2f::ZERO,
-            Vector2f::new(
-                target_size.0 as f32 / scale_factor,
-                target_size.1 as f32 / scale_factor,
-            ),
-        );
-        let mut clip = full_clip;
-        let mut stack: Vec<Rect> = Vec::new();
+        for ((list, scale_factor), (base_vertex, index_offset)) in lists.iter().zip(placements) {
+            // The list's clips nest; the innermost one is the pass's scissor
+            // and the stack restores the previous one on every pop.
+            let full_clip = Rect::new(
+                Vector2f::ZERO,
+                Vector2f::new(
+                    target_size.0 as f32 / scale_factor,
+                    target_size.1 as f32 / scale_factor,
+                ),
+            );
+            let mut clip = full_clip;
+            let mut stack: Vec<Rect> = Vec::new();
 
-        for command in &list.commands {
-            match command {
-                DrawCommand::PushClip(rect) => {
-                    stack.push(clip);
-                    clip = clip
-                        .intersection(rect)
-                        .unwrap_or(Rect::from_min_size(Vector2f::ZERO, Vector2f::ZERO));
-                }
-                DrawCommand::PopClip => {
-                    clip = stack.pop().unwrap_or(full_clip);
-                }
-                DrawCommand::Draw {
-                    texture,
-                    first_index,
-                    index_count,
-                } => {
-                    let Some(bind_group) = self.bind_group_for(texture) else {
-                        continue;
-                    };
-                    let Some(scissor) = physical_scissor(&clip, scale_factor, target_size) else {
-                        continue;
-                    };
-                    pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-                    pass.set_bind_group(1, bind_group, &[]);
-                    pass.draw_indexed(*first_index..first_index + index_count, 0, 0..1);
+            for command in &list.commands {
+                match command {
+                    DrawCommand::PushClip(rect) => {
+                        stack.push(clip);
+                        clip = clip
+                            .intersection(rect)
+                            .unwrap_or(Rect::from_min_size(Vector2f::ZERO, Vector2f::ZERO));
+                    }
+                    DrawCommand::PopClip => {
+                        clip = stack.pop().unwrap_or(full_clip);
+                    }
+                    DrawCommand::Draw {
+                        texture,
+                        first_index,
+                        index_count,
+                    } => {
+                        let Some(bind_group) = self.bind_group_for(texture) else {
+                            continue;
+                        };
+                        let Some(scissor) = physical_scissor(&clip, *scale_factor, target_size)
+                        else {
+                            continue;
+                        };
+                        pass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                        pass.set_bind_group(1, bind_group, &[]);
+                        let first = index_offset + first_index;
+                        pass.draw_indexed(first..first + index_count, base_vertex, 0..1);
+                    }
                 }
             }
         }
@@ -821,26 +833,6 @@ fn physical_scissor(clip: &Rect, scale_factor: f32, target_size: (u32, u32)) -> 
     ])
 }
 
-/// The sRGB to linear-light transfer function, per channel (the same curve
-/// the shader applies), for the one place the CPU writes colour: the clear.
-fn srgb_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// A `pill_draw` sRGB colour as the linear clear value a render pass wants.
-fn linear_clear_value(color: Color) -> wgpu::Color {
-    wgpu::Color {
-        r: srgb_to_linear(color.r) as f64,
-        g: srgb_to_linear(color.g) as f64,
-        b: srgb_to_linear(color.b) as f64,
-        a: color.a as f64,
-    }
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -848,6 +840,7 @@ fn linear_clear_value(color: Color) -> wgpu::Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_draw::Color;
 
     #[test]
     fn physical_scissor_rounds_outward_and_clamps_to_the_target() {
@@ -889,20 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn linear_clear_value_matches_the_standard_curve() {
-        let black = linear_clear_value(Color::rgba(0.0, 0.0, 0.0, 0.5));
-        assert_eq!((black.r, black.g, black.b, black.a), (0.0, 0.0, 0.0, 0.5));
-        let white = linear_clear_value(Color::WHITE);
-        assert_eq!((white.r, white.g, white.b, white.a), (1.0, 1.0, 1.0, 1.0));
-        let middle = linear_clear_value(Color::rgba(0.5, 0.5, 0.5, 1.0));
-        let expected = srgb_to_linear(0.5) as f64;
-        assert!(
-            (middle.r - expected).abs() < 1e-12,
-            "0.5 in sRGB is {expected} in linear light"
-        );
-    }
-
-    #[test]
     fn gpu_vertex_matches_the_declared_layout() {
         assert_eq!(std::mem::size_of::<GpuVertex>(), 56);
         let vertex = UiVertex {
@@ -912,8 +891,12 @@ mod tests {
             local: Vector2f::new(3.0, 4.0),
             shape: [5.0, 6.0, 7.0, 8.0],
         };
-        let gpu = GpuVertex::from(&vertex);
-        assert_eq!(gpu.position, [1.0, 2.0]);
+        let gpu = GpuVertex::scaled(&vertex, 2.0);
+        assert_eq!(
+            gpu.position,
+            [2.0, 4.0],
+            "the position is scaled to physical pixels"
+        );
         assert_eq!(gpu.uv, [0.25, 0.75]);
         assert_eq!(gpu.color, [0.1, 0.2, 0.3, 0.4]);
         assert_eq!(gpu.local, [3.0, 4.0]);

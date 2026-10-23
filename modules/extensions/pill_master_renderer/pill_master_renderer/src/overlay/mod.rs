@@ -1,12 +1,16 @@
 //! What the renderer draws over the chain's picture on every surface: debug
-//! lines and labels, gizmo handles, selection outlines, and the pick buffer.
+//! lines, gizmo handles, selection outlines, and the pick buffer - plus the
+//! debug labels, which it lays out for the UI painter to draw.
 //!
 //! # Responsibilities
 //!
 //! - Build the overlay's pipelines once, beside the chain's ([`Overlay::new`]).
 //! - Record a surface's overlay after its chain: the outline mask and edge,
-//!   the depth-tested and on-top debug lines, the gizmos and the labels
+//!   the depth-tested and on-top debug lines and the gizmos
 //!   ([`Overlay::record`]).
+//! - Lay the debug labels out as a `pill_draw` list over the bitmap font
+//!   ([`label_list`], [`font::texture_set`]); the UI painter draws it, since
+//!   a label is a screen-space textured quad like any UI.
 //! - Draw the pick buffer for a surface that has picks waiting, and read the
 //!   asked-for pixels back frames later ([`Overlay::take_results`]).
 //!
@@ -35,9 +39,11 @@ use std::collections::HashSet;
 use std::num::NonZeroU32;
 
 // External crates
+use pill_core::math::Vector2f;
+use pill_draw::{Color, DrawList, Rect};
 use pill_engine::{DebugFrame, Entity, LabelAnchor};
+use pill_master_renderer_data::color_space::linear_to_srgb;
 use pill_renderer_api::{PickHit, PickRequest, PickResult, PICK_HANDLE_BIT};
-use wgpu::util::DeviceExt;
 
 // Current crate
 use crate::{
@@ -47,10 +53,12 @@ use crate::{
     frame::RenderFrame,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
     resources::{RendererCamera, RendererMeshHandle, RendererResourceStorage, Vertex},
+    stream_buffer::StreamBuffer,
     Instance,
 };
 
-mod font;
+/// The bitmap font the debug labels are drawn in, and its painter texture.
+pub(crate) mod font;
 mod picking;
 
 /// Width of a selection outline, in pixels.
@@ -121,15 +129,6 @@ struct HandleVertex {
     value: u32,
 }
 
-/// A label quad corner: normalized device position, atlas coordinate, colour.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct LabelVertex {
-    position: [f32; 2],
-    texture_coordinates: [f32; 2],
-    color: [f32; 4],
-}
-
 /// The outline uniform: colour, and the width in `settings[0]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -146,51 +145,6 @@ struct OutlineParameters {
 struct GridParameters {
     cell: [f32; 4],
     viewport: [f32; 4],
-}
-
-/// A vertex buffer rewritten every surface, grown when a frame outgrows it.
-struct StreamBuffer {
-    label: &'static str,
-    buffer: Option<wgpu::Buffer>,
-    capacity: u64,
-}
-
-impl StreamBuffer {
-    fn new(label: &'static str) -> Self {
-        Self {
-            label,
-            buffer: None,
-            capacity: 0,
-        }
-    }
-
-    /// Upload `bytes`; returns the buffer holding them, or `None` when empty.
-    ///
-    /// Each surface submits its own frame, and a queue write lands before the
-    /// next submission, so one buffer serves every surface of a frame.
-    fn write(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        bytes: &[u8],
-    ) -> Option<&wgpu::Buffer> {
-        if bytes.is_empty() {
-            return None;
-        }
-        let needed = bytes.len() as u64;
-        if self.buffer.is_none() || needed > self.capacity {
-            self.capacity = needed.next_power_of_two().max(4096);
-            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: self.capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        let buffer = self.buffer.as_ref()?;
-        queue.write_buffer(buffer, 0, bytes);
-        Some(buffer)
-    }
 }
 
 /// The targets sized to one surface size.
@@ -233,7 +187,6 @@ pub(crate) struct Overlay {
     depth_tested_lines: wgpu::RenderPipeline,
     on_top_lines: wgpu::RenderPipeline,
     on_top_triangles: wgpu::RenderPipeline,
-    labels: wgpu::RenderPipeline,
     outline_edge: wgpu::RenderPipeline,
     outline_mask: wgpu::RenderPipeline,
     mesh_pick: wgpu::RenderPipeline,
@@ -242,13 +195,11 @@ pub(crate) struct Overlay {
     grid: wgpu::RenderPipeline,
     grid_parameters: wgpu::Buffer,
     grid_bind_group: wgpu::BindGroup,
-    font_bind_group: wgpu::BindGroup,
     outline_layout: wgpu::BindGroupLayout,
     outline_parameters: wgpu::Buffer,
     tested_lines: StreamBuffer,
     on_top_lines_buffer: StreamBuffer,
     triangles_buffer: StreamBuffer,
-    label_buffer: StreamBuffer,
     handle_lines_buffer: StreamBuffer,
     handle_triangles_buffer: StreamBuffer,
     targets: Vec<SizedTargets>,
@@ -271,13 +222,12 @@ impl Overlay {
     /// Returns [`RendererError::Other`] when wgpu refuses a shader or pipeline.
     pub fn new(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self> {
         capturing_validation(device, || {
-            Self::create(device, queue, color_format, depth_format, camera_layout)
+            Self::create(device, color_format, depth_format, camera_layout)
         })
         .map_err(|detail| RendererError::Other {
             detail: format!("overlay pipelines: {detail}"),
@@ -286,7 +236,6 @@ impl Overlay {
 
     fn create(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         color_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
         camera_layout: &wgpu::BindGroupLayout,
@@ -295,10 +244,6 @@ impl Overlay {
             label: Some("overlay_world"),
             source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()),
         });
-        let label_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("overlay_label"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("label.wgsl").into()),
-        });
         let outline_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay_outline"),
             source: wgpu::ShaderSource::Wgsl(include_str!("outline.wgsl").into()),
@@ -306,71 +251,6 @@ impl Overlay {
         let grid_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("overlay_grid"),
             source: wgpu::ShaderSource::Wgsl(include_str!("grid.wgsl").into()),
-        });
-
-        // The font atlas and how labels sample it: nearest, so glyphs stay
-        // crisp at any scale.
-        let atlas = font::build_atlas();
-        let font_texture = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("overlay_font"),
-                size: wgpu::Extent3d {
-                    width: atlas.width,
-                    height: atlas.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &atlas.texels,
-        );
-        let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("overlay_font"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let font_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("overlay_font"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let font_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("overlay_font"),
-            layout: &font_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&font_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&font_sampler),
-                },
-            ],
         });
 
         // The outline edge pass reads the mask texel by texel.
@@ -444,7 +324,6 @@ impl Overlay {
             })
         };
         let camera_pipeline_layout = layout("overlay_camera", &[camera_layout]);
-        let label_pipeline_layout = layout("overlay_label", &[&font_layout]);
         let outline_pipeline_layout = layout("overlay_outline", &[&outline_layout]);
         let grid_pipeline_layout = layout("overlay_grid", &[camera_layout, &grid_layout]);
 
@@ -467,11 +346,6 @@ impl Overlay {
             array_stride: std::mem::size_of::<HandleLineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: attributes![0 => Float32x4, 1 => Uint32],
-        };
-        let label_vertex = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<LabelVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: attributes![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
         };
         // A mesh position, from the mesh's own vertex buffer, and the
         // instance's model rows from the chain's instance buffer.
@@ -580,17 +454,6 @@ impl Overlay {
                 blended.clone(),
                 Some(on_top.clone()),
             )),
-            labels: pipeline(PipelineDescription {
-                label: "overlay_labels",
-                layout: &label_pipeline_layout,
-                module: &label_module,
-                vertex: "label_vertex",
-                fragment: "label_fragment",
-                buffers: std::slice::from_ref(&label_vertex),
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                target: blended.clone(),
-                depth: Some(on_top.clone()),
-            }),
             outline_edge: pipeline(PipelineDescription {
                 label: "overlay_outline_edge",
                 layout: &outline_pipeline_layout,
@@ -649,24 +512,31 @@ impl Overlay {
                 value_target,
                 Some(pick_on_top),
             )),
-            font_bind_group,
             grid_parameters,
             grid_bind_group,
             outline_layout,
             outline_parameters,
-            tested_lines: StreamBuffer::new("overlay_lines_tested"),
-            on_top_lines_buffer: StreamBuffer::new("overlay_lines_on_top"),
-            triangles_buffer: StreamBuffer::new("overlay_triangles"),
-            label_buffer: StreamBuffer::new("overlay_labels"),
-            handle_lines_buffer: StreamBuffer::new("overlay_handle_lines"),
-            handle_triangles_buffer: StreamBuffer::new("overlay_handle_triangles"),
+            tested_lines: StreamBuffer::new("overlay_lines_tested", wgpu::BufferUsages::VERTEX),
+            on_top_lines_buffer: StreamBuffer::new(
+                "overlay_lines_on_top",
+                wgpu::BufferUsages::VERTEX,
+            ),
+            triangles_buffer: StreamBuffer::new("overlay_triangles", wgpu::BufferUsages::VERTEX),
+            handle_lines_buffer: StreamBuffer::new(
+                "overlay_handle_lines",
+                wgpu::BufferUsages::VERTEX,
+            ),
+            handle_triangles_buffer: StreamBuffer::new(
+                "overlay_handle_triangles",
+                wgpu::BufferUsages::VERTEX,
+            ),
             targets: Vec::new(),
             readback: picking::PickReadback::default(),
         }
     }
 
     /// Record the overlay of one surface after its chain: outlines, debug
-    /// lines, gizmos and labels into the surface, and the pick buffer when
+    /// lines and gizmos into the surface, and the pick buffer when
     /// picks on this surface are waiting.
     pub fn record(
         &mut self,
@@ -712,11 +582,9 @@ impl Overlay {
         );
         let (tested, on_top) = line_vertices(&frame.debug, view_projection, viewport_size);
         let triangles = triangle_vertices(&frame.debug, view_projection, viewport_size);
-        let labels = label_vertices(&frame.debug, &input);
         let tested_count = tested.len() as u32;
         let on_top_count = on_top.len() as u32;
         let triangle_count = triangles.len() as u32;
-        let label_count = labels.len() as u32;
         let tested_buffer = self
             .tested_lines
             .write(device, queue, bytemuck::cast_slice(&tested))
@@ -729,16 +597,11 @@ impl Overlay {
             .triangles_buffer
             .write(device, queue, bytemuck::cast_slice(&triangles))
             .cloned();
-        let label_buffer = self
-            .label_buffer
-            .write(device, queue, bytemuck::cast_slice(&labels))
-            .cloned();
 
         let draws_into_surface = !outlined.is_empty()
             || tested_buffer.is_some()
             || on_top_buffer.is_some()
             || triangles_buffer.is_some()
-            || label_buffer.is_some()
             || grid.is_some();
         if let Some(cell_size) = grid {
             let parameters = GridParameters {
@@ -804,13 +667,6 @@ impl Overlay {
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..count, 0..1);
                 }
-            }
-            // Labels last: text is what has to stay readable.
-            if let Some(buffer) = &label_buffer {
-                pass.set_pipeline(&self.labels);
-                pass.set_bind_group(0, &self.font_bind_group, &[]);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..label_count, 0..1);
             }
         }
 
@@ -1456,56 +1312,50 @@ fn handle_triangle_vertices(debug: &DebugFrame) -> Vec<HandleVertex> {
         .collect()
 }
 
-/// The frame's labels as glyph quads in normalized device coordinates, each
-/// over a shadow one pixel down and right.
-fn label_vertices(debug: &DebugFrame, input: &OverlayFrame) -> Vec<LabelVertex> {
-    let (width, height) = (input.size.0.max(1) as f32, input.size.1.max(1) as f32);
-    let atlas = (font_atlas_size().0 as f32, font_atlas_size().1 as f32);
-    let mut vertices = Vec::new();
+/// The frame's labels as a `pill_draw` list in surface pixels: glyph quads
+/// over the bitmap font texture, each over a shadow one glyph pixel down and
+/// right. The UI painter draws it after the overlay, so text stays readable
+/// over everything the overlay drew.
+///
+/// Debug colours are linear and the painter decodes sRGB vertex colours, so
+/// each colour is encoded on the way in and lands unchanged.
+pub(crate) fn label_list(
+    debug: &DebugFrame,
+    view_projection: &pill_core::math::Matrix4f,
+    viewport: RenderViewport,
+) -> DrawList {
+    let mut list = DrawList::new();
+    let (atlas_width, atlas_height) = font::atlas_size();
+    let (atlas_width, atlas_height) = (atlas_width as f32, atlas_height as f32);
     for label in &debug.labels {
-        let Some((x, y)) = label_origin(
-            label.anchor,
-            &input.camera.parameters_data.view_projection_matrix,
-            input.viewport,
-        ) else {
+        let Some((x, y)) = label_origin(label.anchor, view_projection, viewport) else {
             continue;
         };
         for (offset, color) in [(font::GLYPH_SCALE, LABEL_SHADOW), (0.0, label.color)] {
+            let color = Color::rgba(
+                linear_to_srgb(color[0]),
+                linear_to_srgb(color[1]),
+                linear_to_srgb(color[2]),
+                color[3],
+            );
             for quad in font::layout_text(&label.text, x + offset, y + offset) {
-                let left = quad.origin[0] / width * 2.0 - 1.0;
-                let right = (quad.origin[0] + quad.size[0]) / width * 2.0 - 1.0;
-                let top = 1.0 - quad.origin[1] / height * 2.0;
-                let bottom = 1.0 - (quad.origin[1] + quad.size[1]) / height * 2.0;
-                let u0 = quad.atlas_origin[0] as f32 / atlas.0;
-                let v0 = quad.atlas_origin[1] as f32 / atlas.1;
-                let u1 = (quad.atlas_origin[0] + font::GLYPH_WIDTH) as f32 / atlas.0;
-                let v1 = (quad.atlas_origin[1] + font::GLYPH_HEIGHT) as f32 / atlas.1;
-                let corner = |x, y, u, v| LabelVertex {
-                    position: [x, y],
-                    texture_coordinates: [u, v],
-                    color,
-                };
-                vertices.extend([
-                    corner(left, top, u0, v0),
-                    corner(left, bottom, u0, v1),
-                    corner(right, top, u1, v0),
-                    corner(right, top, u1, v0),
-                    corner(left, bottom, u0, v1),
-                    corner(right, bottom, u1, v1),
-                ]);
+                let rect = Rect::from_min_size(
+                    Vector2f::new(quad.origin[0], quad.origin[1]),
+                    Vector2f::new(quad.size[0], quad.size[1]),
+                );
+                let uv_min = Vector2f::new(
+                    quad.atlas_origin[0] as f32 / atlas_width,
+                    quad.atlas_origin[1] as f32 / atlas_height,
+                );
+                let uv_max = Vector2f::new(
+                    (quad.atlas_origin[0] + font::GLYPH_WIDTH) as f32 / atlas_width,
+                    (quad.atlas_origin[1] + font::GLYPH_HEIGHT) as f32 / atlas_height,
+                );
+                list.push_quad(font::FONT_TEXTURE, rect, uv_min, uv_max, color);
             }
         }
     }
-    vertices
-}
-
-/// The font atlas's size in texels.
-fn font_atlas_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let atlas = font::build_atlas();
-        (atlas.width, atlas.height)
-    })
+    list
 }
 
 /// Where a label's text starts, in surface pixels: a screen anchor as given,
@@ -1537,6 +1387,7 @@ fn label_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::UiRenderer;
 
     /// A world point straight ahead lands in the middle of the viewport, and
     /// one behind the camera is not drawn.
@@ -1639,5 +1490,182 @@ mod tests {
         );
         let behind = behind.collect_frame(0.016);
         assert!(triangle_vertices(&behind, &projection, (100.0, 100.0)).is_empty());
+    }
+
+    /// A device and queue without a surface, preferring the platform's
+    /// software adapter (WARP on Windows) so the test runs without a GPU;
+    /// `None` when the machine offers no adapter at all.
+    async fn windowless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            flags: wgpu::InstanceFlags::from_build_config(),
+            backend_options: wgpu::BackendOptions::default(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                compatible_surface: None,
+                force_fallback_adapter: true,
+                apply_limit_buckets: false,
+            })
+            .await
+            .ok()?;
+        adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("overlay label test device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })
+            .await
+            .ok()
+    }
+
+    /// Draw `list` with `painter` into a transparent sRGB target of `size`
+    /// and read its pixels back as tightly packed RGBA8 rows.
+    fn render_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        painter: &mut UiRenderer,
+        size: (u32, u32),
+        list: &DrawList,
+    ) -> Vec<u8> {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("overlay label test target"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        // A texture-to-buffer copy pads every row to the copy alignment.
+        let row_bytes = size.0 as usize * 4;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+        let padded_row_bytes = row_bytes.div_ceil(alignment) * alignment;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay label test readback"),
+            size: (padded_row_bytes * size.1 as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("overlay label test encoder"),
+        });
+        painter.render(device, queue, &mut encoder, &view, size, &[(list, 1.0)]);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes as u32),
+                    rows_per_image: Some(size.1),
+                },
+            },
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .expect("the readback finishes");
+        receiver
+            .recv()
+            .expect("the map callback ran")
+            .expect("the readback maps");
+        let mapped = slice.get_mapped_range().expect("the mapped range");
+        let mut pixels = Vec::with_capacity(row_bytes * size.1 as usize);
+        for row in 0..size.1 as usize {
+            let start = row * padded_row_bytes;
+            pixels.extend_from_slice(&mapped[start..start + row_bytes]);
+        }
+        pixels
+    }
+
+    /// A debug label drawn through the UI painter lands in its linear debug
+    /// colour - the bytes the label shader it replaced wrote into an sRGB
+    /// target - only where its glyph is lit, over its shadow one glyph pixel
+    /// down and right. Skipped on a machine with no adapter at all.
+    #[test]
+    fn labels_draw_through_the_painter_in_their_linear_colour() {
+        let Some((device, queue)) = pill_core::platform::futures::block_on(windowless_device())
+        else {
+            eprintln!("no wgpu adapter on this machine; the label render test is skipped");
+            return;
+        };
+        let mut painter = UiRenderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            (64, 64),
+        );
+        painter.apply_texture_set(&device, &queue, &font::texture_set());
+
+        // `|` lights its glyph's middle column, so the text covers x 4..6 and
+        // y 0..14, and the shadow x 6..8 and y 2..16.
+        let mut draw = pill_engine::DebugDraw::new(true);
+        let style = pill_engine::DebugStyle::colored([0.5, 0.25, 1.0, 1.0]);
+        draw.label_screen(0.0, 0.0, "|", style);
+        let frame = draw.collect_frame(0.016);
+        let list = label_list(
+            &frame,
+            &pill_core::math::Matrix4f::IDENTITY,
+            RenderViewport::new(0, 0, 32, 32),
+        );
+        let size = (32u32, 32u32);
+        let pixels = render_pixels(&device, &queue, &mut painter, size, &list);
+        let pixel = |x: u32, y: u32| {
+            let start = ((y * size.0 + x) * 4) as usize;
+            [
+                pixels[start],
+                pixels[start + 1],
+                pixels[start + 2],
+                pixels[start + 3],
+            ]
+        };
+
+        // Linear 0.5 and 0.25 encode to sRGB 188 and 137.
+        let text = pixel(5, 1);
+        let expected = [188, 137, 255, 255];
+        for (channel, (got, want)) in text.iter().zip(expected).enumerate() {
+            assert!(
+                got.abs_diff(want) <= 1,
+                "text channel {channel}: {text:?} vs {expected:?}"
+            );
+        }
+        let shadow = pixel(7, 8);
+        assert_eq!(&shadow[..3], &[0, 0, 0], "the shadow is black: {shadow:?}");
+        assert!(
+            shadow[3].abs_diff(217) <= 1,
+            "the shadow is 85% opaque: {shadow:?}"
+        );
+        assert_eq!(pixel(20, 20), [0, 0, 0, 0], "nothing outside the label");
     }
 }

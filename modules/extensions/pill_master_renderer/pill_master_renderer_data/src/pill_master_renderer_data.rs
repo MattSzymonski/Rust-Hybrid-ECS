@@ -32,6 +32,9 @@
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
 
+/// The sRGB transfer curve the importer and the GPU module share.
+pub mod color_space;
+
 /// The world-side draw components and [`register_components`].
 pub mod components;
 

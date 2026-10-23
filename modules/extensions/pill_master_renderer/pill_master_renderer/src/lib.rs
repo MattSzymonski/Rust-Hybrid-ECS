@@ -70,6 +70,9 @@ mod rendering_resources_manager;
 /// One module per cached GPU resource, re-exported flat for the renderer.
 pub mod resources;
 
+/// A GPU buffer rewritten every surface, shared by the overlay and the UI painter.
+mod stream_buffer;
+
 /// The window surface, its swapchain, and the lifecycle that keeps them live.
 mod surface;
 

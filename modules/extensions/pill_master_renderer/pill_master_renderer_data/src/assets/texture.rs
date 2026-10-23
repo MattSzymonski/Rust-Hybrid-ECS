@@ -41,6 +41,9 @@ use pill_engine::{
 };
 use serde::{Deserialize, Serialize};
 
+// Current crate
+use crate::color_space::srgb_to_linear;
+
 /// How a texture's texels are meant to be read.
 ///
 /// The type travels with the texels because the bytes alone do not say how to
@@ -306,15 +309,6 @@ fn expected_byte_count(texture_type: TextureType, width: u32, height: u32) -> us
         * height as usize
         * texture_type.bytes_per_texel()
         * texture_type.layer_count() as usize
-}
-
-/// Converts one sRGB-encoded channel in `[0, 1]` to linear light.
-fn srgb_to_linear(value: f32) -> f32 {
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
 }
 
 /// The equirectangular uv a direction samples, in `[0, 1]`.
