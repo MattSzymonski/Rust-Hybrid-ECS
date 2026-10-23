@@ -20,7 +20,7 @@
 //! - and [`GameUi`] itself lives here, so the type is one across artifacts.
 //!
 //! The frame it produces is neutral (`pill_draw`) and travels through the
-//! engine core's frame slot: the renderer and `pill_renderer_api` never see
+//! draw crate's frame slot (`pill_draw::UiFrameSlot`): the renderer and `pill_renderer_api` never see
 //! egui (D1), and neither side names the other's crate - which is also what
 //! keeps a renderer from having to link this crate, since one link unit cannot
 //! hold two copies of a third-party graph in different formats. A game's own

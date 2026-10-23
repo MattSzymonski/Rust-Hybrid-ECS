@@ -14,7 +14,7 @@ pill_engine = { path = "../../modules/pill_engine" }
 # The math vocabulary the engine and the UI share (positions, sizes).
 pill_core = { path = "../../modules/pill_core" }
 # The in-game UI (W-0028): the tuning overlay builds an egui pass with it, and
-# the renderer draws the frame it publishes through the engine core's slot. A
+# the renderer draws the frame it publishes through `pill_draw`'s slot. A
 # shared library like `pill_ui` was, so the overlay's context - its fonts, its
 # widget state - outlives a reload of this project.
 pill_game_ui = { path = "../../modules/pill_game_ui" }
