@@ -12,6 +12,8 @@
 //!   drawing nothing.
 //! - [`atlas`]: the atlas update data ([`AtlasUpdate`], [`Region`]) a
 //!   backend applies to its own texture.
+//! - [`slot`]: the world resource ([`UiFrameSlot`]) a producer publishes a
+//!   frame into and a renderer drains.
 //!
 //! # Design
 //!
@@ -28,10 +30,13 @@ pub mod atlas;
 pub mod draw;
 /// A frame of UI output.
 pub mod frame;
+/// The world resource a frame travels through.
+pub mod slot;
 /// The versioned textures a frame carries.
 pub mod texture;
 
 pub use atlas::{AtlasRegionUpdate, AtlasUpdate, Region};
 pub use draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 pub use frame::{UiDraw, UiFrame};
+pub use slot::UiFrameSlot;
 pub use texture::{UiTexture, UiTextureFilter, UiTextureSet, UiTextureUpload};

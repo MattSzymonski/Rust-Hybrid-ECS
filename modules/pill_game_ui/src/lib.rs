@@ -6,7 +6,7 @@
 //!   and keyboard claims, and the texture mirror.
 //! - [`GameUi::run`]: one pass - the engine's input in, the frame's draw list
 //!   and textures out, published into the world's
-//!   [`UiFrameSlot`](pill_engine_core::ui_frame::UiFrameSlot).
+//!   [`UiFrameSlot`](pill_draw::UiFrameSlot).
 //! - [`install`]: puts the resource into a project's world, registering its
 //!   type first so a reload finds the same one.
 //! - [`convert`], [`input`], [`textures`]: the three pieces it composes.
@@ -55,13 +55,15 @@ pub mod textures;
 /// The egui this crate pins, re-exported so a project names it through the
 /// engine rather than depending on a second copy of its own.
 pub use egui;
+/// The slot a pass publishes into, re-exported so a project's system names it
+/// without depending on the draw-data crate itself.
+pub use pill_draw::UiFrameSlot;
 
 // External crates
 use egui::Context;
 use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
 use pill_draw::{DrawList, UiDraw, UiFrame};
-use pill_engine_core::ui_frame::UiFrameSlot;
 use pill_engine_core::{Engine, Resource};
 
 // Current crate

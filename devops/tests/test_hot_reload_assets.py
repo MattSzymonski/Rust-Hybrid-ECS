@@ -318,7 +318,10 @@ def main() -> None:
         if not monitor.wait_for(STARTUP_TOKEN, startup_timeout):
             print(f"  [FAIL] Host did not start within {startup_timeout}s.")
             sys.exit(1)
-        if ASSET_WATCH_TOKEN not in monitor.output_since(0):
+        # The watcher starts right after the project loop does, so its line
+        # can land just after the startup token; wait briefly instead of
+        # reading the output once.
+        if not monitor.wait_for(ASSET_WATCH_TOKEN, 10):
             print("  [FAIL] The host did not start its asset watcher.")
             sys.exit(1)
         print("  [OK] Host running, asset watcher started.\n")

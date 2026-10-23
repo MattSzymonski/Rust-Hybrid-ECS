@@ -1,4 +1,5 @@
-//! The neutral frame a UI producer publishes and a renderer drains.
+//! The world resource a UI producer publishes a frame into and a renderer
+//! drains it from.
 //!
 //! # Responsibilities
 //!
@@ -14,17 +15,17 @@
 //! drawing without linking it as well - on Windows a single link unit cannot
 //! hold two copies of the same third-party graph in different formats.
 //!
-//! The type lives in the engine core because both sides already link the core
-//! and because the frame is plain draw data, the same kind of thing
-//! [`DebugDraw`](crate::debug_draw) is. Its [`Resource::shared_name`] is pinned:
-//! a project DLL and the host compile this crate separately, and the name is
-//! what makes the host's slot and the project's writes the same resource.
+//! The slot lives beside the data it holds, so the engine core names no UI
+//! types: both sides already link this crate. Its [`Resource::shared_name`]
+//! is pinned: a project DLL and the host register the resource separately,
+//! and the name is what makes the host's slot and the project's writes the
+//! same resource.
 
 // External crates
-use pill_draw::UiFrame;
+use pill_engine_core::resource::Resource;
 
 // Current crate
-use crate::resource::Resource;
+use crate::frame::UiFrame;
 
 // =============================================================================
 // UiFrameSlot
@@ -39,7 +40,7 @@ pub struct UiFrameSlot {
 
 impl Resource for UiFrameSlot {
     fn shared_name() -> Option<&'static str> {
-        Some("pill_engine_core::UiFrameSlot")
+        Some("pill_draw::UiFrameSlot")
     }
 }
 
@@ -79,18 +80,19 @@ impl UiFrameSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_draw::{DrawList, UiDraw};
+    use crate::draw::{Color, DrawList, Rect};
+    use crate::frame::UiDraw;
 
     /// A frame carrying one draw list, so emptiness is observable.
     fn drawn_frame() -> UiFrame {
         let mut frame = UiFrame::default();
         let mut list = DrawList::new();
         list.push_fill(
-            pill_draw::Rect::from_min_size(
+            Rect::from_min_size(
                 pill_core::math::Vector2f::ZERO,
                 pill_core::math::Vector2f::new(2.0, 2.0),
             ),
-            pill_draw::Color::WHITE,
+            Color::WHITE,
         );
         frame.draws.push(UiDraw {
             surface: 0,

@@ -202,14 +202,14 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
 /// most six.
 ///
 /// The one UI producer is here: the slot a game's own UI publishes into
-/// ([`UiFrameSlot`]). A world that never installed one carries no UI.
+/// ([`UiFrameSlot`](pill_draw::UiFrameSlot)). A world that never installed one carries no UI.
 type RenderingExtras<'w> = (
     Res<'w, pill_engine::Time>,
     Res<'w, pill_renderer_api::SurfaceCameras>,
     ResMut<'w, pill_engine::DebugDraw>,
     Res<'w, pill_renderer_api::SelectionOutlines>,
     ResMut<'w, pill_renderer_api::PickRequests>,
-    ResMut<'w, pill_engine::ui_frame::UiFrameSlot>,
+    ResMut<'w, pill_draw::UiFrameSlot>,
 );
 
 /// Which producer filled `RenderFrame.ui` on the last frame, so a change is
@@ -729,11 +729,11 @@ mod tests {
         let mut engine = renderable_engine();
         engine
             .world_mut()
-            .insert_resource(pill_engine::ui_frame::UiFrameSlot::new());
+            .insert_resource(pill_draw::UiFrameSlot::new());
         {
             let slot = engine
                 .world_mut()
-                .get_resource_mut::<pill_engine::ui_frame::UiFrameSlot>()
+                .get_resource_mut::<pill_draw::UiFrameSlot>()
                 .expect("inserted above");
             slot.publish(drawn_frame().ui);
         }
@@ -750,7 +750,7 @@ mod tests {
         );
         let slot = engine
             .world()
-            .get_resource::<pill_engine::ui_frame::UiFrameSlot>()
+            .get_resource::<pill_draw::UiFrameSlot>()
             .expect("inserted above");
         assert!(slot.is_empty(), "the frame was copied rather than drained");
     }
@@ -760,7 +760,7 @@ mod tests {
         let mut engine = renderable_engine();
         engine
             .world_mut()
-            .insert_resource(pill_engine::ui_frame::UiFrameSlot::new());
+            .insert_resource(pill_draw::UiFrameSlot::new());
         engine.process_frame().expect("the frame runs");
 
         let frame = engine
