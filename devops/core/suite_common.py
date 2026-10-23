@@ -849,7 +849,6 @@ HOST_SOURCE_ROOTS = (
     MODULES_ROOT / "pill_engine",
     MODULES_ROOT / "pill_engine_core",
     MODULES_ROOT / "pill_assets",
-    MODULES_ROOT / "pill_draw_wgpu",
     MODULES_ROOT / "pill_input",
     MODULES_ROOT / "hosting",
     MODULES_ROOT / "frontents" / "pill_standalone",

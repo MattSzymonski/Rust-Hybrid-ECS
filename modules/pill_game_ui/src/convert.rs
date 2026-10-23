@@ -10,7 +10,7 @@
 //! # Design
 //!
 //! egui tessellates premultiplied sRGB colour into triangle lists in *points*,
-//! while `pill_draw::Color` is straight alpha and `pill_draw_wgpu` blends
+//! while `pill_draw::Color` is straight alpha and the renderer's UI painter blends
 //! `SrcAlpha`, so the converter unpremultiplies per vertex and per texel (see
 //! the W-0028 Stage 1 decision record, Q2). Vertices are not scaled: the
 //! painter takes the monitor scale and applies it itself, which keeps one
