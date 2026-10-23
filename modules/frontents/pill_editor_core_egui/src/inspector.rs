@@ -23,10 +23,10 @@
 //! the history records them - the same split the Assets pipeline follows.
 
 // External crates
+use pill_editor_ui::egui::Color32;
+use pill_editor_ui::icons::Icon;
 use pill_engine::component_registry::FieldDecorator;
 use pill_engine::{Entity, FieldValue};
-use pill_ui_egui::egui::Color32;
-use pill_ui_egui::icons::Icon;
 use serde_json::Value as JsonValue;
 
 // Current crate

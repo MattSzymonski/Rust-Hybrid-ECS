@@ -16,7 +16,7 @@
 //! This crate is a shared `dylib` (plan decision D2) so the egui context
 //! outlives a project reload: a rebuilt project finds its fonts, its widget
 //! state and its textures still there. The same reload contract as
-//! `pill_ui_egui` binds - nothing module-defined may be stored in the context
+//! `pill_editor_ui` binds - nothing module-defined may be stored in the context
 //! - and [`GameUi`] itself lives here, so the type is one across artifacts.
 //!
 //! The frame it produces is neutral (`pill_draw`) and travels through the

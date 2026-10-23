@@ -32,11 +32,11 @@ pill_runtime = { path = "../pill_runtime" }
 # references it, so nothing of it is linked into the host.
 renderer_data_dependency_graph = { package = "pill_master_renderer_data", path = "../../extensions/pill_master_renderer/pill_master_renderer_data" }
 # Graph-only, like the renderer crates: the egui editor's executable, its
-# reloadable shell module and its model crate share the `pill_ui_egui` and
+# reloadable shell module and its model crate share the `pill_editor_ui` and
 # `pill_editor_core_egui` dylibs, so the host's resolved graph must include
 # their trees for the module builds - the reload included - to resolve the
 # same features. Nothing in the host's code names either.
-ui_egui_dependency_graph = { package = "pill_ui_egui", path = "../../pill_ui_egui" }
+editor_ui_dependency_graph = { package = "pill_editor_ui", path = "../../pill_editor_ui" }
 editor_core_egui_dependency_graph = { package = "pill_editor_core_egui", path = "../../frontents/pill_editor_core_egui" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running

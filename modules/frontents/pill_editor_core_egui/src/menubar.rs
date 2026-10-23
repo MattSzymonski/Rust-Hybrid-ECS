@@ -16,7 +16,7 @@
 //! buttons out, so the bar follows the theme and the font metrics.
 
 // External crates
-use pill_ui_egui::egui::{pos2, Rect, Vec2};
+use pill_editor_ui::egui::{pos2, Rect, Vec2};
 
 // Current crate
 use crate::assets;

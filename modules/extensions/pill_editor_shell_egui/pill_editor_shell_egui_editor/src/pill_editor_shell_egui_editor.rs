@@ -11,7 +11,7 @@
 //!
 //! The executable owns the window, the GPU device and the input; this crate
 //! owns the dock and the egui pass, and the two exchange plain data
-//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_ui_egui`,
+//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_ui`,
 //! the shared `dylib` both link). Input events transit through the engine's
 //! `Input` resource, and the shell converts them itself.
 //!
@@ -39,9 +39,9 @@ use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCom
 use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
 use pill_editor_core_egui::notices::EditorNotices;
 use pill_editor_core_egui::session::EguiShellState;
+use pill_editor_ui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
+use pill_editor_ui::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
-use pill_ui_egui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
-use pill_ui_egui::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 
 // The build script scans this crate and emits one address entry per function
 // into `function_inventory.rs`; the `include!` is what makes every function

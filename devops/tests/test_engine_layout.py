@@ -33,7 +33,7 @@ DESCRIPTION
                         on would duplicate the entry-point symbols.
       4. shared UI    - each UI-independent shared dylib (`pill_draw`, the in-game
                         egui UI's `pill_game_ui`, and the egui editor's copies,
-                        `pill_editor_core_egui` and `pill_ui_egui`) is built as a
+                        `pill_editor_core_egui` and `pill_editor_ui`) is built as a
                         `dylib` (one copy per process) and links no UI framework,
                         window system or GPU crate (`dioxus`, `tao`, `wry`,
                         `winit`, `wgpu`), followed through every path dependency.
@@ -83,7 +83,7 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     ("pill_game_ui", "pill_game_ui"),
     # The egui editor's copies (W-0017): one shared dylib each, same rule.
     ("pill_editor_core_egui", "frontents/pill_editor_core_egui"),
-    ("pill_ui_egui", "pill_ui_egui"),
+    ("pill_editor_ui", "pill_editor_ui"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 

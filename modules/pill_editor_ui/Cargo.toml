@@ -1,5 +1,5 @@
 [package]
-name = "pill_ui_egui"
+name = "pill_editor_ui"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 workspace = true
 
 [lib]
-name = "pill_ui_egui"
+name = "pill_editor_ui"
 path = "src/lib.rs"
 # A shared `dylib` (plan decision E3): the egui editor's
 # frontend, its reloadable egui shell module and its model crate all link
@@ -44,7 +44,7 @@ egui_dock = { version = "0.21.1", default-features = false, features = [
 # exported symbol names hash the features of every crate below it, and the
 # egui editor's module world (this crate plus the shell) and host world
 # (this crate plus the frontend and `egui-wgpu`) must resolve this tree
-# identically, or each produces its own `pill_ui_egui.dll` and the shell
+# identically, or each produces its own `pill_editor_ui.dll` and the shell
 # would load against type identities the frontend does not have.
 #
 # `epaint` is requested with `bytemuck` because `egui-wgpu` asks for it

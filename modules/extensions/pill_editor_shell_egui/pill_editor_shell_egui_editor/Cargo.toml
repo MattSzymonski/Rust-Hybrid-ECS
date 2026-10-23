@@ -31,7 +31,7 @@ pill_core = { path = "../../../pill_core" }
 # the system resource parameters.
 pill_engine = { path = "../../../pill_engine" }
 # The egui library: the context, the style and the boundary resources.
-pill_ui_egui = { path = "../../../pill_ui_egui" }
+pill_editor_ui = { path = "../../../pill_editor_ui" }
 # The model: the dock, the shared selection and the engine snapshots.
 pill_editor_core_egui = { path = "../../../frontents/pill_editor_core_egui" }
 # The asset settings documents the Inspector edits are JSON.

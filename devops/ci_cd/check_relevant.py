@@ -164,9 +164,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
     if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**"):
+           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_ui_egui",
+                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_editor_ui",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
@@ -190,9 +190,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
     if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**"):
+           "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_ui_egui",
+                                    ("test", "-p", "pill_editor_core_egui", "-p", "pill_editor_ui",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
@@ -301,7 +301,7 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-draw-wgpu", ("modules/pill_draw_wgpu/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
-                     "modules/extensions/pill_editor_shell_egui/**", "modules/pill_ui_egui/**")),
+                     "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**")),
     ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
     ("pill-core", ("modules/pill_core/**",)),
