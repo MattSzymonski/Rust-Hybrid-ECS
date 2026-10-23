@@ -12,10 +12,6 @@ members = [
     # frame's UI type has one identity across every artifact that builds or
     # draws it (W-0032).
     "pill_draw",
-    # The wgpu painter for `pill_draw` lists: an `rlib` compiled into its
-    # users (the GPU module, tests), never loaded as a module itself (plan
-    # decisions D8, D26).
-    "pill_draw_wgpu",
     # The egui editor's own UI library (W-0017): a shared dylib so the egui
     # editor's world can replace its UI core across a reload.
     "pill_editor_ui",

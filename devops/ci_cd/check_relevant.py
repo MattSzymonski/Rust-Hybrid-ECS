@@ -150,15 +150,6 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     ("test", "-p", "pill_draw", "-p", "pill_game_ui", "--offline"),
                                     "shared draw data changed"))
 
-    # The UI painter: `pill_draw` lists to wgpu. Its own tests cover the
-    # texture-set and clip paths; the renderer's tests cover what it is handed
-    # each frame, so both run.
-    if has("modules/pill_draw_wgpu/**"):
-        selected.append(cargo_check("test pill_draw_wgpu",
-                                    ("test", "-p", "pill_draw_wgpu", "-p", "pill_master_renderer",
-                                     "--offline"),
-                                    "UI painter changed"))
-
     # The egui editor: the shared model crate, the UI library, the reloadable
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
@@ -173,7 +164,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
-    # feeds is `pill_draw_wgpu`, whose tests cover the draw lists. The slot it
+    # feeds is the renderer's `ui` module, whose tests cover the draw lists. The slot it
     # publishes into is `pill_draw`'s, so a change here also moves what every
     # module drains.
     if has("modules/pill_game_ui/**"):
@@ -298,7 +289,6 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-draw", ("modules/pill_draw/**",)),
-    ("pill-draw-wgpu", ("modules/pill_draw_wgpu/**",)),
     ("pill-game-ui", ("modules/pill_game_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
                      "modules/extensions/pill_editor_shell_egui/**", "modules/pill_editor_ui/**")),

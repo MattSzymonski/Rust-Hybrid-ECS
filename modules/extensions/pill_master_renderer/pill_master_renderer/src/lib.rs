@@ -5,7 +5,8 @@
 //!
 //! - Own the GPU half: device and surface lifecycle ([`Renderer`]), the
 //!   [`resources`] caches, the [`drawers`], and the [`render_queue`] keys that
-//!   order a frame's draws.
+//!   order a frame's draws, and the [`ui`] painter that draws the frame's
+//!   `pill_draw` lists.
 //! - Fill each frame from the world ([`frame`], the `rendering` system).
 //! - Install the renderer on an engine through [`register`]: the data from
 //!   `pill_renderer_api`, plus the system.
@@ -71,6 +72,9 @@ pub mod resources;
 
 /// The window surface, its swapchain, and the lifecycle that keeps them live.
 mod surface;
+
+/// The UI painter: draws the frame's `pill_draw` lists over each surface.
+mod ui;
 
 /// The C ABI a host drives this renderer through when it loads it as a module.
 ///

@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
 use pill_draw::{
-    AtlasUpdate, Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter,
+    Color, DrawCommand, DrawList, Rect, Region, TextureId, UiTexture, UiTextureFilter,
     UiTextureSet, UiVertex,
 };
 use wgpu::util::DeviceExt;
@@ -398,36 +398,6 @@ impl UiRenderer {
         }
     }
 
-    /// The atlas texture's current size; a page growth changes it.
-    pub fn atlas_size(&self) -> (u32, u32) {
-        self.atlas_size
-    }
-
-    /// Upload the regions of an [`AtlasUpdate`] - the same texture
-    /// [`Self::apply_texture_set`] feeds, for a caller that received the atlas's
-    /// changes as owned data across an artifact boundary. An update whose
-    /// size differs recreates the texture first, like a growth in
-    /// `DEFAULT_ATLAS_LENGTH`.
-    pub fn apply_atlas_update(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        update: &AtlasUpdate,
-    ) {
-        let size = (update.width, update.height);
-        if size != self.atlas_size {
-            let (texture, bind_group) =
-                atlas_resources(device, &self.texture_layout, &self.sampler, size);
-            self.atlas_texture = texture;
-            self.atlas_bind_group = bind_group;
-            self.atlas_size = size;
-        }
-        self.atlas_uploaded = true;
-        for entry in &update.regions {
-            upload_region_pixels(queue, &self.atlas_texture, entry.region, &entry.pixels);
-        }
-    }
-
     /// Upload every texture in `set` whose carried revision this instance has
     /// not applied, then free the ones it names.
     ///
@@ -451,12 +421,6 @@ impl UiRenderer {
         for id in &set.frees {
             self.free_texture(id);
         }
-    }
-
-    /// The revision this instance applied for `id`, or `None` when it has
-    /// never applied it.
-    pub fn applied_revision(&self, id: TextureId) -> Option<u64> {
-        self.applied_revisions.get(&id).copied()
     }
 
     /// Upload one texture at its carried revision.
@@ -578,56 +542,6 @@ impl UiRenderer {
             }
             TextureId::Solid => {}
         }
-    }
-
-    /// Register (or replace) the external texture `id` samples.
-    ///
-    /// `rgba` is `size.0 * size.1 * 4` bytes of sRGB-encoded RGBA8, the same
-    /// space [`Color`] uses; the created texture decodes it while sampling.
-    pub fn set_external(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        id: u64,
-        size: (u32, u32),
-        rgba: &[u8],
-    ) {
-        assert_eq!(
-            rgba.len(),
-            size.0 as usize * size.1 as usize * 4,
-            "an external texture needs exactly width * height * 4 bytes"
-        );
-        let texture = create_srgb_texture(device, "pill_draw external", size);
-        upload_whole_texture(queue, &texture, size, rgba);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_draw external bind group"),
-            layout: &self.texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        self.externals.insert(
-            id,
-            ExternalTexture {
-                texture,
-                bind_group,
-                size,
-            },
-        );
-    }
-
-    /// Forget an external texture; draws naming it are skipped from now on.
-    pub fn remove_external(&mut self, id: u64) -> bool {
-        self.applied_revisions.remove(&TextureId::External(id));
-        self.externals.remove(&id).is_some()
     }
 
     /// Draw `list` into `target`.
