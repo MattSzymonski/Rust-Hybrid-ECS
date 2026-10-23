@@ -8,12 +8,11 @@
 //! # Design
 //!
 //! A UI producer and a renderer meet here rather than naming each other. The
-//! producer (a project's egui pass, or the editor's `pill_ui` context) writes
-//! what it drew; the renderer drains it and draws it. Neither side depends on
-//! the other's crate, which is what lets a project link the game-UI library and
-//! the renderer module keep drawing without linking it as well - on Windows a
-//! single link unit cannot hold two copies of the same third-party graph in
-//! different formats, and the renderer already holds `pill_ui`'s.
+//! producer (a project's egui pass) writes what it drew; the renderer drains
+//! it and draws it. Neither side depends on the other's crate, which is what
+//! lets a project link the game-UI library and the renderer module keep
+//! drawing without linking it as well - on Windows a single link unit cannot
+//! hold two copies of the same third-party graph in different formats.
 //!
 //! The type lives in the engine core because both sides already link the core
 //! and because the frame is plain draw data, the same kind of thing

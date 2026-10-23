@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # and the reloadable editor shell module (panels, commands) both use these
 # types, and one compiled copy per process is what lets the same layout model
 # and command values cross between them. With `-C prefer-dynamic` every user
-# imports `pill_editor_core.dll`. A change to this crate therefore rebuilds its
+# imports `pill_editor_core_egui.dll`. A change to this crate therefore rebuilds its
 # users and restarts the editor (plan decision D17).
 #
 # `rlib` is kept for the crate's own unit tests and any static build.

@@ -22,10 +22,10 @@
 //! The frame it produces is neutral (`pill_draw`) and travels through the
 //! engine core's frame slot: the renderer and `pill_renderer_api` never see
 //! egui (D1), and neither side names the other's crate - which is also what
-//! keeps a renderer that links `pill_ui` from having to link this crate, since
-//! one link unit cannot hold two copies of a third-party graph in different
-//! formats. A game's own systems read [`GameUi::wants_pointer`] /
-//! [`GameUi::wants_keyboard`] to gate their input (D4). The context is exposed
+//! keeps a renderer from having to link this crate, since one link unit cannot
+//! hold two copies of a third-party graph in different formats. A game's own
+//! systems read [`GameUi::wants_pointer`] / [`GameUi::wants_keyboard`] to gate
+//! their input (D4). The context is exposed
 //! for the one thing a facade cannot wrap: a project's UI closure needs
 //! `&mut egui::Ui`.
 //!
@@ -205,7 +205,7 @@ impl GameUi {
 /// A project's `init` calls this and nothing else. An existing UI is kept, so a
 /// project reload does not reset the context, its fonts or the state the player
 /// typed into it; the slot is what tells a renderer that this world's UI is the
-/// game's rather than `pill_ui`'s.
+/// game's.
 pub fn install(engine: &mut Engine) {
     let world = engine.world_mut();
     world.register_resource::<GameUi>();

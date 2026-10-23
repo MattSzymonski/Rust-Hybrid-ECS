@@ -38,7 +38,7 @@ EXAMPLE USAGE:
   python devops/ci_cd/check_relevant.py --dry-run
   python devops/ci_cd/check_relevant.py
   python devops/ci_cd/check_relevant.py --base origin/main
-  python devops/ci_cd/check_relevant.py --paths modules/pill_ui/src/atlas.rs
+  python devops/ci_cd/check_relevant.py --paths modules/pill_draw/src/frame.rs
 
 --- SCRIPT ---
 """

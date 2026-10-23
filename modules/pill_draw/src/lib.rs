@@ -19,8 +19,8 @@
 //! in another draws it (`pill_renderer_api::RenderFrame.ui`) - so they live
 //! in their own shared crate: one type identity across every artifact that
 //! builds or draws UI, without the renderer contract depending on the UI
-//! library (W-0032). Everything here is owned plain data, and `pill_ui`
-//! re-exports it under its historical paths.
+//! library (W-0032). Everything here is owned plain data; the retired
+//! `pill_ui` library re-exported it under its own paths.
 
 /// The atlas update data a backend applies.
 pub mod atlas;

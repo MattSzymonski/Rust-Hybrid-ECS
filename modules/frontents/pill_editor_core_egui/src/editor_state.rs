@@ -2225,10 +2225,10 @@ mod tests {
     ///
     /// The copied version of this test wrote through the renderer's real
     /// `DirectionalLightComponent`; that pin needs the renderer data in this
-    /// crate's test graph, which drags the `pill_ui` stack in beside
-    /// `pill_ui_egui` and rustc refuses the mixed formats (W-0017 Stage 5).
-    /// Follow-up: re-pin against the renderer's real component once the two
-    /// UI stacks can meet in one link step.
+    /// crate's test graph, which at the time dragged the `pill_ui` stack in
+    /// beside `pill_ui_egui` and rustc refused the mixed formats (W-0017
+    /// Stage 5; `pill_ui` retired in W-0043). Follow-up: re-pin against the
+    /// renderer's real component once its data can join this test graph.
     #[test]
     fn set_field_updates_a_registered_layout() {
         let mut engine = demo_engine();

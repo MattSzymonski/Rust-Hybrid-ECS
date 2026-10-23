@@ -74,8 +74,8 @@ fn push_build_output(line: &str) {
 
 /// The ring's current contents, oldest first: what the last build printed.
 ///
-/// The editor parses this into the Problems panel's entries after a failure
-/// ([`pill_editor_core::problems`]); an ordinary host never reads it.
+/// The editor parses this into the Problems panel's entries after a failure;
+/// an ordinary host never reads it.
 pub(crate) fn recent_build_output() -> String {
     let ring = BUILD_OUTPUT
         .lock()
@@ -572,8 +572,8 @@ fn host_anchor_package() -> Option<String> {
 }
 
 /// Whether an executable's package is one of the editor anchors: the
-/// retired Dioxus frontend (`editor`), the `pill_ui` editor, or the egui
-/// editor. Their dependency graphs carry the renderer and UI unions a reload
+/// retired Dioxus frontend (`editor`), the retired `pill_ui` editor, or the
+/// egui editor. Their dependency graphs carry the renderer and UI unions a reload
 /// build must reproduce; a plain game host needs only the explicit engine
 /// features.
 fn is_editor_anchor(package: &str) -> bool {

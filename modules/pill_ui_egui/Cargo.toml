@@ -9,7 +9,7 @@ workspace = true
 [lib]
 name = "pill_ui_egui"
 path = "src/lib.rs"
-# A shared `dylib`, like `pill_ui` (plan decision E3): the egui editor's
+# A shared `dylib` (plan decision E3): the egui editor's
 # frontend, its reloadable egui shell module and its model crate all link
 # this library, and one compiled copy per process keeps the egui `Context`
 # and the boundary types single-instance across the DLL boundary - the
@@ -23,7 +23,8 @@ crate-type = ["rlib", "dylib"]
 pill_core = { path = "../pill_core" }
 # The engine's core (`Input`, `Resource`), never the `pill_engine` facade:
 # the facade is an `rlib` compiled into every artifact, while this crate is
-# a shared `dylib` (the reason is written out in `pill_ui`'s manifest).
+# a shared `dylib`; an `rlib` embedded in a `dylib` breaks the dependency-format
+# check of every binary that links both.
 pill_engine_core = { path = "../pill_engine_core" }
 # egui (plan decisions E1, E3), on the stack W-0026 moved to: egui 0.36.2,
 # whose `egui-wgpu` 0.36.2 renders through the engine's pinned wgpu 30, with
@@ -39,7 +40,7 @@ egui_dock = { version = "0.21.1", default-features = false, features = [
     "serde",
 ] }
 
-# Feature pins, in the style of `pill_ui`'s pin block: this `dylib`'s
+# Feature pins, in the project's usual style: this `dylib`'s
 # exported symbol names hash the features of every crate below it, and the
 # egui editor's module world (this crate plus the shell) and host world
 # (this crate plus the frontend and `egui-wgpu`) must resolve this tree
@@ -54,10 +55,9 @@ epaint = { version = "0.36.2", default-features = false, features = [
     "bytemuck",
 ] }
 # `egui` asks `bitflags` for its own use and the egui world adds nothing on
-# top; the host world's resolve does, because the host also carries the native
-# `pill_ui` (its `cosmic-text` asks `bitflags` for `serde`), and one process
-# resolve unifies the two. Pinned here so the module world resolves the same
-# tree the host builds this DLL with.
+# top; the host world's resolve does (the retired `pill_ui` asked for `serde`
+# through `cosmic-text`, and one process resolve unifies the tree). Pinned here
+# so the module world resolves the same tree the host builds this DLL with.
 bitflags = { version = "2", features = ["serde"] }
 # The same argument for the rest of the editor's shared tree, found by the gate
 # on 2026-10-21 (fourteen drift reports against this crate and

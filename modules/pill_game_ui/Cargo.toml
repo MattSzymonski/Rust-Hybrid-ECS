@@ -6,7 +6,7 @@ edition = "2021"
 [lints]
 workspace = true
 
-# A shared `dylib`, like `pill_ui` (plan decision D2): a project's UI context
+# A shared `dylib` (plan decision D2): a project's UI context
 # must outlive a project reload, and one compiled copy per process keeps the
 # egui context, its fonts and its textures single-instance across the DLL
 # boundary. With `-C prefer-dynamic` every user imports `pill_game_ui.dll`.
@@ -23,7 +23,7 @@ pill_core = { path = "../pill_core" }
 # The engine's core, never the `pill_engine` facade: the core is a shared
 # `dylib`, while the facade is an `rlib` compiled into every artifact, and an
 # `rlib` embedded in a `dylib` breaks the dependency-format check of every
-# binary that links both (see `pill_ui`'s manifest for the full reasoning).
+# binary that links both.
 pill_engine_core = { path = "../pill_engine_core" }
 # The neutral frame the renderer contract carries (`RenderFrame.ui`): the
 # tessellated output becomes this crate's plain data, and no egui type ever
@@ -37,7 +37,7 @@ egui = { version = "0.36.2", default-features = false, features = [
     "default_fonts",
 ] }
 
-# Feature pins, in the style of `pill_core`'s and `pill_ui`'s pin blocks: this
+# Feature pins, in the style of `pill_core`'s pin block: this
 # crate is a `dylib`, and its exported symbol names hash the features of every
 # crate below it, so a posture that unions features onto a crate in this tree
 # would make the host and a module disagree about its symbols. Neither crate

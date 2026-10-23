@@ -31,12 +31,12 @@ DESCRIPTION
                         loadable artifact; the generated `host_module_*`
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
-      4. shared UI    - each UI-independent shared dylib (`pill_ui` and the egui
-                        editor's copies, `pill_editor_core_egui` and
-                        `pill_ui_egui`) is built as a `dylib` (one copy per
-                        process) and links no UI framework, window system or
-                        GPU crate (`dioxus`, `tao`, `wry`, `winit`, `wgpu`),
-                        followed through every path dependency.
+      4. shared UI    - each UI-independent shared dylib (`pill_draw`, the in-game
+                        egui UI's `pill_game_ui`, and the egui editor's copies,
+                        `pill_editor_core_egui` and `pill_ui_egui`) is built as a
+                        `dylib` (one copy per process) and links no UI framework,
+                        window system or GPU crate (`dioxus`, `tao`, `wry`,
+                        `winit`, `wgpu`), followed through every path dependency.
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -74,7 +74,6 @@ REGISTRY_PATH_PREFIX = "inventory::"
 # `modules/`, and the crates they must never link (rule 4). A crate not yet
 # present is skipped, so a later stage adds its entry before the crate exists.
 SHARED_UI_INDEPENDENT_DYLIBS = (
-    ("pill_ui", "pill_ui"),
     # The plain draw data the UI libraries and the renderer contract share
     # (W-0032): one shared dylib, no UI framework inside.
     ("pill_draw", "pill_draw"),

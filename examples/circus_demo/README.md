@@ -15,17 +15,17 @@ cargo run --package pill_standalone --features rendering
 
 ## Controls
 
-| Input | Action |
-| --- | --- |
-| W / A / S / D | Fly forward, left, back, right |
-| E / Q | Fly up, down |
-| Left Shift | Sprint |
-| Right mouse drag | Look around |
-| T / G | Widen, narrow the field of view |
-| O / P | Curl noise scale up, down |
-| L / K | Attraction to the centre up, down |
-| M / N | Damping up, down |
-| V / B | Curl epsilon up, down |
+| Input            | Action                            |
+| ---------------- | --------------------------------- |
+| W / A / S / D    | Fly forward, left, back, right    |
+| E / Q            | Fly up, down                      |
+| Left Shift       | Sprint                            |
+| Right mouse drag | Look around                       |
+| T / G            | Widen, narrow the field of view   |
+| O / P            | Curl noise scale up, down         |
+| L / K            | Attraction to the centre up, down |
+| M / N            | Damping up, down                  |
+| V / B            | Curl epsilon up, down             |
 
 The tuning keys log the field's new values to the host log. The values are also
 shown in the tuning overlay in the window's top-left corner, which the demo

@@ -13,8 +13,8 @@
 //! # Design
 //!
 //! Everything crossing is plain data: no handles, no device objects, no
-//! callbacks - the rule `pill_editor_api` states for the `pill_ui` editor,
-//! kept for this one. The shell's input events travel in this resource as
+//! callbacks - the rule the retired `pill_editor_api` stated for the old
+//! editor, kept for this one. The shell's input events travel in this resource as
 //! owned [`InputEvent`]s, so the UI reads the events of its own windows and
 //! never the game's (W-0038 Stage 1).
 

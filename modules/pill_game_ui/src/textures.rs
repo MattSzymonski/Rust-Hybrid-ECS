@@ -16,7 +16,7 @@
 //! keeps growing - the font atlas is patched for every new glyph. A painter
 //! that was rebuilt mid-run cannot be brought up to date from a patch, so the
 //! producer keeps the full image itself and carries it whenever the texture
-//! changed (W-0028 D3, the rule `pill_ui` follows too). The mirror is that
+//! changed (W-0028 D3). The mirror is that
 //! copy: one `Vec<u8>` per texture, patched by the deltas, read out as the
 //! frame's uploads.
 //!

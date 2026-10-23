@@ -79,8 +79,8 @@ MODULES = REPOSITORY / "modules"
 #
 # `pill_game_ui` is deliberately absent: projects that draw their own egui link
 # it, modules and the renderer do not, so comparing it against a posture that
-# never loads it reports drift nothing can act on - the same reason
-# `pill_ui` is compared per editor family below rather than here.
+# never loads it reports drift nothing can act on - the same reason the
+# editor's dylibs are compared per editor family below rather than here.
 ENGINE_DYLIBS = (
     "pill_core",
     "pill_engine_core",

@@ -3,7 +3,7 @@
 //!
 //! # Responsibilities
 //!
-//! - [`UiFrame`]: everything a `pill_ui` user (a game's overlay, a tool's
+//! - [`UiFrame`]: everything a UI producer (a game's overlay, a tool's
 //!   panels) built this update, as owned plain data.
 //! - [`UiDraw`]: one surface's draw list and the monitor scale its logical
 //!   pixels are in.

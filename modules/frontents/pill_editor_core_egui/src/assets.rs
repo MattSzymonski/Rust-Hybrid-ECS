@@ -14,10 +14,10 @@
 //!
 //! # Design
 //!
-//! The dialogs are egui windows drawn by the shell; the file work is the
-//! `pill_editor_core` asset commands, applied by the executable at the
-//! frame boundary and recorded in the history - the exact contract the
-//! native editor's Assets panel follows. Nothing here touches the engine:
+//! The dialogs are egui windows drawn by the shell; the file work is
+//! [`EditorCommand`](crate::EditorCommand)'s asset commands, applied by the
+//! executable at the frame boundary and recorded in the history - the exact
+//! contract the Assets tab follows. Nothing here touches the engine:
 //! the batches land in [`PendingEditorCommands`] and the executable's drain
 //! does the rest.
 
