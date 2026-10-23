@@ -20,7 +20,7 @@
 // External crates
 use egui::{Event, ImeEvent, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Vec2};
 use pill_core::math::Vector2f;
-use pill_engine_core::input::{
+use pill_engine::input::{
     ButtonState, InputEvent, KeyCode, Modifiers as EngineModifiers, MouseButton, ScrollDelta,
 };
 

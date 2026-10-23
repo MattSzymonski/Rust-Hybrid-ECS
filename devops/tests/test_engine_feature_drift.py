@@ -87,10 +87,9 @@ ENGINE_DYLIBS = (
     "pill_draw",
 )
 
-# The egui editor's shared dylibs: the egui boundary and its model. Only the
-# postures that load egui editor parts resolve them.
+# The egui editor's shared dylib: the egui boundary and its model. Only the
+# postures that load egui editor parts resolve it.
 EGUI_EDITOR_DYLIBS = (
-    "pill_editor_ui",
     "pill_editor_core_egui",
 )
 

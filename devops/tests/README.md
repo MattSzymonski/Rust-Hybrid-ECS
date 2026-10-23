@@ -74,7 +74,7 @@ with the editor suites immediately after (see the ordering rule below).
 ```powershell
 python devops/ci_cd/check_relevant.py --dry-run     # select and print, run nothing
 python devops/ci_cd/check_relevant.py               # run the selection
-python devops/ci_cd/check_relevant.py --paths modules/pill_editor_ui/src/icons.rs
+python devops/ci_cd/check_relevant.py --paths modules/frontents/pill_editor_core_egui/src/icons.rs
 python devops/ci_cd/check_relevant.py --list-rules  # the area table
 ```
 

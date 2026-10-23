@@ -23,7 +23,7 @@
 //! the compositor idle a hidden one.
 //!
 //! The shell boundary is plain data in the world (the shared
-//! `pill_editor_ui::boundary` resources), so the frontend and the reloadable
+//! `pill_editor_core_egui::boundary` resources), so the frontend and the reloadable
 //! shell module never share a type that could dangle across a reload. When
 //! no shell module is loaded, the runner draws a minimal egui fallback of
 //! its own, so the window is never left without a UI.
@@ -38,6 +38,10 @@ use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_core_egui::assets::{self, AssetDialog};
+use pill_editor_core_egui::boundary::{
+    frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellRect,
+    DEFAULT_SCENE_VIEWS,
+};
 use pill_editor_core_egui::cadence::{Cadence, FrameDemand, FrameWake};
 use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
 use pill_editor_core_egui::clipboard::{self, ClipboardAction, ClipboardRequest, EditorClipboard};
@@ -52,6 +56,7 @@ use pill_editor_core_egui::editor_state::{
     AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, SelectionClick,
     StandaloneTypeInfo,
 };
+use pill_editor_core_egui::egui;
 use pill_editor_core_egui::entities;
 use pill_editor_core_egui::gizmo::{
     self, GizmoGeometry, GizmoMode, GizmoSettings, GizmoSpace, GizmoState, HandleKind, HandleStates,
@@ -62,6 +67,9 @@ use pill_editor_core_egui::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
 };
 use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
+use pill_editor_core_egui::panels::{
+    ModuleLiveness, PanelCommand, PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
+};
 use pill_editor_core_egui::preferences::{self, PreferencesView};
 use pill_editor_core_egui::problems::{self as problem_parser, Severity};
 use pill_editor_core_egui::scripted::{
@@ -69,14 +77,6 @@ use pill_editor_core_egui::scripted::{
 };
 use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
 use pill_editor_core_egui::systems;
-use pill_editor_ui::boundary::{
-    frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellRect,
-    DEFAULT_SCENE_VIEWS,
-};
-use pill_editor_ui::egui;
-use pill_editor_ui::panels::{
-    ModuleLiveness, PanelCommand, PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
-};
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
 use pill_engine_core::debug_draw::{DebugDraw, DebugStyle};
 use pill_engine_core::input::{ButtonState, KeyCode, Modifiers as EngineModifiers, MouseButton};
@@ -1050,7 +1050,7 @@ impl EditorWindow {
                 // The fallback draws the same theme as the shell, so a
                 // missing shell module does not flip the look.
                 let context = egui::Context::default();
-                pill_editor_ui::style::apply(&context);
+                pill_editor_core_egui::style::apply(&context);
                 context
             },
             reported_fallback: false,
@@ -1227,7 +1227,7 @@ impl EditorWindow {
     /// get - and starts hidden: the placement that follows this frame shows
     /// it.
     fn ensure_scene_views(&mut self, count: usize, event_loop: &ActiveEventLoop) {
-        let wanted = count.min(pill_editor_ui::boundary::SCENE_VIEWS_MAX);
+        let wanted = count.min(pill_editor_core_egui::boundary::SCENE_VIEWS_MAX);
         while self.views.len() < wanted {
             let view = self.views.len();
             self.cameras.push(OrbitCamera::default());
@@ -5583,7 +5583,7 @@ impl EditorWindow {
         if !fits {
             warn!(
                 target: telemetry_target::ENGINE,
-                limit = pill_editor_ui::boundary::SCENE_VIEWS_MAX,
+                limit = pill_editor_core_egui::boundary::SCENE_VIEWS_MAX,
                 "[editor] scene view refused: the view limit is reached"
             );
             return;
@@ -5603,7 +5603,11 @@ impl EditorWindow {
     /// caret is; this executable is what owns the window, so it is the only
     /// place that can pass those decisions to the platform. The rect is in
     /// logical points, which is the window's IME coordinate space.
-    fn apply_ime(&mut self, allowed: bool, rect: Option<pill_editor_ui::boundary::ShellRect>) {
+    fn apply_ime(
+        &mut self,
+        allowed: bool,
+        rect: Option<pill_editor_core_egui::boundary::ShellRect>,
+    ) {
         let window = self.window.clone();
         if allowed != self.ime_allowed {
             window.set_ime_allowed(allowed);
@@ -5647,7 +5651,7 @@ impl EditorWindow {
     fn present_popouts(
         &mut self,
         event_loop: &ActiveEventLoop,
-        frames: &mut [pill_editor_ui::boundary::PopoutFrame],
+        frames: &mut [pill_editor_core_egui::boundary::PopoutFrame],
     ) {
         for frame in frames.iter() {
             if self.popouts.contains_key(&frame.tab) {
@@ -6943,7 +6947,7 @@ impl EditorWindow {
             .state()
             .iter_all_nodes()
             .filter_map(|(path, node)| match node {
-                pill_editor_ui::egui_dock::Node::Leaf(leaf) => {
+                pill_editor_core_egui::egui_dock::Node::Leaf(leaf) => {
                     let tabs = leaf
                         .tabs
                         .iter()

@@ -30,9 +30,8 @@ pill_core = { path = "../../../pill_core" }
 # The engine facade: the module ABI (`pill_module`), the hot attributes and
 # the system resource parameters.
 pill_engine = { path = "../../../pill_engine" }
-# The egui library: the context, the style and the boundary resources.
-pill_editor_ui = { path = "../../../pill_editor_ui" }
-# The model: the dock, the shared selection and the engine snapshots.
+# The model and the egui library: the dock, the shared selection, the engine
+# snapshots, and the context, the style and the boundary resources.
 pill_editor_core_egui = { path = "../../../frontents/pill_editor_core_egui" }
 # The asset settings documents the Inspector edits are JSON.
 serde_json = "1"

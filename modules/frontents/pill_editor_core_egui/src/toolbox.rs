@@ -26,12 +26,12 @@
 //! toolbox adds a surface, not a fifth way to change the tool.
 
 // External crates
-use pill_editor_ui::egui::{Pos2, Rect, Vec2};
-use pill_editor_ui::icons::Icon;
+use egui::{Pos2, Rect, Vec2};
 
 // Current crate
 use crate::editor_state::EditorCommand;
 use crate::gizmo::{GizmoMode, GizmoSettings, GizmoSpace};
+use crate::icons::Icon;
 
 // =============================================================================
 // Geometry
@@ -272,7 +272,7 @@ impl ToolboxItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_editor_ui::egui::vec2;
+    use egui::vec2;
 
     /// A viewport away from the screen's corner, so a clamp bug that falls
     /// back to zero shows.

@@ -31,11 +31,51 @@ pill_assets = { path = "../../pill_assets" }
 # The renderer contract: the scene grid's switch lives beside the surface
 # camera bindings the command flips.
 pill_renderer_api = { path = "../../hosting/pill_renderer_api" }
-# The egui UI library: the dock model names `egui_dock` through its
-# re-exports, so the shell, the frontend and this crate resolve one pinned
-# copy of egui (W-0017, plan decision E3).
-pill_editor_ui = { path = "../../pill_editor_ui" }
+# egui (plan decisions E1, E3), on the stack W-0026 moved to: egui 0.36.2,
+# whose `egui-wgpu` 0.36.2 renders through the engine's pinned wgpu 30, with
+# `egui_dock` 0.21.1 as the newest docking release that names this egui.
+# `default_fonts` is the one feature the editor needs; every consumer names
+# egui through this crate's re-exports, so the frontend, the shell and this
+# crate resolve one pinned copy.
+egui = { version = "0.36.2", default-features = false, features = [
+    "default_fonts",
+] }
+# Docking (plan decision E2): tabs, splits and undocked windows. `serde`
+# lets the layout model persist the dock.
+egui_dock = { version = "0.21.1", default-features = false, features = [
+    "serde",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
+
+# Feature pins, in the project's usual style: this `dylib`'s exported symbol
+# names hash the features of every crate below it, and the egui editor's
+# module world (this crate plus the shell) and host world (this crate plus the
+# frontend and `egui-wgpu`) must resolve this tree identically, or each
+# produces its own `pill_editor_core_egui.dll` and the shell would load
+# against type identities the frontend does not have.
+#
+# `epaint` is requested with `bytemuck` because `egui-wgpu` asks for it (its
+# vertex buffer conversion) and the module world never links `egui-wgpu`;
+# neither `egui` nor `egui_dock` adds features beyond the requests above, so
+# those need no extra pins.
+epaint = { version = "0.36.2", default-features = false, features = [
+    "bytemuck",
+] }
+# `egui` asks `bitflags` for its own use and the egui world adds nothing on
+# top; the host world's resolve does (the retired `pill_ui` asked for `serde`
+# through `cosmic-text`, and one process resolve unifies the tree). Pinned here
+# so the module world resolves the same tree the host builds this DLL with.
+bitflags = { version = "2", features = ["serde"] }
+# The same argument for the rest of the editor's shared tree, found by the gate
+# on 2026-10-21 (fourteen drift reports against this crate and the editor UI
+# library it absorbed, all of them features the host world turns on and a
+# module or project build does not). None of them is used directly.
+arrayvec = { version = "0.7", features = ["std"] }
+hashbrown = { version = "0.17", features = ["inline-more"] }
+kurbo = "0.13"
+read-fonts = "0.41"
+skrifa = "0.44"
+uuid = { version = "1", features = ["std"] }

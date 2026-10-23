@@ -2226,7 +2226,7 @@ mod tests {
     /// The copied version of this test wrote through the renderer's real
     /// `DirectionalLightComponent`; that pin needs the renderer data in this
     /// crate's test graph, which at the time dragged the `pill_ui` stack in
-    /// beside `pill_editor_ui` and rustc refused the mixed formats (W-0017
+    /// beside the editor's egui library and rustc refused the mixed formats (W-0017
     /// Stage 5; `pill_ui` retired in W-0043). Follow-up: re-pin against the
     /// renderer's real component once its data can join this test graph.
     #[test]

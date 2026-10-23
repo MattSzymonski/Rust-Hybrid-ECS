@@ -22,8 +22,8 @@
 use egui::epaint::ClippedPrimitive;
 use egui::{Context, CursorIcon, FullOutput, OutputCommand, TexturesDelta};
 use pill_core::math::Vector2f;
-use pill_engine_core::input::InputEvent;
-use pill_engine_core::Resource;
+use pill_engine::input::InputEvent;
+use pill_engine::Resource;
 use std::time::Duration;
 
 /// The geometry and focus the frontend feeds the shell each frame.

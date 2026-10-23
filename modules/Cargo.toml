@@ -12,9 +12,6 @@ members = [
     # frame's UI type has one identity across every artifact that builds or
     # draws it (W-0032).
     "pill_draw",
-    # The egui editor's own UI library (W-0017): a shared dylib so the egui
-    # editor's world can replace its UI core across a reload.
-    "pill_editor_ui",
     # The in-game egui UI (W-0028): a third shared dylib, so a project's egui
     # context outlives a project reload and its frame is neutral data the main
     # renderer draws.

@@ -11,7 +11,7 @@
 //!
 //! The executable owns the window, the GPU device and the input; this crate
 //! owns the dock and the egui pass, and the two exchange plain data
-//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_ui`,
+//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_core_egui`,
 //! the shared `dylib` both link). Input events transit through the engine's
 //! `Input` resource, and the shell converts them itself.
 //!
@@ -35,12 +35,14 @@
 extern crate self as pill_editor_shell_egui_editor;
 
 // External crates
+use pill_editor_core_egui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
 use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
 use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
 use pill_editor_core_egui::notices::EditorNotices;
+use pill_editor_core_egui::panels::{
+    PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
+};
 use pill_editor_core_egui::session::EguiShellState;
-use pill_editor_ui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
-use pill_editor_ui::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // The build script scans this crate and emits one address entry per function

@@ -130,8 +130,8 @@ the directory name, so the host needs no changes. The host **generates** the
 `modules/extensions/<name>/generated/host_module_<name>/` on startup: it is a
 build artifact, never written by hand. See
 `modules/extensions/pill_spline/` for the reference implementation. An
-extension's optional editor part is written against `pill_editor_ui` and
-`pill_editor_core_egui` (the old `pill_ui` editor part retired with W-0043).
+extension's optional editor part is written against `pill_editor_core_egui`
+(the old `pill_ui` editor part retired with W-0043).
 
 Modules must live in this directory rather than anywhere on disk: sharing the  
 workspace lockfile is what makes a module resolve the same dependency graph as  

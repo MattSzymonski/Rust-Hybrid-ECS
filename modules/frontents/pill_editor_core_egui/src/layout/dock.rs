@@ -21,8 +21,8 @@
 //! it across restarts.
 
 // External crates
-use pill_editor_ui::egui::Rect;
-use pill_editor_ui::egui_dock::{DockState, Node, NodeIndex};
+use egui::Rect;
+use egui_dock::{DockState, Node, NodeIndex};
 use serde::{Deserialize, Serialize};
 
 /// The fraction of the window's width one side column takes in the default
@@ -345,7 +345,7 @@ impl EditorDock {
     /// Whether one more scene view fits: each view is a child window and a
     /// renderer surface, so the frontend's limit is the dock's too.
     pub fn can_open_scene_view(&self) -> bool {
-        self.scene_view_count() < pill_editor_ui::boundary::SCENE_VIEWS_MAX
+        self.scene_view_count() < crate::boundary::SCENE_VIEWS_MAX
     }
 
     /// Whether the document was written by this build's schema.
@@ -484,7 +484,7 @@ pub fn activate_tab(dock: &mut DockState<EditorTab>, tab: EditorTab) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_editor_ui::egui_dock::SurfaceIndex;
+    use egui_dock::SurfaceIndex;
 
     #[test]
     fn the_default_layout_holds_every_tab() {
