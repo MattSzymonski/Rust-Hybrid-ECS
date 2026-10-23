@@ -928,13 +928,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    # Step 1c: an editor build links a shell beside the runtime modules. The
-    # `pill_ui` posture also links every selected extension's editor crate
-    # (the same discovery an editor host does); the egui posture links only
-    # its editor-only shell, because the extension editor crates carry the
-    # `pill_ui` contract and must not join an egui wasm. They register last:
-    # the shell's own resources exist either way (its `register` tolerates
-    # missing panels), and the editor crates fill the panel registry.
+    # Step 1c: an editor build links a shell beside the runtime modules. Only
+    # the egui posture exists: it links its editor-only shell and never an
+    # extension's editor crate (the retired `pill_ui` posture did, and those
+    # crates carried its panel contract). They register last: the shell's own
+    # resources exist either way (its `register` tolerates missing panels).
     if editor:
         editor_modules = [EDITOR_EGUI_SHELL_CRATE_NAME]
         missing_editor_crates = [

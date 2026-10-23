@@ -246,9 +246,9 @@ pub struct RenderFrame {
     /// Number of this frame, counting from one; packed into the engine
     /// parameters beside the clocks.
     pub sequence: u64,
-    /// The UI to draw over the frame: the draw lists a game's or tool's
-    /// `pill_ui` context built this update, per surface, and the glyph
-    /// atlas changes they need. Empty means no UI (Stage 12).
+    /// The UI to draw over the frame: the draw lists a game's or tool's UI
+    /// pass built this update, per surface, and the glyph atlas changes they
+    /// need. Empty means no UI (Stage 12).
     pub ui: pill_draw::UiFrame,
 }
 

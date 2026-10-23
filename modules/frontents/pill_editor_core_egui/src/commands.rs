@@ -1242,7 +1242,7 @@ mod tests {
     fn owners_replace_their_own_set_only() {
         let mut registry = CommandRegistry::with_builtins();
         registry.register(
-            "pill_spline_editor",
+            "pill_gadget_editor",
             vec![
                 CommandSpec::new("spline_editor.reset_offset", "Reset Spline Offset")
                     .menu(&["Spline", "Reset Offset"])
@@ -1258,7 +1258,7 @@ mod tests {
         assert!(!menus.contains_key("editor.command_palette"));
         // The next generation re-registers; nothing duplicates.
         registry.register(
-            "pill_spline_editor",
+            "pill_gadget_editor",
             vec![CommandSpec::new(
                 "spline_editor.reset_offset",
                 "Reset Spline Offset",

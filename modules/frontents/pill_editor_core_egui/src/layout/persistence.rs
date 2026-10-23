@@ -70,7 +70,7 @@ pub const LAYOUT_SCHEMA_VERSION: u32 = 13;
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
 
-/// The dock document's file name, beside the `pill_ui` editor's layout file.
+/// The dock document's file name, beside the retired `pill_ui` editor's layout file.
 const LAYOUT_FILE: &str = "editor_egui_layout.json";
 
 /// Failures the dock model reports.

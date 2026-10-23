@@ -23,8 +23,8 @@ crate-type = ["rlib"]
 
 # The egui editor's shell: the docked UI the egui frontend shows, rebuilt
 # and swapped while the editor runs. An editor-only extension (the folder
-# holds only this crate): loaded by the egui editor, never by a game or by
-# the `pill_ui` editor (see the `editor_frontend` tag below).
+# holds only this crate): loaded by the egui editor, never by a game (see
+# the `editor_frontend` tag below).
 [dependencies]
 pill_core = { path = "../../../pill_core" }
 # The engine facade: the module ABI (`pill_module`), the hot attributes and
@@ -38,6 +38,6 @@ pill_editor_core_egui = { path = "../../../frontents/pill_editor_core_egui" }
 serde_json = "1"
 
 [package.metadata.pill]
-# This shell builds the egui editor's UI; the `pill_ui` editor loads its own
-# shell instead (W-0017 Stage 6/7).
+# This shell builds the egui editor's UI; it is the only editor frontend
+# (W-0017 Stage 6/7; the `pill_ui` frontend retired in W-0043).
 editor_frontend = "egui"
