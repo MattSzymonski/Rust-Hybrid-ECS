@@ -59,7 +59,7 @@ use crate::{
     drawers::mesh_drawer::MeshDrawer,
     error::{capturing_validation, RendererError, Result},
     frame::{PassTarget, RenderFrame, ResolvedPass},
-    overlay::{Overlay, OverlayFrame},
+    overlay::{self, Overlay, OverlayFrame},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
     profiler::Profiler,
     render_queue::RenderQueueItem,
@@ -662,9 +662,10 @@ pub struct State {
     pub(crate) adapter: wgpu::Adapter,
     /// Debug drawing, outlines and picking, drawn over every surface's chain.
     pub(crate) overlay: Overlay,
-    /// The shared UI backend, built the first time a frame carries UI; its
-    /// pipelines are tied to this surface's colour format (Stage 12).
-    pub(crate) ui_renderer: Option<UiRenderer>,
+    /// The UI painter: the game's UI and the debug labels, over every
+    /// surface's overlay. Its pipeline is tied to the surface's colour format
+    /// (Stage 12), and the debug font is registered in it from the start.
+    pub(crate) ui_renderer: UiRenderer,
     /// UI frames since the UI pass last logged what it drew, so the log
     /// stays readable while the end-to-end suites still see the token.
     frames_since_ui_report: u32,
@@ -704,11 +705,20 @@ impl State {
         })?;
         let overlay = Overlay::new(
             &device,
-            &queue,
             surface.format(),
             depth_format,
             &camera_bind_group_layout,
         )?;
+        let mut ui_renderer = UiRenderer::new(
+            &device,
+            &queue,
+            surface.format(),
+            (
+                pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
+                pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
+            ),
+        );
+        ui_renderer.apply_texture_set(&device, &queue, &overlay::font::texture_set());
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
         let gpu_profiler = create_gpu_profiler(&device, &queue, surface.backend());
@@ -727,7 +737,7 @@ impl State {
             instance,
             adapter,
             overlay,
-            ui_renderer: None,
+            ui_renderer,
             frames_since_ui_report: 0,
         })
     }
@@ -748,12 +758,13 @@ impl State {
         Ok(())
     }
 
-    /// Draw the frame's UI for `surface_id`, uploading atlas changes first.
+    /// Draw the debug labels and the frame's UI for `surface_id`, uploading
+    /// texture changes first.
     ///
-    /// The backend is built lazily, the first time any frame carries UI, so a
-    /// project without a UI context never pays for it. Only the lists naming
-    /// `surface_id` draw here; every surface records through this same path,
-    /// each with its own id.
+    /// The labels go first, in surface pixels, and the game's lists naming
+    /// `surface_id` follow, so the game's UI stays on top; every surface
+    /// records through this same path, each with its own id, and all of a
+    /// surface's lists go to the painter in one call.
     fn record_ui(
         &mut self,
         surface_id: u32,
@@ -761,57 +772,31 @@ impl State {
         view: &wgpu::TextureView,
         size: (u32, u32),
         frame: &RenderFrame,
+        labels: &pill_draw::DrawList,
     ) {
+        if !frame.ui.textures.is_empty() {
+            self.ui_renderer
+                .apply_texture_set(&self.device, &self.queue, &frame.ui.textures);
+        }
+        let mut lists = vec![(labels, 1.0)];
+        lists.extend(
+            frame
+                .ui
+                .draws
+                .iter()
+                .filter(|draw| draw.surface == surface_id)
+                .map(|draw| (&draw.list, draw.scale_factor)),
+        );
+        self.ui_renderer
+            .render(&self.device, &self.queue, encoder, view, size, &lists);
         if frame.ui.is_empty() {
             return;
         }
-        if self.ui_renderer.is_none() {
-            // The set carries whole images, so its first atlas entry already
-            // names the size the texture must have; before any set arrives the
-            // renderer starts at the atlas' default page.
-            let atlas_size = frame
-                .ui
-                .textures
-                .textures
-                .iter()
-                .find(|texture| texture.id == pill_draw::TextureId::Atlas)
-                .map(|texture| (texture.width, texture.height))
-                .unwrap_or((
-                    pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
-                    pill_draw::atlas::DEFAULT_ATLAS_LENGTH,
-                ));
-            self.ui_renderer = Some(UiRenderer::new(
-                &self.device,
-                &self.queue,
-                self.surface.format(),
-                atlas_size,
-            ));
-        }
-        let ui_renderer = self.ui_renderer.as_mut().expect("built above");
-        ui_renderer.apply_texture_set(&self.device, &self.queue, &frame.ui.textures);
-        let mut vertices = 0usize;
-        let mut draws = 0usize;
-        for draw in frame
-            .ui
-            .draws
-            .iter()
-            .filter(|draw| draw.surface == surface_id)
-        {
-            vertices += draw.list.vertices.len();
-            draws += 1;
-            ui_renderer.render(
-                &self.device,
-                &self.queue,
-                encoder,
-                view,
-                size,
-                draw.scale_factor,
-                &draw.list,
-                None,
-            );
-        }
         // Observable proof for the runtime suites, sampled like the GPU
-        // profiler's report so the log stays readable.
+        // profiler's report so the log stays readable. It counts the game's
+        // lists only, as it did before the labels joined them.
+        let draws = lists.len() - 1;
+        let vertices: usize = lists[1..].iter().map(|(list, _)| list.vertices.len()).sum();
         self.frames_since_ui_report += 1;
         if self.frames_since_ui_report >= GPU_REPORT_INTERVAL {
             self.frames_since_ui_report = 0;
@@ -824,7 +809,6 @@ impl State {
             );
         }
     }
-
     /// Create a target for every offscreen output the chain declares.
     ///
     /// Rebuilt whenever the chain is, and sized to the surface: one that no
@@ -1153,6 +1137,11 @@ impl State {
         // Over the chain's picture: outlines, debug lines and labels, gizmos,
         // and the pick buffer when this surface has picks waiting.
         let overlay_zone = pill_core::profile_scope!("renderer: overlay");
+        let labels = overlay::label_list(
+            &frame.debug,
+            &camera.parameters_data.view_projection_matrix,
+            viewport,
+        );
         self.overlay.record(
             &self.device,
             &self.queue,
@@ -1171,9 +1160,16 @@ impl State {
             },
         );
         drop(overlay_zone);
-        // The game's UI, over the chain's picture (Stage 12): the frame's
-        // lists for this surface, through the [`ui`](crate::ui) painter.
-        self.record_ui(surface_id, &mut encoder, &view, (width, height), frame);
+        // The debug labels and the game's UI, over the chain's picture
+        // (Stage 12), through the [`ui`](crate::ui) painter.
+        self.record_ui(
+            surface_id,
+            &mut encoder,
+            &view,
+            (width, height),
+            frame,
+            &labels,
+        );
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);
             profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);

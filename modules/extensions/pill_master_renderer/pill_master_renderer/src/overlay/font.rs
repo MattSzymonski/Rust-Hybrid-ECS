@@ -5,6 +5,8 @@
 //!
 //! - Hold the glyphs as readable pixel art ([`GLYPHS`]) and lay them out as
 //!   one single-channel atlas ([`build_atlas`]).
+//! - Hand that atlas to the UI painter as a texture under its own reserved
+//!   id ([`texture_set`], [`FONT_TEXTURE`]).
 //! - Turn a label into glyph quads at a pixel position ([`layout_text`]).
 //!
 //! # Design
@@ -13,6 +15,12 @@
 //! file being found at runtime: the glyphs live in the source and the atlas is
 //! built from them when the renderer starts. Lowercase letters draw as
 //! uppercase, and a character the font lacks draws as `?`.
+
+// Standard library
+use std::sync::Arc;
+
+// External crates
+use pill_draw::{TextureId, UiTextureFilter, UiTextureSet};
 
 /// Glyph width in pixels.
 pub(super) const GLYPH_WIDTH: u32 = 5;
@@ -103,11 +111,23 @@ pub(super) struct Atlas {
     pub texels: Vec<u8>,
 }
 
+/// The texture the label list samples the font from.
+///
+/// Reserved out of the game UI's external range: `pill_game_ui` numbers
+/// egui's managed textures `1 << 63 | id`, and egui never reaches the id that
+/// would make this one.
+pub(crate) const FONT_TEXTURE: TextureId = TextureId::External(u64::MAX);
+
+/// The atlas's width and height in texels: every glyph's cell, in rows of
+/// [`ATLAS_COLUMNS`].
+pub(super) fn atlas_size() -> (u32, u32) {
+    let rows = (GLYPHS.len() as u32).div_ceil(ATLAS_COLUMNS);
+    (ATLAS_COLUMNS * CELL_WIDTH, rows * CELL_HEIGHT)
+}
+
 /// Draw every glyph of [`GLYPHS`] into its cell, in table order.
 pub(super) fn build_atlas() -> Atlas {
-    let rows = (GLYPHS.len() as u32).div_ceil(ATLAS_COLUMNS);
-    let width = ATLAS_COLUMNS * CELL_WIDTH;
-    let height = rows * CELL_HEIGHT;
+    let (width, height) = atlas_size();
     let mut texels = vec![0u8; (width * height) as usize];
     for (index, (_, art)) in GLYPHS.iter().enumerate() {
         let (cell_x, cell_y) = cell_origin(index);
@@ -126,6 +146,28 @@ pub(super) fn build_atlas() -> Atlas {
         height,
         texels,
     }
+}
+
+/// The atlas as the one-texture set the UI painter registers once: white
+/// texels whose alpha is the glyph coverage, sampled nearest so glyphs stay
+/// crisp at [`GLYPH_SCALE`].
+pub(crate) fn texture_set() -> UiTextureSet {
+    let atlas = build_atlas();
+    let pixels: Vec<u8> = atlas
+        .texels
+        .iter()
+        .flat_map(|&coverage| [255, 255, 255, coverage])
+        .collect();
+    let mut set = UiTextureSet::new();
+    set.push_full(
+        FONT_TEXTURE,
+        atlas.width,
+        atlas.height,
+        1,
+        UiTextureFilter::Nearest,
+        Arc::from(pixels),
+    );
+    set
 }
 
 /// The top-left texel of glyph `index`'s cell.
@@ -189,6 +231,27 @@ pub(super) fn layout_text(text: &str, x: f32, y: f32) -> Vec<GlyphQuad> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The painter's texture is the atlas widened to RGBA: coverage in alpha.
+    #[test]
+    fn the_texture_set_carries_the_atlas_as_white_coverage() {
+        let atlas = build_atlas();
+        let set = texture_set();
+        let texture = &set.textures[0];
+        assert_eq!((texture.width, texture.height), atlas_size());
+        let pixels = texture.full_image().expect("the whole image");
+        let lit = atlas
+            .texels
+            .iter()
+            .position(|&texel| texel == 255)
+            .expect("a lit texel");
+        assert_eq!(&pixels[lit * 4..lit * 4 + 4], &[255, 255, 255, 255]);
+        assert_eq!(
+            &pixels[..4],
+            &[255, 255, 255, 0],
+            "the first texel is blank"
+        );
+    }
 
     /// Every glyph is seven rows of five pixels, so none draws garbage.
     #[test]
