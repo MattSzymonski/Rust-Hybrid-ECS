@@ -322,16 +322,22 @@ impl EditorDock {
             .state
             .iter_all_tabs()
             .filter_map(|(_path, tab)| tab.scene_view())
+            .chain(self.popouts.iter().filter_map(|tab| tab.scene_view()))
             .max();
         EditorTab::Scene(highest.map_or(0, |index| index.saturating_add(1)))
     }
 
     /// How many scene view slots the dock needs: one past its highest view
     /// index, so a view whose tab is not shown keeps its slot.
+    ///
+    /// A popped-out view counts: it is still a view, its child window
+    /// replaced by a window of its own, and dropping its slot would hand its
+    /// index to the next view opened (W-0038 Stage 23).
     pub fn scene_view_count(&self) -> usize {
         self.state
             .iter_all_tabs()
             .filter_map(|(_path, tab)| tab.scene_view())
+            .chain(self.popouts.iter().filter_map(|tab| tab.scene_view()))
             .max()
             .map_or(0, |index| index as usize + 1)
     }
@@ -578,6 +584,72 @@ mod tests {
             assert!(restored.contains(tab));
         }
         assert_eq!(restored.schema_version(), dock.schema_version());
+    }
+
+    #[test]
+    fn popping_a_tab_out_removes_it_from_the_tree_and_remembers_it() {
+        let mut dock = EditorDock::new();
+        assert!(dock.pop_out(EditorTab::Inspector));
+        assert!(
+            !dock.contains(EditorTab::Inspector),
+            "the tab is still docked"
+        );
+        assert_eq!(dock.popouts(), [EditorTab::Inspector]);
+        // Popping the same tab out twice changes nothing: the dock no longer
+        // holds it, so there is no second tab to move.
+        assert!(!dock.pop_out(EditorTab::Inspector));
+    }
+
+    #[test]
+    fn a_popped_out_tab_redocks_into_the_focused_leaf() {
+        let mut dock = EditorDock::new();
+        assert!(dock.pop_out(EditorTab::Inspector));
+        assert!(dock.redock(EditorTab::Inspector));
+        assert!(
+            dock.contains(EditorTab::Inspector),
+            "the tab did not come back"
+        );
+        assert!(dock.popouts().is_empty(), "the dock still lists a pop-out");
+        // A tab that was never popped out has nothing to redock.
+        assert!(!dock.redock(EditorTab::Console));
+    }
+
+    #[test]
+    fn the_last_docked_tab_is_never_popped_out() {
+        let mut dock = EditorDock::new();
+        for tab in [
+            EditorTab::Scene(0),
+            EditorTab::Scene(1),
+            EditorTab::Game,
+            EditorTab::Entities,
+            EditorTab::Systems,
+            EditorTab::Preferences,
+            EditorTab::Inspector,
+            EditorTab::Console,
+            EditorTab::Problems,
+            EditorTab::Statistics,
+        ] {
+            assert!(dock.pop_out(tab), "{tab:?} could not be popped out");
+        }
+        assert_eq!(dock.state().iter_all_tabs().count(), 1);
+        assert!(
+            !dock.pop_out(EditorTab::Assets),
+            "the last docked tab left the dock without a leaf to return to"
+        );
+    }
+
+    #[test]
+    fn a_popped_out_scene_view_keeps_its_slot() {
+        let mut dock = EditorDock::new();
+        // The default layout opens two views; the third is the highest slot.
+        dock.state_mut().push_to_focused_leaf(EditorTab::Scene(2));
+        assert_eq!(dock.scene_view_count(), 3);
+        assert!(dock.pop_out(EditorTab::Scene(2)));
+        // The view left the tree but not the bookkeeping: its slot stays, so
+        // the frontend keeps its window and the next view does not take its
+        // index.
+        assert_eq!(dock.scene_view_count(), 3);
+        assert_eq!(dock.next_scene_view(), EditorTab::Scene(3));
     }
 
     #[test]

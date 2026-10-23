@@ -486,6 +486,7 @@ pub fn run_frame(
         overlay_regions: Vec::new(),
         frames_per_second: shell_input.frames_per_second,
         tab_redock: None,
+        tab_popout: None,
         console_filters,
         problem_open,
         stats,
@@ -593,9 +594,24 @@ pub fn run_frame(
     // context, so its window has its own widget state, its own input record
     // and its own frame. The dock no longer holds these tabs, so nothing draws
     // them twice.
+    // A tab that came back to the dock takes its context with it: a context
+    // nothing draws into would be cleared on every generation's first frame
+    // and kept for the life of the session otherwise.
+    popout_contexts.retain(|tab, _| dock.is_popped_out(*tab));
     claim_popout_contexts(popout_contexts);
     shell_frame.popout_frames =
         run_popout_passes(dock, popout_contexts, popout_inputs, &mut viewer);
+    // A tab menu's pop-out request lands here for the same reason a re-dock
+    // does: the dock is borrowed while it draws (W-0038 Stage 23).
+    if let Some(tab) = viewer.tab_popout.take() {
+        if dock.pop_out(tab) {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                tab = tab.name().as_str(),
+                "[editor] popout moved"
+            );
+        }
+    }
     // A tab menu's re-dock runs after the dock finished drawing: changing
     // the tree mid-draw would edit it under the widget that asked.
     if let Some(surface) = viewer.tab_redock.take() {
@@ -691,13 +707,16 @@ pub fn run_frame(
 /// out Scene tab reports its rectangle in its own window's coordinates, and
 /// the frontend places that view's surface there.
 pub fn run_popout_passes(
-    dock: &pill_editor_core_egui::layout::EditorDock,
+    dock: &mut pill_editor_core_egui::layout::EditorDock,
     contexts: &mut std::collections::BTreeMap<EditorTab, egui::Context>,
     inputs: &pill_ui_egui::boundary::EguiPopoutInputs,
     viewer: &mut EditorTabViewer<'_>,
 ) -> Vec<pill_ui_egui::boundary::PopoutFrame> {
     let mut frames = Vec::new();
-    for tab in dock.popouts().iter().copied() {
+    // Redock requests are applied after the loop: the dock cannot be borrowed
+    // mutably while it is read for each pass's tab list.
+    let mut redock = Vec::new();
+    for tab in dock.popouts().to_vec() {
         let name = tab.name();
         let context = contexts
             .entry(tab)
@@ -713,9 +732,29 @@ pub fn run_popout_passes(
         let raw_input = pill_ui_egui::input::raw_input(&input);
         viewer.scene_rects = vec![None; dock.scene_view_count()];
         let output = context.run_ui(raw_input, |ui| {
+            // The window has no dock around it, so it draws the one dock
+            // affordance it needs: the way back (W-0038 Stage 23).
+            let mut send_back = false;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(tab.title()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    send_back = ui
+                        .add(icons::IconButton::new(icons::Icon::ArrowSquareIn, "Redock"))
+                        .clicked();
+                });
+            });
+            ui.separator();
+            if send_back {
+                redock.push(tab);
+            }
             let mut popout_tab = tab;
             <EditorTabViewer<'_> as TabViewer>::ui(viewer, ui, &mut popout_tab);
         });
+        if redock.contains(&tab) {
+            // Its window closes the moment the dock stops listing it, so no
+            // frame is built for this pass.
+            continue;
+        }
         let mut frame = pill_ui_egui::boundary::frame_from_output(&context, output);
         frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
         frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
@@ -724,6 +763,15 @@ pub fn run_popout_passes(
             title: format!("Pill Editor - {}", tab.title()),
             frame: Box::new(frame),
         });
+    }
+    for tab in redock {
+        if dock.redock(tab) {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                tab = tab.name().as_str(),
+                "[editor] popout returned"
+            );
+        }
     }
     frames
 }
@@ -816,6 +864,10 @@ pub struct EditorTabViewer<'a> {
     /// The surface a tab menu asked to re-dock, drained by `run_frame`
     /// after the dock finishes drawing.
     pub tab_redock: Option<SurfaceIndex>,
+    /// The tab a tab menu asked to pop out into its own window (W-0038 Stage
+    /// 23), drained by `run_frame` after the dock finishes drawing for the
+    /// same reason.
+    pub tab_popout: Option<EditorTab>,
     /// The Console tab's filters (W-0038 Stage 5); the executable applies them
     /// to the history on its next frame.
     pub console_filters: &'a mut ConsoleFilterSettings,
@@ -1008,13 +1060,22 @@ impl TabViewer for EditorTabViewer<'_> {
     /// The dock tab's menu. The dock itself offers Eject (into a window)
     /// and Close; a floating window's tab gets Redock, which brings the
     /// surface's tabs back into the dock.
-    fn context_menu(&mut self, ui: &mut egui::Ui, _tab: &mut Self::Tab, path: NodePath) {
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, path: NodePath) {
+        // Popping a tab out is offered wherever a tab is, docked or floating
+        // (W-0038 Stage 23). The window carries the way back.
+        if ui
+            .add(icons::IconButton::new(
+                icons::Icon::ArrowSquareOut,
+                "Pop Out",
+            ))
+            .clicked()
+        {
+            self.tab_popout = Some(*tab);
+            ui.close();
+        }
         if !path.surface.is_main()
             && ui
-                .add(icons::IconButton::new(
-                    icons::Icon::ArrowSquareOut,
-                    "Redock",
-                ))
+                .add(icons::IconButton::new(icons::Icon::ArrowSquareIn, "Redock"))
                 .clicked()
         {
             self.tab_redock = Some(path.surface);
