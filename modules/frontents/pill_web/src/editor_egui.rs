@@ -38,13 +38,13 @@ use std::sync::Arc;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
-use pill_editor_core_egui::boundary::{EguiShellFrame, EguiShellInput};
-use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
-use pill_editor_core_egui::drain::{self, HistoryDirection};
-use pill_editor_core_egui::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
-use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
-use pill_editor_core_egui::scripted::{Dump, ScriptedCommand};
-use pill_editor_core_egui::{entities, systems};
+use pill_editor_core::boundary::{EguiShellFrame, EguiShellInput};
+use pill_editor_core::commands::{ensure_command_resources, PendingEditorCommands};
+use pill_editor_core::drain::{self, HistoryDirection};
+use pill_editor_core::editor_state::{EditorCommand, EditorSelection, EditorSnapshot};
+use pill_editor_core::gizmo::{GizmoMode, GizmoSettings, GizmoSpace, GizmoState};
+use pill_editor_core::scripted::{Dump, ScriptedCommand};
+use pill_editor_core::{entities, systems};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject};
@@ -450,7 +450,7 @@ impl WebEditorApplication {
 /// Apply the command batches the shell queued last frame.
 ///
 /// The scripted lines go through the shared grammar
-/// ([`pill_editor_core_egui::scripted`]) and then the shared core drain, so
+/// ([`pill_editor_core::scripted`]) and then the shared core drain, so
 /// the browser parses, refuses and applies exactly what the desktop editor
 /// does - including the history recording, the remap and the selection
 /// follow. The listing flag has no work here: the browser stages no asset
@@ -716,7 +716,7 @@ fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
     snapshot.detail = selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
     snapshot.selected_details = selected_entities
         .iter()
-        .take(pill_editor_core_egui::editor_state::SELECTED_DETAILS_MAX)
+        .take(pill_editor_core::editor_state::SELECTED_DETAILS_MAX)
         .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
         .collect();
     if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {

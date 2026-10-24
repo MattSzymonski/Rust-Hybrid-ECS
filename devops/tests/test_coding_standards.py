@@ -160,7 +160,7 @@ TESTS_PLACEMENT_MINIMUM_LINES = 20
 # decision E4, W-0017). A reloadable crate that stores its own types or
 # callbacks through them leaves dangling type IDs, drop code and vtables
 # behind after a reload, so the egui shell keeps its long-lived state in a
-# world resource instead; the contract is documented in `pill_editor_core_egui`'s
+# world resource instead; the contract is documented in `pill_editor_core`'s
 # crate docs. The patterns are dot-prefixed so an unrelated `metadata::<`
 # turbofish cannot trip the `data` rule, and the closure forms require a `|`
 # after the parenthesis so a handle's `.data()` accessor stays legal.
@@ -580,7 +580,7 @@ def check_egui_context_storage(
                     display_path,
                     "egui state",
                     f"line {index + 1}: {detail}; keep long-lived egui state "
-                    "in a world resource (pill_editor_core_egui's reload-safety contract)",
+                    "in a world resource (pill_editor_core's reload-safety contract)",
                 )
 
 
@@ -611,7 +611,7 @@ def self_test() -> int:
         ),
         (
             "the same plant outside a reloadable crate passes",
-            "modules/frontents/pill_editor_egui/src/runner.rs",
+            "modules/frontents/pill_editor/src/runner.rs",
             "let stored = context.data_mut::<Widget>();\n",
             0,
         ),

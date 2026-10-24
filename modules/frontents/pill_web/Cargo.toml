@@ -17,7 +17,7 @@ pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
 pill_engine_core = { path = "../../pill_engine_core" }
 # The egui editor posture (W-0029): the boundary types and the shared model
 # the egui shell writes its frame with, plus egui's own wgpu renderer.
-pill_editor_core_egui = { path = "../../frontents/pill_editor_core_egui" }
+pill_editor_core = { path = "../../frontents/pill_editor_core" }
 egui-wgpu = "0.36.2"
 # The device both UI canvases are drawn through.
 wgpu = "30.0.0"

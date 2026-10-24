@@ -208,10 +208,10 @@ pub fn run_menu_action(
         }
         menubar::MenuAction::Undo => session
             .history_requests
-            .push(pill_editor_core_egui::session::HistoryRequest::Undo),
+            .push(pill_editor_core::session::HistoryRequest::Undo),
         menubar::MenuAction::Redo => session
             .history_requests
-            .push(pill_editor_core_egui::session::HistoryRequest::Redo),
+            .push(pill_editor_core::session::HistoryRequest::Redo),
         menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
         // The dock is borrowed by the `DockArea` while this menu draws, so the
         // new view is docked after the pass (W-0038 Stage 21).
@@ -221,7 +221,7 @@ pub fn run_menu_action(
         // The clipboard (W-0038 Stage 17): the shell builds the payload and
         // queues the request; the executable's OS bridge carries it out.
         menubar::MenuAction::Clipboard(action) => {
-            let summary = pill_editor_core_egui::clipboard::queue_action(
+            let summary = pill_editor_core::clipboard::queue_action(
                 viewer.clipboard,
                 action,
                 viewer.selection,
@@ -231,9 +231,9 @@ pub fn run_menu_action(
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 action = match action {
-                    pill_editor_core_egui::clipboard::ClipboardAction::Copy => "copy",
-                    pill_editor_core_egui::clipboard::ClipboardAction::Cut => "cut",
-                    pill_editor_core_egui::clipboard::ClipboardAction::Paste => "paste",
+                    pill_editor_core::clipboard::ClipboardAction::Copy => "copy",
+                    pill_editor_core::clipboard::ClipboardAction::Cut => "cut",
+                    pill_editor_core::clipboard::ClipboardAction::Paste => "paste",
                 },
                 payload = summary.as_deref().unwrap_or("nothing"),
                 "[editor] clipboard queued"

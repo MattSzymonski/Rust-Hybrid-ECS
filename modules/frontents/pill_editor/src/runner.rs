@@ -23,7 +23,7 @@
 //! the compositor idle a hidden one.
 //!
 //! The shell boundary is plain data in the world (the shared
-//! `pill_editor_core_egui::boundary` resources), so the frontend and the reloadable
+//! `pill_editor_core::boundary` resources), so the frontend and the reloadable
 //! shell module never share a type that could dangle across a reload. When
 //! no shell module is loaded, the runner draws a minimal egui fallback of
 //! its own, so the window is never left without a UI.
@@ -37,46 +37,46 @@ use pill_core::platform::futures::block_on;
 use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
-use pill_editor_core_egui::assets::{self, AssetDialog};
-use pill_editor_core_egui::boundary::{
+use pill_editor_core::assets::{self, AssetDialog};
+use pill_editor_core::boundary::{
     frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellRect,
     DEFAULT_SCENE_VIEWS,
 };
-use pill_editor_core_egui::cadence::{Cadence, FrameDemand, FrameWake};
-use pill_editor_core_egui::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
-use pill_editor_core_egui::clipboard::{self, ClipboardAction, ClipboardRequest, EditorClipboard};
-use pill_editor_core_egui::commands::{
+use pill_editor_core::cadence::{Cadence, FrameDemand, FrameWake};
+use pill_editor_core::camera::{self, CameraButton, CameraNavigation, Modifiers, OrbitCamera};
+use pill_editor_core::clipboard::{self, ClipboardAction, ClipboardRequest, EditorClipboard};
+use pill_editor_core::commands::{
     ensure_command_resources, read_gizmo_settings, write_gizmo_preferences, CommandRegistry,
     EditorPreferences, KeybindingsFile, KeymapPreset, PendingEditorCommands, KEYBINDINGS_FILE,
     PREFERENCES_FILE,
 };
-use pill_editor_core_egui::console::{ConsoleChannel, ConsoleLine, ConsoleState};
-use pill_editor_core_egui::drain::{self, HistoryDirection};
-use pill_editor_core_egui::editor_state::{
+use pill_editor_core::console::{ConsoleChannel, ConsoleLine, ConsoleState};
+use pill_editor_core::drain::{self, HistoryDirection};
+use pill_editor_core::editor_state::{
     AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, SelectionClick,
     StandaloneTypeInfo,
 };
-use pill_editor_core_egui::egui;
-use pill_editor_core_egui::entities;
-use pill_editor_core_egui::gizmo::{
+use pill_editor_core::egui;
+use pill_editor_core::entities;
+use pill_editor_core::gizmo::{
     self, GizmoGeometry, GizmoMode, GizmoSettings, GizmoSpace, GizmoState, HandleKind, HandleStates,
 };
-use pill_editor_core_egui::history::CommandHistory;
-use pill_editor_core_egui::inspector;
-use pill_editor_core_egui::layout::{
+use pill_editor_core::history::CommandHistory;
+use pill_editor_core::inspector;
+use pill_editor_core::layout::{
     layout_directory, EditorTab, BOTTOM_ROW_FRACTION, SIDE_COLUMN_FRACTION,
 };
-use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
-use pill_editor_core_egui::panels::{
+use pill_editor_core::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
+use pill_editor_core::panels::{
     ModuleLiveness, PanelCommand, PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
 };
-use pill_editor_core_egui::preferences::{self, PreferencesView};
-use pill_editor_core_egui::problems::{self as problem_parser, Severity};
-use pill_editor_core_egui::scripted::{
+use pill_editor_core::preferences::{self, PreferencesView};
+use pill_editor_core::problems::{self as problem_parser, Severity};
+use pill_editor_core::scripted::{
     AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
 };
-use pill_editor_core_egui::session::{EguiShellState, HistoryRequest};
-use pill_editor_core_egui::systems;
+use pill_editor_core::session::{EguiShellState, HistoryRequest};
+use pill_editor_core::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
 use pill_engine_core::debug_draw::{DebugDraw, DebugStyle};
 use pill_engine_core::input::{ButtonState, KeyCode, Modifiers as EngineModifiers, MouseButton};
@@ -736,7 +736,7 @@ struct EditorWindow {
     drop_preview: Option<std::path::PathBuf>,
     /// The recovery document a previous run left behind (W-0038 Stage 20),
     /// applied on the first frame the shell's session exists.
-    recovered: Option<pill_editor_core_egui::layout::RecoveryDocument>,
+    recovered: Option<pill_editor_core::layout::RecoveryDocument>,
     /// The state the last recovery write captured, so an unchanged editor
     /// does not rewrite the document every frame.
     last_recovery_key: Option<String>,
@@ -1050,7 +1050,7 @@ impl EditorWindow {
                 // The fallback draws the same theme as the shell, so a
                 // missing shell module does not flip the look.
                 let context = egui::Context::default();
-                pill_editor_core_egui::style::apply(&context);
+                pill_editor_core::style::apply(&context);
                 context
             },
             reported_fallback: false,
@@ -1077,7 +1077,7 @@ impl EditorWindow {
             standalone_types: Vec::new(),
             asset_listing_dirty: true,
             drop_preview: None,
-            recovered: pill_editor_core_egui::layout::read_recovery(),
+            recovered: pill_editor_core::layout::read_recovery(),
             last_recovery_key: None,
             ime_allowed: false,
             ime_rect: None,
@@ -1109,13 +1109,13 @@ impl EditorWindow {
                 if cadence.continuous() {
                     info!(
                         target: telemetry_target::ENGINE,
-                        variable = pill_editor_core_egui::cadence::CONTINUOUS_REDRAW_ENV,
+                        variable = pill_editor_core::cadence::CONTINUOUS_REDRAW_ENV,
                         "[editor] redraw continuous"
                     );
                 } else {
                     info!(
                         target: telemetry_target::ENGINE,
-                        idle_poll_ms = pill_editor_core_egui::cadence::IDLE_POLL.as_millis() as u64,
+                        idle_poll_ms = pill_editor_core::cadence::IDLE_POLL.as_millis() as u64,
                         "[editor] redraw on demand"
                     );
                 }
@@ -1227,7 +1227,7 @@ impl EditorWindow {
     /// get - and starts hidden: the placement that follows this frame shows
     /// it.
     fn ensure_scene_views(&mut self, count: usize, event_loop: &ActiveEventLoop) {
-        let wanted = count.min(pill_editor_core_egui::boundary::SCENE_VIEWS_MAX);
+        let wanted = count.min(pill_editor_core::boundary::SCENE_VIEWS_MAX);
         while self.views.len() < wanted {
             let view = self.views.len();
             self.cameras.push(OrbitCamera::default());
@@ -1913,7 +1913,7 @@ impl EditorWindow {
     fn drop_folder(&mut self) -> String {
         let world = self.host.host_mut().engine_mut().world_mut();
         let folder = world
-            .get_resource::<pill_editor_core_egui::session::EguiShellState>()
+            .get_resource::<pill_editor_core::session::EguiShellState>()
             .map(|state| state.browser.folder.clone())
             .unwrap_or_default();
         if folder.is_empty() {
@@ -2081,9 +2081,9 @@ impl EditorWindow {
             return;
         }
         let document =
-            pill_editor_core_egui::layout::RecoveryDocument::capture(&session.dock, &selection);
+            pill_editor_core::layout::RecoveryDocument::capture(&session.dock, &selection);
         self.last_recovery_key = Some(key);
-        pill_editor_core_egui::layout::write_recovery(&document);
+        pill_editor_core::layout::write_recovery(&document);
     }
 
     /// Publish the shared selection as the renderer's outline set (Stage
@@ -3163,7 +3163,7 @@ impl EditorWindow {
                 None => String::new(),
             }
         };
-        let entries = pill_editor_core_egui::browser::children(&self.asset_entries, &folder);
+        let entries = pill_editor_core::browser::children(&self.asset_entries, &folder);
         info!(
             target: telemetry_target::ENGINE,
             folder = folder.as_str(),
@@ -4420,7 +4420,7 @@ impl EditorWindow {
         // marker reads them.
         snapshot.selected_details = selected_entities
             .iter()
-            .take(pill_editor_core_egui::editor_state::SELECTED_DETAILS_MAX)
+            .take(pill_editor_core::editor_state::SELECTED_DETAILS_MAX)
             .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
             .collect();
         snapshot.assets = self.asset_entries.clone();
@@ -4447,7 +4447,7 @@ impl EditorWindow {
         // owe the next one. They are bounded-latency data instead - the idle
         // poll draws them within its interval - which is what keeps an idle
         // editor idle while its console still fills.
-        compared.console = pill_editor_core_egui::console::ConsoleView::default();
+        compared.console = pill_editor_core::console::ConsoleView::default();
         compared.problems.clear();
         self.demand.snapshot = self
             .last_snapshot
@@ -4571,7 +4571,7 @@ impl EditorWindow {
     /// queued, then publish what the frame needs to follow them.
     ///
     /// The application itself is the shared core drain
-    /// ([`pill_editor_core_egui::drain::apply_pending`]), so the browser
+    /// ([`pill_editor_core::drain::apply_pending`]), so the browser
     /// editor runs exactly this contract; the only executable-owned half is
     /// the asset listing walk a file batch asks for.
     fn apply_pending_commands(&mut self) {
@@ -4939,8 +4939,7 @@ impl EditorWindow {
     fn scripted_edit_resource(&mut self, resource: &str, field: &str, value_text: &str) {
         let world = self.host.host_mut().engine_mut().world_mut();
         let current = world.get_resource::<GizmoState>().and_then(|state| {
-            pill_editor_core_egui::gizmo::resource_field_value(&state.settings, resource, field)
-                .ok()
+            pill_editor_core::gizmo::resource_field_value(&state.settings, resource, field).ok()
         });
         let Some(current) = current else {
             warn!(
@@ -5224,7 +5223,7 @@ impl EditorWindow {
     /// Run `console filter <level>`: the lowest level the Console tab shows,
     /// which the next frame applies to the history (W-0038 Stage 5).
     fn scripted_console_filter(&mut self, level: &str) {
-        let Some(value) = pill_editor_core_egui::console::level_from_name(level) else {
+        let Some(value) = pill_editor_core::console::level_from_name(level) else {
             warn!(
                 target: telemetry_target::ENGINE,
                 level,
@@ -5279,7 +5278,7 @@ impl EditorWindow {
             .unwrap_or_default();
         info!(
             target: telemetry_target::ENGINE,
-            level = pill_editor_core_egui::console::level_name(view.minimum_level),
+            level = pill_editor_core::console::level_name(view.minimum_level),
             channel = view.channel.map_or("both", ConsoleChannel::name),
             search = view.search.as_str(),
             total = view.total,
@@ -5583,7 +5582,7 @@ impl EditorWindow {
         if !fits {
             warn!(
                 target: telemetry_target::ENGINE,
-                limit = pill_editor_core_egui::boundary::SCENE_VIEWS_MAX,
+                limit = pill_editor_core::boundary::SCENE_VIEWS_MAX,
                 "[editor] scene view refused: the view limit is reached"
             );
             return;
@@ -5603,11 +5602,7 @@ impl EditorWindow {
     /// caret is; this executable is what owns the window, so it is the only
     /// place that can pass those decisions to the platform. The rect is in
     /// logical points, which is the window's IME coordinate space.
-    fn apply_ime(
-        &mut self,
-        allowed: bool,
-        rect: Option<pill_editor_core_egui::boundary::ShellRect>,
-    ) {
+    fn apply_ime(&mut self, allowed: bool, rect: Option<pill_editor_core::boundary::ShellRect>) {
         let window = self.window.clone();
         if allowed != self.ime_allowed {
             window.set_ime_allowed(allowed);
@@ -5651,7 +5646,7 @@ impl EditorWindow {
     fn present_popouts(
         &mut self,
         event_loop: &ActiveEventLoop,
-        frames: &mut [pill_editor_core_egui::boundary::PopoutFrame],
+        frames: &mut [pill_editor_core::boundary::PopoutFrame],
     ) {
         for frame in frames.iter() {
             if self.popouts.contains_key(&frame.tab) {
@@ -6815,7 +6810,7 @@ impl EditorWindow {
             );
             return;
         };
-        if pill_editor_core_egui::layout::activate_tab(state.dock.state_mut(), tab) {
+        if pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab) {
             info!(
                 target: telemetry_target::ENGINE,
                 tab = tab.name(),
@@ -6835,7 +6830,7 @@ impl EditorWindow {
             // A scene view's tab is docked the moment it is asked for
             // (W-0038 Stage 21): a view the person added has no other way in.
             state.dock.state_mut().push_to_focused_leaf(tab);
-            pill_editor_core_egui::layout::activate_tab(state.dock.state_mut(), tab);
+            pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab);
             info!(
                 target: telemetry_target::ENGINE,
                 tab = tab.name(),
@@ -6911,7 +6906,7 @@ impl EditorWindow {
         if let Some(state) = world.get_resource_mut::<EguiShellState>() {
             state.dock.set_panel_ids(panel_ids);
             let surfaces = state.dock.state().surfaces_count();
-            pill_editor_core_egui::layout::save(&state.dock);
+            pill_editor_core::layout::save(&state.dock);
             info!(
                 target: telemetry_target::ENGINE,
                 surfaces,
@@ -6920,7 +6915,7 @@ impl EditorWindow {
         }
         // The run is ending on purpose: there is nothing left to recover
         // (W-0038 Stage 20).
-        pill_editor_core_egui::layout::remove_recovery();
+        pill_editor_core::layout::remove_recovery();
         self.quit = true;
     }
 
@@ -6947,7 +6942,7 @@ impl EditorWindow {
             .state()
             .iter_all_nodes()
             .filter_map(|(path, node)| match node {
-                pill_editor_core_egui::egui_dock::Node::Leaf(leaf) => {
+                pill_editor_core::egui_dock::Node::Leaf(leaf) => {
                     let tabs = leaf
                         .tabs
                         .iter()

@@ -29,7 +29,7 @@ cargo run --package pill_standalone --features rendering
 
 The tuning keys log the field's new values to the host log. The values are also
 shown in the tuning overlay in the window's top-left corner, which the demo
-draws with egui (`pill_game_ui`); the overlay has first claim on the pointer and
+draws with egui (`pill_project_ui`); the overlay has first claim on the pointer and
 the keyboard while it is being used, so flying the camera and typing into the UI
 do not fight.
 

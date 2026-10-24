@@ -16,7 +16,7 @@ DESCRIPTION
     (and the example projects') and enforces:
 
       1. wgpu          - only a GPU module depends on `wgpu` (or one of the
-                         named exceptions, `pill_editor_egui` and
+                         named exceptions, `pill_editor` and
                          `pill_web`), and at least one
                          GPU module does.
       2. api deps      - `pill_renderer_api` depends only on the contract's
@@ -94,12 +94,12 @@ GRAPH_ONLY_SUFFIX = "_dependency_graph"
 GRAPHICS_CRATE = "wgpu"
 
 # Crates outside the renderer split that link the graphics crate by design:
-# `pill_editor_egui` is the egui editor
+# `pill_editor` is the egui editor
 # executable, which owns its window and swap chain (plan decisions D8, D19);
 # `pill_web` attaches the renderer surface and draws the browser editor
 # posture's UI on wasm. The egui editor also carries `egui-wgpu`, whose name
 # differs from the crate this rule matches, so it needs no entry.
-WGPU_EXCEPTION_CRATES = {"pill_editor_egui", "pill_web"}
+WGPU_EXCEPTION_CRATES = {"pill_editor", "pill_web"}
 
 
 # Every broken rule under `repository`, as (rule number, message) pairs.
@@ -203,7 +203,7 @@ def report(repository: Path) -> int:
 # A minimal repository that satisfies every rule: a renderer `r` with its data
 # crate, the contract crate, a host with graph-only dependencies, a project.
 VALID_TREE = {
-    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", "pill_editor_egui", '
+    "modules/Cargo.toml": '[workspace]\nmembers = ["pill_renderer_api", "pill_host", "pill_standalone", "pill_editor", '
                           '"extensions/*/*", "extensions/*/generated/*", "projects_generated/*"]\n'
                           'exclude = ["extensions/rendering"]\n',
     "modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\n'
@@ -214,7 +214,7 @@ VALID_TREE = {
     "modules/pill_host/src/lib.rs": "//! Host.\n",
     "modules/pill_host/src/tests.rs": "use renderer_data_dependency_graph as r_data;\n",
     "modules/pill_standalone/Cargo.toml": '[package]\nname = "pill_standalone"\n[dependencies]\npill_host = { path = "x" }\n',
-    "modules/pill_editor_egui/Cargo.toml": '[package]\nname = "pill_editor_egui"\n[dependencies]\nwgpu = "25"\n',
+    "modules/pill_editor/Cargo.toml": '[package]\nname = "pill_editor"\n[dependencies]\nwgpu = "25"\n',
     "modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nwgpu = "25"\nr_data = { path = "x" }\n',
     "modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\npill_renderer_api = { path = "x" }\n',
     "modules/extensions/r/generated/host_module_r/Cargo.toml": '[package]\nname = "host_module_r"\n[dependencies]\nr = { path = "x" }\n',
@@ -226,7 +226,7 @@ VALID_TREE = {
 BROKEN_VARIANTS = [
     (1, {"modules/extensions/r/r_data/Cargo.toml": '[package]\nname = "r_data"\n[dependencies]\nwgpu = "25"\n'}),
     (1, {"modules/extensions/r/r/Cargo.toml": '[package]\nname = "r"\n[dependencies]\nr_data = { path = "x" }\n'}),
-    (1, {"modules/pill_editor_egui/Cargo.toml": '[package]\nname = "pill_not_editor_egui"\n[dependencies]\nwgpu = "25"\n'}),
+    (1, {"modules/pill_editor/Cargo.toml": '[package]\nname = "pill_not_editor"\n[dependencies]\nwgpu = "25"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nglam = "0.33"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[dependencies]\nrand = "0.8"\n'}),
     (2, {"modules/pill_renderer_api/Cargo.toml": '[package]\nname = "pill_renderer_api"\n[build-dependencies]\npill_assets = "1"\n'}),

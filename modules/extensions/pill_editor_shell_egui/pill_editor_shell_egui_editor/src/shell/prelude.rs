@@ -13,44 +13,44 @@
 //! and a `super::`-relative glob would not resolve inside that crate.
 
 // External crates
-pub use pill_editor_core_egui::assets::{self, AssetDialog};
-pub use pill_editor_core_egui::boundary::{
+pub use pill_editor_core::assets::{self, AssetDialog};
+pub use pill_editor_core::boundary::{
     frame_from_output, EguiShellFrame, EguiShellInput, ShellRect, DEFAULT_SCENE_VIEWS,
     SCENE_VIEWS_MAX,
 };
-pub use pill_editor_core_egui::browser::{self, ProjectBrowser};
-pub use pill_editor_core_egui::commands::{CommandView, PendingEditorCommands};
-pub use pill_editor_core_egui::console::{
+pub use pill_editor_core::browser::{self, ProjectBrowser};
+pub use pill_editor_core::commands::{CommandView, PendingEditorCommands};
+pub use pill_editor_core::console::{
     self as console, ConsoleChannel, ConsoleFilterSettings, ConsoleLine, ConsoleView,
 };
-pub use pill_editor_core_egui::editor_state::{
+pub use pill_editor_core::editor_state::{
     AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
     ResourceFieldView, ResourceView,
 };
-pub use pill_editor_core_egui::egui;
-pub use pill_editor_core_egui::egui_dock::{
+pub use pill_editor_core::egui;
+pub use pill_editor_core::egui_dock::{
     DockArea, DockState, NodeIndex, NodePath, SurfaceIndex, TabViewer,
 };
-pub use pill_editor_core_egui::entities;
-pub use pill_editor_core_egui::gizmo::{GizmoMode, GizmoSpace};
-pub use pill_editor_core_egui::icons;
-pub use pill_editor_core_egui::inspector;
-pub use pill_editor_core_egui::layout::EditorTab;
-pub use pill_editor_core_egui::menubar;
-pub use pill_editor_core_egui::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
-pub use pill_editor_core_egui::panels::{
+pub use pill_editor_core::entities;
+pub use pill_editor_core::gizmo::{GizmoMode, GizmoSpace};
+pub use pill_editor_core::icons;
+pub use pill_editor_core::inspector;
+pub use pill_editor_core::layout::EditorTab;
+pub use pill_editor_core::menubar;
+pub use pill_editor_core::notices::{EditorNotices, Notice, NoticeLevel, ProblemRow};
+pub use pill_editor_core::panels::{
     PanelCommand, PanelComponentValues, PanelContext, PanelDrawFn, PanelEntityDetail,
     PanelEntityRow, PanelFieldValue, PanelRegistry, PanelWindowRequest,
 };
-pub use pill_editor_core_egui::preferences;
-pub use pill_editor_core_egui::session::{
+pub use pill_editor_core::preferences;
+pub use pill_editor_core::session::{
     EguiShellState, InspectorSession, MenubarSession, PaletteState, PanelBudget, PanelTiming,
     PanelWindowAnswer, PanelWindowSession, PanelWindowState, StatisticsSession, Toast,
     ToastSession, ToolboxSession, PANEL_BUDGET_FRAMES, PANEL_BUDGET_MICROS, PANEL_WINDOWS_MAX,
     TOASTS_MAX, TOAST_FRAMES,
 };
-pub use pill_editor_core_egui::style;
-pub use pill_editor_core_egui::systems;
-pub use pill_editor_core_egui::toolbox;
+pub use pill_editor_core::style;
+pub use pill_editor_core::systems;
+pub use pill_editor_core::toolbox;
 pub use pill_engine::{pill_hot_fn, Entity, FieldValue, Input};
 pub use serde_json::Value as JsonValue;

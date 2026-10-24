@@ -545,8 +545,8 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
 /// The workspace package name to anchor editor module builds to.
 ///
 /// Cargo unifies features across every selected package, so module builds
-/// select the running editor's own package (`-p editor`, `-p pill_editor`,
-/// `-p pill_editor_egui`) to force the shared engine crates onto that
+/// select the running editor's own package (`-p editor` or `-p pill_editor`)
+/// to force the shared engine crates onto that
 /// editor's exact feature universe. The package name is normally the
 /// executable's file stem, but the Dioxus CLI (`dx`) stages the built binary
 /// under a cargo-metadata-hash suffixed name such as `editor-d6d95e94.exe`;
@@ -577,7 +577,7 @@ fn host_anchor_package() -> Option<String> {
 /// build must reproduce; a plain game host needs only the explicit engine
 /// features.
 fn is_editor_anchor(package: &str) -> bool {
-    matches!(package, "editor" | "pill_editor" | "pill_editor_egui")
+    matches!(package, "editor" | "pill_editor")
 }
 
 /// The frontend features the running host was built with, used to pick the

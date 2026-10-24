@@ -21,7 +21,7 @@
 //! the widget-local state in it (focus, scroll offsets, text-edit state) is
 //! not worth a dangling pointer, and resetting it on a reload is what a user
 //! sees as a fresh panel anyway. Long-lived UI state lives in
-//! [`EguiShellState`](pill_editor_core_egui::session::EguiShellState), a world
+//! [`EguiShellState`](pill_editor_core::session::EguiShellState), a world
 //! resource defined by the shared model crate, which is what makes it safe to
 //! keep across generations.
 //!
@@ -64,7 +64,7 @@ static POPOUTS_CLAIMED: AtomicBool = AtomicBool::new(false);
 /// once, and needs no bookkeeping across reloads. Returns how many contexts
 /// were cleared, which is zero on every frame after the first.
 pub fn claim_popout_contexts(
-    contexts: &std::collections::BTreeMap<pill_editor_core_egui::layout::EditorTab, egui::Context>,
+    contexts: &std::collections::BTreeMap<pill_editor_core::layout::EditorTab, egui::Context>,
 ) -> usize {
     if POPOUTS_CLAIMED.swap(true, Ordering::AcqRel) {
         return 0;

@@ -10,8 +10,8 @@
 // External crates
 use glam::{EulerRot, Quat, Vec3};
 use pill_engine::{pill_hot, Input, KeyCode, MouseButton, Query, Res, SystemError, Time};
-use pill_game_ui::GameUi;
 use pill_master_renderer_data::{CameraComponent, TransformComponent};
+use pill_project_ui::GameUi;
 
 // Current crate
 use crate::game::CameraMovementComponent;

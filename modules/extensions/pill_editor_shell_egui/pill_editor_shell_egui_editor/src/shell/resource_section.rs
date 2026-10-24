@@ -9,7 +9,7 @@
 //! # Design
 //!
 //! The rows come from the snapshot, which read them through the resource's
-//! curated table (`pill_editor_core_egui::resources`), so the tab cannot offer
+//! curated table (`pill_editor_core::resources`), so the tab cannot offer
 //! a field the write path would refuse. Every commit is one recorded command,
 //! which is what makes a resource edit undoable like any other edit.
 

@@ -32,7 +32,7 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
 // Current crate
-use pill_editor_core_egui::clipboard::FORMAT_NAME;
+use pill_editor_core::clipboard::FORMAT_NAME;
 
 /// `CF_UNICODETEXT`: the plain-text format the readable copy uses.
 const CF_UNICODETEXT: u32 = 13;

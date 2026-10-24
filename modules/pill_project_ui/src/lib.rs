@@ -16,7 +16,7 @@
 //! This crate is a shared `dylib` (plan decision D2) so the egui context
 //! outlives a project reload: a rebuilt project finds its fonts, its widget
 //! state and its textures still there. The same reload contract as
-//! `pill_editor_core_egui` binds - nothing module-defined may be stored in the context
+//! `pill_editor_core` binds - nothing module-defined may be stored in the context
 //! - and [`GameUi`] itself lives here, so the type is one across artifacts.
 //!
 //! The frame it produces is neutral (`pill_draw`) and travels through the
@@ -33,13 +33,13 @@
 //!
 //! ```ignore
 //! // Once, in the project's init:
-//! pill_game_ui::install(engine);
+//! pill_project_ui::install(engine);
 //!
 //! // In a system, once per frame:
-//! let input = pill_game_ui::InputFrame::capture(world.get_resource::<Input>().unwrap());
+//! let input = pill_project_ui::InputFrame::capture(world.get_resource::<Input>().unwrap());
 //! let mut ui = world.get_resource_mut::<GameUi>().unwrap();
 //! let mut slot = world.get_resource_mut::<UiFrameSlot>().unwrap();
-//! ui.run(&mut slot, &input, viewport, scale_factor, pill_game_ui::PRIMARY_SURFACE, |ui| {
+//! ui.run(&mut slot, &input, viewport, scale_factor, pill_project_ui::PRIMARY_SURFACE, |ui| {
 //!     ui.heading("Tuning");
 //!     ui.label(format!("fps {fps}"));
 //! });

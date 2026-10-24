@@ -130,7 +130,7 @@ the directory name, so the host needs no changes. The host **generates** the
 `modules/extensions/<name>/generated/host_module_<name>/` on startup: it is a
 build artifact, never written by hand. See
 `modules/extensions/pill_spline/` for the reference implementation. An
-extension's optional editor part is written against `pill_editor_core_egui`
+extension's optional editor part is written against `pill_editor_core`
 (the old `pill_ui` editor part retired with W-0043).
 
 Modules must live in this directory rather than anywhere on disk: sharing the  
@@ -143,7 +143,7 @@ shared `pill_core` library in agreement.
 The engine workspace links `pill_core` dynamically so the host and every loaded  
 module share one copy of its telemetry state. That also makes the built  
 executable depend on the toolchain's `std-<hash>.dll` at load time. The build  
-script in `pill_standalone` (and `pill_editor_egui`) stages that dylib next to the  
+script in `pill_standalone` (and `pill_editor`) stages that dylib next to the  
 executable automatically, so `target\debug\pill_standalone.exe` runs directly  
 without any `PATH` adjustment:
 

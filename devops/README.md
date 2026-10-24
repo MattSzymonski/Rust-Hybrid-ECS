@@ -132,7 +132,7 @@ editor build (the uplift) prepended; a file no rule recognizes falls back to
 and the tier runs stay for stage boundaries and milestones.
 
 The gate itself carries the editor end to end: its `editor` step runs the
-host-tier revision suite, builds `pill_editor_egui` (the uplift), and then
+host-tier revision suite, builds `pill_editor` (the uplift), and then
 runs `test_editor_egui.py` - that order is required, because the revision
 suite's narrowed build re-splits the shared DLLs and the editor launches a
 pre-built binary. It is the slowest step - about fifteen minutes on a warm

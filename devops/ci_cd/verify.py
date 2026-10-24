@@ -29,7 +29,7 @@ DESCRIPTION
     The `editor` step is the end-to-end lane. It first runs the host-tier
     `test_editor_revision.py`, which builds a narrowed `pill_standalone` and
     would re-split the shared DLLs if it ran later; then it builds
-    `pill_editor_egui` (the uplift) and runs `test_editor_egui.py` - serially,
+    `pill_editor` (the uplift) and runs `test_editor_egui.py` - serially,
     with its own timeout. It is the slowest step, about fifteen minutes on a
     warm cache, and it never runs in `--quick`.
 
@@ -92,7 +92,7 @@ DEFAULT_LANE = [
     # every crate in it - the lane exists to test the plain path, and the
     # hot_patch lane below covers the other one.
     "--exclude",
-    "pill_editor_egui",
+    "pill_editor",
 ]
 
 # The unit-test steps run through nextest when it is installed, and through
@@ -288,7 +288,7 @@ STEPS: List[Step] = [
     # The end-to-end editor lane: the real executable, driven through its
     # scripted channel. Order is the whole point. The host-tier revision suite
     # builds its own narrowed `pill_standalone`, which re-splits the shared
-    # DLLs, so it runs first; the `pill_editor_egui` build must then be the
+    # DLLs, so it runs first; the `pill_editor` build must then be the
     # last build before the launch, or the editor dies on 0xC0000139
     # (`check_relevant.py` encodes the same rule for the change-scoped runs).
     Step(
@@ -299,7 +299,7 @@ STEPS: List[Step] = [
             # The egui editor gets its own build right before its suite: the
             # host and the module builds it spawns must share one feature
             # resolution, and a narrower build in between re-splits them.
-            ["cargo", "build", "-p", "pill_editor_egui"],
+            ["cargo", "build", "-p", "pill_editor"],
             [PYTHON, "../devops/tests/run_all.py", "--only", "test_editor_egui.py"],
         ],
     ),

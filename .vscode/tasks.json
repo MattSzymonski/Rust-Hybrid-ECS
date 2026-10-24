@@ -90,14 +90,14 @@
         },
         {
             // Debug build of the editor executable. Matches
-            // `cargo build --package pill_editor_egui --offline`.
+            // `cargo build --package pill_editor --offline`.
             "label": "build editor (debug)",
             "type": "shell",
             "command": "cargo",
             "args": [
                 "build",
                 "--package",
-                "pill_editor_egui",
+                "pill_editor",
                 "--offline"
             ],
             "options": {

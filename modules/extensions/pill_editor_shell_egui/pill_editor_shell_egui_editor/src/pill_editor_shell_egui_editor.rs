@@ -11,7 +11,7 @@
 //!
 //! The executable owns the window, the GPU device and the input; this crate
 //! owns the dock and the egui pass, and the two exchange plain data
-//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_core_egui`,
+//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_core`,
 //! the shared `dylib` both link). Input events transit through the engine's
 //! `Input` resource, and the shell converts them itself.
 //!
@@ -35,14 +35,12 @@
 extern crate self as pill_editor_shell_egui_editor;
 
 // External crates
-use pill_editor_core_egui::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
-use pill_editor_core_egui::commands::{ensure_command_resources, PendingEditorCommands};
-use pill_editor_core_egui::editor_state::{EditorSelection, EditorSnapshot};
-use pill_editor_core_egui::notices::EditorNotices;
-use pill_editor_core_egui::panels::{
-    PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
-};
-use pill_editor_core_egui::session::EguiShellState;
+use pill_editor_core::boundary::{EguiPopoutInputs, EguiShellFrame, EguiShellInput};
+use pill_editor_core::commands::{ensure_command_resources, PendingEditorCommands};
+use pill_editor_core::editor_state::{EditorSelection, EditorSnapshot};
+use pill_editor_core::notices::EditorNotices;
+use pill_editor_core::panels::{PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest};
+use pill_editor_core::session::EguiShellState;
 use pill_engine::{pill_hot, pill_module, Engine, Res, ResMut};
 
 // The build script scans this crate and emits one address entry per function
@@ -83,7 +81,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     // with the executable and re-claimed so a reload keeps them.
     ensure_command_resources(world);
     // Step 2: the session (the egui context and the dock), built on first
-    // load only. Its type lives in `pill_editor_core_egui`, so a reload of
+    // load only. Its type lives in `pill_editor_core`, so a reload of
     // this module finds the same resource and keeps the context alive.
     world.register_resource::<EguiShellState>();
     if world.get_resource::<EguiShellState>().is_none() {
@@ -187,7 +185,7 @@ pub fn egui_shell_update(
             Res<PanelRegistry>,
             ResMut<PanelCommands>,
             // The shell's side of the OS clipboard (W-0038 Stage 17).
-            ResMut<pill_editor_core_egui::clipboard::EditorClipboard>,
+            ResMut<pill_editor_core::clipboard::EditorClipboard>,
         ),
         // Each popped-out window's input (W-0038 Stage 23).
         Res<EguiPopoutInputs>,

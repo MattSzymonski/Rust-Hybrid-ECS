@@ -113,7 +113,7 @@ pub(super) struct Atlas {
 
 /// The texture the label list samples the font from.
 ///
-/// Reserved out of the game UI's external range: `pill_game_ui` numbers
+/// Reserved out of the game UI's external range: `pill_project_ui` numbers
 /// egui's managed textures `1 << 63 | id`, and egui never reaches the id that
 /// would make this one.
 pub(crate) const FONT_TEXTURE: TextureId = TextureId(u64::MAX);
