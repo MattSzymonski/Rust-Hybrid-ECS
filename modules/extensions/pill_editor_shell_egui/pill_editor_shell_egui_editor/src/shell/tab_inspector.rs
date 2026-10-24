@@ -294,6 +294,7 @@ pub fn entity_inspector(
                 &targets,
                 &snapshot.selected_details,
                 &snapshot.assets,
+                &snapshot.entities,
                 pending,
                 session,
             );

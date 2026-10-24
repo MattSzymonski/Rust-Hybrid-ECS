@@ -1312,6 +1312,11 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                 | "BTreeMap" | "BTreeSet" | "VecDeque" | "LinkedList" => {
                     Err(heap_owned_rejection(ty, &last))
                 }
+                // A field holding another entity's handle. Tagged on its own
+                // rather than as a `struct:` so the field layer reads and
+                // writes it as a reference the editor can pick, instead of an
+                // opaque pair of numbers (W-0048 Stage 6).
+                "Entity" => Ok("entity".to_string()),
                 // An asset handle keeps the asset it names, so the C# mirror
                 // can type the field as `Handle<Mesh>` rather than an opaque
                 // `Handle`. Still a `struct:` tag: every reader that folds or

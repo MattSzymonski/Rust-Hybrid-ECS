@@ -86,8 +86,8 @@ pub struct SeededComponent {
 }
 
 /// The canonical token of a field value, or `None` for values the payload
-/// does not carry (heap sequences, opaque bytes, struct arrays, and asset
-/// handles, which address a slot of this process only).
+/// does not carry (heap sequences, opaque bytes, struct arrays, and asset or
+/// entity references, which address a slot of this process only).
 pub fn format_value(value: &FieldValue) -> Option<String> {
     Some(match value {
         FieldValue::F32(value) => format!("{value:?}f"),
@@ -107,6 +107,7 @@ pub fn format_value(value: &FieldValue) -> Option<String> {
         | FieldValue::List { .. }
         | FieldValue::Text(_)
         | FieldValue::Asset { .. }
+        | FieldValue::Entity { .. }
         | FieldValue::Opaque { .. } => return None,
     })
 }
@@ -660,6 +661,7 @@ mod tests {
             components: vec![
                 ComponentView {
                     asset_labels: Vec::new(),
+                    entity_labels: Vec::new(),
                     type_name: "Position".to_string(),
                     persistable: true,
                     editable: true,
@@ -668,6 +670,7 @@ mod tests {
                 },
                 ComponentView {
                     asset_labels: Vec::new(),
+                    entity_labels: Vec::new(),
                     type_name: "Opaque".to_string(),
                     persistable: false,
                     editable: false,
@@ -839,6 +842,7 @@ mod tests {
             entity,
             components: vec![ComponentView {
                 asset_labels: Vec::new(),
+                entity_labels: Vec::new(),
                 type_name: "Position".to_string(),
                 persistable: true,
                 editable: true,

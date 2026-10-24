@@ -567,6 +567,22 @@ pub struct InspectorSession {
     pub asset_picker: Option<String>,
     /// The open asset picker's search text.
     pub asset_search: String,
+    /// Each entity reference row's last logged rectangle, keyed by
+    /// `entity.component.field` (W-0048 Stage 6): what a suite drags an
+    /// entity onto.
+    pub entity_row_rects: Vec<(String, Rect)>,
+    /// Each entity reference row's last logged text, keyed the same way: the
+    /// row logs again whenever it draws a different entity.
+    pub entity_row_texts: Vec<(String, String)>,
+    /// The `component.field` whose entity picker is open, if one is.
+    pub entity_picker: Option<String>,
+    /// The open entity picker's search text.
+    pub entity_search: String,
+    /// Each Hierarchy row's last logged rectangle, keyed by the entity's
+    /// display (W-0048 Stage 6): what a suite drags onto an entity reference
+    /// row. The Entities tab shares this session, since the cache is the same
+    /// "geometry the log already reported" concern.
+    pub hierarchy_row_rects: Vec<(String, Rect)>,
 }
 
 impl Resource for EguiShellState {}

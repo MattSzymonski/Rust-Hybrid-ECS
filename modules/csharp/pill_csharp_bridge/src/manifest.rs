@@ -187,6 +187,16 @@ const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
         tag: Some("u16"),
         default_literal: DefaultLiteral::Unsigned16,
     },
+    // A reference to another entity (W-0048 Stage 6): the runtime's `Entity`
+    // handle, which is the Rust handle's mirror - a `u64` slot id and a `u32`
+    // generation. Eight-byte aligned because of the `u64`, and with no
+    // default: an unset reference is the world's null handle.
+    BlittableLeaf {
+        type_name: "Entity",
+        alignment: 8,
+        tag: Some("entity"),
+        default_literal: DefaultLiteral::Unsupported,
+    },
 ];
 
 /// The nested-struct marker: a shape validation descends into, not a leaf.

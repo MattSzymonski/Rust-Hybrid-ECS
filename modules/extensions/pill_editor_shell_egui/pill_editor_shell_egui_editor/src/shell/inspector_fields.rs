@@ -33,6 +33,7 @@ pub fn inspector_field_row(
     targets: &[Entity],
     details: &[EntityDetail],
     assets: &[AssetListing],
+    scene: &[EntityListEntry],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
 ) {
@@ -253,6 +254,27 @@ pub fn inspector_field_row(
                 session,
             );
         }
+        inspector::FieldRow::Entity {
+            index,
+            field,
+            tooltip,
+        } => {
+            inspector_entity_row(
+                ui,
+                EntityRowInput {
+                    entity,
+                    component,
+                    index: *index,
+                    field,
+                    tooltip: tooltip.as_deref(),
+                    targets,
+                    details,
+                    scene: &scene,
+                },
+                pending,
+                session,
+            );
+        }
         inspector::FieldRow::ReadOnly {
             index,
             field,
@@ -445,8 +467,237 @@ pub fn inspector_asset_row(
 /// Width the clear button takes beside an asset row's button.
 pub const ASSET_ROW_CLEAR_WIDTH: f32 = 24.0;
 
-/// Height the asset picker's list scrolls within.
+/// Height an asset or entity picker's list scrolls within.
 pub const ASSET_PICKER_HEIGHT: f32 = 180.0;
+
+/// What one entity reference row draws from: the field, its component and the
+/// selection it writes to, and the scene's entities the picker offers.
+pub struct EntityRowInput<'a> {
+    /// The primary entity the row describes.
+    pub entity: Entity,
+    /// The component section the row belongs to.
+    pub component: &'a ComponentView,
+    /// The field's position in the component's field list.
+    pub index: usize,
+    /// The field's registered name.
+    pub field: &'a str,
+    /// The field's `[Tooltip]`, if it declared one.
+    pub tooltip: Option<&'a str>,
+    /// Every entity the edit reaches (the primary first).
+    pub targets: &'a [Entity],
+    /// The selected entities' details, for the mixed-value marker.
+    pub details: &'a [EntityDetail],
+    /// The scene's entities, as the Entities tab lists them.
+    pub scene: &'a [EntityListEntry],
+}
+
+/// One entity reference row (W-0048 Stage 6): a button naming the referenced
+/// entity, which opens a picker over the scene, a target button that arms a
+/// scene click, a clear button, and a drop target that takes an entity dragged
+/// from the Entities tab.
+///
+/// Every choice queues one recorded `SetFieldEntity` step for the whole
+/// selection. A reference whose entity is gone reads `(missing)` rather than
+/// disappearing: the field still holds the handle, and hiding that would leave
+/// the row looking unset while the row's bytes say otherwise.
+pub fn inspector_entity_row(
+    ui: &mut egui::Ui,
+    input: EntityRowInput<'_>,
+    pending: &mut PendingEditorCommands,
+    session: &mut InspectorSession,
+) {
+    let type_name = input.component.type_name.as_str();
+    let label = input
+        .component
+        .entity_labels
+        .get(input.index)
+        .cloned()
+        .flatten()
+        .unwrap_or(EntityReferenceLabel::Unset);
+    let text = label.text().to_owned();
+    let key = format!("{}.{type_name}.{}", input.entity, input.field);
+    if remember_entity_row_text(session, &key, &text) {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            entity = %input.entity,
+            component = type_name,
+            field = input.field,
+            reference = text.as_str(),
+            "[editor] inspector row kind=entity"
+        );
+    }
+
+    // `Some(None)` clears the reference, `Some(Some(entity))` points it at one;
+    // collected while drawing and queued once afterwards.
+    let mut chosen: Option<Option<Entity>> = None;
+    let mut armed = false;
+    let mut button_rect = None;
+    let row_label = match input.component.values.get(input.index) {
+        Some(value) => row_label(input.field, input.details, type_name, input.index, value),
+        None => input.field.to_owned(),
+    };
+    inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
+        let width = (ui.available_width() - 2.0 * ASSET_ROW_CLEAR_WIDTH).max(40.0);
+        let color = match label {
+            EntityReferenceLabel::Live(_) => style::TEXT,
+            _ => style::TEXT_MUTED,
+        };
+        let response = ui.add_sized(
+            egui::vec2(width, 18.0),
+            egui::Button::new(icons::rich(icons::Icon::TreeStructure, &text).color(color))
+                .truncate(),
+        );
+        if response.dnd_hover_payload::<DraggedEntity>().is_some() {
+            ui.painter().rect_stroke(
+                response.rect,
+                2.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(dragged) = response.dnd_release_payload::<DraggedEntity>() {
+            chosen = Some(Some(dragged.0));
+        }
+        if response.clicked() {
+            session.entity_picker = match session.entity_picker.as_deref() {
+                Some(open) if open == key => None,
+                _ => Some(key.clone()),
+            };
+            session.entity_search.clear();
+        }
+        button_rect = Some((response.rect, response.interact_rect));
+        if ui
+            .add(egui::Button::new("+").small())
+            .on_hover_text("Pick the reference by clicking it in the scene")
+            .clicked()
+        {
+            armed = true;
+        }
+        if ui
+            .add_enabled(
+                !matches!(label, EntityReferenceLabel::Unset),
+                egui::Button::new("x").small(),
+            )
+            .on_hover_text("Clear the reference")
+            .clicked()
+        {
+            chosen = Some(None);
+        }
+    });
+    if let Some((rect, interact)) = button_rect {
+        remember_entity_row_rect(session, &key, rect, interact.contains(rect.center()));
+    }
+
+    if session.entity_picker.as_deref() == Some(key.as_str()) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut session.entity_search)
+                    .hint_text("Search entities")
+                    .desired_width(f32::INFINITY),
+            );
+            let search = session.entity_search.to_lowercase();
+            egui::ScrollArea::vertical()
+                .max_height(ASSET_PICKER_HEIGHT)
+                .show(ui, |ui| {
+                    if ui.selectable_label(false, "None").clicked() {
+                        chosen = Some(None);
+                    }
+                    for candidate in inspector::entity_candidates(input.scene) {
+                        if !candidate.display.to_lowercase().contains(&search) {
+                            continue;
+                        }
+                        let current = matches!(&label, EntityReferenceLabel::Live(name)
+                            if *name == candidate.display);
+                        if ui.selectable_label(current, &candidate.display).clicked() {
+                            chosen = Some(Some(candidate.entity));
+                        }
+                    }
+                });
+        });
+    }
+
+    if armed {
+        // The scene's own click names the reference, so the request rides the
+        // command queue to the executable that reads scene picks: the shell
+        // draws rows, it does not own the scene.
+        pending.push(vec![EditorCommand::ArmEntityPick {
+            entity: input.entity,
+            component: type_name.to_owned(),
+            field: input.field.to_owned(),
+        }]);
+    }
+
+    if let Some(reference) = chosen {
+        session.entity_picker = None;
+        let (commands, label, coalesce) = inspector::selection_entity_edit(
+            input.targets,
+            input.entity,
+            type_name,
+            input.field,
+            reference,
+        );
+        pending.push_recorded(commands, label, Some(coalesce));
+    }
+}
+
+/// Record the entity an entity row draws, returning whether it changed since
+/// the last frame that drew the row.
+pub fn remember_entity_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
+    if let Some((_, logged)) = session
+        .entity_row_texts
+        .iter_mut()
+        .find(|(logged_key, _)| logged_key == key)
+    {
+        if logged == text {
+            return false;
+        }
+        logged.clear();
+        logged.push_str(text);
+        return true;
+    }
+    session
+        .entity_row_texts
+        .push((key.to_owned(), text.to_owned()));
+    true
+}
+
+/// Log an entity row's rectangle once per placement, keyed by
+/// `entity.component.field`, so a suite can drop an entity onto it.
+pub fn remember_entity_row_rect(
+    session: &mut InspectorSession,
+    key: &str,
+    rect: egui::Rect,
+    visible: bool,
+) {
+    let existing = session
+        .entity_row_rects
+        .iter()
+        .position(|(logged_key, _)| logged_key == key);
+    if !visible {
+        if let Some(index) = existing {
+            session.entity_row_rects.remove(index);
+        }
+        return;
+    }
+    if let Some(index) = existing {
+        let (_, logged) = &mut session.entity_row_rects[index];
+        if *logged == rect {
+            return;
+        }
+        *logged = rect;
+    } else {
+        session.entity_row_rects.push((key.to_owned(), rect));
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        row = key,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] inspector entity row rect"
+    );
+}
 
 /// Record the asset an asset row draws, returning whether it changed since
 /// the last frame that drew the row: the row logs its current asset on its

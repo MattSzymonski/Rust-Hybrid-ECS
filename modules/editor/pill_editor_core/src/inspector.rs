@@ -32,7 +32,9 @@ use pill_engine::{Entity, FieldValue};
 use serde_json::Value as JsonValue;
 
 // Current crate
-use crate::editor_state::{AssetListing, ComponentView, EditorCommand, EntityDetail};
+use crate::editor_state::{
+    AssetListing, ComponentView, EditorCommand, EntityDetail, EntityListEntry,
+};
 use crate::icons::Icon;
 
 /// The name after the last `::`, for labels and history entries.
@@ -152,6 +154,7 @@ pub fn widget_for(value: &FieldValue) -> FieldWidget {
         FieldValue::Array(_)
         | FieldValue::List { .. }
         | FieldValue::Asset { .. }
+        | FieldValue::Entity { .. }
         | FieldValue::Opaque { .. } => FieldWidget::ReadOnly,
     }
 }
@@ -254,6 +257,17 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
+    /// A reference to another entity (W-0048 Stage 6): the referenced
+    /// entity's Hierarchy label, a picker over the scene's entities, a
+    /// viewport pick, a clear button and a drop target for the Entities tab.
+    Entity {
+        /// The field's position in the component's field list.
+        index: usize,
+        /// The field's registered name.
+        field: String,
+        /// Text the field's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
     /// A field shown read-only (a long array, a list, an opaque value).
     ReadOnly {
         /// The field's position in the component's field list.
@@ -332,6 +346,11 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
                 index,
                 field: descriptor.name.to_string(),
                 asset_type: asset_type.clone(),
+                tooltip,
+            },
+            FieldValue::Entity { .. } => FieldRow::Entity {
+                index,
+                field: descriptor.name.to_string(),
                 tooltip,
             },
             FieldValue::Array(_) | FieldValue::List { .. } | FieldValue::Opaque { .. } => {
@@ -456,6 +475,57 @@ pub fn selection_asset_edit(
     )
 }
 
+/// The recorded entity reference edit: `SetFieldEntity` under the field edit's
+/// label (`set Component.field`). `reference` is the entity to point at;
+/// `None` clears the reference.
+pub fn entity_edit(
+    entity: Entity,
+    component: &str,
+    field: &str,
+    reference: Option<Entity>,
+) -> (EditorCommand, String) {
+    (
+        EditorCommand::SetFieldEntity {
+            entity,
+            component: component.to_string(),
+            field: field.to_string(),
+            reference,
+        },
+        format!("set {}.{}", short_component_name(component), field),
+    )
+}
+
+/// [`entity_edit`] for every entity of `targets`, as one recorded step labelled
+/// and coalesced by the primary's edit, like [`selection_field_edit`].
+pub fn selection_entity_edit(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    field: &str,
+    reference: Option<Entity>,
+) -> (Vec<EditorCommand>, String, String) {
+    let commands = targets
+        .iter()
+        .map(|target| entity_edit(*target, component, field, reference).0)
+        .collect();
+    let (_command, label) = entity_edit(primary, component, field, reference);
+    (
+        commands,
+        label,
+        field_coalesce_key(primary, component, field),
+    )
+}
+
+/// The entities an entity row's picker offers: every entity the Hierarchy
+/// lists, in its order.
+///
+/// The row's own entity stays in the list: a component that references its own
+/// entity is odd but harmless, and hiding it would make the picker disagree
+/// with the Hierarchy for no rule the user could see.
+pub fn entity_candidates(entries: &[EntityListEntry]) -> Vec<&EntityListEntry> {
+    entries.iter().collect()
+}
+
 /// The assets an asset row's picker offers: every file of the listing whose
 /// type is the field's, in listing order. A field without a recorded type
 /// offers nothing, rather than every asset of every type.
@@ -476,6 +546,31 @@ pub fn asset_candidates<'a>(
 /// asset reference field.
 pub fn is_cleared_reference(text: &str) -> bool {
     matches!(text.trim(), "" | "none" | "None")
+}
+
+/// The entity a scripted reference names: a Hierarchy label (`3v0`), a bare
+/// slot id (`3`, read as generation 0), or `None` for the word that clears the
+/// reference.
+///
+/// # Errors
+///
+/// A message naming the text when it is not an entity label.
+pub fn parse_entity_reference(text: &str) -> Result<Option<Entity>, String> {
+    if is_cleared_reference(text) {
+        return Ok(None);
+    }
+    let trimmed = text.trim();
+    let (id_text, generation_text) = match trimmed.split_once('v') {
+        Some((id, generation)) => (id, generation),
+        None => (trimmed, "0"),
+    };
+    let id: u64 = id_text
+        .parse()
+        .map_err(|_| format!("`{trimmed}` is not an entity label (`<id>v<generation>`)"))?;
+    let generation: u32 = generation_text
+        .parse()
+        .map_err(|_| format!("`{trimmed}` is not an entity label (`<id>v<generation>`)"))?;
+    Ok(Some(Entity::from_raw(id, generation)))
 }
 
 /// The recorded array-element edit: `SetArrayElement` under the native
@@ -800,6 +895,7 @@ mod tests {
                     fields: Vec::new(),
                     values: Vec::new(),
                     asset_labels: Vec::new(),
+                    entity_labels: Vec::new(),
                 })
                 .collect(),
         }
@@ -998,6 +1094,7 @@ mod tests {
         const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         ComponentView {
             asset_labels: Vec::new(),
+            entity_labels: Vec::new(),
             type_name: name.to_string(),
             persistable: false,
             editable: true,
@@ -1161,6 +1258,7 @@ mod tests {
         const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         ComponentView {
             asset_labels: Vec::new(),
+            entity_labels: Vec::new(),
             type_name: "Decorated".to_string(),
             persistable: false,
             editable: true,
@@ -1491,6 +1589,83 @@ mod tests {
             .collect();
         assert_eq!(paths, ["models/cube.obj", "models/plane.obj"]);
         assert!(asset_candidates(&assets, None).is_empty());
+    }
+
+    /// An entity value becomes an entity row, not a read-only one (W-0048
+    /// Stage 6).
+    #[test]
+    fn an_entity_value_is_an_entity_row() {
+        let view = component(
+            "demo::Follower",
+            vec![FieldValue::Entity {
+                id: 7,
+                generation: 2,
+            }],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![FieldRow::Entity {
+                index: 0,
+                field: "a".to_owned(),
+                tooltip: None,
+            }]
+        );
+    }
+
+    /// The picker offers every listed entity in the Hierarchy's order, and a
+    /// typed or scripted label reads back as the handle it names.
+    #[test]
+    fn entity_references_round_trip_through_their_labels() {
+        let listed = EntityListEntry {
+            entity: Entity::from_raw(9, 3),
+            display: "9v3".to_owned(),
+            component_count: 1,
+            archetype_label: String::new(),
+        };
+        let entries = vec![listed];
+        assert_eq!(entity_candidates(&entries).len(), 1);
+        assert_eq!(
+            parse_entity_reference(&EntityListEntry::display_of(Entity::from_raw(9, 3))),
+            Ok(Some(Entity::from_raw(9, 3)))
+        );
+        assert_eq!(
+            parse_entity_reference("9"),
+            Ok(Some(Entity::from_raw(9, 0)))
+        );
+        assert_eq!(parse_entity_reference("none"), Ok(None));
+        assert!(parse_entity_reference("not-an-entity").is_err());
+    }
+
+    /// The entity edit builders queue `SetFieldEntity` under the field edit's
+    /// label, once per selected entity, and the clear names no entity.
+    #[test]
+    fn entity_edits_queue_set_field_entity_for_the_selection() {
+        let first = Entity::from_raw(1, 0);
+        let second = Entity::from_raw(2, 0);
+        let target = Entity::from_raw(4, 1);
+        let (commands, label, key) = selection_entity_edit(
+            &[first, second],
+            first,
+            "demo::Follower",
+            "follow",
+            Some(target),
+        );
+        assert_eq!(label, "set Follower.follow");
+        assert_eq!(key, field_coalesce_key(first, "demo::Follower", "follow"));
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[1],
+            EditorCommand::SetFieldEntity { entity, reference: Some(entity_ref), .. }
+                if *entity == second && *entity_ref == target
+        ));
+        let (cleared, _label) = entity_edit(first, "demo::Follower", "follow", None);
+        assert!(matches!(
+            cleared,
+            EditorCommand::SetFieldEntity {
+                reference: None,
+                ..
+            }
+        ));
     }
 
     /// The asset edit builders queue `SetFieldAsset` under the field edit's

@@ -498,6 +498,12 @@ fn emit_typed_struct(
             .and_then(|asset| scope.typed_handle(asset));
         let cs_type = if let Some((cs, _, _)) = cs_primitive(base_tag) {
             cs.to_string()
+        } else if base_tag == "entity" && element_size == std::mem::size_of::<pill_engine::Entity>()
+        {
+            // A reference to another entity (W-0048 Stage 6). The runtime's own
+            // handle type is the mirror of the Rust one - same `(id, generation)`
+            // layout - so the field is typed rather than left an opaque blob.
+            "Entity".to_string()
         } else if let Some(typed_handle) = typed_handle {
             // An asset handle whose asset this module mirrors is typed by it,
             // so a C# field holds a `Handle<Mesh>` a mirrored call returned.

@@ -5,6 +5,7 @@
 //! - `entity_rows`: the rows the tab lists, from the snapshot's entity list.
 //! - `entities_tab`: the rows, each a selection move, over the tab's empty strip's menu.
 //! - `entity_menu_items`: the row menu's create and delete actions.
+//! - `remember_hierarchy_row_rect`: each row's rectangle, logged for the suites.
 //!
 //! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
 //! below are absolute paths, so a patch crate resolves them too.
@@ -12,6 +13,48 @@
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
+
+/// The payload a Hierarchy row hands an entity reference row when dragged
+/// (W-0048 Stage 6).
+///
+/// A newtype rather than the bare handle: egui matches a drop by payload
+/// type, and an entity must not be mistaken for the path string an asset tile
+/// drags.
+#[derive(Clone, Copy, Debug)]
+pub struct DraggedEntity(pub Entity);
+
+/// Record a Hierarchy row's rectangle in the shell's session, returning
+/// nothing: a row logs its rectangle on its first draw and whenever it moves,
+/// so a suite can drag from a row it cannot otherwise locate.
+pub fn remember_hierarchy_row_rect(
+    session: &mut InspectorSession,
+    entity: Entity,
+    rect: egui::Rect,
+) {
+    let key = entity.to_string();
+    match session
+        .hierarchy_row_rects
+        .iter_mut()
+        .find(|(logged, _)| *logged == key)
+    {
+        Some((_, logged)) => {
+            if *logged == rect {
+                return;
+            }
+            *logged = rect;
+        }
+        None => session.hierarchy_row_rects.push((key, rect)),
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        entity = %entity,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] hierarchy row rect"
+    );
+}
 
 /// One row per live entity: the entity and its label, for the Entities tab.
 pub fn entity_rows(snapshot: &EditorSnapshot) -> Vec<(Entity, String)> {
@@ -74,6 +117,7 @@ pub fn entities_tab(
     selection: &mut EditorSelection,
     pending: &mut PendingEditorCommands,
     overlay_regions: &mut Vec<ShellRect>,
+    session: &mut InspectorSession,
 ) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         // The list's own order, which a Shift-click reads to select a range.
@@ -84,6 +128,18 @@ pub fn entities_tab(
         for (entity, label) in entity_rows(snapshot) {
             let selected = selection.contains(entity);
             let response = ui.selectable_label(selected, label);
+            // Dragging a row over an entity reference field points it at that
+            // entity (W-0048 Stage 6). The label senses clicks only, so the
+            // drag lives on a layer of its own over the same rectangle: a
+            // press that moves starts the drag, and a press that does not is
+            // still the label's click.
+            let drag = ui.interact(
+                response.rect,
+                response.id.with("dragged-entity"),
+                egui::Sense::drag(),
+            );
+            drag.dnd_set_drag_payload(DraggedEntity(entity));
+            remember_hierarchy_row_rect(session, entity, response.rect);
             if response.clicked() {
                 let click = ui.input(|input| click_from_modifiers(&input.modifiers));
                 select_entity_click(selection, entity, click, &rows);

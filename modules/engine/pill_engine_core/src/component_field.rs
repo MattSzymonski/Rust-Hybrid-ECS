@@ -120,6 +120,20 @@ pub enum FieldValue {
         /// The handle's generation.
         generation: u32,
     },
+    /// A reference to another entity: an `Entity` field, as the slot id and
+    /// generation the handle carries.
+    ///
+    /// Writable like a scalar. The pair is the *handle*, so it resolves only
+    /// in the world that issued it; what a reference saved for a later run
+    /// carries is the entity's [`EntityId`](crate::EntityId), which the writer
+    /// looks up and the loader resolves back to a handle (W-0048 Stage 7).
+    Entity {
+        /// The referenced entity's slot id.
+        id: u64,
+        /// The slot's generation, which tells a live entity from a recycled
+        /// slot's previous occupant.
+        generation: u32,
+    },
     /// A field the engine can locate but not interpret. Never writable.
     Opaque {
         /// The registered `type_tag` of the field (for example `struct:path`).
@@ -154,6 +168,7 @@ impl FieldValue {
             Self::List { .. } => "list",
             Self::Text(_) => "text",
             Self::Asset { .. } => "asset",
+            Self::Entity { .. } => "entity",
             Self::Opaque { .. } => "opaque",
         }
     }
@@ -319,8 +334,17 @@ pub(crate) fn is_handle_tag(tag: &str) -> bool {
     tag == "struct:Handle" || tag.starts_with("struct:Handle<")
 }
 
+/// Whether a type tag is an `Entity` field's.
+pub(crate) fn is_entity_tag(tag: &str) -> bool {
+    tag == "entity"
+}
+
 /// The byte size of a handle: its `u32` index and `u32` generation.
 const HANDLE_SIZE: usize = 8;
+
+/// The byte size of an entity reference: the `u64` slot id, the `u32`
+/// generation, and the padding `#[repr(C)]` puts after them.
+const ENTITY_REFERENCE_SIZE: usize = size_of::<Entity>();
 
 /// The size in bytes of one scalar whose tag is in the closed vocabulary.
 fn scalar_size(tag: &str) -> Option<usize> {
@@ -524,6 +548,15 @@ fn decode_tagged(bytes: &[u8], offset: usize, tag: &'static str, size: usize) ->
                 index,
                 generation,
             };
+        }
+    }
+    // An entity reference is a slot id and a generation, in the handle's
+    // `#[repr(C)]` order; the trailing padding is not read.
+    if is_entity_tag(tag) && size == ENTITY_REFERENCE_SIZE {
+        let id = decode_scalar(bytes, offset, "u64");
+        let generation = decode_scalar(bytes, offset + 8, "u32");
+        if let (Some(FieldValue::U64(id)), Some(FieldValue::U32(generation))) = (id, generation) {
+            return FieldValue::Entity { id, generation };
         }
     }
     let mut raw = vec![0u8; size];
@@ -1062,6 +1095,33 @@ fn encode_field_write(
             field: field.to_string(),
             expected: tag,
             found: value.variant_tag(),
+        });
+    }
+    // An entity reference takes an entity value: the slot id and generation,
+    // then the padding a `#[repr(C)]` handle leaves after them, written as
+    // zero so a row byte never carries a stale value.
+    if is_entity_tag(tag) {
+        let FieldValue::Entity { id, generation } = value else {
+            return Err(ComponentFieldError::TypeMismatch {
+                field: field.to_string(),
+                expected: tag,
+                found: value.variant_tag(),
+            });
+        };
+        if descriptor.size != ENTITY_REFERENCE_SIZE {
+            return Err(ComponentFieldError::TypeMismatch {
+                field: field.to_string(),
+                expected: tag,
+                found: value.variant_tag(),
+            });
+        }
+        let mut bytes = Vec::with_capacity(ENTITY_REFERENCE_SIZE);
+        bytes.extend_from_slice(&id.to_ne_bytes());
+        bytes.extend_from_slice(&generation.to_ne_bytes());
+        bytes.resize(ENTITY_REFERENCE_SIZE, 0);
+        return Ok(FieldWrite {
+            row_offset: descriptor.offset,
+            bytes,
         });
     }
     // A `struct:` field, or any other tag the engine cannot interpret, is
@@ -2350,6 +2410,133 @@ mod tests {
         assert_eq!(
             world.get_component::<RendererProbe>(entity).unwrap().mesh,
             crate::asset::Handle::from_raw(0, 0),
+            "nothing was written"
+        );
+    }
+
+    /// A component holding a reference to another entity, laid out like the
+    /// derive lays out an `Entity` field.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct FollowProbe {
+        target: crate::entity::Entity,
+        weight: f32,
+    }
+    impl Component for FollowProbe {}
+
+    static FOLLOW_PROBE_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "target",
+            type_tag: "entity",
+            offset: 0,
+            size: size_of::<crate::entity::Entity>(),
+            align: 8,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+        ComponentFieldDescriptor {
+            name: "weight",
+            type_tag: "f32",
+            offset: 16,
+            size: 4,
+            align: 4,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+    ];
+
+    /// An entity field reads as an entity value naming the handle it holds,
+    /// not as opaque bytes.
+    #[test]
+    fn an_entity_field_reads_as_an_entity_reference() {
+        let mut world = World::new();
+        world.register_component_with_layout::<FollowProbe>(FOLLOW_PROBE_FIELDS);
+        let target = world.create_entity().build().expect("target builds");
+        let follower = world
+            .create_entity()
+            .with(FollowProbe {
+                target,
+                weight: 0.5,
+            })
+            .build()
+            .expect("follower builds");
+        let name = crate::component::ComponentRegistry::registered_name::<FollowProbe>();
+
+        assert_eq!(
+            world
+                .read_component_field(follower, &name, "target")
+                .unwrap(),
+            FieldValue::Entity {
+                id: target.id(),
+                generation: target.generation(),
+            }
+        );
+    }
+
+    /// Writing another handle re-points the reference and stamps the row
+    /// changed; the following scalar keeps its bytes.
+    #[test]
+    fn an_entity_field_writes_another_reference() {
+        let mut world = World::new();
+        world.register_component_with_layout::<FollowProbe>(FOLLOW_PROBE_FIELDS);
+        let first = world.create_entity().build().expect("first builds");
+        let second = world.create_entity().build().expect("second builds");
+        let follower = world
+            .create_entity()
+            .with(FollowProbe {
+                target: first,
+                weight: 0.5,
+            })
+            .build()
+            .expect("follower builds");
+        let name = crate::component::ComponentRegistry::registered_name::<FollowProbe>();
+
+        let rewritten = FieldValue::Entity {
+            id: second.id(),
+            generation: second.generation(),
+        };
+        world
+            .write_component_field(follower, &name, "target", rewritten)
+            .expect("an entity value writes into the reference");
+        assert_eq!(
+            world.get_component::<FollowProbe>(follower).unwrap().target,
+            second
+        );
+        assert_eq!(
+            world.get_component::<FollowProbe>(follower).unwrap().weight,
+            0.5,
+            "the neighbouring field was not touched"
+        );
+    }
+
+    /// A non-entity value is refused and nothing is written.
+    #[test]
+    fn an_entity_field_refuses_a_scalar() {
+        let mut world = World::new();
+        world.register_component_with_layout::<FollowProbe>(FOLLOW_PROBE_FIELDS);
+        let target = world.create_entity().build().expect("target builds");
+        let follower = world
+            .create_entity()
+            .with(FollowProbe {
+                target,
+                weight: 0.5,
+            })
+            .build()
+            .expect("follower builds");
+        let name = crate::component::ComponentRegistry::registered_name::<FollowProbe>();
+
+        let refused = world.write_component_field(follower, &name, "target", FieldValue::U64(7));
+        assert!(
+            matches!(
+                &refused,
+                Err(ComponentFieldError::TypeMismatch { expected, found, .. })
+                    if *expected == "entity" && *found == "u64"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            world.get_component::<FollowProbe>(follower).unwrap().target,
+            target,
             "nothing was written"
         );
     }

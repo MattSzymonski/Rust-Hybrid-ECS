@@ -51,7 +51,7 @@ use std::fmt;
 /// assert!(!world.is_entity_valid(enemy));
 /// ```
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Entity {
     /// Unique numeric identifier for this entity slot.
     ///
@@ -69,11 +69,38 @@ pub struct Entity {
     pub(crate) generation: u32,
 }
 
+impl Default for Entity {
+    /// The [null handle](Self::NULL): a reference to nothing.
+    ///
+    /// Slot 0 is a real slot the world hands out, so a defaulted field must not
+    /// mean "entity 0" - a component whose reference field was never set would
+    /// otherwise point at whoever owns that slot.
+    fn default() -> Self {
+        Self::NULL
+    }
+}
+
 // =============================================================================
 // Entity - Inherent Implementations
 // =============================================================================
 
 impl Entity {
+    /// A handle that names no entity.
+    ///
+    /// What a reference field holds before it is set and after it is cleared.
+    /// Both halves are saturated, so no slot allocation can ever produce it:
+    /// slot ids count up from zero and generations count up from zero too.
+    pub const NULL: Self = Self {
+        id: u64::MAX,
+        generation: u32::MAX,
+    };
+
+    /// Whether this is the [null handle](Self::NULL).
+    #[inline]
+    pub fn is_null(self) -> bool {
+        self == Self::NULL
+    }
+
     // -------------------------------------------------------------------------
     // Construction
     // -------------------------------------------------------------------------

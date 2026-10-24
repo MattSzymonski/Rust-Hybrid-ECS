@@ -6,8 +6,11 @@
 //! - Spawn one model variant per tagged shape, each guarded by its tag so a
 //!   reload re-runs the system without stacking duplicates.
 
-use crate::{asset_loading::SceneAssets, ShowcaseComponent, ShowcasePoint, TagAlphaComponent};
-use pill_engine::{Query, World};
+use crate::{
+    asset_loading::SceneAssets, ShowcaseComponent, ShowcasePoint, ShowcaseReferenceComponent,
+    TagAlphaComponent,
+};
+use pill_engine::{Entity, Query, World};
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
 /// Creates the camera and the three model variants in `world`.
@@ -40,6 +43,9 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
         return Ok(());
     }
 
+    // The entity every showcase reference is pointed at: one of the models, so
+    // the row names something the Entities tab lists (W-0048 Stage 6).
+    let mut follow_target = None;
     for (index, (translation, material)) in [
         ([-1.25, 0.0, 0.0], assets.lit),
         ([1.25, 0.0, 0.0], assets.unlit),
@@ -48,7 +54,7 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
     .into_iter()
     .enumerate()
     {
-        world
+        let entity = world
             .create_entity()
             .with(TransformComponent {
                 translation,
@@ -83,6 +89,37 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
             .with(TagAlphaComponent)
             .build()
             .map_err(|error| error.to_string())?;
+        if index == 0 {
+            follow_target = Some(entity);
+        }
+    }
+
+    // The last model points at the first one, set from code so the Inspector's
+    // reference row names a target the moment the project loads. One model
+    // carries it rather than all of them: a single reference shows the row, and
+    // the reference section is drawn above the others, so putting it on every
+    // model would push the first model's mesh rows out of the Inspector's body.
+    if let Some(target) = follow_target {
+        let tagged: Vec<Entity> = {
+            let mut query = Query::<(&TagAlphaComponent, Entity)>::new(world);
+            query.iter_mut().map(|(_, entity)| entity).collect()
+        };
+        if let Some(follower) = tagged.iter().copied().find(|entity| *entity != target) {
+            if world
+                .get_component::<ShowcaseReferenceComponent>(follower)
+                .is_none()
+            {
+                world
+                    .add_component(
+                        follower,
+                        ShowcaseReferenceComponent {
+                            follow: target,
+                            weight: 0.5,
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
     Ok(())
 }

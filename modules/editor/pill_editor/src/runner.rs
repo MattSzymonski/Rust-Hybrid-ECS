@@ -53,8 +53,8 @@ use pill_editor_core::commands::{
 use pill_editor_core::console::{ConsoleChannel, ConsoleLine, ConsoleState};
 use pill_editor_core::drain::{self, HistoryDirection};
 use pill_editor_core::editor_state::{
-    AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, SelectionClick,
-    StandaloneTypeInfo,
+    AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, EntityPickRequest,
+    SelectionClick, StandaloneTypeInfo,
 };
 use pill_editor_core::egui;
 use pill_editor_core::entities;
@@ -1815,7 +1815,35 @@ impl EditorWindow {
                         entity = %entity,
                         "[editor] scene pick entity"
                     );
-                    if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
+                    // An armed Inspector row takes the click as its reference
+                    // and leaves the selection alone: the person is naming a
+                    // target, not changing what they are editing (W-0048
+                    // Stage 6).
+                    let armed = world
+                        .get_resource_mut::<EntityPickRequest>()
+                        .and_then(|request| request.take());
+                    if let Some(target) = armed {
+                        let (edit, label) = inspector::entity_edit(
+                            target.entity,
+                            &target.component,
+                            &target.field,
+                            Some(entity),
+                        );
+                        let coalesce = inspector::field_coalesce_key(
+                            target.entity,
+                            &target.component,
+                            &target.field,
+                        );
+                        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                            pending.push_recorded(vec![edit], label, Some(coalesce));
+                        }
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            component = target.component.as_str(),
+                            field = target.field.as_str(),
+                            "[editor] inspector entity pick answered"
+                        );
+                    } else if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
                         if selection.primary() != Some(entity) || selection.entities().len() != 1 {
                             selection.select_only(entity);
                             info!(
@@ -3614,6 +3642,38 @@ impl EditorWindow {
             );
             return;
         }
+        // An entity reference: the value is a Hierarchy label (`3v0`) or the
+        // word that clears it, and the step is one recorded batch for the set
+        // (W-0048 Stage 6).
+        if matches!(current, FieldValue::Entity { .. }) {
+            let reference = match inspector::parse_entity_reference(value_text) {
+                Ok(reference) => reference,
+                Err(message) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        field,
+                        message = message.as_str(),
+                        "[editor] inspector value not understood"
+                    );
+                    return;
+                }
+            };
+            let (commands, label, coalesce) =
+                inspector::selection_entity_edit(&targets, entity, &component, field, reference);
+            let written = commands.len();
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                pending.push_recorded(commands, label, Some(coalesce));
+            }
+            info!(
+                target: telemetry_target::ENGINE,
+                component = component.as_str(),
+                field,
+                entities = written,
+                "[editor] selection field edit queued"
+            );
+            return;
+        }
         let value = match inspector::parse_field_value(value_text, &current) {
             Ok(value) => value,
             Err(message) => {
@@ -3642,6 +3702,34 @@ impl EditorWindow {
         );
     }
 
+    /// Arm an entity reference row (`pick entity <entity> <component>
+    /// <field>`): the same `ArmEntityPick` the row's target button queues, so
+    /// the next scene press names the field's reference (W-0048 Stage 6).
+    fn scripted_pick_entity(&mut self, entity_text: &str, component_text: &str, field: &str) {
+        let Some((entity, component, current)) =
+            self.resolve_edit_target(entity_text, component_text, field)
+        else {
+            return;
+        };
+        if !matches!(current, FieldValue::Entity { .. }) {
+            warn!(
+                target: telemetry_target::ENGINE,
+                field,
+                "[editor] inspector value not understood"
+            );
+            return;
+        }
+        let command = EditorCommand::ArmEntityPick {
+            entity,
+            component,
+            field: field.to_owned(),
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push(vec![command]);
+        }
+    }
+
     /// One scripted whole-field edit (`edit set <entity> <component>
     /// <field> <value>`): the same recorded `SetField` batch an inspector
     /// widget queues, parsed against the field's current kind.
@@ -3664,6 +3752,29 @@ impl EditorWindow {
             let reference = (!inspector::is_cleared_reference(value_text))
                 .then(|| value_text.trim().to_owned());
             let (edit, label) = inspector::asset_edit(entity, &component, field, reference);
+            let coalesce = inspector::field_coalesce_key(entity, &component, field);
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                pending.push_recorded(vec![edit], label, Some(coalesce));
+            }
+            return;
+        }
+        // An entity reference takes a Hierarchy label (`3v0`) or the word that
+        // clears it (W-0048 Stage 6).
+        if matches!(current, FieldValue::Entity { .. }) {
+            let reference = match inspector::parse_entity_reference(value_text) {
+                Ok(reference) => reference,
+                Err(message) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        field,
+                        message = message.as_str(),
+                        "[editor] inspector value not understood"
+                    );
+                    return;
+                }
+            };
+            let (edit, label) = inspector::entity_edit(entity, &component, field, reference);
             let coalesce = inspector::field_coalesce_key(entity, &component, field);
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -6396,6 +6507,11 @@ impl EditorWindow {
             ScriptedCommand::DialogSetName(text) => self.scripted_dialog_set_name(&text),
             ScriptedCommand::DialogSubmit => self.scripted_dialog_submit(),
             ScriptedCommand::EditAsset(edit) => self.scripted_asset_edit(edit),
+            ScriptedCommand::PickEntity {
+                entity,
+                component,
+                field,
+            } => self.scripted_pick_entity(&entity, &component, &field),
             ScriptedCommand::EditSet {
                 entity,
                 component,
