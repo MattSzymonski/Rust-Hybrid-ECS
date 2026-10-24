@@ -323,6 +323,7 @@ pub use assets_tiles::asset_dialog_window;
 pub use assets_tiles::asset_icon;
 pub use assets_tiles::asset_menu_items;
 pub use assets_tiles::asset_tile;
+pub use assets_tiles::asset_type_icon;
 pub use assets_tiles::tile_name_job;
 pub use assets_tiles::AssetTileWrites;
 pub use assets_tiles::ASSETS_TILE_CORNER_RADIUS;

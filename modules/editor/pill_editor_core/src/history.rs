@@ -145,6 +145,12 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                 value,
                 ..
             } => component.len() + field.len() + field_value_bytes(value),
+            EditorCommand::SetFieldAsset {
+                component,
+                field,
+                reference,
+                ..
+            } => component.len() + field.len() + reference.as_ref().map_or(0, String::len),
             EditorCommand::AddComponent { component, .. }
             | EditorCommand::RemoveComponent { component, .. }
             | EditorCommand::RestoreComponent { component, .. } => component.len(),

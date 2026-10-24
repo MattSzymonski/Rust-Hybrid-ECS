@@ -555,6 +555,18 @@ pub struct InspectorSession {
     /// The row signatures already logged, so a panel that redraws every frame
     /// does not flood the log with the same row.
     pub rows_logged: Vec<String>,
+    /// Each asset reference row's last logged rectangle, keyed by
+    /// `entity.component.field` (W-0048): what a suite drops an asset onto.
+    /// Only a row on screen keeps an entry; see the shell's
+    /// `remember_asset_row_rect`.
+    pub asset_row_rects: Vec<(String, Rect)>,
+    /// Each asset reference row's last logged text, keyed the same way: the
+    /// row logs again whenever it draws a different asset.
+    pub asset_row_texts: Vec<(String, String)>,
+    /// The `component.field` whose asset picker is open, if one is.
+    pub asset_picker: Option<String>,
+    /// The open asset picker's search text.
+    pub asset_search: String,
 }
 
 impl Resource for EguiShellState {}

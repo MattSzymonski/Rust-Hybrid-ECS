@@ -52,6 +52,9 @@ pub struct ProjectBrowser {
     pub expanded: BTreeSet<String>,
     /// The tile size the grid draws, in points.
     pub tile_size: f32,
+    /// Each tile's last logged rectangle, keyed by its path: logged once per
+    /// placement, so a suite can drag a tile without reading pixels.
+    pub tile_rects: Vec<(String, [f32; 4])>,
 }
 
 impl Default for ProjectBrowser {
@@ -60,6 +63,7 @@ impl Default for ProjectBrowser {
             folder: String::new(),
             expanded: BTreeSet::new(),
             tile_size: DEFAULT_TILE_SIZE,
+            tile_rects: Vec::new(),
         }
     }
 }

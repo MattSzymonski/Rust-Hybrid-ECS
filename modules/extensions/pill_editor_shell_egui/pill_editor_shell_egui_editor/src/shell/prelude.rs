@@ -24,8 +24,8 @@ pub use pill_editor_core::console::{
     self as console, ConsoleChannel, ConsoleFilterSettings, ConsoleLine, ConsoleView,
 };
 pub use pill_editor_core::editor_state::{
-    AssetListing, ComponentView, EditorCommand, EditorSelection, EditorSnapshot, EntityDetail,
-    ResourceFieldView, ResourceView,
+    AssetListing, AssetReferenceLabel, ComponentView, EditorCommand, EditorSelection,
+    EditorSnapshot, EntityDetail, ResourceFieldView, ResourceView,
 };
 pub use pill_editor_core::egui;
 pub use pill_editor_core::egui_dock::{

@@ -13,6 +13,9 @@
 //! - The section model the tab draws: [`component_label`],
 //!   [`component_icon`], [`widget_for`] and [`rows`] - what each component
 //!   section holds and which widget each row asks for.
+//! - Asset reference rows (W-0048): the [`EditorCommand::SetFieldAsset`]
+//!   builders ([`asset_edit`], [`selection_asset_edit`]) and the assets a
+//!   row's picker offers ([`asset_candidates`]).
 //! - Asset settings as editable data: key paths (`a.b[0]`), leaf reads and
 //!   patches, and the [`EditorCommand::SetAssetSettings`] builder.
 //!
@@ -29,7 +32,7 @@ use pill_engine::{Entity, FieldValue};
 use serde_json::Value as JsonValue;
 
 // Current crate
-use crate::editor_state::{ComponentView, EditorCommand, EntityDetail};
+use crate::editor_state::{AssetListing, ComponentView, EditorCommand, EntityDetail};
 use crate::icons::Icon;
 
 /// The name after the last `::`, for labels and history entries.
@@ -238,6 +241,19 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
+    /// A reference to an asset: the asset it names, a picker of the assets
+    /// of its type, a clear button and a drop target for the Assets tab.
+    Asset {
+        /// The field's position in the component's field list.
+        index: usize,
+        /// The field's registered name.
+        field: String,
+        /// The registered name of the asset type the field references, when
+        /// recorded; the picker offers only assets of this type.
+        asset_type: Option<String>,
+        /// Text the field's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
     /// A field shown read-only (a long array, a list, an opaque value).
     ReadOnly {
         /// The field's position in the component's field list.
@@ -312,6 +328,12 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
                     tooltip,
                 }
             }
+            FieldValue::Asset { asset_type, .. } => FieldRow::Asset {
+                index,
+                field: descriptor.name.to_string(),
+                asset_type: asset_type.clone(),
+                tooltip,
+            },
             FieldValue::Array(_) | FieldValue::List { .. } | FieldValue::Opaque { .. } => {
                 FieldRow::ReadOnly {
                     index,
@@ -391,6 +413,69 @@ pub fn field_edit(
         },
         format!("set {}.{}", short_component_name(component), field),
     )
+}
+
+/// The recorded asset reference edit: `SetFieldAsset` under the field edit's
+/// label (`set Component.field`). `reference` is a path relative to `res` or
+/// a guid; `None` clears the reference.
+pub fn asset_edit(
+    entity: Entity,
+    component: &str,
+    field: &str,
+    reference: Option<String>,
+) -> (EditorCommand, String) {
+    (
+        EditorCommand::SetFieldAsset {
+            entity,
+            component: component.to_string(),
+            field: field.to_string(),
+            reference,
+        },
+        format!("set {}.{}", short_component_name(component), field),
+    )
+}
+
+/// [`asset_edit`] for every entity of `targets`, as one recorded step labelled
+/// and coalesced by the primary's edit, like [`selection_field_edit`].
+pub fn selection_asset_edit(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    field: &str,
+    reference: Option<String>,
+) -> (Vec<EditorCommand>, String, String) {
+    let commands = targets
+        .iter()
+        .map(|target| asset_edit(*target, component, field, reference.clone()).0)
+        .collect();
+    let (_command, label) = asset_edit(primary, component, field, reference);
+    (
+        commands,
+        label,
+        field_coalesce_key(primary, component, field),
+    )
+}
+
+/// The assets an asset row's picker offers: every file of the listing whose
+/// type is the field's, in listing order. A field without a recorded type
+/// offers nothing, rather than every asset of every type.
+pub fn asset_candidates<'a>(
+    listing: &'a [AssetListing],
+    asset_type: Option<&str>,
+) -> Vec<&'a AssetListing> {
+    let Some(asset_type) = asset_type else {
+        return Vec::new();
+    };
+    listing
+        .iter()
+        .filter(|entry| entry.kind == asset_type)
+        .collect()
+}
+
+/// Whether a scripted or typed value names "no asset": the word that clears an
+/// asset reference field.
+pub fn is_cleared_reference(text: &str) -> bool {
+    matches!(text.trim(), "" | "none" | "None")
 }
 
 /// The recorded array-element edit: `SetArrayElement` under the native
@@ -714,6 +799,7 @@ mod tests {
                     editable: true,
                     fields: Vec::new(),
                     values: Vec::new(),
+                    asset_labels: Vec::new(),
                 })
                 .collect(),
         }
@@ -911,6 +997,7 @@ mod tests {
         /// str`), indexed by the value's position.
         const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         ComponentView {
+            asset_labels: Vec::new(),
             type_name: name.to_string(),
             persistable: false,
             editable: true,
@@ -1073,6 +1160,7 @@ mod tests {
         /// str`), indexed by the value's position.
         const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
         ComponentView {
+            asset_labels: Vec::new(),
             type_name: "Decorated".to_string(),
             persistable: false,
             editable: true,
@@ -1356,5 +1444,76 @@ mod tests {
         );
         assert!(blue.b() > blue.r() && blue.b() > blue.g(), "Z is blue-ish");
         assert_eq!(axis_color(3), Color32::GRAY);
+    }
+
+    /// An asset value becomes an asset row carrying the field's asset type,
+    /// not a read-only row (W-0048).
+    #[test]
+    fn an_asset_value_is_an_asset_row() {
+        let view = component(
+            "demo::Renderer",
+            vec![FieldValue::Asset {
+                asset_type: Some("demo::Mesh".to_owned()),
+                index: 0,
+                generation: 0,
+            }],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![FieldRow::Asset {
+                index: 0,
+                field: "a".to_owned(),
+                asset_type: Some("demo::Mesh".to_owned()),
+                tooltip: None,
+            }]
+        );
+    }
+
+    /// The picker offers the listing's files of the field's type only, and
+    /// nothing for a field whose type is not recorded.
+    #[test]
+    fn asset_candidates_are_the_files_of_the_fields_type() {
+        let listing = |path: &str, kind: &str| AssetListing {
+            path: path.to_owned(),
+            kind: kind.to_owned(),
+            standalone: false,
+            has_meta: true,
+        };
+        let assets = vec![
+            listing("models", "folder"),
+            listing("models/cube.obj", "demo::Mesh"),
+            listing("textures/a.png", "demo::Texture"),
+            listing("models/plane.obj", "demo::Mesh"),
+        ];
+        let paths: Vec<&str> = asset_candidates(&assets, Some("demo::Mesh"))
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(paths, ["models/cube.obj", "models/plane.obj"]);
+        assert!(asset_candidates(&assets, None).is_empty());
+    }
+
+    /// The asset edit builders queue `SetFieldAsset` under the field edit's
+    /// label, once per selected entity, and `none` reads as a clear.
+    #[test]
+    fn asset_edits_queue_set_field_asset_for_the_selection() {
+        let first = Entity::from_raw(1, 0);
+        let second = Entity::from_raw(2, 0);
+        let (commands, label, _key) = selection_asset_edit(
+            &[first, second],
+            first,
+            "demo::MeshRendererComponent",
+            "mesh",
+            Some("models/cube.obj".to_owned()),
+        );
+        assert_eq!(label, "set MeshRendererComponent.mesh");
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[1],
+            EditorCommand::SetFieldAsset { entity, reference: Some(path), .. }
+                if *entity == second && path == "models/cube.obj"
+        ));
+        assert!(is_cleared_reference(" none "));
+        assert!(!is_cleared_reference("models/cube.obj"));
     }
 }
