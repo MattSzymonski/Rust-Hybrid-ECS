@@ -473,7 +473,9 @@ impl CommandQueue {
         }
 
         // Step 2: Insert the entity row and write its native components into storage.
-        world.insert_entity_with_components(entity, component_ids, |storage| {
+        // A command never supplies the stable id: the world mints one, which
+        // is what a managed `ReserveEntity` caller reads back afterwards.
+        world.insert_entity_with_components(entity, component_ids, None, |storage| {
             for component_adder in component_adders {
                 component_adder.add_component_to_storage(storage);
             }

@@ -234,9 +234,12 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
     engine.register_system("spline_path", spline_path_system);
-    engine.world_mut().insert_resource(SplineProbeState {
-        last_report: Instant::now(),
-    });
+    // Replaced, not reused. The state holds nothing that has to outlive a
+    // generation - a report timestamp and the id string re-derived below - and
+    // a resource the previous generation inserted is retired by the reload, so
+    // keeping the reload's copy would leave the system pointing at a resource
+    // the world no longer has.
+    engine.world_mut().insert_resource(SplineProbeState::new());
     engine.register_system("spline_probe", spline_probe_system);
 
     // The spline entity. `Spline` is registered by the linked `pill_spline`
@@ -323,6 +326,20 @@ pub fn init(engine: &mut Engine) -> u32 {
             );
             return 1;
         }
+    }
+
+    // The probe reports the spline entity's stable id, which is what the reload
+    // suites compare across a reload: the entity handle names a slot the world
+    // recycles, the id names the entity (W-0048 Stage 5). The spline is the
+    // witness because it is `#[pill(shared)]` and so is still there after a
+    // project reload, while the project's own components are only carried over
+    // when they are persistable.
+    let probe_entity_id = spline_probe::spline_entity(engine.world())
+        .and_then(|entity| engine.world().entity_id(entity))
+        .map(|id| id.to_string());
+    if let Some(state) = engine.world_mut().get_resource_mut::<SplineProbeState>() {
+        state.probe_entity_id = probe_entity_id;
+        state.last_report = Instant::now();
     }
 
     // One sample dot per t step, placed on the curve as it stands right now:

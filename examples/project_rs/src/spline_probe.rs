@@ -19,9 +19,47 @@ use pill_spline::Spline;
 use crate::physics::ball_spawn_state;
 use crate::settings::BALL_COUNT;
 
+/// The registered name of the spline component, as the world's registry spells
+/// it.
+///
+/// `Spline` is `#[pill(shared)]`, so this is the name under whichever copy of
+/// `pill_spline` registered it - the linked crate or the module DLL.
+const SPLINE_COMPONENT_NAME: &str = "pill_spline::Spline";
+
+/// The live entity carrying the world's spline, if there is one.
+///
+/// Looked up by component name rather than held as a handle. A handle names a
+/// slot the world recycles and a stored one would have to be trusted across a
+/// reload; the probe exists to show what a *reload* does to identity, so it
+/// re-finds the entity every generation and compares ids instead (W-0048
+/// Stage 5).
+pub(crate) fn spline_entity(world: &World) -> Option<Entity> {
+    world
+        .entity_rows()
+        .into_iter()
+        .find(|row| {
+            row.components
+                .iter()
+                .any(|name| name == SPLINE_COMPONENT_NAME)
+        })
+        .map(|row| row.entity)
+}
+
 /// Timestamps the last spline probe report so the cadence is wall-clock.
 pub(crate) struct SplineProbeState {
     pub(crate) last_report: Instant,
+    /// The spline entity's stable id, as hex, re-read on every generation.
+    pub(crate) probe_entity_id: Option<String>,
+}
+
+impl SplineProbeState {
+    /// A state that has not found its entity yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            last_report: Instant::now(),
+            probe_entity_id: None,
+        }
+    }
 }
 
 impl Resource for SplineProbeState {}
@@ -78,12 +116,18 @@ pub(crate) fn spline_probe_system(
     let reference = Spline::from_points(&spawn_points);
     let midpoint = reference.get_location_at(0.5);
     let color = reference.get_color_a();
+    // The stable id is part of the report because it is what a reload must not
+    // change: the entity handle names a slot the world recycles, while the id
+    // names the entity itself (W-0048 Stage 5). `init` re-reads it from the
+    // world on every generation, so a generation that lost the entity prints
+    // `entityid none` rather than a stale value.
+    let entity_id = state.probe_entity_id.as_deref().unwrap_or("none");
     // Logged through the engine's `tracing`, which the host shares with the
     // project through `pill_core.dll`. `[project] ...` is the text the
     // end-to-end suites wait for.
     pill_engine::tracing::info!(
         target: "project",
-        "[project] 12xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
+        "[project] 12xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}, entityid {entity_id}",
         midpoint.x, midpoint.y, color
     );
 

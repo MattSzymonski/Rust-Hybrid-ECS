@@ -50,6 +50,7 @@ use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
 use super::parallel::{
     ffi_parallel_for, parallel_for, PARALLEL_NESTED, PARALLEL_NO_SCOPE, PARALLEL_OK,
 };
+use super::queries::ffi_entity_stable_id;
 // The shared-ABI fixtures: the engine's `Position` and the renderer data's
 // `MeshRendererComponent`, bound the way a managed project gets them.
 use super::context::ActiveSystemGuard;
@@ -332,6 +333,26 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
         engine.world().get_component::<Position>(entity).unwrap().x,
         9.0
     );
+
+    // The managed side reads the stable id of the entity it just created
+    // (W-0048 Stage 5): the two halves re-assemble into the id the world
+    // indexes, and a destroyed entity reports "not live" instead.
+    engine
+        .run_deferred_commands(|world, queue| {
+            let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+            let expected = world.entity_id(entity).expect("the entity has an id");
+            let mut low = 0u64;
+            let mut high = 0u64;
+            // The query family reports success as `0`, like `ffi_entity_count`;
+            // the command family uses `ABI_SUCCESS`.
+            assert_eq!(ffi_entity_stable_id(&entity, &mut low, &mut high), 0);
+            assert_eq!(
+                u128::from(low) | (u128::from(high) << 64),
+                expected.value(),
+                "the halves re-assemble into the world's id"
+            );
+        })
+        .unwrap();
     assert_eq!(
         engine
             .world()

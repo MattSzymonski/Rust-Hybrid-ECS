@@ -771,6 +771,14 @@ pub enum BuildError {
         " not registered — call world.register_component::<T>() first"
     )]
     ComponentNotRegistered { id: ComponentId },
+
+    /// The stable id handed to `EntityBuilder::with_id` already belongs to a
+    /// live entity.
+    ///
+    /// Two entities under one id would make a saved reference ambiguous, so
+    /// the second build is refused rather than merged into the first.
+    #[message("entity id ", debug_value(id), " already belongs to a live entity")]
+    DuplicateEntityId { id: crate::entity::EntityId },
 }
 
 // =============================================================================

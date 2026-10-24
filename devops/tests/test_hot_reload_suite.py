@@ -119,6 +119,18 @@ MODULE_FORGOTTEN_WARN_TOKEN = "no longer registered by this module"
 # folded `test_module_project_auto_reload.py` made on its own).
 PROBE_PREFIX = "midpoint ("
 PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
+# One entity's stable id, as the project re-reads it from the world on every
+# generation (W-0048 Stage 5). The handle a query yields names a recycled slot;
+# this id is what must not change across a reload.
+PROBE_ID_PATTERN = re.compile(r"entityid ([0-9a-f]{32})")
+
+
+def last_probe_entity_id(output: str) -> str:
+    """Returns the stable id the newest probe report names."""
+    matches = PROBE_ID_PATTERN.findall(output)
+    if not matches:
+        raise RuntimeError("No entity stable id found in the host output")
+    return matches[-1]
 
 
 def last_probe_midpoint(output: str) -> Tuple[float, float]:
@@ -497,12 +509,13 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
         return None
 
     baseline_x, baseline_y = last_probe_midpoint(monitor.output_since(0))
+    baseline_id = last_probe_entity_id(monitor.output_since(0))
     expected_midpoint = (
         f"midpoint ({baseline_x:.1f}, {baseline_y + CASCADE_OFFSET_EDIT.delta:.1f})"
     )
     print(
-        f"  [OK] Project probe baseline ({baseline_x:.1f}, {baseline_y:.1f}); the "
-        f"cascade edit must report {expected_midpoint!r}."
+        f"  [OK] Project probe baseline ({baseline_x:.1f}, {baseline_y:.1f}), entity id "
+        f"{baseline_id}; the cascade edit must report {expected_midpoint!r}."
     )
 
     return [
@@ -541,7 +554,15 @@ def session_b_scenarios(monitor: OutputMonitor) -> Optional[Sequence[Scenario]]:
                     # that arrives after the module reload can carry the new
                     # offset. The value is derived above, from the baseline the
                     # host itself printed.
-                    alive_tokens=[(expected_midpoint, PROBE_TIMEOUT)],
+                    #
+                    # The id token is the Stage 5 check: the probe re-reads the
+                    # spline's stable id from the world every generation, so a
+                    # report carrying the baseline id after the reload says the
+                    # id survived it.
+                    alive_tokens=[
+                        (expected_midpoint, PROBE_TIMEOUT),
+                        (f"entityid {baseline_id}", PROBE_TIMEOUT),
+                    ],
                 )
             ],
             restore_after=[SPLINE_LIB_RS],
