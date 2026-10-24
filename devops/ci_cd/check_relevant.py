@@ -38,7 +38,7 @@ EXAMPLE USAGE:
   python devops/ci_cd/check_relevant.py --dry-run
   python devops/ci_cd/check_relevant.py
   python devops/ci_cd/check_relevant.py --base origin/main
-  python devops/ci_cd/check_relevant.py --paths modules/rendering/pill_draw/src/frame.rs
+  python devops/ci_cd/check_relevant.py --paths modules/ui/pill_draw/src/frame.rs
 
 --- SCRIPT ---
 """
@@ -145,7 +145,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # The shared draw data every UI producer and the renderer contract name:
     # its own tests (the frame slot's among them), plus the game UI, which
     # builds the lists and publishes them into the slot.
-    if has("modules/rendering/pill_draw/**"):
+    if has("modules/ui/pill_draw/**"):
         selected.append(cargo_check("test pill_draw",
                                     ("test", "-p", "pill_draw", "-p", "pill_project_ui", "--offline"),
                                     "shared draw data changed"))
@@ -167,7 +167,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # feeds is the renderer's `ui` module, whose tests cover the draw lists. The slot it
     # publishes into is `pill_draw`'s, so a change here also moves what every
     # module drains.
-    if has("modules/rendering/pill_project_ui/**"):
+    if has("modules/ui/pill_project_ui/**"):
         selected.append(cargo_check("test pill_project_ui", ("test", "-p", "pill_project_ui", "--offline"),
                                     "pill_project_ui changed"))
         selected.append(cargo_check("test the frame slot",
@@ -288,8 +288,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # beside it so "is this path recognized" and "what does it select" cannot
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("pill-draw", ("modules/rendering/pill_draw/**",)),
-    ("pill-project-ui", ("modules/rendering/pill_project_ui/**",)),
+    ("pill-draw", ("modules/ui/pill_draw/**",)),
+    ("pill-project-ui", ("modules/ui/pill_project_ui/**",)),
     ("egui-editor", ("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
                      "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),

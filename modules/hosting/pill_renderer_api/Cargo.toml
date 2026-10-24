@@ -26,7 +26,7 @@ pill_engine = { path = "../../pill_engine" }
 # so this contract never names the UI library). A shared `dylib`, like
 # `pill_core`, so the lists are one type identity across every artifact that
 # builds or draws them.
-pill_draw = { path = "../../rendering/pill_draw" }
+pill_draw = { path = "../../ui/pill_draw" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
