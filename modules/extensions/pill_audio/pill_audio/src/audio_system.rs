@@ -121,7 +121,7 @@ pub fn audio_system(
                     manager.release(sound_type, source.sink);
                     source.sink = NO_SINK;
                 }
-                let sound = assets.get_by_name::<Sound>(source.sound_name.as_str());
+                let sound = assets.get::<Sound>(source.sound);
                 if let Some(sound) = sound {
                     if let Some(sink) = manager.acquire(sound_type) {
                         if manager.start(sound_type, sink, sound, source.volume) {

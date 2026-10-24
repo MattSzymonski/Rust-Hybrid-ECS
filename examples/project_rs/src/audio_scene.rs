@@ -2,31 +2,51 @@
 //!
 //! # Responsibilities
 //!
-//! - Queue the bundled sound for loading when the audio module is present.
+//! - Register the bundled sound in the asset store when the audio module is
+//!   present, and keep the handle the source plays.
 //! - Create the listener and the playing source once, so a reload that runs
 //!   `init` again finds them instead of adding more.
 
 // External crates
-use pill_audio::{AudioListenerComponent, AudioLoadQueue, AudioSourceComponent};
-use pill_engine::{Engine, Position, Query};
+use pill_audio::{AudioListenerComponent, AudioLoadQueue, AudioSourceComponent, Sound};
+use pill_engine::{AssetManager, Engine, Handle, Position, Query};
 
 const SOUND_NAME: &str = "sound_1";
 // Embed the project asset so development and shipping builds need no working-directory setup.
 const SOUND_BYTES: &[u8] = include_bytes!("../assets/audio/sound_1.mp3");
 
-/// Queue the project's sound and create its listener and source, unless they
-/// already exist. Does nothing when the audio module is not loaded.
+/// Register the sound and create its listener and source, unless they already
+/// exist. Does nothing when the audio module is not loaded.
 ///
 /// # Errors
 ///
-/// Returns a message when the listener or the source cannot be created.
+/// Returns a message when the sound, the listener or the source cannot be
+/// created.
 pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
-    // The host initializes pill_audio from project_settings.yaml before the project.
-    let Some(loads) = engine.world_mut().get_resource_mut::<AudioLoadQueue>() else {
-        // Settings can disable audio (including in headless benchmark projects).
+    // The host initializes pill_audio from project_settings.yaml before the project,
+    // and settings can disable audio (including in headless benchmark projects):
+    // the module installs the queue when it loads, so its absence is the one
+    // signal a project has.
+    if engine.world().get_resource::<AudioLoadQueue>().is_none() {
         return Ok(());
+    }
+    // `Sound` is a shared asset type, so the handle taken here is the one the
+    // module's playback system resolves even though the two DLLs hold their
+    // own copy of the crate: one pinned name, one asset column.
+    let sound: Handle<Sound> = {
+        let assets = engine
+            .world_mut()
+            .get_resource_mut::<AssetManager>()
+            .ok_or("the engine always owns an AssetManager")?;
+        if let Some(sound) = assets.handle_by_name::<Sound>(SOUND_NAME) {
+            sound
+        } else {
+            let path = std::path::Path::new(SOUND_NAME);
+            assets
+                .add_named(SOUND_NAME, Sound::from_bytes(path, SOUND_BYTES.to_vec()))
+                .map_err(|_| "could not register the bundled sound")?
+        }
     };
-    loads.load(SOUND_NAME, SOUND_BYTES);
 
     let has_listener = Query::<&AudioListenerComponent>::new(engine.world_mut())
         .iter_mut()
@@ -44,14 +64,14 @@ pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
 
     let has_source = Query::<&AudioSourceComponent>::new(engine.world_mut())
         .iter_mut()
-        .any(|source| source.sound_name.as_str() == SOUND_NAME);
+        .any(|source| source.sound == sound);
     if !has_source {
         engine
             .world_mut()
             .create_entity()
             // Keep the emitter near the listener: spatial attenuation uses world units.
             .with(Position { x: 400.0, y: 300.0 })
-            .with(AudioSourceComponent::playing(SOUND_NAME))
+            .with(AudioSourceComponent::playing(sound))
             .build()
             .map_err(|_| "could not create the audio source")?;
     }
@@ -62,6 +82,7 @@ pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
 mod tests {
     use super::*;
     use pill_audio::Sound;
+    use pill_engine::Asset;
 
     #[test]
     fn audio_is_disabled_without_the_configured_extension() {
@@ -120,7 +141,22 @@ mod tests {
         let mut query = Query::<&AudioSourceComponent>::new(engine.world_mut());
         let sources: Vec<_> = query.iter_mut().map(|source| *source).collect();
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].sound_name.as_str(), SOUND_NAME);
         assert!(sources[0].play_on_awake);
+        // The source names the one sound the store holds, which is what makes
+        // the second `initialize` adopt it instead of adding another.
+        let registered = engine
+            .world()
+            .get_resource::<AssetManager>()
+            .expect("the engine owns the asset store")
+            .handle_by_name::<Sound>(SOUND_NAME)
+            .expect("the sound is registered");
+        assert_eq!(sources[0].sound, registered);
+    }
+
+    /// The shared name is what gives the project and the module DLL one asset
+    /// column, and it is the spelling every `.meta` file records.
+    #[test]
+    fn the_sound_type_keeps_its_pinned_name() {
+        assert_eq!(Sound::shared_name(), Some("pill_audio::Sound"));
     }
 }

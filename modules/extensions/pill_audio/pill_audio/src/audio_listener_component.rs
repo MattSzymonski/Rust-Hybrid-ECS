@@ -45,3 +45,15 @@ impl core::default::Default for AudioListenerComponent {
         }
     }
 }
+
+// --- Registration ---
+
+/// Registers [`AudioListenerComponent`] with the world, field layout included.
+///
+/// The derive generates `__pill_register_AudioListenerComponent` as a private
+/// item of this module, so [`crate::register`] reaches it through here rather
+/// than by path. Without the layout the Inspector and the managed codegen see
+/// an opaque blob instead of the two rows this component has.
+pub(crate) fn register(world: &mut pill_engine::World) {
+    __pill_register_AudioListenerComponent(world);
+}

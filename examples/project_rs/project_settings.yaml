@@ -2,3 +2,4 @@ name: "Editor Crates Test"
 build_binary_name: "EditorCratesTest"
 modules:
   - "pill_spline"
+  - "pill_audio"

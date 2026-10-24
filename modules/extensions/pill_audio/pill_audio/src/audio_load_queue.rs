@@ -2,15 +2,22 @@
 //!
 //! # Responsibilities
 //!
-//! - Carry encoded sound bytes from a project to the playback DLL that owns
-//!   the sound, so the bytes never cross an asset-identity boundary.
+//! - Carry encoded sound bytes from a project to the running playback DLL,
+//!   which turns them into [`Sound`](crate::Sound) assets on its next frame.
 //! - Coalesce repeated loads of one playback name.
+//!
+//! # Design
+//!
+//! [`Sound`](crate::Sound) is a shared asset type, so a project that links the
+//! crate can also register a sound itself and take the handle directly - that
+//! is what `examples/project_rs` does with its embedded MP3. The queue stays
+//! for bytes a project hands over at runtime without naming the type: the
+//! module drains it, so the project never has to know when loading happens.
 
 // Standard library
 use std::collections::BTreeMap;
 
-/// Keeps sound creation inside the playback DLL, whose asset type identity
-/// can differ from the copy linked into a project.
+/// Pending sound loads, by playback name.
 #[repr(C)]
 #[derive(Default)]
 pub struct AudioLoadQueue {

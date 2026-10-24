@@ -76,7 +76,33 @@ pub struct Sound {
     bytes: std::sync::Arc<[u8]>,
 }
 
-impl Asset for Sound {}
+/// The pinned shared name of [`Sound`]; see the comment on its `Asset` impl.
+const SOUND_SHARED_NAME: &str = "pill_audio::Sound";
+
+// Shared across binaries: the module DLL and every project that links this
+// crate hold their own `Sound` type, and one shared name gives them one asset
+// column (see `Asset::shared_name`). Without it a `Handle<Sound>` a project
+// issued would address a column the module's playback system never reads.
+// Keep this string and `metadata_type_name` in step: the `.meta` files name
+// the type by the same string, so moving the type does not orphan them.
+// The trait's full path, not the imported name: the hot-patch inventory is
+// generated at the crate root and cannot see this module's `use` lines.
+impl pill_engine::Asset for Sound {
+    fn shared_name() -> Option<&'static str> {
+        Some(SOUND_SHARED_NAME)
+    }
+
+    fn shared_identity() -> Option<u128> {
+        /// The stable identity of [`Sound`]'s shared name.
+        ///
+        /// The same construction a shared component identity uses, so a
+        /// cooking step and a runtime agree on the column without agreeing on
+        /// a `TypeId`.
+        const IDENTITY: u128 = pill_engine::component::shared_component_identity(SOUND_SHARED_NAME);
+
+        Some(IDENTITY)
+    }
+}
 trait_type_map::impl_trait_accessible!(dyn Asset; Sound);
 
 impl std::fmt::Debug for Sound {
@@ -103,11 +129,8 @@ impl pill_engine::ImportedAsset for Sound {
     type ImportSettings = SoundImportSettings;
     const SOURCE_EXTENSIONS: &'static [&'static str] = SUPPORTED_AUDIO_FORMATS;
 
-    // `Sound` has no shared name, so the default would be its Rust type path,
-    // which changes if the type moves; the files must keep matching.
-    fn metadata_type_name() -> &'static str {
-        "pill_audio::Sound"
-    }
+    // No `metadata_type_name` override: the default prefers the shared name
+    // above, which is the pinned spelling a `.meta` file records.
 
     fn import(
         name: &str,
@@ -419,7 +442,8 @@ mod tests {
         assert_eq!(sound.path(), std::path::Path::new("embedded.wav"));
     }
 
-    /// A sound is an asset, so it is stored many-per-type and reached by name.
+    /// A sound is an asset, so it is stored many-per-type and reached by
+    /// handle, with its name as the store's second index.
     #[test]
     fn sounds_are_stored_as_assets() {
         let mut assets = AssetManager::new();
@@ -438,11 +462,11 @@ mod tests {
         assert_eq!(assets.len::<Sound>(), 1);
     }
 
-    /// Unloading a sound leaves an `AudioSourceComponent` naming it resolving to
-    /// nothing, which is what replaces the old engine's `destroy` hook that
-    /// reached into every component.
+    /// Unloading a sound leaves a source's handle resolving to nothing, which
+    /// is what replaces the old engine's `destroy` hook that reached into
+    /// every component.
     #[test]
-    fn unloading_a_sound_leaves_its_name_unresolvable() {
+    fn unloading_a_sound_leaves_its_handle_unresolvable() {
         let mut assets = AssetManager::new();
         let handle = assets
             .add_named(
@@ -452,6 +476,7 @@ mod tests {
             .expect("a fresh name");
         assets.remove(handle);
 
+        assert!(assets.get(handle).is_none());
         assert!(assets.get_by_name::<Sound>("footstep").is_none());
     }
 }
