@@ -159,6 +159,75 @@ mod tests {
     use super::*;
     use pill_engine::{Engine, Handle, ImportRegistry, MetadataPolicy};
 
+    /// A mesh renderer's handle fields are typed asset references (W-0048):
+    /// they read naming the registered asset type, another mesh's handle
+    /// writes through the field layer into the component the renderer reads,
+    /// and a material handle is refused for the mesh field.
+    #[test]
+    fn the_mesh_renderers_handles_are_writable_asset_references() {
+        let mut engine = Engine::new();
+        assert_eq!(register(&mut engine), 0);
+        let world = engine.world_mut();
+        let entity = world
+            .create_entity()
+            .with(MeshRendererComponent {
+                mesh: Handle::from_raw(0, 0),
+                material: Handle::from_raw(1, 0),
+            })
+            .build()
+            .unwrap();
+        let name =
+            pill_engine::component::ComponentRegistry::registered_name::<MeshRendererComponent>();
+        let mesh_type = "pill_master_renderer::assets::Mesh";
+        assert_eq!(
+            world.read_component_field(entity, &name, "mesh").unwrap(),
+            pill_engine::FieldValue::Asset {
+                asset_type: Some(mesh_type.to_owned()),
+                index: 0,
+                generation: 0,
+            }
+        );
+
+        world
+            .write_component_field(
+                entity,
+                &name,
+                "mesh",
+                pill_engine::FieldValue::Asset {
+                    asset_type: Some(mesh_type.to_owned()),
+                    index: 5,
+                    generation: 2,
+                },
+            )
+            .expect("another mesh's handle writes");
+        assert_eq!(
+            world
+                .get_component::<MeshRendererComponent>(entity)
+                .unwrap()
+                .mesh,
+            Handle::from_raw(5, 2),
+            "the component the renderer reads holds the new mesh"
+        );
+
+        let refused = world.write_component_field(
+            entity,
+            &name,
+            "mesh",
+            pill_engine::FieldValue::Asset {
+                asset_type: Some("pill_master_renderer::assets::Material".to_owned()),
+                index: 1,
+                generation: 0,
+            },
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(pill_engine::component_field::ComponentFieldError::AssetTypeMismatch { .. })
+            ),
+            "{refused:?}"
+        );
+    }
+
     /// Registering the crate makes texture and mesh files importable by
     /// extension, through the registry, without naming their types.
     ///

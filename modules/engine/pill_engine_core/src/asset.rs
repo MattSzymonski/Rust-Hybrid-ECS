@@ -564,6 +564,11 @@ pub struct AssetManager {
     /// How to rebuild each registered type's table from the generation that
     /// last registered it; see [`Self::rehome`].
     ops_refreshers: HashMap<TypeId, AssetOpsRefresher>,
+    /// Each registered type's registered name - its shared name, or its Rust
+    /// type name without one - by its Rust type path, so a caller that knows
+    /// only the path (a C# mirror, which carries `std::any::type_name`) finds
+    /// the name references use. Owned copies.
+    registered_names: HashMap<String, String>,
     /// Changes whenever stored asset data may have changed.
     revision: u64,
 }
@@ -583,6 +588,13 @@ impl Resource for AssetManager {
 }
 
 impl AssetManager {
+    /// The registered name of the asset type whose Rust type path is
+    /// `type_path` (`std::any::type_name`), if one registered: what a
+    /// `Handle<T>` field's asset type is recorded as.
+    pub fn registered_asset_type(&self, type_path: &str) -> Option<&str> {
+        self.registered_names.get(type_path).map(String::as_str)
+    }
+
     /// The storage key `T`'s column is kept under, or `None` when `T` is a
     /// shared type no binary has registered yet.
     #[inline]
@@ -1140,6 +1152,11 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
+        let type_path = std::any::type_name::<T>();
+        self.registered_names.insert(
+            type_path.to_owned(),
+            T::shared_name().unwrap_or(type_path).to_owned(),
+        );
         let key = match T::shared_identity() {
             Some(identity) => *self
                 .shared_keys

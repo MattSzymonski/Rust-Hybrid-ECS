@@ -114,6 +114,18 @@ type DefaultDocumentFunction = fn() -> AssetLoadResult<serde_json::Value>;
 /// Write a sourced asset's missing metadata file; the guid written, if any.
 type EnsureMetadataFunction =
     fn(&AssetManager, &Path) -> Result<Option<AssetGuid>, AssetImportError>;
+/// What a handle of the type addresses, from its index and generation.
+type IdentityFunction = fn(&AssetManager, u32, u32) -> Option<AssetIdentity>;
+
+/// The live asset a handle addresses, as a tool shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetIdentity {
+    /// The asset's guid, when it has one.
+    pub guid: Option<AssetGuid>,
+    /// The asset's name - its path relative to `res` for an imported one -
+    /// when it has one.
+    pub name: Option<String>,
+}
 
 /// The result of an erased import or reimport.
 pub type ErasedImportResult = Result<ErasedImportOutcome, AssetImportError>;
@@ -128,6 +140,7 @@ struct ImportFunctions {
     normalize_settings: NormalizeSettingsFunction,
     follow_move: FollowMoveFunction,
     is_loaded: IsLoadedFunction,
+    identity: IdentityFunction,
     /// `Some` for a standalone type, whose file is the asset; `None` for a
     /// sourced one.
     default_document: Option<DefaultDocumentFunction>,
@@ -146,6 +159,7 @@ impl ImportFunctions {
             normalize_settings: normalize_settings_json::<T>,
             follow_move: AssetManager::follow_move::<T>,
             is_loaded: is_loaded::<T>,
+            identity: identity_of::<T>,
             default_document: None,
             ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
         }
@@ -161,6 +175,7 @@ impl ImportFunctions {
             normalize_settings: normalize_standalone_document::<T>,
             follow_move: AssetManager::follow_standalone_move::<T>,
             is_loaded: is_loaded::<T>,
+            identity: identity_of::<T>,
             default_document: Some(default_standalone_document::<T>),
             ensure_metadata: None,
         }
@@ -247,6 +262,20 @@ where
     T: crate::asset::Asset + trait_type_map::TraitAccessible<dyn crate::asset::Asset>,
 {
     pack_key(path).is_some_and(|name| assets.handle_by_name::<T>(&name).is_some())
+}
+
+/// The live asset a `T` handle with `index` and `generation` addresses, or
+/// `None` when the handle is stale.
+fn identity_of<T>(assets: &AssetManager, index: u32, generation: u32) -> Option<AssetIdentity>
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    let handle = Handle::<T>::from_raw(index, generation);
+    assets.get(handle)?;
+    Some(AssetIdentity {
+        guid: assets.guid_of(handle),
+        name: assets.name_of(handle).map(str::to_owned),
+    })
 }
 
 /// [`AssetManager::reimport`] for `T`.
@@ -634,6 +663,20 @@ impl ImportRegistry {
     ) -> Result<ErasedImportOutcome, ErasedImportError> {
         let functions = self.functions_for_path(path)?;
         Ok((functions.import)(assets, path, policy)?)
+    }
+
+    /// What the handle `index`/`generation` of the asset type `type_name`
+    /// addresses - its guid and name - for a tool that holds only a field
+    /// value; `None` when the type is not registered or the handle is stale.
+    pub fn asset_identity(
+        &self,
+        assets: &AssetManager,
+        type_name: &str,
+        index: u32,
+        generation: u32,
+    ) -> Option<AssetIdentity> {
+        let functions = self.functions_for_type(type_name).ok()?;
+        (functions.identity)(assets, index, generation)
     }
 
     /// Load the asset at `path`, whether or not it is loaded yet: the same

@@ -192,6 +192,28 @@ const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
 /// The nested-struct marker: a shape validation descends into, not a leaf.
 const STRUCT_TYPE: &str = "struct";
 
+/// The prefix of a `Handle<T>` field's type: `handle:` and the Rust type path
+/// of `T`, as the C# mirror of `T` carries it (W-0048).
+const HANDLE_PREFIX: &str = "handle:";
+
+/// A handle's size and alignment: two `u32`s, `index` then `generation`.
+const HANDLE_SIZE: usize = 8;
+const HANDLE_ALIGNMENT: usize = 4;
+
+/// The Rust type path of a handle field's asset type, when the field is one.
+pub(super) fn handle_asset_path(primitive_type: &str) -> Option<&str> {
+    primitive_type
+        .strip_prefix(HANDLE_PREFIX)
+        .filter(|path| !path.is_empty())
+}
+
+/// The engine tag a handle field is recorded under: `struct:Handle<Mesh>`,
+/// the last segment of the asset type's path, as the derive writes it.
+fn handle_tag(asset_path: &str) -> &'static str {
+    let short = asset_path.rsplit("::").next().unwrap_or(asset_path);
+    intern(&format!("struct:Handle<{short}>"))
+}
+
 /// The vocabulary row for one managed type, when it is an accepted leaf.
 fn blittable_leaf(primitive_type: &str) -> Option<&'static BlittableLeaf> {
     BLITTABLE_LEAVES
@@ -203,7 +225,9 @@ fn blittable_leaf(primitive_type: &str) -> Option<&'static BlittableLeaf> {
 /// a nested value struct whose own fields are validated recursively against
 /// this same vocabulary.
 fn is_blittable(primitive_type: &str) -> bool {
-    primitive_type == STRUCT_TYPE || blittable_leaf(primitive_type).is_some()
+    primitive_type == STRUCT_TYPE
+        || blittable_leaf(primitive_type).is_some()
+        || handle_asset_path(primitive_type).is_some()
 }
 
 /// Deserialized entry from the managed component manifest.
@@ -416,6 +440,18 @@ pub(super) fn validate_field_manifest(
         // offset is checked against its parent by the same rule, so a field is
         // correctly aligned within the component exactly when every step of
         // that chain is.
+        // A handle is exactly the engine's `Handle<T>`: two `u32`s, aligned to
+        // four, with no default (an unset reference is the invalid handle).
+        if handle_asset_path(&field.primitive_type).is_some()
+            && (field.size != HANDLE_SIZE
+                || field.offset % HANDLE_ALIGNMENT != 0
+                || field.default.is_some())
+        {
+            return Err(format!(
+                "managed handle field {} must be {HANDLE_SIZE} bytes at a {HANDLE_ALIGNMENT}-byte boundary with no default",
+                field.name
+            ));
+        }
         if let Some(leaf) = blittable_leaf(&field.primitive_type) {
             if field.offset % leaf.alignment != 0 {
                 return Err(format!(
@@ -561,6 +597,9 @@ pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
     if field.primitive_type == STRUCT_TYPE {
         return STRUCT_TYPE;
     }
+    if let Some(asset_path) = handle_asset_path(&field.primitive_type) {
+        return handle_tag(asset_path);
+    }
     blittable_leaf(&field.primitive_type)
         .and_then(|leaf| leaf.tag)
         .unwrap_or("unsupported")
@@ -695,6 +734,20 @@ pub(super) fn managed_field_layout(
 ) -> Vec<ComponentFieldDescriptor> {
     let mut layout = Vec::new();
     for field in fields {
+        // A handle is a leaf the engine decodes as an asset reference; its
+        // asset type is recorded beside the layout (`managed_asset_fields`).
+        if let Some(asset_path) = handle_asset_path(&field.primitive_type) {
+            layout.push(ComponentFieldDescriptor {
+                name: intern(&field.name),
+                type_tag: handle_tag(asset_path),
+                offset: field.offset,
+                size: field.size,
+                align: HANDLE_ALIGNMENT,
+                element_count: 0,
+                decorators: field_decorations(&field.decorations),
+            });
+            continue;
+        }
         if field.primitive_type == STRUCT_TYPE {
             layout.push(ComponentFieldDescriptor {
                 name: intern(&field.name),

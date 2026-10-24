@@ -268,16 +268,41 @@ internal static class ProjectManifestBuilder
             // the attribute being silently ignored.
             var declaredDefault = (EcsFieldDefaultAttribute?)Attribute.GetCustomAttribute(
                 field, typeof(EcsFieldDefaultAttribute), inherit: false);
+            // A Handle<T> field is an asset reference: described by the Rust
+            // type path of T, so the host records what it references (W-0048).
+            string? handleAsset = HandleAssetPath(valueType);
+            string primitiveType = handleAsset is not null
+                ? "handle:" + handleAsset
+                : primitive ? valueType.FullName! : "struct";
             return new ComponentFieldManifest(
                 field.Name,
                 NativeLayout.FieldOffset(type, field.Name),
                 NativeLayout.SizeOf(valueType),
-                primitive ? valueType.FullName! : "struct",
-                primitive ? [] : DescribeFields(valueType),
+                primitiveType,
+                primitive || handleAsset is not null ? [] : DescribeFields(valueType),
                 DescribeDecorators(field),
                 declaredDefault?.Literal);
         })
         .ToArray();
+
+    /// <summary>
+    /// The Rust type path of the asset a <c>Handle&lt;T&gt;</c> type references,
+    /// or <c>null</c> when <paramref name="type"/> is not a handle or its asset
+    /// mirror carries no <c>RustType</c> constant.
+    /// </summary>
+    /// <remarks>
+    /// Every generated asset mirror declares <c>public const string RustType</c>;
+    /// a handle whose argument lacks it stays an opaque struct, as before.
+    /// </remarks>
+    private static string? HandleAssetPath(Type type)
+    {
+        if (!type.IsGenericType || type.GetGenericTypeDefinition() != typeof(TracyLive.Handle<>))
+            return null;
+        Type asset = type.GetGenericArguments()[0];
+        return asset
+            .GetField("RustType", BindingFlags.Public | BindingFlags.Static)?
+            .GetRawConstantValue() as string;
+    }
 
     /// <summary>
     /// The presentation decorators a field declared, in declaration order.

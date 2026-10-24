@@ -41,8 +41,8 @@ use pill_engine::{ComponentId, Engine, World};
 
 // Current crate
 use super::manifest::{
-    build_field_plan, format_field_layout_line, managed_field_layout, parse_and_validate_manifest,
-    plan_tag, split_manifest_kinds, ManagedComponentManifest,
+    build_field_plan, format_field_layout_line, handle_asset_path, managed_field_layout,
+    parse_and_validate_manifest, plan_tag, split_manifest_kinds, ManagedComponentManifest,
 };
 use super::manifest_apply::{
     apply_manifest, BindingTable, ManifestSubject, RenamePredecessor, Settlement,
@@ -808,6 +808,7 @@ fn reshape_component_entry(
         .map_err(|error| CSharpError::ManifestInvalid {
             message: error.to_string(),
         })?;
+    record_managed_asset_fields(engine, component_id, component);
     info!(
         target: telemetry_target::HOT_RELOAD,
         component = %component.full_name,
@@ -1032,6 +1033,32 @@ fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
 
 /// Register one manifest entry as managed descriptor storage with its layout.
 ///
+/// Record the asset type each `Handle<T>` field of a managed component
+/// references, as the derive does for a Rust component (W-0048).
+///
+/// The manifest names `T` by its Rust type path (what its C# mirror carries);
+/// the world records the type's registered name, found through the asset
+/// manager, so a Rust and a C# field referencing one asset type agree. A path
+/// no Rust type registered under is recorded as written.
+fn record_managed_asset_fields(
+    engine: &mut Engine,
+    component_id: ComponentId,
+    component: &ManagedComponentManifest,
+) {
+    let world = engine.world_mut();
+    for field in &component.fields {
+        let Some(asset_path) = handle_asset_path(&field.primitive_type) else {
+            continue;
+        };
+        let registered = world
+            .get_resource::<pill_engine::AssetManager>()
+            .and_then(|assets| assets.registered_asset_type(asset_path))
+            .unwrap_or(asset_path)
+            .to_owned();
+        world.record_asset_field_type(component_id, &field.name, &registered);
+    }
+}
+
 /// The one registration sequence: startup and every reload action (add,
 /// rename) go through it, so the descriptor, the binding entry and the
 /// editor-facing layout cannot be installed by one path and skipped by
@@ -1058,6 +1085,7 @@ fn register_managed_storage(
         .map_err(|error| CSharpError::ManifestInvalid {
             message: error.to_plain_message(),
         })?;
+    record_managed_asset_fields(engine, component_id, component);
     engine
         .world_mut()
         .register_component_descriptor_with_layout(component_id, field_layout.clone())

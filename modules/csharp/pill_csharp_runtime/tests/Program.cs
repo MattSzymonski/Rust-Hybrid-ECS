@@ -68,6 +68,26 @@ internal struct DecoratedProbe
     public uint InternalId;
 }
 
+/// <summary>
+/// An asset mirror the way the codegen emits one: what a handle names is its
+/// <c>RustType</c> constant.
+/// </summary>
+internal sealed class ProbeMeshAsset
+{
+    public const string RustType = "probe::assets::mesh::ProbeMesh";
+}
+
+/// <summary>
+/// A project component holding an asset reference, used to prove the manifest
+/// describes a <c>Handle&lt;T&gt;</c> field by the Rust type path of T (W-0048).
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct HandleProbe
+{
+    public TracyLive.Handle<ProbeMeshAsset> Mesh;
+    public float Scale;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct InvalidBoolComponent { public bool Value; }
 
@@ -801,6 +821,22 @@ internal static class Program
                     "space,min", "Ammo decorator order mismatch");
                 Equal(ammo.GetProperty("decorators")[0].GetProperty("number").GetSingle(), 10f,
                     "the gap height was not carried");
+            });
+
+            Test("manifest describes a handle field by its asset's Rust type", () =>
+            {
+                using var json = System.Text.Json.JsonDocument.Parse(
+                    ProjectManifestBuilder.Build([], typeof(HandleProbe).Assembly));
+                var probe = json.RootElement.EnumerateArray().Single(component =>
+                    component.GetProperty("full_name").GetString() ==
+                    typeof(HandleProbe).FullName);
+                var mesh = probe.GetProperty("fields").EnumerateArray().Single(field =>
+                    field.GetProperty("name").GetString() == "Mesh");
+                Equal(mesh.GetProperty("primitive_type").GetString(),
+                    "handle:probe::assets::mesh::ProbeMesh", "the handle's type was not carried");
+                Equal(mesh.GetProperty("size").GetInt32(), 8, "a handle is two uints");
+                Equal(mesh.GetProperty("fields").GetArrayLength(), 0,
+                    "a handle is a leaf, not a nested struct");
             });
 
             Test("ball physics declares PhysicsState, Position, and TransformComponent writes", () =>

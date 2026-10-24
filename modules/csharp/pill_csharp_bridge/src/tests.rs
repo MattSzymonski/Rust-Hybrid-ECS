@@ -572,6 +572,92 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
     }
 }
 
+/// A C#-only component's `Handle<T>` field is a typed asset reference: the
+/// manifest names `T` by its Rust type path, and the world records the type's
+/// registered name, the same one a Rust component's field gets (W-0048).
+#[test]
+fn a_managed_handle_field_is_recorded_with_its_registered_asset_type() {
+    let mut engine = Engine::new();
+    engine
+        .world_mut()
+        .register_imported_asset::<pill_master_renderer_data::Mesh>();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("Project.MeshReferenceInCSharp");
+    let mesh_path = std::any::type_name::<pill_master_renderer_data::Mesh>();
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "Project.MeshReferenceInCSharp",
+        "size": 8,
+        "alignment": 4,
+        "schema_hash": 4242,
+        "shared": false,
+        "fields": [{
+            "name": "Mesh",
+            "offset": 0,
+            "size": 8,
+            "primitive_type": format!("handle:{mesh_path}"),
+            "fields": []
+        }]
+    }]);
+    let bindings =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .unwrap();
+    let component_id = bindings[&stable_id].component_id();
+    assert_eq!(
+        engine.world().asset_field_type(component_id, "Mesh"),
+        Some("pill_master_renderer::assets::Mesh"),
+        "the Rust type path is recorded as the registered name"
+    );
+
+    let mut bytes = 3_u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    let entity = engine
+        .world_mut()
+        .create_descriptor_entity(&[(component_id, bytes)])
+        .unwrap();
+    let value = engine
+        .world()
+        .read_component_field(entity, "Project.MeshReferenceInCSharp", "Mesh")
+        .unwrap();
+    assert_eq!(
+        value,
+        pill_engine::component_field::FieldValue::Asset {
+            asset_type: Some("pill_master_renderer::assets::Mesh".to_owned()),
+            index: 3,
+            generation: 1,
+        }
+    );
+}
+
+/// A handle field that is not the engine's handle shape is refused.
+#[test]
+fn a_managed_handle_field_of_the_wrong_size_is_refused() {
+    let stable_id = stable_component_id("Project.BrokenHandle");
+    let manifest = serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "Project.BrokenHandle",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [{
+            "name": "Mesh",
+            "offset": 0,
+            "size": 4,
+            "primitive_type": "handle:some::Mesh",
+            "fields": []
+        }]
+    }]))
+    .unwrap();
+    let error = match parse_and_validate_manifest(&manifest) {
+        Ok(_) => panic!("a four-byte handle is refused"),
+        Err(error) => error,
+    };
+    assert!(error.to_plain_message().contains("handle field"), "{error}");
+}
+
 /// Verify a C#-only manifest component can be registered and queried natively.
 #[test]
 fn managed_manifest_registers_and_queries_a_new_descriptor_component() {
