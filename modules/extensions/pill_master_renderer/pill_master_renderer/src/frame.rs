@@ -202,14 +202,14 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
 /// most six.
 ///
 /// The one UI producer is here: the slot a game's own UI publishes into
-/// ([`UiFrameSlot`](pill_draw::UiFrameSlot)). A world that never installed one carries no UI.
+/// ([`UiFrameSlot`](pill_ui_frame::UiFrameSlot)). A world that never installed one carries no UI.
 type RenderingExtras<'w> = (
     Res<'w, pill_engine::Time>,
     Res<'w, pill_renderer_api::SurfaceCameras>,
     ResMut<'w, pill_engine::DebugDraw>,
     Res<'w, pill_renderer_api::SelectionOutlines>,
     ResMut<'w, pill_renderer_api::PickRequests>,
-    ResMut<'w, pill_draw::UiFrameSlot>,
+    ResMut<'w, pill_ui_frame::UiFrameSlot>,
 );
 
 /// Which producer filled `RenderFrame.ui` on the last frame, so a change is
@@ -704,22 +704,22 @@ mod tests {
     }
 
     /// A frame carrying one filled quad, as a game's UI producer would publish
-    /// it. Built out of `pill_draw`'s draw vocabulary, which is the plain data
+    /// it. Built out of `pill_ui_frame`'s draw vocabulary, which is the plain data
     /// the slot carries.
     fn drawn_frame() -> pill_renderer_api::frame::RenderFrame {
         let mut frame = RenderFrame::default();
-        let mut list = pill_draw::DrawList::new();
+        let mut list = pill_ui_frame::DrawList::new();
         list.push_quad(
-            pill_draw::TextureId(1),
-            pill_draw::Rect::from_min_size(
+            pill_ui_frame::TextureId(1),
+            pill_ui_frame::Rect::from_min_size(
                 pill_core::math::Vector2f::ZERO,
                 pill_core::math::Vector2f::new(2.0, 2.0),
             ),
             pill_core::math::Vector2f::ZERO,
             pill_core::math::Vector2f::new(1.0, 1.0),
-            pill_draw::Color::WHITE,
+            pill_ui_frame::Color::WHITE,
         );
-        frame.ui.draws.push(pill_draw::UiDraw {
+        frame.ui.draws.push(pill_ui_frame::UiDraw {
             surface: 0,
             scale_factor: 1.0,
             list,
@@ -732,11 +732,11 @@ mod tests {
         let mut engine = renderable_engine();
         engine
             .world_mut()
-            .insert_resource(pill_draw::UiFrameSlot::new());
+            .insert_resource(pill_ui_frame::UiFrameSlot::new());
         {
             let slot = engine
                 .world_mut()
-                .get_resource_mut::<pill_draw::UiFrameSlot>()
+                .get_resource_mut::<pill_ui_frame::UiFrameSlot>()
                 .expect("inserted above");
             slot.publish(drawn_frame().ui);
         }
@@ -753,7 +753,7 @@ mod tests {
         );
         let slot = engine
             .world()
-            .get_resource::<pill_draw::UiFrameSlot>()
+            .get_resource::<pill_ui_frame::UiFrameSlot>()
             .expect("inserted above");
         assert!(slot.is_empty(), "the frame was copied rather than drained");
     }
@@ -763,7 +763,7 @@ mod tests {
         let mut engine = renderable_engine();
         engine
             .world_mut()
-            .insert_resource(pill_draw::UiFrameSlot::new());
+            .insert_resource(pill_ui_frame::UiFrameSlot::new());
         engine.process_frame().expect("the frame runs");
 
         let frame = engine

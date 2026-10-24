@@ -1,5 +1,5 @@
 [package]
-name = "pill_draw"
+name = "pill_ui_frame"
 version = "0.1.0"
 edition = "2021"
 

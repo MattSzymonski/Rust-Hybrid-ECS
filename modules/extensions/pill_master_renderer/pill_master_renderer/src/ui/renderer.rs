@@ -24,7 +24,7 @@
 //! set carries instead of drawing with empty textures (W-0028 D3). A draw
 //! naming a texture the painter does not hold is skipped.
 //!
-//! Colour correctness: `pill_draw` colours are sRGB with straight alpha. The
+//! Colour correctness: `pill_ui_frame` colours are sRGB with straight alpha. The
 //! shader converts vertex colours to linear, the textures are created as
 //! `Rgba8UnormSrgb` (so sampling decodes them), and the caller is expected to
 //! pass an sRGB target format - the hardware then encodes linear to sRGB
@@ -37,7 +37,7 @@ use std::collections::HashMap;
 // External crates
 use bytemuck::{Pod, Zeroable};
 use pill_core::math::Vector2f;
-use pill_draw::{
+use pill_ui_frame::{
     DrawCommand, DrawList, Rect, TextureId, UiTexture, UiTextureFilter, UiTextureSet, UiVertex,
 };
 
@@ -145,7 +145,7 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
 // UiRenderer
 // =============================================================================
 
-/// GPU resources for drawing `pill_draw` draw lists.
+/// GPU resources for drawing `pill_ui_frame` draw lists.
 ///
 /// One renderer belongs to one device and one target format. The caller
 /// uploads texture changes once per frame ([`Self::apply_texture_set`]) and calls
@@ -174,7 +174,7 @@ impl UiRenderer {
     /// sRGB variant); the shader assumes the target encodes linear light.
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> UiRenderer {
         let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pill_draw globals layout"),
+            label: Some("pill_ui_frame globals layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -187,7 +187,7 @@ impl UiRenderer {
             }],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pill_draw texture layout"),
+            label: Some("pill_ui_frame texture layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -209,13 +209,13 @@ impl UiRenderer {
         });
 
         let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pill_draw globals"),
+            label: Some("pill_ui_frame globals"),
             size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_draw globals bind group"),
+            label: Some("pill_ui_frame globals bind group"),
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -224,7 +224,7 @@ impl UiRenderer {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pill_draw sampler"),
+            label: Some("pill_ui_frame sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -234,7 +234,7 @@ impl UiRenderer {
             ..Default::default()
         });
         let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("pill_draw nearest sampler"),
+            label: Some("pill_ui_frame nearest sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -245,16 +245,16 @@ impl UiRenderer {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pill_draw shader"),
+            label: Some("pill_ui_frame shader"),
             source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pill_draw pipeline layout"),
+            label: Some("pill_ui_frame pipeline layout"),
             bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pill_draw pipeline"),
+            label: Some("pill_ui_frame pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -306,8 +306,8 @@ impl UiRenderer {
             sampler,
             nearest_sampler,
             textures: HashMap::new(),
-            vertices: StreamBuffer::new("pill_draw vertices", wgpu::BufferUsages::VERTEX),
-            indices: StreamBuffer::new("pill_draw indices", wgpu::BufferUsages::INDEX),
+            vertices: StreamBuffer::new("pill_ui_frame vertices", wgpu::BufferUsages::VERTEX),
+            indices: StreamBuffer::new("pill_ui_frame indices", wgpu::BufferUsages::INDEX),
         }
     }
 
@@ -341,7 +341,7 @@ impl UiRenderer {
         let size = (texture.width, texture.height);
         let created = match self.textures.remove(&texture.id) {
             Some(entry) if entry.size == size => entry.texture,
-            _ => create_srgb_texture(device, "pill_draw texture", size),
+            _ => create_srgb_texture(device, "pill_ui_frame texture", size),
         };
         upload_whole_texture(queue, &created, size, &texture.pixels);
         let sampler = match texture.filter {
@@ -350,7 +350,7 @@ impl UiRenderer {
         };
         let view = created.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pill_draw texture bind group"),
+            label: Some("pill_ui_frame texture bind group"),
             layout: &self.texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -425,7 +425,7 @@ impl UiRenderer {
         };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("pill_draw"),
+            label: Some("pill_ui_frame"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
@@ -579,7 +579,7 @@ fn physical_scissor(clip: &Rect, scale_factor: f32, target_size: (u32, u32)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_draw::Color;
+    use pill_ui_frame::Color;
 
     #[test]
     fn physical_scissor_rounds_outward_and_clamps_to_the_target() {

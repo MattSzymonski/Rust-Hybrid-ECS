@@ -28,7 +28,7 @@ pill_engine_core = { path = "../../pill_engine_core" }
 # The neutral frame the renderer contract carries (`RenderFrame.ui`): the
 # tessellated output becomes this crate's plain data, and no egui type ever
 # crosses into `pill_renderer_api` (plan decision D1).
-pill_draw = { path = "../pill_draw" }
+pill_ui_frame = { path = "../pill_ui_frame" }
 # egui, pinned here alone: every consumer names it through this crate's
 # re-export, so the whole engine has one egui (W-0026 moved the world to
 # 0.36.2). `default_fonts` is the one feature needed; the docking crate the

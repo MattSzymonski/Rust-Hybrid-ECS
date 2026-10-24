@@ -764,7 +764,7 @@ impl State {
         view: &wgpu::TextureView,
         size: (u32, u32),
         frame: &RenderFrame,
-        labels: &pill_draw::DrawList,
+        labels: &pill_ui_frame::DrawList,
     ) {
         if !frame.ui.textures.is_empty() {
             self.ui_renderer

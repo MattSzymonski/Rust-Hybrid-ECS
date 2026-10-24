@@ -6,7 +6,7 @@
 //!   and keyboard claims, and the texture mirror.
 //! - [`GameUi::run`]: one pass - the engine's input in, the frame's draw list
 //!   and textures out, published into the world's
-//!   [`UiFrameSlot`](pill_draw::UiFrameSlot).
+//!   [`UiFrameSlot`](pill_ui_frame::UiFrameSlot).
 //! - [`install`]: puts the resource into a project's world, registering its
 //!   type first so a reload finds the same one.
 //! - [`convert`], [`input`], [`textures`]: the three pieces it composes.
@@ -19,8 +19,8 @@
 //! `pill_editor_core` binds - nothing module-defined may be stored in the context
 //! - and [`GameUi`] itself lives here, so the type is one across artifacts.
 //!
-//! The frame it produces is neutral (`pill_draw`) and travels through the
-//! draw crate's frame slot (`pill_draw::UiFrameSlot`): the renderer and `pill_renderer_api` never see
+//! The frame it produces is neutral (`pill_ui_frame`) and travels through the
+//! draw crate's frame slot (`pill_ui_frame::UiFrameSlot`): the renderer and `pill_renderer_api` never see
 //! egui (D1), and neither side names the other's crate - which is also what
 //! keeps a renderer from having to link this crate, since one link unit cannot
 //! hold two copies of a third-party graph in different formats. A game's own
@@ -45,7 +45,7 @@
 //! });
 //! ```
 
-/// The tessellated output to `pill_draw`.
+/// The tessellated output to `pill_ui_frame`.
 pub mod convert;
 /// The engine's input snapshot and the bridge to egui's input.
 pub mod input;
@@ -57,14 +57,14 @@ pub mod textures;
 pub use egui;
 /// The slot a pass publishes into, re-exported so a project's system names it
 /// without depending on the draw-data crate itself.
-pub use pill_draw::UiFrameSlot;
+pub use pill_ui_frame::UiFrameSlot;
 
 // External crates
 use egui::Context;
 use pill_core::math::Vector2f;
 use pill_core::platform::Instant;
-use pill_draw::{DrawList, UiDraw, UiFrame};
 use pill_engine_core::{Engine, Resource};
+use pill_ui_frame::{DrawList, UiDraw, UiFrame};
 
 // Current crate
 pub use convert::{convert, external_id, straight_color};
@@ -283,7 +283,7 @@ mod tests {
                 .textures
                 .textures
                 .iter()
-                .any(|texture| texture.id == pill_draw::TextureId(1 << 63)),
+                .any(|texture| texture.id == pill_ui_frame::TextureId(1 << 63)),
             "the font atlas was not carried"
         );
         let ui = engine

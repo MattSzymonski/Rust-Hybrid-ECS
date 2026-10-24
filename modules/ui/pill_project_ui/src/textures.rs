@@ -21,7 +21,7 @@
 //! frame's uploads.
 //!
 //! The bytes are straight-alpha sRGB RGBA8, because that is what
-//! `pill_draw::Color` and the painter's shader expect; egui's premultiplied
+//! `pill_ui_frame::Color` and the painter's shader expect; egui's premultiplied
 //! `Color32` pixels are unpremultiplied on the way in.
 
 // Standard library
@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 // External crates
 use egui::{ImageData, TextureId as EguiTextureId, TexturesDelta};
-use pill_draw::{TextureId, UiTextureFilter, UiTextureSet};
+use pill_ui_frame::{TextureId, UiTextureFilter, UiTextureSet};
 
 // Current crate
 use crate::convert::external_id;

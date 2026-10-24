@@ -40,7 +40,7 @@ pub struct UiFrameSlot {
 
 impl Resource for UiFrameSlot {
     fn shared_name() -> Option<&'static str> {
-        Some("pill_draw::UiFrameSlot")
+        Some("pill_ui_frame::UiFrameSlot")
     }
 }
 

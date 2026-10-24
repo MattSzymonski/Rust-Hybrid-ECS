@@ -8,7 +8,7 @@
 //! - Record a surface's overlay after its chain: the outline mask and edge,
 //!   the depth-tested and on-top debug lines and the gizmos
 //!   ([`Overlay::record`]).
-//! - Lay the debug labels out as a `pill_draw` list over the bitmap font
+//! - Lay the debug labels out as a `pill_ui_frame` list over the bitmap font
 //!   ([`label_list`], [`font::texture_set`]); the UI painter draws it, since
 //!   a label is a screen-space textured quad like any UI.
 //! - Draw the pick buffer for a surface that has picks waiting, and read the
@@ -40,10 +40,10 @@ use std::num::NonZeroU32;
 
 // External crates
 use pill_core::math::Vector2f;
-use pill_draw::{Color, DrawList, Rect};
 use pill_engine::{DebugFrame, Entity, LabelAnchor};
 use pill_master_renderer_data::color_space::linear_to_srgb;
 use pill_renderer_api::{PickHit, PickRequest, PickResult, PICK_HANDLE_BIT};
+use pill_ui_frame::{Color, DrawList, Rect};
 
 // Current crate
 use crate::{
@@ -1312,7 +1312,7 @@ fn handle_triangle_vertices(debug: &DebugFrame) -> Vec<HandleVertex> {
         .collect()
 }
 
-/// The frame's labels as a `pill_draw` list in surface pixels: glyph quads
+/// The frame's labels as a `pill_ui_frame` list in surface pixels: glyph quads
 /// over the bitmap font texture, each over a shadow one glyph pixel down and
 /// right. The UI painter draws it after the overlay, so text stays readable
 /// over everything the overlay drew.
