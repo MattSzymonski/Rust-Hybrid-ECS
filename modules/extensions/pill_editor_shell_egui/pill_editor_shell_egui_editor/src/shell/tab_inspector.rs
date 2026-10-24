@@ -36,62 +36,64 @@ pub fn inspector_tab(
     overlay_regions: &mut Vec<ShellRect>,
     session: &mut InspectorSession,
 ) {
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        // A selected resource takes the tab: one selection shows one thing
-        // (W-0038 Stage 14).
-        if let Some(view) = selection
-            .resource
-            .as_deref()
-            .and_then(|name| snapshot.resources.iter().find(|view| view.name == name))
-        {
-            resource_section(ui, view, pending);
-            return;
+    // No scroll area of its own: the dock wraps every tab body in one, and a
+    // nested area sizes itself to its content rather than to the body, so the
+    // rows were laid out below the body and nothing could scroll them into
+    // view (W-0048).
+    // A selected resource takes the tab: one selection shows one thing
+    // (W-0038 Stage 14).
+    if let Some(view) = selection
+        .resource
+        .as_deref()
+        .and_then(|name| snapshot.resources.iter().find(|view| view.name == name))
+    {
+        resource_section(ui, view, pending);
+        return;
+    }
+    match snapshot.detail.as_ref() {
+        Some(detail) => {
+            inspector_header(ui, snapshot, detail, pending, overlay_regions, session);
+            entity_inspector(ui, snapshot, detail, pending, overlay_regions, session);
         }
-        match snapshot.detail.as_ref() {
-            Some(detail) => {
-                inspector_header(ui, snapshot, detail, pending, overlay_regions, session);
-                entity_inspector(ui, snapshot, detail, pending, overlay_regions, session);
+        None => match selection.primary() {
+            Some(entity) => {
+                ui.label(format!("entity {entity} is not alive"));
             }
-            None => match selection.primary() {
-                Some(entity) => {
-                    ui.label(format!("entity {entity} is not alive"));
-                }
-                None => {
-                    ui.label("Select an entity in the Entities tab.");
-                }
-            },
-        }
-        // The selected asset's section follows the entity's: its kind and
-        // its import settings, editable leaf by leaf.
-        let selected_asset = selection.asset.as_deref();
-        if let Some(detail) = snapshot
-            .asset_detail
-            .as_ref()
-            .filter(|detail| selected_asset == Some(detail.path.as_str()))
-        {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(format!("asset {}", detail.path)).strong());
-            read_only_row(ui, "kind", &detail.kind);
-            if detail.standalone {
-                read_only_row(ui, "standalone", "yes");
+            None => {
+                ui.label("Select an entity in the Entities tab.");
             }
-            ui.separator();
-            match detail.settings.as_ref() {
-                Some(settings) => asset_settings_rows(ui, &detail.path, settings, pending),
-                None => {
-                    ui.label(egui::RichText::new("no editable settings").weak().italics());
-                }
+        },
+    }
+    // The selected asset's section follows the entity's: its kind and
+    // its import settings, editable leaf by leaf.
+    let selected_asset = selection.asset.as_deref();
+    if let Some(detail) = snapshot
+        .asset_detail
+        .as_ref()
+        .filter(|detail| selected_asset == Some(detail.path.as_str()))
+    {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("asset {}", detail.path)).strong());
+        read_only_row(ui, "kind", &detail.kind);
+        if detail.standalone {
+            read_only_row(ui, "standalone", "yes");
+        }
+        ui.separator();
+        match detail.settings.as_ref() {
+            Some(settings) => asset_settings_rows(ui, &detail.path, settings, pending),
+            None => {
+                ui.label(egui::RichText::new("no editable settings").weak().italics());
             }
         }
-        // The strip below the rows carries the component menu where no
-        // heading is there to hang it on (a right-click there adds).
-        if let Some(detail) = snapshot.detail.as_ref() {
-            let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
-            context_menu("inspector", &empty, overlay_regions, &mut |ui| {
-                component_menu_items(ui, snapshot, detail, None, pending)
-            });
-        }
-    });
+    }
+    // The strip below the rows carries the component menu where no
+    // heading is there to hang it on (a right-click there adds).
+    if let Some(detail) = snapshot.detail.as_ref() {
+        let empty = ui.allocate_response(empty_area(ui), egui::Sense::click());
+        context_menu("inspector", &empty, overlay_regions, &mut |ui| {
+            component_menu_items(ui, snapshot, detail, None, pending)
+        });
+    }
 }
 
 /// The Inspector's top row: the selected entity's name and, right aligned,
@@ -291,6 +293,7 @@ pub fn entity_inspector(
                 &row,
                 &targets,
                 &snapshot.selected_details,
+                &snapshot.assets,
                 pending,
                 session,
             );

@@ -242,6 +242,221 @@ fn tiles_pick_an_icon_from_the_kind_and_the_extension() {
 }
 
 #[test]
+fn an_asset_type_names_its_row_icon() {
+    assert_eq!(
+        asset_type_icon("pill_master_renderer::assets::Mesh"),
+        icons::Icon::Cube
+    );
+    assert_eq!(
+        asset_type_icon("pill_master_renderer::assets::Material"),
+        icons::Icon::Sphere
+    );
+    assert_eq!(
+        asset_type_icon("pill_master_renderer::assets::Texture"),
+        icons::Icon::Image
+    );
+    assert_eq!(
+        asset_type_icon("pill_master_renderer::assets::Shader"),
+        icons::Icon::Code
+    );
+    // A type with no shape of its own falls back to the plain file icon.
+    assert_eq!(asset_type_icon("demo::Sound"), icons::Icon::File);
+    assert_eq!(asset_type_icon(""), icons::Icon::File);
+}
+
+/// One egui pass over a fixed screen with an explicit event list: the drag
+/// tests need presses and releases, which the plain [`run_pass`] never sends.
+#[cfg(test)]
+fn run_pass_with(
+    context: &egui::Context,
+    events: Vec<egui::Event>,
+    pass: &mut dyn FnMut(&mut egui::Ui),
+) {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 720.0),
+        )),
+        events,
+        ..Default::default()
+    };
+    let mut output = context.run_ui(input, pass);
+    output.textures_delta.clear();
+}
+
+/// Dragging an asset tile from the grid onto its Inspector asset row queues
+/// the reference edit, through egui's drag-and-drop payload (W-0048).
+#[test]
+fn a_dropped_asset_tile_queues_the_reference_edit() {
+    const MESH_TYPE: &str = "pill_master_renderer::assets::Mesh";
+    /// Draw the grid and the asset row, one frame.
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+        snapshot: &EditorSnapshot,
+        browser: &mut ProjectBrowser,
+        selection: &mut EditorSelection,
+        dialog: &mut Option<AssetDialog>,
+        pending: &mut PendingEditorCommands,
+        regions: &mut Vec<ShellRect>,
+        drag_out: &mut Option<String>,
+        session: &mut InspectorSession,
+        view: &ComponentView,
+        entity: Entity,
+    ) {
+        run_pass_with(context, events, &mut |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.allocate_ui(egui::vec2(640.0, 300.0), |ui| {
+                    let mut writes = AssetTileWrites {
+                        selection,
+                        dialog,
+                        pending,
+                        overlay_regions: regions,
+                        drag_out,
+                    };
+                    assets_grid(ui, snapshot, browser, &mut writes);
+                });
+                inspector_fields::inspector_asset_row(
+                    ui,
+                    inspector_fields::AssetRowInput {
+                        entity,
+                        component: view,
+                        index: 0,
+                        field: "mesh",
+                        asset_type: Some(MESH_TYPE),
+                        tooltip: None,
+                        targets: std::slice::from_ref(&entity),
+                        details: &[],
+                        assets: &snapshot.assets,
+                    },
+                    pending,
+                    session,
+                );
+            });
+        });
+    }
+
+    let engine = Engine::new();
+    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    snapshot.assets = vec![AssetListing {
+        path: "cube.obj".to_string(),
+        kind: MESH_TYPE.to_string(),
+        standalone: false,
+        has_meta: true,
+    }];
+    let entity = Entity::from_raw(1, 0);
+    let view = ComponentView {
+        type_name: "demo::MeshRenderer".to_string(),
+        persistable: false,
+        editable: true,
+        fields: Vec::new(),
+        values: vec![FieldValue::Asset {
+            asset_type: Some(MESH_TYPE.to_string()),
+            index: u32::MAX,
+            generation: u32::MAX,
+        }],
+        asset_labels: vec![Some(AssetReferenceLabel::Unset)],
+    };
+    let mut browser = ProjectBrowser::default();
+    let mut selection = EditorSelection::default();
+    let mut dialog: Option<AssetDialog> = None;
+    let mut pending = PendingEditorCommands::default();
+    let mut regions: Vec<ShellRect> = Vec::new();
+    let mut drag_out: Option<String> = None;
+    let mut session = InspectorSession::default();
+    let context = egui::Context::default();
+    style::apply(&context);
+
+    // One idle pass lays both ends out and records their rectangles.
+    draw(
+        &context,
+        Vec::new(),
+        &snapshot,
+        &mut browser,
+        &mut selection,
+        &mut dialog,
+        &mut pending,
+        &mut regions,
+        &mut drag_out,
+        &mut session,
+        &view,
+        entity,
+    );
+    let tile = browser
+        .tile_rects
+        .iter()
+        .find(|(path, _)| path == "cube.obj")
+        .map(|(_, corners)| {
+            egui::Rect::from_min_max(
+                egui::pos2(corners[0], corners[1]),
+                egui::pos2(corners[2], corners[3]),
+            )
+        })
+        .expect("the tile drew");
+    let row = session
+        .asset_row_rects
+        .first()
+        .map(|(_, rect)| *rect)
+        .expect("the asset row drew");
+    let from = tile.center();
+    let to = row.center();
+
+    // Press on the tile, move onto the row, release: the scripted drag's
+    // three frames, in the same event shapes the window bridge produces.
+    let press = egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    };
+    let release = egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    for events in [
+        vec![egui::Event::PointerMoved(from), press],
+        vec![egui::Event::PointerMoved(to)],
+        vec![release],
+    ] {
+        draw(
+            &context,
+            events,
+            &snapshot,
+            &mut browser,
+            &mut selection,
+            &mut dialog,
+            &mut pending,
+            &mut regions,
+            &mut drag_out,
+            &mut session,
+            &view,
+            entity,
+        );
+    }
+
+    assert_eq!(
+        pending.batches.len(),
+        1,
+        "the drop queued one recorded edit"
+    );
+    assert!(
+        matches!(
+            pending.batches[0].commands.as_slice(),
+            [EditorCommand::SetFieldAsset { field, reference: Some(path), .. }]
+                if field == "mesh" && path == "cube.obj"
+        ),
+        "the drop points the field at the tile's asset: {:?}",
+        pending.batches[0].commands
+    );
+}
+
+/// A wheel event over a scroll area scrolls it; the bridge and the dock both
+/// pass wheel deltas through untouched (W-0048: the Inspector is scrolled by
+/// wheeling over it).
+#[test]
 fn a_row_click_moves_the_shared_selection() {
     let mut engine = Engine::new();
     let entity = engine
@@ -279,6 +494,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
         entity,
         components: vec![
             ComponentView {
+                asset_labels: Vec::new(),
                 type_name: "tests::Health".to_string(),
                 persistable: false,
                 editable: true,
@@ -294,6 +510,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
                 values: vec![FieldValue::F32(3.0)],
             },
             ComponentView {
+                asset_labels: Vec::new(),
                 type_name: "tests::Marker".to_string(),
                 persistable: false,
                 editable: false,

@@ -54,6 +54,64 @@ pub struct ComponentView {
     pub fields: Vec<ComponentFieldDescriptor>,
     /// One current value per field, parallel to `fields`.
     pub values: Vec<FieldValue>,
+    /// What each asset reference field names, parallel to `values`: `None`
+    /// for a field that is not an asset reference (W-0048). Resolved when
+    /// the view is captured, since the shell sees no asset store.
+    pub asset_labels: Vec<Option<AssetReferenceLabel>>,
+}
+
+/// What an asset reference field currently names, as the Inspector shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetReferenceLabel {
+    /// The field is cleared: it holds the invalid handle.
+    Unset,
+    /// The field addresses a live asset, named by its path (or the name its
+    /// creator gave it).
+    Named(String),
+    /// The field addresses a live asset that has no name.
+    Unnamed,
+    /// The field addresses nothing live: the asset was removed or the handle
+    /// is stale.
+    Missing,
+}
+
+impl AssetReferenceLabel {
+    /// The label of an asset value, read through the world's import registry.
+    pub fn of(world: &pill_engine::World, value: &FieldValue) -> Option<Self> {
+        let FieldValue::Asset {
+            asset_type,
+            index,
+            generation,
+        } = value
+        else {
+            return None;
+        };
+        if (*index, *generation) == (u32::MAX, u32::MAX) {
+            return Some(Self::Unset);
+        }
+        let identity = asset_type.as_deref().and_then(|asset_type| {
+            let registry = world.get_resource::<pill_engine::ImportRegistry>()?;
+            let assets = world.get_resource::<pill_engine::AssetManager>()?;
+            registry.asset_identity(assets, asset_type, *index, *generation)
+        });
+        Some(match identity {
+            Some(identity) => match identity.name {
+                Some(name) => Self::Named(name),
+                None => Self::Unnamed,
+            },
+            None => Self::Missing,
+        })
+    }
+
+    /// The text the Inspector draws for this label.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Unset => "None",
+            Self::Named(name) => name,
+            Self::Unnamed => "(unnamed)",
+            Self::Missing => "(missing)",
+        }
+    }
 }
 
 /// The expensive tier of the snapshot: only built for the selection.
@@ -500,17 +558,58 @@ impl EditorSnapshot {
                 } else {
                     Vec::new()
                 };
+                let asset_labels = values
+                    .iter()
+                    .map(|value| AssetReferenceLabel::of(world, value))
+                    .collect();
                 Some(ComponentView {
                     type_name,
                     persistable,
                     editable,
                     fields,
                     values,
+                    asset_labels,
                 })
             })
             .collect();
         Some(EntityDetail { entity, components })
     }
+}
+
+/// The asset value `reference` names - a path relative to `res`, or a guid in
+/// the world's asset database - loading the asset first when it is not loaded.
+///
+/// The value carries the type the asset loaded as, so the field write that
+/// follows refuses an asset of another type than the field references.
+fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<FieldValue, String> {
+    let world = engine.world_mut();
+    let registry = world
+        .get_resource::<pill_engine::ImportRegistry>()
+        .cloned()
+        .ok_or("no asset types are registered")?;
+    let path = match pill_engine::AssetGuid::parse(reference) {
+        Some(guid) => world
+            .get_resource::<pill_engine::AssetDatabase>()
+            .and_then(|database| database.by_guid(guid))
+            .map(|record| record.path.clone())
+            .ok_or_else(|| format!("no asset in the project has the guid {guid}"))?,
+        None => reference.to_owned(),
+    };
+    let assets = world
+        .get_resource_mut::<pill_engine::AssetManager>()
+        .ok_or("the world has no asset store")?;
+    let outcome = registry
+        .load_by_path(
+            assets,
+            std::path::Path::new(&path),
+            pill_engine::MetadataPolicy::CreateIfMissing,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(FieldValue::Asset {
+        asset_type: Some(outcome.type_name),
+        index: outcome.index,
+        generation: outcome.generation,
+    })
 }
 
 /// Label a system owner using the host's extension names.
@@ -632,6 +731,23 @@ pub enum EditorCommand {
         field: String,
         /// New value.
         value: FieldValue,
+    },
+    /// Point an asset reference field at the asset `reference` names - a path
+    /// relative to `res` or a 32-digit guid - or clear it with `None`
+    /// (W-0048).
+    ///
+    /// Resolved at the frame boundary, where the asset is loaded first when
+    /// it is not loaded yet; it then writes like a [`Self::SetField`], whose
+    /// inverse it records.
+    SetFieldAsset {
+        /// The target entity.
+        entity: Entity,
+        /// Registered component type name.
+        component: String,
+        /// Field name.
+        field: String,
+        /// The asset's path or guid, or `None` to clear the reference.
+        reference: Option<String>,
     },
     /// Write one element of a fixed-size array field.
     SetArrayElement {
@@ -909,6 +1025,7 @@ impl EditorCommand {
                 | EditorCommand::AddComponent { .. }
                 | EditorCommand::RemoveComponent { .. }
                 | EditorCommand::SetField { .. }
+                | EditorCommand::SetFieldAsset { .. }
                 | EditorCommand::SetArrayElement { .. }
                 | EditorCommand::SetSystemEnabled { .. }
                 | EditorCommand::ImportFiles { .. }
@@ -933,6 +1050,9 @@ impl EditorCommand {
         let mut identifiers = Vec::new();
         match self {
             EditorCommand::SetField {
+                component, field, ..
+            }
+            | EditorCommand::SetFieldAsset {
                 component, field, ..
             }
             | EditorCommand::SetArrayElement {
@@ -990,6 +1110,7 @@ impl EditorCommand {
             | EditorCommand::RemoveComponent { entity, .. }
             | EditorCommand::RestoreComponent { entity, .. }
             | EditorCommand::SetField { entity, .. }
+            | EditorCommand::SetFieldAsset { entity, .. }
             | EditorCommand::SetArrayElement { entity, .. } => {
                 if *entity == previous {
                     *entity = assigned;
@@ -1205,6 +1326,47 @@ impl EditorCommand {
                     .world_mut()
                     .write_component_field(*entity, component, field, value.clone())
                     .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::inverse(EditorCommand::SetField {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    value: previous,
+                }))
+            }
+
+            EditorCommand::SetFieldAsset {
+                entity,
+                component,
+                field,
+                reference,
+            } => {
+                let previous = engine
+                    .world()
+                    .read_component_field(*entity, component, field)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                let FieldValue::Asset { asset_type, .. } = &previous else {
+                    return Err(format!("{command:?}: `{field}` is not an asset reference"));
+                };
+                let value = match reference {
+                    None => FieldValue::Asset {
+                        asset_type: asset_type.clone(),
+                        index: u32::MAX,
+                        generation: u32::MAX,
+                    },
+                    Some(reference) => resolve_asset_reference(engine, reference)
+                        .map_err(|error| format!("{command:?}: {error}"))?,
+                };
+                engine
+                    .world_mut()
+                    .write_component_field(*entity, component, field, value)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = component.as_str(),
+                    field = field.as_str(),
+                    asset = reference.as_deref().unwrap_or("none"),
+                    "[editor] asset reference set"
+                );
                 Ok(CommandOutcome::inverse(EditorCommand::SetField {
                     entity: *entity,
                     component: component.clone(),
@@ -2733,5 +2895,223 @@ mod tests {
             .read_component_field(*restored, &demo_component_name(), "strength")
             .expect("restored value");
         assert_eq!(strength, FieldValue::F32(6.5));
+    }
+
+    /// A note file as an asset, for the asset reference tests (W-0048).
+    #[derive(Debug)]
+    struct Note;
+    impl pill_engine::asset::Asset for Note {}
+    trait_type_map::impl_trait_accessible!(dyn pill_engine::asset::Asset; Note);
+
+    impl pill_engine::asset_metadata::ImportedAsset for Note {
+        type ImportSettings = NoteSettings;
+        const SOURCE_EXTENSIONS: &'static [&'static str] = &["note"];
+
+        fn metadata_type_name() -> &'static str {
+            "pill_editor_core::tests::Note"
+        }
+
+        fn import(
+            _name: &str,
+            _bytes: &[u8],
+            _settings: &NoteSettings,
+        ) -> pill_engine::AssetLoadResult<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// Another imported type, so a wrong-type pick has something to name.
+    #[derive(Debug)]
+    struct Card;
+    impl pill_engine::asset::Asset for Card {}
+    trait_type_map::impl_trait_accessible!(dyn pill_engine::asset::Asset; Card);
+
+    impl pill_engine::asset_metadata::ImportedAsset for Card {
+        type ImportSettings = NoteSettings;
+        const SOURCE_EXTENSIONS: &'static [&'static str] = &["card"];
+
+        fn metadata_type_name() -> &'static str {
+            "pill_editor_core::tests::Card"
+        }
+
+        fn import(
+            _name: &str,
+            _bytes: &[u8],
+            _settings: &NoteSettings,
+        ) -> pill_engine::AssetLoadResult<Self> {
+            Ok(Self)
+        }
+    }
+
+    /// The test assets' (empty) import settings.
+    #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+    struct NoteSettings {}
+
+    /// A component with one note reference, laid out as the derive does.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct NoteHolder {
+        note: pill_engine::Handle<Note>,
+    }
+    impl pill_engine::Component for NoteHolder {}
+
+    static NOTE_HOLDER_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+        name: "note",
+        type_tag: "struct:Handle<Note>",
+        offset: 0,
+        size: 8,
+        align: 4,
+        element_count: 0,
+        decorators: std::borrow::Cow::Borrowed(&[]),
+    }];
+
+    /// One `.meta` sidecar's text: the header naming `asset_type` and `guid`.
+    fn sidecar(asset_type: &str, guid: &str) -> String {
+        serde_json::json!({
+            "format_version": 1,
+            "asset_type": asset_type,
+            "guid": guid,
+            "settings": {},
+        })
+        .to_string()
+    }
+
+    /// An engine with both test asset types, a mounted scratch `res` holding
+    /// `a.note`, `b.note` and `c.card` (each with a `.meta`), the asset
+    /// database over it, and one entity whose note field references nothing.
+    fn reference_engine(label: &str) -> (Engine, Entity, String, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "pill-editor-asset-reference-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (file, guid, asset_type) in [
+            (
+                "a.note",
+                "000000000000000000000000000000a1",
+                "pill_editor_core::tests::Note",
+            ),
+            (
+                "b.note",
+                "000000000000000000000000000000b1",
+                "pill_editor_core::tests::Note",
+            ),
+            (
+                "c.card",
+                "000000000000000000000000000000c1",
+                "pill_editor_core::tests::Card",
+            ),
+        ] {
+            std::fs::write(root.join(file), "x").unwrap();
+            std::fs::write(root.join(format!("{file}.meta")), sidecar(asset_type, guid)).unwrap();
+        }
+        pill_engine::asset_store::mount_directory(&root);
+        let mut engine = Engine::new();
+        let world = engine.world_mut();
+        world.register_imported_asset::<Note>();
+        world.register_imported_asset::<Card>();
+        world.register_component_with_layout::<NoteHolder>(NOTE_HOLDER_FIELDS);
+        world.record_asset_field_type(
+            pill_engine::ComponentId::of::<NoteHolder>(),
+            "note",
+            "pill_editor_core::tests::Note",
+        );
+        let registry = world
+            .get_resource::<pill_engine::ImportRegistry>()
+            .unwrap()
+            .clone();
+        world.insert_resource(pill_engine::AssetDatabase::from_directory(&root, &registry));
+        let entity = world
+            .create_entity()
+            .with(NoteHolder {
+                note: pill_engine::Handle::INVALID,
+            })
+            .build()
+            .unwrap();
+        let name = pill_engine::component::ComponentRegistry::registered_name::<NoteHolder>();
+        (engine, entity, name, root)
+    }
+
+    /// The note field's label as the Inspector would show it.
+    fn note_label(engine: &Engine, entity: Entity) -> AssetReferenceLabel {
+        let detail = EditorSnapshot::capture_detail(engine, entity).unwrap();
+        let view = detail
+            .components
+            .iter()
+            .find(|view| view.type_name.contains("NoteHolder"))
+            .unwrap();
+        view.asset_labels[0]
+            .clone()
+            .expect("an asset field has a label")
+    }
+
+    /// One `SetFieldAsset` for the note field.
+    fn pick(entity: Entity, component: &str, reference: Option<&str>) -> EditorCommand {
+        EditorCommand::SetFieldAsset {
+            entity,
+            component: component.to_owned(),
+            field: "note".to_owned(),
+            reference: reference.map(str::to_owned),
+        }
+    }
+
+    /// Picking an unloaded asset by path loads it and points the field at it;
+    /// a guid names an asset as well as its path; the recorded inverse
+    /// restores the previous reference; `None` clears.
+    ///
+    /// The two asset reference tests mount one directory each, so they run as
+    /// one test: the mounted directory is process-wide.
+    #[test]
+    fn asset_picks_load_assign_undo_clear_and_refuse() {
+        let (mut engine, entity, name, root) = reference_engine("pick");
+        assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
+
+        let applied =
+            EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, Some("a.note"))]);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert_eq!(
+            note_label(&engine, entity),
+            AssetReferenceLabel::Named("a.note".to_owned())
+        );
+
+        let by_guid = EditorCommand::apply_recorded(
+            &mut engine,
+            &[pick(
+                entity,
+                &name,
+                Some("000000000000000000000000000000b1"),
+            )],
+        );
+        assert!(by_guid.failures.is_empty(), "{:?}", by_guid.failures);
+        assert_eq!(
+            note_label(&engine, entity),
+            AssetReferenceLabel::Named("b.note".to_owned())
+        );
+
+        // Undo: the inverse is a plain field write of the previous handle.
+        let undo = EditorCommand::apply_recorded(&mut engine, &by_guid.inverses);
+        assert!(undo.failures.is_empty(), "{:?}", undo.failures);
+        assert_eq!(
+            note_label(&engine, entity),
+            AssetReferenceLabel::Named("a.note".to_owned())
+        );
+
+        // Another asset type, a path the project lacks and an unknown guid
+        // are refused, and the field keeps what it had.
+        for reference in ["c.card", "missing.note", "000000000000000000000000000000ff"] {
+            let refused =
+                EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, Some(reference))]);
+            assert_eq!(refused.failures.len(), 1, "{reference} is refused");
+            assert_eq!(
+                note_label(&engine, entity),
+                AssetReferenceLabel::Named("a.note".to_owned())
+            );
+        }
+
+        let cleared = EditorCommand::apply_recorded(&mut engine, &[pick(entity, &name, None)]);
+        assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
+        assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -202,6 +202,13 @@ ASSET_META_QUEUED_TOKEN = "[editor] asset meta queued"
 ENGINE_COMMANDS_APPLIED_TOKEN = "[editor] engine commands applied"
 HISTORY_PUSH_TOKEN = "[editor] history push"
 HISTORY_UNDO_TOKEN = "[editor] history undo"
+# An asset reference row and what it names (W-0048): the Inspector logs each
+# distinct row once, the applied pick or drop once, and the drop's two ends'
+# rectangles once per placement.
+REFERENCE_ROW_TOKEN = "[editor] inspector row kind=asset"
+REFERENCE_SET_TOKEN = "[editor] asset reference set"
+REFERENCE_TILE_RECT_TOKEN = "[editor] assets tile rect"
+REFERENCE_ROW_RECT_TOKEN = "[editor] inspector asset row rect"
 RESOURCES_DUMP_TOKEN = "[test] resources"
 RESOURCE_FIELD_TOKEN = "[test] resource field"
 RESOURCE_SELECTED_TOKEN = "[editor] resource selected"
@@ -644,6 +651,40 @@ def wait_for_stub_record(session: EditorSession, timeout: float = 30.0) -> str:
     )
 
 
+def last_log_match(session: EditorSession, pattern: str, start: int = 0) -> re.Match:
+    """The newest match of `pattern` in the log from `start`: a rectangle or a
+    row can be logged again as the layout settles, and the latest one counts."""
+    matches = list(re.finditer(pattern, session.read_log()[start:]))
+    assert matches, "no match for {}".format(pattern)
+    return matches[-1]
+
+
+def logged_rect_centre(line: str) -> tuple:
+    """The centre of a rectangle a log line spells as `min_x`..`max_y`."""
+    values = {
+        key: float(value)
+        for key, value in re.findall(r"\b(min_x|min_y|max_x|max_y)=(-?[0-9.]+)", line)
+    }
+    return (
+        (values["min_x"] + values["max_x"]) / 2.0,
+        (values["min_y"] + values["max_y"]) / 2.0,
+    )
+
+
+def logged_rect_bounds(line: str) -> tuple:
+    """A rectangle a log line spells as `min_x`..`max_y`, as (x, y, width, height)."""
+    values = {
+        key: float(value)
+        for key, value in re.findall(r"\b(min_x|min_y|max_x|max_y)=(-?[0-9.]+)", line)
+    }
+    return (
+        values["min_x"],
+        values["min_y"],
+        values["max_x"] - values["min_x"],
+        values["max_y"] - values["min_y"],
+    )
+
+
 def rect_center(rect: tuple) -> tuple:
     """The center of an (x, y, width, height) rectangle."""
     return (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0)
@@ -763,6 +804,38 @@ def main() -> int:
     samples = sorted((asset_root / "textures").glob("*.png"))
     assert samples, "no texture png to stage the meta probe from"
     stage_file.write_bytes(samples[0].read_bytes())
+    # The asset reference step (W-0048 Stage 3) needs a material file: the
+    # example builds its materials in code, and the picker offers the files of
+    # the field's type, so there must be one in `res` to pick and to drop. It
+    # names the PBR chain's shader - installed in every build under a guid
+    # derived from its name (`pbr_pipeline::SHADER_GUID`) - and binds no maps,
+    # so it loads and draws in this project. Staged before the editor starts,
+    # like the meta probe, so the res watcher sees it indexed at startup.
+    reference_material = asset_root / "materials" / "s16_reference.material"
+    reference_material.parent.mkdir(exist_ok=True)
+    reference_material.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "asset_type": "pill_master_renderer::assets::Material",
+                "guid": "5f16a9c2d47b4e0f8a1b2c3d4e5f6a7b",
+                "asset": {
+                    "shader": "8cedb4197c9f26a86708b1cd14399eab",
+                    "textures": {},
+                    "parameters": {
+                        "pbr_base": {"Color": [1.0, 1.0, 1.0]},
+                        "pbr_emissive": {"Color": [1.0, 1.0, 1.0]},
+                        "pbr_metallic": {"Scalar": 1.0},
+                        "pbr_roughness": {"Scalar": 1.0},
+                    },
+                    "rendering_order": 255,
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     # The Inspector's settings step writes two `.meta` sidecars through the
     # real apply and undoes them; the engine's normalization reorders their
     # keys, so their original bytes are snapshotted and put back in the
@@ -1515,6 +1588,279 @@ def main() -> int:
         )
         print("  [OK] a struct-array element edited and undid")
 
+        # Step 3a8b: asset reference rows (W-0048 Stage 3). A mesh renderer's
+        # mesh and material fields are asset rows, each naming the asset it
+        # holds. A scripted pick points one at another asset and loads it on
+        # demand - the material file the suite stages is loaded by nothing
+        # before the pick - undo brings the previous asset back, `none` clears
+        # the row, and a material tile dragged from the Assets tab onto the
+        # material row assigns it. Both rows end on the assets they started
+        # with.
+        dump = session.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 30, "the entity list"
+        )
+        mesh_row = next(
+            (
+                match
+                for match in re.finditer(
+                    re.escape(ENTITY_ROW_TOKEN)
+                    + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                    dump,
+                )
+                if "MeshRendererComponent" in match.group(2)
+            ),
+            None,
+        )
+        assert mesh_row is not None, (
+            "no entity carries a mesh renderer: {}".format(dump[-800:])
+        )
+        mesh_entity = mesh_row.group(1)
+        # What was selected before this step: the viewport steps after it drag
+        # the selection's gizmo, so the step puts the selection back.
+        prior = session.request(
+            "dump selection", re.escape(SELECTION_DUMP_TOKEN), 30, "the prior selection"
+        )
+        prior_match = re.search(r'primary="([^"]+)"', prior)
+        assert prior_match is not None, "the prior selection did not read back: {}".format(
+            prior[-400:]
+        )
+        prior_entity = prior_match.group(1)
+
+        def asset_row_capture(field: str) -> str:
+            """The selected entity's asset row for `field`, capturing its text."""
+            return (
+                re.escape(REFERENCE_ROW_TOKEN)
+                + r"(?=[^\n]*entity="
+                + re.escape(mesh_entity)
+                + r"\b)"
+                + r'(?=[^\n]*field="'
+                + field
+                + r'")[^\n]*asset="([^"]*)"'
+            )
+
+        def asset_row_pattern(field: str, asset: str) -> str:
+            """The selected entity's asset row for `field`, naming `asset`."""
+            return (
+                re.escape(REFERENCE_ROW_TOKEN)
+                + r"(?=[^\n]*entity="
+                + re.escape(mesh_entity)
+                + r"\b)"
+                + r'(?=[^\n]*field="'
+                + field
+                + r'")[^\n]*asset="'
+                + re.escape(asset)
+                + r'"'
+            )
+
+        begin = len(session.read_log())
+        session.send("select entity {}".format(mesh_entity))
+        session.wait(asset_row_capture("mesh"), 30, "the mesh field's asset row", begin)
+        session.wait(
+            asset_row_capture("material"), 30, "the material field's asset row", begin
+        )
+        original_mesh = last_log_match(session, asset_row_capture("mesh"), begin).group(1)
+        original_material = last_log_match(
+            session, asset_row_capture("material"), begin
+        ).group(1)
+        assert original_mesh not in ("None", "(missing)"), (
+            "the mesh row starts empty: {}".format(original_mesh)
+        )
+        assert original_material not in ("None", "(missing)"), (
+            "the material row starts empty: {}".format(original_material)
+        )
+        print(
+            "  [OK] the mesh renderer's rows name {} and {}".format(
+                original_mesh, original_material
+            )
+        )
+
+        # The pick: by path, through the recorded step the picker queues. The
+        # mesh is not loaded before this, so the step loads it.
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} MeshRendererComponent mesh models/plane.obj".format(mesh_entity)
+        )
+        session.wait(
+            re.escape(REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="mesh")[^\n]*asset="models/plane\.obj"',
+            60,
+            "the mesh pick",
+            begin,
+        )
+        session.wait(
+            asset_row_pattern("mesh", "models/plane.obj"),
+            30,
+            "the row names the picked mesh",
+            begin,
+        )
+        print("  [OK] picking another mesh loaded and assigned it")
+
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the pick's undo", begin)
+        session.wait(
+            asset_row_pattern("mesh", original_mesh),
+            30,
+            "the row names the original mesh again",
+            begin,
+        )
+        print("  [OK] undo restored the original mesh")
+
+        begin = len(session.read_log())
+        session.send("edit set {} MeshRendererComponent mesh none".format(mesh_entity))
+        session.wait(
+            asset_row_pattern("mesh", "None"), 30, "the cleared reference", begin
+        )
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the clear's undo", begin)
+        session.wait(
+            asset_row_pattern("mesh", original_mesh),
+            30,
+            "the mesh row restored after the clear",
+            begin,
+        )
+        print("  [OK] the reference cleared and came back")
+
+        # The material pick: the staged file is indexed but loaded by nothing,
+        # so assigning it is what loads it.
+        staged_material = "materials/s16_reference.material"
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} MeshRendererComponent material {}".format(
+                mesh_entity, staged_material
+            )
+        )
+        session.wait(
+            re.escape(REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="material")[^\n]*asset="'
+            + re.escape(staged_material)
+            + r'"',
+            60,
+            "the material pick",
+            begin,
+        )
+        session.wait(
+            asset_row_pattern("material", staged_material),
+            30,
+            "the row names the picked material",
+            begin,
+        )
+        print("  [OK] picking the staged, unloaded material loaded and assigned it")
+
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the material pick's undo", begin)
+        session.wait(
+            asset_row_pattern("material", original_material),
+            30,
+            "the row names the original material again",
+            begin,
+        )
+        print("  [OK] undo restored the original material")
+
+        # The drop: the material's tile dragged from the Assets tab onto the
+        # material row. The Assets tab is brought to the front first: the grid
+        # only draws - and so only logs its tiles - while it is visible.
+        begin = len(session.read_log())
+        session.send("tab assets")
+        session.send("browser materials")
+        tile_pattern = (
+            re.escape(REFERENCE_TILE_RECT_TOKEN)
+            + r'(?=[^\n]*path="'
+            + re.escape(staged_material)
+            + r'")[^\n]*'
+        )
+        session.wait(tile_pattern, 30, "the material tile's rectangle", begin)
+        # The Inspector's body is shorter than its rows, and the mesh renderer
+        # sits below it: the sections above it are collapsed, as a person
+        # collapsing a header does, so its rows come on screen. A row logs its
+        # rectangle only while its centre is visible - the box a drop lands in.
+        collapsed_sections = (
+            "italian_brainrot::ShowcaseComponent",
+            "italian_brainrot::TagAlphaComponent",
+            "pill_master_renderer::component::TransformComponent",
+        )
+        visible_from = len(session.read_log())
+        for component in collapsed_sections:
+            begin = len(session.read_log())
+            x, y, width, height = inspector_section_rect(session, component)
+            session.send("click {:.0f} {:.0f}".format(x + 12.0, y + 6.0))
+            session.wait(
+                re.escape(INSPECTOR_SECTION_TOKEN)
+                + r'(?=[^\n]*component="'
+                + re.escape(component)
+                + r'")[^\n]*collapsed=true',
+                30,
+                "the {} section collapsed".format(component.rsplit("::", 1)[-1]),
+                begin,
+            )
+        row_rect_pattern = (
+            re.escape(REFERENCE_ROW_RECT_TOKEN)
+            + r'(?=[^\n]*MeshRendererComponent\.material")[^\n]*'
+        )
+        session.wait(row_rect_pattern, 30, "the material row's rectangle", visible_from)
+        row_rect = logged_rect_bounds(
+            last_log_match(session, row_rect_pattern, visible_from).group(0)
+        )
+        print("  [OK] the material row came on screen")
+        tile_x, tile_y = logged_rect_centre(last_log_match(session, tile_pattern).group(0))
+        row_x, row_y = rect_center(row_rect)
+        begin = len(session.read_log())
+        session.send(f"drag {tile_x:.0f} {tile_y:.0f} {row_x:.0f} {row_y:.0f}")
+        session.wait(
+            re.escape(REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="material")[^\n]*asset="'
+            + re.escape(staged_material)
+            + r'"',
+            60,
+            "the dropped material",
+            begin,
+        )
+        session.wait(
+            asset_row_pattern("material", staged_material),
+            30,
+            "the row names the dropped material",
+            begin,
+        )
+        print("  [OK] dropping a material tile onto the row assigned it")
+
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the drop's undo", begin)
+        session.wait(
+            asset_row_pattern("material", original_material),
+            30,
+            "the original material after the undo",
+            begin,
+        )
+        # The sections are opened again - each header is on screen when its
+        # turn comes - so the steps after this see the Inspector as they did.
+        for component in reversed(collapsed_sections):
+            begin = len(session.read_log())
+            x, y, width, height = inspector_section_rect(session, component)
+            session.send("click {:.0f} {:.0f}".format(x + 12.0, y + 6.0))
+            session.wait(
+                re.escape(INSPECTOR_SECTION_TOKEN)
+                + r'(?=[^\n]*component="'
+                + re.escape(component)
+                + r'")[^\n]*collapsed=false',
+                30,
+                "the {} section expanded".format(component.rsplit("::", 1)[-1]),
+                begin,
+            )
+        print("  [OK] an asset reference picked, undid, cleared and took a drop")
+
+        begin = len(session.read_log())
+        session.send("select entity {}".format(prior_entity))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+            30,
+            "the prior selection restored",
+            begin,
+        )
+        print("  [OK] the prior selection is back")
+
         # Step 3a9: the multi-selection (W-0038 Stage 16). Ctrl adds, Shift
         # ranges, a plain click resets, and a field edit over the set is one
         # recorded step that undoes in one.
@@ -1689,6 +2035,7 @@ def main() -> int:
         }
         win_clipboard.write_payload(json.dumps(component_payload))
         begin = len(session.read_log())
+        applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
         session.send("command editor.paste")
         session.wait(
             re.escape(CLIPBOARD_PASTED_TOKEN) + r'\s+kind="component"',
@@ -1696,6 +2043,10 @@ def main() -> int:
             "the component paste",
             begin,
         )
+        # The paste is logged when the payload is decoded; its commands cross
+        # the frame boundary after that, so the dump below would otherwise race
+        # the write it is meant to read.
+        wait_applied(applied_before, "the component paste applied")
         begin = len(session.read_log())
         session.send(
             "dump field {} {} frame".format(prior_entity, SHOWCASE_COMPONENT)
@@ -1720,17 +2071,6 @@ def main() -> int:
             )
         )
         print("  [OK] a component paste applied and undid in one step")
-
-        # The entity copy is taken here and pasted by the restart session
-        # below: the clipboard is the OS's, so the paste crosses a process
-        # boundary and the two editors never have to run at once.
-        win_clipboard.clear()
-        begin = len(session.read_log())
-        session.send("command editor.copy")
-        session.wait(
-            re.escape(CLIPBOARD_WRITTEN_TOKEN), 30, "the second clipboard write", begin
-        )
-        print("  [OK] an entity copy sits on the OS clipboard for the next editor")
 
         # Step 3a11: an OS drop into Assets (W-0038 Stage 18). winit's drop
         # events cannot be synthesised from the command file, so the paths go to
@@ -3997,6 +4337,41 @@ def main() -> int:
         # and its clean exit code.
         menu_click(session, "help", "About Pill Editor", "About Pill Editor")
         print("  [OK] the Help menu opened the About window")
+        # The entity copy the restart session pastes is taken here, one step
+        # before the quit. The clipboard is the OS's - any other program can
+        # replace it - so the copy is refreshed right before the editor leaves
+        # instead of two minutes earlier, and read back to prove it landed.
+        # The copy follows the selection, and the asset steps above left an
+        # asset selected: a copy of that writes an asset payload, not an
+        # entity. The handle comes from the list the editor has now, because
+        # the reloads above renumber the display handles.
+        listed = session.request(
+            "dump entities",
+            re.escape(ENTITIES_DUMP_TOKEN),
+            30,
+            "the entity list for the copy",
+        )
+        handles = re.findall(r'display="([^"]+)"', listed)
+        assert handles, "no entity to copy: {}".format(listed[-400:])
+        begin = len(session.read_log())
+        session.send("select entity {}".format(handles[0]))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + r'\s+entity=[^ ]+\s+count=1\b',
+            30,
+            "the entity re-selected for the copy",
+            begin,
+        )
+        win_clipboard.clear()
+        begin = len(session.read_log())
+        session.send("command editor.copy")
+        session.wait(
+            re.escape(CLIPBOARD_WRITTEN_TOKEN), 30, "the second clipboard write", begin
+        )
+        copied = json.loads(win_clipboard.read_payload())
+        assert copied.get("kind") == "entity", (
+            "the entity copy did not reach the clipboard: {}".format(copied)
+        )
+        print("  [OK] an entity copy sits on the OS clipboard for the next editor")
         begin = len(session.read_log())
         menu_click(session, "file", "Quit Editor", "Quit Editor")
         session.wait(re.escape(QUIT_REQUESTED_TOKEN), 30, "the quit reached the frontend", begin)
@@ -4025,6 +4400,13 @@ def main() -> int:
         ):
             for path in asset_root.glob(pattern):
                 path.unlink(missing_ok=True)
+        # The staged material and the folder it needed go together; the
+        # example ships no materials folder, so an empty one is the step's.
+        staged_materials = asset_root / "materials"
+        for path in staged_materials.glob("s16_reference*"):
+            path.unlink(missing_ok=True)
+        if staged_materials.is_dir() and not any(staged_materials.iterdir()):
+            staged_materials.rmdir()
         # The settings step's sidecars return to their recorded bytes: the
         # engine's normalization reorders their keys even when the values
         # come back through undo.
@@ -4035,6 +4417,16 @@ def main() -> int:
     # above quit through File -> Quit, which wrote the rearranged dock - the
     # second viewport floating on its own surface, in front - into the
     # sandbox; a second session on the same sandbox must open with it.
+    # The copy the restart pastes crosses a process boundary through the OS
+    # clipboard, so it is checked here as well: a payload another program
+    # replaced reports itself, instead of surfacing as a timeout a minute into
+    # the restarted editor.
+    leftover = win_clipboard.read_payload()
+    assert leftover and json.loads(leftover).get("kind") == "entity", (
+        "the entity copy did not survive the quit: payload={!r} text={!r}".format(
+            leftover, win_clipboard.read_text()
+        )
+    )
     restart = EditorSession(
         "egui",
         "restart",

@@ -2753,6 +2753,7 @@ dependencies = [
  "serde_json",
  "skrifa",
  "thiserror 2.0.20",
+ "trait_type_map",
  "uuid",
 ]
 

@@ -659,6 +659,7 @@ mod tests {
             entity,
             components: vec![
                 ComponentView {
+                    asset_labels: Vec::new(),
                     type_name: "Position".to_string(),
                     persistable: true,
                     editable: true,
@@ -666,6 +667,7 @@ mod tests {
                     values: vec![FieldValue::F32(1.5), FieldValue::F32(-2.25)],
                 },
                 ComponentView {
+                    asset_labels: Vec::new(),
                     type_name: "Opaque".to_string(),
                     persistable: false,
                     editable: false,
@@ -836,6 +838,7 @@ mod tests {
         snapshot.detail = Some(EntityDetail {
             entity,
             components: vec![ComponentView {
+                asset_labels: Vec::new(),
                 type_name: "Position".to_string(),
                 persistable: true,
                 editable: true,

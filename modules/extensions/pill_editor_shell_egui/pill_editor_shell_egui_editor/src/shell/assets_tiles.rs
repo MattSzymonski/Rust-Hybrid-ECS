@@ -49,6 +49,33 @@ pub struct AssetTileWrites<'a> {
     pub drag_out: &'a mut Option<String>,
 }
 
+/// Log a tile's rectangle once per placement, so a suite can drag a file onto
+/// a drop target (an Inspector asset row, a folder) without reading pixels.
+pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::Rect) {
+    let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
+    if let Some((_, logged)) = browser
+        .tile_rects
+        .iter_mut()
+        .find(|(logged_path, _)| logged_path == path)
+    {
+        if *logged == corners {
+            return;
+        }
+        *logged = corners;
+    } else {
+        browser.tile_rects.push((path.to_owned(), corners));
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        path,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] assets tile rect"
+    );
+}
+
 /// One grid tile: the row's duotone icon and its name, the selection and
 /// hover washes, the double-click that opens a folder, the drag a tile
 /// carries and the menu the right-click opens.
@@ -61,6 +88,7 @@ pub fn asset_tile(
     writes: &mut AssetTileWrites<'_>,
 ) {
     let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
+    remember_tile_rect(browser, &row.path, rect);
     let visuals = ui.visuals().clone();
     let selected = writes.selection.asset.as_deref() == Some(row.path.as_str());
     if selected || response.hovered() {
@@ -154,22 +182,33 @@ pub fn asset_icon(row: &AssetListing) -> icons::Icon {
     if browser::is_folder(row) {
         return icons::Icon::Folder;
     }
-    let type_leaf = row.kind.rsplit("::").next().unwrap_or(row.kind.as_str());
+    let type_icon = asset_type_icon(&row.kind);
+    if !matches!(type_icon, icons::Icon::File) {
+        return type_icon;
+    }
     let extension = row
         .path
         .rsplit_once('.')
         .map(|(_, extension)| extension.to_ascii_lowercase())
         .unwrap_or_default();
-    match type_leaf {
+    match extension.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "tga" | "hdr" => icons::Icon::Image,
+        "obj" | "gltf" | "glb" => icons::Icon::Cube,
+        "hlsl" | "wgsl" | "glsl" | "frag" | "vert" | "comp" => icons::Icon::Code,
+        _ => icons::Icon::File,
+    }
+}
+
+/// The icon an asset type draws, by its last type-name segment: what a tile
+/// of that type shows, and what an Inspector asset row puts before the
+/// asset's name.
+pub fn asset_type_icon(asset_type: &str) -> icons::Icon {
+    match asset_type.rsplit("::").next().unwrap_or(asset_type) {
         "Mesh" => icons::Icon::Cube,
         "Texture" => icons::Icon::Image,
         "Material" => icons::Icon::Sphere,
-        _ => match extension.as_str() {
-            "png" | "jpg" | "jpeg" | "bmp" | "tga" | "hdr" => icons::Icon::Image,
-            "obj" | "gltf" | "glb" => icons::Icon::Cube,
-            "hlsl" | "wgsl" | "glsl" | "frag" | "vert" | "comp" => icons::Icon::Code,
-            _ => icons::Icon::File,
-        },
+        "Shader" => icons::Icon::Code,
+        _ => icons::Icon::File,
     }
 }
 

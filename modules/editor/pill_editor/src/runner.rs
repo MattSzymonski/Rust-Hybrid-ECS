@@ -3592,6 +3592,28 @@ impl EditorWindow {
         else {
             return;
         };
+        let targets = inspector::selection_targets(&details, entity, &component);
+        // An asset reference: the same recorded step for the whole selection,
+        // resolved where it is applied (W-0048).
+        if matches!(current, FieldValue::Asset { .. }) {
+            let reference = (!inspector::is_cleared_reference(value_text))
+                .then(|| value_text.trim().to_owned());
+            let (commands, label, coalesce) =
+                inspector::selection_asset_edit(&targets, entity, &component, field, reference);
+            let written = commands.len();
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                pending.push_recorded(commands, label, Some(coalesce));
+            }
+            info!(
+                target: telemetry_target::ENGINE,
+                component = component.as_str(),
+                field,
+                entities = written,
+                "[editor] selection field edit queued"
+            );
+            return;
+        }
         let value = match inspector::parse_field_value(value_text, &current) {
             Ok(value) => value,
             Err(message) => {
@@ -3604,7 +3626,6 @@ impl EditorWindow {
                 return;
             }
         };
-        let targets = inspector::selection_targets(&details, entity, &component);
         let (commands, label, coalesce) =
             inspector::selection_field_edit(&targets, entity, &component, field, value);
         let written = commands.len();
@@ -3636,6 +3657,20 @@ impl EditorWindow {
         else {
             return;
         };
+        // An asset reference takes a path or a guid (or `none`), resolved -
+        // and loaded when it is not loaded yet - where the step is applied
+        // (W-0048).
+        if matches!(current, FieldValue::Asset { .. }) {
+            let reference = (!inspector::is_cleared_reference(value_text))
+                .then(|| value_text.trim().to_owned());
+            let (edit, label) = inspector::asset_edit(entity, &component, field, reference);
+            let coalesce = inspector::field_coalesce_key(entity, &component, field);
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                pending.push_recorded(vec![edit], label, Some(coalesce));
+            }
+            return;
+        }
         let value = match inspector::parse_field_value(value_text, &current) {
             Ok(value) => value,
             Err(message) => {

@@ -4,7 +4,12 @@
 //!
 //! - `inspector_field_row`: the decorators a component declares (`[Header]`, `[Space]`, `[Tooltip]`, `[Range]`, `[Min]`, the multi-line boxes, `[HideInInspector]`) applied to one field's row.
 //! - `inspector_row` and `is_scalar_field`: which control a field gets.
+//! - `inspector_asset_row`: an asset reference field's row - the named asset,
+//!   its type's picker, clear, and a drop target for the Assets tab (W-0048).
 //! - `remember_inspector_row` and `field_widget_name`: the once-per-row logging the suite asserts on.
+//! - `remember_asset_row_text` and `remember_asset_row_rect`: an asset row's
+//!   current text (logged per change) and its rectangle (logged per placement),
+//!   which the editor suite waits on.
 //!
 //! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
 //! below are absolute paths, so a patch crate resolves them too.
@@ -27,6 +32,7 @@ pub fn inspector_field_row(
     row: &inspector::FieldRow,
     targets: &[Entity],
     details: &[EntityDetail],
+    assets: &[AssetListing],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
 ) {
@@ -224,6 +230,29 @@ pub fn inspector_field_row(
                 }
             });
         }
+        inspector::FieldRow::Asset {
+            index,
+            field,
+            asset_type,
+            tooltip,
+        } => {
+            inspector_asset_row(
+                ui,
+                AssetRowInput {
+                    entity,
+                    component,
+                    index: *index,
+                    field,
+                    asset_type: asset_type.as_deref(),
+                    tooltip: tooltip.as_deref(),
+                    targets,
+                    details,
+                    assets,
+                },
+                pending,
+                session,
+            );
+        }
         inspector::FieldRow::ReadOnly {
             index,
             field,
@@ -251,6 +280,238 @@ pub fn inspector_field_row(
             });
         }
     }
+}
+
+/// What one asset reference row draws from: the field, its component and
+/// the selection it writes to, and the project's assets the picker offers.
+pub struct AssetRowInput<'a> {
+    /// The primary entity the row describes.
+    pub entity: Entity,
+    /// The component section the row belongs to.
+    pub component: &'a ComponentView,
+    /// The field's position in the component's field list.
+    pub index: usize,
+    /// The field's registered name.
+    pub field: &'a str,
+    /// The registered asset type the field references, when recorded.
+    pub asset_type: Option<&'a str>,
+    /// The field's `[Tooltip]`, if it declared one.
+    pub tooltip: Option<&'a str>,
+    /// Every entity the edit reaches (the primary first).
+    pub targets: &'a [Entity],
+    /// The selected entities' details, for the mixed-value marker.
+    pub details: &'a [EntityDetail],
+    /// The project's assets, as the Assets tab lists them.
+    pub assets: &'a [AssetListing],
+}
+
+/// One asset reference row (W-0048): a button naming the referenced asset,
+/// which opens a picker of every asset of the field's type, a clear button,
+/// and a drop target that takes an asset dragged from the Assets tab.
+///
+/// Every choice queues one recorded `SetFieldAsset` step for the whole
+/// selection; an unloaded asset is loaded when the step is applied.
+pub fn inspector_asset_row(
+    ui: &mut egui::Ui,
+    input: AssetRowInput<'_>,
+    pending: &mut PendingEditorCommands,
+    session: &mut InspectorSession,
+) {
+    let type_name = input.component.type_name.as_str();
+    let label = input
+        .component
+        .asset_labels
+        .get(input.index)
+        .cloned()
+        .flatten()
+        .unwrap_or(AssetReferenceLabel::Missing);
+    let text = label.text().to_owned();
+    // One line per row and text: the row reports the asset it draws the first
+    // time it appears and whenever that asset changes, so a suite can wait for
+    // a pick to show up - and for the previous asset to show up again after an
+    // undo. The entity is part of the key: two entities holding one asset are
+    // still two rows.
+    let key = format!("{}.{type_name}.{}", input.entity, input.field);
+    if remember_asset_row_text(session, &key, &text) {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            entity = %input.entity,
+            component = type_name,
+            field = input.field,
+            asset_type = input.asset_type.unwrap_or_default(),
+            asset = text.as_str(),
+            "[editor] inspector row kind=asset"
+        );
+    }
+
+    // `Some(None)` clears the reference, `Some(Some(path))` points it at an
+    // asset; collected while drawing and queued once afterwards.
+    let mut chosen: Option<Option<String>> = None;
+    let mut button_rect = None;
+    let row_label = match input.component.values.get(input.index) {
+        Some(value) => row_label(input.field, input.details, type_name, input.index, value),
+        None => input.field.to_owned(),
+    };
+    inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
+        let width = (ui.available_width() - ASSET_ROW_CLEAR_WIDTH).max(40.0);
+        let color = match label {
+            AssetReferenceLabel::Named(_) => style::TEXT,
+            _ => style::TEXT_MUTED,
+        };
+        let icon = assets_tiles::asset_type_icon(input.asset_type.unwrap_or_default());
+        let response = ui.add_sized(
+            egui::vec2(width, 18.0),
+            egui::Button::new(icons::rich(icon, &text).color(color)).truncate(),
+        );
+        // A file dragged from the Assets tab lands here; hovering one marks
+        // the row so the drop is visibly accepted.
+        if response.dnd_hover_payload::<String>().is_some() {
+            ui.painter().rect_stroke(
+                response.rect,
+                2.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        if let Some(path) = response.dnd_release_payload::<String>() {
+            chosen = Some(Some((*path).clone()));
+        }
+        if response.clicked() {
+            session.asset_picker = match session.asset_picker.as_deref() {
+                Some(open) if open == key => None,
+                _ => Some(key.clone()),
+            };
+            session.asset_search.clear();
+        }
+        button_rect = Some((response.rect, response.interact_rect));
+        if ui
+            .add_enabled(
+                !matches!(label, AssetReferenceLabel::Unset),
+                egui::Button::new("x").small(),
+            )
+            .on_hover_text("Clear the reference")
+            .clicked()
+        {
+            chosen = Some(None);
+        }
+    });
+    if let Some((rect, interact)) = button_rect {
+        remember_asset_row_rect(session, &key, rect, interact.contains(rect.center()));
+    }
+
+    // The picker opens under its row: a search box, then the field's
+    // candidates, with `None` first.
+    if session.asset_picker.as_deref() == Some(key.as_str()) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut session.asset_search)
+                    .hint_text("Search assets")
+                    .desired_width(f32::INFINITY),
+            );
+            let search = session.asset_search.to_lowercase();
+            egui::ScrollArea::vertical()
+                .max_height(ASSET_PICKER_HEIGHT)
+                .show(ui, |ui| {
+                    if ui.selectable_label(false, "None").clicked() {
+                        chosen = Some(None);
+                    }
+                    for candidate in inspector::asset_candidates(input.assets, input.asset_type)
+                        .into_iter()
+                        .filter(|candidate| candidate.path.to_lowercase().contains(&search))
+                    {
+                        let current = matches!(&label, AssetReferenceLabel::Named(name)
+                            if *name == candidate.path);
+                        if ui.selectable_label(current, &candidate.path).clicked() {
+                            chosen = Some(Some(candidate.path.clone()));
+                        }
+                    }
+                });
+        });
+    }
+
+    if let Some(reference) = chosen {
+        session.asset_picker = None;
+        let (commands, label, coalesce) = inspector::selection_asset_edit(
+            input.targets,
+            input.entity,
+            type_name,
+            input.field,
+            reference,
+        );
+        pending.push_recorded(commands, label, Some(coalesce));
+    }
+}
+
+/// Width the clear button takes beside an asset row's button.
+pub const ASSET_ROW_CLEAR_WIDTH: f32 = 24.0;
+
+/// Height the asset picker's list scrolls within.
+pub const ASSET_PICKER_HEIGHT: f32 = 180.0;
+
+/// Record the asset an asset row draws, returning whether it changed since
+/// the last frame that drew the row: the row logs its current asset on its
+/// first draw and on every change, so a suite can wait for a pick to show up
+/// and for an undo to bring the previous asset back.
+pub fn remember_asset_row_text(session: &mut InspectorSession, key: &str, text: &str) -> bool {
+    if let Some((_, logged)) = session
+        .asset_row_texts
+        .iter_mut()
+        .find(|(logged_key, _)| logged_key == key)
+    {
+        if logged == text {
+            return false;
+        }
+        logged.clear();
+        logged.push_str(text);
+        return true;
+    }
+    session
+        .asset_row_texts
+        .push((key.to_owned(), text.to_owned()));
+    true
+}
+
+/// Log an asset row's rectangle once per placement, keyed by
+/// `entity.component.field`, so a suite can drop an asset onto it.
+///
+/// Only a row whose centre is inside its visible area is logged: a row
+/// scrolled out of the panel cannot be clicked or dropped on, so the suite
+/// sees a rectangle only while the row is actually reachable, and a fresh one
+/// after it is scrolled back into view.
+pub fn remember_asset_row_rect(
+    session: &mut InspectorSession,
+    key: &str,
+    rect: egui::Rect,
+    visible: bool,
+) {
+    let existing = session
+        .asset_row_rects
+        .iter()
+        .position(|(logged_key, _)| logged_key == key);
+    if !visible {
+        if let Some(index) = existing {
+            session.asset_row_rects.remove(index);
+        }
+        return;
+    }
+    if let Some(index) = existing {
+        let (_, logged) = &mut session.asset_row_rects[index];
+        if *logged == rect {
+            return;
+        }
+        *logged = rect;
+    } else {
+        session.asset_row_rects.push((key.to_owned(), rect));
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        row = key,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] inspector asset row rect"
+    );
 }
 
 /// The label a row draws, marked when the selection disagrees on its value
