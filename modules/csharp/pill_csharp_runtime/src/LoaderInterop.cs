@@ -137,9 +137,10 @@ public static unsafe class LoaderInterop
     /// Bumped to 16 by the parallel-dispatch slot appended to the API table.
     /// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
     /// slots left the table, and the mirror text, native resource and asset
-    /// store slots were appended.
+    /// store slots were appended. Bumped to 18 by the entity stable-id slot
+    /// appended to the table.
     /// </summary>
-    public const uint InteropContractVersion = 17;
+    public const uint InteropContractVersion = 18;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT

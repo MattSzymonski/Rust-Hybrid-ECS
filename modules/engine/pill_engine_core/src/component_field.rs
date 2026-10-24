@@ -799,15 +799,17 @@ impl World {
     /// colour or vector channel by channel. Resolution sees the layouts
     /// registered so far, so the nested type registers first.
     ///
-    /// The common case - nothing to expand - keeps borrowing the caller's
-    /// `'static` slice; only an actual expansion copies into an owned layout.
+    /// The declared slice is kept beside the flattened view: a generated
+    /// mirror describes declarations, not leaf rows. The common case - nothing
+    /// to expand - borrows the caller's `'static` slice for both; only an
+    /// actual expansion copies into an owned editor layout.
     pub(crate) fn record_component_field_layout(
         &mut self,
         component_id: ComponentId,
         fields: &'static [ComponentFieldDescriptor],
     ) {
         let layout = match self.expanded_field_layout(fields) {
-            Some(expanded) => crate::world::ComponentFieldLayout::from_owned(expanded),
+            Some(expanded) => crate::world::ComponentFieldLayout::from_expanded(fields, expanded),
             None => crate::world::ComponentFieldLayout::from_static(fields),
         };
         self.component_field_layouts.insert(component_id, layout);
@@ -1806,6 +1808,35 @@ mod tests {
             world.read_component_field(entity, name, "inner.b").unwrap(),
             FieldValue::F32(9.0)
         );
+    }
+
+    /// The declared view keeps the nesting the editor view flattens: a mirror
+    /// is a struct declaration, and a leaf row names no field a struct has.
+    #[test]
+    fn the_declared_layout_keeps_nested_fields_whole() {
+        let mut world = nested_world();
+        world.replace_value_type_layout_resolver(Some(probe_value_types));
+        world.register_component_with_layout::<PointArray>(POINT_ARRAY_FIELDS);
+        world.replace_value_type_layout_resolver(None);
+
+        let declared = world
+            .component_declared_field_layout(ComponentId::of::<NestedOuter>())
+            .expect("NestedOuter registered with a layout");
+        let names: Vec<&str> = declared.iter().map(|field| field.name).collect();
+        assert_eq!(names, ["lead", "inner", "probe"]);
+        assert_eq!(declared[1].type_tag, "struct:NestedInner");
+        assert_eq!(declared[1].offset, 4);
+        assert_eq!(declared[1].size, 8, "the whole nested struct, not a leaf");
+
+        // An array of structs stays one array field, so the mirror emits the
+        // elements it declares rather than one struct field per leaf.
+        let declared = world
+            .component_declared_field_layout(ComponentId::of::<PointArray>())
+            .expect("PointArray registered with a layout");
+        let names: Vec<&str> = declared.iter().map(|field| field.name).collect();
+        assert_eq!(names, ["lead", "points"]);
+        assert_eq!(declared[1].type_tag, "array:struct:ProbeVector");
+        assert_eq!(declared[1].element_count, 2);
     }
 
     /// A `struct:` field whose type has no known layout stays one opaque row

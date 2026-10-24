@@ -245,6 +245,11 @@ pub struct ModuleExposedComponent {
     /// component was declared with `#[derive(PillComponent)]`. Empty for
     /// hand-registered or managed components, which keep the opaque ABI-blob
     /// mirror.
+    ///
+    /// These are the fields *as declared*: a mirror is a struct declaration, so
+    /// a nested `struct:` field stays one field and its C# type is resolved by
+    /// the codegen. The editor's flattened leaf rows (`points[0].y`) describe
+    /// an inspector, not a type, and would name fields C# cannot declare.
     #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     pub fields: Vec<ComponentFieldDescriptor>,
 }
@@ -272,7 +277,9 @@ pub fn exposed_components_from_names(
         .filter_map(|type_name| {
             let component_id = resolve_exposed_component_id(world, type_name)?;
             let (size, align) = world.component_layout(component_id)?;
-            let fields = world.component_field_layout(component_id).unwrap_or(&[]);
+            let fields = world
+                .component_declared_field_layout(component_id)
+                .unwrap_or(&[]);
             Some(ModuleExposedComponent {
                 csharp_name: type_name.replace("::", "."),
                 component_id,

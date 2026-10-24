@@ -43,7 +43,7 @@ use crate::commands::CommandQueue;
 use crate::component::{
     Component, ComponentId, ComponentMask, ComponentRegistry, ComponentTicks, Tick,
 };
-use crate::entity::Entity;
+use crate::entity::{Entity, EntityId};
 use crate::query::change_detection::Mut;
 use crate::resource::{ErasedResource, ErasedResourceOps, Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
@@ -249,39 +249,73 @@ pub struct EntityRow {
     pub components: Vec<String>,
 }
 
-/// Where a component's field layout came from.
-///
-/// One component's field list, declared either way.
+/// One component's field list, in the two forms the world needs.
 ///
 /// Native components submit a `&'static` slice from their declaring
 /// artifact's static data; components defined by another language describe
 /// themselves in a runtime manifest, so their layout is owned by the `World`
-/// instead. The difference is storage, not meaning, so it lives in a single
-/// `Cow`; the editor reads the list through [`World::component_field_layout`].
+/// instead. The difference is storage, not meaning, so each form lives in a
+/// `Cow`.
+///
+/// The list is kept twice because the two readers want different things. The
+/// **declared** fields are what the type actually contains, which is what a
+/// generated mirror (the C# struct) has to describe. The **editor** view
+/// flattens `struct:` fields into one dotted leaf row per channel
+/// (`position.x`), which is what makes a nested colour editable row by row
+/// but describes no declaration a mirror could emit. Both views are the same
+/// slice when nothing needed flattening.
 #[derive(Debug, Clone)]
-pub(crate) struct ComponentFieldLayout(
-    std::borrow::Cow<'static, [crate::component_registry::ComponentFieldDescriptor]>,
-);
+pub(crate) struct ComponentFieldLayout {
+    /// The fields exactly as the declaring artifact registered them.
+    declared: std::borrow::Cow<'static, [crate::component_registry::ComponentFieldDescriptor]>,
+    /// The editor's view: `struct:` fields flattened into dotted leaf rows.
+    editor: std::borrow::Cow<'static, [crate::component_registry::ComponentFieldDescriptor]>,
+}
 
 impl ComponentFieldLayout {
     /// Wrap a compile-time layout living in the declaring artifact's static data.
     pub(crate) fn from_static(
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) -> Self {
-        Self(std::borrow::Cow::Borrowed(fields))
+        Self {
+            declared: std::borrow::Cow::Borrowed(fields),
+            editor: std::borrow::Cow::Borrowed(fields),
+        }
+    }
+
+    /// Wrap a compile-time layout whose editor view needed flattening.
+    pub(crate) fn from_expanded(
+        declared: &'static [crate::component_registry::ComponentFieldDescriptor],
+        editor: Vec<crate::component_registry::ComponentFieldDescriptor>,
+    ) -> Self {
+        Self {
+            declared: std::borrow::Cow::Borrowed(declared),
+            editor: std::borrow::Cow::Owned(editor),
+        }
     }
 
     /// Wrap a runtime-described layout owned by the world (foreign-language
-    /// components).
+    /// components and resources).
+    ///
+    /// Nothing flattens these: a manifest describes fields it wants seen as
+    /// they are, so the two views are one list.
     pub(crate) fn from_owned(
         fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
     ) -> Self {
-        Self(std::borrow::Cow::Owned(fields))
+        Self {
+            declared: std::borrow::Cow::Owned(fields.clone()),
+            editor: std::borrow::Cow::Owned(fields),
+        }
     }
 
-    /// The field list, whichever lane declared it.
+    /// The editor's view: nested `struct:` fields flattened into leaf rows.
     pub(crate) fn fields(&self) -> &[crate::component_registry::ComponentFieldDescriptor] {
-        &self.0
+        &self.editor
+    }
+
+    /// The fields as declared, which a generated mirror has to describe.
+    pub(crate) fn declared(&self) -> &[crate::component_registry::ComponentFieldDescriptor] {
+        &self.declared
     }
 }
 
@@ -296,6 +330,17 @@ pub struct World {
     next_free_entity_id: u64,
     /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
     pub(crate) free_entity_ids: Vec<(u64, u32)>,
+    /// Stable id of every live entity, by its handle.
+    ///
+    /// World metadata rather than a component: it is one row per entity the
+    /// archetypes would otherwise have to carry through every move, and no
+    /// query ever needs it as data (W-0048 Stage 5).
+    entity_ids: HashMap<Entity, EntityId>,
+    /// Reverse of [`Self::entity_ids`], so a saved reference resolves in O(1).
+    entity_handles: HashMap<EntityId, Entity>,
+    /// Seeds the counter-derived ids used when the platform has no random
+    /// source; see [`Self::mint_entity_id`].
+    entity_id_fallback: u64,
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
     /// Tracks where each entity is located in the archetype system
@@ -522,6 +567,9 @@ impl World {
         Self {
             next_free_entity_id: 0,
             free_entity_ids: Vec::new(),
+            entity_ids: HashMap::new(),
+            entity_handles: HashMap::new(),
+            entity_id_fallback: 0,
             archetypes: HashMap::new(),
             entity_locations: HashMap::new(),
             storage_factories: HashMap::new(),
@@ -712,6 +760,14 @@ impl World {
                 index_in_archetype: index,
             },
         );
+
+        // Step 6: give the entity its stable id, indexed both ways. A
+        // descriptor entity is always created here rather than loaded from a
+        // file, so it never arrives with an id of its own; a scene load that
+        // must keep its ids goes through `EntityBuilder::with_id`.
+        let stable_id = self.mint_entity_id();
+        self.entity_ids.insert(entity, stable_id);
+        self.entity_handles.insert(stable_id, entity);
         Ok(entity)
     }
 
@@ -763,6 +819,57 @@ impl World {
     /// used by foreign-language runtimes.
     pub fn reserve_entity(&mut self) -> Entity {
         self.allocate_entity()
+    }
+
+    /// The stable id of a live entity, or `None` once it is destroyed.
+    ///
+    /// A handle names a slot; an [`EntityId`] names the entity itself and is
+    /// what data written for a later run stores. Both indexes are dropped
+    /// together when the entity is destroyed, so an id stops resolving with
+    /// its entity and never names a later occupant of the slot.
+    #[must_use]
+    pub fn entity_id(&self, entity: Entity) -> Option<EntityId> {
+        self.entity_ids.get(&entity).copied()
+    }
+
+    /// The live entity an [`EntityId`] names, or `None`.
+    #[must_use]
+    pub fn entity_by_id(&self, id: EntityId) -> Option<Entity> {
+        self.entity_handles.get(&id).copied()
+    }
+
+    /// Whether an [`EntityId`] already belongs to a live entity.
+    #[must_use]
+    pub fn entity_id_is_taken(&self, id: EntityId) -> bool {
+        self.entity_handles.contains_key(&id)
+    }
+
+    /// A fresh id for a newly inserted entity.
+    ///
+    /// Random, so an id says nothing about the order entities were spawned in
+    /// and a stale reference names nothing rather than a later occupant. Four
+    /// attempts cover a collision; after that - or when the platform has no
+    /// random source at all - the fallback derives an id from a counter, and
+    /// says so once, because a world that cannot spawn is worse than one whose
+    /// ids are predictable.
+    fn mint_entity_id(&mut self) -> EntityId {
+        for _ in 0..4 {
+            match EntityId::random() {
+                Ok(id) if !self.entity_id_is_taken(id) => return id,
+                Ok(_) => continue,
+                Err(error) => {
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        error = %error,
+                        "the platform has no random source; entity ids are derived from a counter"
+                    );
+                    break;
+                }
+            }
+        }
+        let id = EntityId::from_name(&format!("pill:entity:{}", self.entity_id_fallback));
+        self.entity_id_fallback = self.entity_id_fallback.wrapping_add(1);
+        id
     }
 
     /// Return a reserved entity handle that was never created.
@@ -851,6 +958,7 @@ impl World {
         EntityBuilder {
             world: self,
             entity,
+            stable_id: None,
             // Most entities have 3-8 components; pre-allocate to avoid
             // reallocation during .with() chains.
             components: Vec::with_capacity(
@@ -861,6 +969,10 @@ impl World {
 
     /// Insert an entity with its components into the appropriate archetype
     ///
+    /// `stable_id` is the id the creator supplied, or `None` to mint a fresh
+    /// one. The caller that supplies an id has already checked it is free;
+    /// the command path always passes `None`.
+    ///
     /// Note: the archetype's columns are type-erased, so pushing a component
     /// still needs its concrete type. Components are added via EntityBuilder,
     /// which has access to those types.
@@ -868,6 +980,7 @@ impl World {
         &mut self,
         entity: Entity,
         component_ids: Vec<ComponentId>,
+        stable_id: Option<EntityId>,
         insert_fn: F,
     ) where
         F: FnOnce(&mut ComponentColumns),
@@ -939,6 +1052,13 @@ impl World {
                 index_in_archetype: index,
             },
         );
+
+        // Step 6: give the entity its stable id, indexed both ways. The id is
+        // minted here rather than when the handle was reserved, so a handle
+        // that is reserved and never inserted costs nothing.
+        let stable_id = stable_id.unwrap_or_else(|| self.mint_entity_id());
+        self.entity_ids.insert(entity, stable_id);
+        self.entity_handles.insert(stable_id, entity);
     }
 
     /// Move an entity to a new archetype, carrying every component it keeps.
@@ -1268,6 +1388,12 @@ impl World {
             None => return false, // Entity doesn't exist
         };
 
+        // Step 1b: forget its stable id. Both indexes go together so the id
+        // never names a later occupant of the recycled slot.
+        if let Some(stable_id) = self.entity_ids.remove(&entity) {
+            self.entity_handles.remove(&stable_id);
+        }
+
         let archetype = match self.archetypes.get_mut(&location.archetype_id) {
             Some(arch) => arch,
             None => return false,
@@ -1453,11 +1579,23 @@ pub struct EntityBuilder<'w> {
     world: &'w mut World,
     /// Entity handle reserved by the free list for this build.
     entity: Entity,
+    /// Stable id the creator supplied, or `None` to mint a fresh one.
+    stable_id: Option<EntityId>,
     /// Type-erased components accumulated via [`with`](Self::with).
     components: Vec<Box<dyn ComponentInserter>>,
 }
 
 impl<'w> EntityBuilder<'w> {
+    /// Build the entity with an id the caller already chose.
+    ///
+    /// What a scene load does: the id written in the file has to be the id the
+    /// loaded entities carry, or every reference inside the scene would dangle.
+    /// [`build`](Self::build) refuses an id a live entity already holds.
+    pub fn with_id(mut self, id: EntityId) -> Self {
+        self.stable_id = Some(id);
+        self
+    }
+
     /// Add a component to the entity being built
     pub fn with<T>(mut self, component: T) -> Self
     where
@@ -1474,7 +1612,8 @@ impl<'w> EntityBuilder<'w> {
     ///
     /// Returns [`BuildError::ComponentNotRegistered`] if any of the component
     /// types added via [`.with()`](Self::with) were not registered with the
-    /// world beforehand.
+    /// world beforehand, and [`BuildError::DuplicateEntityId`] when the id
+    /// given to [`with_id`](Self::with_id) belongs to a live entity.
     pub fn build(self) -> Result<Entity, BuildError> {
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
@@ -1488,13 +1627,25 @@ impl<'w> EntityBuilder<'w> {
         // create the archetype (which would panic on an unregistered type).
         for &id in &component_ids {
             if !self.world.storage_factories.contains_key(&id) {
+                self.world.release_entity(entity);
                 return Err(BuildError::ComponentNotRegistered { id });
             }
         }
 
+        // A supplied id has to be free: two live entities under one id would
+        // make a saved reference ambiguous, and the reverse index keeps only
+        // one of them.
+        if let Some(id) = self.stable_id {
+            if self.world.entity_id_is_taken(id) {
+                self.world.release_entity(entity);
+                return Err(BuildError::DuplicateEntityId { id });
+            }
+        }
+
+        let stable_id = self.stable_id;
         let components = self.components;
         self.world
-            .insert_entity_with_components(entity, component_ids, |storage| {
+            .insert_entity_with_components(entity, component_ids, stable_id, |storage| {
                 for inserter in components {
                     inserter.insert(storage);
                 }

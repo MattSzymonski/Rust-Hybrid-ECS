@@ -28,7 +28,8 @@ use super::commands::{
     ffi_reserve_entity,
 };
 use super::queries::{
-    ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
+    ffi_entity_count, ffi_entity_stable_id, ffi_get_archetype_chunk, ffi_get_component_chunk,
+    ffi_get_entity_chunk,
 };
 use super::ResolvedMirrorMethod;
 use crate::INTEROP_CONTRACT_VERSION;
@@ -279,6 +280,10 @@ pub(super) struct CsEngineApi {
     /// Read a file below `res` through the mounted asset store for
     /// `AssetLoader.Load()`; see `mirror_calls::ffi_asset_loader_read`.
     asset_loader_read: extern "C" fn(*const u8, u32, *mut *const u8, *mut u32) -> u8,
+    /// Write a live entity's stable id as its low and high halves for
+    /// `Engine.TryGetStableId`; `0` wrote it, `1` the entity is not live.
+    /// Appended at the end like every earlier slot.
+    entity_stable_id: extern "C" fn(*const Entity, *mut u64, *mut u64) -> u8,
 }
 
 impl CsEngineApi {
@@ -322,6 +327,7 @@ impl CsEngineApi {
             take_mirror_text: super::mirror_calls::ffi_take_mirror_text,
             get_native_resource: super::mirror_calls::ffi_get_native_resource,
             asset_loader_read: super::mirror_calls::ffi_asset_loader_read,
+            entity_stable_id: ffi_entity_stable_id,
         }
     }
 }

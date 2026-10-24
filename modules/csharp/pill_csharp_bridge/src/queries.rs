@@ -487,3 +487,46 @@ pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
         ffi_entity_count_guarded(output)
     })
 }
+
+/// Write a live entity's stable id, split into two `u64` halves.
+///
+/// Status codes: `0` wrote the id, `1` the entity is not live (it was
+/// destroyed, or the handle belongs to another world), `3` no managed system is
+/// scheduled, and `5` a half was missing or the call could not be served.
+///
+/// Two halves rather than a `u128`: no C ABI in the table carries one, and the
+/// managed side re-assembles the pair into the hex form saved data uses
+/// (W-0048 Stage 5).
+fn ffi_entity_stable_id_guarded(entity: *const Entity, low: *mut u64, high: *mut u64) -> u8 {
+    if entity.is_null() || low.is_null() || high.is_null() {
+        return 5;
+    }
+    // SAFETY: `entity` was checked non-null above and points at a caller-owned
+    // handle for the duration of this call.
+    let entity = unsafe { entity.read() };
+    let Some(id) = with_active_world(|world| world.entity_id(entity)) else {
+        return 3;
+    };
+    let Some(id) = id else {
+        return 1;
+    };
+    let value = id.value();
+    // SAFETY: both halves were checked non-null above and point at
+    // caller-owned `u64`s for the duration of this call.
+    unsafe {
+        low.write(value as u64);
+        high.write((value >> 64) as u64);
+    }
+    0
+}
+
+/// Panic-guarded entry point for [`ffi_entity_stable_id_guarded`].
+pub(super) extern "C" fn ffi_entity_stable_id(
+    entity: *const Entity,
+    low: *mut u64,
+    high: *mut u64,
+) -> u8 {
+    super::context::guard_managed_callback("ffi_entity_stable_id", 5, || {
+        ffi_entity_stable_id_guarded(entity, low, high)
+    })
+}

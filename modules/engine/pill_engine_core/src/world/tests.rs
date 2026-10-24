@@ -95,6 +95,14 @@ fn descriptor_components_coexist_and_survive_archetype_migration() {
     );
     assert!(world.descriptor_component_bytes(entity, b).is_none());
     assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
+
+    // The archetype migrations above are what a reload's remap does to an
+    // entity's row; the stable id is world metadata and rides along (W-0048
+    // Stage 5).
+    let id = world
+        .entity_id(entity)
+        .expect("a descriptor-created entity has an id");
+    assert_eq!(world.entity_by_id(id), Some(entity));
 }
 
 /// A relayout rewrites rows where they are: entities keep their rows, values
@@ -1273,10 +1281,10 @@ fn test_create_entities_with_different_components() {
             archetype_id, archetype.component_mask, expected_mask
         );
 
-        println!("✓ Mask verified: {:?}", archetype.component_mask);
+        println!("âœ“ Mask verified: {:?}", archetype.component_mask);
     }
 
-    println!("\n✓ All 3 archetypes verified successfully!");
+    println!("\nâœ“ All 3 archetypes verified successfully!");
 }
 
 /// Tests adding a new component to an existing entity.
@@ -1713,7 +1721,7 @@ fn test_automatic_empty_archetype_cleanup() {
         "Entity should have 3 components"
     );
 
-    println!("✓ Empty archetype automatically cleaned up after entity migration");
+    println!("âœ“ Empty archetype automatically cleaned up after entity migration");
 }
 
 /// Test that archetype print_info displays component names and entity count
@@ -1787,7 +1795,7 @@ fn test_archetype_print_info() {
         comp_names
     );
 
-    println!("✓ Component names verified: {:?}", comp_names);
+    println!("âœ“ Component names verified: {:?}", comp_names);
 }
 
 /// Tests entity generation system for safe ID recycling.
@@ -1882,7 +1890,7 @@ fn test_entity_generations() {
         "Entities with different generations should not be equal"
     );
 
-    println!("✓ Entity generation recycling works correctly!");
+    println!("âœ“ Entity generation recycling works correctly!");
 }
 
 /// Tests multiple rounds of entity recycling.
@@ -1933,7 +1941,7 @@ fn test_multiple_entity_recycling_rounds() {
         last_entity = new_entity;
     }
 
-    println!("✓ Multiple recycling rounds work correctly!");
+    println!("âœ“ Multiple recycling rounds work correctly!");
 }
 
 /// Tests that multiple entities can be recycled independently.
@@ -2006,7 +2014,7 @@ fn test_free_list_lifo_order() {
     assert_eq!(new_entity4.id, 3, "Should allocate fresh ID 3");
     assert_eq!(new_entity4.generation, 0);
 
-    println!("✓ Free list LIFO order works correctly!");
+    println!("âœ“ Free list LIFO order works correctly!");
 }
 
 /// A slot whose generation reaches `u32::MAX` is retired instead of
@@ -2220,7 +2228,7 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     assert_eq!(new_entity3.id, 0, "Should reuse ID 1");
     assert_eq!(new_entity3.generation, 1, "Should have generation 1");
 
-    println!("✓ Generations with multiple archetypes and component removal work correctly!");
+    println!("âœ“ Generations with multiple archetypes and component removal work correctly!");
 }
 
 /// Tests that component data is correctly swap-removed when an entity is destroyed.
@@ -2298,7 +2306,7 @@ fn test_component_swap_remove_on_destroy() {
         pos2.y
     );
 
-    println!("✓ Component swap_remove works correctly!");
+    println!("âœ“ Component swap_remove works correctly!");
 }
 
 /// Tests that component data is properly cleaned up when an entity migrates between archetypes.
@@ -2404,7 +2412,7 @@ fn test_component_cleanup_on_archetype_migration() {
     assert!(world.get_component::<Velocity>(entity1).is_none());
     assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
 
-    println!("✓ Component cleanup on archetype migration works correctly!");
+    println!("âœ“ Component cleanup on archetype migration works correctly!");
 }
 
 /// Tests that `IteratorTimings` detects duplicate labels within a frame.
@@ -2456,7 +2464,7 @@ fn test_per_label_duplicate_detection() {
     // "physics" splitting hint was corrupted by the second write.
     assert_eq!(t.per_iterator_label_average_duration["physics"], 800_000);
 
-    println!("✓ Duplicate label detection works correctly!");
+    println!("âœ“ Duplicate label detection works correctly!");
 }
 
 /// The editor's Hierarchy source: `entity_rows` lists every live entity
@@ -3562,5 +3570,75 @@ fn a_relayout_drops_the_stored_resource_field_layout() {
     assert!(
         world.resource_field_layout(id).is_none(),
         "the layout that described the old shape is forgotten"
+    );
+}
+
+/// The stable-id index (W-0048 Stage 5): every created entity gets an id,
+/// the id resolves back to the entity, and destroying the entity drops both
+/// directions - so a stale id names nothing rather than a later occupant of
+/// the recycled slot.
+#[test]
+fn a_created_entity_has_an_id_that_dies_with_it() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    let entity = world
+        .create_entity()
+        .with(Position { x: 1.0, y: 2.0 })
+        .build()
+        .unwrap();
+    let id = world.entity_id(entity).expect("a created entity has an id");
+    assert_eq!(world.entity_by_id(id), Some(entity));
+
+    let other = world
+        .create_entity()
+        .with(Position { x: 0.0, y: 0.0 })
+        .build()
+        .unwrap();
+    let other_id = world.entity_id(other).expect("the second entity has one");
+    assert_ne!(id, other_id, "ids are not derived from the slot");
+
+    assert!(world.destroy_entity(entity));
+    assert_eq!(world.entity_id(entity), None);
+    assert_eq!(world.entity_by_id(id), None, "the id no longer resolves");
+
+    // The slot is recycled by the next create, and the recycled entity gets a
+    // fresh id: the old one must not come back with it.
+    let recycled = world
+        .create_entity()
+        .with(Position { x: 0.0, y: 0.0 })
+        .build()
+        .unwrap();
+    let recycled_id = world.entity_id(recycled).expect("it has one");
+    assert_ne!(recycled_id, id);
+}
+
+/// A creator that supplies the id keeps it, which is what a scene load needs;
+/// a second entity claiming the same id is refused before it is inserted.
+#[test]
+fn a_supplied_id_is_kept_and_a_duplicate_is_refused() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    let id = EntityId::new(0x5eed);
+    let loaded = world
+        .create_entity()
+        .with_id(id)
+        .with(Position { x: 0.0, y: 0.0 })
+        .build()
+        .unwrap();
+    assert_eq!(world.entity_by_id(id), Some(loaded));
+
+    let refused = world
+        .create_entity()
+        .with_id(id)
+        .with(Position { x: 0.0, y: 0.0 })
+        .build();
+    assert!(
+        matches!(refused, Err(BuildError::DuplicateEntityId { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        world.entity_count() == 1,
+        "the refused build inserted nothing: {} entities",
+        world.entity_count()
     );
 }

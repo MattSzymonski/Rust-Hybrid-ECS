@@ -166,6 +166,13 @@ public unsafe struct EngineApi
     /// the last-error channel.
     /// </summary>
     public delegate* unmanaged[Cdecl]<byte*, uint, byte**, uint*, byte> AssetLoaderRead;
+
+    /// <summary>
+    /// Write a live entity's stable id as its low and high halves; status
+    /// <c>0</c> wrote it, <c>1</c> the entity is not live, <c>5</c> an output
+    /// half was missing.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<Entity*, ulong*, ulong*, byte> EntityStableId;
 }
 
 /// <summary>

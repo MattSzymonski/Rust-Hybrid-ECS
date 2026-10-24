@@ -201,7 +201,7 @@ pub use debug_draw::{
     GizmoTriangle, LabelAnchor,
 };
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
-pub use entity::Entity;
+pub use entity::{Entity, EntityId};
 pub use error::{EngineError, SystemError, SystemFailure};
 pub use hot_patch::{HotPatchError, HotPatchRegistry, HotSlot, PlainSlot};
 pub use input::{

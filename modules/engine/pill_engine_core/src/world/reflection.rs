@@ -24,10 +24,10 @@ use super::*;
 // =============================================================================
 
 impl World {
-    /// Return the field layout a component was registered with.
+    /// Return the field layout a component was registered with, as the editor
+    /// reads it: nested `struct:` fields flattened into dotted leaf rows.
     ///
     /// `None` for components registered without field metadata, which is how
-    /// the C# codegen decides between a typed mirror and the ABI blob, and how
     /// the editor decides a component is not field-editable.
     pub fn component_field_layout(
         &self,
@@ -36,6 +36,21 @@ impl World {
         self.component_field_layouts
             .get(&component_id)
             .map(ComponentFieldLayout::fields)
+    }
+
+    /// The same layout as declared, with no nested field flattened.
+    ///
+    /// This is the form a generated mirror has to describe: the editor's view
+    /// names leaf rows (`position.x`, `points[0].y`) that no struct declares.
+    /// `None` for components registered without field metadata, which is how
+    /// the C# codegen decides between a typed mirror and the ABI blob.
+    pub fn component_declared_field_layout(
+        &self,
+        component_id: ComponentId,
+    ) -> Option<&[crate::component_registry::ComponentFieldDescriptor]> {
+        self.component_field_layouts
+            .get(&component_id)
+            .map(ComponentFieldLayout::declared)
     }
 
     /// The declared field layout of a foreign resource, if one was recorded.
@@ -265,6 +280,11 @@ impl World {
 
         // Entity location map: ~32 bytes per entry (Entity key + EntityLocation value + HashMap overhead)
         total += self.entity_locations.len() * 48;
+
+        // Stable-id indexes: a handle-keyed map and its reverse, two entries
+        // per live entity at 16-byte keys and values plus table overhead.
+        total += self.entity_ids.len() * 48;
+        total += self.entity_handles.len() * 48;
 
         // Resources: approximate based on type count
         total += self.resources.len() * 128;

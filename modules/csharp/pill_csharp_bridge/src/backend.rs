@@ -115,13 +115,14 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// Bumped to 16 by the parallel-dispatch slot appended to `CsEngineApi`.
 /// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
 /// slots left `CsEngineApi`, and the mirror text, native resource and asset
-/// store slots were appended.
+/// store slots were appended. Bumped to 18 by the entity stable-id slot
+/// appended to `CsEngineApi`.
 ///
 /// Collapsing the four length/copy export pairs into one pair keyed by a
 /// payload-kind number would save six exports here and six resolutions
 /// across the two export constructors. It was proposed and declined: see
 /// the design note in `LoaderInterop.cs` for why the named exports are kept.
-pub const INTEROP_CONTRACT_VERSION: u32 = 17;
+pub const INTEROP_CONTRACT_VERSION: u32 = 18;
 
 // =============================================================================
 // Types + Impls

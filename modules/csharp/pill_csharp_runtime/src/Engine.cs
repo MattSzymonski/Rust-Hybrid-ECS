@@ -493,6 +493,44 @@ public static unsafe class Engine
     }
 
     /// <summary>
+    /// Read a live entity's stable id, the identity a saved reference uses.
+    /// </summary>
+    /// <returns>
+    /// <c>false</c> when the entity is not live - destroyed, or a handle from
+    /// another world - which is not an error: a reference to a destroyed entity
+    /// is data the caller has to handle, not a broken call.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// No managed system is scheduled on the native side.
+    /// </exception>
+    /// <remarks>
+    /// The handle a query hands out names a slot that is recycled, so it cannot
+    /// be stored in anything meant to outlive the run. This reads the stable id
+    /// instead (W-0048 Stage 5).
+    /// </remarks>
+    public static bool TryGetStableId(Entity entity, out StableEntityId id)
+    {
+        ulong low;
+        ulong high;
+        Entity target = entity;
+        byte status = _api.EntityStableId(&target, &low, &high);
+        if (status == 0)
+        {
+            id = new StableEntityId(low, high);
+            return true;
+        }
+        if (status == 1)
+        {
+            id = default;
+            return false;
+        }
+        if (status == 3)
+            throw new InvalidOperationException(
+                "TryGetStableId is only available while a system is scheduled.");
+        throw new InvalidOperationException($"TryGetStableId failed with native status {status}.");
+    }
+
+    /// <summary>
     /// Re-copy the host's mirrored-method table when the host has republished
     /// it since the last copy.
     ///
@@ -1274,8 +1312,44 @@ public readonly struct Entity
     public Entity(ulong id, uint generation) => (Id, Generation) = (id, generation);
 }
 
+/// <summary>
+/// The stable 128-bit identity of one entity, as saved data names it.
+/// </summary>
+/// <remarks>
+/// A handle names a slot the world recycles; this id names the entity. Read it
+/// with <see cref="Engine.TryGetStableId"/> and keep it for anything that has
+/// to find the entity again later. The id is random, so it says nothing about
+/// spawn order, and it stops resolving when its entity is destroyed.
+///
+/// Two halves rather than a 128-bit value: no C ABI in the engine table carries
+/// one. The textual form is the hex string Rust's `EntityId` prints - high half
+/// first - which is what a saved scene records.
+/// </remarks>
+public readonly struct StableEntityId : IEquatable<StableEntityId>
+{
+    public readonly ulong Low;
+    public readonly ulong High;
+
+    public StableEntityId(ulong low, ulong high) => (Low, High) = (low, high);
+
+    public bool Equals(StableEntityId other) => Low == other.Low && High == other.High;
+
+    public override bool Equals(object? obj) => obj is StableEntityId other && Equals(other);
+
+    public override int GetHashCode() => HashCode.Combine(Low, High);
+
+    public static bool operator ==(StableEntityId left, StableEntityId right) => left.Equals(right);
+
+    public static bool operator !=(StableEntityId left, StableEntityId right) => !left.Equals(right);
+
+    /// <summary>The 32-digit hex form saved data records.</summary>
+    public override string ToString() => $"{High:x16}{Low:x16}";
+}
+
+/// <summary>One archetype of the native world, by the two halves of its id.</summary>
 internal readonly record struct ArchetypeKey(ulong Low, ulong High);
 
+/// <summary>One component (or the entity column) of a query enumeration.</summary>
 internal struct QueryColumn
 {
     internal QueryTermDescriptor Term;
