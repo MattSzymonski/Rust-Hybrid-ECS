@@ -1,5 +1,5 @@
 [package]
-name = "pill_editor_egui"
+name = "pill_editor"
 version = "0.1.0"
 edition = "2021"
 
@@ -73,6 +73,6 @@ egui-wgpu = "0.36.2"
 # editor snapshot the shell's tabs read. A shared dylib, so both sides agree
 # on the resource types' identity across a reload; consumed by both the
 # executable's fallback UI and the reloadable shell.
-pill_editor_core_egui = { path = "../pill_editor_core_egui" }
+pill_editor_core = { path = "../pill_editor_core" }
 # The asset settings documents the Inspector's asset rows edit are JSON.
 serde_json = "1"

@@ -122,7 +122,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "preLaunchTask": "build editor (debug)",
-            "program": "${workspaceFolder}/modules/target/debug/pill_editor_egui.exe",
+            "program": "${workspaceFolder}/modules/target/debug/pill_editor.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/modules",

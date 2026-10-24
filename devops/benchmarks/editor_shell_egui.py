@@ -4,8 +4,8 @@ Editor Shell (egui) benchmark: the egui editor's warm startup, steady-state
 frame rate, idle CPU and its per-update UI time, with the D32 comparison
 ratios (W-0037 Stage 0; the measured baseline W-0008's targets were about).
 
-REQUIREMENTS: Python 3.8+, a built `pill_editor_egui` and `pill_standalone`
-(prefers the `dev-optimized` profile: `cargo build -p pill_editor_egui
+REQUIREMENTS: Python 3.8+, a built `pill_editor` and `pill_standalone`
+(prefers the `dev-optimized` profile: `cargo build -p pill_editor
 --profile dev-optimized` and the same for `pill_standalone` in modules/),
 and a GPU the windowed editor can render with.
 
@@ -118,14 +118,14 @@ def binary_for(name: str) -> Path:
 
 def editor_binary() -> Path:
     """The egui editor executable, required to exist already."""
-    return binary_for("pill_editor_egui")
+    return binary_for("pill_editor")
 
 
 def kill_editors() -> None:
     """Kills stray egui editors so they cannot fight this run over the
     module build directory."""
     subprocess.run(
-        ["taskkill", "/F", "/IM", "pill_editor_egui.exe"],
+        ["taskkill", "/F", "/IM", "pill_editor.exe"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -322,9 +322,9 @@ def run(
 ) -> Dict[str, Any]:
     """Runs the warmup, startup, steady, idle, UI and (unless skipped)
     standalone sessions, and assembles the D32 cases."""
-    appdata = Path(tempfile.gettempdir()) / "pill_editor_egui_shell_bench_appdata"
+    appdata = Path(tempfile.gettempdir()) / "pill_editor_shell_bench_appdata"
     appdata.mkdir(parents=True, exist_ok=True)
-    logs = Path(tempfile.gettempdir()) / "pill_editor_egui_shell_bench_logs"
+    logs = Path(tempfile.gettempdir()) / "pill_editor_shell_bench_logs"
     logs.mkdir(parents=True, exist_ok=True)
     log(f"  Editor binary: {editor_binary()}")
     clear_layouts(appdata)
@@ -518,7 +518,7 @@ def run(
 
     return {
         "command": {
-            "argv": ["pill_editor_egui", "--project", project],
+            "argv": ["pill_editor", "--project", project],
             "cwd": str(MODULES_ROOT),
         },
         "measurement": {

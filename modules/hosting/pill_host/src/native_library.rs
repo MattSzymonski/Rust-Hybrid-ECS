@@ -101,18 +101,18 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// `pill_draw` carries the frame's UI draw data that the UI painters and the
 /// renderer contract share (W-0032); every artifact that builds or draws UI
 /// lists imports it, so it stages like the rest.
-/// `pill_game_ui` is the in-game egui UI (W-0028): a project draws into its
+/// `pill_project_ui` is the in-game egui UI (W-0028): a project draws into its
 /// context and the renderer drains its frame, so a project reload must find
 /// the same copy the host loaded - the whole point of the crate being shared.
-/// `pill_editor_core_egui` is the egui editor's shared copy (W-0017). Its
+/// `pill_editor_core` is the egui editor's shared copy (W-0017). Its
 /// frontend and shell exchange their types the same way, so it gets the same
 /// treatment.
 pub(crate) const ENGINE_DYLIB_STEMS: [&str; 5] = [
     "pill_core",
     "pill_engine_core",
     "pill_draw",
-    "pill_game_ui",
-    "pill_editor_core_egui",
+    "pill_project_ui",
+    "pill_editor_core",
 ];
 
 /// Whether a module build produced engine dylibs different from the ones the

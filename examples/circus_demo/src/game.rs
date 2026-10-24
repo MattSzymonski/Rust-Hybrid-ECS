@@ -17,8 +17,8 @@ use pill_engine::{
     pill_hot, tracing, Input, KeyCode, PillComponent, Query, Res, ResMut, Resource, SystemError,
     World,
 };
-use pill_game_ui::GameUi;
 use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
+use pill_project_ui::GameUi;
 use serde::{Deserialize, Serialize};
 
 // Current crate

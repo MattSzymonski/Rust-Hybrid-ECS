@@ -267,7 +267,7 @@ fn an_asset_row_click_moves_the_asset_selection() {
 
 #[test]
 fn the_inspector_lists_the_selections_components_and_fields() {
-    use pill_editor_core_egui::editor_state::ComponentView;
+    use pill_editor_core::editor_state::ComponentView;
     use pill_engine::component_registry::ComponentFieldDescriptor;
     let mut engine = Engine::new();
     let entity = engine
@@ -316,7 +316,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     let mut selection = EditorSelection::default();
     selection.select_only(entity);
     selection.asset = Some("textures/rock.png".to_string());
-    snapshot.asset_detail = Some(pill_editor_core_egui::editor_state::AssetDetail {
+    snapshot.asset_detail = Some(pill_editor_core::editor_state::AssetDetail {
         path: "textures/rock.png".to_string(),
         kind: "pill_master_renderer::assets::Texture".to_string(),
         standalone: false,

@@ -17,7 +17,7 @@ pill_core = { path = "../../modules/pill_core" }
 # the renderer draws the frame it publishes through `pill_draw`'s slot. A
 # shared library like `pill_ui` was, so the overlay's context - its fonts, its
 # widget state - outlives a reload of this project.
-pill_game_ui = { path = "../../modules/pill_game_ui" }
+pill_project_ui = { path = "../../modules/pill_project_ui" }
 # The master renderer's data only - components, assets, pipelines. The GPU
 # renderer is the host's. `default-features = false`, as for every extension,
 # keeps its module exports out of this project's DLL.

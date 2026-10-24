@@ -28,14 +28,14 @@
 //! with premultiplied composition - the transparent clear plus egui's
 //! premultiplied output is exactly what the compositor multiplies back out.
 //!
-//! [`EguiShellFrame`]: pill_editor_core_egui::boundary::EguiShellFrame
+//! [`EguiShellFrame`]: pill_editor_core::boundary::EguiShellFrame
 
 // Standard library
 use std::sync::Arc;
 
 // External crates
-use pill_editor_core_egui::egui::epaint::ClippedPrimitive;
-use pill_editor_core_egui::egui::TexturesDelta;
+use pill_editor_core::egui::epaint::ClippedPrimitive;
+use pill_editor_core::egui::TexturesDelta;
 use winit::window::Window;
 
 /// Why an overlay could not be created; the executable logs it once and

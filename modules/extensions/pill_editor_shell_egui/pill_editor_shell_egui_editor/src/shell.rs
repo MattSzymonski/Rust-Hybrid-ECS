@@ -16,7 +16,7 @@
 //!
 //! The dock is the session's `egui_dock` state, so layout edits land in the
 //! resource the next generation re-claims. Nothing here stores anything in
-//! egui's `Context` (the reload-safety contract `pill_editor_core_egui` documents);
+//! egui's `Context` (the reload-safety contract `pill_editor_core` documents);
 //! the tabs read the snapshot and write the shared selection.
 //!
 //! # Patchability
@@ -366,8 +366,8 @@ pub fn run_frame(
     notices: &EditorNotices,
     panels: &PanelRegistry,
     panel_commands: &mut Vec<PanelCommand>,
-    clipboard: &mut pill_editor_core_egui::clipboard::EditorClipboard,
-    popout_inputs: &pill_editor_core_egui::boundary::EguiPopoutInputs,
+    clipboard: &mut pill_editor_core::clipboard::EditorClipboard,
+    popout_inputs: &pill_editor_core::boundary::EguiPopoutInputs,
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
@@ -419,7 +419,7 @@ pub fn run_frame(
     // benchmark measures the D32 UI-redraw case from it; the GPU overlay
     // draw is outside it, as presentation is vsync-bound.
     let ui_started = pill_core::platform::Instant::now();
-    let raw_input = pill_editor_core_egui::input::raw_input(shell_input);
+    let raw_input = pill_editor_core::input::raw_input(shell_input);
     // The brand mark is uploaded once per session: the context owns the
     // texture, so a shell reload finds it already there.
     let mark = state.mark_texture();
@@ -440,12 +440,15 @@ pub fn run_frame(
     // A tile drag that left the windows hands its path to the executable
     // (W-0038 Stage 19), through the frame the frontend drains.
     let mut drag_out: Option<String> = None;
-    let panel_answer = state.panel_windows.answer.as_ref().map(|answer| {
-        pill_editor_core_egui::panels::PanelAnswer {
-            window: answer.window.clone(),
-            accepted: answer.accepted,
-        }
-    });
+    let panel_answer =
+        state
+            .panel_windows
+            .answer
+            .as_ref()
+            .map(|answer| pill_editor_core::panels::PanelAnswer {
+                window: answer.window.clone(),
+                accepted: answer.accepted,
+            });
     let mut panel_window_requests: Vec<(u16, PanelCommand)> = Vec::new();
     let EguiShellState {
         dock,
@@ -634,7 +637,7 @@ pub fn run_frame(
         } else {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
-                limit = pill_editor_core_egui::boundary::SCENE_VIEWS_MAX,
+                limit = pill_editor_core::boundary::SCENE_VIEWS_MAX,
                 "[editor] scene view refused: the view limit is reached"
             );
         }
@@ -704,11 +707,11 @@ pub fn run_frame(
 /// out Scene tab reports its rectangle in its own window's coordinates, and
 /// the frontend places that view's surface there.
 pub fn run_popout_passes(
-    dock: &mut pill_editor_core_egui::layout::EditorDock,
+    dock: &mut pill_editor_core::layout::EditorDock,
     contexts: &mut std::collections::BTreeMap<EditorTab, egui::Context>,
-    inputs: &pill_editor_core_egui::boundary::EguiPopoutInputs,
+    inputs: &pill_editor_core::boundary::EguiPopoutInputs,
     viewer: &mut EditorTabViewer<'_>,
-) -> Vec<pill_editor_core_egui::boundary::PopoutFrame> {
+) -> Vec<pill_editor_core::boundary::PopoutFrame> {
     let mut frames = Vec::new();
     // Redock requests are applied after the loop: the dock cannot be borrowed
     // mutably while it is read for each pass's tab list.
@@ -719,14 +722,14 @@ pub fn run_popout_passes(
             .entry(tab)
             .or_insert_with(|| {
                 let context = egui::Context::default();
-                pill_editor_core_egui::style::apply(&context);
+                pill_editor_core::style::apply(&context);
                 context
             })
             .clone();
         // A window the frontend has not reported yet gets a default record:
         // an empty event list, so the pass draws without interaction.
         let input = inputs.by_tab.get(&name).cloned().unwrap_or_default();
-        let raw_input = pill_editor_core_egui::input::raw_input(&input);
+        let raw_input = pill_editor_core::input::raw_input(&input);
         viewer.scene_rects = vec![None; dock.scene_view_count()];
         let output = context.run_ui(raw_input, |ui| {
             // The window has no dock around it, so it draws the one dock
@@ -752,10 +755,10 @@ pub fn run_popout_passes(
             // frame is built for this pass.
             continue;
         }
-        let mut frame = pill_editor_core_egui::boundary::frame_from_output(&context, output);
+        let mut frame = pill_editor_core::boundary::frame_from_output(&context, output);
         frame.scene_rects = std::mem::take(&mut viewer.scene_rects);
         frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
-        frames.push(pill_editor_core_egui::boundary::PopoutFrame {
+        frames.push(pill_editor_core::boundary::PopoutFrame {
             tab: name,
             title: format!("Pill Editor - {}", tab.title()),
             frame: Box::new(frame),
@@ -889,7 +892,7 @@ pub struct EditorTabViewer<'a> {
     pub panel_detail: Option<&'a PanelEntityDetail>,
     /// The answer a modal window took, for the pass that follows it
     /// (W-0038 Stage 13).
-    pub panel_answer: Option<&'a pill_editor_core_egui::panels::PanelAnswer>,
+    pub panel_answer: Option<&'a pill_editor_core::panels::PanelAnswer>,
     /// The windows the panels asked to open or close this pass, with the slot
     /// that asked: applied after the dock, before the windows draw.
     pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
@@ -900,7 +903,7 @@ pub struct EditorTabViewer<'a> {
     pub panel_window_ping_used: bool,
     /// The shell's side of the OS clipboard (W-0038 Stage 17): the request
     /// the executable carries out, and the text it read back.
-    pub clipboard: &'a mut pill_editor_core_egui::clipboard::EditorClipboard,
+    pub clipboard: &'a mut pill_editor_core::clipboard::EditorClipboard,
     /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
     /// executable starts an OLE drag with it.
     pub drag_out: &'a mut Option<String>,

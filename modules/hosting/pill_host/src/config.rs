@@ -121,7 +121,7 @@ const GENERATED_DIRECTORY: &str = "generated";
 /// loads (after the folder's runtime crates) and no other build ever sees.
 pub(crate) const EDITOR_CRATE_SUFFIX: &str = "_editor";
 
-/// The editor frontend the `pill_editor_egui` host and the standalone's editor
+/// The editor frontend the `pill_editor` host and the standalone's editor
 /// posture report as. An editor crate tagged with another name (see
 /// `declared_editor_frontend`) loads only under that other frontend
 /// (W-0017 Stage 6).

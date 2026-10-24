@@ -32,8 +32,8 @@ DESCRIPTION
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
       4. shared UI    - each UI-independent shared dylib (`pill_draw`, the in-game
-                        egui UI's `pill_game_ui`, and the egui editor's copy,
-                        `pill_editor_core_egui`) is built as a
+                        egui UI's `pill_project_ui`, and the egui editor's copy,
+                        `pill_editor_core`) is built as a
                         `dylib` (one copy per process) and links no UI framework,
                         window system or GPU crate (`dioxus`, `tao`, `wry`,
                         `winit`, `wgpu`), followed through every path dependency.
@@ -80,9 +80,9 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     # The in-game egui UI (W-0028): one shared dylib over egui alone, so a
     # project links the UI without the windowing or GPU crates the frontends
     # own.
-    ("pill_game_ui", "pill_game_ui"),
+    ("pill_project_ui", "pill_project_ui"),
     # The egui editor's copy (W-0017): one shared dylib, same rule.
-    ("pill_editor_core_egui", "frontents/pill_editor_core_egui"),
+    ("pill_editor_core", "frontents/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
@@ -290,10 +290,10 @@ def self_test():
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_crate(root, "pill_engine_core", [])
-            directory = root / "modules" / "frontents" / "pill_editor_core_egui"
+            directory = root / "modules" / "frontents" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             lines = [
-                '[package]\nname = "pill_editor_core_egui"\nversion = "0.1.0"\n',
+                '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
                 f"[lib]\ncrate-type = {crate_type}\n",
                 "[dependencies]",
             ]

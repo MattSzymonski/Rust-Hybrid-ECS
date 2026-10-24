@@ -147,32 +147,32 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # builds the lists and publishes them into the slot.
     if has("modules/pill_draw/**"):
         selected.append(cargo_check("test pill_draw",
-                                    ("test", "-p", "pill_draw", "-p", "pill_game_ui", "--offline"),
+                                    ("test", "-p", "pill_draw", "-p", "pill_project_ui", "--offline"),
                                     "shared draw data changed"))
 
     # The egui editor: the shared model crate, the UI library, the reloadable
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
-    if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+    if has("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
            "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui",
+                                    ("test", "-p", "pill_editor_core",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
-    # pill_game_ui: the in-game egui UI (W-0028). Its own unit tests cover the
+    # pill_project_ui: the in-game egui UI (W-0028). Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
     # feeds is the renderer's `ui` module, whose tests cover the draw lists. The slot it
     # publishes into is `pill_draw`'s, so a change here also moves what every
     # module drains.
-    if has("modules/pill_game_ui/**"):
-        selected.append(cargo_check("test pill_game_ui", ("test", "-p", "pill_game_ui", "--offline"),
-                                    "pill_game_ui changed"))
+    if has("modules/pill_project_ui/**"):
+        selected.append(cargo_check("test pill_project_ui", ("test", "-p", "pill_project_ui", "--offline"),
+                                    "pill_project_ui changed"))
         selected.append(cargo_check("test the frame slot",
                                     ("test", "-p", "pill_draw", "--offline"),
-                                    "pill_game_ui changed"))
+                                    "pill_project_ui changed"))
 
     # The editor: the shell module, frontend and the editor-side crates.
     # The frontend-facing suites are picked per area; run_all handles the rest.
@@ -180,10 +180,10 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
-    if has("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+    if has("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
            "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core_egui",
+                                    ("test", "-p", "pill_editor_core",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
         selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
@@ -289,8 +289,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-draw", ("modules/pill_draw/**",)),
-    ("pill-game-ui", ("modules/pill_game_ui/**",)),
-    ("egui-editor", ("modules/frontents/pill_editor_core_egui/**", "modules/frontents/pill_editor_egui/**",
+    ("pill-project-ui", ("modules/pill_project_ui/**",)),
+    ("egui-editor", ("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
                      "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
@@ -342,7 +342,7 @@ def select_checks(paths: Sequence[str]) -> List[Check]:
     editor_rows = [check for check in ordered if check.label.startswith("suite:test_editor_")]
     if editor_rows:
         ordered = [check for check in ordered if not check.label.startswith("suite:test_editor_")]
-        uplift = cargo_check("editor build", ("build", "-p", "pill_editor_egui", "--offline"),
+        uplift = cargo_check("editor build", ("build", "-p", "pill_editor", "--offline"),
                              "editor suites selected")
         uplift.reasons = ["editor suites need the frontend built on the current dylibs"]
         ordered.append(uplift)

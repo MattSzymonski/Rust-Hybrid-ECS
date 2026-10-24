@@ -1084,14 +1084,14 @@ def kill_stale_hosts() -> None:
     """Best-effort cleanup of leftover host and editor processes that lock shared DLLs.
 
     Both images lock the shared DLLs: host suites drive `pill_standalone` and
-    the editor suites drive `pill_editor_egui`, so both are cleared
+    the editor suites drive `pill_editor`, so both are cleared
     the same way. Takes the host lock first: killing without it would kill
     the process a concurrent suite is driving - the exact interference this
     lock exists to stop - while killing under it can only hit a leak from an
     earlier run.
     """
     ensure_host_lock()
-    for image in ("pill_standalone", "pill_editor_egui"):
+    for image in ("pill_standalone", "pill_editor"):
         if os.name == "nt":
             subprocess.run(
                 ["taskkill", "/IM", "{}.exe".format(image), "/F"],

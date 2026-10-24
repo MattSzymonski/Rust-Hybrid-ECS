@@ -53,7 +53,7 @@ pub fn gizmo_space_label(space: GizmoSpace) -> &'static str {
 }
 
 /// What a click on an entity row means (W-0038 Stage 16).
-pub use pill_editor_core_egui::editor_state::SelectionClick;
+pub use pill_editor_core::editor_state::SelectionClick;
 
 /// The meaning of a click made with these modifiers.
 pub fn click_from_modifiers(modifiers: &egui::Modifiers) -> SelectionClick {

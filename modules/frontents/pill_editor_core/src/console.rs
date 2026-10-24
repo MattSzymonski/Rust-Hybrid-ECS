@@ -49,7 +49,7 @@ impl ConsoleChannel {
     ///
     /// The engine, host and editor crates log under a crate path whose first
     /// segment names them (`engine::ecs`, `pill_host::loader`,
-    /// `pill_editor_core_egui::...`); a project's own logs carry the
+    /// `pill_editor_core::...`); a project's own logs carry the
     /// project's, so anything else is the game's.
     pub fn of_target(target: &str) -> Self {
         let engine_roots = ["engine", "host", "editor", "pill_core", "render"];

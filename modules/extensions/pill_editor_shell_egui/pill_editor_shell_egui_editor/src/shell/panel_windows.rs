@@ -62,14 +62,13 @@ pub fn panel_windows(
         let Some(draw) = registry.draw_of(window.slot) else {
             continue;
         };
-        let answer =
-            windows
-                .answer
-                .as_ref()
-                .map(|answer| pill_editor_core_egui::panels::PanelAnswer {
-                    window: answer.window.clone(),
-                    accepted: answer.accepted,
-                });
+        let answer = windows
+            .answer
+            .as_ref()
+            .map(|answer| pill_editor_core::panels::PanelAnswer {
+                window: answer.window.clone(),
+                accepted: answer.accepted,
+            });
         let mut body = |ui: &mut egui::Ui, commands: &mut Vec<PanelCommand>| {
             let mut panel_context = PanelContext {
                 frames_per_second: feed.frames_per_second,

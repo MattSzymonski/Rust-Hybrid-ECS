@@ -63,7 +63,7 @@ pub fn init(engine: &mut Engine) -> u32 {
     // new generation does not re-register - and inserts the values only when no
     // earlier generation left them behind. The frame slot it installs is also
     // what tells the renderer that this world's UI is the game's.
-    pill_game_ui::install(engine);
+    pill_project_ui::install(engine);
 
     engine.register_system("fps_camera", camera::fps_camera_system);
     engine.register_system("camera_fov", camera::camera_fov_changing_system);

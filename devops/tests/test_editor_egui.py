@@ -4,7 +4,7 @@ PROTECTS: The egui editor: startup, shell module, dock rearrangement, patch and 
 TIER: editor
 SETS: editor
 
-Builds against an already-built `pill_editor_egui` binary, starts it on
+Builds against an already-built `pill_editor` binary, starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the
 heartbeat waits are short - with the scripted input channel
 (`PILL_EDITOR_TEST_COMMANDS`), and asserts on its log tokens: startup and the
@@ -80,7 +80,7 @@ from core import win_clipboard  # noqa: E402
 # `test_log_contract.py` checks each against the Rust sources. Patterns that
 # embed runtime values (frame counts, dock surfaces) compose them with their
 # regex suffix at the wait.
-EGUI_EDITOR_BINARY = executable_name("pill_editor_egui")
+EGUI_EDITOR_BINARY = executable_name("pill_editor")
 EGUI_SHELL_LOADED_TOKEN = "[editor] pill_editor_shell_egui_editor loaded"
 # Every shell generation clears the shared egui context's temporary data
 # before its first draw, so nothing a previous generation created is read
@@ -685,7 +685,7 @@ def main() -> int:
     parser.add_argument(
         "--binary",
         type=Path,
-        help="the built pill_editor_egui binary (default: the debug build)",
+        help="the built pill_editor binary (default: the debug build)",
     )
     parser.add_argument(
         "--project",
@@ -733,7 +733,7 @@ def main() -> int:
     if not binary.is_file():
         raise SystemExit(
             "editor binary not found at {}; build it with "
-            "`cargo build -p pill_editor_egui` in modules/ first".format(EGUI_EDITOR_BINARY)
+            "`cargo build -p pill_editor` in modules/ first".format(EGUI_EDITOR_BINARY)
         )
     shell_source = (
         MODULES_ROOT

@@ -24,7 +24,7 @@
 20. **Docs come from the suites.** The catalogue below is generated from each suite's own header (`--write-catalogue`).
 21. **Numbers live elsewhere.** Performance measurement is in `devops/benchmarks/`, not here.
 22. **The full gate.** `verify.py` runs this directory plus every other CI check - it is what CI calls.
-23. **Editor rule.** Build `pill_editor_egui` right before its suite, with nothing in between.
+23. **Editor rule.** Build `pill_editor` right before its suite, with nothing in between.
 
 The pass/fail checks for Rust-Hybrid-ECS. Every script here asserts and
 returns a non-zero exit code on failure, and every script runs standalone
@@ -68,13 +68,13 @@ table of repository areas, and runs only that area's checks: format and
 coding-standards on Rust changes, the area's cargo tests, the suites named for
 it and the few `verify.py` steps that guard it. A file no rule recognizes
 falls back to `verify.py --quick`, so no area passes unchecked, and an editor
-selection gets its `cargo build -p pill_editor_egui` prepended automatically
+selection gets its `cargo build -p pill_editor` prepended automatically
 with the editor suites immediately after (see the ordering rule below).
 
 ```powershell
 python devops/ci_cd/check_relevant.py --dry-run     # select and print, run nothing
 python devops/ci_cd/check_relevant.py               # run the selection
-python devops/ci_cd/check_relevant.py --paths modules/frontents/pill_editor_core_egui/src/icons.rs
+python devops/ci_cd/check_relevant.py --paths modules/frontents/pill_editor_core/src/icons.rs
 python devops/ci_cd/check_relevant.py --list-rules  # the area table
 ```
 
@@ -110,7 +110,7 @@ carries each suite's last recorded result):
 | -------------------------------------------------------- | ------------------------------ |
 | The static tier                                          | seconds                        |
 | One editor suite                                         | 15 s to 190 s                  |
-| `cargo build -p pill_editor_egui` + `run_all.py --only test_editor_egui.py` | ~18 min |
+| `cargo build -p pill_editor` + `run_all.py --only test_editor_egui.py` | ~18 min |
 | The hot-reload set (`run_hot_reload_tests.sh`)           | 15-20 min plus the first build |
 | The full gate (`verify.py`)                              | ~2 h                           |
 
@@ -132,13 +132,13 @@ suites whose parser declares them, which is every suite built on
 `add_common_suite_arguments` in `devops/core/suite_common.py`.
 
 **The editor ordering rule.** Any cargo build or test between
-`cargo build -p pill_editor_egui` and its suite re-splits the shared dylibs
+`cargo build -p pill_editor` and its suite re-splits the shared dylibs
 under the built binary, and the editor then dies at process start
 (`0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`). Build the editor and run its suite
 immediately after, with nothing in between - or let `check_relevant.py`
 enforce the order for you. `verify.py`'s `editor` step encodes the same order:
 the host-tier revision suite first (it builds a narrowed `pill_standalone`),
-then `cargo build -p pill_editor_egui`, then
+then `cargo build -p pill_editor`, then
 `run_all.py --only test_editor_egui.py`, because the host and the module
 builds it spawns must share one feature resolution.
 

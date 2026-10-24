@@ -77,7 +77,7 @@ MODULES = REPOSITORY / "modules"
 # posture: the engine's, and the plain draw data the UI library and the
 # renderer contract share.
 #
-# `pill_game_ui` is deliberately absent: projects that draw their own egui link
+# `pill_project_ui` is deliberately absent: projects that draw their own egui link
 # it, modules and the renderer do not, so comparing it against a posture that
 # never loads it reports drift nothing can act on - the same reason the
 # editor's dylibs are compared per editor family below rather than here.
@@ -90,7 +90,7 @@ ENGINE_DYLIBS = (
 # The egui editor's shared dylib: the egui boundary and its model. Only the
 # postures that load egui editor parts resolve it.
 EGUI_EDITOR_DYLIBS = (
-    "pill_editor_core_egui",
+    "pill_editor_core",
 )
 
 # The editor family is the egui one alone (W-0043 retired the `pill_ui`
@@ -127,7 +127,7 @@ FRONTENDS = {
         ALL_DYLIBS,
     ),
     "editor": (
-        ["--package", "pill_editor_egui"],
+        ["--package", "pill_editor"],
         ["pill_engine/hot_patch"],
         None,
         EGUI_DYLIBS,

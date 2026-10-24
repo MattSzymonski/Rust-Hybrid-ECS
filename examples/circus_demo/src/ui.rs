@@ -34,7 +34,7 @@ use pill_core::math::Vector2f;
 use pill_engine::{pill_hot, Input, Res, ResMut, SystemError, Time};
 // The egui this engine pins, named through the crate that owns it: a project
 // never depends on egui directly, so every artifact shares the one copy.
-use pill_game_ui::{egui, GameUi, InputFrame, UiFrameSlot, PRIMARY_SURFACE};
+use pill_project_ui::{egui, GameUi, InputFrame, UiFrameSlot, PRIMARY_SURFACE};
 
 // The crate's own items, named through its package name rather than `crate::`:
 // a generated hot patch replays this file's imports into a synthetic crate,

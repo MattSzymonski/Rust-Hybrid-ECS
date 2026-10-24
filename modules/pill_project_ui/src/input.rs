@@ -22,7 +22,7 @@
 //! the pointer moves before a button press that names its position, so events
 //! are emitted in that order rather than the snapshot's field order.
 //!
-//! The editor's equivalent (`pill_editor_core_egui::input`) is the shape this mirrors,
+//! The editor's equivalent (`pill_editor_core::input`) is the shape this mirrors,
 //! deliberately not a dependency: that crate carries `egui_dock` and the
 //! editor's boundary types, and a game build must not link the docking crate
 //! (plan decision D2).
