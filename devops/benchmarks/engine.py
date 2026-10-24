@@ -6,7 +6,7 @@ REQUIREMENTS: Python 3.8+, Rust toolchain (cargo) on PATH.
 
 DESCRIPTION
     Runs the existing Criterion benchmark targets declared in
-    `modules/pill_engine/Cargo.toml` and normalizes `target/criterion/` into
+    `modules/engine/pill_engine/Cargo.toml` and normalizes `target/criterion/` into
     measurement JSON. No benchmark infrastructure is invented here: the same
     `cargo bench` invocation a developer would type is executed, and the
     parsing is the shared implementation in `criterion.py`.
@@ -48,7 +48,7 @@ from core import criterion  # noqa: E402
 from core.cli import add_json_flag, banner, run_standalone, store_measurement  # noqa: E402
 from core.paths import CRITERION_ROOT, MODULES_ROOT, find_executable  # noqa: E402
 
-# The benchmark targets declared in `modules/pill_engine/Cargo.toml`. Listed
+# The benchmark targets declared in `modules/engine/pill_engine/Cargo.toml`. Listed
 # so `--bench` can validate a selection before spending minutes compiling.
 KNOWN_BENCH_TARGETS = (
     "minimal",

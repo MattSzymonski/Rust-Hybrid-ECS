@@ -12,8 +12,8 @@ workspace = true
 # the engine's input vocabulary. Linked only by frontends (`pill_standalone`,
 # `pill_web`, `pill_editor`), each picking the half it needs.
 [dependencies]
-pill_core = { path = "../../pill_core" }
-pill_engine = { path = "../../pill_engine" }
+pill_core = { path = "../../engine/pill_core" }
+pill_engine = { path = "../../engine/pill_engine" }
 # winit's window and device events, for the frontends built on winit.
 winit = { version = "0.30", optional = true }
 

@@ -5,7 +5,7 @@
 //
 // Design
 // These are a deliberate, field-for-field mirror of the components in
-// `modules/pill_engine/benches/query_iteration.rs`, because the whole point of
+// `modules/engine/pill_engine/benches/query_iteration.rs`, because the whole point of
 // this project is to put a managed number beside that Rust one. Same field
 // count, same widths, same three-component population on every entity: an
 // 8-byte Position, an 8-byte Velocity and a 4-byte Health. Getting this wrong

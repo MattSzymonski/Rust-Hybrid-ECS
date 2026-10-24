@@ -24,7 +24,7 @@ DESCRIPTION
 USAGE
   from core.workspace_graph import Crate, example_projects, workspace_members
 
-  crate = Crate(MODULES / "pill_core" / "Cargo.toml")
+  crate = Crate(MODULES / "engine" / "pill_core" / "Cargo.toml")
   for dependency in crate.linked():
       print(dependency.package, dependency.kind, dependency.directory)
 

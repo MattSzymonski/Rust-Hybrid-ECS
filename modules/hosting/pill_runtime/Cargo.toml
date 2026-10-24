@@ -13,15 +13,15 @@ workspace = true
 # alone. It must never load DLLs, watch or build anything, host .NET, or link
 # winit or YAML: whatever a shipped game does not do stays out of here.
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../engine/pill_core" }
 # The `#[engine_error]` attribute behind `RenderingError`, plus the two crates
 # it expands into.
-pill_core_macros = { path = "../../pill_core_macros" }
+pill_core_macros = { path = "../../engine/pill_core_macros" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
-pill_engine = { path = "../../pill_engine" }
+pill_engine = { path = "../../engine/pill_engine" }
 # The renderer contract - the backend trait, the frame, window handles as data.
-pill_renderer_api = { path = "../pill_renderer_api" }
+pill_renderer_api = { path = "../../rendering/pill_renderer_api" }
 tracing = "0.1"
 # The start-up system report (`system_specs`). Here, not in the engine core:
 # see that module for why.

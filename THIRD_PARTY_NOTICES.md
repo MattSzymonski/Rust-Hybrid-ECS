@@ -6,9 +6,9 @@ came from.
 
 ## Phosphor Icons (web fonts, regular and duotone weights)
 
-- Files: `modules/frontents/pill_editor_core/assets/Phosphor.ttf`,
-  `modules/frontents/pill_editor_core/assets/Phosphor-Duotone.ttf` and
-  `modules/frontents/pill_editor_core/assets/Phosphor-LICENSE.txt` (the MIT text).
+- Files: `modules/editor/pill_editor_core/assets/Phosphor.ttf`,
+  `modules/editor/pill_editor_core/assets/Phosphor-Duotone.ttf` and
+  `modules/editor/pill_editor_core/assets/Phosphor-LICENSE.txt` (the MIT text).
 - Licence: MIT (Copyright (c) 2023 Phosphor Icons).
 - Source: the `@phosphor-icons/web` package, version 2.1.1, from
   `https://unpkg.com/@phosphor-icons/web@2.1.1/src/{regular/Phosphor.ttf,

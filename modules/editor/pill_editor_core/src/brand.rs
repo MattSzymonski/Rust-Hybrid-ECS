@@ -7,7 +7,7 @@
 //! - Holds no drawing code: the shell decides where the mark sits and what
 //!   colour it takes.
 //!
-//! The source is `modules/frontents/pill_editor_core/assets/pill_mark.svg` (500x500, one
+//! The source is `modules/editor/pill_editor_core/assets/pill_mark.svg` (500x500, one
 //! white path of three subpaths). egui has no SVG renderer in this crate
 //! graph, so the path was flattened and rasterised offline - even-odd fill,
 //! 8x8 supersampling per texel, the path's bounding box

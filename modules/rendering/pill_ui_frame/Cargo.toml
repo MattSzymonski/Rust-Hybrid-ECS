@@ -17,8 +17,8 @@ workspace = true
 crate-type = ["rlib", "dylib"]
 
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../engine/pill_core" }
 # The `Resource` trait the frame slot implements (`slot::UiFrameSlot`). The
 # core is a shared `dylib` too, so this embeds nothing; the core itself never
 # names this crate.
-pill_engine_core = { path = "../../pill_engine_core" }
+pill_engine_core = { path = "../../engine/pill_engine_core" }

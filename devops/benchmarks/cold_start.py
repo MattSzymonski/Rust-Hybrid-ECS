@@ -78,7 +78,7 @@ DEFAULT_PACKAGE = "pill_standalone"
 # timestamp changes - the file's bytes are never touched.
 # The engine core rather than the `pill_engine` facade, which re-exports it:
 # touching the core rebuilds the engine itself, as this case always measured.
-INCREMENTAL_TOUCH_FILE = MODULES_ROOT / "pill_engine_core" / "src" / "lib.rs"
+INCREMENTAL_TOUCH_FILE = MODULES_ROOT / "engine" / "pill_engine_core" / "src" / "lib.rs"
 
 # Host startup can include a full module build after a clean, so it gets a
 # much larger budget than the reload suites use.

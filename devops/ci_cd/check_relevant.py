@@ -38,7 +38,7 @@ EXAMPLE USAGE:
   python devops/ci_cd/check_relevant.py --dry-run
   python devops/ci_cd/check_relevant.py
   python devops/ci_cd/check_relevant.py --base origin/main
-  python devops/ci_cd/check_relevant.py --paths modules/ui/pill_ui_frame/src/frame.rs
+  python devops/ci_cd/check_relevant.py --paths modules/rendering/pill_ui_frame/src/frame.rs
 
 --- SCRIPT ---
 """
@@ -145,7 +145,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # The shared draw data every UI producer and the renderer contract name:
     # its own tests (the frame slot's among them), plus the game UI, which
     # builds the lists and publishes them into the slot.
-    if has("modules/ui/pill_ui_frame/**"):
+    if has("modules/rendering/pill_ui_frame/**"):
         selected.append(cargo_check("test pill_ui_frame",
                                     ("test", "-p", "pill_ui_frame", "-p", "pill_project_ui", "--offline"),
                                     "shared draw data changed"))
@@ -154,7 +154,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
-    if has("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
+    if has("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
            "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
                                     ("test", "-p", "pill_editor_core",
@@ -180,7 +180,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # shell module and the frontend. Its suites are the crates' own unit
     # tests plus the egui editor suite; the editor build uplift is added
     # below, since only that build re-freezes the shared dylibs.
-    if has("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
+    if has("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
            "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
                                     ("test", "-p", "pill_editor_core",
@@ -191,7 +191,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # The browser frontend: the crate only compiles for wasm, so its check is
     # the wasm target, and the page smoke suite builds a project and draws it
     # in a headless browser.
-    if has("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**"):
+    if has("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**"):
         selected.append(cargo_check("check pill_web (wasm)",
                                     ("check", "-p", "pill_web", "--target", "wasm32-unknown-unknown",
                                      "--offline"),
@@ -200,10 +200,10 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 
     # Engine core and the shared crates below it: unit tests plus the
     # hot-reload regression net that runs a host against real projects.
-    if has("modules/pill_core/**"):
+    if has("modules/engine/pill_core/**"):
         selected.append(cargo_check("test pill_core", ("test", "-p", "pill_core", "--offline"), "pill_core changed"))
         selected.append(suite_check("test_editor_revision.py", "pill_core changed"))
-    if has("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**"):
+    if has("modules/engine/pill_engine_core/**", "modules/engine/pill_engine/**", "modules/engine/pill_engine_macros/**"):
         selected.append(cargo_check("test pill_engine_core",
                                     ("test", "-p", "pill_engine_core", "-p", "pill_engine", "--offline"),
                                     "engine core changed"))
@@ -217,7 +217,7 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     "host changed"))
         selected.append(suite_check("test_hot_reload_suite.py", "host reload path changed"))
         selected.append(suite_check("test_hot_patch_coverage.py", "host patch path changed"))
-    if has("modules/hosting/pill_runtime/**", "modules/hosting/pill_renderer_api/**"):
+    if has("modules/hosting/pill_runtime/**", "modules/rendering/pill_renderer_api/**"):
         selected.append(cargo_check("check shipping", ("check", "-p", "pill_standalone",
                                                        "--no-default-features", "--features", "shipping",
                                                        "--offline"), "runtime changed"))
@@ -288,15 +288,15 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 # beside it so "is this path recognized" and "what does it select" cannot
 # drift apart; `--list-rules` prints exactly this.
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
-    ("pill-ui-frame", ("modules/ui/pill_ui_frame/**",)),
+    ("pill-ui-frame", ("modules/rendering/pill_ui_frame/**",)),
     ("pill-project-ui", ("modules/ui/pill_project_ui/**",)),
-    ("egui-editor", ("modules/frontents/pill_editor_core/**", "modules/frontents/pill_editor/**",
+    ("egui-editor", ("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
                      "modules/extensions/pill_editor_shell_egui/**")),
-    ("web-frontend", ("modules/frontents/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
-    ("engine-core", ("modules/pill_engine_core/**", "modules/pill_engine/**", "modules/pill_engine_macros/**")),
-    ("pill-core", ("modules/pill_core/**",)),
+    ("web-frontend", ("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
+    ("engine-core", ("modules/engine/pill_engine_core/**", "modules/engine/pill_engine/**", "modules/engine/pill_engine_macros/**")),
+    ("pill-core", ("modules/engine/pill_core/**",)),
     ("host", ("modules/hosting/pill_host/**", "modules/hosting/pill_hot_scan/**")),
-    ("runtime", ("modules/hosting/pill_runtime/**", "modules/hosting/pill_renderer_api/**")),
+    ("runtime", ("modules/hosting/pill_runtime/**", "modules/rendering/pill_renderer_api/**")),
     ("extensions", ("modules/extensions/**",)),
     ("csharp", ("modules/csharp/**", "modules/pill_csharp_compiler/**", "modules/pill_csharp_runtime/**",
                 "**/*.cs", "**/*.csproj")),

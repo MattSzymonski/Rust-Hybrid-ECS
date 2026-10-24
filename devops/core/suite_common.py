@@ -844,14 +844,13 @@ HOST_DEV_RENDERING = HostPosture(
 HOST_SOURCE_ROOTS = (
     MODULES_ROOT / "Cargo.toml",
     MODULES_ROOT / ".cargo",
-    MODULES_ROOT / "pill_core",
-    MODULES_ROOT / "pill_core_macros",
-    MODULES_ROOT / "pill_engine",
-    MODULES_ROOT / "pill_engine_core",
-    MODULES_ROOT / "pill_assets",
-    MODULES_ROOT / "pill_input",
+    MODULES_ROOT / "engine",
+    MODULES_ROOT / "assets",
+    MODULES_ROOT / "frontends" / "pill_input",
+    MODULES_ROOT / "rendering",
+    MODULES_ROOT / "ui",
     MODULES_ROOT / "hosting",
-    MODULES_ROOT / "frontents" / "pill_standalone",
+    MODULES_ROOT / "frontends" / "pill_standalone",
 )
 
 # What `build_host` records about the binary it produced. A binary carries no

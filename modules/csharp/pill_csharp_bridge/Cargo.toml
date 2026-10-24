@@ -12,8 +12,8 @@ workspace = true
 # change together. Linked by every build that runs C# - the development host and
 # a C# shipping bundle - and never by a module DLL or a web build.
 [dependencies]
-pill_core = { path = "../../pill_core" }
-pill_engine = { path = "../../pill_engine" }
+pill_core = { path = "../../engine/pill_core" }
+pill_engine = { path = "../../engine/pill_engine" }
 # The runtime's `ProjectBackend`, which a C# project is started through in a
 # shipping build. The runtime never depends back on the bridge.
 pill_runtime = { path = "../../hosting/pill_runtime" }

@@ -8,7 +8,7 @@ DESCRIPTION
     structured benchmark data". Two consumers share it:
 
       * `pill_lab.py` - normalizes the result into measurement JSON.
-      * `modules/pill_engine/benches/reports/gen_bench_report.py` - the legacy
+      * `modules/engine/pill_engine/benches/reports/gen_bench_report.py` - the legacy
         self-contained HTML report generator.
 
     Everything here is parsing and statistics only. Formatting (durations,

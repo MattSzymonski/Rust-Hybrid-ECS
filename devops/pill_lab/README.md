@@ -162,7 +162,7 @@ got slower" can be separated from "the build compiled more crates".
 
 ### Engine Performance
 
-Runs the Criterion benchmarks declared in `modules/pill_engine/Cargo.toml` and
+Runs the Criterion benchmarks declared in `modules/engine/pill_engine/Cargo.toml` and
 normalizes `modules/target/criterion/` into JSON: per-benchmark mean / median /
 std-dev / slope with 95% confidence intervals, min / max, outlier flags,
 throughput, raw samples for the charts, and Criterion's own change versus its
@@ -298,7 +298,7 @@ apart:
 
 ## Relationship to `gen_bench_report.py`
 
-`modules/pill_engine/benches/reports/gen_bench_report.py` still works and still
+`modules/engine/pill_engine/benches/reports/gen_bench_report.py` still works and still
 produces its self-contained HTML report. Its Criterion parsing and machine
 detection were removed and it now imports them from
 `devops/core/`, so the repository has one benchmark parser

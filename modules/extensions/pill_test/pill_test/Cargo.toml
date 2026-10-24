@@ -19,6 +19,6 @@ path = "src/pill_test.rs"
 crate-type = ["rlib"]
 
 [dependencies]
-pill_core = { path = "../../../pill_core" }
-pill_engine = { path = "../../../pill_engine" }
+pill_core = { path = "../../../engine/pill_core" }
+pill_engine = { path = "../../../engine/pill_engine" }
 serde = { version = "1", features = ["derive"] }

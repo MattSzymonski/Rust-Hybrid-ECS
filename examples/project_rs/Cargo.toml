@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pill_audio = { path = "../../modules/extensions/pill_audio/pill_audio", default-features = false }
-pill_engine = { path = "../../modules/pill_engine" }
-pill_core = { path = "../../modules/pill_core" }
+pill_engine = { path = "../../modules/engine/pill_engine" }
+pill_core = { path = "../../modules/engine/pill_core" }
 # The master renderer's data only - components, assets, pipelines. The GPU
 # renderer is the host's; a project that linked it would carry wgpu in its own
 # DLL. `default-features = false` documents that this edge chooses its

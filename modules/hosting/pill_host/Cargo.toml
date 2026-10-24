@@ -8,11 +8,11 @@ workspace = true
 
 [dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }
-pill_engine = { path = "../../pill_engine" }
-pill_core = { path = "../../pill_core" }
+pill_engine = { path = "../../engine/pill_engine" }
+pill_core = { path = "../../engine/pill_core" }
 # The renderer contract - the backend trait, the frame, the camera, window
 # handles as data - with no wgpu. Linked in every posture.
-pill_renderer_api = { path = "../pill_renderer_api" }
+pill_renderer_api = { path = "../../rendering/pill_renderer_api" }
 # The Rust half of the C#/Rust ABI: hosting .NET and running a C# project.
 # The host adds C# development tooling on top (mirror generation, the
 # in-process compiler); a C# shipping bundle links the bridge alone.
@@ -36,7 +36,7 @@ renderer_data_dependency_graph = { package = "pill_master_renderer_data", path =
 # host's resolved graph must include its tree for the module builds - the
 # reload included - to resolve the same features. Nothing in the host's code
 # names it.
-editor_core_dependency_graph = { package = "pill_editor_core", path = "../../frontents/pill_editor_core" }
+editor_core_dependency_graph = { package = "pill_editor_core", path = "../../editor/pill_editor_core" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running
 # host (see `build_runner::apply_cargo_host_overrides`), and cargo folds each
@@ -51,7 +51,7 @@ libloading = "0.8"
 # cooker the shader watcher runs - the one the renderer data crate's build
 # script runs, so a runtime cook matches the build's.
 notify = { version = "6", optional = true }
-pill_assets = { path = "../../pill_assets", optional = true }
+pill_assets = { path = "../../assets/pill_assets", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
