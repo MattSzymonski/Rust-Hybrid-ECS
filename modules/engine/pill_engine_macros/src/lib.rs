@@ -197,6 +197,14 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
             Err(error) => return error.to_compile_error().into(),
         };
 
+    // Each `Handle<T>` field's asset type, recorded at registration so the
+    // field layer knows what the field references (W-0048). Recorded by the
+    // generated function, in this artifact, from `T`'s own shared name.
+    let asset_field_records = match handle_field_records(&input, ident) {
+        Ok(records) => records,
+        Err(error) => return error.to_compile_error().into(),
+    };
+
     let register_fn_name = format_ident!("__pill_register_{}", ident);
     let registration_call = if persistable {
         quote! {
@@ -261,6 +269,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         #[allow(non_snake_case)]
         fn #register_fn_name(world: &mut ::pill_engine::World) {
             #registration_call
+            #asset_field_records
         }
 
         ::pill_engine::submit! {
@@ -274,6 +283,61 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// The registration statements that record each top-level `Handle<T>` field's
+/// asset type: `T`'s shared name, or its Rust type name without one.
+///
+/// Fields of a struct that is not a named-field struct have no handle records;
+/// the layout code reports those shapes itself.
+fn handle_field_records(
+    input: &DeriveInput,
+    ident: &syn::Ident,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let syn::Data::Struct(data) = &input.data else {
+        return Ok(quote! {});
+    };
+    let syn::Fields::Named(named) = &data.fields else {
+        return Ok(quote! {});
+    };
+    let mut records = Vec::new();
+    for field in &named.named {
+        let Some(asset) = handle_type_argument(&field.ty) else {
+            continue;
+        };
+        let field_name = field
+            .ident
+            .as_ref()
+            .expect("named field has an identifier")
+            .to_string();
+        records.push(quote! {
+            world.record_asset_field_type(
+                ::pill_engine::ComponentId::of::<#ident>(),
+                #field_name,
+                <#asset as ::pill_engine::asset::Asset>::shared_name()
+                    .unwrap_or_else(::core::any::type_name::<#asset>),
+            );
+        });
+    }
+    Ok(quote! { #(#records)* })
+}
+
+/// The `T` of a `Handle<T>` type, written with any path prefix.
+fn handle_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Handle" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    arguments.args.iter().find_map(|argument| match argument {
+        syn::GenericArgument::Type(asset) => Some(asset),
+        _ => None,
+    })
 }
 
 // =============================================================================

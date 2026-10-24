@@ -86,7 +86,8 @@ pub struct SeededComponent {
 }
 
 /// The canonical token of a field value, or `None` for values the payload
-/// does not carry (heap sequences, opaque bytes, struct arrays).
+/// does not carry (heap sequences, opaque bytes, struct arrays, and asset
+/// handles, which address a slot of this process only).
 pub fn format_value(value: &FieldValue) -> Option<String> {
     Some(match value {
         FieldValue::F32(value) => format!("{value:?}f"),
@@ -105,6 +106,7 @@ pub fn format_value(value: &FieldValue) -> Option<String> {
         FieldValue::Array(_)
         | FieldValue::List { .. }
         | FieldValue::Text(_)
+        | FieldValue::Asset { .. }
         | FieldValue::Opaque { .. } => return None,
     })
 }

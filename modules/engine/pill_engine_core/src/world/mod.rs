@@ -495,6 +495,11 @@ pub struct World {
     /// into dotted leaf rows (`World::record_component_field_layout`), so a
     /// nested colour or vector is editable channel by channel.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
+    /// The asset type each `Handle<T>` field of a component references, by
+    /// field name: the registered name of `T` (W-0048). Owned copies, since
+    /// the names come from module code; re-recorded by each generation's
+    /// registration.
+    pub(crate) asset_field_types: HashMap<ComponentId, HashMap<String, String>>,
     /// Finds a `#[derive(PillMirror)]` value type's layout while a layout is
     /// recorded, so its nested fields expand. Installed by the facade's
     /// `register_all_components` for the duration of its loop, and `None`
@@ -555,6 +560,7 @@ impl World {
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
             component_field_layouts: HashMap::new(),
+            asset_field_types: HashMap::new(),
             value_type_layout_resolver: None,
             registration_error: None,
         }

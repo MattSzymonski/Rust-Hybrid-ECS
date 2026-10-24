@@ -146,9 +146,10 @@ pub fn widget_for(value: &FieldValue) -> FieldWidget {
         | FieldValue::Usize(_)
         | FieldValue::Isize(_) => FieldWidget::Integer,
         FieldValue::Text(_) => FieldWidget::Text,
-        FieldValue::Array(_) | FieldValue::List { .. } | FieldValue::Opaque { .. } => {
-            FieldWidget::ReadOnly
-        }
+        FieldValue::Array(_)
+        | FieldValue::List { .. }
+        | FieldValue::Asset { .. }
+        | FieldValue::Opaque { .. } => FieldWidget::ReadOnly,
     }
 }
 

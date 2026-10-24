@@ -182,6 +182,7 @@ pub use asset::{
     AssetLoader, AssetManager, Handle,
 };
 pub use asset_database::{AssetDatabase, AssetRecord, GuidConflict};
+pub use asset_import_registry::AssetIdentity;
 pub use asset_import_registry::{
     ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
 };

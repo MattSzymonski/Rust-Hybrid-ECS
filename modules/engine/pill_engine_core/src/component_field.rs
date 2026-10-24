@@ -104,6 +104,22 @@ pub enum FieldValue {
     /// A heap-backed UTF-8 string field (`string`), decoded for display.
     /// Read-only here; use the field's accessors to replace its contents.
     Text(String),
+    /// A reference to an asset: a `Handle<T>` field, as its slot index and
+    /// generation, with the asset type the field was registered with.
+    ///
+    /// Writable like a scalar; a write naming another asset type than the
+    /// field's is refused. `asset_type` is the type's registered name (the
+    /// one `.meta` files and the import registry use), `None` when the field
+    /// carries no record of it. A cleared reference is
+    /// [`Handle::INVALID`](crate::Handle::INVALID)'s pair, `u32::MAX` twice.
+    Asset {
+        /// The registered name of the referenced asset's type.
+        asset_type: Option<String>,
+        /// The handle's slot index.
+        index: u32,
+        /// The handle's generation.
+        generation: u32,
+    },
     /// A field the engine can locate but not interpret. Never writable.
     Opaque {
         /// The registered `type_tag` of the field (for example `struct:path`).
@@ -137,6 +153,7 @@ impl FieldValue {
             Self::Array(_) => "array",
             Self::List { .. } => "list",
             Self::Text(_) => "text",
+            Self::Asset { .. } => "asset",
             Self::Opaque { .. } => "opaque",
         }
     }
@@ -210,6 +227,15 @@ pub enum ComponentFieldError {
         /// The element count the layout declares.
         length: usize,
     },
+    /// An asset reference write named another asset type than the field's.
+    AssetTypeMismatch {
+        /// The field being edited.
+        field: String,
+        /// The asset type the field references.
+        expected: String,
+        /// The asset type the caller supplied.
+        found: String,
+    },
     /// The field's tag is outside the editable vocabulary (`struct:` and
     /// anything the derive does not emit a scalar tag for).
     UnsupportedField {
@@ -271,6 +297,11 @@ impl ComponentFieldError {
                 index,
                 length,
             } => format!("field `{field}` index {index} is out of range (length {length})"),
+            Self::AssetTypeMismatch {
+                field,
+                expected,
+                found,
+            } => format!("field `{field}` references a `{expected}` but received a `{found}`"),
             Self::UnsupportedField { field, reason } => {
                 format!("field `{field}` is not editable: {reason}")
             }
@@ -281,6 +312,15 @@ impl ComponentFieldError {
 // =============================================================================
 // Tag vocabulary helpers
 // =============================================================================
+
+/// Whether a type tag is a `Handle<T>` field's (`struct:Handle<Mesh>`, or
+/// `struct:Handle` when the derive could not read the type argument).
+pub(crate) fn is_handle_tag(tag: &str) -> bool {
+    tag == "struct:Handle" || tag.starts_with("struct:Handle<")
+}
+
+/// The byte size of a handle: its `u32` index and `u32` generation.
+const HANDLE_SIZE: usize = 8;
 
 /// The size in bytes of one scalar whose tag is in the closed vocabulary.
 fn scalar_size(tag: &str) -> Option<usize> {
@@ -471,6 +511,21 @@ fn decode_tagged(bytes: &[u8], offset: usize, tag: &'static str, size: usize) ->
     if let Some(value) = decode_scalar(bytes, offset, tag) {
         return value;
     }
+    // A handle is two `u32`s; the asset type is the world's record of the
+    // field, filled in by the caller that knows the component.
+    if is_handle_tag(tag) && size == HANDLE_SIZE {
+        let index = decode_scalar(bytes, offset, "u32");
+        let generation = decode_scalar(bytes, offset + 4, "u32");
+        if let (Some(FieldValue::U32(index)), Some(FieldValue::U32(generation))) =
+            (index, generation)
+        {
+            return FieldValue::Asset {
+                asset_type: None,
+                index,
+                generation,
+            };
+        }
+    }
     let mut raw = vec![0u8; size];
     if let Some(source) = bytes.get(offset..offset + size) {
         raw.copy_from_slice(source);
@@ -596,7 +651,11 @@ impl World {
             .ok_or(ComponentFieldError::ComponentStorageMissing {
                 component: component_name.to_string(),
             })?;
-        Ok(decode_field(&row_bytes, descriptor))
+        Ok(self.with_asset_type(
+            component_id,
+            descriptor,
+            decode_field(&row_bytes, descriptor),
+        ))
     }
 
     /// Read every field of one component in layout order, for the inspector.
@@ -629,8 +688,91 @@ impl World {
         // Step 3: Decode every field from the one row image.
         Ok(layout
             .iter()
-            .map(|descriptor| decode_field(&row_bytes, descriptor))
+            .map(|descriptor| {
+                self.with_asset_type(
+                    component_id,
+                    descriptor,
+                    decode_field(&row_bytes, descriptor),
+                )
+            })
             .collect())
+    }
+
+    /// `value` with the asset type a handle field was registered with, when
+    /// it is one; any other value unchanged.
+    fn with_asset_type(
+        &self,
+        component_id: ComponentId,
+        descriptor: &ComponentFieldDescriptor,
+        value: FieldValue,
+    ) -> FieldValue {
+        match value {
+            FieldValue::Asset {
+                asset_type: None,
+                index,
+                generation,
+            } => FieldValue::Asset {
+                asset_type: self
+                    .asset_field_type(component_id, descriptor.name)
+                    .map(str::to_owned),
+                index,
+                generation,
+            },
+            other => other,
+        }
+    }
+
+    /// Record that `component`'s handle field `field` references assets of the
+    /// type registered as `asset_type`.
+    ///
+    /// Called by `#[derive(PillComponent)]`'s generated registration for each
+    /// `Handle<T>` field, with `T`'s shared name, and by a foreign-language
+    /// backend for its components. The name is copied: the caller's string
+    /// may live in a module that a reload unmaps.
+    pub fn record_asset_field_type(
+        &mut self,
+        component: ComponentId,
+        field: &str,
+        asset_type: &str,
+    ) {
+        self.asset_field_types
+            .entry(component)
+            .or_default()
+            .insert(field.to_owned(), asset_type.to_owned());
+    }
+
+    /// Refuse an asset value whose type is not the one `field` was recorded
+    /// with; a value or a field without a recorded type passes.
+    fn check_asset_type(
+        &self,
+        component: ComponentId,
+        field: &str,
+        value: &FieldValue,
+    ) -> Result<(), ComponentFieldError> {
+        let FieldValue::Asset {
+            asset_type: Some(found),
+            ..
+        } = value
+        else {
+            return Ok(());
+        };
+        match self.asset_field_type(component, field) {
+            Some(expected) if expected != found => Err(ComponentFieldError::AssetTypeMismatch {
+                field: field.to_owned(),
+                expected: expected.to_owned(),
+                found: found.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The asset type `component`'s handle field `field` references, if
+    /// recorded.
+    pub fn asset_field_type(&self, component: ComponentId, field: &str) -> Option<&str> {
+        self.asset_field_types
+            .get(&component)?
+            .get(field)
+            .map(String::as_str)
     }
 }
 
@@ -890,6 +1032,36 @@ fn encode_field_write(
             found: value.variant_tag(),
         });
     }
+    // A handle field takes an asset value: its index and generation, in the
+    // handle's `repr(C)` order. The asset type is checked by the caller,
+    // which knows the field's record (`World::write_component_field`).
+    if let FieldValue::Asset {
+        index, generation, ..
+    } = value
+    {
+        if !is_handle_tag(tag) || descriptor.size != HANDLE_SIZE {
+            return Err(ComponentFieldError::TypeMismatch {
+                field: field.to_string(),
+                expected: tag,
+                found: value.variant_tag(),
+            });
+        }
+        let mut bytes = Vec::with_capacity(HANDLE_SIZE);
+        bytes.extend_from_slice(&index.to_le_bytes());
+        bytes.extend_from_slice(&generation.to_le_bytes());
+        return Ok(FieldWrite {
+            row_offset: descriptor.offset,
+            bytes,
+        });
+    }
+    // A handle field is editable, but only by an asset value.
+    if is_handle_tag(tag) {
+        return Err(ComponentFieldError::TypeMismatch {
+            field: field.to_string(),
+            expected: tag,
+            found: value.variant_tag(),
+        });
+    }
     // A `struct:` field, or any other tag the engine cannot interpret, is
     // never writable through the generic path.
     if !is_scalar_tag(tag) && !tag.starts_with("array:") {
@@ -987,6 +1159,7 @@ impl World {
 
         // Step 2: Validate and encode the payload BEFORE touching any column,
         // so a refused edit leaves the world untouched.
+        self.check_asset_type(component_id, field_name, &value)?;
         let write = encode_field_write(descriptor, field_name, &value)?;
 
         // Step 3: Write the payload and stamp the row's changed tick, each in
@@ -1053,6 +1226,7 @@ impl World {
                     component: component_name.to_string(),
                     field: field_name.clone(),
                 })?;
+            self.check_asset_type(component_id, field_name, value)?;
             let write = encode_field_write(descriptor, field_name, value)?;
             let target = image
                 .get_mut(write.row_offset..write.row_offset + write.bytes.len())
@@ -2000,5 +2174,152 @@ mod tests {
             Query::<(crate::entity::Entity,), Changed<SampleComponent>>::new(&mut world);
         let hits: Vec<crate::entity::Entity> = query.iter_mut().map(|(e,)| e).collect();
         assert_eq!(hits, vec![entity]);
+    }
+
+    /// A component holding two asset handles, laid out like the derive lays
+    /// out `MeshRendererComponent`.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct RendererProbe {
+        mesh: crate::asset::Handle<ProbeMesh>,
+        material: crate::asset::Handle<ProbeMaterial>,
+    }
+    impl Component for RendererProbe {}
+
+    /// The two asset types the probe references.
+    struct ProbeMesh;
+    impl crate::asset::Asset for ProbeMesh {}
+    struct ProbeMaterial;
+    impl crate::asset::Asset for ProbeMaterial {}
+
+    static RENDERER_PROBE_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "mesh",
+            type_tag: "struct:Handle<ProbeMesh>",
+            offset: 0,
+            size: 8,
+            align: 4,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+        ComponentFieldDescriptor {
+            name: "material",
+            type_tag: "struct:Handle<ProbeMaterial>",
+            offset: 8,
+            size: 8,
+            align: 4,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+    ];
+
+    /// A world with the probe registered and its two fields' asset types
+    /// recorded, and one entity carrying it.
+    fn renderer_probe_world() -> (World, crate::entity::Entity, String) {
+        let mut world = World::new();
+        world.register_component_with_layout::<RendererProbe>(RENDERER_PROBE_FIELDS);
+        let component = ComponentId::of::<RendererProbe>();
+        world.record_asset_field_type(component, "mesh", "probe::Mesh");
+        world.record_asset_field_type(component, "material", "probe::Material");
+        let entity = world
+            .create_entity()
+            .with(RendererProbe {
+                mesh: crate::asset::Handle::from_raw(0, 0),
+                material: crate::asset::Handle::from_raw(1, 0),
+            })
+            .build()
+            .expect("entity builds");
+        let name = crate::component::ComponentRegistry::registered_name::<RendererProbe>();
+        (world, entity, name)
+    }
+
+    /// A handle field reads as an asset value naming its type and the handle,
+    /// not as opaque bytes.
+    #[test]
+    fn a_handle_field_reads_as_a_typed_asset_reference() {
+        let (world, entity, name) = renderer_probe_world();
+        let fields = world.read_component_fields(entity, &name).unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                FieldValue::Asset {
+                    asset_type: Some("probe::Mesh".to_owned()),
+                    index: 0,
+                    generation: 0,
+                },
+                FieldValue::Asset {
+                    asset_type: Some("probe::Material".to_owned()),
+                    index: 1,
+                    generation: 0,
+                },
+            ]
+        );
+    }
+
+    /// Another handle of the field's type writes, stamps the row changed, and
+    /// reads back; the invalid handle clears the reference.
+    #[test]
+    fn a_handle_field_writes_another_handle_and_clears() {
+        let (mut world, entity, name) = renderer_probe_world();
+        let other = FieldValue::Asset {
+            asset_type: Some("probe::Mesh".to_owned()),
+            index: 7,
+            generation: 2,
+        };
+        world
+            .write_component_field(entity, &name, "mesh", other.clone())
+            .expect("a mesh handle writes into the mesh field");
+        assert_eq!(
+            world.read_component_field(entity, &name, "mesh").unwrap(),
+            other
+        );
+        assert_eq!(
+            world.get_component::<RendererProbe>(entity).unwrap().mesh,
+            crate::asset::Handle::from_raw(7, 2)
+        );
+
+        let cleared = FieldValue::Asset {
+            asset_type: Some("probe::Mesh".to_owned()),
+            index: u32::MAX,
+            generation: u32::MAX,
+        };
+        world
+            .write_component_field(entity, &name, "mesh", cleared)
+            .expect("the invalid handle clears the reference");
+        assert_eq!(
+            world.get_component::<RendererProbe>(entity).unwrap().mesh,
+            crate::asset::Handle::INVALID
+        );
+    }
+
+    /// A handle of another asset type is refused with a typed error, and a
+    /// non-asset value is refused as a type mismatch; neither writes.
+    #[test]
+    fn a_handle_of_another_asset_type_is_refused() {
+        let (mut world, entity, name) = renderer_probe_world();
+        let material = FieldValue::Asset {
+            asset_type: Some("probe::Material".to_owned()),
+            index: 3,
+            generation: 0,
+        };
+        let refused = world.write_component_field(entity, &name, "mesh", material);
+        assert!(
+            matches!(
+                &refused,
+                Err(ComponentFieldError::AssetTypeMismatch { expected, found, .. })
+                    if expected == "probe::Mesh" && found == "probe::Material"
+            ),
+            "{refused:?}"
+        );
+        let scalar = world.write_component_field(entity, &name, "mesh", FieldValue::U32(5));
+        assert!(
+            matches!(scalar, Err(ComponentFieldError::TypeMismatch { .. })),
+            "{scalar:?}"
+        );
+        assert_eq!(
+            world.get_component::<RendererProbe>(entity).unwrap().mesh,
+            crate::asset::Handle::from_raw(0, 0),
+            "nothing was written"
+        );
     }
 }

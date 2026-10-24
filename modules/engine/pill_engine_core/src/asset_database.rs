@@ -632,6 +632,40 @@ mod tests {
     }
 
     #[test]
+    fn a_handle_names_its_asset_through_the_registry() {
+        let mut scratch = Scratch::new("identity");
+        scratch.note("a.note", NOTE_GUID);
+        let registry = scratch.registry();
+        let database = AssetDatabase::from_directory(&scratch.root, &registry);
+        let assets = scratch.world.get_resource_mut::<AssetManager>().unwrap();
+        let loaded = registry
+            .load_by_guid(
+                assets,
+                &database,
+                guid(NOTE_GUID),
+                MetadataPolicy::ReadIfPresent,
+            )
+            .unwrap();
+        let note_type = "pill_engine::asset_database::tests::Note";
+        let identity = registry
+            .asset_identity(assets, note_type, loaded.index, loaded.generation)
+            .expect("a live handle has an identity");
+        assert_eq!(identity.guid, Some(guid(NOTE_GUID)));
+        assert_eq!(identity.name.as_deref(), Some("a.note"));
+        assert!(
+            registry
+                .asset_identity(assets, note_type, loaded.index, loaded.generation + 1)
+                .is_none(),
+            "a stale handle has none"
+        );
+        assert_eq!(
+            assets.registered_asset_type(std::any::type_name::<Note>()),
+            Some(std::any::type_name::<Note>()),
+            "a type without a shared name is registered under its Rust type name"
+        );
+    }
+
+    #[test]
     fn an_unknown_guid_or_a_wrong_type_is_an_error() {
         let mut scratch = Scratch::new("errors");
         scratch.note("a.note", NOTE_GUID);
