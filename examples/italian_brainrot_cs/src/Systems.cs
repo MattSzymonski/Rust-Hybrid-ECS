@@ -197,13 +197,6 @@ public static class SceneStartup
 /// <summary>Rotates each tagged entity around its local Y axis at 90 degrees per second.</summary>
 public static class RotationSystem
 {
-    // PILL0301 warns that mutable statics in a system-declaring type are what a
-    // parallel batch races on. Only this one system touches the field, and the
-    // reset it takes on a reload is what makes the next value print again.
-#pragma warning disable PILL0301
-    private static float _reportedAlpha = float.NaN;
-#pragma warning restore PILL0301
-
     [EcsSystem]
     public static void Run(
         ResMut<SimulationTime> time,

@@ -1,4 +1,4 @@
-# Project settings for the native Rust example project.
+# Project settings for the managed C# bouncing-ball example.
 #
 # `name` is the display name (window title); `build_binary_name` is the
 # artifact file base and must contain only letters, digits and underscores.
