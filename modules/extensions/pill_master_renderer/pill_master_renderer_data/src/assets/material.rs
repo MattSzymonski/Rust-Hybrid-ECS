@@ -304,7 +304,8 @@ mod tests {
         assert_eq!(chain_default.parameters, material.parameters);
         assert_eq!(
             serde_json::to_value(MaterialDocument::default()).unwrap()["shader"],
-            serde_json::json!(pbr_pipeline::SHADER_GUID.to_string())
+            serde_json::json!({ "guid": pbr_pipeline::SHADER_GUID.to_string() }),
+            "a material names its shader in the saved reference form"
         );
     }
 }
