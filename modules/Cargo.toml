@@ -11,11 +11,11 @@ members = [
     # shares (`pill_renderer_api::RenderFrame.ui`): one shared dylib, so the
     # frame's UI type has one identity across every artifact that builds or
     # draws it (W-0032).
-    "pill_draw",
+    "rendering/pill_draw",
     # The in-game egui UI (W-0028): a third shared dylib, so a project's egui
     # context outlives a project reload and its frame is neutral data the main
     # renderer draws.
-    "pill_project_ui",
+    "rendering/pill_project_ui",
     # The C# half of the engine: the bridge crate, plus the managed runtime and
     # compiler that live beside it. This one is named explicitly rather than
     # globbed, because `csharp/` is not all crates - the other two are MSBuild
