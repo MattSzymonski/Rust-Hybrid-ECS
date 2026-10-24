@@ -227,6 +227,8 @@ pub mod tab_entities;
 pub use tab_entities::entities_tab;
 pub use tab_entities::entity_menu_items;
 pub use tab_entities::entity_rows;
+pub use tab_entities::remember_hierarchy_row_rect;
+pub use tab_entities::DraggedEntity;
 
 /// The [`tab_preferences`] module: the preferences tab: the editor-wide rows and the project's gizmo state.
 ///
@@ -261,10 +263,14 @@ pub use tab_inspector::INSPECTOR_VECTOR_FIELD_WIDTH;
 pub mod inspector_fields;
 
 pub use inspector_fields::field_widget_name;
+pub use inspector_fields::inspector_entity_row;
 pub use inspector_fields::inspector_field_row;
 pub use inspector_fields::inspector_row;
 pub use inspector_fields::is_scalar_field;
+pub use inspector_fields::remember_entity_row_rect;
+pub use inspector_fields::remember_entity_row_text;
 pub use inspector_fields::remember_inspector_row;
+pub use inspector_fields::EntityRowInput;
 
 /// The [`inspector_widgets`] module: the inspector's field controls.
 ///
@@ -960,6 +966,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 self.selection,
                 self.pending,
                 &mut self.overlay_regions,
+                self.inspector,
             ),
             EditorTab::Systems => systems_tab(ui, self.snapshot, self.pending),
             EditorTab::Inspector => inspector_tab(

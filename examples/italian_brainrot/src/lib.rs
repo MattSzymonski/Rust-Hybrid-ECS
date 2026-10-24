@@ -10,7 +10,7 @@
 //! configuration, and showcase media are kept under `res` and `media`.
 
 // External crates
-use pill_engine::{pill_project, Engine, PillComponent};
+use pill_engine::{pill_project, Engine, Entity, PillComponent};
 use serde::{Deserialize, Serialize};
 
 mod asset_loading;
@@ -55,6 +55,23 @@ pub struct ShowcaseComponent {
 /// How many showcase points the collection field holds.
 pub const SHOWCASE_POINTS: usize = 2;
 
+/// A reference to another entity, so the Inspector has a reference row to draw
+/// (W-0048 Stage 6).
+///
+/// Not persistable, and it carries nothing serialised: the point is the field's
+/// *kind*, which the Inspector turns into a row naming the referenced entity,
+/// with a picker, a scene pick and a drop target.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PillComponent)]
+pub struct ShowcaseReferenceComponent {
+    /// The entity this one points at.
+    #[pill(tooltip("The entity this one points at"))]
+    pub follow: Entity,
+    /// A weight beside the reference, so the section has two rows.
+    #[pill(range(0.0, 1.0))]
+    pub weight: f32,
+}
+
 /// One element of [`ShowcaseComponent::points`]: a value type with a declared
 /// layout, so the engine can expand the array into editable leaf rows.
 #[repr(C)]
@@ -88,6 +105,7 @@ pub fn init(engine: &mut Engine) -> u32 {
         .clear();
     __pill_register_TagAlphaComponent(engine.world_mut());
     __pill_register_ShowcaseComponent(engine.world_mut());
+    __pill_register_ShowcaseReferenceComponent(engine.world_mut());
 
     let assets = match asset_loading::load(engine.world_mut()) {
         Ok(assets) => assets,

@@ -209,6 +209,15 @@ REFERENCE_ROW_TOKEN = "[editor] inspector row kind=asset"
 REFERENCE_SET_TOKEN = "[editor] asset reference set"
 REFERENCE_TILE_RECT_TOKEN = "[editor] assets tile rect"
 REFERENCE_ROW_RECT_TOKEN = "[editor] inspector asset row rect"
+# An entity reference row and what it names (W-0048 Stage 6): the row logs each
+# distinct reference once, the applied edit once, and the scene-pick arming
+# once per request.
+ENTITY_REFERENCE_ROW_TOKEN = "[editor] inspector row kind=entity"
+ENTITY_REFERENCE_SET_TOKEN = "[editor] entity reference set"
+ENTITY_REFERENCE_ROW_RECT_TOKEN = "[editor] inspector entity row rect"
+ENTITY_REFERENCE_ARMED_TOKEN = "[editor] inspector entity pick armed"
+ENTITY_REFERENCE_ANSWERED_TOKEN = "[editor] inspector entity pick answered"
+HIERARCHY_ROW_RECT_TOKEN = "[editor] hierarchy row rect"
 RESOURCES_DUMP_TOKEN = "[test] resources"
 RESOURCE_FIELD_TOKEN = "[test] resource field"
 RESOURCE_SELECTED_TOKEN = "[editor] resource selected"
@@ -1773,16 +1782,38 @@ def main() -> int:
         )
         session.wait(tile_pattern, 30, "the material tile's rectangle", begin)
         # The Inspector's body is shorter than its rows, and the mesh renderer
-        # sits below it: the sections above it are collapsed, as a person
-        # collapsing a header does, so its rows come on screen. A row logs its
-        # rectangle only while its centre is visible - the box a drop lands in.
-        collapsed_sections = (
-            "italian_brainrot::ShowcaseComponent",
-            "italian_brainrot::TagAlphaComponent",
-            "pill_master_renderer::component::TransformComponent",
+        # sits below others: the sections above it are collapsed, topmost
+        # first, as a person collapsing a header does, until its material row's
+        # rectangle - logged only while the row's centre is visible - comes on
+        # screen. Which sections those are is read from the log rather than
+        # listed here, so a component the project adds moves nothing.
+        row_rect_pattern = (
+            re.escape(REFERENCE_ROW_RECT_TOKEN)
+            + r'(?=[^\n]*MeshRendererComponent\.material")[^\n]*'
         )
         visible_from = len(session.read_log())
-        for component in collapsed_sections:
+        collapsed_sections = []
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if re.search(row_rect_pattern, session.read_log()[visible_from:]):
+                break
+            headers = {}
+            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log()):
+                headers[match.group(1)] = match
+            above = sorted(
+                (
+                    (name, float(logged.group(3)))
+                    for name, logged in headers.items()
+                    if name != "pill_master_renderer::component::MeshRendererComponent"
+                    and name not in collapsed_sections
+                ),
+                key=lambda entry: entry[1],
+            )
+            assert above, (
+                "every Inspector section is collapsed and the material row's "
+                "rectangle never came on screen"
+            )
+            component = above[0][0]
             begin = len(session.read_log())
             x, y, width, height = inspector_section_rect(session, component)
             session.send("click {:.0f} {:.0f}".format(x + 12.0, y + 6.0))
@@ -1795,10 +1826,7 @@ def main() -> int:
                 "the {} section collapsed".format(component.rsplit("::", 1)[-1]),
                 begin,
             )
-        row_rect_pattern = (
-            re.escape(REFERENCE_ROW_RECT_TOKEN)
-            + r'(?=[^\n]*MeshRendererComponent\.material")[^\n]*'
-        )
+            collapsed_sections.append(component)
         session.wait(row_rect_pattern, 30, "the material row's rectangle", visible_from)
         row_rect = logged_rect_bounds(
             last_log_match(session, row_rect_pattern, visible_from).group(0)
@@ -1850,6 +1878,351 @@ def main() -> int:
                 begin,
             )
         print("  [OK] an asset reference picked, undid, cleared and took a drop")
+
+        # Step 3a8c: entity reference rows (W-0048 Stage 6). A field that names
+        # another entity draws a row whose text is that entity's Hierarchy
+        # label. A scripted pick - the same recorded step the row's picker
+        # queues - re-points it and undoes, `none` clears it, a Hierarchy row
+        # dragged onto it assigns that entity, and an armed row takes the next
+        # scene press as its reference instead of the press selecting. Every
+        # way in is one history step, so the row ends where it started.
+        reference_dump = session.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 30, "the entity list"
+        )
+        reference_rows = [
+            match.group(1)
+            for match in re.finditer(
+                re.escape(ENTITY_ROW_TOKEN)
+                + r'\s+display="([^"]+)"\s+components="([^"]*)"',
+                reference_dump,
+            )
+            if "ShowcaseReferenceComponent" in match.group(2)
+        ]
+        assert reference_rows, (
+            "no entity carries a showcase reference: {}".format(reference_dump[-800:])
+        )
+        listed_entities = [
+            match.group(1)
+            for match in re.finditer(
+                re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"', reference_dump
+            )
+        ]
+        # A carrier no earlier step selected: a row logs its text on its first
+        # draw and on every change, so a freshly selected one always logs.
+        holder = next(
+            (
+                display
+                for display in reference_rows
+                if display not in (mesh_entity, prior_entity, picked_entity)
+            ),
+            None,
+        )
+        assert holder, "every reference carrier was selected by an earlier step"
+
+        def entity_row_capture() -> str:
+            """The holder's reference row, capturing the text it names."""
+            return (
+                re.escape(ENTITY_REFERENCE_ROW_TOKEN)
+                + r"(?=[^\n]*entity="
+                + re.escape(holder)
+                + r"\b)[^\n]*reference=\"([^\"]*)\""
+            )
+
+        def entity_row_pattern(reference: str) -> str:
+            """The holder's reference row, naming `reference`."""
+            return (
+                re.escape(ENTITY_REFERENCE_ROW_TOKEN)
+                + r"(?=[^\n]*entity="
+                + re.escape(holder)
+                + r"\b)[^\n]*reference=\""
+                + re.escape(reference)
+                + r'"'
+            )
+
+        begin = len(session.read_log())
+        session.send("select entity {}".format(holder))
+        session.wait(entity_row_capture(), 30, "the reference row", begin)
+        authored_target = last_log_match(session, entity_row_capture(), begin).group(1)
+        assert authored_target not in ("None", "(missing)"), (
+            "the reference row starts unset: {}".format(authored_target)
+        )
+        print("  [OK] the reference row names {}".format(authored_target))
+
+        # The picker's step: by label, recorded, and undone back.
+        picked_target = next(
+            display
+            for display in listed_entities
+            if display not in (authored_target, holder)
+        )
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} ShowcaseReferenceComponent follow {}".format(
+                holder, picked_target
+            )
+        )
+        session.wait(
+            re.escape(ENTITY_REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="follow")[^\n]*reference="'
+            + re.escape(picked_target)
+            + r'"',
+            60,
+            "the reference pick",
+            begin,
+        )
+        session.wait(
+            entity_row_pattern(picked_target),
+            30,
+            "the row names the picked entity",
+            begin,
+        )
+        print("  [OK] a scripted pick pointed the reference at {}".format(picked_target))
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the pick's undo", begin)
+        session.wait(
+            entity_row_pattern(authored_target),
+            30,
+            "the authored reference after the undo",
+            begin,
+        )
+        print("  [OK] undoing the pick put the authored reference back")
+
+        # `none` clears the field to the null handle, and undoes back.
+        begin = len(session.read_log())
+        session.send("edit set {} ShowcaseReferenceComponent follow none".format(holder))
+        session.wait(
+            re.escape(ENTITY_REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="follow")[^\n]*reference="none"',
+            60,
+            "the reference cleared",
+            begin,
+        )
+        session.wait(entity_row_pattern("None"), 30, "the row reads unset", begin)
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the clear's undo", begin)
+        session.wait(
+            entity_row_pattern(authored_target),
+            30,
+            "the authored reference after the clear's undo",
+            begin,
+        )
+        print("  [OK] clearing the reference undoes back to what it named")
+
+        # The drop: the entities tab's rows are the drag sources, so the tab is
+        # opened (the Inspector stays beside it) and both ends' rectangles come
+        # from the logs. The rows log their rectangles the first time they are
+        # drawn, and the tab body keeps drawing while another tab is in front,
+        # so the dragged row's rectangle is already there.
+        session.send("tab entities")
+        hierarchy_row_pattern = (
+            re.escape(HIERARCHY_ROW_RECT_TOKEN)
+            + r"\s+entity="
+            + re.escape(picked_target)
+            + r"\b[^\n]*"
+        )
+        session.wait(hierarchy_row_pattern, 60, "the hierarchy row's rectangle", 0)
+        reference_row_rect_pattern = (
+            re.escape(ENTITY_REFERENCE_ROW_RECT_TOKEN)
+            + r'(?=[^\n]*row="'
+            + re.escape(holder)
+            + r"\.)"
+            + r"[^\n]*"
+        )
+        # The reference section sits below others: they are collapsed, topmost
+        # first, until its row's rectangle - logged only while the row's centre
+        # is visible, which is the box a drop lands in - comes on screen. The
+        # row kept drawing since the holder was first selected, so a rectangle
+        # it already logged counts.
+        collapsed_for_reference = []
+        begin = len(session.read_log())
+        session.send("select entity {}".format(holder))
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if re.search(reference_row_rect_pattern, session.read_log()):
+                break
+            headers = {}
+            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log()):
+                headers[match.group(1)] = match
+            above = sorted(
+                (
+                    (name, float(logged.group(3)))
+                    for name, logged in headers.items()
+                    if not name.endswith("::ShowcaseReferenceComponent")
+                    and name not in collapsed_for_reference
+                ),
+                key=lambda entry: entry[1],
+            )
+            assert above, "every other Inspector section is collapsed and the row stayed off screen"
+            component = above[0][0]
+            section_begin = len(session.read_log())
+            x, y, width, height = inspector_section_rect(session, component)
+            session.send("click {:.0f} {:.0f}".format(x + 12.0, y + 6.0))
+            session.wait(
+                re.escape(INSPECTOR_SECTION_TOKEN)
+                + r'(?=[^\n]*component="'
+                + re.escape(component)
+                + r'")[^\n]*collapsed=true',
+                30,
+                "the {} section collapsed".format(component.rsplit("::", 1)[-1]),
+                section_begin,
+            )
+            collapsed_for_reference.append(component)
+        session.wait(
+            reference_row_rect_pattern,
+            30,
+            "the reference row's rectangle",
+            0,
+        )
+        drop_from = logged_rect_centre(
+            last_log_match(session, hierarchy_row_pattern).group(0)
+        )
+        drop_to = logged_rect_centre(
+            last_log_match(session, reference_row_rect_pattern).group(0)
+        )
+        begin = len(session.read_log())
+        session.send(f"drag {drop_from[0]:.0f} {drop_from[1]:.0f} {drop_to[0]:.0f} {drop_to[1]:.0f}")
+        session.wait(
+            re.escape(ENTITY_REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="follow")[^\n]*reference="'
+            + re.escape(picked_target)
+            + r'"',
+            60,
+            "the dropped entity",
+            begin,
+        )
+        session.wait(
+            entity_row_pattern(picked_target),
+            30,
+            "the row names the dropped entity",
+            begin,
+        )
+        print("  [OK] dropping a Hierarchy row onto the reference assigned it")
+        begin = len(session.read_log())
+        session.send("command editor.undo")
+        session.wait(re.escape(HISTORY_UNDO_TOKEN), 30, "the drop's undo", begin)
+        session.wait(
+            entity_row_pattern(authored_target),
+            30,
+            "the authored reference after the drop's undo",
+            begin,
+        )
+
+        # A reference to a destroyed entity reads as missing: a throwaway
+        # entity is created, pointed at, deleted and the row re-read, so the
+        # scene's own entities are left alone.
+        begin = len(session.read_log())
+        applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
+        session.send("command editor.entity_create")
+        session.wait(re.escape(NEW_ENTITY_TOKEN), 30, "the throwaway entity queued", begin)
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="new entity"',
+            30,
+            "the throwaway recorded",
+            begin,
+        )
+        wait_applied(applied_before, "the throwaway applied")
+        # The created entity is the one the list did not have: the selection
+        # the create leaves behind is not read, because a later `select entity`
+        # in this step would then name the wrong entity.
+        after_create = session.request(
+            "dump entities", re.escape(ENTITIES_DUMP_TOKEN), 30, "the entity list again"
+        )
+        created = [
+            match.group(1)
+            for match in re.finditer(
+                re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"', after_create
+            )
+            if match.group(1) not in listed_entities
+        ]
+        assert len(created) == 1, "the create added {} entities".format(len(created))
+        throwaway = created[0]
+        assert throwaway != holder, "the throwaway is the holder itself"
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} ShowcaseReferenceComponent follow {}".format(holder, throwaway)
+        )
+        session.wait(
+            re.escape(ENTITY_REFERENCE_SET_TOKEN)
+            + r'(?=[^\n]*field="follow")[^\n]*reference="'
+            + re.escape(throwaway)
+            + r'"',
+            60,
+            "the reference pointed at the throwaway",
+            begin,
+        )
+        # The selection has to be on the throwaway before the delete is queued:
+        # the delete command reads the selection when it is built.
+        begin = len(session.read_log())
+        session.send("select entity {}".format(throwaway))
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN)
+            + r"\s+entity="
+            + re.escape(throwaway)
+            + r"\b",
+            30,
+            "the throwaway selected",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("command editor.entity_delete")
+        session.wait(
+            re.escape(DELETE_ENTITY_TOKEN) + r"\s+entity=" + re.escape(throwaway) + r"\b",
+            30,
+            "the throwaway deleted",
+            begin,
+        )
+        session.wait(
+            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="delete entity"',
+            30,
+            "the delete recorded",
+            begin,
+        )
+        begin = len(session.read_log())
+        session.send("select entity {}".format(holder))
+        session.wait(
+            entity_row_pattern("(missing)"),
+            60,
+            "the row reads missing",
+            begin,
+        )
+        print("  [OK] a reference to a destroyed entity reads as missing")
+
+        # And back to the entity the scene authored the reference with.
+        begin = len(session.read_log())
+        session.send(
+            "edit set {} ShowcaseReferenceComponent follow {}".format(
+                holder, authored_target
+            )
+        )
+        session.wait(
+            entity_row_pattern(authored_target),
+            60,
+            "the authored reference back",
+            begin,
+        )
+        for component in reversed(collapsed_for_reference):
+            begin = len(session.read_log())
+            x, y, width, height = inspector_section_rect(session, component)
+            session.send("click {:.0f} {:.0f}".format(x + 12.0, y + 6.0))
+            session.wait(
+                re.escape(INSPECTOR_SECTION_TOKEN)
+                + r'(?=[^\n]*component="'
+                + re.escape(component)
+                + r'")[^\n]*collapsed=false',
+                30,
+                "the {} section expanded".format(component.rsplit("::", 1)[-1]),
+                begin,
+            )
+        heartbeats_before = occurrence_count(session, re.escape(EGUI_ROWS_TOKEN))
+        session.send("tab assets")
+        wait_for_frames = time.monotonic() + 30
+        while time.monotonic() < wait_for_frames:
+            if occurrence_count(session, re.escape(EGUI_ROWS_TOKEN)) > heartbeats_before:
+                break
+            # Poll until a frame drawn after the tab switch reports in.
+            time.sleep(0.2)
+        print("  [OK] an entity reference was picked, cleared, dropped and went missing")
 
         begin = len(session.read_log())
         session.send("select entity {}".format(prior_entity))

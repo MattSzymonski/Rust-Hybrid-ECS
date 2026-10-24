@@ -1318,6 +1318,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "host_module_pill_editor_shell_egui_editor"
+version = "0.1.0"
+dependencies = [
+ "pill_editor_shell_egui_editor",
+ "pill_engine",
+]
+
+[[package]]
 name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
@@ -1334,24 +1342,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_module_pill_spline"
+name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
- "pill_engine",
- "pill_spline",
-]
-
-[[package]]
-name = "host_project_project"
-version = "0.1.0"
-dependencies = [
- "pill_audio",
- "pill_core",
+ "glam",
+ "pill_dummy_color",
  "pill_engine",
  "pill_master_renderer_data",
- "pill_spline",
  "serde",
- "tracing",
+ "trait_type_map",
 ]
 
 [[package]]

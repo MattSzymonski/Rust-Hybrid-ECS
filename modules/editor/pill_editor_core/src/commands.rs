@@ -1095,6 +1095,13 @@ pub fn ensure_command_resources(world: &mut pill_engine::World) {
     if world.get_resource::<PendingEditorCommands>().is_none() {
         world.insert_resource(PendingEditorCommands::default());
     }
+    world.register_resource::<crate::editor_state::EntityPickRequest>();
+    if world
+        .get_resource::<crate::editor_state::EntityPickRequest>()
+        .is_none()
+    {
+        world.insert_resource(crate::editor_state::EntityPickRequest::default());
+    }
     crate::history::CommandHistory::ensure(world);
 }
 

@@ -186,6 +186,16 @@ pub enum ScriptedCommand {
     DialogSubmit,
     /// `edit asset <action> ...` - queue one recorded asset-file edit.
     EditAsset(AssetEdit),
+    /// `pick entity <entity> <component> <field>` - arm an entity reference
+    /// row, so the next scene press names its reference (W-0048 Stage 6).
+    PickEntity {
+        /// The entity the field belongs to.
+        entity: String,
+        /// The component's registered name, or its suffix.
+        component: String,
+        /// The field's name.
+        field: String,
+    },
     /// `edit set <entity> <component> <field> <value>` - one recorded field edit.
     EditSet {
         /// The entity's display handle (`3v0`).
@@ -751,6 +761,7 @@ impl ScriptedCommand {
             }
             "dialog" => dialog(&mut cursor),
             "edit" => edit(&mut cursor),
+            "pick" => pick(&mut cursor),
             "command" => command(&mut cursor),
             other => Err(ParseError::new(format!("unknown verb '{other}'"))),
         }
@@ -890,6 +901,26 @@ fn dialog(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
             Ok(ScriptedCommand::DialogSubmit)
         }
         _ => Err(ParseError::new("dialog needs open, set, submit or cancel")),
+    }
+}
+
+/// `pick entity <entity> <component> <field>`: arm an entity reference row, so
+/// the next scene click names its reference.
+fn pick(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
+    match cursor.word() {
+        Some("entity") => {
+            let reason = "pick entity needs an entity, a component and a field";
+            let entity = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let component = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let field = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            cursor.finish("pick entity")?;
+            Ok(ScriptedCommand::PickEntity {
+                entity: entity.to_string(),
+                component: component.to_string(),
+                field: field.to_string(),
+            })
+        }
+        _ => Err(ParseError::new("pick needs entity")),
     }
 }
 

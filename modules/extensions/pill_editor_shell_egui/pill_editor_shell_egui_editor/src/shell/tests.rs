@@ -91,7 +91,14 @@ fn the_tab_bodies_draw_without_panicking() {
     let mut inspector_session = InspectorSession::default();
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
-            entities_tab(ui, &snapshot, &mut selection, &mut pending, &mut regions);
+            entities_tab(
+                ui,
+                &snapshot,
+                &mut selection,
+                &mut pending,
+                &mut regions,
+                &mut inspector_session,
+            );
             systems_tab(ui, &snapshot, &mut pending);
             inspector_tab(
                 ui,
@@ -357,6 +364,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
             generation: u32::MAX,
         }],
         asset_labels: vec![Some(AssetReferenceLabel::Unset)],
+        entity_labels: vec![None],
     };
     let mut browser = ProjectBrowser::default();
     let mut selection = EditorSelection::default();
@@ -495,6 +503,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
         components: vec![
             ComponentView {
                 asset_labels: Vec::new(),
+                entity_labels: Vec::new(),
                 type_name: "tests::Health".to_string(),
                 persistable: false,
                 editable: true,
@@ -511,6 +520,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
             },
             ComponentView {
                 asset_labels: Vec::new(),
+                entity_labels: Vec::new(),
                 type_name: "tests::Marker".to_string(),
                 persistable: false,
                 editable: false,

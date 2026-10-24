@@ -42,6 +42,7 @@ use pill_spline::Spline;
 use serde::{Deserialize, Serialize};
 
 mod audio_scene;
+mod follow_target;
 mod physics;
 /// The scene's tuning constants. Public because hot patches compile separately
 /// and import the same settings.
@@ -132,6 +133,9 @@ pub fn init(engine: &mut Engine) -> u32 {
     // resource, so the host-side GPU backend reads the extracted data through
     // the engine's stable cross-artifact resource identity.
     pill_master_renderer_data::register(engine);
+    // The entity-reference test subject: its layout is what gives the
+    // Inspector a reference row to draw (W-0048 Stage 6).
+    follow_target::register(engine.world_mut());
     let (mesh, scene_material, ball_materials, sample_material) = {
         let assets = engine
             .world_mut()
@@ -206,8 +210,13 @@ pub fn init(engine: &mut Engine) -> u32 {
             return 1;
         }
     }
-    if !has_camera
-        && engine
+    let existing_camera = Query::<(&CameraComponent, Entity)>::new(engine.world_mut())
+        .iter_mut()
+        .next()
+        .map(|(_, entity)| entity);
+    let camera = match existing_camera {
+        Some(camera) => camera,
+        None => match engine
             .world_mut()
             .create_entity()
             .with(CameraComponent::default())
@@ -216,10 +225,11 @@ pub fn init(engine: &mut Engine) -> u32 {
                 ..Default::default()
             })
             .build()
-            .is_err()
-    {
-        return 1;
-    }
+        {
+            Ok(camera) => camera,
+            Err(_) => return 1,
+        },
+    };
 
     if let Err(message) = audio_scene::initialize(engine) {
         pill_engine::tracing::error!("audio initialization failed: {message}");
@@ -234,6 +244,7 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
     engine.register_system("spline_path", spline_path_system);
+    engine.register_system("follow_target", follow_target::follow_target_system);
     // Replaced, not reused. The state holds nothing that has to outlive a
     // generation - a report timestamp and the id string re-derived below - and
     // a resource the previous generation inserted is retired by the reload, so
@@ -325,6 +336,40 @@ pub fn init(engine: &mut Engine) -> u32 {
                 "failed to build a ball entity; aborting this project generation"
             );
             return 1;
+        }
+    }
+
+    // The camera follows the first ball, set from code so the Inspector's
+    // reference row has a target to name the moment the project starts
+    // (W-0048 Stage 6). Attaching only when absent keeps the reload's
+    // component - and whatever the user pointed it at - intact.
+    let first_ball = Query::<(&PhysicsState, Entity)>::new(engine.world_mut())
+        .iter_mut()
+        .next()
+        .map(|(_, entity)| entity);
+    if engine
+        .world()
+        .get_component::<follow_target::FollowTarget>(camera)
+        .is_none()
+    {
+        if let Some(first_ball) = first_ball {
+            if engine
+                .world_mut()
+                .add_component(
+                    camera,
+                    follow_target::FollowTarget {
+                        target: first_ball,
+                        weight: FOLLOW_WEIGHT,
+                    },
+                )
+                .is_err()
+            {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "failed to attach the camera's follow target; aborting this project generation"
+                );
+                return 1;
+            }
         }
     }
 

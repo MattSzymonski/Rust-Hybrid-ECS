@@ -41,6 +41,16 @@ pub struct EntityListEntry {
     pub archetype_label: String,
 }
 
+impl EntityListEntry {
+    /// The label one entity is listed and referenced by.
+    ///
+    /// The Hierarchy list, an entity reference row and the picker all name an
+    /// entity this way, so a reference reads the same wherever it is shown.
+    pub fn display_of(entity: Entity) -> String {
+        format!("{}v{}", entity.id(), entity.generation())
+    }
+}
+
 /// One attached component of the selected entity, with its current values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentView {
@@ -58,6 +68,10 @@ pub struct ComponentView {
     /// for a field that is not an asset reference (W-0048). Resolved when
     /// the view is captured, since the shell sees no asset store.
     pub asset_labels: Vec<Option<AssetReferenceLabel>>,
+    /// What each entity reference field names, parallel to `values`: `None`
+    /// for a field that is not an entity reference (W-0048 Stage 6). Resolved
+    /// when the view is captured, for the same reason.
+    pub entity_labels: Vec<Option<EntityReferenceLabel>>,
 }
 
 /// What an asset reference field currently names, as the Inspector shows it.
@@ -113,6 +127,79 @@ impl AssetReferenceLabel {
         }
     }
 }
+
+/// What an entity reference field currently names, as the Inspector shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntityReferenceLabel {
+    /// The field is cleared: it holds the null handle.
+    Unset,
+    /// The field addresses a live entity, shown by its Hierarchy label.
+    Live(String),
+    /// The field addresses nothing live: the entity was destroyed, or the
+    /// handle names a slot whose occupant has since been replaced.
+    Missing,
+}
+
+impl EntityReferenceLabel {
+    /// The label of an entity value, checked against the world.
+    pub fn of(world: &pill_engine::World, value: &FieldValue) -> Option<Self> {
+        let FieldValue::Entity { id, generation } = value else {
+            return None;
+        };
+        let entity = Entity::from_raw(*id, *generation);
+        if entity.is_null() {
+            return Some(Self::Unset);
+        }
+        Some(if world.is_entity_valid(entity) {
+            Self::Live(EntityListEntry::display_of(entity))
+        } else {
+            Self::Missing
+        })
+    }
+
+    /// The text the Inspector draws for this label.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Unset => "None",
+            Self::Live(display) => display,
+            Self::Missing => "(missing)",
+        }
+    }
+}
+
+/// What an entity reference row is waiting for: the field a scene click should
+/// name, and which entity it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityPickTarget {
+    /// The entity the field belongs to.
+    pub entity: Entity,
+    /// Registered component type name.
+    pub component: String,
+    /// Field name.
+    pub field: String,
+}
+
+/// The world resource carrying an armed entity pick (W-0048 Stage 6).
+///
+/// The Inspector row arms it through [`EditorCommand::ArmEntityPick`] and the
+/// executable that answers scene picks reads it: the shell draws rows and has
+/// no world, and the picking code lives in the executable, so a world resource
+/// is the one place both can reach.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntityPickRequest {
+    /// The field the next scene click should name, if a row is waiting.
+    pub target: Option<EntityPickTarget>,
+}
+
+impl EntityPickRequest {
+    /// Take the armed target, leaving the request clear: the one caller that
+    /// consumes it is the click that answers it.
+    pub fn take(&mut self) -> Option<EntityPickTarget> {
+        self.target.take()
+    }
+}
+
+impl pill_engine::Resource for EntityPickRequest {}
 
 /// The expensive tier of the snapshot: only built for the selection.
 #[derive(Clone, Debug, PartialEq)]
@@ -499,7 +586,7 @@ impl EditorSnapshot {
             .entity_rows()
             .into_iter()
             .map(|row| {
-                let display = format!("{}v{}", row.entity.id(), row.entity.generation());
+                let display = EntityListEntry::display_of(row.entity);
                 let archetype_label = row.components.join(", ");
                 let component_count = row.components.len();
                 EntityListEntry {
@@ -562,6 +649,10 @@ impl EditorSnapshot {
                     .iter()
                     .map(|value| AssetReferenceLabel::of(world, value))
                     .collect();
+                let entity_labels = values
+                    .iter()
+                    .map(|value| EntityReferenceLabel::of(world, value))
+                    .collect();
                 Some(ComponentView {
                     type_name,
                     persistable,
@@ -569,6 +660,7 @@ impl EditorSnapshot {
                     fields,
                     values,
                     asset_labels,
+                    entity_labels,
                 })
             })
             .collect();
@@ -748,6 +840,36 @@ pub enum EditorCommand {
         field: String,
         /// The asset's path or guid, or `None` to clear the reference.
         reference: Option<String>,
+    },
+    /// Point an entity reference field at `reference`, or clear it with `None`
+    /// (W-0048 Stage 6).
+    ///
+    /// The handle is checked against the world when the batch is applied, so a
+    /// reference to an entity that has gone by then is refused rather than
+    /// written; a write records the [`Self::SetField`] that restores what the
+    /// field held.
+    SetFieldEntity {
+        /// The target entity.
+        entity: Entity,
+        /// Registered component type name.
+        component: String,
+        /// Field name.
+        field: String,
+        /// The entity to reference, or `None` to clear the reference.
+        reference: Option<Entity>,
+    },
+    /// Wait for the next scene click to name an entity reference field
+    /// (W-0048 Stage 6).
+    ///
+    /// The row's target button arms it and the scene click answers it; neither
+    /// is an edit, so nothing is recorded until the click names an entity.
+    ArmEntityPick {
+        /// The entity the field belongs to.
+        entity: Entity,
+        /// Registered component type name.
+        component: String,
+        /// Field name.
+        field: String,
     },
     /// Write one element of a fixed-size array field.
     SetArrayElement {
@@ -1026,7 +1148,9 @@ impl EditorCommand {
                 | EditorCommand::RemoveComponent { .. }
                 | EditorCommand::SetField { .. }
                 | EditorCommand::SetFieldAsset { .. }
+                | EditorCommand::SetFieldEntity { .. }
                 | EditorCommand::SetArrayElement { .. }
+                | EditorCommand::ArmEntityPick { .. }
                 | EditorCommand::SetSystemEnabled { .. }
                 | EditorCommand::ImportFiles { .. }
                 | EditorCommand::RemoveFiles { .. }
@@ -1053,6 +1177,12 @@ impl EditorCommand {
                 component, field, ..
             }
             | EditorCommand::SetFieldAsset {
+                component, field, ..
+            }
+            | EditorCommand::SetFieldEntity {
+                component, field, ..
+            }
+            | EditorCommand::ArmEntityPick {
                 component, field, ..
             }
             | EditorCommand::SetArrayElement {
@@ -1111,6 +1241,8 @@ impl EditorCommand {
             | EditorCommand::RestoreComponent { entity, .. }
             | EditorCommand::SetField { entity, .. }
             | EditorCommand::SetFieldAsset { entity, .. }
+            | EditorCommand::SetFieldEntity { entity, .. }
+            | EditorCommand::ArmEntityPick { entity, .. }
             | EditorCommand::SetArrayElement { entity, .. } => {
                 if *entity == previous {
                     *entity = assigned;
@@ -1366,6 +1498,86 @@ impl EditorCommand {
                     field = field.as_str(),
                     asset = reference.as_deref().unwrap_or("none"),
                     "[editor] asset reference set"
+                );
+                Ok(CommandOutcome::inverse(EditorCommand::SetField {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                    value: previous,
+                }))
+            }
+
+            EditorCommand::ArmEntityPick {
+                entity,
+                component,
+                field,
+            } => {
+                let world = engine.world_mut();
+                let request = world
+                    .get_resource_mut::<crate::editor_state::EntityPickRequest>()
+                    .ok_or("the world has no entity pick request slot")?;
+                request.target = Some(crate::editor_state::EntityPickTarget {
+                    entity: *entity,
+                    component: component.clone(),
+                    field: field.clone(),
+                });
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    entity = %entity,
+                    component = component.as_str(),
+                    field = field.as_str(),
+                    "[editor] inspector entity pick armed"
+                );
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SetFieldEntity {
+                entity,
+                component,
+                field,
+                reference,
+            } => {
+                let previous = engine
+                    .world()
+                    .read_component_field(*entity, component, field)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                if !matches!(previous, FieldValue::Entity { .. }) {
+                    return Err(format!("{command:?}: `{field}` is not an entity reference"));
+                }
+                let value = match reference {
+                    None => FieldValue::Entity {
+                        id: Entity::NULL.id(),
+                        generation: Entity::NULL.generation(),
+                    },
+                    Some(target) => {
+                        // A reference to an entity that has gone since the row
+                        // was drawn is refused here rather than written as a
+                        // dangling handle: the row would show it missing, and
+                        // the undo step would restore a reference to nothing.
+                        if !engine.world().is_entity_valid(*target) {
+                            return Err(format!(
+                                "{command:?}: no live entity carries the reference {}",
+                                EntityListEntry::display_of(*target)
+                            ));
+                        }
+                        FieldValue::Entity {
+                            id: target.id(),
+                            generation: target.generation(),
+                        }
+                    }
+                };
+                engine
+                    .world_mut()
+                    .write_component_field(*entity, component, field, value)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = component.as_str(),
+                    field = field.as_str(),
+                    reference = reference
+                        .map(EntityListEntry::display_of)
+                        .unwrap_or_else(|| "none".to_owned()),
+                    "[editor] entity reference set"
                 );
                 Ok(CommandOutcome::inverse(EditorCommand::SetField {
                     entity: *entity,
@@ -3113,5 +3325,190 @@ mod tests {
         assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
         assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A component holding a reference to another entity, as the derive lays
+    /// one out (W-0048 Stage 6).
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, Default)]
+    struct TargetHolder {
+        target: Entity,
+        weight: f32,
+    }
+    impl pill_engine::Component for TargetHolder {}
+
+    static TARGET_HOLDER_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "target",
+            type_tag: "entity",
+            offset: 0,
+            size: std::mem::size_of::<Entity>(),
+            align: 8,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+        ComponentFieldDescriptor {
+            name: "weight",
+            type_tag: "f32",
+            offset: 16,
+            size: 4,
+            align: 4,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        },
+    ];
+
+    /// An engine with the holder registered, one holder (referencing nothing)
+    /// and two entities it can be pointed at.
+    fn holder_engine() -> (Engine, Entity, Entity, Entity) {
+        let mut engine = Engine::new();
+        let world = engine.world_mut();
+        world.register_component_with_layout::<TargetHolder>(TARGET_HOLDER_FIELDS);
+        let first = world.create_entity().build().unwrap();
+        let second = world.create_entity().build().unwrap();
+        let holder = world
+            .create_entity()
+            .with(TargetHolder {
+                target: Entity::NULL,
+                weight: 0.5,
+            })
+            .build()
+            .unwrap();
+        (engine, holder, first, second)
+    }
+
+    /// The holder's reference label as the Inspector would show it.
+    fn target_label(engine: &Engine, entity: Entity) -> EntityReferenceLabel {
+        let detail = EditorSnapshot::capture_detail(engine, entity).unwrap();
+        let view = detail
+            .components
+            .iter()
+            .find(|view| view.type_name.contains("TargetHolder"))
+            .unwrap();
+        view.entity_labels[0]
+            .clone()
+            .expect("an entity field has a label")
+    }
+
+    /// One `SetFieldEntity` for the target field.
+    fn retarget(entity: Entity, component: &str, reference: Option<Entity>) -> EditorCommand {
+        EditorCommand::SetFieldEntity {
+            entity,
+            component: component.to_owned(),
+            field: "target".to_owned(),
+            reference,
+        }
+    }
+
+    /// Arming a row records the field a scene press names, and the request the
+    /// runner takes is what the press turns into one recorded step - the same
+    /// `entity_edit` the row's own picker and drop queue (W-0048 Stage 6).
+    #[test]
+    fn an_armed_row_answers_the_scene_press_with_one_recorded_step() {
+        let (mut engine, holder, first, second) = holder_engine();
+        crate::commands::ensure_command_resources(engine.world_mut());
+        let name = pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
+        let armed = EditorCommand::ArmEntityPick {
+            entity: holder,
+            component: name.clone(),
+            field: "target".to_owned(),
+        };
+        let outcome = EditorCommand::apply_recorded(&mut engine, &[armed]);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        let target = engine
+            .world_mut()
+            .get_resource_mut::<EntityPickRequest>()
+            .and_then(|request| request.take())
+            .expect("the arm left a target for the press");
+        assert_eq!(target.entity, holder);
+        assert_eq!(target.field, "target");
+        assert!(
+            engine
+                .world_mut()
+                .get_resource_mut::<EntityPickRequest>()
+                .and_then(|request| request.take())
+                .is_none(),
+            "the press takes the request once"
+        );
+
+        // What the runner does with the answer: one recorded step, which
+        // undoes back to the reference the field held.
+        let (edit, label) = crate::inspector::entity_edit(
+            target.entity,
+            &target.component,
+            &target.field,
+            Some(second),
+        );
+        assert_eq!(label, "set TargetHolder.target");
+        let applied = EditorCommand::apply_recorded(&mut engine, &[edit]);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert_eq!(
+            target_label(&engine, holder),
+            EntityReferenceLabel::Live(EntityListEntry::display_of(second))
+        );
+        let undone = EditorCommand::apply_recorded(&mut engine, &applied.inverses);
+        assert!(undone.failures.is_empty(), "{:?}", undone.failures);
+        assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
+        assert_ne!(first, second);
+    }
+
+    /// A reference reads as unset, names its entity by the Hierarchy label,
+    /// writes, undoes and clears; a dangling reference reads as missing, and a
+    /// reference to an entity that is gone is refused rather than written.
+    #[test]
+    fn entity_references_read_write_undo_clear_and_go_missing() {
+        let (mut engine, holder, first, second) = holder_engine();
+        let name = pill_engine::component::ComponentRegistry::registered_name::<TargetHolder>();
+        assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
+
+        let applied =
+            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(first))]);
+        assert!(applied.failures.is_empty(), "{:?}", applied.failures);
+        assert_eq!(
+            target_label(&engine, holder),
+            EntityReferenceLabel::Live(EntityListEntry::display_of(first))
+        );
+        assert_eq!(
+            engine
+                .world()
+                .get_component::<TargetHolder>(holder)
+                .unwrap()
+                .target,
+            first
+        );
+
+        let rewritten =
+            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(second))]);
+        assert!(rewritten.failures.is_empty(), "{:?}", rewritten.failures);
+        assert_eq!(
+            target_label(&engine, holder),
+            EntityReferenceLabel::Live(EntityListEntry::display_of(second))
+        );
+
+        // Undo: the inverse is a plain field write of the previous handle.
+        let undo = EditorCommand::apply_recorded(&mut engine, &rewritten.inverses);
+        assert!(undo.failures.is_empty(), "{:?}", undo.failures);
+        assert_eq!(
+            target_label(&engine, holder),
+            EntityReferenceLabel::Live(EntityListEntry::display_of(first))
+        );
+
+        // The target dies: the row shows the reference as missing, because the
+        // field still holds the handle it was given.
+        engine.world_mut().destroy_entity(second);
+        let pointed_at_dead =
+            EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(second))]);
+        assert_eq!(
+            pointed_at_dead.failures.len(),
+            1,
+            "a dead handle is refused"
+        );
+
+        engine.world_mut().destroy_entity(first);
+        assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Missing);
+
+        let cleared = EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, None)]);
+        assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
+        assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
     }
 }

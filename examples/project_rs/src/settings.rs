@@ -55,3 +55,9 @@ pub const BALL_COLOR: Color = Color::new(1.0, 0.3, 0.3, 1.0);
 
 /// Fill colour of the sample dots.
 pub const SAMPLE_DOT_COLOR: Color = Color::new(0.25, 0.85, 1.0, 1.0);
+
+/// How much of the distance to its target the camera closes each frame.
+///
+/// Small enough that the camera drifts rather than snapping: the follow is a
+/// visible behaviour the Inspector's reference row can be pointed at.
+pub const FOLLOW_WEIGHT: f32 = 0.02;
