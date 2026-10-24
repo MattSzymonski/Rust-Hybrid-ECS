@@ -162,6 +162,10 @@ pub mod saved_references;
 /// asset that loads back into a world.
 pub mod scene;
 
+/// The startup scene: the `.scene` a project's settings name, loaded before
+/// the project's own `init` seeds anything.
+pub mod startup_scene;
+
 /// Per-function hot patching: stable dispatch slots for registered systems.
 pub mod hot_patch;
 
@@ -229,6 +233,7 @@ pub use saved_references::{
 pub use scene::{load_scene, save_scene, Scene, SceneDocument, SceneEntity, SceneLoad, SceneSave};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
+pub use startup_scene::{apply_startup_scene, queue_startup_scene, StartupScene};
 pub use time::Time;
 
 // Serde derives re-exported so downstream components can derive serialization without a direct dependency.

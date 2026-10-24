@@ -62,9 +62,8 @@ pub(crate) fn follow_target_system(
             continue;
         };
         let weight = follow.weight.clamp(0.0, 1.0);
-        for axis in 0..3 {
-            transform.translation[axis] +=
-                (target_translation[axis] - transform.translation[axis]) * weight;
+        for (axis, target_axis) in target_translation.iter().enumerate() {
+            transform.translation[axis] += (target_axis - transform.translation[axis]) * weight;
         }
     }
     Ok(())

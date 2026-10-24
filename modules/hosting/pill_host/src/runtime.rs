@@ -1321,6 +1321,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // address does not change when the runtime moves.
     let mut runtime = Runtime::new();
     runtime.engine_mut().set_parallel_execution(true);
+    // The settings' startup scene is queued here, before any artifact loads:
+    // the project's entry point takes it between component registration and
+    // its own `init`, so a project that seeds its world finds the scene
+    // already in it instead of duplicating it.
+    if let Some(startup_scene) = host_config.startup_scene.as_deref() {
+        pill_engine::queue_startup_scene(runtime.engine_mut().world_mut(), startup_scene);
+    }
     // Debug drawing is always on in the development host (D14); the
     // settings' `debug_draw:` key is what a shipping build starts with.
     pill_runtime::insert_debug_resources(runtime.engine_mut().world_mut(), true);

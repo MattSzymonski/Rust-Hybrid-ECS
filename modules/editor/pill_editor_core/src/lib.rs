@@ -123,6 +123,9 @@ pub mod preferences;
 pub mod problems;
 /// The world resources the Inspector can show and edit (W-0038 Stage 14).
 pub mod resources;
+/// The open scene: its path, guid and unsaved marker, and the file operations
+/// behind New, Open, Save and Save As (W-0048 Stage 9).
+pub mod scene_workflow;
 /// The scripted test channel's grammar: one typed parse of the suites' lines.
 pub mod scripted;
 /// The egui shell's long-lived session state.

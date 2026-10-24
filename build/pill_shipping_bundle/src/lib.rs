@@ -55,5 +55,6 @@ pub fn static_project() -> StaticProject {
         asset_pack: None,
         logging: LOGGING,
         debug_draw: false,
+        startup_scene: None,
     }
 }

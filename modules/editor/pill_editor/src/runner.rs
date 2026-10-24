@@ -796,6 +796,9 @@ struct EditorWindow {
     test_channel: Option<TestChannel>,
     /// A scripted left-button drag in flight, when one is.
     scripted_drag: Option<ScriptedDrag>,
+    /// The scene title the main window last showed, so the window is only
+    /// retitled when the document's state actually changed (W-0048 Stage 9).
+    scene_title: String,
     /// Quit after this many seconds, when the environment asks for it.
     test_seconds: Option<f64>,
     /// A quit the scripted channel or the deadline asked for.
@@ -1102,6 +1105,7 @@ impl EditorWindow {
             claimed_keyboard: false,
             test_channel: TestChannel::from_environment(),
             scripted_drag: None,
+            scene_title: "untitled".to_string(),
             test_seconds: test_channel::seconds_from_environment(),
             quit: false,
             cadence: {
@@ -3963,6 +3967,9 @@ impl EditorWindow {
         // a failure, a rollback - becomes the notices the shell draws toasts
         // and Problems rows from (W-0038 Stages 4 and 6).
         self.fold_host_notices();
+        // Step 2d: the main window names the open scene and its unsaved marker
+        // (W-0048 Stage 9).
+        self.sync_scene_title();
         // Step 3: the shell boundary's input resource.
         if let Some(input) = self
             .host
@@ -5569,6 +5576,44 @@ impl EditorWindow {
         }
     }
 
+    /// Keep the main window's title equal to the open scene and its unsaved
+    /// marker.
+    ///
+    /// The title is recomputed every frame from the session resource and only
+    /// pushed to the window when it changed, so the log names each state the
+    /// document went through - which is what the editor suite waits for.
+    fn sync_scene_title(&mut self) {
+        let title = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource::<pill_editor_core::scene_workflow::SceneSession>()
+                .map(pill_editor_core::scene_workflow::SceneSession::title)
+                .unwrap_or_else(|| "untitled".to_string())
+        };
+        if title == self.scene_title {
+            return;
+        }
+        self.window.set_title(&format!("{title} - Pill Editor"));
+        info!(
+            target: telemetry_target::ENGINE,
+            title = title.as_str(),
+            "[editor] scene title"
+        );
+        self.scene_title = title;
+    }
+
+    /// `scene new|open|save` from the scripted channel: the same command the
+    /// File menu queues, applied at the next frame boundary (W-0048 Stage 9).
+    ///
+    /// Document commands are not recorded - they replace the world rather than
+    /// edit it - so the batch is queued unrecorded.
+    fn scripted_scene(&mut self, command: EditorCommand) {
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push(vec![command]);
+        }
+    }
+
     /// `editor.entity_create` from the scripted channel: the recorded
     /// one-empty-entity edit the Entities menu's New Entity queues.
     fn scripted_entity_create(&mut self) {
@@ -6504,6 +6549,14 @@ impl EditorWindow {
                 value,
             } => self.scripted_edit_resource(&resource, &field, &value),
             ScriptedCommand::Toolbar(action) => self.scripted_toolbar(action),
+            ScriptedCommand::SceneNew => self.scripted_scene(EditorCommand::SceneNew),
+            ScriptedCommand::SceneOpen(path) => {
+                self.scripted_scene(EditorCommand::SceneOpen { path })
+            }
+            ScriptedCommand::SceneSave(path) => match path {
+                Some(path) => self.scripted_scene(EditorCommand::SceneSaveAs { path }),
+                None => self.scripted_scene(EditorCommand::SceneSave),
+            },
             ScriptedCommand::DialogSetName(text) => self.scripted_dialog_set_name(&text),
             ScriptedCommand::DialogSubmit => self.scripted_dialog_submit(),
             ScriptedCommand::EditAsset(edit) => self.scripted_asset_edit(edit),

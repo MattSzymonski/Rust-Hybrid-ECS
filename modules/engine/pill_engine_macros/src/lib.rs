@@ -2549,6 +2549,17 @@ fn module_init_export(
     gate: &proc_macro2::TokenStream,
     init_fn: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
+    module_init_export_with(gate, init_fn, &quote! { run_artifact_init })
+}
+
+/// [`module_init_export`] with the registration entry point chosen by the
+/// caller: a project uses `run_project_init`, which also loads the startup
+/// scene between registration and the user's `init`.
+fn module_init_export_with(
+    gate: &proc_macro2::TokenStream,
+    init_fn: &proc_macro2::TokenStream,
+    run: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     quote! {
         /// Registers this artifact against the host engine; returns zero on
         /// success.
@@ -2578,7 +2589,7 @@ fn module_init_export(
                 // value types installed for the whole entry point, so a
                 // `struct:`-tagged field expands into editable rows even when
                 // the artifact registers components itself.
-                ::pill_engine::component_registry::run_artifact_init(engine, #init_fn)
+                ::pill_engine::component_registry::#run(engine, #init_fn)
             }));
             result.unwrap_or(u32::MAX)
         }
@@ -2845,7 +2856,11 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     // collide with.
     let ungated = quote! {};
     let abi_version_export = module_abi_version_export(&ungated);
-    let init_export = module_init_export(&ungated, &quote! { #fn_ident });
+    let init_export = module_init_export_with(
+        &ungated,
+        &quote! { #fn_ident },
+        &quote! { run_project_init },
+    );
 
     let expanded = quote! {
         #item_fn

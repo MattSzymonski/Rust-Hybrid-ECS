@@ -134,6 +134,18 @@ pub fn asset_tile(
     if response.double_clicked() && browser::is_folder(row) {
         browser.open(&row.path);
     }
+    // A scene tile opens on the second click, the way a document does
+    // everywhere else; the command is the File menu's, so both reach one
+    // implementation.
+    if response.double_clicked()
+        && !browser::is_folder(row)
+        && row.path.to_ascii_lowercase().ends_with(".scene")
+    {
+        let command = pill_editor_core::editor_state::EditorCommand::SceneOpen {
+            path: row.path.clone(),
+        };
+        writes.pending.push(vec![command]);
+    }
     if response.secondary_clicked() {
         select_asset(writes.selection, &row.path);
     }

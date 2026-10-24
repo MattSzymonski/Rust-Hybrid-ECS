@@ -232,6 +232,10 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                     + asset.as_ref().map(String::len).unwrap_or(0)
                     + resource.as_ref().map(String::len).unwrap_or(0)
             }
+            // Document commands are never recorded, so their cost is zero -
+            // but the estimate still has to name them.
+            EditorCommand::SceneNew | EditorCommand::SceneSave => 0,
+            EditorCommand::SceneOpen { path } | EditorCommand::SceneSaveAs { path } => path.len(),
         };
         bytes += strings;
     }
@@ -319,6 +323,17 @@ impl CommandHistory {
         if world.get_resource::<CommandHistory>().is_none() {
             world.insert_resource(Self::default());
         }
+    }
+
+    /// Drop every recorded step, keeping the configured limits.
+    ///
+    /// What opening or starting a scene does: its entries name entities the
+    /// previous document owned, and undoing into those would edit a world they
+    /// never belonged to.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.cursor = 0;
+        self.memory_used_bytes = 0;
     }
 
     /// Apply the preferences' limits (D31), trimming if they shrank.

@@ -179,6 +179,10 @@ CONSOLE_DUMP_PATTERN = (
     + r"\s+engine=(?P<engine>\d+)\s+game=(?P<game>\d+)"
 )
 QUIT_REQUESTED_TOKEN = "[editor] quit requested"
+SCENE_NEW_TOKEN = "[editor] scene new"
+SCENE_OPENED_TOKEN = "[editor] scene opened"
+SCENE_SAVED_TOKEN = "[editor] scene saved"
+SCENE_TITLE_TOKEN = "[editor] scene title"
 LAYOUT_SAVED_TOKEN = "[editor] layout saved"
 LAYOUT_LEAF_TOKEN = "[editor] egui dock leaf"
 INSPECTOR_SECTION_TOKEN = "[editor] inspector section"
@@ -5450,6 +5454,71 @@ def main() -> int:
             begin,
         )
         print("  [OK] Escape dismisses a modal")
+        # Stage 9 (W-0048): a scene saves, empties and opens again. Save
+        # writes the live world to a new `.scene` under the project's asset
+        # directory, New replaces it with nothing, and Open brings the same
+        # entities back. The window title names the file the whole time.
+        scene_path = "scenes/egui_suite.scene"
+        scene_file = (MODULES_ROOT / arguments.project / "res" / scene_path).resolve()
+        scene_file.unlink(missing_ok=True)
+        begin = len(panels.read_log())
+        panels.send("scene save {}".format(scene_path))
+        panels.wait(re.escape(SCENE_SAVED_TOKEN), 60, "the scene save", begin)
+        saved = re.search(
+            re.escape(SCENE_SAVED_TOKEN)
+            + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)',
+            panels.read_log()[begin:],
+        )
+        assert saved is not None, "the save did not name the scene it wrote"
+        saved_count = int(saved.group(1))
+        assert saved_count > 0, "the save wrote no entities"
+        assert scene_file.is_file(), "the scene file was not written: {}".format(
+            scene_file
+        )
+        panels.wait(
+            re.escape(SCENE_TITLE_TOKEN) + r'\s+title="egui_suite\.scene"',
+            60,
+            "the title naming the saved scene",
+            begin,
+        )
+        begin = len(panels.read_log())
+        panels.send("scene new")
+        panels.wait(re.escape(SCENE_NEW_TOKEN), 60, "the new scene", begin)
+        removed = re.search(
+            re.escape(SCENE_NEW_TOKEN) + r"\s+entities=(\d+)",
+            panels.read_log()[begin:],
+        )
+        assert removed is not None and int(removed.group(1)) == saved_count, (
+            "the new scene did not empty the world: {}".format(
+                (removed.group(0) if removed else "no scene new line")
+            )
+        )
+        begin = len(panels.read_log())
+        panels.send("scene open {}".format(scene_path))
+        panels.wait(re.escape(SCENE_OPENED_TOKEN), 60, "the scene open", begin)
+        reopened = re.search(
+            re.escape(SCENE_OPENED_TOKEN)
+            + r'\s+path="scenes/egui_suite\.scene"\s+guid=\S+\s+entities=(\d+)'
+            + r"\s+components=(\d+)",
+            panels.read_log()[begin:],
+        )
+        assert reopened is not None, "the open did not name the scene it read"
+        assert int(reopened.group(1)) == saved_count, (
+            "the scene opened with {} of {} entities".format(
+                reopened.group(1), saved_count
+            )
+        )
+        assert int(reopened.group(2)) > 0, "the scene opened with no components"
+        panels.wait(
+            re.escape(SCENE_TITLE_TOKEN) + r'\s+title="egui_suite\.scene"',
+            60,
+            "the title naming the opened scene",
+            begin,
+        )
+        print("  [OK] a scene saved, emptied and opened with its entities")
+        # The scene is a suite artifact: it must not outlive the run that made
+        # it, or the next start's asset scan finds it.
+        scene_file.unlink(missing_ok=True)
         # Float the tab and leave: the layout writes the panel id beside it.
         panels.send("undock module:{}".format(slot))
         dock = panels.request(

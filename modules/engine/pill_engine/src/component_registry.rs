@@ -363,6 +363,38 @@ pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u
     status
 }
 
+/// [`run_artifact_init`] for a project, which also loads the startup scene the
+/// front end queued.
+///
+/// The load runs after registration and before the user's `init`: a scene
+/// loaded earlier would find no component types to attach, and one loaded later
+/// would double every entity the project seeds.
+pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
+    let previous = engine
+        .world_mut()
+        .replace_value_type_layout_resolver(Some(resolve_value_type_layout));
+    let mut status = match register_all_components(engine.world_mut()) {
+        Ok(()) => {
+            if let Some(Err(reason)) = pill_engine_core::apply_startup_scene(engine) {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    reason,
+                    "[engine] startup scene not loaded"
+                );
+            }
+            init(engine)
+        }
+        Err(_error) => u32::MAX,
+    };
+    if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
+        status = u32::MAX;
+    }
+    engine
+        .world_mut()
+        .replace_value_type_layout_resolver(previous);
+    status
+}
+
 /// The layout of the value type a `struct:<path>` field tag names, among the
 /// ones this artifact declares with `#[derive(PillMirror)]`.
 ///

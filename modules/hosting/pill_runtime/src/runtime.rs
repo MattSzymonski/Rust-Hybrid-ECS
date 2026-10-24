@@ -500,6 +500,7 @@ mod tests {
             asset_pack: None,
             logging: crate::StaticLogging::NONE,
             debug_draw: false,
+            startup_scene: None,
         })
         .expect("it starts");
         assert!(run_one_frame(&mut runtime).is_none());
