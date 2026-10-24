@@ -8,18 +8,20 @@
 //! # Design
 //!
 //! Every field is plain data, so the component survives a hot reload and can
-//! be mirrored into C#. That constraint is why the sound is named with a
-//! [`FixedString64`] rather than held as a `Handle<Sound>` or a `String`: the
-//! component is copied between archetypes and lives in host-owned memory
-//! while this module is a separately loaded library.
+//! be mirrored into C#. The sound is held as a [`Handle<Sound>`], like a mesh
+//! or a material: `Handle` is `#[repr(C)]` two-integer data with no allocation,
+//! so it crosses the module boundary as safely as the fixed-size name it
+//! replaced, and it names one loaded sound instead of a string somebody has to
+//! resolve again on every play.
 
 // External crates
-use pill_core::FixedString64;
+use pill_engine::Handle;
 use pill_engine::PillComponent;
 use serde::{Deserialize, Serialize};
 
 // Current crate
 use crate::audio_command::AudioCommand;
+use crate::sound::Sound;
 use crate::sound_type::SoundType;
 
 // =============================================================================
@@ -32,11 +34,10 @@ use crate::sound_type::SoundType;
 /// result back here. Every field is plain data, so the component survives a
 /// hot reload and can be mirrored into C#.
 ///
-/// The sound is named rather than handle-typed because `Handle<Sound>` is not
-/// `#[repr(C)]`-stable across artifacts: a name is resolved through
-/// [`AssetManager::handle_by_name`](pill_engine::AssetManager::handle_by_name)
-/// each time playback starts, which also means unloading and reloading a sound
-/// under the same name does the right thing.
+/// The sound is a [`Handle<Sound>`], the same reference every other component
+/// uses for its assets. A handle that no longer resolves - its sound was
+/// unloaded, or the asset store was replaced - plays nothing, which is what
+/// makes unloading a sound safe.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
 #[pill(persistable, shared)]
@@ -59,14 +60,10 @@ pub struct AudioSourceComponent {
     ///
     /// Written by [`audio_system`]; treat as read-only.
     pub sink: u32,
-    /// Name the sound is registered under in the
-    /// [`AssetManager`](pill_engine::AssetManager).
+    /// The sound this source plays.
     ///
-    /// A [`FixedString64`] rather than a `String`: the component is copied
-    /// between archetypes and lives in host-owned memory while this module is
-    /// a separately loaded library, so a heap allocation made by one and freed
-    /// by the other is exactly the hazard `#[repr(C)]` plain data avoids.
-    pub sound_name: FixedString64,
+    /// [`Handle::INVALID`] until it is pointed at one, which plays nothing.
+    pub sound: Handle<Sound>,
 }
 
 /// Sentinel for [`AudioSourceComponent::sink`] when no sink is held.
@@ -81,25 +78,25 @@ impl core::default::Default for AudioSourceComponent {
             command: AudioCommand::None,
             is_playing: false,
             sink: NO_SINK,
-            sound_name: FixedString64::empty(),
+            sound: Handle::INVALID,
         }
     }
 }
 
 impl AudioSourceComponent {
-    /// A source that will play `name` when the world next ticks.
-    pub fn playing(name: &str) -> Self {
+    /// A source that will play `sound` when the world next ticks.
+    pub fn playing(sound: Handle<Sound>) -> Self {
         Self {
             play_on_awake: true,
-            sound_name: FixedString64::new(name),
+            sound,
             ..Self::default()
         }
     }
 
-    /// A source bound to `name` but silent until [`Self::play`] is called.
-    pub fn new(name: &str) -> Self {
+    /// A source bound to `sound` but silent until [`Self::play`] is called.
+    pub fn new(sound: Handle<Sound>) -> Self {
         Self {
-            sound_name: FixedString64::new(name),
+            sound,
             ..Self::default()
         }
     }
@@ -122,10 +119,10 @@ impl AudioSourceComponent {
     /// Point this source at a different sound.
     ///
     /// Stops whatever is playing: the sink holds a decoder over the old bytes,
-    /// so continuing would play the previous sound under the new name.
-    pub fn set_sound(&mut self, name: &str) {
-        if self.sound_name.as_str() != name {
-            self.sound_name = FixedString64::new(name);
+    /// so continuing would play the previous sound under the new one.
+    pub fn set_sound(&mut self, sound: Handle<Sound>) {
+        if self.sound != sound {
+            self.sound = sound;
             self.command = AudioCommand::Stop;
         }
     }
@@ -137,6 +134,20 @@ impl AudioSourceComponent {
 }
 
 // =============================================================================
+// Registration
+// =============================================================================
+
+/// Registers [`AudioSourceComponent`] with the world, field layout included.
+///
+/// The derive generates `__pill_register_AudioSourceComponent` as a private
+/// item of this module, so [`crate::register`] reaches it through here rather
+/// than by path. The layout is what turns the `sound` handle into an asset row
+/// in the Inspector and into a typed field in the managed mirror.
+pub(crate) fn register(world: &mut pill_engine::World) {
+    __pill_register_AudioSourceComponent(world);
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -144,39 +155,44 @@ impl AudioSourceComponent {
 mod tests {
     use super::*;
 
-    /// The name field is inline plain data, which is what lets the component
-    /// cross the module boundary; `FixedString64` owns the truncation and
-    /// UTF-8 rules, tested in `pill_core`.
+    /// A handle is plain two-integer data, which is what lets the component
+    /// cross the module boundary; `pill_engine` keeps that layout.
     #[test]
-    fn the_sound_name_is_inline_plain_data() {
-        let source = AudioSourceComponent::new("footstep");
-        assert_eq!(source.sound_name, "footstep");
-        assert!(AudioSourceComponent::default().sound_name.is_empty());
+    fn the_sound_is_a_plain_handle() {
+        let sound = Handle::from_raw(3, 1);
+        let source = AudioSourceComponent::new(sound);
+        assert_eq!(source.sound, sound);
+        assert_eq!(source.sound.index(), 3);
+        assert_eq!(
+            AudioSourceComponent::default().sound,
+            Handle::<Sound>::INVALID
+        );
     }
 
     /// Pointing a source at a new sound stops the old one, because the sink
     /// still holds a decoder over the previous bytes.
     #[test]
     fn changing_the_sound_requests_a_stop() {
-        let mut source = AudioSourceComponent::new("footstep");
+        let mut source = AudioSourceComponent::new(Handle::from_raw(1, 0));
         assert_eq!(source.command, AudioCommand::None);
-        source.set_sound("splash");
-        assert_eq!(source.sound_name.as_str(), "splash");
+        source.set_sound(Handle::from_raw(2, 0));
+        assert_eq!(source.sound, Handle::from_raw(2, 0));
         assert_eq!(source.command, AudioCommand::Stop);
     }
 
     /// Setting the same sound again is not a change, so playback continues.
     #[test]
     fn setting_the_same_sound_is_a_no_op() {
-        let mut source = AudioSourceComponent::new("footstep");
-        source.set_sound("footstep");
+        let sound = Handle::from_raw(1, 0);
+        let mut source = AudioSourceComponent::new(sound);
+        source.set_sound(sound);
         assert_eq!(source.command, AudioCommand::None);
     }
 
     /// The command field records the last intent expressed.
     #[test]
     fn commands_replace_one_another() {
-        let mut source = AudioSourceComponent::new("music");
+        let mut source = AudioSourceComponent::new(Handle::from_raw(1, 0));
         source.play();
         assert_eq!(source.command, AudioCommand::Play);
         source.pause();
@@ -198,8 +214,9 @@ mod tests {
     /// `playing` is the shorthand for "start as soon as the world ticks".
     #[test]
     fn playing_marks_the_source_for_awake_playback() {
-        let source = AudioSourceComponent::playing("intro");
+        let sound = Handle::from_raw(7, 2);
+        let source = AudioSourceComponent::playing(sound);
         assert!(source.play_on_awake);
-        assert_eq!(source.sound_name.as_str(), "intro");
+        assert_eq!(source.sound, sound);
     }
 }

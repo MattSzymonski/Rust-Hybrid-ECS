@@ -139,12 +139,11 @@ pub fn register(engine: &mut Engine) -> u32 {
             .world_mut()
             .insert_resource(AudioLoadQueue::default());
     }
-    engine
-        .world_mut()
-        .register_component::<AudioListenerComponent>();
-    engine
-        .world_mut()
-        .register_component::<AudioSourceComponent>();
+    // Through the derives' own registrars, so each component arrives with its
+    // field layout: that is what the Inspector's rows and the managed codegen
+    // read, and a component without one is an opaque blob to both.
+    audio_listener_component::register(engine.world_mut());
+    audio_source_component::register(engine.world_mut());
     // Declare the asset type this module stores. Sounds outlive a reload of
     // this DLL - the world's asset store does - so the column's per-type table
     // has to be re-pointed at the generation still mapped. Registering it as
@@ -176,4 +175,74 @@ pub fn register(engine: &mut Engine) -> u32 {
         "pill_audio module registered"
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pill_engine::{Engine, Handle};
+
+    /// An audio source's sound is a typed asset reference (W-0048): it reads
+    /// naming the shared sound type - which is what the Inspector draws as an
+    /// asset row and the picker lists - and a handle writes back into the
+    /// component the playback system reads.
+    #[test]
+    fn the_audio_sources_sound_is_a_writable_asset_reference() {
+        let mut engine = Engine::new();
+        assert_eq!(register(&mut engine), 0);
+        let world = engine.world_mut();
+        let entity = world
+            .create_entity()
+            .with(AudioSourceComponent::new(Handle::from_raw(2, 1)))
+            .build()
+            .unwrap();
+        let name =
+            pill_engine::component::ComponentRegistry::registered_name::<AudioSourceComponent>();
+        assert_eq!(
+            world.read_component_field(entity, &name, "sound").unwrap(),
+            pill_engine::FieldValue::Asset {
+                asset_type: Some("pill_audio::Sound".to_owned()),
+                index: 2,
+                generation: 1,
+            }
+        );
+
+        world
+            .write_component_field(
+                entity,
+                &name,
+                "sound",
+                pill_engine::FieldValue::Asset {
+                    asset_type: Some("pill_audio::Sound".to_owned()),
+                    index: 4,
+                    generation: 0,
+                },
+            )
+            .expect("another sound's handle writes");
+        assert_eq!(
+            world
+                .get_component::<AudioSourceComponent>(entity)
+                .unwrap()
+                .sound,
+            Handle::from_raw(4, 0)
+        );
+
+        let refused = world.write_component_field(
+            entity,
+            &name,
+            "sound",
+            pill_engine::FieldValue::Asset {
+                asset_type: Some("pill_master_renderer::assets::Mesh".to_owned()),
+                index: 0,
+                generation: 0,
+            },
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(pill_engine::component_field::ComponentFieldError::AssetTypeMismatch { .. })
+            ),
+            "{refused:?}"
+        );
+    }
 }
