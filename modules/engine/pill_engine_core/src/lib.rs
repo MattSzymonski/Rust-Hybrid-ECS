@@ -62,6 +62,9 @@ pub mod archetype;
 /// `Res` / `ResMut` parameters.
 pub mod asset;
 
+/// Every asset of a project by guid and by path, loaded or not.
+pub mod asset_database;
+
 /// Importing assets by file extension, for code that does not know their type.
 pub mod asset_import_registry;
 
@@ -178,6 +181,7 @@ pub use asset::{
     Asset, AssetBindingError, AssetBindingResult, AssetGuid, AssetLoadError, AssetLoadResult,
     AssetLoader, AssetManager, Handle,
 };
+pub use asset_database::{AssetDatabase, AssetRecord, GuidConflict};
 pub use asset_import_registry::{
     ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
 };

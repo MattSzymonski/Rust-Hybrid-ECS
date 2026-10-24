@@ -50,8 +50,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+// External crates
+use trait_type_map::TraitAccessible;
+
 // Current crate
-use crate::asset::{AssetGuid, AssetLoadError, AssetLoadResult, AssetManager};
+use crate::asset::{Asset, AssetGuid, AssetLoadError, AssetLoadResult, AssetManager, Handle};
+use crate::asset_database::AssetDatabase;
 use crate::asset_metadata::{
     normalize_settings_json, settings_json_for, AssetImport, AssetImportError, ImportedAsset,
     MetadataPolicy, MetadataSource, METADATA_EXTENSION,
@@ -76,6 +80,11 @@ pub struct ErasedImportOutcome {
     pub name: String,
     /// The asset's guid.
     pub guid: AssetGuid,
+    /// The slot index of the asset's handle: with [`Self::generation`], the
+    /// handle a typed caller rebuilds with [`Handle::from_raw`](crate::Handle::from_raw).
+    pub index: u32,
+    /// The generation of the asset's handle.
+    pub generation: u32,
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
     /// For an import: the path was already loaded and nothing was decoded.
@@ -174,6 +183,8 @@ fn import_standalone_erased<T: StandaloneAsset>(
             .unwrap_or_default()
             .to_owned(),
         guid: outcome.guid,
+        index: outcome.handle.index(),
+        generation: outcome.handle.generation(),
         metadata: outcome.metadata,
         previously_loaded: outcome.already_loaded,
         content_version,
@@ -197,6 +208,8 @@ fn reimport_standalone_erased<T: StandaloneAsset>(
             .unwrap_or_default()
             .to_owned(),
         guid: outcome.guid,
+        index: outcome.handle.index(),
+        generation: outcome.handle.generation(),
         metadata: outcome.metadata,
         previously_loaded: outcome.replaced,
         content_version: assets.content_version(outcome.handle),
@@ -219,6 +232,8 @@ fn import_erased<T: ImportedAsset>(
             .unwrap_or_default()
             .to_owned(),
         guid: outcome.guid,
+        index: outcome.handle.index(),
+        generation: outcome.handle.generation(),
         metadata: outcome.metadata,
         previously_loaded: outcome.already_loaded,
         content_version,
@@ -247,6 +262,8 @@ fn reimport_erased<T: ImportedAsset>(assets: &mut AssetManager, path: &Path) -> 
             .unwrap_or_default()
             .to_owned(),
         guid: outcome.guid,
+        index: outcome.handle.index(),
+        generation: outcome.handle.generation(),
         metadata: outcome.metadata,
         previously_loaded: outcome.replaced,
         content_version: assets.content_version(outcome.handle),
@@ -286,6 +303,22 @@ pub enum ErasedImportError {
     UnknownType {
         /// The type name asked for.
         type_name: String,
+    },
+    /// No asset of the project has this guid.
+    #[error("no asset in the project has the guid {guid}")]
+    UnknownGuid {
+        /// The guid asked for.
+        guid: AssetGuid,
+    },
+    /// The asset with this guid is of another type than the one asked for.
+    #[error("the asset with guid {guid} is a `{found}`, not a `{expected}`")]
+    WrongType {
+        /// The guid asked for.
+        guid: AssetGuid,
+        /// The type the caller asked for.
+        expected: String,
+        /// The type the asset is.
+        found: String,
     },
     /// The import itself failed.
     #[error(transparent)]
@@ -601,6 +634,69 @@ impl ImportRegistry {
     ) -> Result<ErasedImportOutcome, ErasedImportError> {
         let functions = self.functions_for_path(path)?;
         Ok((functions.import)(assets, path, policy)?)
+    }
+
+    /// Load the asset at `path`, whether or not it is loaded yet: the same
+    /// call as [`Self::import`], named for callers that resolve a reference.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::import`].
+    pub fn load_by_path(
+        &self,
+        assets: &mut AssetManager,
+        path: &Path,
+        policy: MetadataPolicy,
+    ) -> Result<ErasedImportOutcome, ErasedImportError> {
+        self.import(assets, path, policy)
+    }
+
+    /// Load the asset with `guid`, whether or not it is loaded yet: the guid's
+    /// path comes from `database`, then the asset imports as [`Self::import`]
+    /// would.
+    ///
+    /// # Errors
+    ///
+    /// [`ErasedImportError::UnknownGuid`] when `database` has no asset with
+    /// the guid; otherwise as [`Self::import`].
+    pub fn load_by_guid(
+        &self,
+        assets: &mut AssetManager,
+        database: &AssetDatabase,
+        guid: AssetGuid,
+        policy: MetadataPolicy,
+    ) -> Result<ErasedImportOutcome, ErasedImportError> {
+        let record = database
+            .by_guid(guid)
+            .ok_or(ErasedImportError::UnknownGuid { guid })?;
+        self.import(assets, Path::new(&record.path), policy)
+    }
+
+    /// [`Self::load_by_guid`] for a caller that knows the asset's type, which
+    /// gets the typed handle back.
+    ///
+    /// # Errors
+    ///
+    /// [`ErasedImportError::WrongType`] when the guid names an asset of
+    /// another type; otherwise as [`Self::load_by_guid`].
+    pub fn load_handle_by_guid<T>(
+        &self,
+        assets: &mut AssetManager,
+        database: &AssetDatabase,
+        guid: AssetGuid,
+        policy: MetadataPolicy,
+    ) -> Result<Handle<T>, ErasedImportError>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let outcome = self.load_by_guid(assets, database, guid, policy)?;
+        assets
+            .handle_by_guid::<T>(guid)
+            .ok_or_else(|| ErasedImportError::WrongType {
+                guid,
+                expected: std::any::type_name::<T>().to_owned(),
+                found: outcome.type_name,
+            })
     }
 
     /// Decode `path` again in place as the type its extension maps to; see
