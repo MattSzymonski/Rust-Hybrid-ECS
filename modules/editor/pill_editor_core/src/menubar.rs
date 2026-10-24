@@ -215,6 +215,16 @@ pub fn action_for(
     }
 }
 
+/// The `.scene` asset the Assets tab has selected, as the path Open Scene
+/// loads; `None` when the selection is not a scene file.
+fn scene_selection(selection: &EditorSelection) -> Option<String> {
+    selection
+        .asset
+        .as_deref()
+        .filter(|path| path.to_ascii_lowercase().ends_with(".scene"))
+        .map(str::to_string)
+}
+
 /// One row for one registered command: its label, and what a click asks the
 /// editor to do.
 ///
@@ -270,6 +280,36 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
             MenuAction::Clipboard(action)
         }
         "editor.paste" => MenuAction::Clipboard(crate::clipboard::ClipboardAction::Paste),
+        // The scene document's rows (W-0048 Stage 9). Open acts on the scene
+        // selected in the Assets tab, so it greys out until one is; Save needs
+        // an open scene file, and Save As always has somewhere to write.
+        "editor.scene_new" => MenuAction::Queue {
+            label: "new scene".to_string(),
+            commands: vec![EditorCommand::SceneNew],
+        },
+        "editor.scene_open" => match scene_selection(view.selection) {
+            Some(path) => MenuAction::Queue {
+                label: format!("open scene {path}"),
+                commands: vec![EditorCommand::SceneOpen { path }],
+            },
+            None => {
+                enabled = false;
+                MenuAction::Inert
+            }
+        },
+        "editor.scene_save" => {
+            enabled = view.snapshot.scene_open;
+            MenuAction::Queue {
+                label: "save scene".to_string(),
+                commands: vec![EditorCommand::SceneSave],
+            }
+        }
+        "editor.scene_save_as" => MenuAction::Queue {
+            label: "save scene as".to_string(),
+            commands: vec![EditorCommand::SceneSaveAs {
+                path: view.snapshot.scene_save_path.clone(),
+            }],
+        },
         "editor.asset.create" => MenuAction::CreateAsset,
         "editor.asset_write_meta" => {
             // The toolbar's rule: only a sourced file without a sidecar can

@@ -173,6 +173,10 @@ pub struct StaticProject {
     /// Whether debug drawing starts on: the settings' `debug_draw:` key,
     /// `false` when absent. A system can still switch it at runtime.
     pub debug_draw: bool,
+    /// The scene the project's settings named as its startup scene, loaded
+    /// after every component is registered and before the project's `init`
+    /// seeds anything (`startup_scene:` in `project_settings.yaml`).
+    pub startup_scene: Option<&'static str>,
 }
 
 /// A project's logging settings, compiled into the binary as text.
@@ -251,7 +255,7 @@ impl StaticProject {
         for (index, module) in self.modules.iter().enumerate() {
             let owner = extension_owner(index);
             let registration_sequence = engine.world().component_registration_sequence();
-            initialize_linked(engine, module.init, Some(owner)).map_err(|status| {
+            initialize_linked(engine, module.init, Some(owner), None).map_err(|status| {
                 ModuleError::InitializationFailed {
                     module: module.name.to_string(),
                     status,
@@ -272,7 +276,7 @@ impl StaticProject {
 
         let guard = match &self.backend {
             StaticProjectBackend::Native { init } => {
-                initialize_linked(engine, *init, PROJECT_SCOPE)
+                initialize_linked(engine, *init, PROJECT_SCOPE, self.startup_scene)
                     .map_err(|status| LibraryError::InitializationFailed { status })?;
                 None
             }
@@ -309,7 +313,7 @@ pub(crate) fn initialize_static_renderer(
     renderer: StaticRenderer,
     owner: SystemOwner,
 ) -> Result<(), u32> {
-    initialize_linked(engine, renderer.init, Some(owner))
+    initialize_linked(engine, renderer.init, Some(owner), None)
 }
 
 /// Run one linked entry point the way its generated ABI wrapper would.
@@ -322,6 +326,7 @@ fn initialize_linked(
     engine: &mut Engine,
     init: fn(&mut Engine) -> u32,
     scope: Option<SystemOwner>,
+    startup_scene: Option<&'static str>,
 ) -> Result<(), u32> {
     // Exactly what `#[pill_project]` and `#[pill_module]` emit ahead of the
     // user's function. Idempotent, so running it once per entry point costs one
@@ -336,6 +341,19 @@ fn initialize_linked(
     // expands into editable rows while a resolver is installed.
     let previous = pill_engine::component_registry::install_value_type_layouts(engine.world_mut());
     let _ = pill_engine::component_registry::register_all_components(engine.world_mut());
+    // A project's startup scene goes in here: the component types exist, and
+    // the project has not yet seeded its own entities over them.
+    if let Some(path) = startup_scene {
+        pill_engine::queue_startup_scene(engine.world_mut(), path);
+        if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                path,
+                reason,
+                "[engine] startup scene not loaded"
+            );
+        }
+    }
     let status = register_scoped(engine, scope, init);
     let registration_error = engine.world_mut().take_registration_error();
     pill_engine::component_registry::restore_value_type_layouts(engine.world_mut(), previous);
@@ -419,6 +437,7 @@ mod tests {
             asset_pack: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
+            startup_scene: None,
         };
         project.initialize(&mut engine).expect("both succeed");
 
@@ -449,6 +468,7 @@ mod tests {
             asset_pack: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
+            startup_scene: None,
         };
         let Err(error) = project.initialize(&mut engine) else {
             panic!("a non-zero module status must be reported");
@@ -473,6 +493,7 @@ mod tests {
             asset_pack: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
+            startup_scene: None,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
         assert!(guard.is_none());
@@ -503,6 +524,7 @@ mod tests {
             asset_pack: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
+            startup_scene: None,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
 

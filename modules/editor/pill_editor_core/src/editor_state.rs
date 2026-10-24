@@ -449,6 +449,15 @@ pub struct EditorSnapshot {
     pub undo_depth: usize,
     /// How many steps the redo history holds.
     pub redo_depth: usize,
+    /// What the title bar shows for the open scene: the file name, or
+    /// `untitled`, with a trailing `*` while it has unsaved edits (W-0048
+    /// Stage 9).
+    pub scene_title: String,
+    /// Whether a scene file is open; Save greys out when nothing is.
+    pub scene_open: bool,
+    /// Where Save As writes by default: the open scene's path, or
+    /// `scenes/untitled.scene` for a world that was never saved.
+    pub scene_save_path: String,
     /// Every registered command in registration order (W-0038 Stage 2): the
     /// menu bar draws a row per command whose menu path names the menu, and
     /// a spec that is not here has no row.
@@ -520,6 +529,20 @@ impl EditorSnapshot {
             preferences: crate::preferences::PreferencesView::default(),
             undo_depth: 0,
             redo_depth: 0,
+            scene_title: engine
+                .world()
+                .get_resource::<crate::scene_workflow::SceneSession>()
+                .map(crate::scene_workflow::SceneSession::title)
+                .unwrap_or_else(|| "untitled".to_string()),
+            scene_open: engine
+                .world()
+                .get_resource::<crate::scene_workflow::SceneSession>()
+                .is_some_and(|session| session.open.is_some()),
+            scene_save_path: engine
+                .world()
+                .get_resource::<crate::scene_workflow::SceneSession>()
+                .map(crate::scene_workflow::default_save_path)
+                .unwrap_or_else(|| "scenes/untitled.scene".to_string()),
             commands: engine
                 .world()
                 .get_resource::<crate::commands::CommandRegistry>()
@@ -1055,6 +1078,25 @@ pub enum EditorCommand {
         /// `(key, value)` pairs; keys are the file's own, dots nest.
         values: Vec<(String, String)>,
     },
+    /// Start an empty scene: every entity goes, no file is open (W-0048
+    /// Stage 9).
+    ///
+    /// A document action, not an edit: it is not recorded, and the history it
+    /// would otherwise fill names entities this world no longer has.
+    SceneNew,
+    /// Open the scene at `path`, replacing the world's entities.
+    SceneOpen {
+        /// The scene's path below the asset directory.
+        path: String,
+    },
+    /// Write the world to the open scene, keeping its guid.
+    SceneSave,
+    /// Write the world to `path`, taking over that file's guid when it exists
+    /// and a fresh one otherwise.
+    SceneSaveAs {
+        /// The scene's path below the asset directory.
+        path: String,
+    },
 }
 
 /// What one applied command hands back to the recording layer.
@@ -1223,7 +1265,11 @@ impl EditorCommand {
             | EditorCommand::SetResourceField { .. }
             | EditorCommand::SetSelection { .. }
             | EditorCommand::SelectResource { .. }
-            | EditorCommand::RestoreSelection { .. } => {}
+            | EditorCommand::RestoreSelection { .. }
+            | EditorCommand::SceneNew
+            | EditorCommand::SceneOpen { .. }
+            | EditorCommand::SceneSave
+            | EditorCommand::SceneSaveAs { .. } => {}
         }
         identifiers
     }
@@ -1277,7 +1323,11 @@ impl EditorCommand {
             | EditorCommand::WriteAssetMeta { .. }
             | EditorCommand::SetAssetSettings { .. }
             | EditorCommand::SetResourceField { .. }
-            | EditorCommand::SelectResource { .. } => {}
+            | EditorCommand::SelectResource { .. }
+            | EditorCommand::SceneNew
+            | EditorCommand::SceneOpen { .. }
+            | EditorCommand::SceneSave
+            | EditorCommand::SceneSaveAs { .. } => {}
         }
     }
 
@@ -1316,6 +1366,11 @@ impl EditorCommand {
             }
             match Self::apply_one(engine, &working[index]) {
                 Ok(applied) => {
+                    // An edit that succeeded is an unsaved change; the
+                    // document commands clear or set the marker themselves.
+                    if working[index].recordable() {
+                        crate::scene_workflow::mark_dirty(engine.world_mut());
+                    }
                     if let Some(inverse) = applied.inverse {
                         outcome.inverses.push(inverse);
                     } else {
@@ -2121,6 +2176,35 @@ impl EditorCommand {
                 selection.set_entities(taken);
                 selection.asset = asset.clone();
                 Ok(CommandOutcome::inverse(previous))
+            }
+
+            EditorCommand::SceneNew => {
+                let removed = crate::scene_workflow::new_scene(engine);
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    entities = removed,
+                    "[editor] scene new"
+                );
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SceneOpen { path } => {
+                crate::scene_workflow::open_scene(engine, path)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SceneSave => {
+                crate::scene_workflow::write_scene(engine, None)
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::plain())
+            }
+
+            EditorCommand::SceneSaveAs { path } => {
+                let path = crate::scene_workflow::scene_file_name(path);
+                crate::scene_workflow::write_scene(engine, Some(&path))
+                    .map_err(|error| format!("{command:?}: {error}"))?;
+                Ok(CommandOutcome::plain())
             }
 
             EditorCommand::SetPreferences { values } => {

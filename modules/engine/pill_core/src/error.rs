@@ -534,6 +534,17 @@ pub enum ConfigError {
     )]
     InvalidLoggingSettings { path: String, details: String },
 
+    /// The settings file's `startup_scene:` is not a relative `.scene` path
+    /// below the asset directory.
+    #[message(
+        "project settings file ",
+        name_style(path),
+        " has an invalid `startup_scene:`: ",
+        value(details),
+        " (use a relative path to a .scene file below `res`)"
+    )]
+    InvalidStartupScene { path: String, details: String },
+
     /// An extension name in the settings file is not a usable crate
     /// directory name.
     #[message(

@@ -676,6 +676,12 @@ pub struct HostConfig {
     /// development host always draws.
     pub shipping_debug_draw: bool,
 
+    /// The settings' `startup_scene:` key: the `.scene` the project starts
+    /// with, as a path below `res`. Queued into the world before any artifact
+    /// loads, so the load happens between component registration and the
+    /// project's own `init`.
+    pub startup_scene: Option<String>,
+
     /// The project's `res` directory, which asset paths are relative to;
     /// `None` when the configuration was not read from a project directory.
     pub asset_directory: Option<PathBuf>,
@@ -913,6 +919,10 @@ impl HostConfig {
         prune_stale_host_module_wrappers(&workspace_root, &kept_wrappers);
 
         let logging = project_settings.logging.validate(&settings_path)?;
+        let startup_scene = Self::validate_startup_scene(
+            project_settings.startup_scene.as_deref(),
+            &settings_path,
+        )?;
         Ok(Self {
             name: project_name,
             build_binary_name,
@@ -924,8 +934,44 @@ impl HostConfig {
             assets: project_settings.assets,
             logging,
             shipping_debug_draw: project_settings.debug_draw.unwrap_or(false),
+            startup_scene,
             asset_directory: Some(project_root.join(PROJECT_ASSET_DIRECTORY)),
         })
+    }
+
+    /// The settings' `startup_scene:` value, checked to be a relative path to
+    /// a `.scene` file below the asset directory.
+    fn validate_startup_scene(
+        setting: Option<&str>,
+        settings_path: &Path,
+    ) -> Result<Option<String>, ConfigError> {
+        let Some(value) = setting else {
+            return Ok(None);
+        };
+        let path = value.trim();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        let invalid = |details: &str| ConfigError::InvalidStartupScene {
+            path: settings_path.display().to_string(),
+            details: details.to_string(),
+        };
+        if !path.to_ascii_lowercase().ends_with(".scene") {
+            return Err(invalid("it does not name a .scene file"));
+        }
+        if path.starts_with('/') || path.starts_with('\\') || path.contains(':') {
+            return Err(invalid("it is not a relative path"));
+        }
+        if path
+            .split(['/', '\\'])
+            .any(|component| component == ".." || component == ".")
+        {
+            return Err(invalid("it climbs out of the asset directory"));
+        }
+        if pill_engine::asset_metadata::checked_relative(path).is_err() {
+            return Err(invalid("it is not a plain path below the asset directory"));
+        }
+        Ok(Some(path.to_string()))
     }
 
     /// Resolve the settings' `renderer:` value to a renderer name.
@@ -1145,6 +1191,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             assets: ProjectAssetSettings::default(),
             logging: pill_runtime::LoggingSettings::default(),
             shipping_debug_draw: false,
+            startup_scene: None,
             asset_directory: None,
         }
     }
@@ -1641,6 +1688,10 @@ struct ProjectSettingsFile {
     /// Whether a shipping or web build starts with debug drawing on; the
     /// development host always draws.
     debug_draw: Option<bool>,
+    /// The `.scene` the project starts with, as a path below `res`; loaded
+    /// after every component is registered and before the project's `init`
+    /// seeds anything.
+    startup_scene: Option<String>,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
@@ -2325,6 +2376,34 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(settings.name.as_deref(), Some("Bouncing Balls"));
         assert_eq!(settings.build_binary_name.as_deref(), Some("BouncingBalls"));
         assert_eq!(settings.modules, vec!["pill_spline", "pill_dummy_math"]);
+    }
+
+    /// The `startup_scene:` key reads a relative `.scene` path and refuses
+    /// anything that would leave the asset directory.
+    #[test]
+    fn the_startup_scene_key_reads_a_relative_scene_path() {
+        let settings = temp_root().join("project_settings_startup_scene");
+        let here = settings.join("project_settings.yaml");
+
+        let accepted = HostConfig::validate_startup_scene(Some("scenes/start.scene"), &here)
+            .expect("a relative scene path is accepted");
+        assert_eq!(accepted.as_deref(), Some("scenes/start.scene"));
+        assert_eq!(
+            HostConfig::validate_startup_scene(None, &here).unwrap(),
+            None
+        );
+        assert_eq!(
+            HostConfig::validate_startup_scene(Some("   "), &here).unwrap(),
+            None,
+            "a blank value means no startup scene"
+        );
+
+        for refused in ["scenes/start.txt", "/scenes/start.scene", "..\\start.scene"] {
+            assert!(
+                HostConfig::validate_startup_scene(Some(refused), &here).is_err(),
+                "`{refused}` must be refused"
+            );
+        }
     }
 
     /// The `logging:` section is optional, reads levels by name, and names a

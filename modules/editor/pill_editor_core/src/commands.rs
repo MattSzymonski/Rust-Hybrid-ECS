@@ -761,6 +761,26 @@ fn builtin_commands() -> Vec<CommandSpec> {
         CommandSpec::new("editor.preferences_open", "Preferences...")
             .menu(&["Edit", "Preferences..."])
             .separator(),
+        // The scene document's rows (W-0048 Stage 9), at the head of File:
+        // what the editor opens and writes. Save As carries no chord for the
+        // same reason the other rows do not - the menu and the palette carry
+        // it - and Open acts on the scene selected in the Assets tab.
+        CommandSpec::new("editor.scene_new", "New Scene")
+            .menu(&["File", "New Scene"])
+            .bind(Blender, "ctrl+n")
+            .bind(Unity, "ctrl+n")
+            .bind(Godot, "ctrl+n")
+            .bind(Unreal, "ctrl+n"),
+        CommandSpec::new("editor.scene_open", "Open Scene").menu(&["File", "Open Scene"]),
+        CommandSpec::new("editor.scene_save", "Save Scene")
+            .menu(&["File", "Save Scene"])
+            .bind(Blender, "ctrl+s")
+            .bind(Unity, "ctrl+s")
+            .bind(Godot, "ctrl+s")
+            .bind(Unreal, "ctrl+s"),
+        CommandSpec::new("editor.scene_save_as", "Save Scene As")
+            .menu(&["File", "Save Scene As"])
+            .separator(),
         // The Assets dialogs' buttons (Stage 25). They are registered like
         // any other command - the button row runs them by id - with no menu
         // entry of their own: they answer through the dialog they were
@@ -1103,6 +1123,7 @@ pub fn ensure_command_resources(world: &mut pill_engine::World) {
         world.insert_resource(crate::editor_state::EntityPickRequest::default());
     }
     crate::history::CommandHistory::ensure(world);
+    crate::scene_workflow::SceneSession::ensure(world);
 }
 
 // =============================================================================

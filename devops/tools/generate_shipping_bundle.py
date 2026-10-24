@@ -278,6 +278,25 @@ def load_debug_draw(project_root: Path) -> bool:
     return value
 
 
+def load_startup_scene(project_root: Path) -> str:
+    """Loads the `startup_scene:` key: the `.scene` the build loads before the
+    project's `init` seeds anything. Absent means none. Raises ValueError when
+    the value is not a relative `.scene` path below the asset directory.
+    """
+    settings_path = project_root / PROJECT_SETTINGS_FILE_NAME
+    with settings_path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    value = data.get("startup_scene")
+    if value is None:
+        return ""
+    text = str(value)
+    if not text.endswith(".scene") or text.startswith(("/", "\\")) or ".." in text:
+        raise ValueError(
+            f"{settings_path}: `startup_scene:` is `{value}`; use a relative path to a .scene file"
+        )
+    return text
+
+
 def build_logging_literal(logging) -> str:
     """Renders the `StaticLogging` expression for the loaded `logging:` section."""
     level, timestamp, source_location, targets = logging
@@ -562,6 +581,7 @@ def build_library_source(
     packs_assets: bool = False,
     logging=(None, None, None, []),
     debug_draw: bool = False,
+    startup_scene: str = "",
 ) -> str:
     """Builds the generated bundle's src/lib.rs text.
 
@@ -686,6 +706,11 @@ def build_library_source(
         ),
         "        logging: LOGGING,",
         f"        debug_draw: {'true' if debug_draw else 'false'},",
+        (
+            f'        startup_scene: Some("{startup_scene}"),'
+            if startup_scene
+            else "        startup_scene: None,"
+        ),
         "    }",
         "}",
     ]
@@ -1017,6 +1042,7 @@ def main() -> int:
         packs_assets=packs_assets,
         logging=load_logging(project_root),
         debug_draw=load_debug_draw(project_root),
+        startup_scene=load_startup_scene(project_root),
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest

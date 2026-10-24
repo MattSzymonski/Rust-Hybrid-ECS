@@ -180,6 +180,13 @@ pub enum ScriptedCommand {
     },
     /// `toolbar <create|rename|delete|meta>` - press one Assets toolbar button.
     Toolbar(ToolbarAction),
+    /// `scene new` - start an empty scene (W-0048 Stage 9).
+    SceneNew,
+    /// `scene open <path>` - open a `.scene` file, replacing the world.
+    SceneOpen(String),
+    /// `scene save [<path>]` - write the world to the open scene, or to
+    /// `path` when one is given.
+    SceneSave(Option<String>),
     /// `dialog set name <text>` - type into the open asset dialog's name field.
     DialogSetName(String),
     /// `dialog submit` - press the open asset dialog's confirm button.
@@ -762,10 +769,41 @@ impl ScriptedCommand {
             "dialog" => dialog(&mut cursor),
             "edit" => edit(&mut cursor),
             "pick" => pick(&mut cursor),
+            "scene" => scene_action(&mut cursor),
             "command" => command(&mut cursor),
             other => Err(ParseError::new(format!("unknown verb '{other}'"))),
         }
     }
+}
+
+/// `scene new|open <path>|save [<path>]`.
+fn scene_action(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
+    let command = match cursor.word() {
+        Some("new") => ScriptedCommand::SceneNew,
+        Some("open") => {
+            let path = cursor
+                .word()
+                .ok_or_else(|| ParseError::new("scene open needs a .scene path"))?;
+            ScriptedCommand::SceneOpen(path.to_string())
+        }
+        // Save with no path writes the open scene; one argument is a save-as.
+        Some("save") => {
+            let path = if cursor.rest().is_empty() {
+                None
+            } else {
+                Some(cursor.text("scene save takes at most one path")?)
+            };
+            ScriptedCommand::SceneSave(path)
+        }
+        Some(other) => {
+            return Err(ParseError::new(format!(
+                "unknown scene action '{other}' (new, open, save)"
+            )))
+        }
+        None => return Err(ParseError::new("scene needs an action (new, open, save)")),
+    };
+    cursor.finish("scene")?;
+    Ok(command)
 }
 
 /// `gizmo drag|press|release|<tool>`.
