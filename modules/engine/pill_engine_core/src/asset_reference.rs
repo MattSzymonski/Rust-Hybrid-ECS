@@ -155,15 +155,29 @@ impl<T: Asset> std::fmt::Debug for AssetReference<T> {
 }
 
 impl<T: Asset> serde::Serialize for AssetReference<T> {
+    /// The saved form of a reference (Q1): `{"guid": "<32 hex>"}`, or `null`
+    /// when unset. A reference holds no path, so the hint is left out; a
+    /// writer that has the asset manager adds it through
+    /// [`SavedAssetReference::with_path`](crate::SavedAssetReference::with_path).
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.guid.serialize(serializer)
+        match self.guid {
+            Some(guid) => {
+                crate::saved_references::SavedAssetReference::new(guid).serialize(serializer)
+            }
+            None => serializer.serialize_none(),
+        }
     }
 }
 
 impl<'de, T: Asset> serde::Deserialize<'de> for AssetReference<T> {
+    /// Reads both spellings: the object form this build writes and the bare
+    /// 32-hex guid every material and render pass written before Q1 holds.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self {
-            guid: Option::<AssetGuid>::deserialize(deserializer)?,
+            guid: Option::<crate::saved_references::SavedAssetReference>::deserialize(
+                deserializer,
+            )?
+            .map(|reference| reference.guid),
             _type: PhantomData,
         })
     }
@@ -182,13 +196,25 @@ mod tests {
     const GUID: &str = "000000000000000000000000000000ab";
 
     #[test]
-    fn a_reference_serializes_as_its_hex_guid_and_back() {
+    fn a_reference_serializes_in_the_saved_form_and_back() {
         let reference = AssetReference::<Picture>::new(AssetGuid::parse(GUID).unwrap());
 
         let json = serde_json::to_string(&reference).unwrap();
-        assert_eq!(json, format!("\"{GUID}\""));
+        assert_eq!(json, format!(r#"{{"guid":"{GUID}"}}"#));
         let read: AssetReference<Picture> = serde_json::from_str(&json).unwrap();
         assert_eq!(read, reference);
+    }
+
+    /// AC3: the bare hex a `.material` file written before Q1 holds still
+    /// loads as the same reference.
+    #[test]
+    fn a_reference_reads_the_bare_guid_older_files_hold() {
+        let read: AssetReference<Picture> = serde_json::from_str(&format!("\"{GUID}\"")).unwrap();
+        assert_eq!(read, AssetReference::new(AssetGuid::parse(GUID).unwrap()));
+
+        let object: AssetReference<Picture> =
+            serde_json::from_str(&format!(r#"{{"guid":"{GUID}","path":"a.png"}}"#)).unwrap();
+        assert_eq!(object, read, "the path hint does not change the identity");
     }
 
     #[test]

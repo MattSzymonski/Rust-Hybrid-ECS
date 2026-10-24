@@ -154,6 +154,14 @@ pub mod scheduler;
 /// Script components with deferred structural mutation safety.
 pub mod scripting;
 
+/// The saved form of asset and entity references: guid and stable id, with the
+/// resolution a later run needs.
+pub mod saved_references;
+
+/// A scene: a world's entities, components and references as one standalone
+/// asset that loads back into a world.
+pub mod scene;
+
 /// Per-function hot patching: stable dispatch slots for registered systems.
 pub mod hot_patch;
 
@@ -214,6 +222,11 @@ pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 pub use resource::{ResHandle, Resource, ResourceId};
+pub use saved_references::{
+    restore_asset_reference, saved_reference, SavedAssetReference, SavedEntityLink,
+    SavedEntityLinks, SavedReference,
+};
+pub use scene::{load_scene, save_scene, Scene, SceneDocument, SceneEntity, SceneLoad, SceneSave};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
 pub use time::Time;
