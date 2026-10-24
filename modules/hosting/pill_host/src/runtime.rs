@@ -1200,6 +1200,37 @@ fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path)
     );
 }
 
+/// Build the world's [`pill_engine::AssetDatabase`] from the project's asset
+/// directory, replacing any earlier one, and log what it indexed.
+///
+/// A guid two files claim is logged once per file: the second file needs a
+/// guid of its own, which is what a `.meta` copied with its source lacks.
+fn index_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path) {
+    let world = engine.world_mut();
+    let registry = world
+        .get_resource::<pill_engine::ImportRegistry>()
+        .cloned()
+        .unwrap_or_default();
+    let database = pill_engine::AssetDatabase::from_directory(asset_directory, &registry);
+    for conflict in database.conflicts() {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            guid = %conflict.guid,
+            kept = conflict.kept.as_str(),
+            refused = conflict.refused.as_str(),
+            "[assets] two files claim one guid; the second is not indexed"
+        );
+    }
+    info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        directory = %asset_directory.display(),
+        assets = database.len(),
+        conflicts = database.conflicts().len(),
+        "[assets] database indexed"
+    );
+    world.insert_resource(database);
+}
+
 /// Report a setup failure and hand the error back to the caller.
 ///
 /// The host state built so far unwinds as soon as the error is returned, and
@@ -1473,6 +1504,13 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         if let Some(asset_directory) = &host_config.asset_directory {
             scan_project_assets(runtime.engine_mut(), asset_directory);
         }
+    }
+
+    // Step 5c: Index every asset of the project by guid and by path, loaded
+    // or not, so a reference can find and load one (W-0048). After the module
+    // and project registrations, which say which extensions are standalone.
+    if let Some(asset_directory) = &host_config.asset_directory {
+        index_project_assets(runtime.engine_mut(), asset_directory);
     }
 
     // Step 6: Snapshot host memory and print the startup analytics report.
@@ -2879,6 +2917,17 @@ fn apply_asset_changes(host: &mut DevHost) {
         return;
     }
     let ensure_metadata = host.ensure_asset_metadata;
+    // Every path the batch touched, so the asset database follows it once the
+    // batch is applied (a `.meta` change is reported under its source).
+    let touched: Vec<String> = changes
+        .iter()
+        .map(|change| match change {
+            AssetChange::Edited { source, .. }
+            | AssetChange::SourceRemoved { source }
+            | AssetChange::MetadataRemoved { source } => source.clone(),
+        })
+        .collect();
+    let asset_root = host.asset_directory.clone();
     let world = host.runtime.engine_mut().world_mut();
     // A clone, so the registry can be called against the asset manager, which
     // is a second resource of the same world.
@@ -3005,6 +3054,34 @@ fn apply_asset_changes(host: &mut DevHost) {
             }
             _ => {}
         }
+    }
+
+    // The database follows the batch after it is applied, so it sees the
+    // `.meta` files the imports above just wrote. Paths go in the order the
+    // watcher reported them; a move's new path comes before its old one.
+    if let (Some(asset_root), Some(database)) = (
+        asset_root,
+        world.get_resource_mut::<pill_engine::AssetDatabase>(),
+    ) {
+        let conflicts_before = database.conflicts().len();
+        for source in &touched {
+            database.refresh(&asset_root, source, &registry);
+        }
+        for conflict in database.conflicts().iter().skip(conflicts_before) {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                guid = %conflict.guid,
+                kept = conflict.kept.as_str(),
+                refused = conflict.refused.as_str(),
+                "[assets] two files claim one guid; the second is not indexed"
+            );
+        }
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            paths = touched.len(),
+            assets = database.len(),
+            "[assets] database refreshed"
+        );
     }
 }
 

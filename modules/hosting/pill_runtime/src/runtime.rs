@@ -432,6 +432,16 @@ pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
             files = pack.len(),
             "mounted the embedded asset pack"
         );
+        // Every packed asset by guid and by path, so a reference can find and
+        // load one that is not loaded yet (W-0048). Built here because mounting
+        // consumes the pack.
+        let database = pill_engine::AssetDatabase::from_pack(&pack);
+        info!(
+            target: telemetry_target::ENGINE,
+            assets = database.len(),
+            "[assets] database indexed from the embedded pack"
+        );
+        runtime.engine_mut().world_mut().insert_resource(database);
         pill_engine::asset_store::mount_pack(pack);
     }
 

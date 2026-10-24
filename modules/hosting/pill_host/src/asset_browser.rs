@@ -71,6 +71,7 @@ pub struct AssetEntry {
 pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
     let registry = world.get_resource::<ImportRegistry>();
     let assets = world.get_resource::<AssetManager>();
+    let database = world.get_resource::<pill_engine::AssetDatabase>();
     let mut entries = Vec::new();
     visit(
         asset_directory,
@@ -103,12 +104,19 @@ pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
                     entry.loaded =
                         assets.is_some_and(|assets| registry.is_loaded(assets, relative));
                 }
-                let header = if entry.standalone {
-                    asset_directory.join(relative)
-                } else {
-                    asset_directory.join(format!("{}{METADATA_SUFFIX}", relative.display()))
-                };
-                entry.guid = read_guid(&header);
+                // The asset database knows every indexed guid; reading the
+                // header covers a host without one and a file indexed late.
+                entry.guid = database
+                    .and_then(|database| database.by_path(&entry.path))
+                    .map(|record| record.guid.to_string())
+                    .or_else(|| {
+                        let header = if entry.standalone {
+                            asset_directory.join(relative)
+                        } else {
+                            asset_directory.join(format!("{}{METADATA_SUFFIX}", relative.display()))
+                        };
+                        read_guid(&header)
+                    });
             }
             entries.push(entry);
         },

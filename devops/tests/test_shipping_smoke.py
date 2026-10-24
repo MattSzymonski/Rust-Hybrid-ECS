@@ -45,6 +45,7 @@ EXAMPLE USAGE
 # Standard library
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,10 @@ PROJECT_TOKEN = "[project]"
 
 # Proof that the statically linked modules initialized too.
 MODULE_TOKEN = "extension linked"
+
+# The embedded pack indexed by guid (W-0048): the example ships one standalone
+# asset (`res/dwdw.render_pass`), so the index holds at least one record.
+PACK_DATABASE_PATTERN = re.compile(r"database indexed from the embedded pack\s+assets=([0-9]+)")
 
 # Anything here means the reload machinery was compiled in after all.
 FORBIDDEN_TOKENS = (
@@ -345,6 +350,11 @@ def run_and_observe(timeout_scale: float) -> int:
         failures.append("no extension was linked and initialized")
     if PROJECT_TOKEN not in output:
         failures.append("the project's own systems never produced output")
+    pack_database = PACK_DATABASE_PATTERN.search(output)
+    if pack_database is None:
+        failures.append("the embedded asset pack was not indexed by guid")
+    elif int(pack_database.group(1)) < 1:
+        failures.append("the embedded pack's guid index holds no asset")
     for token in FORBIDDEN_TOKENS:
         if token in output:
             failures.append(f"reload machinery ran: {token!r}")

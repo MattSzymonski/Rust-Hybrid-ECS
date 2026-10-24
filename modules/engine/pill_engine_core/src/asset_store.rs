@@ -144,6 +144,11 @@ impl AssetPack {
         Some(&self.bytes[offset..offset + length])
     }
 
+    /// The relative path of every file in the pack, in no particular order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     /// Number of files in the pack.
     pub fn len(&self) -> usize {
         self.entries.len()
