@@ -19,12 +19,12 @@ path = "src/lib.rs"
 crate-type = ["rlib", "dylib"]
 
 [dependencies]
-pill_core = { path = "../pill_core" }
+pill_core = { path = "../../pill_core" }
 # The engine's core, never the `pill_engine` facade: the core is a shared
 # `dylib`, while the facade is an `rlib` compiled into every artifact, and an
 # `rlib` embedded in a `dylib` breaks the dependency-format check of every
 # binary that links both.
-pill_engine_core = { path = "../pill_engine_core" }
+pill_engine_core = { path = "../../pill_engine_core" }
 # The neutral frame the renderer contract carries (`RenderFrame.ui`): the
 # tessellated output becomes this crate's plain data, and no egui type ever
 # crosses into `pill_renderer_api` (plan decision D1).

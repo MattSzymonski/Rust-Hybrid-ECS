@@ -76,11 +76,11 @@ REGISTRY_PATH_PREFIX = "inventory::"
 SHARED_UI_INDEPENDENT_DYLIBS = (
     # The plain draw data the UI libraries and the renderer contract share
     # (W-0032): one shared dylib, no UI framework inside.
-    ("pill_draw", "pill_draw"),
+    ("pill_draw", "rendering/pill_draw"),
     # The in-game egui UI (W-0028): one shared dylib over egui alone, so a
     # project links the UI without the windowing or GPU crates the frontends
     # own.
-    ("pill_project_ui", "pill_project_ui"),
+    ("pill_project_ui", "rendering/pill_project_ui"),
     # The egui editor's copy (W-0017): one shared dylib, same rule.
     ("pill_editor_core", "frontents/pill_editor_core"),
 )
