@@ -65,7 +65,9 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -244,9 +246,43 @@ class ViolationCollector:
 # =============================================================================
 
 
+@lru_cache(maxsize=1)
+def ignored_rust_files() -> frozenset:
+    """The Rust files this checkout ignores and has not added to the index.
+
+    The changed-files hook can never receive one of these paths, so the CI
+    scan must not lint it either; otherwise a local scratch project can turn
+    the gate red for a file nobody can fix through the hook. The list is
+    computed once per process because `is_linted` is called for every file.
+    """
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--",
+                "*.rs",
+            ],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return frozenset()
+    if completed.returncode != 0:
+        return frozenset()
+    return frozenset(
+        (REPOSITORY_ROOT / line).resolve() for line in completed.stdout.splitlines()
+    )
+
+
 def is_linted(path: Path) -> bool:
     """Whether the lint checks this path: a `.rs` source outside every excluded
-tree.
+tree and outside git's ignored set.
 
     One predicate for every caller. CI scans with it (through
     `find_rust_files`), the changed-files hook imports it to select what it
@@ -254,8 +290,14 @@ tree.
     run and a CI run can never disagree about a file again. Before this was
     shared, the hook linted single files before any exclusions applied while CI
     scanned `modules/` only, so a file could pass one and fail the other.
+
+    Gitignored files are excluded because the hook cannot receive them: a
+    scratch project under `examples/` is part of the checkout only for its
+    owner, and a gate that lints it fails for everyone else.
     """
     if path.suffix != ".rs":
+        return False
+    if path.resolve() in ignored_rust_files():
         return False
     try:
         relative = path.relative_to(REPOSITORY_ROOT)
