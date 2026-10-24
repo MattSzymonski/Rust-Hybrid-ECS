@@ -64,6 +64,8 @@ from core.workspace_graph import Crate, ManifestError  # noqa: E402
 
 # The engine core, and the facade it must never link (rule 1).
 CORE_CRATE = "pill_engine_core"
+# The folder under `modules/` holding the core and the facade.
+ENGINE_FOLDER = "engine"
 FACADE_CRATE = "pill_engine"
 
 # The registry crate the core must not use (rule 2).
@@ -76,13 +78,13 @@ REGISTRY_PATH_PREFIX = "inventory::"
 SHARED_UI_INDEPENDENT_DYLIBS = (
     # The plain draw data the UI libraries and the renderer contract share
     # (W-0032): one shared dylib, no UI framework inside.
-    ("pill_ui_frame", "ui/pill_ui_frame"),
+    ("pill_ui_frame", "rendering/pill_ui_frame"),
     # The in-game egui UI (W-0028): one shared dylib over egui alone, so a
     # project links the UI without the windowing or GPU crates the frontends
     # own.
     ("pill_project_ui", "ui/pill_project_ui"),
     # The egui editor's copy (W-0017): one shared dylib, same rule.
-    ("pill_editor_core", "frontents/pill_editor_core"),
+    ("pill_editor_core", "editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
 
@@ -179,7 +181,7 @@ def shared_dylib_failures(root):
 
 # Runs every rule against the repository at `root`; returns the failures.
 def check(root):
-    core_directory = root / "modules" / CORE_CRATE
+    core_directory = root / "modules" / ENGINE_FOLDER / CORE_CRATE
     if not (core_directory / "Cargo.toml").is_file():
         return [f"{CORE_CRATE}: no manifest at {core_directory / 'Cargo.toml'}"]
     failures = [
@@ -200,11 +202,11 @@ def check(root):
     return failures
 
 
-# Writes a minimal crate under `root/modules/<name>`: a manifest and a
+# Writes a minimal crate under `root/modules/engine/<name>`: a manifest and a
 # `src/lib.rs` holding `source`. A dependency named `inventory` is written as a
-# registry dependency, every other one as a path dependency.
+# registry dependency, every other one as a path dependency to a sibling.
 def write_crate(root, name, dependencies, source=""):
-    directory = root / "modules" / name
+    directory = root / "modules" / ENGINE_FOLDER / name
     (directory / "src").mkdir(parents=True, exist_ok=True)
     lines = [f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n[dependencies]']
     for dependency in dependencies:
@@ -270,7 +272,7 @@ def self_test():
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         write_crate(root, "pill_dummy_color", [])
-        manifest = root / "modules" / "pill_dummy_color" / "Cargo.toml"
+        manifest = root / "modules" / ENGINE_FOLDER / "pill_dummy_color" / "Cargo.toml"
         manifest.write_text(
             manifest.read_text(encoding="utf-8") + "\n[features]\nmodule-abi = []\n",
             encoding="utf-8",
@@ -290,7 +292,7 @@ def self_test():
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             write_crate(root, "pill_engine_core", [])
-            directory = root / "modules" / "frontents" / "pill_editor_core"
+            directory = root / "modules" / "editor" / "pill_editor_core"
             (directory / "src").mkdir(parents=True, exist_ok=True)
             lines = [
                 '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',

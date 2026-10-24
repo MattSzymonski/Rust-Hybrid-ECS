@@ -2058,7 +2058,7 @@ fn materialize_host_module_wrapper(
         .join(GENERATED_DIRECTORY)
         .join(&member_name);
     let extension_directory = folder_directory.join(name);
-    let engine_directory = workspace_root.join("pill_engine");
+    let engine_directory = workspace_root.join("engine").join("pill_engine");
 
     // Everything the extension declares except the `default` key. A wrapper
     // that enabled fewer features than a project's dependency edge would
@@ -2234,7 +2234,7 @@ mod tests {
 name = "project"
 
 [dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
+pill_engine = { path = "../../modules/engine/pill_engine" }
 pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
 
@@ -2245,7 +2245,7 @@ pill_spline = { path = "../../modules/extensions/pill_spline" }
 name = "project"
 
 [dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
+pill_engine = { path = "../../modules/engine/pill_engine" }
 serde = { version = "1", features = ["derive"] }
 "#;
 
@@ -2892,7 +2892,7 @@ path = "../../modules/extensions/pill_spline"
 pill_spline = { path = "../../modules/extensions/pill_spline" }
 
 [dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
+pill_engine = { path = "../../modules/engine/pill_engine" }
 "#;
         assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -2909,7 +2909,7 @@ name = "pill_spline"
 pill_spline = []
 
 [dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
+pill_engine = { path = "../../modules/engine/pill_engine" }
 "#;
         assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -3139,7 +3139,7 @@ mod host_project_member_validation_tests {
 
     #[test]
     fn refuses_to_write_a_member_with_an_unresolvable_path() {
-        let root = workspace("unresolvable", "../../modules/pill_engine");
+        let root = workspace("unresolvable", "../../modules/engine/pill_engine");
 
         let error = materialize_host_project_member(&root, "project", "project")
             .expect_err("a dependency path that does not exist must be reported");

@@ -100,7 +100,7 @@ name = "host_module_wrapper_probe"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pill_engine = { path = "../../../../pill_engine", features = ["hot_patch"] }
+pill_engine = { path = "../../../../engine/pill_engine", features = ["hot_patch"] }
 pill_dummy_color = { path = "../../pill_dummy_color", default-features = false }
 """
 

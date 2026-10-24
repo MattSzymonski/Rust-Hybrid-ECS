@@ -17,16 +17,16 @@ workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../engine/pill_core" }
 # `#[engine_error]`, which expands to the `thiserror` and `miette` derives below.
-pill_core_macros = { path = "../../pill_core_macros" }
-pill_engine = { path = "../../pill_engine" }
+pill_core_macros = { path = "../../engine/pill_core_macros" }
+pill_engine = { path = "../../engine/pill_engine" }
 # The UI draw data the frame carries (plan decision: the frame carries UI
 # draw lists per surface, Stage 12; W-0032 moved the types out of `pill_ui`
 # so this contract never names the UI library). A shared `dylib`, like
 # `pill_core`, so the lists are one type identity across every artifact that
 # builds or draws them.
-pill_ui_frame = { path = "../../ui/pill_ui_frame" }
+pill_ui_frame = { path = "../pill_ui_frame" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

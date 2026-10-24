@@ -7,13 +7,13 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../engine/pill_core" }
 # The `#[engine_error]` attribute behind this binary's error type.
-pill_core_macros = { path = "../../pill_core_macros" }
+pill_core_macros = { path = "../../engine/pill_core_macros" }
 # The engine's input event types this executable translates winit events
 # into, the same shared dylib `pill_input` maps into: frontends name the
 # core, never the `pill_engine` facade with its per-DLL registries.
-pill_engine_core = { path = "../../pill_engine_core" }
+pill_engine_core = { path = "../../engine/pill_engine_core" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
@@ -57,7 +57,7 @@ windows = { version = "0.58", features = [
 windows-core = "0.58"
 # winit's keyboard and mouse events as engine input events, shared with the
 # standalone.
-pill_input = { path = "../pill_input", features = ["winit"] }
+pill_input = { path = "../../frontends/pill_input", features = ["winit"] }
 # The editor's own renderer for its UI: the executable owns its wgpu device
 # and presents the editor with it (D8, D19). The same wgpu the renderer
 # module uses - a second version in one process would bring a second copy of

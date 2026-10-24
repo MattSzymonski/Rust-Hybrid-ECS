@@ -17,7 +17,7 @@ DESCRIPTION
     emits HTML.
 
     Categories:
-      engine      Criterion benchmarks from `modules/pill_engine`
+      engine      Criterion benchmarks from `modules/engine/pill_engine`
       hot-reload  the real hot-reload pipeline, driven through the
                   `devops/benchmarks/` scripts
       cold-start  clean/incremental cargo builds, host startup and engine

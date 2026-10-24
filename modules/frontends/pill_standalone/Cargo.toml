@@ -7,10 +7,10 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../engine/pill_core" }
 # The `#[engine_error]` attribute behind this binary's own error types, plus
 # the two crates it expands into.
-pill_core_macros = { path = "../../pill_core_macros" }
+pill_core_macros = { path = "../../engine/pill_core_macros" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"

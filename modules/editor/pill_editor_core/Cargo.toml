@@ -24,13 +24,13 @@ crate-type = ["rlib", "dylib"]
 # this crate (`pill_host`'s `editor_core_dependency_graph`) resolves the same
 # tree as a module that uses it.
 [dependencies]
-pill_core = { path = "../../pill_core" }
-pill_core_macros = { path = "../../pill_core_macros" }
-pill_engine = { path = "../../pill_engine" }
-pill_assets = { path = "../../pill_assets" }
+pill_core = { path = "../../engine/pill_core" }
+pill_core_macros = { path = "../../engine/pill_core_macros" }
+pill_engine = { path = "../../engine/pill_engine" }
+pill_assets = { path = "../../assets/pill_assets" }
 # The renderer contract: the scene grid's switch lives beside the surface
 # camera bindings the command flips.
-pill_renderer_api = { path = "../../hosting/pill_renderer_api" }
+pill_renderer_api = { path = "../../rendering/pill_renderer_api" }
 # egui (plan decisions E1, E3), on the stack W-0026 moved to: egui 0.36.2,
 # whose `egui-wgpu` 0.36.2 renders through the engine's pinned wgpu 30, with
 # `egui_dock` 0.21.1 as the newest docking release that names this egui.

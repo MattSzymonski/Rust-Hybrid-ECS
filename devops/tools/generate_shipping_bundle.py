@@ -122,14 +122,14 @@ RENDERING_FEATURE = "rendering"
 # The project's asset directory, packed into the binary when it exists, and the
 # crate whose build-time writer packs it.
 ASSETS_DIRECTORY_NAME = "res"
-ASSETS_CRATE_DIRECTORY = Path("modules") / "pill_assets"
+ASSETS_CRATE_DIRECTORY = Path("modules") / "assets" / "pill_assets"
 ASSET_PACK_FILE_NAME = "assets.pillpack"
 BUILD_SCRIPT_FILE_NAME = "build.rs"
 # The web app crate `--web` writes, the frontend it runs on, and the id of the
 # canvas its page provides (`devops/tools/web/index.html`).
 WEB_APP_CRATE_NAME = "pill_web_app"
 WEB_APP_DIRECTORY = Path("build") / WEB_APP_CRATE_NAME
-WEB_CRATE_DIRECTORY = Path("modules") / "frontents" / "pill_web"
+WEB_CRATE_DIRECTORY = Path("modules") / "frontends" / "pill_web"
 WEB_CANVAS_ID = "pill-canvas"
 
 # Managed (C#) project constants, mirroring `pill_host::config` so a generated

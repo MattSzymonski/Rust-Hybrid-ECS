@@ -24,8 +24,8 @@ crate-type = ["rlib"]
 pill_hot_scan = { path = "../../../hosting/pill_hot_scan" }
 
 [dependencies]
-pill_core = { path = "../../../pill_core" }
-pill_engine = { path = "../../../pill_engine" }
+pill_core = { path = "../../../engine/pill_core" }
+pill_engine = { path = "../../../engine/pill_engine" }
 serde = { version = "1", features = ["derive"] }
 # `default-features = false` is a defensive no-op today (`pill_dummy_color`
 # declares no defaults); it stays so a default added there cannot pull extra

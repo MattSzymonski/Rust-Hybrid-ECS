@@ -854,13 +854,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pill_draw"
-version = "0.1.0"
-dependencies = [
- "pill_core",
-]
-
-[[package]]
 name = "pill_dummy_color"
 version = "0.1.0"
 dependencies = [
@@ -887,7 +880,6 @@ dependencies = [
  "pill_asset_format",
  "pill_core",
  "pill_core_macros",
- "pill_draw",
  "pill_engine_macros",
  "serde",
  "serde_json",
@@ -938,11 +930,19 @@ dependencies = [
  "miette",
  "pill_core",
  "pill_core_macros",
- "pill_draw",
  "pill_engine",
+ "pill_ui_frame",
  "raw-window-handle",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "pill_ui_frame"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_engine_core",
 ]
 
 [[package]]

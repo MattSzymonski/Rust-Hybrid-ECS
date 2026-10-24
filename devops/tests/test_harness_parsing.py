@@ -552,7 +552,7 @@ def check_editor_edits_keep_lf_and_restore() -> None:
 
 def check_workspace_members_expand_globs_and_excludes() -> None:
     """The member globs expand as cargo's do: the explicit crates, the
-    `frontents/*` and `extensions/*/*` globs - and nothing under the excluded
+    `frontends/*` and `extensions/*/*` globs - and nothing under the excluded
     `extensions/rendering`, whose old renderers no build uses."""
     members = workspace_members(MODULES_ROOT)
     names = [member.name for member in members]

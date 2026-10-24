@@ -11,7 +11,7 @@ DESCRIPTION
     context, not a measurement precondition.
 
     `collect_system_info` is also imported by the legacy
-    `modules/pill_engine/benches/reports/gen_bench_report.py`, so machine
+    `modules/engine/pill_engine/benches/reports/gen_bench_report.py`, so machine
     detection exists in exactly one place.
 
 --- SCRIPT ---

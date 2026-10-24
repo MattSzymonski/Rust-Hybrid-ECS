@@ -48,9 +48,9 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py
   python devops/tests/test_coding_standards.py --list
   python devops/tests/test_coding_standards.py --self-test
-  python devops/tests/test_coding_standards.py --root modules/pill_engine/src
-  python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs
-  python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs \
+  python devops/tests/test_coding_standards.py --root modules/engine/pill_engine/src
+  python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs
+  python devops/tests/test_coding_standards.py modules/engine/pill_core/src/lib.rs \
       examples/project_rs/src/lib.rs --report local/lint.json
   python devops/tests/test_coding_standards.py --root modules \
       --exclude modules/extensions/pill_master_renderer
@@ -611,7 +611,7 @@ def self_test() -> int:
         ),
         (
             "the same plant outside a reloadable crate passes",
-            "modules/frontents/pill_editor/src/runner.rs",
+            "modules/editor/pill_editor/src/runner.rs",
             "let stored = context.data_mut::<Widget>();\n",
             0,
         ),
@@ -699,8 +699,8 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  test_coding_standards.py\n"
             "  test_coding_standards.py --list\n"
-            "  test_coding_standards.py --root modules/pill_engine/src\n"
-            "  test_coding_standards.py modules/pill_core/src/lib.rs\n"
+            "  test_coding_standards.py --root modules/engine/pill_engine/src\n"
+            "  test_coding_standards.py modules/engine/pill_core/src/lib.rs\n"
             "  test_coding_standards.py --root modules --exclude "
             "modules/extensions/pill_master_renderer\n"
         ),
