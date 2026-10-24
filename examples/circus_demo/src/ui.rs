@@ -26,7 +26,7 @@
 //! keys, and the overlay displays them. That keeps one writer for the tuning
 //! values and lets the overlay take them immutably.
 //!
-//! The frame reaches the renderer as `pill_draw` data - a draw list and a
+//! The frame reaches the renderer as `pill_ui_frame` data - a draw list and a
 //! texture set - so nothing in the rendering path names egui (W-0028 D1).
 
 // External crates

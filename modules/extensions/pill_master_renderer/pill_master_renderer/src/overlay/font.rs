@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 // External crates
-use pill_draw::{TextureId, UiTextureFilter, UiTextureSet};
+use pill_ui_frame::{TextureId, UiTextureFilter, UiTextureSet};
 
 /// Glyph width in pixels.
 pub(super) const GLYPH_WIDTH: u32 = 5;

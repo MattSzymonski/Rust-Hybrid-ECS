@@ -98,7 +98,7 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// The engine's shared libraries, by file stem: every module, project and
 /// patch imports them, and each exists once per process unless a module needs
 /// the isolated copies (see [`engine_dylib_needs_isolation`]).
-/// `pill_draw` carries the frame's UI draw data that the UI painters and the
+/// `pill_ui_frame` carries the frame's UI draw data that the UI painters and the
 /// renderer contract share (W-0032); every artifact that builds or draws UI
 /// lists imports it, so it stages like the rest.
 /// `pill_project_ui` is the in-game egui UI (W-0028): a project draws into its
@@ -110,7 +110,7 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 pub(crate) const ENGINE_DYLIB_STEMS: [&str; 5] = [
     "pill_core",
     "pill_engine_core",
-    "pill_draw",
+    "pill_ui_frame",
     "pill_project_ui",
     "pill_editor_core",
 ];
@@ -1683,16 +1683,16 @@ mod tests {
 
     use crate::scratch::ScratchDirectory;
 
-    /// The Stage 27 case: the artifact imports a symbol `pill_draw` does not
+    /// The Stage 27 case: the artifact imports a symbol `pill_ui_frame` does not
     /// export while `pill_core`'s copies differ. The message must name
-    /// `pill_draw` and the symbol - the mismatch story must not win and bury
+    /// `pill_ui_frame` and the symbol - the mismatch story must not win and bury
     /// the real answer.
     #[test]
-    fn a_missing_pill_draw_import_wins_over_a_pill_core_mismatch() {
+    fn a_missing_pill_ui_frame_import_wins_over_a_pill_core_mismatch() {
         let unresolved = UnresolvedImport {
-            dll: "pill_draw.dll".to_string(),
-            symbol: "pill_draw_frame_take".to_string(),
-            path: PathBuf::from("target/hot/pill_draw.dll"),
+            dll: "pill_ui_frame.dll".to_string(),
+            symbol: "pill_ui_frame_frame_take".to_string(),
+            path: PathBuf::from("target/hot/pill_ui_frame.dll"),
         };
         let mismatch = Some((
             PathBuf::from("target/debug/pill_core.dll"),
@@ -1701,8 +1701,8 @@ mod tests {
         let explanation = choose_explanation(Some(unresolved), None, mismatch);
         let error = explanation_error("editor_shell", explanation).expect("an explanation");
         let text = error.to_string();
-        assert!(text.contains("pill_draw.dll"), "{text}");
-        assert!(text.contains("pill_draw_frame_take"), "{text}");
+        assert!(text.contains("pill_ui_frame.dll"), "{text}");
+        assert!(text.contains("pill_ui_frame_frame_take"), "{text}");
         assert!(
             !text.contains("pill_core"),
             "the mismatch story must not win: {text}"

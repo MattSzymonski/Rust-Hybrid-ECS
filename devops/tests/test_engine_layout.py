@@ -31,7 +31,7 @@ DESCRIPTION
                         loadable artifact; the generated `host_module_*`
                         wrappers replaced it, and a build that turned it back
                         on would duplicate the entry-point symbols.
-      4. shared UI    - each UI-independent shared dylib (`pill_draw`, the in-game
+      4. shared UI    - each UI-independent shared dylib (`pill_ui_frame`, the in-game
                         egui UI's `pill_project_ui`, and the egui editor's copy,
                         `pill_editor_core`) is built as a
                         `dylib` (one copy per process) and links no UI framework,
@@ -76,7 +76,7 @@ REGISTRY_PATH_PREFIX = "inventory::"
 SHARED_UI_INDEPENDENT_DYLIBS = (
     # The plain draw data the UI libraries and the renderer contract share
     # (W-0032): one shared dylib, no UI framework inside.
-    ("pill_draw", "ui/pill_draw"),
+    ("pill_ui_frame", "ui/pill_ui_frame"),
     # The in-game egui UI (W-0028): one shared dylib over egui alone, so a
     # project links the UI without the windowing or GPU crates the frontends
     # own.

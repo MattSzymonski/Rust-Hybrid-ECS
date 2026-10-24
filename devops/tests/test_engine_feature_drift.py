@@ -84,7 +84,7 @@ MODULES = REPOSITORY / "modules"
 ENGINE_DYLIBS = (
     "pill_core",
     "pill_engine_core",
-    "pill_draw",
+    "pill_ui_frame",
 )
 
 # The egui editor's shared dylib: the egui boundary and its model. Only the

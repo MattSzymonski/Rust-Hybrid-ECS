@@ -1,4 +1,4 @@
-//! The tessellated output to `pill_draw`: meshes, clips and texture ids.
+//! The tessellated output to `pill_ui_frame`: meshes, clips and texture ids.
 //!
 //! # Responsibilities
 //!
@@ -10,7 +10,7 @@
 //! # Design
 //!
 //! egui tessellates premultiplied sRGB colour into triangle lists in *points*,
-//! while `pill_draw::Color` is straight alpha and the renderer's UI painter blends
+//! while `pill_ui_frame::Color` is straight alpha and the renderer's UI painter blends
 //! `SrcAlpha`, so the converter unpremultiplies per vertex and per texel (see
 //! the W-0028 Stage 1 decision record, Q2). Vertices are not scaled: the
 //! painter takes the monitor scale and applies it itself, which keeps one
@@ -19,10 +19,10 @@
 // External crates
 use egui::{ClippedPrimitive, Color32, TextureId as EguiTextureId};
 use pill_core::math::Vector2f;
-use pill_draw::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
+use pill_ui_frame::{Color, DrawCommand, DrawList, Rect, TextureId, UiVertex};
 
 /// The bit that separates egui's managed texture ids from its user ids, so
-/// the two id spaces cannot collide in one `pill_draw::TextureId`.
+/// the two id spaces cannot collide in one `pill_ui_frame::TextureId`.
 const USER_TEXTURE_CEILING: u64 = 1 << 63;
 
 /// Append `primitives` to `list` and return how many draws it added.

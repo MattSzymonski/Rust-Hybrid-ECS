@@ -249,7 +249,7 @@ pub struct RenderFrame {
     /// The UI to draw over the frame: the draw lists a game's or tool's UI
     /// pass built this update, per surface, and the textures they sample.
     /// Empty means no UI (Stage 12).
-    pub ui: pill_draw::UiFrame,
+    pub ui: pill_ui_frame::UiFrame,
 }
 
 impl Default for RenderFrame {
@@ -271,7 +271,7 @@ impl Default for RenderFrame {
             grid: None,
             pick_requests: Vec::new(),
             sequence: 0,
-            ui: pill_draw::UiFrame::default(),
+            ui: pill_ui_frame::UiFrame::default(),
         }
     }
 }
