@@ -68,6 +68,9 @@ pub mod asset_database;
 /// Importing assets by file extension, for code that does not know their type.
 pub mod asset_import_registry;
 
+/// Loading assets and scenes from game code by path (W-0048 Stage 10).
+pub mod asset_loading;
+
 /// Metadata files beside an asset's source (`<asset_name>.meta`).
 pub mod asset_metadata;
 

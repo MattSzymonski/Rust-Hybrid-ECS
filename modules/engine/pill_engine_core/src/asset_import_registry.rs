@@ -742,9 +742,38 @@ impl ImportRegistry {
             })
     }
 
-    /// Decode `path` again in place as the type its extension maps to; see
-    /// [`AssetManager::reimport`].
+    /// [`Self::load_by_path`] for a caller that knows the asset's type, which
+    /// gets the typed handle back.
     ///
+    /// The game-code shape of loading an asset by name, recorded with its
+    /// guid the way any import is: `world.load_asset::<Mesh>("models/x.obj")`
+    /// wraps it (W-0048 Stage 10).
+    ///
+    /// # Errors
+    ///
+    /// [`ErasedImportError::WrongType`] when the extension names an asset of
+    /// another type; otherwise as [`Self::load_by_path`].
+    pub fn load_handle_by_path<T>(
+        &self,
+        assets: &mut AssetManager,
+        path: &Path,
+        policy: MetadataPolicy,
+    ) -> Result<Handle<T>, ErasedImportError>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let outcome = self.load_by_path(assets, path, policy)?;
+        assets
+            .handle_by_name::<T>(&outcome.name)
+            .ok_or_else(|| ErasedImportError::WrongType {
+                guid: outcome.guid,
+                expected: std::any::type_name::<T>().to_owned(),
+                found: outcome.type_name,
+            })
+    }
+
+    /// Decode `path` again in place as the type its extension maps to; see
+    /// [`AssetManager::reimport`].    ///
     /// # Errors
     ///
     /// As [`Self::import`].
