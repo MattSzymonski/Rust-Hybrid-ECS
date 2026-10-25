@@ -489,15 +489,26 @@ mod tests {
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let entries = entries(Menu::File, &view_over(&snapshot, &selection, &commands));
+        // The scene document's rows lead the menu (W-0048 Stage 9), then the
+        // asset actions, then quitting.
         assert_eq!(
             labels(&entries),
-            vec!["Create Asset...", "Write Asset Meta", "Quit Editor"]
+            vec![
+                "New Scene",
+                "Open Scene",
+                "Save Scene",
+                "Save Scene As",
+                "Create Asset...",
+                "Write Asset Meta",
+                "Quit Editor",
+            ]
         );
         // Only the sidecar write needs a selection, and nothing is selected.
-        assert_eq!(actions(&entries)[1].1, false);
-        // One rule, above Quit Editor.
-        assert_eq!(separators(&entries), 1);
-        assert!(matches!(entries[2], MenuEntry::Separator));
+        assert_eq!(actions(&entries)[5].1, false);
+        // One rule after the scene rows and one above Quit Editor.
+        assert_eq!(separators(&entries), 2);
+        assert!(matches!(entries[3], MenuEntry::Separator));
+        assert!(matches!(entries[7], MenuEntry::Separator));
     }
 
     #[test]

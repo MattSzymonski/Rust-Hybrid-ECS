@@ -50,6 +50,21 @@ pub fn inspector_tab(
         resource_section(ui, view, pending);
         return;
     }
+    // The rows this tab reports are the ones it draws for the entity in front
+    // of it: a new subject makes every row - and every rectangle - new again,
+    // so what the previous subject left in the memory cannot hide the new
+    // entity's rows or point a click at where a section used to be (W-0049).
+    let subject = snapshot.detail.as_ref().map(|detail| detail.entity);
+    if session.subject != subject {
+        session.subject = subject;
+        session.rows_logged.clear();
+        session.section_rects.clear();
+        session.add_rect = None;
+        session.asset_row_texts.clear();
+        session.asset_row_rects.clear();
+        session.entity_row_texts.clear();
+        session.entity_row_rects.clear();
+    }
     match snapshot.detail.as_ref() {
         Some(detail) => {
             inspector_header(ui, snapshot, detail, pending, overlay_regions, session);
@@ -80,7 +95,15 @@ pub fn inspector_tab(
         }
         ui.separator();
         match detail.settings.as_ref() {
-            Some(settings) => asset_settings_rows(ui, &detail.path, settings, pending),
+            Some(settings) => asset_settings_rows(
+                ui,
+                &detail.path,
+                settings,
+                &snapshot.assets,
+                pending,
+                session,
+                overlay_regions,
+            ),
             None => {
                 ui.label(egui::RichText::new("no editable settings").weak().italics());
             }
@@ -297,6 +320,7 @@ pub fn entity_inspector(
                 &snapshot.entities,
                 pending,
                 session,
+                overlay_regions,
             );
         }
         ui.add_space(6.0);

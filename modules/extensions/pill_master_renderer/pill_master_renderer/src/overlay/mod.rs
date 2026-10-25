@@ -80,6 +80,13 @@ const NEAR_CLIP_DEPTH: f32 = 1e-3;
 const LINE_HALF_WIDTH: f32 = 1.0;
 /// How far past its half width a line's anti-aliasing fades, in pixels.
 const LINE_FEATHER: f32 = 0.5;
+/// The half width of a gizmo line's quad in the pick buffer, in pixels.
+///
+/// Wider than the drawn line so the pick covers the band the editor's hover
+/// test accepts as a handle (a fraction of the handle's length, which keeps a
+/// roughly constant screen size). W-0049: a handle presses where it
+/// highlights.
+const PICK_LINE_HALF_WIDTH: f32 = 7.0;
 /// Which side of its line each of a quad's six corners sits on, in order.
 const LINE_QUAD_SIDES: [f32; 6] = [1.0, -1.0, 1.0, 1.0, -1.0, -1.0];
 /// How far a gizmo triangle's corners are pushed out, in pixels, so its
@@ -552,7 +559,16 @@ impl Overlay {
             .filter(|request| request.surface.0 == input.surface)
             .copied()
             .collect();
-        let outlined = outlined_positions(frame, input.render_queue);
+        // The editor's chrome - outlines, gizmo handles and their picks -
+        // belongs on the surfaces the frame marks as editor views (W-0049):
+        // the game's own window draws the game and nothing else. The project's
+        // own debug lines are not chrome and draw everywhere.
+        let editor_view = frame.editor_views.contains(&input.surface);
+        let outlined = if editor_view {
+            outlined_positions(frame, input.render_queue)
+        } else {
+            Vec::new()
+        };
         // The scene grid, when the frame asked for one on this surface: the
         // editor's view-bound viewports draw it, a game's surface never does.
         let grid = frame
@@ -580,8 +596,10 @@ impl Overlay {
             input.viewport.width.max(1) as f32,
             input.viewport.height.max(1) as f32,
         );
-        let (tested, on_top) = line_vertices(&frame.debug, view_projection, viewport_size);
-        let triangles = triangle_vertices(&frame.debug, view_projection, viewport_size);
+        let (tested, on_top) =
+            line_vertices(&frame.debug, view_projection, viewport_size, editor_view);
+        let triangles =
+            triangle_vertices(&frame.debug, view_projection, viewport_size, editor_view);
         let tested_count = tested.len() as u32;
         let on_top_count = on_top.len() as u32;
         let triangle_count = triangles.len() as u32;
@@ -671,7 +689,15 @@ impl Overlay {
         }
 
         if !picks.is_empty() {
-            self.record_picks(device, queue, encoder, &input, target_index, picks);
+            self.record_picks(
+                device,
+                queue,
+                encoder,
+                &input,
+                target_index,
+                picks,
+                editor_view,
+            );
         }
     }
 
@@ -775,6 +801,10 @@ impl Overlay {
     }
 
     /// Draw the pick buffer and record the copies of the requested pixels.
+    ///
+    /// A surface that is not an editor view draws no handles into its pick
+    /// buffer: the gizmo is not there, so nothing may pick it there.
+    #[allow(clippy::too_many_arguments)]
     fn record_picks(
         &mut self,
         device: &wgpu::Device,
@@ -783,6 +813,7 @@ impl Overlay {
         input: &OverlayFrame,
         target_index: usize,
         picks: Vec<PickRequest>,
+        handles: bool,
     ) {
         let (width, height) = (
             self.targets[target_index].width,
@@ -814,8 +845,16 @@ impl Overlay {
             input.viewport.width.max(1) as f32,
             input.viewport.height.max(1) as f32,
         );
-        let handle_lines = handle_line_vertices(&input.frame.debug, view_projection, viewport_size);
-        let handle_triangles = handle_triangle_vertices(&input.frame.debug);
+        let handle_lines = if handles {
+            handle_line_vertices(&input.frame.debug, view_projection, viewport_size)
+        } else {
+            Vec::new()
+        };
+        let handle_triangles = if handles {
+            handle_triangle_vertices(&input.frame.debug)
+        } else {
+            Vec::new()
+        };
         let handle_line_count = handle_lines.len() as u32;
         let handle_triangle_count = handle_triangles.len() as u32;
         let handle_lines_buffer = self
@@ -1028,11 +1067,13 @@ type ClipVertex = ([f32; 4], [f32; 3]);
 /// feather on each side, with every corner carrying its distance from the
 /// line's centre, so the fragment shader can fade the edge. Widening happens
 /// through the camera's own projection, which keeps a line the same width at
-/// any depth.
+/// any depth. `gizmos` is the editor-view switch (W-0049): the project's own
+/// debug lines always draw, the gizmo handles only on an editor view.
 fn line_vertices(
     debug: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
     size: (f32, f32),
+    gizmos: bool,
 ) -> (Vec<LineVertex>, Vec<LineVertex>) {
     let offset = LINE_HALF_WIDTH + LINE_FEATHER;
     let push_line =
@@ -1058,7 +1099,9 @@ fn line_vertices(
         }
     }
     for line in &debug.gizmo_lines {
-        push_line(&mut on_top, line.start, line.end, line.color);
+        if gizmos {
+            push_line(&mut on_top, line.start, line.end, line.color);
+        }
     }
     (tested, on_top)
 }
@@ -1182,12 +1225,17 @@ fn unit(vector: [f32; 2]) -> Option<[f32; 2]> {
 
 /// The frame's gizmo triangles as screen-space triangles whose corners are
 /// pushed `TRIANGLE_FEATHER` pixels out, which the fragment shader feathers
-/// back down to the silhouette the triangles really have.
+/// back down to the silhouette the triangles really have. `gizmos` is the
+/// editor-view switch, as in [`line_vertices`].
 fn triangle_vertices(
     debug: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
     size: (f32, f32),
+    gizmos: bool,
 ) -> Vec<TriangleVertex> {
+    if !gizmos {
+        return Vec::new();
+    }
     let mut vertices = Vec::new();
     for triangle in &debug.gizmo_triangles {
         let corners = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -1279,7 +1327,8 @@ fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<
 }
 
 /// The gizmo lines as the pick buffer draws them: the same quads as the drawn
-/// lines, so picking covers the line the user sees.
+/// lines, widened to the band the editor's hover test accepts (W-0049), so
+/// picking covers the handle the pointer highlights.
 fn handle_line_vertices(
     debug: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
@@ -1288,8 +1337,13 @@ fn handle_line_vertices(
     let mut vertices = Vec::new();
     for line in &debug.gizmo_lines {
         let value = PICK_HANDLE_BIT | line.handle;
-        let Some(quad) = line_quad(line.start, line.end, view_projection, size, LINE_HALF_WIDTH)
-        else {
+        let Some(quad) = line_quad(
+            line.start,
+            line.end,
+            view_projection,
+            size,
+            PICK_LINE_HALF_WIDTH,
+        ) else {
             continue;
         };
         vertices.extend(quad.map(|clip| HandleLineVertex { clip, value }));
@@ -1428,12 +1482,48 @@ mod tests {
         draw.gizmo_line([-1.0, 0.0, -5.0], [1.0, 0.0, -5.0], [1.0, 4.0, 1.0, 1.0], 5);
         let frame = draw.collect_frame(0.016);
         let projection = glam::camera::rh::proj::directx::perspective(1.0, 1.0, 0.1, 100.0);
-        let (tested, on_top) = line_vertices(&frame, &projection, (100.0, 100.0));
+        let (tested, on_top) = line_vertices(&frame, &projection, (100.0, 100.0), true);
         assert_eq!(tested.len(), 6 * usize::from(style.depth_test));
         assert_eq!(on_top.len(), 18 - tested.len());
         let handle_lines = handle_line_vertices(&frame, &projection, (100.0, 100.0));
         assert_eq!(handle_lines.len(), 6);
         assert_eq!(handle_lines[0].value, PICK_HANDLE_BIT | 5);
+    }
+
+    /// A surface that is not an editor view draws the project's own debug
+    /// lines and no editor chrome: no gizmo lines, no gizmo triangles (W-0049,
+    /// which pins the chosen behaviour for a game's `DebugDraw`).
+    #[test]
+    fn a_game_surface_draws_its_debug_lines_without_the_editor_chrome() {
+        let mut draw = pill_engine::DebugDraw::new(true);
+        draw.line(
+            [-1.0, 0.0, -5.0],
+            [1.0, 0.0, -5.0],
+            pill_engine::DebugStyle::default(),
+        );
+        draw.gizmo_line([-1.0, 0.0, -5.0], [1.0, 0.0, -5.0], [1.0, 4.0, 1.0, 1.0], 5);
+        draw.gizmo_triangle(
+            [[-1.0, -1.0, -5.0], [1.0, -1.0, -5.0], [0.0, 1.0, -5.0]],
+            [1.0, 1.0, 1.0, 1.0],
+            7,
+        );
+        let frame = draw.collect_frame(0.016);
+        let projection = glam::camera::rh::proj::directx::perspective(1.0, 1.0, 0.1, 100.0);
+        let (tested, on_top) = line_vertices(&frame, &projection, (100.0, 100.0), false);
+        assert_eq!(
+            tested.len() + on_top.len(),
+            6,
+            "the project's own line stays"
+        );
+        assert!(triangle_vertices(&frame, &projection, (100.0, 100.0), false).is_empty());
+        // The same frame on an editor view draws the chrome as well.
+        let (editor_tested, editor_on_top) =
+            line_vertices(&frame, &projection, (100.0, 100.0), true);
+        assert_eq!(editor_tested.len() + editor_on_top.len(), 12);
+        assert_eq!(
+            triangle_vertices(&frame, &projection, (100.0, 100.0), true).len(),
+            3
+        );
     }
 
     /// A line entirely behind the camera draws nothing; one that crosses the
@@ -1445,12 +1535,12 @@ mod tests {
         let style = pill_engine::DebugStyle::default();
         draw.line([-1.0, 0.0, 1.0], [1.0, 0.0, 2.0], style);
         let behind = draw.collect_frame(0.016);
-        let (tested, on_top) = line_vertices(&behind, &projection, (100.0, 100.0));
+        let (tested, on_top) = line_vertices(&behind, &projection, (100.0, 100.0), true);
         assert!(tested.is_empty() && on_top.is_empty());
 
         draw.line([-0.2, 2.0, 5.0], [1.0, -1.0, -5.0], style);
         let in_view = draw.collect_frame(0.016);
-        let (tested, on_top) = line_vertices(&in_view, &projection, (100.0, 100.0));
+        let (tested, on_top) = line_vertices(&in_view, &projection, (100.0, 100.0), true);
         assert_eq!(tested.len() + on_top.len(), 6);
     }
 
@@ -1464,7 +1554,7 @@ mod tests {
         let corners = [[-1.0, -1.0, -5.0], [1.0, -1.0, -5.0], [0.0, 1.0, -5.0]];
         draw.gizmo_triangle(corners, [1.0, 1.0, 1.0, 1.0], 7);
         let frame = draw.collect_frame(0.016);
-        let vertices = triangle_vertices(&frame, &projection, (100.0, 100.0));
+        let vertices = triangle_vertices(&frame, &projection, (100.0, 100.0), true);
         assert_eq!(vertices.len(), 3);
         let mut barycentrics: Vec<[f32; 3]> =
             vertices.iter().map(|vertex| vertex.barycentric).collect();
@@ -1489,7 +1579,7 @@ mod tests {
             7,
         );
         let behind = behind.collect_frame(0.016);
-        assert!(triangle_vertices(&behind, &projection, (100.0, 100.0)).is_empty());
+        assert!(triangle_vertices(&behind, &projection, (100.0, 100.0), true).is_empty());
     }
 
     /// A device and queue without a surface, preferring the platform's

@@ -53,6 +53,14 @@ pub struct EguiShellState {
     /// The brand mark's texture, uploaded on the first frame and kept for the
     /// session: the context owns it, so a shell reload reuses it.
     pub mark: Option<TextureHandle>,
+    /// The rendered asset previews, by project-relative path (W-0049
+    /// Stage 11): pixels the executable read back from the renderer and
+    /// uploaded once, kept in memory so a tile redraws without another
+    /// request.
+    pub previews: BTreeMap<String, TextureHandle>,
+    /// The paths of the tiles the Assets grid drew this frame, so the
+    /// executable asks only for previews on screen.
+    pub preview_visible: Vec<String>,
     /// The menu bar's already-logged geometry and the requests its items
     /// raised.
     pub menubar: MenubarSession,
@@ -555,6 +563,9 @@ pub struct InspectorSession {
     /// The row signatures already logged, so a panel that redraws every frame
     /// does not flood the log with the same row.
     pub rows_logged: Vec<String>,
+    /// The entity whose rows were last reported. A different subject clears
+    /// the row memories below, because the rows on screen are that entity's.
+    pub subject: Option<pill_engine::Entity>,
     /// Each asset reference row's last logged rectangle, keyed by
     /// `entity.component.field` (W-0048): what a suite drops an asset onto.
     /// Only a row on screen keeps an entry; see the shell's
@@ -578,11 +589,19 @@ pub struct InspectorSession {
     pub entity_picker: Option<String>,
     /// The open entity picker's search text.
     pub entity_search: String,
+    /// The settings-document key (`textures.albedo`) whose picker is open, if
+    /// one is (W-0049 Stage 8).
+    pub settings_picker: Option<String>,
+    /// The open settings picker's search text.
+    pub settings_search: String,
     /// Each Hierarchy row's last logged rectangle, keyed by the entity's
     /// display (W-0048 Stage 6): what a suite drags onto an entity reference
     /// row. The Entities tab shares this session, since the cache is the same
     /// "geometry the log already reported" concern.
     pub hierarchy_row_rects: Vec<(String, Rect)>,
+    /// Each scene badge's last logged rectangle, keyed by `view:entity`
+    /// (W-0049 Stage 12): what a suite clicks to select through a badge.
+    pub badge_rects: Vec<(String, Rect)>,
 }
 
 impl Resource for EguiShellState {}
@@ -604,6 +623,8 @@ impl EguiShellState {
             toolbox: ToolboxSession::default(),
             browser: ProjectBrowser::default(),
             mark: None,
+            previews: BTreeMap::new(),
+            preview_visible: Vec::new(),
             menubar: MenubarSession::default(),
             inspector: InspectorSession::default(),
             toasts: ToastSession::default(),

@@ -52,6 +52,9 @@ pub mod instance;
 /// The frame's chain as GPU objects: a pass pipeline each, and the plan a frame is recorded from.
 mod pipeline;
 
+/// The asset preview path: one small off-screen render, read back as pixels.
+mod preview;
+
 /// Debug drawing, selection outlines and picking, drawn over each surface.
 mod overlay;
 

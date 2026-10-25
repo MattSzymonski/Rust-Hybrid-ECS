@@ -23,6 +23,10 @@
 *.wgsl
 !examples/italian_brainrot/res/shaders/*.wgsl
 !examples/italian_brainrot_cs/res/shaders/*.wgsl
+# Hand-written WGSL in the renderer crate itself, with no `.hlsl` beside it to
+# cook: the overlay's three and the preview's one are embedded through
+# `include_str!` and nothing regenerates them.
+!modules/extensions/pill_master_renderer/pill_master_renderer/src/**/*.wgsl
 
 # Hand-written WGSL, with no `.hlsl` beside it to cook. `master_renderer_test`
 # carries its own rule for its cooked output, and the matching exception for

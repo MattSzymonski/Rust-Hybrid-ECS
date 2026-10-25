@@ -246,6 +246,10 @@ pub struct AssetListing {
     /// Whether a `.meta` sidecar - or a standalone header - carries a guid;
     /// a sourced file without one can get a written sidecar (Stage 25).
     pub has_meta: bool,
+    /// The asset's guid when the file names one, in its sidecar or its own
+    /// header (W-0049): what a settings document's reference writes, and the
+    /// key that names the asset behind such a reference.
+    pub guid: Option<String>,
 }
 
 /// One standalone asset type a new file can be created for (Stage 25): a
@@ -3579,7 +3583,7 @@ mod tests {
 
         // The target dies: the row shows the reference as missing, because the
         // field still holds the handle it was given.
-        engine.world_mut().destroy_entity(second);
+        let _ = engine.world_mut().destroy_entity(second);
         let pointed_at_dead =
             EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, Some(second))]);
         assert_eq!(
@@ -3588,7 +3592,7 @@ mod tests {
             "a dead handle is refused"
         );
 
-        engine.world_mut().destroy_entity(first);
+        let _ = engine.world_mut().destroy_entity(first);
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Missing);
 
         let cleared = EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, None)]);

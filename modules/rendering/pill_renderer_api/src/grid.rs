@@ -96,6 +96,16 @@ fn view_bound_surfaces(bindings: &BTreeMap<u32, CameraBinding>) -> Vec<u32> {
         .collect()
 }
 
+/// The surfaces an editor's own viewports draw through: every surface bound
+/// to a view camera, whether or not the grid is on (W-0049).
+///
+/// This is the same set [`frame_grid`] draws the grid on, named separately
+/// because the gizmo handles and the selection outlines need the answer even
+/// when the person turned the grid off.
+pub fn editor_view_surfaces(cameras: &SurfaceCameras) -> Vec<u32> {
+    view_bound_surfaces(&cameras.bindings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

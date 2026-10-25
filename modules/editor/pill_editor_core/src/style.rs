@@ -165,9 +165,11 @@ pub fn dock_style(egui_style: &egui::Style) -> egui_dock::Style {
     style.tab.tab_body.inner_margin = egui::Margin::same(6);
     style.tab.tab_body.corner_radius = CornerRadius::ZERO;
     style.tab.tab_body.stroke = Stroke::NONE;
-    // Panel boundaries: one thin line, brightened while interacted with.
+    // Panel boundaries: one thin line, with a grab band several times its
+    // width so the splitter is easy to catch (W-0049), brightened while
+    // interacted with.
     style.separator.width = 1.0;
-    style.separator.extra_interact_width = 4.0;
+    style.separator.extra_interact_width = 8.0;
     style.separator.color_idle = BORDER;
     style.separator.color_hovered = Color32::from_rgb(96, 99, 104);
     style.separator.color_dragged = Color32::from_rgb(126, 130, 136);

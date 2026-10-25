@@ -89,6 +89,8 @@ fn the_tab_bodies_draw_without_panicking() {
     style::apply(&context);
     let mut regions = Vec::new();
     let mut inspector_session = InspectorSession::default();
+    let previews = std::collections::BTreeMap::new();
+    let mut preview_visible = Vec::new();
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
             entities_tab(
@@ -115,6 +117,8 @@ fn the_tab_bodies_draw_without_panicking() {
                     pending: &mut pending,
                     overlay_regions: &mut regions,
                     drag_out: &mut drag_out,
+                    previews: &previews,
+                    preview_visible: &mut preview_visible,
                 };
                 assets_tab(ui, &snapshot, &mut browser, &mut writes);
             }
@@ -123,6 +127,50 @@ fn the_tab_bodies_draw_without_panicking() {
         });
     });
     assert_eq!(regions.len(), 2, "the two chips are the UI's regions");
+}
+
+/// The Add list the popup and the component menu share omits every component
+/// the entity already carries, whether it is addable or not (W-0049 Stage 9).
+#[test]
+fn the_addable_list_omits_the_components_the_entity_carries() {
+    let mut engine = Engine::new();
+    engine
+        .world_mut()
+        .create_entity()
+        .build()
+        .expect("entity builds");
+    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    snapshot.components = vec![
+        pill_editor_core::editor_state::RegisteredComponent {
+            type_name: "demo::Carried".to_string(),
+            addable: true,
+        },
+        pill_editor_core::editor_state::RegisteredComponent {
+            type_name: "demo::Missing".to_string(),
+            addable: true,
+        },
+        pill_editor_core::editor_state::RegisteredComponent {
+            type_name: "demo::NotAddable".to_string(),
+            addable: false,
+        },
+    ];
+    let detail = EntityDetail {
+        entity: Entity::from_raw(1, 0),
+        components: vec![ComponentView {
+            type_name: "demo::Carried".to_string(),
+            persistable: false,
+            editable: true,
+            fields: Vec::new(),
+            values: Vec::new(),
+            asset_labels: Vec::new(),
+            entity_labels: Vec::new(),
+        }],
+    };
+    assert_eq!(
+        addable_components(&snapshot, &detail),
+        vec!["demo::Missing"],
+        "a carried component is not offered again, and neither is a non-addable one"
+    );
 }
 
 #[test]
@@ -135,24 +183,28 @@ fn the_browser_draws_its_tree_path_and_tiles() {
             kind: "folder".to_string(),
             standalone: false,
             has_meta: false,
+            guid: None,
         },
         AssetListing {
             path: "models/nested".to_string(),
             kind: "folder".to_string(),
             standalone: false,
             has_meta: false,
+            guid: None,
         },
         AssetListing {
             path: "models/cube.obj".to_string(),
             kind: "pill_master_renderer::assets::Mesh".to_string(),
             standalone: false,
             has_meta: true,
+            guid: None,
         },
         AssetListing {
             path: "shaders/code.wgsl".to_string(),
             kind: "file".to_string(),
             standalone: false,
             has_meta: false,
+            guid: None,
         },
     ];
     let mut browser = ProjectBrowser::default();
@@ -173,12 +225,16 @@ fn the_browser_draws_its_tree_path_and_tiles() {
             assets_path_bar(ui, &mut browser);
             assets_zoom_bar(ui, &snapshot.assets, &mut browser);
             {
+                let previews = std::collections::BTreeMap::new();
+                let mut preview_visible = Vec::new();
                 let mut writes = AssetTileWrites {
                     selection: &mut selection,
                     dialog: &mut dialog,
                     pending: &mut pending,
                     overlay_regions: &mut regions,
                     drag_out: &mut drag_out,
+                    previews: &previews,
+                    preview_visible: &mut preview_visible,
                 };
                 assets_grid(ui, &snapshot, &mut browser, &mut writes);
             }
@@ -218,6 +274,7 @@ fn tiles_pick_an_icon_from_the_kind_and_the_extension() {
         kind: kind.to_string(),
         standalone: false,
         has_meta: false,
+        guid: None,
     };
     assert_eq!(asset_icon(&row("models", "folder")), icons::Icon::Folder);
     assert_eq!(
@@ -315,12 +372,16 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         run_pass_with(context, events, &mut |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.allocate_ui(egui::vec2(640.0, 300.0), |ui| {
+                    let previews = std::collections::BTreeMap::new();
+                    let mut preview_visible = Vec::new();
                     let mut writes = AssetTileWrites {
                         selection,
                         dialog,
                         pending,
                         overlay_regions: regions,
                         drag_out,
+                        previews: &previews,
+                        preview_visible: &mut preview_visible,
                     };
                     assets_grid(ui, snapshot, browser, &mut writes);
                 });
@@ -339,6 +400,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
                     },
                     pending,
                     session,
+                    regions,
                 );
             });
         });
@@ -351,6 +413,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         kind: MESH_TYPE.to_string(),
         standalone: false,
         has_meta: true,
+        guid: None,
     }];
     let entity = Entity::from_raw(1, 0);
     let view = ComponentView {

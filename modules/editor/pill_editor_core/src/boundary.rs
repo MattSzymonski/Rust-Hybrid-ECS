@@ -60,7 +60,32 @@ pub struct EguiShellInput {
     /// and the bridge appends the event: without this a focused text field
     /// would ignore Ctrl+V.
     pub paste_text: Option<String>,
+    /// The entities the executable projected into this frame's scene views
+    /// (W-0049 Stage 12), one entry per entity and view.
+    ///
+    /// The executable owns the views' cameras and the renderer's projection,
+    /// so it is the side that can say where an entity lands on screen; the
+    /// shell owns the icon atlas, so it is the side that draws the badge.
+    pub badges: Vec<ShellBadge>,
 }
+
+/// One entity's badge in one scene view (W-0049 Stage 12).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShellBadge {
+    /// Which scene view the badge belongs to.
+    pub view: usize,
+    /// Where the entity projects to, in the main window's logical points.
+    pub x: f32,
+    /// Where the entity projects to, in the main window's logical points.
+    pub y: f32,
+    /// The entity the badge names; a click selects it.
+    pub entity: pill_engine::Entity,
+}
+
+/// How many badges one scene view draws: enough for a scene's population to
+/// read at a glance, few enough that the overlay never turns into a wall of
+/// chips (W-0049 Stage 12).
+pub const BADGES_PER_VIEW_MAX: usize = 48;
 
 impl Resource for EguiShellInput {}
 
@@ -75,6 +100,7 @@ impl Default for EguiShellInput {
             events: Vec::new(),
             cursor: None,
             paste_text: None,
+            badges: Vec::new(),
         }
     }
 }

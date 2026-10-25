@@ -128,28 +128,26 @@ pub fn entities_tab(
         for (entity, label) in entity_rows(snapshot) {
             let selected = selection.contains(entity);
             let response = ui.selectable_label(selected, label);
-            // Dragging a row over an entity reference field points it at that
-            // entity (W-0048 Stage 6). The label senses clicks only, so the
-            // drag lives on a layer of its own over the same rectangle: a
-            // press that moves starts the drag, and a press that does not is
-            // still the label's click.
-            let drag = ui.interact(
+            // One layer senses the row's press both ways (W-0049): a press
+            // that moves carries the entity for a drop on a reference field
+            // (W-0048 Stage 6), and a press that does not is the row's click.
+            let row = ui.interact(
                 response.rect,
                 response.id.with("dragged-entity"),
-                egui::Sense::drag(),
+                egui::Sense::click_and_drag(),
             );
-            drag.dnd_set_drag_payload(DraggedEntity(entity));
-            remember_hierarchy_row_rect(session, entity, response.rect);
-            if response.clicked() {
+            row.dnd_set_drag_payload(DraggedEntity(entity));
+            remember_hierarchy_row_rect(session, entity, row.rect);
+            if row.clicked() {
                 let click = ui.input(|input| click_from_modifiers(&input.modifiers));
                 select_entity_click(selection, entity, click, &rows);
             }
             // A right click picks the row it opens the menu for, without
             // disturbing a set the person is about to edit.
-            if response.secondary_clicked() {
+            if row.secondary_clicked() {
                 select_entity(selection, entity);
             }
-            context_menu("entities", &response, overlay_regions, &mut |ui| {
+            context_menu("entities", &row, overlay_regions, &mut |ui| {
                 entity_menu_items(ui, Some(entity), selection, pending)
             });
         }

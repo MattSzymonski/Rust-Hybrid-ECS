@@ -11,6 +11,9 @@
 //! - The immediate toolbar actions: [`queue_delete`],
 //!   [`queue_write_meta`] and [`queue_move`], each a recorded
 //!   [`EditorCommand`] batch.
+//! - [`reveal_target`]: the absolute path a "show in the file manager"
+//!   request opens, refused when it would leave the asset directory
+//!   (W-0049 Stage 10).
 //!
 //! # Design
 //!
@@ -19,7 +22,12 @@
 //! executable at the frame boundary and recorded in the history - the exact
 //! contract the Assets tab follows. Nothing here touches the engine:
 //! the batches land in [`PendingEditorCommands`] and the executable's drain
-//! does the rest.
+//! does the rest. A reveal is the one exception: nothing in the world changes,
+//! so the shell queues it beside the batches and the executable opens the
+//! folder.
+
+// Standard library
+use std::path::{Path, PathBuf};
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -373,6 +381,38 @@ pub fn drop_destination(from: &str, folder: &str) -> Option<String> {
     (to != from).then_some(to)
 }
 
+/// The absolute path a reveal opens, for a project-relative asset path
+/// (W-0049 Stage 10).
+///
+/// The empty path is the asset root itself - the Assets panel's open folder at
+/// the top - and a nested path is joined below it. A path that climbs out of
+/// the root, or one that names nothing on disk, is refused with a message
+/// rather than opened: the panel's rows are the only callers, and a stale row
+/// must not make the OS open something else.
+///
+/// # Errors
+///
+/// A message naming the refusal, which the executable logs instead of opening
+/// anything.
+pub fn reveal_target(asset_root: &Path, path: &str) -> Result<PathBuf, String> {
+    let relative = path.trim().replace('\\', "/");
+    if relative.starts_with('/') || Path::new(&relative).is_absolute() {
+        return Err(format!("`{path}` is not a path below the asset directory"));
+    }
+    if relative.split('/').any(|segment| segment == "..") {
+        return Err(format!("`{path}` climbs out of the asset directory"));
+    }
+    let target = if relative.is_empty() {
+        asset_root.to_path_buf()
+    } else {
+        asset_root.join(&relative)
+    };
+    if !target.exists() {
+        return Err(format!("`{path}` is not on disk"));
+    }
+    Ok(target)
+}
+
 /// Close the dialog, logging it under the given kind.
 fn close(dialog: &mut Option<AssetDialog>, kind: &str) {
     *dialog = None;
@@ -388,12 +428,54 @@ mod tests {
     use super::*;
     use crate::editor_state::EditorSelection;
 
+    /// A scratch folder of this test's own, with one file in it.
+    fn scratch_folder(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "pill-reveal-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(directory.join("models")).unwrap();
+        std::fs::write(directory.join("models/cube.obj"), b"o cube").unwrap();
+        directory
+    }
+
+    /// A reveal resolves below the asset root, refuses leaving it, and
+    /// reports a path that is not on disk instead of opening its parent.
+    #[test]
+    fn a_reveal_resolves_below_the_asset_root_and_refuses_escapes() {
+        let root = scratch_folder("targets");
+        // The empty path is the root itself: the panel's open folder at the top.
+        assert_eq!(reveal_target(&root, "").unwrap(), root);
+        // A nested file and folder both resolve.
+        assert_eq!(
+            reveal_target(&root, "models/cube.obj").unwrap(),
+            root.join("models/cube.obj")
+        );
+        assert_eq!(reveal_target(&root, "models").unwrap(), root.join("models"));
+        // Backslashes read as separators, the way the panels may hand them over.
+        assert_eq!(
+            reveal_target(&root, "models\\cube.obj").unwrap(),
+            root.join("models/cube.obj")
+        );
+        // Escapes, absolute paths and missing files are all refusals.
+        assert!(reveal_target(&root, "../outside").is_err());
+        assert!(reveal_target(&root, "models/../../outside").is_err());
+        assert!(reveal_target(&root, "/etc").is_err());
+        assert!(reveal_target(&root, "models/missing.obj").is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn listing(path: &str, kind: &str, standalone: bool, has_meta: bool) -> AssetListing {
         AssetListing {
             path: path.to_string(),
             kind: kind.to_string(),
             standalone,
             has_meta,
+            guid: None,
         }
     }
 

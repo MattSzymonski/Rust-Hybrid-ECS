@@ -240,9 +240,23 @@ pub struct RenderFrame {
     /// The scene grid this frame draws: its spacing and the surfaces that
     /// draw it, or nothing when no frontend asked for one.
     pub grid: Option<crate::FrameGrid>,
+    /// The surfaces this frame marks as editor views, ascending.
+    ///
+    /// A surface bound to a view camera is an editor's own viewport: it draws
+    /// the grid, and the editor's chrome - the transform gizmo and the
+    /// selection outlines - belongs on it. A surface drawn through a world
+    /// camera is a game's window and never carries that chrome, so a project
+    /// that binds its viewport as a view also keeps its own pixels free of the
+    /// editor's furniture (W-0049). Empty means no editor is looking at this
+    /// frame.
+    pub editor_views: Vec<u32>,
     /// The picks asked for since the last frame; the renderer answers them
     /// through [`crate::PillRenderer::take_pick_results`].
     pub pick_requests: Vec<crate::PickRequest>,
+    /// The previews asked for since the last frame (W-0049 Stage 11); the
+    /// renderer draws at most one per frame and answers them through
+    /// [`crate::PillRenderer::take_preview_results`].
+    pub preview_requests: Vec<crate::PreviewRequest>,
     /// Number of this frame, counting from one; packed into the engine
     /// parameters beside the clocks.
     pub sequence: u64,
@@ -269,7 +283,9 @@ impl Default for RenderFrame {
             outlined: Vec::new(),
             outline_color: [1.0, 0.55, 0.1, 1.0],
             grid: None,
+            editor_views: Vec::new(),
             pick_requests: Vec::new(),
+            preview_requests: Vec::new(),
             sequence: 0,
             ui: pill_ui_frame::UiFrame::default(),
         }

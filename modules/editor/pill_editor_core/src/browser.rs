@@ -235,6 +235,7 @@ mod tests {
             kind: kind.to_string(),
             standalone: kind == "Material",
             has_meta: false,
+            guid: None,
         }
     }
 

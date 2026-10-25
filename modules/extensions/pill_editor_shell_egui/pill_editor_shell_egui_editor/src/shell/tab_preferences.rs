@@ -36,6 +36,16 @@ pub fn preferences_tab(
         );
         for field in preferences::PREFERENCE_FIELDS {
             let buffer = buffers.entry(field.key.to_string()).or_default();
+            // The previews switch is a real checkbox (W-0049 Stage 11): a
+            // boolean row a person can see the state of, written back as the
+            // text the document's parser reads.
+            if field.key == pill_editor_core::previews::RENDER_PREVIEWS_KEY {
+                let mut enabled = buffer.trim().eq_ignore_ascii_case("true");
+                if ui.checkbox(&mut enabled, field.label).changed() {
+                    *buffer = if enabled { "true" } else { "false" }.to_string();
+                }
+                continue;
+            }
             ui.horizontal(|ui| {
                 ui.label(field.label);
                 ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
