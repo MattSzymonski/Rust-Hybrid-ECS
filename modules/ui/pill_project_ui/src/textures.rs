@@ -154,6 +154,15 @@ impl TextureMirror {
         }
     }
 
+    /// Mark every held image for carrying again.
+    ///
+    /// A painter that was rebuilt holds no textures, and the dirty set is empty
+    /// by then, so the next [`carry`](Self::carry) re-sends the lot instead.
+    pub fn resend_all(&mut self) {
+        self.dirty.clear();
+        self.dirty.extend(self.textures.keys().copied());
+    }
+
     /// Append what changed to `set` as whole-image uploads, and what egui
     /// freed as frees; then forget both lists.
     pub fn carry(&mut self, set: &mut UiTextureSet) {
@@ -326,5 +335,39 @@ mod tests {
         let mut set = UiTextureSet::new();
         mirror.carry(&mut set);
         assert!(set.is_empty());
+    }
+
+    /// A rebuilt painter holds no textures, and only a full re-carry reaches it.
+    #[test]
+    fn resend_all_carries_every_held_image_again() {
+        let mut mirror = TextureMirror::new();
+        for id in [EguiTextureId::Managed(0), EguiTextureId::User(7)] {
+            let mut delta = whole_image(id, 2, Color32::WHITE);
+            mirror.apply(&delta);
+            delta.clear();
+        }
+
+        // The first carry delivers both and empties the dirty set, so a second
+        // one delivers nothing - which is what loses the painter's images.
+        let mut first = UiTextureSet::new();
+        mirror.carry(&mut first);
+        assert_eq!(first.textures.len(), 2);
+        let mut quiet = UiTextureSet::new();
+        mirror.carry(&mut quiet);
+        assert!(quiet.is_empty(), "nothing changed, so nothing carries");
+
+        mirror.resend_all();
+        let mut resent = UiTextureSet::new();
+        mirror.carry(&mut resent);
+        assert_eq!(
+            resent.textures.len(),
+            2,
+            "a painter that starts empty gets every image back"
+        );
+        assert_eq!(
+            resent.textures[0].pixels.len(),
+            2 * 2 * 4,
+            "and each one is the whole image, not a patch"
+        );
     }
 }

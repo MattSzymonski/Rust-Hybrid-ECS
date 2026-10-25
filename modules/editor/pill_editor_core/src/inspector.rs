@@ -166,12 +166,15 @@ pub fn widget_for(value: &FieldValue) -> FieldWidget {
         | FieldValue::U64(_)
         | FieldValue::Usize(_)
         | FieldValue::Isize(_) => FieldWidget::Integer,
-        FieldValue::Text(_) => FieldWidget::Text,
         FieldValue::Array(_)
         | FieldValue::List { .. }
         | FieldValue::Asset { .. }
         | FieldValue::Entity { .. }
         | FieldValue::Opaque { .. } => FieldWidget::ReadOnly,
+        // A heap-backed string is read-only through the field layer: its buffer
+        // is reached through the type's own accessors, so a text box here would
+        // queue an edit the writer refuses on every keystroke.
+        FieldValue::Text(_) => FieldWidget::ReadOnly,
     }
 }
 
@@ -1401,9 +1404,11 @@ mod tests {
         ] {
             assert_eq!(widget_for(&value), FieldWidget::Integer);
         }
+        // A heap-backed string is read-only through the field layer, so the
+        // inspector offers no box that could only refuse its keystrokes.
         assert_eq!(
             widget_for(&FieldValue::Text("x".to_string())),
-            FieldWidget::Text
+            FieldWidget::ReadOnly
         );
         assert_eq!(
             widget_for(&FieldValue::Opaque {
@@ -1672,8 +1677,12 @@ mod tests {
         );
     }
 
+    /// `[TextArea]` and `[Multiline]` shape a text box, and a text row has no
+    /// box to shape until heap-backed fields are writable: the row stays
+    /// read-only and the decorators are ignored rather than promising an edit
+    /// the field writer refuses.
     #[test]
-    fn text_decorators_make_a_multiline_box() {
+    fn text_decorators_wait_for_a_writable_text_row() {
         let view = decorated(
             vec![FieldValue::Text("a".into()), FieldValue::Text("b".into())],
             vec![
@@ -1690,13 +1699,13 @@ mod tests {
                 FieldRow::Single {
                     index: 0,
                     field: "a".to_string(),
-                    widget: FieldWidget::MultilineText { lines: 3 },
+                    widget: FieldWidget::ReadOnly,
                     tooltip: None,
                 },
                 FieldRow::Single {
                     index: 1,
                     field: "b".to_string(),
-                    widget: FieldWidget::MultilineText { lines: 5 },
+                    widget: FieldWidget::ReadOnly,
                     tooltip: None,
                 },
             ]
@@ -1727,7 +1736,7 @@ mod tests {
                 FieldRow::Single {
                     index: 1,
                     field: "b".to_string(),
-                    widget: FieldWidget::Text,
+                    widget: FieldWidget::ReadOnly,
                     tooltip: None,
                 },
             ]

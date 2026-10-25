@@ -196,12 +196,16 @@ mod slot {
                 &library,
                 first_load_failure,
             );
-            // Under `ClearSystemsOnly` a refused image stays mapped for good:
-            // that is half of what makes keeping the world sound (see
-            // `FirstLoadFailure`). It leaks one image and its staged copy,
-            // which the next host startup cleans up.
+            // Under the two keep-the-world policies a refused image stays
+            // mapped for good: that is half of what makes keeping the world
+            // sound (see `FirstLoadFailure`). It leaks one image and its
+            // staged copy, which the next host startup cleans up.
             let refuse = |library: NativeLibrary, error: HostError| {
-                if first_load_failure == crate::reload::FirstLoadFailure::ClearSystemsOnly {
+                if matches!(
+                    first_load_failure,
+                    crate::reload::FirstLoadFailure::ClearSystemsOnly
+                        | crate::reload::FirstLoadFailure::ClearGenerationData
+                ) {
                     std::mem::forget(library);
                 }
                 Err(error)
@@ -216,9 +220,13 @@ mod slot {
                     .into(),
                 );
             }
-            // The other half: a module that may keep the world on failure
-            // must own no data, so one that registered data nobody had
-            // registered before it is refused.
+            // The other half, for the policy that keeps the world without
+            // touching what the artifact registered: a module that may keep the
+            // world on failure must own no data, so one that registered data
+            // nobody had registered before it is refused. `ClearGenerationData`
+            // is exempt because it drops exactly that data on the failing path
+            // - which is what lets the editor retry a shell module that
+            // registers components.
             if let Some((components_before, resources_before)) = &registered_before {
                 let new_components = init
                     .component_names

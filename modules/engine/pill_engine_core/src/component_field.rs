@@ -36,6 +36,7 @@
 
 // Standard library
 use std::mem::size_of;
+use std::sync::OnceLock;
 
 // Current crate
 use crate::archetype::ArchetypeId;
@@ -429,23 +430,80 @@ fn array_element_size(descriptor: &ComponentFieldDescriptor) -> Option<usize> {
     Some(descriptor.size / descriptor.element_count)
 }
 
-/// Read the `(pointer, length)` header of a heap container field.
+/// Read one machine word out of a row image.
+fn header_word(bytes: &[u8], at: usize) -> Option<usize> {
+    Some(usize::from_ne_bytes(
+        bytes.get(at..at + size_of::<usize>())?.try_into().ok()?,
+    ))
+}
+
+/// Byte offsets of the pointer and the length inside a `Vec`/`String` header.
 ///
-/// `std::vec::Vec` stores its three words in `(pointer, length, capacity)`
-/// order, and `String` — a `Vec<u8>` newtype — inherits that layout. The
-/// generic path has no concrete type to call `as_ptr()` on, so it reads the
-/// two words it needs directly: the length the inspector reports, and the
-/// pointer it dereferences only to decode a `String`. Fixed-array fields keep
-/// going through `element_count`/`element_size`; only `vec:` and `string` tags
-/// reach here, and only from a row copied out of a live column.
+/// The standard library gives `Vec` - and `String`, a `Vec<u8>` newtype - no
+/// `repr(C)`, so their field order is the compiler's to choose and it is not
+/// pointer-first on this build. The offsets are measured once from a live value
+/// rather than assumed: an assumed word is either the length, dereferenced as
+/// an address, or the capacity, read as a count.
+fn std_container_offsets() -> (usize, usize) {
+    static OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
+    *OFFSETS.get_or_init(|| {
+        // Pointer, capacity and length all differ, so each word is
+        // recognisable: 12 bytes held in a 64-byte allocation.
+        let mut text = String::with_capacity(64);
+        text.push_str("header probe");
+        let words = header_words_of(&text);
+        let pointer_index = words
+            .iter()
+            .position(|&word| word == text.as_ptr() as usize)
+            .expect("the pointer is one of a string's three words");
+        let length_index = words
+            .iter()
+            .position(|&word| word == text.len())
+            .expect("the length is one of a string's three words");
+        assert_ne!(
+            pointer_index, length_index,
+            "a string's pointer and length must occupy different words"
+        );
+        (
+            pointer_index * size_of::<usize>(),
+            length_index * size_of::<usize>(),
+        )
+    })
+}
+
+/// The three header words of a `String`, in the order the compiler laid them
+/// out.
+fn header_words_of(text: &String) -> [usize; 3] {
+    assert_eq!(
+        size_of::<String>(),
+        3 * size_of::<usize>(),
+        "a string header is three words; the field layer reads it as one"
+    );
+    // SAFETY: the size was just checked, so three words cover the value
+    // exactly, and `transmute_copy` reads it without moving it.
+    unsafe { std::mem::transmute_copy(text) }
+}
+
+/// Read the `(pointer, length)` header of a std heap container field.
+///
+/// `vec:` and `string` tags reach here, and only from a row copied out of a
+/// live column. Fixed-array fields keep going through
+/// `element_count`/`element_size` instead.
 fn container_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize)> {
-    let read_word = |at: usize| -> Option<usize> {
-        Some(usize::from_ne_bytes(
-            bytes.get(at..at + size_of::<usize>())?.try_into().ok()?,
-        ))
-    };
-    let pointer = read_word(offset)? as *const u8;
-    let length = read_word(offset + size_of::<usize>())?;
+    let (pointer_at, length_at) = std_container_offsets();
+    let pointer = header_word(bytes, offset + pointer_at)? as *const u8;
+    let length = header_word(bytes, offset + length_at)?;
+    Some((pointer, length))
+}
+
+/// Read the `(pointer, length)` header of an engine-owned native buffer field.
+///
+/// `DynamicBuffer` pins that order with `repr(C)` - the C# mirror reads the same
+/// three words straight out of the row - so unlike [`container_header`] this one
+/// can name the offsets.
+fn native_buffer_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize)> {
+    let pointer = header_word(bytes, offset)? as *const u8;
+    let length = header_word(bytes, offset + size_of::<usize>())?;
     Some((pointer, length))
 }
 
@@ -455,15 +513,22 @@ fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) -> FieldVal
     // Heap-owning containers are summarized rather than materialized. Both are
     // read-only through this path; writes go through the field's generated
     // accessors, which reach the live buffer in place.
-    if let Some(element_tag) = descriptor
-        .type_tag
-        .strip_prefix("vec:")
-        .or_else(|| descriptor.type_tag.strip_prefix("dynbuf:"))
-    {
-        // Both containers lead with their element pointer and follow it with
-        // the count: `DynamicBuffer` pins that order with `repr(C)`, and `Vec`
-        // has kept it across every released toolchain.
+    //
+    // The two kinds read their count from different headers: a `vec:` field is
+    // a std `Vec`, whose word order the compiler chooses (see
+    // [`std_container_offsets`]), and a `dynbuf:` field is a `DynamicBuffer`,
+    // whose `repr(C)` order the engine owns.
+    if let Some(element_tag) = descriptor.type_tag.strip_prefix("vec:") {
         let element_count = container_header(bytes, descriptor.offset)
+            .map(|(_, length)| length)
+            .unwrap_or(0);
+        return FieldValue::List {
+            element_tag,
+            element_count,
+        };
+    }
+    if let Some(element_tag) = descriptor.type_tag.strip_prefix("dynbuf:") {
+        let element_count = native_buffer_header(bytes, descriptor.offset)
             .map(|(_, length)| length)
             .unwrap_or(0);
         return FieldValue::List {
@@ -1089,8 +1154,10 @@ fn encode_field_write(
     // A heap-backed container is never writable through the generic path: its
     // buffer is reached through the field's accessors, which edit the live
     // container in place rather than replacing it, so an editor that showed a
-    // stale image cannot overwrite the real one here.
-    if tag.starts_with("vec:") || tag == "string" {
+    // stale image cannot overwrite the real one here. The predicate is the
+    // crate's one spelling of "heap-backed", so a container tag added there
+    // cannot leave a writable raw handle behind in a document.
+    if is_container_tag(tag) {
         return Err(ComponentFieldError::UnsupportedField {
             field: field.to_string(),
             reason: "heap-backed fields are read-only here; edit them through the field accessors",
@@ -2057,6 +2124,132 @@ mod tests {
                 field: "mystery".to_string(),
                 expected: "struct:NoSuchTypeExists",
                 found: "opaque",
+            })
+        );
+    }
+
+    /// An opaque payload cannot be written over a heap container's header.
+    ///
+    /// `dynbuf:` names a `DynamicBuffer` header, and an opaque payload whose
+    /// tag and size pin to the field would copy its bytes straight over the
+    /// live pointer. Every container tag takes the accessor-only path instead.
+    #[test]
+    fn an_opaque_payload_cannot_overwrite_a_container_handle() {
+        static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+            name: "samples",
+            type_tag: "dynbuf:f32",
+            offset: 0,
+            size: 3 * std::mem::size_of::<usize>(),
+            align: std::mem::align_of::<usize>(),
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        }];
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        struct DynHolder {
+            /// A `DynamicBuffer` header: pointer, length, capacity.
+            samples: [usize; 3],
+        }
+        impl Component for DynHolder {}
+
+        let mut world = World::new();
+        world.register_component_with_layout::<DynHolder>(FIELDS);
+        let name = crate::component::ComponentRegistry::registered_name::<DynHolder>();
+        let entity = world
+            .create_entity()
+            .with(DynHolder {
+                samples: [0x1000, 4, 8],
+            })
+            .build()
+            .expect("entity builds");
+
+        // A payload a hand-written document could carry: tagged and sized to
+        // pin exactly to this field, filled with bytes of its choosing.
+        let forged = FieldValue::Opaque {
+            type_tag: "dynbuf:f32",
+            bytes: 0xDEAD_BEEF_u64.to_ne_bytes().repeat(3),
+        };
+        assert!(
+            matches!(
+                world.write_component_field(entity, &name, "samples", forged),
+                Err(ComponentFieldError::UnsupportedField { .. })
+            ),
+            "a container field must refuse the generic write path"
+        );
+
+        // The live header is untouched.
+        assert_eq!(
+            world.read_component_field(entity, &name, "samples"),
+            Ok(FieldValue::List {
+                element_tag: "f32",
+                element_count: 4,
+            })
+        );
+    }
+
+    /// A heap container field is read by following its real header.
+    ///
+    /// Neither a `String` nor a `Vec` puts its pointer in the first word of its
+    /// header, so a decoder that assumes one either reports the length as a
+    /// pointer - and dereferences it - or the capacity as an element count.
+    #[test]
+    fn heap_container_fields_read_through_their_real_header() {
+        static FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor {
+                name: "label",
+                type_tag: "string",
+                offset: 0,
+                size: std::mem::size_of::<String>(),
+                align: std::mem::align_of::<String>(),
+                element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
+            },
+            ComponentFieldDescriptor {
+                name: "points",
+                type_tag: "vec:u32",
+                offset: std::mem::size_of::<String>(),
+                size: std::mem::size_of::<Vec<u32>>(),
+                align: std::mem::align_of::<Vec<u32>>(),
+                element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
+            },
+        ];
+
+        #[repr(C)]
+        #[derive(Debug)]
+        struct Holder {
+            label: String,
+            points: Vec<u32>,
+        }
+        impl Component for Holder {}
+
+        // Three live elements in a sixteen-element allocation, so the count and
+        // the capacity cannot be confused for one another.
+        let mut points = Vec::with_capacity(16);
+        points.extend([10_u32, 20, 30]);
+
+        let mut world = World::new();
+        world.register_component_with_layout::<Holder>(FIELDS);
+        let name = crate::component::ComponentRegistry::registered_name::<Holder>();
+        let entity = world
+            .create_entity()
+            .with(Holder {
+                label: "hello".to_string(),
+                points,
+            })
+            .build()
+            .expect("entity builds");
+
+        assert_eq!(
+            world.read_component_field(entity, &name, "label"),
+            Ok(FieldValue::Text("hello".to_string()))
+        );
+        assert_eq!(
+            world.read_component_field(entity, &name, "points"),
+            Ok(FieldValue::List {
+                element_tag: "u32",
+                element_count: 3,
             })
         );
     }

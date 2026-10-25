@@ -212,34 +212,33 @@ struct JournalEntry<Binding, Undo> {
 // The pipeline
 // =============================================================================
 
-/// Apply one kind's declarations to the live world and its binding table.
+/// The half of the pipeline that resolves a manifest: everything the pipeline
+/// can refuse about the manifest's own shape.
 ///
-/// Returns the outcome and the table to publish. The table comes back on the
-/// failing path too, because a refusal still has a correct table to publish -
-/// everything the rollback put back, plus the entries whose engine effect could
-/// not be reversed and must therefore keep describing what the engine holds.
+/// Split from [`execute_manifest`] so one caller can resolve two kinds before
+/// executing either: a resource declaration and a component declaration arrive
+/// in one manifest, and a shape refusal in one kind must not leave the other
+/// kind's relayout already applied. Nothing here mutates the engine or the
+/// table.
 ///
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when an alias claims more than one predecessor,
-/// when a declaration cannot be registered as it stands, or when the engine
-/// refuses a registration, a migration or a rename.
-pub(super) fn apply_manifest<Declaration, Binding, Undo>(
+/// when a declaration cannot be registered as it stands, or when an entry the
+/// table already holds declares an alias of its own.
+pub(super) fn prepare_manifest<'declaration, Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
-    engine: &mut Engine,
+    engine: &Engine,
     previous: BindingTable<Binding>,
-    declarations: &[Declaration],
-) -> (Result<ManifestOutcome, CSharpError>, BindingTable<Binding>)
+    declarations: &'declaration [Declaration],
+) -> Result<PreparedManifest<'declaration, Declaration, Binding>, CSharpError>
 where
     Binding: Clone,
 {
     // Step 1: Resolve aliases, before anything else looks at what vanished.
     // An entry whose alias reaches a live predecessor is a rename, and its
     // predecessor is not a disappearance.
-    let renames = match resolve_renames(subject, engine, &previous, declarations) {
-        Ok(renames) => renames,
-        Err(error) => return (Err(error), previous),
-    };
+    let renames = resolve_renames(subject, engine, &previous, declarations)?;
 
     // Step 2: Collect the entries the manifest stopped naming, to be retired
     // after everything else has applied. Collected here because an alias in the
@@ -264,10 +263,30 @@ where
 
     // Step 3: Resolve every entry before the first mutation. The reads below
     // are read-only, so a refusal here leaves the world and the table alone.
-    let resolutions = match resolve_entries(subject, engine, &previous, declarations, &renames) {
-        Ok(resolutions) => resolutions,
-        Err(error) => return (Err(error), previous),
-    };
+    let resolutions = resolve_entries(subject, engine, &previous, declarations, &renames)?;
+
+    Ok(PreparedManifest {
+        previous,
+        vanished,
+        resolutions,
+    })
+}
+
+/// The mutating half of [`apply_manifest`]: apply what [`prepare_manifest`]
+/// resolved, unwind on a refusal, and retire last.
+pub(super) fn execute_manifest<Declaration, Binding, Undo>(
+    subject: &ManifestSubject<Declaration, Binding, Undo>,
+    engine: &mut Engine,
+    prepared: PreparedManifest<'_, Declaration, Binding>,
+) -> (Result<ManifestOutcome, CSharpError>, BindingTable<Binding>)
+where
+    Binding: Clone,
+{
+    let PreparedManifest {
+        previous,
+        vanished,
+        resolutions,
+    } = prepared;
 
     // Step 4: Execute, journalling one entry per applied resolution.
     let mut table = previous;
@@ -321,6 +340,19 @@ where
     }
 
     (Ok(outcome), table)
+}
+
+/// One kind's declarations, resolved against the live table and ready to
+/// apply. [`prepare_manifest`] produces it; nothing in it has touched the
+/// engine yet.
+pub(super) struct PreparedManifest<'declaration, Declaration, Binding> {
+    /// The table the resolutions were made against, handed on so the execute
+    /// half writes into it rather than reading it again.
+    previous: BindingTable<Binding>,
+    /// The entries the manifest stopped naming, retired after everything else.
+    vanished: Vec<StableComponentId>,
+    /// Each arriving entry and what has to happen to it.
+    resolutions: Vec<(StableComponentId, Resolution<'declaration, Declaration>)>,
 }
 
 /// Resolve every declaration's aliases to the live entries they used to name.

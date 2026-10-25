@@ -994,10 +994,11 @@ impl Engine {
             // this frame sees the same values and none sees last frame's.
             //
             // Done here rather than in a registered system because
-            // `build_execution_graph` orders systems independently of
-            // registration order: a time system could be batched after its
-            // readers, which would hand them stale values with nothing in the
-            // API to reveal it. `get_resource_mut` rather than the tracked
+            // `build_execution_graph` batches in registration order: a time
+            // system would only be ordered ahead of its readers if every
+            // project registered it first, and a project that registers one
+            // late would hand its earlier systems stale values with nothing in
+            // the API to reveal it. `get_resource_mut` rather than the tracked
             // variant, since bumping a change tick for a resource that changes
             // every single frame tells a reader nothing.
             if let Some(time) = self.world.get_resource_mut::<crate::time::Time>() {

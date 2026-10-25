@@ -3642,3 +3642,50 @@ fn a_supplied_id_is_kept_and_a_duplicate_is_refused() {
         world.entity_count()
     );
 }
+
+/// A builder handed one component type twice is refused before the row exists.
+///
+/// The columns are keyed by component id, so the second inserter pushes into
+/// the column the first one already grew: one entity row, two component rows.
+/// Every later entity then reads the row before its own - which is what the
+/// assertion at the end measures. The archetype is built first, because on a
+/// fresh component set the duplicate panics inside it instead, so only the
+/// cached path shows the silent corruption.
+#[test]
+fn a_component_the_builder_is_given_twice_is_refused() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    world
+        .create_entity()
+        .with(Position { x: 0.0, y: 0.0 })
+        .build()
+        .unwrap();
+
+    let refused = world
+        .create_entity()
+        .with(Position { x: 1.0, y: 0.0 })
+        .with(Position { x: 2.0, y: 0.0 })
+        .build();
+    assert!(
+        matches!(refused, Err(BuildError::DuplicateComponent { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        world.entity_count() == 1,
+        "the refused build inserted nothing: {} entities",
+        world.entity_count()
+    );
+
+    // The damage the refusal prevents: with the duplicate accepted, the column
+    // ends one row ahead of the entity list, so this entity's component reads
+    // the duplicate's second value instead of its own.
+    let next = world
+        .create_entity()
+        .with(Position { x: 3.0, y: 0.0 })
+        .build()
+        .unwrap();
+    assert_eq!(
+        world.get_component::<Position>(next),
+        Some(&Position { x: 3.0, y: 0.0 })
+    );
+}

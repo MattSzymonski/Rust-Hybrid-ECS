@@ -976,6 +976,14 @@ impl World {
     /// Note: the archetype's columns are type-erased, so pushing a component
     /// still needs its concrete type. Components are added via EntityBuilder,
     /// which has access to those types.
+    ///
+    /// # Panics
+    ///
+    /// Panics in a debug build when `component_ids` repeats an id. Each caller
+    /// refuses that before it gets here - the builder and the deferred command
+    /// executor both return a duplicate-component error, and
+    /// `create_descriptor_entity` de-duplicates - so this only names the state
+    /// the archetype's one-column-per-id addressing cannot survive.
     pub(crate) fn insert_entity_with_components<F>(
         &mut self,
         entity: Entity,
@@ -988,6 +996,15 @@ impl World {
         let _zone = crate::profile_scope!(
             "insert entity",
             [("Target entity being inserted: {:?}", entity)]
+        );
+        // Step 0: the component set has to be a set. A repeat would push two
+        // rows into one column for the one entity row appended below.
+        debug_assert!(
+            component_ids
+                .iter()
+                .enumerate()
+                .all(|(index, id)| !component_ids[index + 1..].contains(id)),
+            "component set repeated an id while inserting entity {entity:?}: {component_ids:?}"
         );
         // Step 1: Get or create the archetype for this component set.
         let archetype_id = self.get_or_create_archetype(component_ids);
@@ -1612,16 +1629,34 @@ impl<'w> EntityBuilder<'w> {
     ///
     /// Returns [`BuildError::ComponentNotRegistered`] if any of the component
     /// types added via [`.with()`](Self::with) were not registered with the
-    /// world beforehand, and [`BuildError::DuplicateEntityId`] when the id
+    /// world beforehand, [`BuildError::DuplicateComponent`] when one type was
+    /// added more than once, and [`BuildError::DuplicateEntityId`] when the id
     /// given to [`with_id`](Self::with_id) belongs to a live entity.
     pub fn build(self) -> Result<Entity, BuildError> {
-        let component_ids: Vec<ComponentId> =
+        let mut component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
         let _zone = crate::profile_scope!(
             "entity build",
             [("Component types on entity: {}", component_ids.len())]
         );
         let entity = self.entity;
+
+        // Refuse a repeated id before the row exists. The set defines the
+        // archetype's columns, so a second value of one type would grow one
+        // column by two rows for one entity row: the archetype panics on the
+        // repeated column when it is being created, and when it is already
+        // cached it accepts both and leaves every later entity reading the row
+        // before its own. The deferred path refuses the same way in
+        // `commands::execute_create_entity`.
+        component_ids.sort_unstable();
+        if let Some(duplicate) = component_ids
+            .windows(2)
+            .find(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+        {
+            self.world.release_entity(entity);
+            return Err(BuildError::DuplicateComponent { id: duplicate });
+        }
 
         // Validate that every component type is registered before we try to
         // create the archetype (which would panic on an unregistered type).

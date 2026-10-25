@@ -13,12 +13,14 @@
 //! runs. Systems only ever read it through `Res<Time>`.
 //!
 //! It is advanced directly by `process_frame` rather than by a registered
-//! system, and that is deliberate. The scheduler builds its execution graph
-//! independently of registration order - see
+//! system, and that is deliberate. A registered "time system" would only be
+//! ordered ahead of its readers if every project registered it first: the
+//! scheduler batches in registration order - see
 //! [`build_execution_graph`](crate::scheduler::SystemScheduler::build_execution_graph) -
-//! so a "time system" could be batched after the systems that read it, handing
-//! them values a frame stale. Advancing the clock outside the system set is the
-//! only way to guarantee every system in a frame sees the same, current time.
+//! so a project that registers a time-updating system late would hand its
+//! earlier systems values a frame stale. Advancing the clock outside the system
+//! set is the only way to guarantee every system in a frame sees the same,
+//! current time.
 //!
 //! Durations are reported both as `f32` seconds, which is what gameplay
 //! integration wants, and as whole milliseconds, which is what a HUD or a log

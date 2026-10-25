@@ -349,7 +349,19 @@ impl DevHost {
             &pending.config,
             pending.owner,
             Arc::clone(&pending.source_edit_generation),
-            crate::reload::FirstLoadFailure::ClearWorld,
+            // A retry runs long after the project filled the world, so it must
+            // not take the world with it: `ClearWorld` replaces everything when
+            // the module fails to initialize, which is right for the first
+            // thing a host loads and catastrophic for a click on Retry.
+            //
+            // `ClearSystemsOnly` would keep the world but refuses a module that
+            // registers data, and this retry serves the editor's shell module,
+            // which registers components like any other - every retry would
+            // fail instead of loading. `ClearGenerationData` is the one that
+            // fits: it keeps the project's world, drops what the failed attempt
+            // registered, and parks the refused image so nothing it left points
+            // at unmapped code.
+            crate::reload::FirstLoadFailure::ClearGenerationData,
         ) {
             Ok(slot) => {
                 if let Err(error) = spawn_source_watcher(
@@ -1469,14 +1481,20 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // real registered layout. Nothing is hand-written in the project.
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
     let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
+    // Which module's file carries which component, decided once over the whole
+    // load order: a shared component appears in every linking module's log.
+    let mirror_ownership = module_mirror_ownership(runtime.engine(), &extensions);
     if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
-        for slot in &extensions {
+        for (index, slot) in extensions.iter().enumerate() {
             // Regenerate the module's C# mirror from its current generation.
             // The returned change flag is ignored at startup (the mirror is
             // always written before the project compiles); the reload path
             // uses it to decide whether to queue a C# project rebuild.
-            let (exposed, methods, accessors, _changed) =
-                regenerate_module_csharp_mirror(&workspace_root, runtime.engine_mut(), slot)?;
+            let (exposed, methods, accessors, _changed) = regenerate_module_csharp_mirror(
+                &workspace_root,
+                slot,
+                mirror_ownership[index].clone(),
+            )?;
             module_exposed_components.extend(exposed);
             all_mirror_methods.extend(methods);
             // Container accessors ride the mirror-method table, so the managed
@@ -2265,15 +2283,9 @@ type RegeneratedMirror = (
 /// only when the C# surface moved.
 fn regenerate_module_csharp_mirror(
     workspace_root: &Path,
-    engine: &mut Engine,
     slot: &ExtensionSlot,
+    exposed: Vec<ModuleExposedComponent>,
 ) -> Result<RegeneratedMirror, CSharpError> {
-    // Each registered type name resolves to its native component, under the
-    // C#-facing name a generated mirror struct is declared with.
-    let exposed = crate::csharp::exposed_components_from_names(
-        engine.world(),
-        slot.exposed_component_names(),
-    );
     let methods = slot.mirror_methods();
     let accessors = slot.field_accessors();
     let changed = crate::csharp::generate_module_components_csharp(
@@ -2286,6 +2298,34 @@ fn regenerate_module_csharp_mirror(
     )
     .map_err(|message| CSharpError::CodegenFailed { message })?;
     Ok((exposed, methods, accessors, changed))
+}
+
+/// The components each loaded module's mirror file carries, by first-claim
+/// order.
+///
+/// A component is mirrored once per process. A shared component is registered by
+/// every module that links it, so several modules' registration logs name it -
+/// and two generated files declaring the same C# `partial struct` collide on
+/// every member (`CS0102`, "already contains a definition for `Color0`"). The
+/// first module to expose a component in load order keeps it, which is stable
+/// because the module list is the project's own settings order.
+fn module_mirror_ownership(
+    engine: &Engine,
+    extensions: &[ExtensionSlot],
+) -> Vec<Vec<ModuleExposedComponent>> {
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    extensions
+        .iter()
+        .map(|slot| {
+            crate::csharp::exposed_components_from_names(
+                engine.world(),
+                slot.exposed_component_names(),
+            )
+            .into_iter()
+            .filter(|component| claimed.insert(component.csharp_name.clone()))
+            .collect()
+        })
+        .collect()
 }
 
 /// Run every reload step of one frame: module reloads, the per-function fast
@@ -2586,8 +2626,15 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // the rebuild entirely.
     if matches!(&module_config.backend, ProjectModuleBackend::CSharp(_)) && any_module_reloaded {
         let mut needs_csharp_reload = false;
+        // Recomputed over the whole list so a reloaded module keeps exactly the
+        // file it owned before the reload.
+        let mirror_ownership = module_mirror_ownership(engine, extensions);
         for index in &reloaded_modules {
-            match regenerate_module_csharp_mirror(workspace_root, engine, &extensions[*index]) {
+            match regenerate_module_csharp_mirror(
+                workspace_root,
+                &extensions[*index],
+                mirror_ownership[*index].clone(),
+            ) {
                 Ok((_exposed, methods, accessors, mirror_changed)) => {
                     // A mirror-content change (fields/value types/method set)
                     // always rebuilds; a module exposing mirrored methods or

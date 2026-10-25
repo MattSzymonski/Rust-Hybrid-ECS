@@ -205,6 +205,10 @@ pub fn save_scene(
 /// One field value as a scene document holds it, or `None` for a value the
 /// field layer can only summarise (a heap container) or a float JSON has no
 /// number for.
+///
+/// `Text` is `None` for the same reason `List` is: a heap-backed field is not
+/// writable through the field layer, so a value written here could never be
+/// restored - and a document that carries one lies about what a load will do.
 fn saved_field(
     world: &World,
     assets: &AssetManager,
@@ -229,7 +233,6 @@ fn saved_field(
         FieldValue::Usize(value) => Some(serde_json::json!(value)),
         FieldValue::Isize(value) => Some(serde_json::json!(value)),
         FieldValue::Bool(value) => Some(serde_json::json!(value)),
-        FieldValue::Text(value) => Some(serde_json::json!(value)),
         FieldValue::Array(elements) => {
             let mut encoded = Vec::with_capacity(elements.len());
             for element in elements {
@@ -241,7 +244,7 @@ fn saved_field(
             "opaque": hex_of(bytes),
             "tag": type_tag,
         })),
-        FieldValue::List { .. } => None,
+        FieldValue::Text(_) | FieldValue::List { .. } => None,
         FieldValue::Asset { .. } | FieldValue::Entity { .. } => {
             match saved_reference(world, assets, registry, value) {
                 Some(SavedReference::Asset(reference)) => serde_json::to_value(reference).ok(),
@@ -861,6 +864,84 @@ mod tests {
             "and the asset it names is the one that was loaded"
         );
         assert_eq!(world.entity_id(actor.target), Some(target_id));
+    }
+
+    /// Whatever `save_scene` writes, `load_scene` restores.
+    ///
+    /// A heap-backed field is read-only through the field layer - its buffer is
+    /// reached through the type's own accessors, not through raw row bytes - so
+    /// the saver must leave one out. It used to write a `string` as JSON while
+    /// the writer refused the same value back, so the file claimed a value no
+    /// load could restore, and `vec:` fields were dropped without a word.
+    #[test]
+    fn a_saved_field_is_one_the_loader_accepts() {
+        static LABELED_FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor {
+                name: "label",
+                type_tag: "string",
+                offset: 0,
+                size: std::mem::size_of::<String>(),
+                align: std::mem::align_of::<String>(),
+                element_count: 0,
+                decorators: Cow::Borrowed(&[]),
+            },
+            ComponentFieldDescriptor {
+                name: "points",
+                type_tag: "vec:u32",
+                offset: std::mem::size_of::<String>(),
+                size: std::mem::size_of::<Vec<u32>>(),
+                align: std::mem::align_of::<Vec<u32>>(),
+                element_count: 0,
+                decorators: Cow::Borrowed(&[]),
+            },
+        ];
+
+        #[repr(C)]
+        #[derive(Debug)]
+        struct Labeled {
+            label: String,
+            points: Vec<u32>,
+        }
+        impl Component for Labeled {}
+
+        // Step 1: a world holding both heap kinds saves.
+        let (document, save) = {
+            let mut scratch = Scratch::new("heap-save");
+            scratch
+                .engine
+                .world_mut()
+                .register_component_with_layout::<Labeled>(LABELED_FIELDS);
+            let registry = scratch.registry();
+            let world = scratch.engine.world_mut();
+            world
+                .create_entity()
+                .with(Labeled {
+                    label: "a note's title".to_string(),
+                    points: vec![1, 2, 3],
+                })
+                .build()
+                .expect("entity builds");
+            let assets = world.get_resource::<AssetManager>().unwrap();
+            save_scene(world, assets, &registry, None)
+        };
+
+        // Step 2: the document carries no field a load would have to refuse,
+        // and both omissions are reported rather than silent.
+        let component_fields =
+            &document.entities[0].components[&ComponentRegistry::registered_name::<Labeled>()];
+        assert!(
+            component_fields.is_empty(),
+            "a heap-backed field is never written: {component_fields:?}"
+        );
+        for field in ["label", "points"] {
+            assert!(
+                save.skipped_fields
+                    .iter()
+                    .any(|skipped| skipped.ends_with(&format!(".{field}"))),
+                "{field} is reported as skipped: {:?}",
+                save.skipped_fields
+            );
+        }
     }
 
     /// AC2: a component the world does not know is reported, and the rest of

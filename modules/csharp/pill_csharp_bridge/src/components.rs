@@ -44,9 +44,7 @@ use super::manifest::{
     build_field_plan, format_field_layout_line, handle_asset_path, managed_field_layout,
     parse_and_validate_manifest, plan_tag, split_manifest_kinds, ManagedComponentManifest,
 };
-use super::manifest_apply::{
-    apply_manifest, BindingTable, ManifestSubject, RenamePredecessor, Settlement,
-};
+use super::manifest_apply::{BindingTable, ManifestSubject, RenamePredecessor, Settlement};
 
 // Current crate
 
@@ -580,20 +578,32 @@ pub(super) fn apply_component_manifest_on_reload(
     store: &BindingStore,
 ) -> Result<ManifestApplyReport, CSharpError> {
     let (manifest, resources) = split_manifest_kinds(parse_and_validate_manifest(bytes)?);
-    // Resources settle first and on their own terms: they own no column, so a
-    // component refused afterwards leaves nothing of theirs half-applied, and a
-    // resource entry that reached the component pipeline would be resolved as a
-    // column to add.
-    let resource_outcome = super::resources::apply_resource_manifest_on_reload(engine, &resources)?;
+    // Both kinds are resolved before either one mutates the engine. A manifest
+    // carries resources and components together, and every refusal that is
+    // about the manifest's own shape - an ambiguous alias, an entry that cannot
+    // be registered as it stands, a table that already disagrees - is raised
+    // here, while the world is still untouched. Applying one kind first and
+    // letting the other refuse later is what used to leave a rejected reload's
+    // resources migrated under the generation that kept running.
+    let prepared_resources = super::resources::prepare_resource_manifest(engine, &resources)?;
+    let previous_components = store.read().clone();
+    let prepared_components = super::manifest_apply::prepare_manifest(
+        &COMPONENT_SUBJECT,
+        engine,
+        previous_components,
+        &manifest,
+    )?;
 
-    // The component table is handed to the shared pipeline as a plain map and
-    // published whole when it comes back, which is what makes the table half of
-    // the rollback all-or-nothing: nothing observes an intermediate state,
-    // because there is no intermediate state to observe.
-    let previous = store.read().clone();
-    let (result, table) = apply_manifest(&COMPONENT_SUBJECT, engine, previous, &manifest);
+    // Components next: their pipeline unwinds a refusal through its journal, so
+    // a refusal here still leaves nothing applied and the resources below
+    // untouched. Resources run last because a relayout is the one step that
+    // cannot be reversed - nothing should run after it that could fail.
+    let (result, table) =
+        super::manifest_apply::execute_manifest(&COMPONENT_SUBJECT, engine, prepared_components);
     *store.write() = table;
     let outcome = result?;
+
+    let resource_outcome = super::resources::execute_resource_manifest(engine, prepared_resources)?;
 
     Ok(ManifestApplyReport {
         migrated: outcome.migrated,

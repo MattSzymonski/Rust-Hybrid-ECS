@@ -33,8 +33,8 @@ use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDes
 
 use super::mirror_codegen;
 use pill_csharp_bridge::{
-    is_opaque_container_tag, snake_to_pascal, split_array_tag, ModuleExposedComponent,
-    ResolvedFieldAccessor, ResolvedMirrorMethod,
+    is_heap_owned_tag, is_opaque_container_tag, snake_to_pascal, split_array_tag,
+    ModuleExposedComponent, ResolvedFieldAccessor, ResolvedMirrorMethod,
 };
 
 // =============================================================================
@@ -1002,7 +1002,7 @@ fn emit_heap_field_accessors(
 ) -> Result<String, String> {
     let mut containers: Vec<&ComponentFieldDescriptor> = fields
         .iter()
-        .filter(|field| is_heap_field_tag(field.type_tag))
+        .filter(|field| is_heap_owned_tag(field.type_tag))
         .collect();
     if containers.is_empty() {
         return Ok(String::new());
@@ -1508,13 +1508,6 @@ fn resolve_span_element_type(
     Err(format!(
         "container field `{field_name}` of `{cs_name}` has unsupported element tag `{element_tag}`"
     ))
-}
-
-/// Whether a tag names any heap-owning field, which the accessor member
-/// emitter handles - Rust-owned containers and engine-owned native buffers
-/// alike.
-fn is_heap_field_tag(tag: &str) -> bool {
-    is_opaque_container_tag(tag) || tag.starts_with("dynbuf:")
 }
 
 /// Map a primitive type tag to its C# type, byte size, and alignment.
