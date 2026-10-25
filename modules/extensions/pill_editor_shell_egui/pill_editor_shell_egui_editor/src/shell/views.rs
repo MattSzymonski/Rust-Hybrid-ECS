@@ -19,9 +19,12 @@ use pill_editor_shell_egui_editor::shell::*;
 pub const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
 /// A shell update slower than this logs its own `[editor] egui frame` line
-/// in addition to the 210-frame heartbeat: the D32 bar for the whole UI pass
-/// is 2 ms, so anything near it is worth a sample on a slow (debug) run.
-pub const SLOW_UPDATE_MICROS: u64 = 800;
+/// in addition to the 210-frame heartbeat. The bar is a whole 60 Hz frame,
+/// not the D32 UI target: a debug build's pass runs several milliseconds, so
+/// a line per pass over the target would be a line per frame, and the log
+/// (and the console's capture rows) would be nothing but this heartbeat. A
+/// pass that eats a whole frame is the one worth its own record.
+pub const SLOW_UPDATE_MICROS: u64 = 16_000;
 
 /// The scene's frame counter: its box in logical points, and the gap to the
 /// tab body's corner.

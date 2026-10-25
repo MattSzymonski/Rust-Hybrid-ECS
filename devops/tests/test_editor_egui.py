@@ -1179,6 +1179,23 @@ def main() -> int:
             preview_begin,
         )
         print("  [OK] a texture tile's preview came back rendered")
+        # A mesh tile takes the preview's own mesh pass: its own pipeline,
+        # depth target and camera framing, so a mesh needs no material.
+        session.send("browser models")
+        mesh_begin = len(session.read_log())
+        session.wait(
+            re.escape(PREVIEW_REQUESTED_TOKEN) + r'\s+path="[^"]+\.obj"',
+            120,
+            "a mesh tile's preview request",
+            mesh_begin,
+        )
+        session.wait(
+            re.escape(PREVIEW_READY_TOKEN) + r'\s+path="[^"]+\.obj"\s+width=128\s+height=128',
+            120,
+            "the mesh tile's preview image",
+            mesh_begin,
+        )
+        print("  [OK] a mesh tile's preview came back rendered")
         # Off again, so the rest of the run costs no preview work, and the
         # Inspector goes back on top of the column the grid shared, whose rows
         # the steps below read.
