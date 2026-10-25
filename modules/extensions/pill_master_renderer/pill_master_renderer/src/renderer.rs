@@ -699,8 +699,32 @@ fn draw_preview(
                 .unwrap_or([0.72, 0.72, 0.72, 1.0]);
             (crate::preview::PreviewMode::Material, color, None)
         }
-        pill_renderer_api::PreviewAsset::Mesh { .. } => {
-            return Err("mesh previews are not drawn yet, so mesh tiles keep their icon");
+        pill_renderer_api::PreviewAsset::Mesh { path } => {
+            let mesh = renderer
+                .state
+                .preview
+                .mesh(&renderer.state.device, &renderer.state.queue, path)
+                .ok_or("the mesh file could not be decoded")?;
+            let mut encoder =
+                renderer
+                    .state
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("preview_mesh_encoder"),
+                    });
+            renderer.state.preview.record_mesh(
+                &renderer.state.device,
+                &renderer.state.queue,
+                &mut encoder,
+                request.id,
+                &mesh,
+            );
+            renderer
+                .state
+                .queue
+                .submit(std::iter::once(encoder.finish()));
+            renderer.state.preview.after_submit();
+            return Ok(());
         }
     };
     let mut encoder =

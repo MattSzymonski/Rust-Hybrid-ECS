@@ -35,10 +35,13 @@ pub enum PreviewAsset {
         /// The asset's guid, in hex.
         guid: String,
     },
-    /// A mesh, drawn with the renderer's own default material.
+    /// A mesh, drawn with the renderer's own default shading.
+    ///
+    /// Named by its file for the same reason a texture is: the project may
+    /// have loaded it under a name of its own, or not at all.
     Mesh {
-        /// The asset's guid, in hex.
-        guid: String,
+        /// The file to decode, as the frontend resolves it (absolute).
+        path: String,
     },
 }
 

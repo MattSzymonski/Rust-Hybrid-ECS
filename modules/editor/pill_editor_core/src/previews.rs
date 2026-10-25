@@ -6,7 +6,7 @@
 //! - [`RENDER_PREVIEWS_KEY`] and [`render_previews`]: the preference a person
 //!   flips in the Preferences tab.
 //! - [`preview_asset`]: which renderer preview a listing row asks for, from its
-//!   asset type and guid.
+//!   asset type, its file and its guid.
 //! - [`PreviewQueue`]: the paths the Assets grid drew this frame, so the
 //!   executable asks only for tiles on screen.
 //!
@@ -40,9 +40,9 @@ pub fn render_previews(document: &Map<String, Value>) -> bool {
 }
 
 /// The preview a listing row asks for: a texture, a material or a mesh, when
-/// The preview a listing row asks for: a texture, a material or a mesh, when
-/// its type is one of those. A texture is named by its file below `root`, a
-/// material and a mesh by the guid their sidecar carries.
+/// its type is one of those. A texture and a mesh are named by their file
+/// below `root`, because a project may load an asset under its own name or
+/// not load it at all; a material is named by the guid its sidecar carries.
 pub fn preview_asset(row: &AssetListing, root: &Path) -> Option<pill_renderer_api::PreviewAsset> {
     let kind = row.kind.rsplit("::").next().unwrap_or(row.kind.as_str());
     match kind {
@@ -53,7 +53,7 @@ pub fn preview_asset(row: &AssetListing, root: &Path) -> Option<pill_renderer_ap
             guid: row.guid.clone()?,
         }),
         "Mesh" => Some(pill_renderer_api::PreviewAsset::Mesh {
-            guid: row.guid.clone()?,
+            path: root.join(&row.path).to_string_lossy().into_owned(),
         }),
         _ => None,
     }
@@ -137,9 +137,9 @@ mod tests {
         assert!(!render_previews(&document));
     }
 
-    /// A row's preview comes from its type's last segment: a texture names
-    /// its file below the asset root, a material and a mesh their guid, and a
-    /// row with neither asks for nothing.
+    /// A row's preview comes from its type's last segment: a texture and a
+    /// mesh name their file below the asset root, a material names its guid,
+    /// and a row whose type has no preview asks for nothing.
     #[test]
     fn a_row_names_the_preview_its_type_asks_for() {
         let root = Path::new("C:/project/res");
@@ -168,10 +168,16 @@ mod tests {
         assert_eq!(
             preview_asset_for(&assets, "models/cube.obj", root),
             Some(pill_renderer_api::PreviewAsset::Mesh {
-                guid: "cc".to_string()
+                path: root.join("models/cube.obj").to_string_lossy().into_owned()
             })
         );
-        assert!(preview_asset_for(&assets, "models/loose.obj", root).is_none());
+        // A mesh needs no sidecar: the file is what the pass decodes.
+        assert_eq!(
+            preview_asset_for(&assets, "models/loose.obj", root),
+            Some(pill_renderer_api::PreviewAsset::Mesh {
+                path: root.join("models/loose.obj").to_string_lossy().into_owned()
+            })
+        );
         assert!(preview_asset_for(&assets, "scenes/main.scene", root).is_none());
         assert!(preview_asset_for(&assets, "textures/missing.png", root).is_none());
     }
