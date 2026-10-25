@@ -95,6 +95,7 @@ SCENE_VIEW_OPENED_TOKEN = "[editor] scene view opened"
 SCENE_SURFACE_RESIZED_TOKEN = "[editor] scene surface resized"
 FRAME_HEARTBEAT_TOKEN = "[editor] frame heartbeat"
 FRAME_IDLE_TOKEN = "[editor] frame idle"
+CURSOR_ICON_TOKEN = "[editor] cursor icon"
 SCENE_BADGE_RECT_TOKEN = "[editor] scene badge rect"
 SCENE_BADGE_TOKEN = "[editor] scene badge"
 PREVIEW_REQUESTED_TOKEN = "[editor] preview requested"
@@ -1045,6 +1046,18 @@ def main() -> int:
         badge_begin = len(session.read_log())
         splitter_x = scene_x + scene_width * 0.5
         splitter_y = scene_y + scene_height - 4.0
+        # A hover on the band asks the dock for the resize cursor, which the
+        # executable maps and logs on change - the half of the splitter's
+        # story a drag cannot show.
+        hover_begin = len(session.read_log())
+        session.send(f"hover ui {splitter_x:.0f} {splitter_y:.0f}")
+        session.wait(
+            re.escape(CURSOR_ICON_TOKEN) + r'\s+icon="ResizeVertical"',
+            30,
+            "the resize cursor over the splitter",
+            hover_begin,
+        )
+        print("  [OK] hovering the splitter asked for the resize cursor")
         session.send(f"drag {splitter_x:.0f} {splitter_y:.0f} {splitter_x:.0f} {splitter_y + 24:.0f}")
         # The release lands on the next frame and the dock lays out after it,
         # so the rects are read once that frame has had time to draw.

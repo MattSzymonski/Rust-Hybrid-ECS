@@ -145,6 +145,17 @@ pub enum ScriptedCommand {
         /// The pointer's y in physical pixels.
         y: f32,
     },
+    /// `hover ui <x> <y>` - move the shell's own pointer, as a real move would.
+    ///
+    /// The UI's hover state is egui's, and egui learns a position from an
+    /// event: this is how a suite makes a tooltip or a cursor appear without
+    /// a mouse (W-0049).
+    HoverUi {
+        /// The pointer's x in physical pixels.
+        x: f32,
+        /// The pointer's y in physical pixels.
+        y: f32,
+    },
     /// `select asset <path>` - move the shared selection onto an asset.
     SelectAsset(String),
     /// `select entity <handle>` - move the shared selection onto an entity.
@@ -697,6 +708,14 @@ impl ScriptedCommand {
                 Some("file") => {
                     let path = cursor.text("hover file needs a path")?;
                     Ok(ScriptedCommand::HoverFile(path))
+                }
+                // The shell's own pointer: the UI's hover state, which the
+                // scene hover below never touches.
+                Some("ui") => {
+                    let x = number(&mut cursor, "hover ui needs an x")?;
+                    let y = number(&mut cursor, "hover ui needs a y")?;
+                    cursor.finish(verb)?;
+                    Ok(ScriptedCommand::HoverUi { x, y })
                 }
                 // The view index was the word just read, so the numbers that
                 // follow it are the pointer position.
@@ -1860,6 +1879,10 @@ mod tests {
                     x: 320.0,
                     y: 240.0,
                 },
+            },
+            Accept {
+                line: "hover ui 640 312",
+                command: ScriptedCommand::HoverUi { x: 640.0, y: 312.0 },
             },
             Accept {
                 line: "select asset textures/wall.png",

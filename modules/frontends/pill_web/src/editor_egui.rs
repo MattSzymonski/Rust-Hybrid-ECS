@@ -637,6 +637,7 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::Camera { .. } => "camera",
         ScriptedCommand::CameraZoom(_) => "camera zoom",
         ScriptedCommand::Hover { .. } => "hover",
+        ScriptedCommand::HoverUi { .. } => "hover ui",
         ScriptedCommand::SelectAsset(_) => "select asset",
         ScriptedCommand::SelectEntity(_) => "select entity",
         ScriptedCommand::SelectAdd(_) => "select add",
