@@ -119,6 +119,9 @@ pub mod notices;
 pub mod panels;
 /// The Preferences tab's shared vocabulary: the file's editable keys.
 pub mod preferences;
+/// Asset previews: the preference that turns them on and the tiles worth
+/// drawing one for (W-0049 Stage 11).
+pub mod previews;
 /// Build diagnostics: the problems the Problems panel shows.
 pub mod problems;
 /// The world resources the Inspector can show and edit (W-0038 Stage 14).

@@ -1062,6 +1062,10 @@ impl RenderingHost {
         self.display.render(self.host.runtime.engine().world())?;
         self.display
             .deliver_pick_results(self.host.runtime.engine_mut().world_mut());
+        // Previews too (W-0049 Stage 11): the renderer reads one back between
+        // frames, and the editor's tiles pick the pixels up next frame.
+        self.display
+            .deliver_preview_results(self.host.runtime.engine_mut().world_mut());
         self.scene_drawn = true;
         Ok(report)
     }

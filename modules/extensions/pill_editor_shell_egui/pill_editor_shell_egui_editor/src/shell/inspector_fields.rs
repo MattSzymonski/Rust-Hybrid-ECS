@@ -36,6 +36,7 @@ pub fn inspector_field_row(
     scene: &[EntityListEntry],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
+    overlay_regions: &mut Vec<ShellRect>,
 ) {
     let type_name = component.type_name.as_str();
     match row {
@@ -231,6 +232,141 @@ pub fn inspector_field_row(
                 }
             });
         }
+        inspector::FieldRow::Color {
+            leaves,
+            field,
+            tooltip,
+        } => {
+            let values = leaf_values(component, leaves);
+            if remember_inspector_row(
+                session,
+                type_name,
+                "color",
+                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
+            ) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    channels = leaves.len(),
+                    tooltip = tooltip.as_deref().unwrap_or_default(),
+                    "[editor] inspector row kind=color"
+                );
+            }
+            inspector_row(ui, field, tooltip.as_deref(), &mut |ui| {
+                let Some(mut channels) = color_channels(&values) else {
+                    // Channels the picker cannot read (integer kinds) stay
+                    // editable one by one rather than becoming uneditable.
+                    for (axis, value) in values.iter().enumerate() {
+                        ui.label(
+                            egui::RichText::new(inspector::axis_label(axis))
+                                .color(inspector::axis_color(axis))
+                                .small(),
+                        );
+                        if let Some(edited) = scalar_edit(ui, value) {
+                            let leaf = &leaves[axis];
+                            match leaf.element {
+                                Some(element) => queue_element_edit(
+                                    pending,
+                                    targets,
+                                    entity,
+                                    type_name,
+                                    &leaf.field,
+                                    element,
+                                    edited,
+                                ),
+                                None => queue_field_edit(
+                                    pending,
+                                    targets,
+                                    entity,
+                                    type_name,
+                                    &leaf.field,
+                                    edited,
+                                ),
+                            }
+                        }
+                    }
+                    return;
+                };
+                // The picker writes linear channels, which is what the value
+                // holds, so no conversion stands between the two.
+                let response = ui.color_edit_button_rgba_unmultiplied(&mut channels);
+                if response.changed() {
+                    let edited: Vec<FieldValue> = leaves
+                        .iter()
+                        .zip(channels)
+                        .map(|(leaf, channel)| match component.values.get(leaf.index) {
+                            Some(FieldValue::F64(_)) => FieldValue::F64(channel as f64),
+                            _ => FieldValue::F32(channel),
+                        })
+                        .collect();
+                    let (commands, label, key) =
+                        inspector::selection_leaf_edit(targets, entity, type_name, leaves, &edited);
+                    pending.push_recorded(commands, label, Some(key));
+                }
+            });
+        }
+        inspector::FieldRow::VectorGroup {
+            leaves,
+            widget,
+            field,
+            tooltip,
+        } => {
+            if remember_inspector_row(
+                session,
+                type_name,
+                "vector",
+                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
+            ) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ENGINE,
+                    component = type_name,
+                    field = field.as_str(),
+                    axes = leaves.len(),
+                    tooltip = tooltip.as_deref().unwrap_or_default(),
+                    "[editor] inspector row kind=vector"
+                );
+            }
+            // The same row a `[f32; 3]` field draws, assembled from leaves
+            // that live in fields of their own (W-0049).
+            ui.horizontal_wrapped(|ui| {
+                let label = ui.add_sized(
+                    egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
+                    egui::Label::new(egui::RichText::new(field).color(style::TEXT_MUTED))
+                        .truncate(),
+                );
+                if let Some(text) = tooltip.as_deref() {
+                    label.on_hover_text(text);
+                }
+                for (axis, leaf) in leaves.iter().enumerate() {
+                    let Some(value) = component.values.get(leaf.index) else {
+                        continue;
+                    };
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(inspector::axis_label(axis))
+                                    .color(inspector::axis_color(axis))
+                                    .small(),
+                            );
+                            if let Some(edited) = scalar_edit_decorated(ui, value, widget) {
+                                queue_field_edit(
+                                    pending,
+                                    targets,
+                                    entity,
+                                    type_name,
+                                    &leaf.field,
+                                    edited,
+                                );
+                            }
+                        },
+                    );
+                    ui.add_space(2.0);
+                }
+            });
+        }
         inspector::FieldRow::Asset {
             index,
             field,
@@ -252,6 +388,7 @@ pub fn inspector_field_row(
                 },
                 pending,
                 session,
+                overlay_regions,
             );
         }
         inspector::FieldRow::Entity {
@@ -269,10 +406,11 @@ pub fn inspector_field_row(
                     tooltip: tooltip.as_deref(),
                     targets,
                     details,
-                    scene: &scene,
+                    scene,
                 },
                 pending,
                 session,
+                overlay_regions,
             );
         }
         inspector::FieldRow::ReadOnly {
@@ -338,6 +476,7 @@ pub fn inspector_asset_row(
     input: AssetRowInput<'_>,
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
+    overlay_regions: &mut Vec<ShellRect>,
 ) {
     let type_name = input.component.type_name.as_str();
     let label = input
@@ -422,33 +561,47 @@ pub fn inspector_asset_row(
     }
 
     // The picker opens under its row: a search box, then the field's
-    // candidates, with `None` first.
+    // candidates, with `None` first. It floats over the rows below and claims
+    // its rectangle, so a click in it is the picker's (W-0049 Stage 8).
     if session.asset_picker.as_deref() == Some(key.as_str()) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut session.asset_search)
-                    .hint_text("Search assets")
-                    .desired_width(f32::INFINITY),
+        if let Some((rect, _)) = button_rect {
+            let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
+            floating_popup(
+                ui,
+                picker_id,
+                rect,
+                rect.width().max(180.0),
+                overlay_regions,
+                &mut |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut session.asset_search)
+                            .hint_text("Search assets")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let search = session.asset_search.to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .max_height(ASSET_PICKER_HEIGHT)
+                        .show(ui, |ui| {
+                            if ui.selectable_label(false, "None").clicked() {
+                                chosen = Some(None);
+                            }
+                            for candidate in
+                                inspector::asset_candidates(input.assets, input.asset_type)
+                                    .into_iter()
+                                    .filter(|candidate| {
+                                        candidate.path.to_lowercase().contains(&search)
+                                    })
+                            {
+                                let current = matches!(&label, AssetReferenceLabel::Named(name)
+                                    if *name == candidate.path);
+                                if ui.selectable_label(current, &candidate.path).clicked() {
+                                    chosen = Some(Some(candidate.path.clone()));
+                                }
+                            }
+                        });
+                },
             );
-            let search = session.asset_search.to_lowercase();
-            egui::ScrollArea::vertical()
-                .max_height(ASSET_PICKER_HEIGHT)
-                .show(ui, |ui| {
-                    if ui.selectable_label(false, "None").clicked() {
-                        chosen = Some(None);
-                    }
-                    for candidate in inspector::asset_candidates(input.assets, input.asset_type)
-                        .into_iter()
-                        .filter(|candidate| candidate.path.to_lowercase().contains(&search))
-                    {
-                        let current = matches!(&label, AssetReferenceLabel::Named(name)
-                            if *name == candidate.path);
-                        if ui.selectable_label(current, &candidate.path).clicked() {
-                            chosen = Some(Some(candidate.path.clone()));
-                        }
-                    }
-                });
-        });
+        }
     }
 
     if let Some(reference) = chosen {
@@ -505,6 +658,7 @@ pub fn inspector_entity_row(
     input: EntityRowInput<'_>,
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
+    overlay_regions: &mut Vec<ShellRect>,
 ) {
     let type_name = input.component.type_name.as_str();
     let label = input
@@ -589,31 +743,41 @@ pub fn inspector_entity_row(
     }
 
     if session.entity_picker.as_deref() == Some(key.as_str()) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut session.entity_search)
-                    .hint_text("Search entities")
-                    .desired_width(f32::INFINITY),
+        if let Some((rect, _)) = button_rect {
+            let picker_id = egui::Id::new(("pill_editor_shell_egui.entity_picker", key.as_str()));
+            floating_popup(
+                ui,
+                picker_id,
+                rect,
+                rect.width().max(180.0),
+                overlay_regions,
+                &mut |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut session.entity_search)
+                            .hint_text("Search entities")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let search = session.entity_search.to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .max_height(ASSET_PICKER_HEIGHT)
+                        .show(ui, |ui| {
+                            if ui.selectable_label(false, "None").clicked() {
+                                chosen = Some(None);
+                            }
+                            for candidate in inspector::entity_candidates(input.scene) {
+                                if !candidate.display.to_lowercase().contains(&search) {
+                                    continue;
+                                }
+                                let current = matches!(&label, EntityReferenceLabel::Live(name)
+                                    if *name == candidate.display);
+                                if ui.selectable_label(current, &candidate.display).clicked() {
+                                    chosen = Some(Some(candidate.entity));
+                                }
+                            }
+                        });
+                },
             );
-            let search = session.entity_search.to_lowercase();
-            egui::ScrollArea::vertical()
-                .max_height(ASSET_PICKER_HEIGHT)
-                .show(ui, |ui| {
-                    if ui.selectable_label(false, "None").clicked() {
-                        chosen = Some(None);
-                    }
-                    for candidate in inspector::entity_candidates(input.scene) {
-                        if !candidate.display.to_lowercase().contains(&search) {
-                            continue;
-                        }
-                        let current = matches!(&label, EntityReferenceLabel::Live(name)
-                            if *name == candidate.display);
-                        if ui.selectable_label(current, &candidate.display).clicked() {
-                            chosen = Some(Some(candidate.entity));
-                        }
-                    }
-                });
-        });
+        }
     }
 
     if armed {
@@ -763,6 +927,41 @@ pub fn remember_asset_row_rect(
         max_y = rect.max.y,
         "[editor] inspector asset row rect"
     );
+}
+
+/// The current values of a grouped row's leaves, in the row's own order
+/// (W-0049): a leaf inside an array value reads its element.
+pub fn leaf_values(component: &ComponentView, leaves: &[inspector::RowLeaf]) -> Vec<FieldValue> {
+    leaves
+        .iter()
+        .filter_map(|leaf| match leaf.element {
+            Some(element) => component
+                .values
+                .get(leaf.index)
+                .and_then(|value| inspector::element_field(value, element)),
+            None => component.values.get(leaf.index).cloned(),
+        })
+        .collect()
+}
+
+/// The channels a colour row's values hold, as the picker's unmultiplied
+/// linear floats, or `None` when a value is not a float.
+///
+/// Three channels stay opaque; four carry their alpha. A colour of any other
+/// length is not one the picker draws.
+pub fn color_channels(values: &[FieldValue]) -> Option<[f32; 4]> {
+    if !(3..=4).contains(&values.len()) {
+        return None;
+    }
+    let mut channels = [1.0f32; 4];
+    for (channel, value) in channels.iter_mut().zip(values) {
+        *channel = match value {
+            FieldValue::F32(number) => *number,
+            FieldValue::F64(number) => *number as f32,
+            _ => return None,
+        };
+    }
+    Some(channels)
 }
 
 /// The label a row draws, marked when the selection disagrees on its value

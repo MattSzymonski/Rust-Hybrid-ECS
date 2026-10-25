@@ -94,6 +94,11 @@ SCENE_VIEW_ADDED_TOKEN = "[editor] scene view added"
 SCENE_VIEW_OPENED_TOKEN = "[editor] scene view opened"
 SCENE_SURFACE_RESIZED_TOKEN = "[editor] scene surface resized"
 FRAME_HEARTBEAT_TOKEN = "[editor] frame heartbeat"
+FRAME_IDLE_TOKEN = "[editor] frame idle"
+SCENE_BADGE_RECT_TOKEN = "[editor] scene badge rect"
+SCENE_BADGE_TOKEN = "[editor] scene badge"
+PREVIEW_REQUESTED_TOKEN = "[editor] preview requested"
+PREVIEW_READY_TOKEN = "[editor] preview ready"
 PROJECT_RELOAD_TOKEN = "hot reload complete"
 EXTENSION_RELOAD_TOKEN = "extension reload processed"
 SCENE_VIEW_RECT_TOKEN = "[editor] scene view rect"
@@ -1030,6 +1035,143 @@ def main() -> int:
             "the outline was published for it",
         )
 
+        # The dock's splitter (W-0049 Stage 6): the grab band beside a
+        # panel's edge takes the drag, so a press a few pixels outside the
+        # one-pixel line still moves the split - and the scene window, which
+        # the shell places at the dock's own rectangle, moves with it. The
+        # band is the line plus eight points of grab width on each side, so a
+        # press four points above the scene's bottom edge is inside it and
+        # was outside the four points the dock shipped with.
+        badge_begin = len(session.read_log())
+        splitter_x = scene_x + scene_width * 0.5
+        splitter_y = scene_y + scene_height - 4.0
+        session.send(f"drag {splitter_x:.0f} {splitter_y:.0f} {splitter_x:.0f} {splitter_y + 24:.0f}")
+        # The release lands on the next frame and the dock lays out after it,
+        # so the rects are read once that frame has had time to draw.
+        time.sleep(0.6)
+        scenes = session.request(
+            "dump scenes", SCENE_RECT_PATTERN, 30, "the scene rects after the splitter drag"
+        )
+        moved = next(
+            (
+                tuple(int(value) for value in match.groups()[1:5])
+                for match in re.finditer(SCENE_RECT_PATTERN, scenes)
+                if match.group(1) == "0" and match.group(6) == "true"
+            ),
+            None,
+        )
+        assert moved is not None, "the scene rect vanished after the splitter drag"
+        assert moved != scene_rect, (
+            "a drag within the grab band left the split where it was: {} -> {}".format(
+                scene_rect, moved
+            )
+        )
+        print(
+            "  [OK] a splitter drag {}px off the line moved the split {}".format(
+                4, moved
+            )
+        )
+
+        # The scene badges (W-0049 Stage 12): the executable projects every
+        # entity into the view and the shell draws a chip at each point. A
+        # click on a chip selects its entity through the shell, so no scene
+        # pick is asked for - the badge's own log line is the proof. The chips
+        # report their rectangles only when they move, and the splitter drag
+        # above moved the window, so the lines read here are the live ones.
+        session.wait(
+            re.escape(SCENE_BADGE_RECT_TOKEN)
+            + r"\s+view=\d+\s+entity=\S+\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)"
+            + r"\s+max_x=(-?[\d.]+)\s+max_y=(-?[\d.]+)",
+            60,
+            "a scene badge's rectangle",
+            badge_begin,
+        )
+        badge = re.search(
+            re.escape(SCENE_BADGE_RECT_TOKEN)
+            + r"\s+view=\d+\s+entity=(\S+)\s+min_x=(-?[\d.]+)\s+min_y=(-?[\d.]+)"
+            + r"\s+max_x=(-?[\d.]+)\s+max_y=(-?[\d.]+)",
+            session.read_log()[badge_begin:],
+        )
+        assert badge, "the badge's rectangle carried no entity"
+        badge_entity = badge.group(1)
+        badge_x = (float(badge.group(2)) + float(badge.group(4))) * 0.5
+        badge_y = (float(badge.group(3)) + float(badge.group(5))) * 0.5
+        # Select another entity first, so the badge's own selection is a
+        # change the log states rather than a repeat of the same handle.
+        entities = re.findall(
+            re.escape(ENTITY_ROW_TOKEN) + r'\s+display="([^"]+)"',
+            session.request(
+                "dump entities",
+                re.escape(ENTITIES_DUMP_TOKEN),
+                60,
+                "the entity list for the badge step",
+            ),
+        )
+        other = next(
+            (entity for entity in entities if entity != badge_entity), None
+        )
+        if other is not None:
+            begin = len(session.read_log())
+            session.send("select entity {}".format(other))
+            session.wait(
+                re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(other)}",
+                60,
+                "another entity selected before the badge click",
+                begin,
+            )
+        begin = len(session.read_log())
+        session.send(f"click {badge_x:.0f} {badge_y:.0f}")
+        session.wait(
+            re.escape(SCENE_BADGE_TOKEN) + rf"\s+entity={re.escape(badge_entity)}",
+            60,
+            "the badge's click selected its entity",
+            begin,
+        )
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(badge_entity)}",
+            60,
+            "the badge's click moved the shared selection",
+            begin,
+        )
+        print(f"  [OK] scene badge {badge_entity} clicked at ({badge_x:.0f}, {badge_y:.0f})")
+        # The badge moved the shared selection; the steps below read the
+        # entity the scene pick made, so it goes back on it here.
+        restored = len(session.read_log())
+        session.send(f"select entity {picked_entity}")
+        session.wait(
+            re.escape(SELECTION_CHANGED_TOKEN) + rf"\s+entity={re.escape(picked_entity)}",
+            60,
+            "the picked entity selected again",
+            restored,
+        )
+
+        # The asset previews (W-0049 Stage 11): the preference turns them on,
+        # the grid queues only the tiles it drew, and the texture's rendered
+        # pixels come back as an image the tile draws. One request per frame,
+        # so the assertions are the request line and then the finished image.
+        session.send("edit preference editor.render_asset_previews true")
+        session.send("browser textures")
+        session.send("tab assets")
+        preview_begin = len(session.read_log())
+        session.wait(
+            re.escape(PREVIEW_REQUESTED_TOKEN) + r'\s+path="[^"]+\.png"',
+            120,
+            "a texture tile's preview request",
+            preview_begin,
+        )
+        session.wait(
+            re.escape(PREVIEW_READY_TOKEN) + r'\s+path="[^"]+\.png"\s+width=128\s+height=128',
+            120,
+            "the texture tile's preview image",
+            preview_begin,
+        )
+        print("  [OK] a texture tile's preview came back rendered")
+        # Off again, so the rest of the run costs no preview work, and the
+        # Inspector goes back on top of the column the grid shared, whose rows
+        # the steps below read.
+        session.send("edit preference editor.render_asset_previews false")
+        session.send("tab inspector")
+
         # The Inspector's data follows the selection: the rows heartbeat
         # reports the detail tier (the selected entity and its component
         # count), which is what the Inspector tab draws.
@@ -1802,7 +1944,13 @@ def main() -> int:
             if re.search(row_rect_pattern, session.read_log()[visible_from:]):
                 break
             headers = {}
-            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log()):
+            # Only the sections the panel drew for the entity it shows now:
+            # the shell forgets a previous subject's rectangles, so everything
+            # after the last selection change is this entity's.
+            log_text = session.read_log()
+            last_change = log_text.rfind(SELECTION_CHANGED_TOKEN)
+            scoped = log_text[last_change:] if last_change >= 0 else log_text
+            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, scoped):
                 headers[match.group(1)] = match
             above = sorted(
                 (
@@ -2046,7 +2194,13 @@ def main() -> int:
             if re.search(reference_row_rect_pattern, session.read_log()):
                 break
             headers = {}
-            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, session.read_log()):
+            # Only this entity's sections: the shell forgets a previous
+            # subject's rectangles, so everything after the last selection
+            # change belongs to the entity it shows now.
+            log_text = session.read_log()
+            last_change = log_text.rfind(SELECTION_CHANGED_TOKEN)
+            scoped = log_text[last_change:] if last_change >= 0 else log_text
+            for match in re.finditer(INSPECTOR_SECTION_RECT_PATTERN, scoped):
                 headers[match.group(1)] = match
             above = sorted(
                 (
@@ -5057,6 +5211,15 @@ def main() -> int:
             re.escape(PAUSE_TOGGLED_TOKEN) + r"\s+paused=true",
             60,
             "the project paused for the cadence step",
+            begin,
+        )
+        # A settled editor says so once, with the poll it settles into
+        # (W-0049 Stage 1): a running project draws at the display rate and a
+        # paused one stops drawing until something asks for a frame.
+        cadence.wait(
+            re.escape(FRAME_IDLE_TOKEN) + r"\s+poll_millis=250\b",
+            60,
+            "the editor settled into its idle poll",
             begin,
         )
         cadence_frames = []

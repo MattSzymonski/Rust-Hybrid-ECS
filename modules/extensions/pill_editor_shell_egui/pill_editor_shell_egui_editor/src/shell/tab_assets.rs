@@ -296,6 +296,24 @@ pub fn assets_grid(
                     );
                     ui.close();
                 }
+                // The open folder itself in the platform's file manager
+                // (W-0049 Stage 10): the empty area has no row to reveal, so
+                // it reveals the folder the grid is showing.
+                if ui
+                    .add(icons::IconButton::new(
+                        icons::Icon::FolderOpen,
+                        "Open Folder in File Explorer",
+                    ))
+                    .clicked()
+                {
+                    writes.pending.reveal(folder.clone());
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        path = folder.as_str(),
+                        "[editor] reveal queued"
+                    );
+                    ui.close();
+                }
             });
         });
 }

@@ -429,6 +429,21 @@ impl AttachedRenderer {
             delivered.results.extend(results);
         }
     }
+
+    /// Move the previews the renderer has read back since the last call into
+    /// the world's [`pill_renderer_api::PreviewResults`] (W-0049 Stage 11).
+    ///
+    /// Like a pick, a preview is answered frames after it was asked; a world
+    /// without the resource drops it.
+    pub fn deliver_preview_results(&mut self, world: &mut World) {
+        let results = self.renderer.take_preview_results();
+        if results.is_empty() {
+            return;
+        }
+        if let Some(delivered) = world.get_resource_mut::<pill_renderer_api::PreviewResults>() {
+            delivered.results.extend(results);
+        }
+    }
 }
 
 // =============================================================================
@@ -488,6 +503,8 @@ impl RenderingRuntime {
         self.display.render(self.runtime.engine().world())?;
         self.display
             .deliver_pick_results(self.runtime.engine_mut().world_mut());
+        self.display
+            .deliver_preview_results(self.runtime.engine_mut().world_mut());
         Ok(report)
     }
 

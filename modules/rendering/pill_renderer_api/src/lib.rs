@@ -57,6 +57,9 @@ pub mod surface;
 /// Selection outlines and picking.
 pub mod picking;
 
+/// Asset previews: off-screen renders the editor asks a renderer for.
+pub mod preview;
+
 // Current crate
 pub use api::{
     AttachFuture, FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
@@ -66,10 +69,14 @@ pub use error::RendererError;
 pub use frame::{
     CullMode, MaterialParameter, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
 };
-pub use grid::{frame_grid, FrameGrid, SceneGrid};
+pub use grid::{editor_view_surfaces, frame_grid, FrameGrid, SceneGrid};
 pub use picking::{
     decode_pick_value, PickHit, PickRequest, PickRequests, PickResult, PickResults,
     SelectionOutlines, PICK_HANDLE_BIT,
+};
+pub use preview::{
+    ensure_preview_resources, PreviewAsset, PreviewImage, PreviewRequest, PreviewRequests,
+    PreviewResults,
 };
 pub use raw_window::{RawWindowData, RawWindowKind};
 pub use surface::{

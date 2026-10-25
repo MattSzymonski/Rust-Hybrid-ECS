@@ -163,6 +163,7 @@ pub use resource_section::{queue_edit as queue_resource_edit, resource_section};
 pub mod views;
 
 pub use views::frame_counter_rect;
+pub use views::scene_badges;
 pub use views::scene_body_rect;
 pub use views::scene_overlay;
 pub use views::shell_rect;
@@ -182,9 +183,11 @@ pub use views::SLOW_UPDATE_MICROS;
 pub mod chrome;
 
 pub use chrome::apply_tab_redock;
+pub use chrome::claim_pointer;
 pub use chrome::click_from_modifiers;
 pub use chrome::context_menu;
 pub use chrome::empty_area;
+pub use chrome::floating_popup;
 pub use chrome::gizmo_mode_label;
 pub use chrome::gizmo_space_label;
 pub use chrome::log_context_menu;
@@ -474,8 +477,13 @@ pub fn run_frame(
         panel_windows: windows,
         panel_window_ping: window_ping,
         popout_contexts,
+        previews,
+        preview_visible,
         ..
     } = state;
+    // The grid reports what it drew, so the executable asks for previews of
+    // what is on screen only (W-0049 Stage 11).
+    preview_visible.clear();
     // Named through the package path, not as a file-local item: a hot patch
     // compiles this body in a crate of its own, where only the package's
     // public items exist (see the crate header).
@@ -510,6 +518,9 @@ pub fn run_frame(
         panel_window_ping_used: false,
         clipboard,
         drag_out: &mut drag_out,
+        previews,
+        preview_visible,
+        badges: &shell_input.badges,
     };
     let output = context.run_ui(raw_input, |ui| {
         // The strip comes first, so the dock - and every viewport rectangle it
@@ -529,11 +540,13 @@ pub fn run_frame(
             viewer.asset_dialog,
             viewer.pending,
             viewer.snapshot,
+            &mut viewer.overlay_regions,
         );
         pill_editor_shell_egui_editor::shell::about_window(
             ui.ctx(),
             &mark,
             &mut menubar.about_open,
+            &mut viewer.overlay_regions,
         );
         // The toast stack floats over the dock and every viewport it covers,
         // so its rows join the frame's overlay regions.
@@ -914,6 +927,14 @@ pub struct EditorTabViewer<'a> {
     /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
     /// executable starts an OLE drag with it.
     pub drag_out: &'a mut Option<String>,
+    /// The rendered asset previews, by path (W-0049 Stage 11).
+    pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
+    /// The tiles the grid drew this frame, which the executable turns into
+    /// preview requests.
+    pub preview_visible: &'a mut Vec<String>,
+    /// The entity badges the executable projected into this frame's scene
+    /// views (W-0049 Stage 12).
+    pub badges: &'a [ShellBadge],
 }
 
 impl TabViewer for EditorTabViewer<'_> {
@@ -953,6 +974,7 @@ impl TabViewer for EditorTabViewer<'_> {
                 scene_context_menu(self, ui);
                 scene_overlay(ui, self.frames_per_second, &mut self.overlay_regions);
                 toolbox_overlay(self, ui, view);
+                scene_badges(self, ui, view);
             }
             EditorTab::Game => {
                 // The game viewport is the primary surface's child window: a
@@ -986,6 +1008,8 @@ impl TabViewer for EditorTabViewer<'_> {
                     pending: self.pending,
                     overlay_regions: &mut self.overlay_regions,
                     drag_out: self.drag_out,
+                    previews: self.previews,
+                    preview_visible: self.preview_visible,
                 };
                 assets_tab(ui, self.snapshot, self.browser, &mut writes);
             }

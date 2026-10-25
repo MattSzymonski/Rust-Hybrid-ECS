@@ -89,7 +89,12 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 /// - `#[pill(text_area)]`, `#[pill(text_area(3, 10))]` - a multi-line text box
 ///   for a `String` field;
 /// - `#[pill(multiline(5))]` - a fixed-height multi-line text box;
-/// - `#[pill(min(0.0))]` - a drag value that never goes below the minimum.
+/// - `#[pill(min(0.0))]` - a drag value that never goes below the minimum;
+/// - `#[pill(color)]` - the field is a colour: an array of three or four
+///   numbers draws as one colour row with a popup picker, and a struct field
+///   whose leaves are named `r`, `g`, `b`[, `a`] draws as one too;
+/// - `#[pill(vector)]` - consecutive scalar leaves sharing a dotted prefix
+///   draw as one vector row (X/Y/Z/W) instead of one row each.
 ///
 /// Decorators are presentation only: they change nothing about storage,
 /// persistence, the schema fingerprint or the generated C# mirror.
@@ -543,6 +548,15 @@ fn add_field_decorator(
     if path.is_ident("hide_in_inspector") {
         decorators.push(quote! {
             ::pill_engine::component_registry::FieldDecorator::HideInInspector
+        });
+        return Ok(());
+    }
+    // The two grouping decorators take no argument (W-0049).
+    if path.is_ident("color") || path.is_ident("vector") {
+        decorators.push(if path.is_ident("color") {
+            quote! { ::pill_engine::component_registry::FieldDecorator::Color }
+        } else {
+            quote! { ::pill_engine::component_registry::FieldDecorator::Vector }
         });
         return Ok(());
     }

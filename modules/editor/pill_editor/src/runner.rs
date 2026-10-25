@@ -39,7 +39,7 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::{info, warn};
 use pill_editor_core::assets::{self, AssetDialog};
 use pill_editor_core::boundary::{
-    frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellRect,
+    frame_from_output, EguiPopoutInputs, EguiShellFrame, EguiShellInput, ShellBadge, ShellRect,
     DEFAULT_SCENE_VIEWS,
 };
 use pill_editor_core::cadence::{Cadence, FrameDemand, FrameWake};
@@ -71,6 +71,7 @@ use pill_editor_core::panels::{
     ModuleLiveness, PanelCommand, PanelCommands, PanelRegistrations, PanelRegistry, PanelRequest,
 };
 use pill_editor_core::preferences::{self, PreferencesView};
+use pill_editor_core::previews;
 use pill_editor_core::problems::{self as problem_parser, Severity};
 use pill_editor_core::scripted::{
     AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
@@ -189,6 +190,11 @@ const SHELL_MODULE_NAME: &str = "pill_editor_shell_egui_editor";
 /// The window's initial size in logical pixels.
 const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
 
+/// The window's minimum size in logical pixels: the dock's minimum layout
+/// plus room for the menu bar, so a drag of the window's edge cannot leave the
+/// panels unusable (W-0049).
+const MINIMUM_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(960.0, 600.0);
+
 /// The scene view's initial size in logical pixels.
 const INITIAL_SCENE_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 480.0);
 
@@ -229,9 +235,11 @@ const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
 /// a fraction of the handle length: long enough to leave any view.
 const GIZMO_GUIDE_SPAN: f32 = 200.0;
 
-/// The hover test's radius around a handle, as a fraction of the handle
-/// length: roughly the width the overlay draws a line with.
-const GIZMO_HOVER_RADIUS: f32 = 0.07;
+/// The hover test's default radius around a handle, as a fraction of the
+/// handle length: roughly the width the overlay draws a line with. The
+/// preferences' `editor.gizmo_hit_radius` overrides it, and both the hover
+/// and the press read the one value (W-0049).
+const GIZMO_HIT_RADIUS_DEFAULT: f32 = preferences::GIZMO_HIT_RADIUS_DEFAULT;
 
 /// One dash (and one gap) of the translation displacement line, as a
 /// fraction of the handle length.
@@ -703,6 +711,13 @@ struct EditorWindow {
     /// How long the handles were when they were last built, in world units:
     /// the hover test's radius and the drag guides' dash length follow it.
     gizmo_reference: f32,
+    /// The handle hit radius as a fraction of the handle length, from the
+    /// preferences file: the hover test and the press share it (W-0049).
+    gizmo_hit_radius: f32,
+    /// Whether the preferences file asks for rendered asset previews, and the
+    /// paths whose preview is on its way to the renderer (W-0049 Stage 11).
+    render_previews: bool,
+    preview_in_flight: std::collections::HashMap<u64, String>,
     /// Whether the drag guides drew last frame, so the log line appears on
     /// the state change instead of every frame.
     gizmo_guides: Option<bool>,
@@ -792,6 +807,10 @@ struct EditorWindow {
     claimed_pointer: bool,
     /// Whether egui claimed the keyboard in the last frame.
     claimed_keyboard: bool,
+    /// The cursor egui asked for in the last frame, so a change is logged
+    /// once instead of every frame (W-0049: the resize cursors over a
+    /// splitter are how the widened grab band shows itself).
+    last_cursor: egui::CursorIcon,
     /// The scripted command channel, when the environment names one.
     test_channel: Option<TestChannel>,
     /// A scripted left-button drag in flight, when one is.
@@ -813,6 +832,15 @@ struct EditorWindow {
     repaint_after: Option<Duration>,
     /// What asked for the last frame, kept for the cadence dump.
     last_demand: FrameDemand,
+    /// The entity badges this frame's scene views draw (W-0049 Stage 12):
+    /// every visible view's entities, projected to logical points.
+    badges: Vec<ShellBadge>,
+    /// Whether the last decision left the loop in the polled state, so the
+    /// `[editor] frame idle` line appears once per transition (W-0049).
+    polling: bool,
+    /// The most expensive frame drawn while polling since the last
+    /// heartbeat, in milliseconds: the measured cost of an idle frame.
+    idle_frame_millis_max: f32,
     /// The snapshot field whose change last asked for a frame, so the log
     /// names a churning reason once rather than every frame.
     snapshot_changed_field: Option<String>,
@@ -850,10 +878,12 @@ impl EditorWindow {
         event_loop: &ActiveEventLoop,
         log_buffer: pill_core::telemetry::capture::LogBuffer,
     ) -> Result<EditorWindow, EditorError> {
-        // Step 1: the main window.
+        // Step 1: the main window. A minimum size keeps an accidental drag of
+        // the window's own edge from squeezing the dock unusable (W-0049).
         let attributes = Window::default_attributes()
             .with_title("Pill Editor (egui)")
-            .with_inner_size(INITIAL_WINDOW_SIZE);
+            .with_inner_size(INITIAL_WINDOW_SIZE)
+            .with_min_inner_size(MINIMUM_WINDOW_SIZE);
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -1069,6 +1099,10 @@ impl EditorWindow {
             gizmo_geometry: GizmoGeometry::default(),
             hovered_handle: None,
             gizmo_reference: 0.0,
+            gizmo_hit_radius: GIZMO_HIT_RADIUS_DEFAULT,
+            render_previews: false,
+            preview_in_flight: std::collections::HashMap::new(),
+            badges: Vec::new(),
             gizmo_guides: None,
             gizmo_logged: None,
             synthetic_press_ids: Vec::new(),
@@ -1103,6 +1137,7 @@ impl EditorWindow {
             started: Instant::now(),
             claimed_pointer: false,
             claimed_keyboard: false,
+            last_cursor: egui::CursorIcon::Default,
             test_channel: TestChannel::from_environment(),
             scripted_drag: None,
             scene_title: "untitled".to_string(),
@@ -1129,6 +1164,8 @@ impl EditorWindow {
             next_wake: FrameWake::Immediate,
             repaint_after: None,
             last_demand: FrameDemand::default(),
+            polling: false,
+            idle_frame_millis_max: 0.0,
             last_snapshot: None,
             snapshot_changed_field: None,
             panel_markers: std::collections::HashMap::new(),
@@ -1503,10 +1540,30 @@ impl EditorWindow {
         camera::navigation_binding(self.keymap, button, self.modifiers)
     }
 
-    /// Ask what is under a left press, while the button is held: the answer
-    /// either starts a gizmo drag on the handle it names or moves the shared
-    /// selection.
+    /// Ask what is under a left press, while the button is held: a handle the
+    /// hover test names starts its drag in this same press, and only a miss
+    /// queues the object pick.
+    ///
+    /// The CPU test answers first (W-0049): the pick's answer arrives a frame
+    /// later and only covers a couple of pixels, so a handle that highlighted
+    /// under the pointer could lose the press to the pick and clear the
+    /// selection. One hitbox, read by the hover and the press alike, is what
+    /// keeps the highlight and the grab in agreement.
     fn press_scene(&mut self, view: usize, x: f32, y: f32) {
+        if self.gizmo_drag.is_none() {
+            if let Some(handle) = self.handle_at(view, x, y) {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    view,
+                    handle,
+                    path = "handle",
+                    "[editor] gizmo press"
+                );
+                self.set_hovered_handle(view, Some(handle));
+                self.begin_gizmo_drag(view, handle, x, y);
+                return;
+            }
+        }
         let physical_x = x.max(0.0).round() as u32;
         let physical_y = y.max(0.0).round() as u32;
         let Some(id) = self.queue_scene_pick_at(view, physical_x, physical_y) else {
@@ -1524,6 +1581,7 @@ impl EditorWindow {
             x = physical_x,
             y = physical_y,
             id,
+            path = "pick",
             "[editor] pick requested"
         );
     }
@@ -1634,20 +1692,30 @@ impl EditorWindow {
         );
     }
 
-    /// Update the hovered handle from the pointer's ray, against the handles
-    /// the last frame drew. The radius follows the handle length, so it
-    /// reads like the drawn line rather than a fixed world distance.
+    /// The hovered handle from the pointer's ray, against the handles the
+    /// last frame drew. The radius follows the handle length, so it reads
+    /// like the drawn line rather than a fixed world distance, and the
+    /// preference scales it (W-0049).
     fn update_hover(&mut self, view: usize, point: (f32, f32)) {
         if self.gizmo_drag.is_some() || self.camera_drag.is_some() {
             return;
         }
-        let Some((ray_origin, ray_direction)) = self.scene_ray(view, point.0, point.1) else {
-            self.set_hovered_handle(view, None);
-            return;
-        };
-        let radius = (self.gizmo_reference * GIZMO_HOVER_RADIUS).max(1e-4);
-        let hit = gizmo::hit_test(&self.gizmo_geometry, ray_origin, ray_direction, radius);
+        let hit = self.handle_at(view, point.0, point.1);
         self.set_hovered_handle(view, hit);
+    }
+
+    /// The handle under one pixel of one view, by the CPU ray test.
+    ///
+    /// The hover highlight and the press both answer through this one call,
+    /// so a handle that lights up under the pointer is a handle the press
+    /// grabs (W-0049).
+    fn handle_at(&self, view: usize, x: f32, y: f32) -> Option<u32> {
+        if self.gizmo_geometry.lines.is_empty() && self.gizmo_geometry.triangles.is_empty() {
+            return None;
+        }
+        let (ray_origin, ray_direction) = self.scene_ray(view, x, y)?;
+        let radius = (self.gizmo_reference * self.gizmo_hit_radius).max(1e-4);
+        gizmo::hit_test(&self.gizmo_geometry, ray_origin, ray_direction, radius)
     }
 
     /// Record the hovered handle, logging the change once - the suite's
@@ -1905,6 +1973,177 @@ impl EditorWindow {
                     );
                 }
             }
+        }
+    }
+
+    /// Move the previews the renderer finished into the shell's textures, then
+    /// ask for the next tile's (W-0049 Stage 11).
+    ///
+    /// One request at a time: the renderer draws one preview per frame and
+    /// reads it back between frames, so a grid of tiles fills in over frames
+    /// rather than stalling one. A tile only asks once - its image is kept in
+    /// the session until the listing changes - and the queue is the grid's own
+    /// list of what it drew, so scrolling costs work only for what is visible.
+    fn apply_asset_previews(&mut self) {
+        let images = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<pill_runtime::PreviewResults>()
+                .map(|results| results.take())
+                .unwrap_or_default()
+        };
+        if !images.is_empty() {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let Some(state) = world.get_resource_mut::<EguiShellState>() else {
+                return;
+            };
+            for image in images {
+                let Some(path) = self.preview_in_flight.remove(&image.id) else {
+                    continue;
+                };
+                let size = [image.width as usize, image.height as usize];
+                let texture = state.context.load_texture(
+                    format!("preview:{path}"),
+                    egui::ColorImage::from_rgba_unmultiplied(size, &image.rgba),
+                    egui::TextureOptions::LINEAR,
+                );
+                state.previews.insert(path.clone(), texture);
+                info!(
+                    target: telemetry_target::ENGINE,
+                    path = path.as_str(),
+                    width = image.width,
+                    height = image.height,
+                    "[editor] preview ready"
+                );
+            }
+        }
+        if !self.render_previews || !self.preview_in_flight.is_empty() {
+            return;
+        }
+        // The first visible tile without a preview and without a request.
+        let next = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let Some(state) = world.get_resource::<EguiShellState>() else {
+                return;
+            };
+            state
+                .preview_visible
+                .iter()
+                .find(|path| !state.previews.contains_key(*path))
+                .cloned()
+        };
+        let Some(path) = next else {
+            return;
+        };
+        // A texture preview names its file, so the request needs the asset
+        // root the listing's paths are relative to.
+        let root = self
+            .host
+            .host_mut()
+            .asset_directory()
+            .map(std::path::Path::to_path_buf);
+        let Some(root) = root else {
+            return;
+        };
+        let asset = previews::preview_asset_for(self.asset_entries.iter(), &path, &root);
+        let Some(asset) = asset else {
+            return;
+        };
+        let id = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            pill_runtime::ensure_preview_resources(world);
+            let Some(requests) = world.get_resource_mut::<pill_runtime::PreviewRequests>() else {
+                return;
+            };
+            requests.request(asset)
+        };
+        self.preview_in_flight.insert(id, path.clone());
+        info!(
+            target: telemetry_target::ENGINE,
+            path = path.as_str(),
+            id,
+            "[editor] preview requested"
+        );
+    }
+
+    /// Project every visible entity into every visible scene view, for the
+    /// shell's badges (W-0049 Stage 12).
+    ///
+    /// The executable owns the views' cameras and the renderer's projection
+    /// terms, so it is the only side that can say where an entity lands on
+    /// screen. Each view is capped at [`BADGES_PER_VIEW_MAX`] and an entity
+    /// behind the camera or outside its viewport is left out, so the overlay
+    /// stays a map of the scene rather than a wall of chips.
+    fn publish_badges(&mut self) {
+        self.badges.clear();
+        let rows = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world.entity_rows()
+        };
+        for view in 0..self.views.len() {
+            if self.views[view]
+                .as_ref()
+                .is_none_or(|scene| !scene.window.visible)
+            {
+                continue;
+            }
+            let Some((width, height)) = self.scene_pixel_size(view) else {
+                continue;
+            };
+            let (origin_x, origin_y) = self.view_origin(view);
+            let mut drawn = 0usize;
+            for row in &rows {
+                if drawn >= pill_editor_core::boundary::BADGES_PER_VIEW_MAX {
+                    break;
+                }
+                let Some(translation) = self.entity_translation(row) else {
+                    continue;
+                };
+                let Some((x, y)) = self.project_to_screen_in(view, translation) else {
+                    continue;
+                };
+                if x < 0.0 || y < 0.0 || x > width || y > height {
+                    continue;
+                }
+                self.badges.push(ShellBadge {
+                    view,
+                    x: (origin_x + x) / self.scale_factor,
+                    y: (origin_y + y) / self.scale_factor,
+                    entity: row.entity,
+                });
+                drawn += 1;
+            }
+        }
+    }
+
+    /// One entity's world translation, read through the generic field path so
+    /// the executable needs no query of its own outside a frame.
+    fn entity_translation(&mut self, row: &pill_engine_core::EntityRow) -> Option<[f32; 3]> {
+        if !row
+            .components
+            .iter()
+            .any(|name| name.ends_with("TransformComponent"))
+        {
+            return None;
+        }
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let component = world
+            .resolve_component_id_by_name_any(TRANSFORM_SHARED_NAME)
+            .ok()
+            .flatten()?;
+        let name = world.component_registry().get_name(&component)?.to_string();
+        match world.read_component_field(row.entity, &name, "translation") {
+            Ok(FieldValue::Array(values)) => {
+                let mut translation = [0.0f32; 3];
+                for (axis, value) in values.iter().enumerate().take(3) {
+                    translation[axis] = match value {
+                        FieldValue::F32(number) => *number,
+                        _ => return None,
+                    };
+                }
+                Some(translation)
+            }
+            _ => None,
         }
     }
 
@@ -3919,7 +4158,8 @@ impl EditorWindow {
     fn frame(&mut self, event_loop: &ActiveEventLoop) -> Result<bool, EditorError> {
         self.frame_index += 1;
         // Step 1: the frame rate heartbeat, for the person reading the log.
-        let now = Instant::now();
+        let frame_started = Instant::now();
+        let now = frame_started;
         if let Some(last) = self.last_frame_time {
             let delta_time = now.duration_since(last).as_secs_f32();
             if delta_time > 0.0 {
@@ -3943,11 +4183,14 @@ impl EditorWindow {
                 .as_ref()
                 .map(OverlaySurface::frames)
                 .unwrap_or(0);
+            let idle_frame_millis = self.idle_frame_millis_max;
+            self.idle_frame_millis_max = 0.0;
             info!(
                 target: telemetry_target::ENGINE,
                 fps = self.fps,
                 frame = self.frame_index,
                 overlay_frames,
+                idle_frame_millis,
                 "[editor] frame heartbeat"
             );
         }
@@ -3967,6 +4210,9 @@ impl EditorWindow {
         // a failure, a rollback - becomes the notices the shell draws toasts
         // and Problems rows from (W-0038 Stages 4 and 6).
         self.fold_host_notices();
+        // Step 2c2: where each entity lands in each visible scene view, for
+        // the shell's badges (W-0049 Stage 12).
+        self.publish_badges();
         // Step 2d: the main window names the open scene and its unsaved marker
         // (W-0048 Stage 9).
         self.sync_scene_title();
@@ -4010,6 +4256,7 @@ impl EditorWindow {
                 events,
                 cursor: self.shell_cursor,
                 paste_text: paste_text.flatten(),
+                badges: self.badges.clone(),
             };
         }
         // Step 3a2: each popped-out window's own input record (W-0038 Stage
@@ -4062,6 +4309,9 @@ impl EditorWindow {
         // move the shared selection; the outline follows on the next
         // publish (Stage 13).
         self.drain_scene_picks();
+        // Step 7a: the asset previews the renderer read back, and the next one
+        // to ask for (W-0049 Stage 11).
+        self.apply_asset_previews();
         // Step 7b: the menu bar's requests - undo/redo, a window switch and a
         // quit - taken through the same paths the scripted channel uses.
         self.drain_menu_requests();
@@ -4081,7 +4331,11 @@ impl EditorWindow {
         // Step 10: what the loop does next (W-0038 Stage 9) - draw again at
         // once when anything asked for a frame, or sleep for the idle poll
         // and let this frame's evidence expire.
-        self.decide_next_wake();
+        let frame_millis = frame_started.elapsed().as_secs_f32() * 1000.0;
+        if self.polling {
+            self.idle_frame_millis_max = self.idle_frame_millis_max.max(frame_millis);
+        }
+        self.decide_next_wake(frame_millis);
         Ok(self.quit)
     }
 
@@ -4089,8 +4343,10 @@ impl EditorWindow {
     ///
     /// The demand is cleared here rather than at the start of the next frame:
     /// an event that arrives between the two sets it again, and the loop
-    /// already knows to draw at once.
-    fn decide_next_wake(&mut self) {
+    /// already knows to draw at once. A frame that leaves the loop polling
+    /// logs `[editor] frame idle` once per transition, with the cost of the
+    /// frame that settled (W-0049).
+    fn decide_next_wake(&mut self, frame_millis: f32) {
         let demand = FrameDemand {
             animating: self.animating(),
             repaint_requested: self.repaint_after.is_some(),
@@ -4099,9 +4355,19 @@ impl EditorWindow {
         self.cadence.record_frame(demand);
         self.last_demand = demand;
         self.next_wake = self.cadence.decide(demand);
-        if !matches!(self.next_wake, FrameWake::Immediate) {
+        let polling = matches!(self.next_wake, FrameWake::After(_));
+        if polling {
             self.cadence.record_wait();
         }
+        if polling && !self.polling {
+            info!(
+                target: telemetry_target::ENGINE,
+                poll_millis = pill_editor_core::cadence::IDLE_POLL.as_millis() as u64,
+                frame_millis,
+                "[editor] frame idle"
+            );
+        }
+        self.polling = polling;
         self.demand = FrameDemand::default();
         self.repaint_after = None;
     }
@@ -4637,6 +4903,16 @@ impl EditorWindow {
             return false;
         }
         self.asset_listing_dirty = false;
+        // The tree moving means an asset was re-imported or its settings were
+        // edited, so every preview is stale: dropping them is what makes the
+        // tiles render again on the frames that follow (W-0049 Stage 11).
+        self.preview_in_flight.clear();
+        {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+                state.previews.clear();
+            }
+        }
         self.asset_entries = self
             .host
             .host_mut()
@@ -4652,6 +4928,7 @@ impl EditorWindow {
                 },
                 standalone: entry.standalone,
                 has_meta: entry.guid.is_some(),
+                guid: entry.guid.map(|guid| guid.to_string()),
             })
             .collect();
         let types = pill_host::standalone_types(self.host.host_mut().engine_mut().world());
@@ -4726,12 +5003,68 @@ impl EditorWindow {
     /// The application itself is the shared core drain
     /// ([`pill_editor_core::drain::apply_pending`]), so the browser
     /// editor runs exactly this contract; the only executable-owned half is
-    /// the asset listing walk a file batch asks for.
+    /// the asset listing walk a file batch asks for and the reveal requests,
+    /// which only this side can carry out (W-0049 Stage 10).
     fn apply_pending_commands(&mut self) {
+        self.apply_reveals();
         let now_millis = self.started.elapsed().as_millis() as u64;
         let outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
         if outcome.files_changed {
             self.asset_listing_dirty = true;
+        }
+    }
+
+    /// Open the platform's file manager for every queued reveal.
+    ///
+    /// The shell knows the project-relative path; this side knows where the
+    /// project lives and which file manager the OS has, so the request
+    /// crosses as a path and the answer is an OS process. A refusal - no
+    /// mounted directory, a path that left the root or no longer exists - is a
+    /// console line, never a panic.
+    fn apply_reveals(&mut self) {
+        let paths = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<PendingEditorCommands>()
+                .map(|pending| pending.take_reveals())
+                .unwrap_or_default()
+        };
+        if paths.is_empty() {
+            return;
+        }
+        let Some(root) = self
+            .host
+            .host_mut()
+            .asset_directory()
+            .map(std::path::Path::to_path_buf)
+        else {
+            for path in paths {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    path = path.as_str(),
+                    "[editor] reveal refused: the host knows no asset directory"
+                );
+            }
+            return;
+        };
+        for path in paths {
+            match assets::reveal_target(&root, &path) {
+                Ok(target) => {
+                    open_in_file_manager(&target);
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        path = path.as_str(),
+                        target = %target.display(),
+                        "[editor] reveal"
+                    );
+                }
+                Err(message) => warn!(
+                    target: telemetry_target::ENGINE,
+                    path = path.as_str(),
+                    message = message.as_str(),
+                    "[editor] reveal refused"
+                ),
+            }
         }
     }
 
@@ -4811,6 +5144,41 @@ impl EditorWindow {
                 target: telemetry_target::ENGINE,
                 preset = %keymap,
                 "[editor] camera keymap"
+            );
+        }
+        // The gizmo's hit radius is a preference (W-0049): the hover and the
+        // press read this cached value, so one edit moves both.
+        let hit_radius = preferences::gizmo_hit_radius(&self.preferences_document);
+        if (hit_radius - self.gizmo_hit_radius).abs() > f32::EPSILON {
+            self.gizmo_hit_radius = hit_radius;
+            info!(
+                target: telemetry_target::ENGINE,
+                hit_radius,
+                "[editor] gizmo hit radius"
+            );
+        }
+        // Asset previews are the preference's to switch (W-0049 Stage 11):
+        // turning them off drops the images already made, so the tiles go back
+        // to their icons rather than showing a stale picture.
+        let render_previews = previews::render_previews(&self.preferences_document);
+        if render_previews != self.render_previews {
+            self.render_previews = render_previews;
+            if !render_previews {
+                self.preview_in_flight.clear();
+                if let Some(state) = self
+                    .host
+                    .host_mut()
+                    .engine_mut()
+                    .world_mut()
+                    .get_resource_mut::<EguiShellState>()
+                {
+                    state.previews.clear();
+                }
+            }
+            info!(
+                target: telemetry_target::ENGINE,
+                enabled = render_previews,
+                "[editor] asset previews"
             );
         }
         let world = self.host.host_mut().engine_mut().world_mut();
@@ -6372,7 +6740,19 @@ impl EditorWindow {
     }
 
     /// Set the cursor shape egui asked for, when it maps onto one.
-    fn apply_cursor_icon(&self, icon: egui::CursorIcon) {
+    ///
+    /// The resize shapes matter as much as the pointing hand (W-0049): the
+    /// dock reports one over a splitter, and without it the widened grab band
+    /// is invisible to the person dragging it.
+    fn apply_cursor_icon(&mut self, icon: egui::CursorIcon) {
+        if icon != self.last_cursor {
+            info!(
+                target: telemetry_target::ENGINE,
+                icon = format!("{icon:?}").as_str(),
+                "[editor] cursor icon"
+            );
+            self.last_cursor = icon;
+        }
         let shape = match icon {
             egui::CursorIcon::Default => winit::window::CursorIcon::Default,
             egui::CursorIcon::PointingHand => winit::window::CursorIcon::Pointer,
@@ -6380,6 +6760,16 @@ impl EditorWindow {
             egui::CursorIcon::Crosshair => winit::window::CursorIcon::Crosshair,
             egui::CursorIcon::Grab => winit::window::CursorIcon::Grab,
             egui::CursorIcon::Grabbing => winit::window::CursorIcon::Grabbing,
+            egui::CursorIcon::ResizeHorizontal => winit::window::CursorIcon::EwResize,
+            egui::CursorIcon::ResizeVertical => winit::window::CursorIcon::NsResize,
+            egui::CursorIcon::ResizeNeSw => winit::window::CursorIcon::NeswResize,
+            egui::CursorIcon::ResizeNwSe => winit::window::CursorIcon::NwseResize,
+            egui::CursorIcon::ResizeEast => winit::window::CursorIcon::EResize,
+            egui::CursorIcon::ResizeWest => winit::window::CursorIcon::WResize,
+            egui::CursorIcon::ResizeNorth => winit::window::CursorIcon::NResize,
+            egui::CursorIcon::ResizeSouth => winit::window::CursorIcon::SResize,
+            egui::CursorIcon::ResizeColumn => winit::window::CursorIcon::ColResize,
+            egui::CursorIcon::ResizeRow => winit::window::CursorIcon::RowResize,
             _ => return,
         };
         self.window.set_cursor(shape);
@@ -8065,6 +8455,40 @@ fn scaled_view_rect(
     let width = width.min((client_width - x).max(1)) as u32;
     let height = height.min((client_height - y).max(1)) as u32;
     (x, y, width, height)
+}
+
+/// Ask the platform's file manager to show `target`: the file selected beside
+/// its siblings on Windows, the folder opened everywhere else (W-0049
+/// Stage 10).
+///
+/// A spawn the OS refuses is not worth failing a frame over: the caller has
+/// already logged what it asked for, and no window is in a state to report it.
+fn open_in_file_manager(target: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = std::process::Command::new("explorer");
+        if target.is_dir() {
+            command.arg(target);
+        } else {
+            // `explorer` takes the file and its selection switch as one word.
+            command.arg(format!("/select,{}", target.display()));
+        }
+        let _ = command.spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(target)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // The FreeDesktop helper takes a folder: a file's parent is what a
+        // select-in-place request shows on a desktop without `-R`.
+        let folder = target.parent().unwrap_or(target);
+        let _ = std::process::Command::new("xdg-open").arg(folder).spawn();
+    }
 }
 
 // =============================================================================

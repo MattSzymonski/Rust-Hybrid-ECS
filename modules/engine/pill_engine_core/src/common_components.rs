@@ -75,12 +75,16 @@ impl Component for Position {}
 #[derive(Debug, Clone, Copy, PartialEq, PillLayout)]
 pub struct Color {
     /// Red channel.
+    #[pill(color)]
     pub r: f32,
     /// Green channel.
+    #[pill(color)]
     pub g: f32,
     /// Blue channel.
+    #[pill(color)]
     pub b: f32,
     /// Alpha channel.
+    #[pill(color)]
     pub a: f32,
 }
 impl Component for Color {}

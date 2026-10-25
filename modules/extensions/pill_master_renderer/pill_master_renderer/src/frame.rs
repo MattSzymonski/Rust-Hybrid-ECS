@@ -199,7 +199,7 @@ pub(crate) fn consumed_component_names() -> Vec<String> {
 
 /// The resources [`rendering_system`] reads besides the frame, the assets and
 /// the rendering manager, grouped into one parameter because a system takes at
-/// most six.
+/// most seven.
 ///
 /// The one UI producer is here: the slot a game's own UI publishes into
 /// ([`UiFrameSlot`](pill_ui_frame::UiFrameSlot)). A world that never installed one carries no UI.
@@ -210,6 +210,7 @@ type RenderingExtras<'w> = (
     Res<'w, pill_renderer_api::SelectionOutlines>,
     ResMut<'w, pill_renderer_api::PickRequests>,
     ResMut<'w, pill_ui_frame::UiFrameSlot>,
+    ResMut<'w, pill_renderer_api::PreviewRequests>,
 );
 
 /// Which producer filled `RenderFrame.ui` on the last frame, so a change is
@@ -250,8 +251,15 @@ pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
     assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
-    (time, surface_cameras, mut debug_draw, outlines, mut pick_requests, mut ui_slot):
-        RenderingExtras<'_,>,
+    (
+        time,
+        surface_cameras,
+        mut debug_draw,
+        outlines,
+        mut pick_requests,
+        mut ui_slot,
+        mut preview_requests,
+    ): RenderingExtras<'_>,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
     mut objects: Query<(Entity, &TransformComponent, &MeshRendererComponent)>,
 ) -> Result<(), SystemError> {
@@ -307,6 +315,12 @@ pub fn rendering_system(
         .get_mut()
         .map(|mut requests| std::mem::take(&mut requests.pending))
         .unwrap_or_default();
+    // Previews too (W-0049 Stage 11): the renderer draws at most one per
+    // frame, oldest first.
+    frame.preview_requests = preview_requests
+        .get_mut()
+        .map(|mut requests| std::mem::take(&mut requests.pending))
+        .unwrap_or_default();
     frame.instances.clear();
     let world_cameras: Vec<(Entity, CameraComponent, TransformComponent)> = cameras
         .iter_mut()
@@ -357,6 +371,13 @@ pub fn rendering_system(
     // through a world camera never does.
     frame.grid =
         bindings.and_then(|bindings| pill_renderer_api::frame_grid(bindings, bindings.grid));
+    // The editor's views, for the chrome that only belongs on them (W-0049):
+    // the gizmo handles and the selection outlines. The answer is the
+    // view-bound set whether or not the grid is on, so turning the grid off
+    // never moves the gizmo onto the game's surface.
+    frame.editor_views = bindings
+        .map(pill_renderer_api::editor_view_surfaces)
+        .unwrap_or_default();
 
     // The frame's UI, from the world's one producer. A frame slot means the
     // project installed its own egui UI, and then that UI is what the frame

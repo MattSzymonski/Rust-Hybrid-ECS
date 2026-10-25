@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct DirectionalLightComponent {
     /// Linear RGB colour the light emits, one channel per element.
+    #[pill(color)]
     pub color: [f32; 3],
     /// Scalar multiplier applied to each colour channel.
     pub intensity: f32,

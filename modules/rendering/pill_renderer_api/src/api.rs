@@ -234,6 +234,16 @@ pub trait PillRenderer {
     fn take_pick_results(&mut self) -> Vec<crate::PickResult> {
         Vec::new()
     }
+
+    /// Take every preview the GPU has finished since the last call.
+    ///
+    /// A preview is read back frames after it was asked, like a pick, and the
+    /// frontend writes what this returns into the world's
+    /// [`crate::PreviewResults`]. The default answers nothing: a renderer
+    /// without an off-screen preview target (W-0049 Stage 11).
+    fn take_preview_results(&mut self) -> Vec<crate::PreviewImage> {
+        Vec::new()
+    }
 }
 
 /// Stub renderer for frontends that run without a GPU surface.

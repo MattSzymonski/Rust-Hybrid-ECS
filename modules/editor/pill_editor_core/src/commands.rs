@@ -1054,6 +1054,14 @@ impl pill_engine::Resource for CommandInbox {}
 pub struct PendingEditorCommands {
     /// The queued batches, drained by the executable.
     pub batches: Vec<PendingCommandBatch>,
+    /// Asset paths the shell asked the executable to show in the platform's
+    /// file manager, in request order (W-0049 Stage 10).
+    ///
+    /// Not commands: showing a file changes nothing in the world and has
+    /// nothing to undo, and the shell cannot reach the asset root - only the
+    /// executable knows where the project lives and which file manager the OS
+    /// has.
+    pub reveals: Vec<String>,
 }
 
 impl PendingEditorCommands {
@@ -1066,6 +1074,17 @@ impl PendingEditorCommands {
             label: String::new(),
             coalesce_key: None,
         });
+    }
+
+    /// Ask the executable to show `path` (project-relative, below `res`) in
+    /// the platform's file manager.
+    pub fn reveal(&mut self, path: impl Into<String>) {
+        self.reveals.push(path.into());
+    }
+
+    /// Take the reveal requests waiting for the executable's OS half.
+    pub fn take_reveals(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.reveals)
     }
 
     /// Queue an edit the history should record as one undo step.

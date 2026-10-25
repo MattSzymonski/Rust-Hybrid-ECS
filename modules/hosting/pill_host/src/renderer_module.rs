@@ -407,6 +407,10 @@ impl PillRenderer for ModuleRenderer {
     fn take_pick_results(&mut self) -> Vec<pill_renderer_api::PickResult> {
         self.backend_mut().take_pick_results()
     }
+
+    fn take_preview_results(&mut self) -> Vec<pill_renderer_api::PreviewImage> {
+        self.backend_mut().take_preview_results()
+    }
 }
 
 impl Drop for ModuleRenderer {

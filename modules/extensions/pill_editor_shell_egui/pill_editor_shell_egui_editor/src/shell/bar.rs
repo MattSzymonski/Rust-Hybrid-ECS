@@ -249,12 +249,20 @@ pub fn run_menu_action(
 }
 
 /// The About window: the mark, the editor's name and the shell's version.
-pub fn about_window(context: &egui::Context, mark: &egui::TextureHandle, open: &mut bool) {
+///
+/// Its rectangle joins the frame's overlay regions while it is open (W-0049),
+/// so a click on it is the UI's and never a scene pick.
+pub fn about_window(
+    context: &egui::Context,
+    mark: &egui::TextureHandle,
+    open: &mut bool,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
     if !*open {
         return;
     }
     let mut opened = *open;
-    egui::Window::new("About Pill Editor")
+    let window = egui::Window::new("About Pill Editor")
         .open(&mut opened)
         .collapsible(false)
         .resizable(false)
@@ -270,5 +278,8 @@ pub fn about_window(context: &egui::Context, mark: &egui::TextureHandle, open: &
                 });
             });
         });
+    if let Some(window) = window {
+        claim_pointer(window.response.rect, overlay_regions);
+    }
     *open = opened;
 }

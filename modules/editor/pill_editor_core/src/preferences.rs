@@ -47,11 +47,21 @@ pub struct PreferenceField {
 }
 
 /// The editable rows, in the order the tab draws them.
-pub const PREFERENCE_FIELDS: [PreferenceField; 8] = [
+pub const PREFERENCE_FIELDS: [PreferenceField; 10] = [
     PreferenceField {
         key: "keymap_preset",
         label: "keymap preset",
         fallback: "",
+    },
+    PreferenceField {
+        key: crate::previews::RENDER_PREVIEWS_KEY,
+        label: "render asset previews",
+        fallback: "false",
+    },
+    PreferenceField {
+        key: "editor.gizmo_hit_radius",
+        label: "gizmo hit radius",
+        fallback: "0.07",
     },
     PreferenceField {
         key: "code_editor_command",
@@ -105,6 +115,38 @@ pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
         _ => KeymapPreset::default(),
     }
 }
+
+/// The gizmo handle's hit radius the file asks for, as a multiplier on the
+/// handle length (W-0049).
+///
+/// The hover test and the press both read this one number, so a handle that
+/// highlights under the pointer is a handle a press grabs. A missing, blank
+/// or unparsable value keeps the default, and a value outside
+/// [`GIZMO_HIT_RADIUS_RANGE`] is clamped rather than trusted: a zero radius
+/// would make the gizmo ungrabbable.
+pub fn gizmo_hit_radius(document: &Map<String, Value>) -> f32 {
+    let value = match lookup(document, GIZMO_HIT_RADIUS_KEY) {
+        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
+        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
+        _ => None,
+    };
+    value
+        .filter(|radius| radius.is_finite())
+        .unwrap_or(GIZMO_HIT_RADIUS_DEFAULT)
+        .clamp(GIZMO_HIT_RADIUS_RANGE.0, GIZMO_HIT_RADIUS_RANGE.1)
+}
+
+/// The preference key the gizmo's hit radius lives under.
+pub const GIZMO_HIT_RADIUS_KEY: &str = "editor.gizmo_hit_radius";
+
+/// The hit radius used when the file says nothing: about the width the
+/// overlay draws a handle's line with.
+pub const GIZMO_HIT_RADIUS_DEFAULT: f32 = 0.07;
+
+/// The range a file's hit radius is clamped into, as multipliers on the
+/// handle length: tight enough to still mean a handle, wide enough to grab
+/// from.
+pub const GIZMO_HIT_RADIUS_RANGE: (f32, f32) = (0.01, 0.35);
 
 /// The file's current values as the tab shows them.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -269,6 +311,33 @@ mod tests {
         assert_eq!(parse_value("true"), serde_json::json!(true));
         assert_eq!(parse_value("code ."), serde_json::json!("code ."));
         assert_eq!(parse_value(""), serde_json::json!(""));
+    }
+
+    #[test]
+    fn the_gizmo_hit_radius_reads_numbers_strings_and_clamps() {
+        let mut document = Map::new();
+        // Absent: the default.
+        assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_DEFAULT);
+        // A number and a numeric string both read.
+        set_key(&mut document, GIZMO_HIT_RADIUS_KEY, serde_json::json!(0.12)).unwrap();
+        assert_eq!(gizmo_hit_radius(&document), 0.12);
+        set_key(
+            &mut document,
+            GIZMO_HIT_RADIUS_KEY,
+            serde_json::json!("0.2"),
+        )
+        .unwrap();
+        assert_eq!(gizmo_hit_radius(&document), 0.2);
+        // A value outside the range is clamped, and junk keeps the default.
+        set_key(&mut document, GIZMO_HIT_RADIUS_KEY, serde_json::json!(40.0)).unwrap();
+        assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_RANGE.1);
+        set_key(
+            &mut document,
+            GIZMO_HIT_RADIUS_KEY,
+            serde_json::json!("wide"),
+        )
+        .unwrap();
+        assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_DEFAULT);
     }
 
     #[test]

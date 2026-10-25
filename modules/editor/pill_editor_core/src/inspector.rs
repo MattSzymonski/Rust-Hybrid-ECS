@@ -90,6 +90,22 @@ pub fn component_icon(type_name: &str) -> Icon {
     }
 }
 
+/// The duotone icon a scene badge draws for an entity (W-0049 Stage 12): the
+/// camera mark for something that can see, the light mark for something that
+/// shines, and nothing for everything else - which draws as a plain circle.
+///
+/// The label is the component list the Hierarchy row already carries, so a new
+/// component type gains a badge by naming it here and nowhere else.
+pub fn badge_icon(archetype_label: &str) -> Option<Icon> {
+    if archetype_label.contains("Camera") {
+        Some(Icon::MonitorPlay)
+    } else if archetype_label.contains("Light") {
+        Some(Icon::Power)
+    } else {
+        None
+    }
+}
+
 /// The widget a value's kind asks for.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FieldWidget {
@@ -180,7 +196,9 @@ pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -
             FieldDecorator::HideInInspector
             | FieldDecorator::Header(_)
             | FieldDecorator::Space(_)
-            | FieldDecorator::Tooltip(_) => {}
+            | FieldDecorator::Tooltip(_)
+            | FieldDecorator::Color
+            | FieldDecorator::Vector => {}
         }
     }
     if let Some((min, max)) = range {
@@ -204,6 +222,34 @@ pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -
 
 /// How many side-by-side elements a vector row holds at most: X, Y, Z, W.
 pub const VECTOR_AXES_MAX: usize = 4;
+
+/// The channel suffixes a colour row reads, in order (W-0049).
+pub const COLOR_CHANNELS: [&str; 4] = ["r", "g", "b", "a"];
+
+/// The axis suffixes a grouped vector row reads, in order.
+pub const VECTOR_AXES: [&str; 4] = ["x", "y", "z", "w"];
+
+/// How many channels a colour row needs at least: red, green and blue.
+pub const COLOR_CHANNELS_MIN: usize = 3;
+
+/// The shortest grouped vector row: two axes.
+pub const VECTOR_AXES_MIN: usize = 2;
+
+/// One writable leaf of a grouped row.
+///
+/// A leaf is one field, or one element inside a field's array value: a colour
+/// held as `[f32; 4]` writes `SetArrayElement` four times, one held as four
+/// scalar fields writes `SetField` four times. Either way the row's commit is
+/// one recorded step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowLeaf {
+    /// The field's position in the component's field list (the value's, too).
+    pub index: usize,
+    /// The field's registered name, which the edit names.
+    pub field: String,
+    /// The element inside the field's array value, when the field is one.
+    pub element: Option<usize>,
+}
 
 /// One row of a component section.
 #[derive(Clone, Debug, PartialEq)]
@@ -268,6 +314,30 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
+    /// A colour (W-0049): one swatch whose popup holds the picker. Its leaves
+    /// are the channels, whether they are one array field's elements or one
+    /// scalar field each.
+    Color {
+        /// The channels the row writes, in R/G/B[/A] order.
+        leaves: Vec<RowLeaf>,
+        /// The name the row labels itself with.
+        field: String,
+        /// Text a channel's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
+    /// A vector assembled from consecutive leaves that share a dotted prefix
+    /// and a `#[pill(vector)]` decorator: one row of X/Y/Z side-by-side
+    /// numeric fields, as a `[f32; 3]` field already draws (W-0049).
+    VectorGroup {
+        /// The axes the row writes, in X/Y/Z[/W] order.
+        leaves: Vec<RowLeaf>,
+        /// The element widgets' kind.
+        widget: FieldWidget,
+        /// The name the row labels itself with.
+        field: String,
+        /// Text a leaf's `[Tooltip]` declared, shown on hover of the label.
+        tooltip: Option<String>,
+    },
     /// A field shown read-only (a long array, a list, an opaque value).
     ReadOnly {
         /// The field's position in the component's field list.
@@ -291,12 +361,14 @@ pub enum FieldRow {
 /// order, and `[Tooltip]` rides on the field's row.
 pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
     let mut rows = Vec::new();
-    for (index, (descriptor, value)) in component
-        .fields
-        .iter()
-        .zip(component.values.iter())
-        .enumerate()
-    {
+    let mut index = 0;
+    while index < component.fields.len() {
+        let Some(descriptor) = component.fields.get(index) else {
+            break;
+        };
+        let Some(value) = component.values.get(index) else {
+            break;
+        };
         // A hidden field takes its decorations with it: drawing a header over
         // nothing would be worse than drawing nothing at all.
         if descriptor
@@ -304,6 +376,7 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
             .iter()
             .any(|decorator| matches!(decorator, FieldDecorator::HideInInspector))
         {
+            index += 1;
             continue;
         }
         let mut tooltip: Option<String> = None;
@@ -318,11 +391,47 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
                 | FieldDecorator::Range { .. }
                 | FieldDecorator::TextArea { .. }
                 | FieldDecorator::Multiline(_)
-                | FieldDecorator::Min(_) => {}
+                | FieldDecorator::Min(_)
+                | FieldDecorator::Color
+                | FieldDecorator::Vector => {}
             }
+        }
+        // A run of scalar leaves sharing a dotted prefix and a grouping
+        // decorator draws as one row: a colour's channels or a vector's axes
+        // (W-0049). The run decides the row, so a nested struct the world
+        // flattened at registration reads as the value it is.
+        if let Some((row, consumed)) = grouped_row(component, index, tooltip.clone()) {
+            rows.push(row);
+            index += consumed;
+            continue;
         }
         let widget = widget_for_decorated(value, descriptor.decorators.as_ref());
         let row = match value {
+            FieldValue::Array(elements)
+                if (COLOR_CHANNELS_MIN..=VECTOR_AXES_MAX).contains(&elements.len())
+                    && elements.iter().all(|element| {
+                        matches!(
+                            widget_for(element),
+                            FieldWidget::Integer | FieldWidget::Float
+                        )
+                    })
+                    && descriptor
+                        .decorators
+                        .iter()
+                        .any(|decorator| matches!(decorator, FieldDecorator::Color)) =>
+            {
+                FieldRow::Color {
+                    leaves: (0..elements.len())
+                        .map(|element| RowLeaf {
+                            index,
+                            field: descriptor.name.to_string(),
+                            element: Some(element),
+                        })
+                        .collect(),
+                    field: descriptor.name.to_string(),
+                    tooltip,
+                }
+            }
             FieldValue::Array(elements)
                 if (2..=VECTOR_AXES_MAX).contains(&elements.len())
                     && elements.iter().all(|element| {
@@ -368,8 +477,128 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
             },
         };
         rows.push(row);
+        index += 1;
     }
     rows
+}
+
+/// The grouped row that starts at `start`, with how many fields it consumed.
+///
+/// A colour wins over a vector: a field marked both reads as the colour it
+/// most likely is, and a group's first suffix decides which run is even
+/// possible.
+fn grouped_row(
+    component: &ComponentView,
+    start: usize,
+    tooltip: Option<String>,
+) -> Option<(FieldRow, usize)> {
+    if let Some(leaves) = channel_run(
+        component,
+        start,
+        &COLOR_CHANNELS,
+        &FieldDecorator::Color,
+        COLOR_CHANNELS_MIN,
+    ) {
+        let consumed = leaves.len();
+        let field = grouped_label(component, start, "color");
+        return Some((
+            FieldRow::Color {
+                leaves,
+                field,
+                tooltip,
+            },
+            consumed,
+        ));
+    }
+    let leaves = channel_run(
+        component,
+        start,
+        &VECTOR_AXES,
+        &FieldDecorator::Vector,
+        VECTOR_AXES_MIN,
+    )?;
+    let consumed = leaves.len();
+    let field = grouped_label(component, start, "vector");
+    let widget = component
+        .values
+        .get(start)
+        .map(widget_for)
+        .unwrap_or(FieldWidget::Float);
+    Some((
+        FieldRow::VectorGroup {
+            leaves,
+            widget,
+            field,
+            tooltip,
+        },
+        consumed,
+    ))
+}
+
+/// The name a grouped row labels itself with: the dotted prefix its leaves
+/// share, or the row's kind when they have none (the `Color` component's own
+/// channels are `r`, `g`, `b`, `a`, with no prefix to name).
+fn grouped_label(component: &ComponentView, start: usize, kind: &str) -> String {
+    match component
+        .fields
+        .get(start)
+        .map(|field| leaf_parts(field.name))
+    {
+        Some((prefix, _)) if !prefix.is_empty() => prefix.to_string(),
+        _ => kind.to_string(),
+    }
+}
+
+/// The dotted prefix and last segment of a leaf field's name: `fill.g` is
+/// (`fill`, `g`), and a bare `g` is (`""`, `g`).
+pub fn leaf_parts(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot) => (&name[..dot], &name[dot + 1..]),
+        None => ("", name),
+    }
+}
+
+/// A run of consecutive scalar leaves from `start` that are the channels of
+/// one grouped row: the same dotted prefix, the suffixes of `suffixes` in
+/// order, each carrying `decorator` and holding a numeric value.
+///
+/// The run stops at the first leaf that does not match, and one shorter than
+/// `minimum` is not a row at all - a `fill.r` with no `fill.g` is just a float.
+fn channel_run(
+    component: &ComponentView,
+    start: usize,
+    suffixes: &[&str],
+    decorator: &FieldDecorator,
+    minimum: usize,
+) -> Option<Vec<RowLeaf>> {
+    let first = component.fields.get(start)?;
+    let (prefix, first_suffix) = leaf_parts(first.name);
+    if first_suffix != suffixes[0] || !first.decorators.contains(decorator) {
+        return None;
+    }
+    let mut leaves = Vec::new();
+    for (offset, suffix) in suffixes.iter().enumerate() {
+        let Some(descriptor) = component.fields.get(start + offset) else {
+            break;
+        };
+        let Some(value) = component.values.get(start + offset) else {
+            break;
+        };
+        let (prefix_here, suffix_here) = leaf_parts(descriptor.name);
+        if prefix_here != prefix
+            || suffix_here != *suffix
+            || !descriptor.decorators.contains(decorator)
+            || !matches!(widget_for(value), FieldWidget::Integer | FieldWidget::Float)
+        {
+            break;
+        }
+        leaves.push(RowLeaf {
+            index: start + offset,
+            field: descriptor.name.to_string(),
+            element: None,
+        });
+    }
+    (leaves.len() >= minimum).then_some(leaves)
 }
 
 /// The axis label a vector row shows for element `index`: `X`, `Y`, `Z`, `W`.
@@ -662,6 +891,42 @@ pub fn element_field(value: &FieldValue, index: usize) -> Option<FieldValue> {
         return None;
     };
     elements.get(index).cloned()
+}
+
+/// One recorded batch writing every leaf of a grouped row (W-0049): the colour
+/// or vector a row draws, across the whole selection, as one undo step.
+///
+/// `values` holds one value per leaf, in the row's own order. The label and the
+/// coalesce key both name the first leaf, so a colour reads as one edit of one
+/// field however many channels and entities it wrote.
+pub fn selection_leaf_edit(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    leaves: &[RowLeaf],
+    values: &[FieldValue],
+) -> (Vec<EditorCommand>, String, String) {
+    let mut commands = Vec::with_capacity(targets.len() * leaves.len());
+    for target in targets {
+        for (leaf, value) in leaves.iter().zip(values) {
+            let command = match leaf.element {
+                Some(element) => {
+                    element_edit(*target, component, &leaf.field, element, value.clone()).0
+                }
+                None => field_edit(*target, component, &leaf.field, value.clone()).0,
+            };
+            commands.push(command);
+        }
+    }
+    let label = match leaves.first() {
+        Some(leaf) => format!("set {}.{}", short_component_name(component), leaf.field),
+        None => format!("set {}", short_component_name(component)),
+    };
+    let key = leaves
+        .first()
+        .map(|leaf| field_coalesce_key(primary, component, &leaf.field))
+        .unwrap_or_default();
+    (commands, label, key)
 }
 
 /// Parse an edited text back into the kind `current` already holds.
@@ -1576,6 +1841,7 @@ mod tests {
             kind: kind.to_owned(),
             standalone: false,
             has_meta: true,
+            guid: None,
         };
         let assets = vec![
             listing("models", "folder"),
@@ -1690,5 +1956,262 @@ mod tests {
         ));
         assert!(is_cleared_reference(" none "));
         assert!(!is_cleared_reference("models/cube.obj"));
+    }
+
+    /// A component whose fields carry their own names and decorations, for the
+    /// grouped-row tests: a nested type's leaves are dotted, so the fixture
+    /// has to name them.
+    fn named_fields(
+        entries: Vec<(&'static str, FieldValue, Vec<FieldDecorator>)>,
+    ) -> ComponentView {
+        ComponentView {
+            asset_labels: Vec::new(),
+            entity_labels: Vec::new(),
+            type_name: "demo::Grouped".to_string(),
+            persistable: false,
+            editable: true,
+            fields: entries
+                .iter()
+                .map(|(name, _, decorators)| {
+                    pill_engine::component_registry::ComponentFieldDescriptor {
+                        name,
+                        type_tag: "f32",
+                        offset: 0,
+                        size: 4,
+                        align: 4,
+                        element_count: 0,
+                        decorators: std::borrow::Cow::Owned(decorators.clone()),
+                    }
+                })
+                .collect(),
+            values: entries.into_iter().map(|(_, value, _)| value).collect(),
+        }
+    }
+
+    /// The `Color` component's four channels are one colour row: `r`, `g`,
+    /// `b` and `a` share a (empty) prefix and carry the colour decorator.
+    #[test]
+    fn a_colour_components_channels_draw_as_one_colour_row() {
+        let colour = |value: f32| {
+            vec![
+                ("r", FieldValue::F32(value), vec![FieldDecorator::Color]),
+                ("g", FieldValue::F32(value), vec![FieldDecorator::Color]),
+                ("b", FieldValue::F32(value), vec![FieldDecorator::Color]),
+                ("a", FieldValue::F32(1.0), vec![FieldDecorator::Color]),
+            ]
+        };
+        let view = named_fields(colour(0.5));
+        assert_eq!(
+            rows(&view),
+            vec![FieldRow::Color {
+                leaves: vec![
+                    RowLeaf {
+                        index: 0,
+                        field: "r".to_string(),
+                        element: None,
+                    },
+                    RowLeaf {
+                        index: 1,
+                        field: "g".to_string(),
+                        element: None,
+                    },
+                    RowLeaf {
+                        index: 2,
+                        field: "b".to_string(),
+                        element: None,
+                    },
+                    RowLeaf {
+                        index: 3,
+                        field: "a".to_string(),
+                        element: None,
+                    },
+                ],
+                field: "color".to_string(),
+                tooltip: None,
+            }]
+        );
+    }
+
+    /// A nested struct's leaves (`fill.r`, `fill.g`, `fill.b`) collapse into
+    /// one colour row, and the field after them keeps its own row.
+    #[test]
+    fn dotted_colour_leaves_collapse_into_one_row() {
+        let view = named_fields(vec![
+            ("fill.r", FieldValue::F32(1.0), vec![FieldDecorator::Color]),
+            ("fill.g", FieldValue::F32(0.5), vec![FieldDecorator::Color]),
+            ("fill.b", FieldValue::F32(0.25), vec![FieldDecorator::Color]),
+            ("strength", FieldValue::F32(2.0), Vec::new()),
+        ]);
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::Color {
+                    leaves: vec![
+                        RowLeaf {
+                            index: 0,
+                            field: "fill.r".to_string(),
+                            element: None,
+                        },
+                        RowLeaf {
+                            index: 1,
+                            field: "fill.g".to_string(),
+                            element: None,
+                        },
+                        RowLeaf {
+                            index: 2,
+                            field: "fill.b".to_string(),
+                            element: None,
+                        },
+                    ],
+                    field: "fill".to_string(),
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 3,
+                    field: "strength".to_string(),
+                    widget: FieldWidget::Float,
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    /// Two dotted leaves marked as a vector draw as one vector row, and a lone
+    /// channel without its partner stays a plain field.
+    #[test]
+    fn dotted_vector_leaves_collapse_into_one_row() {
+        let view = named_fields(vec![
+            (
+                "point.x",
+                FieldValue::F32(1.0),
+                vec![FieldDecorator::Vector],
+            ),
+            (
+                "point.y",
+                FieldValue::F32(2.0),
+                vec![FieldDecorator::Vector],
+            ),
+            (
+                "point.z",
+                FieldValue::F32(3.0),
+                vec![FieldDecorator::Vector],
+            ),
+            (
+                "stray.x",
+                FieldValue::F32(4.0),
+                vec![FieldDecorator::Vector],
+            ),
+        ]);
+        assert_eq!(
+            rows(&view),
+            vec![
+                FieldRow::VectorGroup {
+                    leaves: vec![
+                        RowLeaf {
+                            index: 0,
+                            field: "point.x".to_string(),
+                            element: None,
+                        },
+                        RowLeaf {
+                            index: 1,
+                            field: "point.y".to_string(),
+                            element: None,
+                        },
+                        RowLeaf {
+                            index: 2,
+                            field: "point.z".to_string(),
+                            element: None,
+                        },
+                    ],
+                    widget: FieldWidget::Float,
+                    field: "point".to_string(),
+                    tooltip: None,
+                },
+                FieldRow::Single {
+                    index: 3,
+                    field: "stray.x".to_string(),
+                    widget: FieldWidget::Float,
+                    tooltip: None,
+                },
+            ]
+        );
+    }
+
+    /// A `[f32; 3]` field that declares the colour decorator draws as one
+    /// colour row whose leaves are the array's own elements.
+    #[test]
+    fn a_colour_array_draws_one_colour_row() {
+        let view = decorated(
+            vec![FieldValue::Array(vec![
+                FieldValue::F32(1.0),
+                FieldValue::F32(0.0),
+                FieldValue::F32(0.0),
+            ])],
+            vec![vec![FieldDecorator::Color]],
+        );
+        assert_eq!(
+            rows(&view),
+            vec![FieldRow::Color {
+                leaves: vec![
+                    RowLeaf {
+                        index: 0,
+                        field: "a".to_string(),
+                        element: Some(0),
+                    },
+                    RowLeaf {
+                        index: 0,
+                        field: "a".to_string(),
+                        element: Some(1),
+                    },
+                    RowLeaf {
+                        index: 0,
+                        field: "a".to_string(),
+                        element: Some(2),
+                    },
+                ],
+                field: "a".to_string(),
+                tooltip: None,
+            }]
+        );
+    }
+
+    /// A grouped row's commit writes every channel and every selected entity,
+    /// as one batch under one label.
+    #[test]
+    fn a_grouped_row_edit_writes_every_channel_in_one_batch() {
+        let first = Entity::from_raw(1, 0);
+        let second = Entity::from_raw(2, 0);
+        let leaves = vec![
+            RowLeaf {
+                index: 0,
+                field: "fill.r".to_string(),
+                element: None,
+            },
+            RowLeaf {
+                index: 1,
+                field: "fill.g".to_string(),
+                element: None,
+            },
+            RowLeaf {
+                index: 2,
+                field: "fill.b".to_string(),
+                element: None,
+            },
+        ];
+        let values = vec![
+            FieldValue::F32(0.1),
+            FieldValue::F32(0.2),
+            FieldValue::F32(0.3),
+        ];
+        let (commands, label, key) =
+            selection_leaf_edit(&[first, second], first, "demo::Grouped", &leaves, &values);
+        assert_eq!(label, "set Grouped.fill.r");
+        assert_eq!(key, field_coalesce_key(first, "demo::Grouped", "fill.r"));
+        assert_eq!(commands.len(), 6, "three channels on two entities");
+        assert!(matches!(
+            &commands[5],
+            EditorCommand::SetField { entity, field, .. }
+                if *entity == second && field == "fill.b"
+        ));
     }
 }

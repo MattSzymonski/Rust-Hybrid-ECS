@@ -37,25 +37,16 @@ pub fn component_menu_items(
     ui.menu_button(
         icons::rich(icons::Icon::PlusCircle, "Add Component"),
         |ui| {
-            for registered in snapshot
-                .components
-                .iter()
-                .filter(|registered| registered.addable)
-            {
-                let attached = detail
-                    .components
-                    .iter()
-                    .any(|component| component.type_name == registered.type_name);
-                if attached {
-                    continue;
-                }
-                let short = inspector::short_component_name(&registered.type_name);
+            // The same list the Inspector's Add popup offers (W-0049
+            // Stage 9): one rule decides what is addable, so the menu and the
+            // popup cannot disagree about a component the entity carries.
+            for type_name in addable_components(snapshot, detail) {
+                let short = inspector::short_component_name(type_name);
                 if ui
                     .add(icons::IconButton::new(icons::Icon::PlusCircle, short))
                     .clicked()
                 {
-                    let (command, label) =
-                        inspector::component_add(detail.entity, &registered.type_name);
+                    let (command, label) = inspector::component_add(detail.entity, type_name);
                     pending.push_recorded(vec![command], label, None);
                     ui.close();
                 }

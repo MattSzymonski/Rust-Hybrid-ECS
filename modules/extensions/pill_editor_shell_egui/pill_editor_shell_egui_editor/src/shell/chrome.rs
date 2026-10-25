@@ -166,6 +166,22 @@ pub fn log_context_menu(area: &str) {
     );
 }
 
+/// Claim one floating surface's rectangle for the UI (W-0049).
+///
+/// Every surface the shell draws outside the tab viewer - the create and
+/// rename dialog, the About window, a picker popup under a field, a menu -
+/// pushes its rectangle through here, so a press inside it is the UI's and
+/// never a scene pick. One helper, so a new floating surface cannot forget the
+/// rule.
+pub fn claim_pointer(rect: egui::Rect, regions: &mut Vec<ShellRect>) {
+    regions.push(ShellRect {
+        x: rect.min.x,
+        y: rect.min.y,
+        width: rect.width(),
+        height: rect.height(),
+    });
+}
+
 /// Add an open context menu's rectangle to the frame's overlay regions: a
 /// menu floats over whatever it was opened on (a clamped menu can hang over
 /// the scene viewport), and a click inside it must never reach the scene
@@ -175,14 +191,41 @@ pub fn log_context_menu(area: &str) {
 /// its own rectangle through the `TabViewer` hook.
 pub fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut Vec<ShellRect>) {
     if let Some(menu) = opened {
-        let rect = menu.response.rect;
-        regions.push(ShellRect {
-            x: rect.min.x,
-            y: rect.min.y,
-            width: rect.width(),
-            height: rect.height(),
-        });
+        claim_pointer(menu.response.rect, regions);
     }
+}
+
+/// Open a floating popup under an anchor rectangle, and claim its area
+/// (W-0049 Stage 8).
+///
+/// A picker draws in a foreground `Area` anchored under the field it belongs
+/// to, so it floats over the rows below instead of pushing them down, and
+/// its rectangle joins the frame's overlay regions, so a click inside it never
+/// becomes a scene pick.
+///
+/// # Errors
+///
+/// Nothing: the popup is pure UI. It returns the area's response, so the
+/// caller can tell whether a press landed outside it.
+pub fn floating_popup(
+    ui: &egui::Ui,
+    id: egui::Id,
+    anchor: egui::Rect,
+    width: f32,
+    regions: &mut Vec<ShellRect>,
+    contents: &mut dyn FnMut(&mut egui::Ui),
+) -> egui::InnerResponse<()> {
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::pos2(anchor.left(), anchor.bottom() + 2.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(width);
+                contents(ui);
+            });
+        });
+    claim_pointer(area.response.rect, regions);
+    area
 }
 
 /// Open a panel's context menu on a secondary click: the area is logged once

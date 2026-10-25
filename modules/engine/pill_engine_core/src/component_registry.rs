@@ -70,6 +70,13 @@ pub enum FieldDecorator {
     /// Unity's `[Min(value)]`: a numeric field's drag value never goes below
     /// the minimum.
     Min(f32),
+    /// W-0049: the field is a colour. An array of three or four numbers draws
+    /// as one colour row with a popup picker, and consecutive scalar leaves
+    /// sharing a dotted prefix (a nested `Color`, say) collapse into one.
+    Color,
+    /// W-0049: consecutive scalar leaves sharing a dotted prefix draw as one
+    /// vector row - X/Y/Z/W side by side - instead of one row each.
+    Vector,
 }
 
 /// One named field of a `#[derive(PillComponent)]` component or a

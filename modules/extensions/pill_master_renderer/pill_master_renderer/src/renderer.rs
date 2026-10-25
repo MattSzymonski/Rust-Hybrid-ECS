@@ -460,6 +460,10 @@ impl PillRenderer for Renderer {
             }
         }
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
+        // One asset preview, when an editor asked for one (W-0049 Stage 11):
+        // its own encoder and submission, after the frame's surfaces, so it
+        // never delays a presented frame.
+        record_preview(self, frame, assets_manager);
         Ok(FrameOutcome::Presented)
     }
 
@@ -618,6 +622,109 @@ impl PillRenderer for Renderer {
     fn take_pick_results(&mut self) -> Vec<pill_renderer_api::PickResult> {
         self.state.overlay.take_results(&self.state.device)
     }
+
+    fn take_preview_results(&mut self) -> Vec<pill_renderer_api::PreviewImage> {
+        self.state.preview.collect(&self.state.device)
+    }
+}
+
+/// Draw one asset preview, when the frame asked for one and the last one has
+/// been handed over (W-0049 Stage 11).
+///
+/// A texture is drawn from the GPU texture the asset sync already uploaded; a
+/// material is a sphere in the first colour parameter the material declares. A
+/// mesh has no preview yet - it needs the mesh pipeline's vertex layout, depth
+/// and a camera - so its request is answered by nothing, which leaves the
+/// tile's type icon in place.
+///
+/// Its own encoder and submission, after the frame's surfaces: a preview never
+/// delays a presented frame, and the readback is mapped once this submission
+/// is in.
+fn record_preview(renderer: &mut Renderer, frame: &RenderFrame, assets_manager: &AssetManager) {
+    let Some(request) = frame.preview_requests.first() else {
+        return;
+    };
+    if !renderer.state.preview.ready() {
+        return;
+    }
+    let id = request.id;
+    if let Err(reason) = draw_preview(renderer, request, assets_manager) {
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            id,
+            reason,
+            "[preview] not drawn"
+        );
+    }
+}
+
+/// Draw one preview, naming what stopped it when it cannot be drawn.
+fn draw_preview(
+    renderer: &mut Renderer,
+    request: &pill_renderer_api::PreviewRequest,
+    assets_manager: &AssetManager,
+) -> std::result::Result<(), &'static str> {
+    // What the fragment shader draws, and the source it samples: a texture
+    // file decoded here, or the preview's own white texture for a material.
+    let (mode, color, source) = match &request.asset {
+        pill_renderer_api::PreviewAsset::Texture { path } => {
+            let source = renderer
+                .state
+                .preview
+                .texture(&renderer.state.device, &renderer.state.queue, path)
+                .ok_or("the texture file could not be decoded")?;
+            (
+                crate::preview::PreviewMode::Texture,
+                [1.0f32; 4],
+                Some(source),
+            )
+        }
+        pill_renderer_api::PreviewAsset::Material { guid } => {
+            let color = pill_engine::AssetGuid::parse(guid)
+                .and_then(|guid| {
+                    assets_manager
+                        .get_by_guid::<crate::assets::Material>(guid)
+                        .and_then(|material| {
+                            material
+                                .parameters
+                                .values()
+                                .find_map(|parameter| match parameter {
+                                    pill_renderer_api::MaterialParameter::Color(color) => {
+                                        Some([color[0], color[1], color[2], 1.0])
+                                    }
+                                    _ => None,
+                                })
+                        })
+                })
+                .unwrap_or([0.72, 0.72, 0.72, 1.0]);
+            (crate::preview::PreviewMode::Material, color, None)
+        }
+        pill_renderer_api::PreviewAsset::Mesh { .. } => {
+            return Err("mesh previews are not drawn yet, so mesh tiles keep their icon");
+        }
+    };
+    let mut encoder =
+        renderer
+            .state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview_encoder"),
+            });
+    renderer.state.preview.record(
+        &renderer.state.device,
+        &renderer.state.queue,
+        &mut encoder,
+        request.id,
+        mode,
+        color,
+        source,
+    );
+    renderer
+        .state
+        .queue
+        .submit(std::iter::once(encoder.finish()));
+    renderer.state.preview.after_submit();
+    Ok(())
 }
 
 /// The wgpu objects behind a [`Renderer`]: device, surface, and frame state.
@@ -662,6 +769,9 @@ pub struct State {
     pub(crate) adapter: wgpu::Adapter,
     /// Debug drawing, outlines and picking, drawn over every surface's chain.
     pub(crate) overlay: Overlay,
+    /// The asset preview path: one small off-screen render per request, read
+    /// back between frames (W-0049 Stage 11).
+    pub(crate) preview: crate::preview::PreviewRenderer,
     /// The UI painter: the game's UI and the debug labels, over every
     /// surface's overlay. Its pipeline is tied to the surface's colour format
     /// (Stage 12), and the debug font is registered in it from the start.
@@ -714,6 +824,7 @@ impl State {
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
         let gpu_profiler = create_gpu_profiler(&device, &queue, surface.backend());
+        let preview = crate::preview::PreviewRenderer::new(&device);
         Ok(Self {
             renderer_resource_storage,
             surface,
@@ -729,6 +840,7 @@ impl State {
             instance,
             adapter,
             overlay,
+            preview,
             ui_renderer,
             frames_since_ui_report: 0,
         })

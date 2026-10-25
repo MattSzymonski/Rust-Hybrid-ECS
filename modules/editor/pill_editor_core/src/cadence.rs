@@ -7,6 +7,13 @@
 //! - Decide whether the loop draws at once or sleeps for the idle poll.
 //! - Count the frames it drew, how many of them were demanded, and how often
 //!   it waited.
+//!
+//! # Rules
+//!
+//! A frame is drawn at once when input, a scripted command, a changed
+//! snapshot or a resize owes one, when egui asked for a repaint, or while
+//! something is moving. Only a settled editor sleeps for [`IDLE_POLL`], so a
+//! running project draws at the display rate and an idle one stops drawing.
 //! - Read `PILL_EDITOR_CONTINUOUS_REDRAW`, the switch that restores the
 //!   always-draw posture a profile or a suite wants.
 //!
@@ -147,10 +154,11 @@ impl Cadence {
     /// Decide when to draw next.
     ///
     /// A continuous cadence always draws at once. Otherwise the frame's own
-    /// evidence decides: an urgent reason or egui's own repaint request draws
-    /// now, and no reason at all sleeps for [`IDLE_POLL`].
+    /// evidence decides: an urgent reason, egui's own repaint request, or
+    /// something still moving draws now, and a settled frame sleeps for
+    /// [`IDLE_POLL`].
     pub fn decide(&self, demand: FrameDemand) -> FrameWake {
-        if self.continuous || demand.urgent() || demand.repaint_requested {
+        if self.continuous || demand.urgent() || demand.animating || demand.repaint_requested {
             FrameWake::Immediate
         } else {
             FrameWake::After(IDLE_POLL)
@@ -220,15 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_demand_makes_an_animation_reason_urgent() {
+    fn something_moving_draws_at_once() {
         let demand = FrameDemand {
             animating: true,
             ..FrameDemand::default()
         };
         assert!(demand.any());
-        assert!(!demand.urgent());
         let cadence = Cadence::new(false);
-        assert_eq!(cadence.decide(demand), FrameWake::After(IDLE_POLL));
+        assert_eq!(cadence.decide(demand), FrameWake::Immediate);
     }
 
     #[test]

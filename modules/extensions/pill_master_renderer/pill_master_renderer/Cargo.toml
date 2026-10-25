@@ -27,6 +27,10 @@ miette = { version = "7", features = ["derive"] }
 glam = { version = "0.33", features = ["serde", "bytemuck"] }
 bytemuck = { version = "1.4", features = ["derive"] }
 wgpu = "30.0.0"
+# A texture preview decodes the file the tile names: a project brings a
+# texture in under its own asset name, and a file nothing loaded still
+# previews (W-0049 Stage 11).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "hdr"] }
 # The GPU caches key their slot tables the way the shader assets do.
 indexmap = "2"
 # The renderer contract: the backend trait this crate implements, the frame it

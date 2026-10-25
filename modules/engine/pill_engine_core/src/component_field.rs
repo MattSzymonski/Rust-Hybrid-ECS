@@ -40,7 +40,7 @@ use std::mem::size_of;
 // Current crate
 use crate::archetype::ArchetypeId;
 use crate::component::{ComponentId, Tick};
-use crate::component_registry::ComponentFieldDescriptor;
+use crate::component_registry::{ComponentFieldDescriptor, FieldDecorator};
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -856,7 +856,7 @@ impl World {
     ) -> Option<Vec<ComponentFieldDescriptor>> {
         let mut expanded = Vec::new();
         let mut changed = false;
-        self.expand_fields_into(fields, "", 0, &mut expanded, &mut changed);
+        self.expand_fields_into(fields, "", 0, &[], &mut expanded, &mut changed);
         changed.then_some(expanded)
     }
 
@@ -864,15 +864,18 @@ impl World {
     /// `struct:` field whose path resolves to a known layout.
     ///
     /// `prefix` is the dotted path of the struct being flattened ("" at the
-    /// top level) and `base_offset` is where that struct starts in the
-    /// component row. A struct cannot contain itself without a heap
-    /// indirection, and heap fields are not `struct:`-tagged, so the recursion
-    /// terminates.
+    /// top level), `base_offset` is where that struct starts in the component
+    /// row, and `inherited` is the grouping decorators (W-0049: `Color`,
+    /// `Vector`) the enclosing struct fields declared - the editor's row model
+    /// groups leaves by them, so they have to reach the rows the leaves
+    /// produce. A struct cannot contain itself without a heap indirection, and
+    /// heap fields are not `struct:`-tagged, so the recursion terminates.
     fn expand_fields_into(
         &self,
         fields: &[ComponentFieldDescriptor],
         prefix: &str,
         base_offset: usize,
+        inherited: &[FieldDecorator],
         out: &mut Vec<ComponentFieldDescriptor>,
         changed: &mut bool,
     ) {
@@ -900,6 +903,7 @@ impl World {
                                 &nested,
                                 &element,
                                 base_offset + field.offset + index * stride,
+                                &grouping_decorators(&field.decorators),
                                 out,
                                 changed,
                             );
@@ -919,12 +923,25 @@ impl World {
                 } else {
                     format!("{prefix}.{}", field.name)
                 };
-                self.expand_fields_into(&nested, &name, base_offset + field.offset, out, changed);
+                let group = grouping_decorators(&field.decorators);
+                self.expand_fields_into(
+                    &nested,
+                    &name,
+                    base_offset + field.offset,
+                    &group,
+                    out,
+                    changed,
+                );
             } else {
                 let name = if prefix.is_empty() {
                     field.name
                 } else {
                     intern_nested_field_name(format!("{prefix}.{}", field.name))
+                };
+                let decorators = if inherited.is_empty() {
+                    field.decorators.clone()
+                } else {
+                    inherited_decorators(inherited, field.decorators.as_ref())
                 };
                 out.push(ComponentFieldDescriptor {
                     name,
@@ -933,7 +950,7 @@ impl World {
                     size: field.size,
                     align: field.align,
                     element_count: field.element_count,
-                    decorators: field.decorators.clone(),
+                    decorators,
                 });
             }
         }
@@ -993,6 +1010,36 @@ impl World {
     ) -> Option<crate::component_registry::ValueTypeLayoutResolver> {
         std::mem::replace(&mut self.value_type_layout_resolver, resolver)
     }
+}
+
+/// The grouping decorators a struct field declares, which its flattened leaves
+/// inherit (W-0049).
+///
+/// `Color` and `Vector` describe the group of leaves a struct expands into, so
+/// they have to travel with the leaves. Every other decorator presents the
+/// single value its field holds - a header above it, a tooltip on it - and is
+/// dropped together with the field that held the struct.
+fn grouping_decorators(decorators: &[FieldDecorator]) -> Vec<FieldDecorator> {
+    decorators
+        .iter()
+        .filter(|decorator| matches!(decorator, FieldDecorator::Color | FieldDecorator::Vector))
+        .cloned()
+        .collect()
+}
+
+/// The decorators one flattened leaf carries: what the struct fields above it
+/// inherited, then what the leaf declared itself, without repeating one twice.
+fn inherited_decorators(
+    inherited: &[FieldDecorator],
+    own: &[FieldDecorator],
+) -> std::borrow::Cow<'static, [FieldDecorator]> {
+    let mut merged = inherited.to_vec();
+    for decorator in own {
+        if !merged.contains(decorator) {
+            merged.push(decorator.clone());
+        }
+    }
+    std::borrow::Cow::Owned(merged)
 }
 
 /// Intern a synthesized nested field name ("color.r", "inner.a.b") into

@@ -31,6 +31,10 @@ pub const ASSETS_TILE_LABEL_SIZE: f32 = 11.0;
 /// The rows a tile's name may wrap to before it elides, like Unity's two.
 pub const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
+/// The side of the type icon a finished preview keeps in its bottom-left
+/// corner, in points (W-0049 Stage 11).
+pub const ASSETS_TILE_BADGE_SIZE: f32 = 14.0;
+
 /// The handles a grid tile writes through: the selection a click moves, the
 /// dialog a menu entry opens, the commands it queues and the overlay regions
 /// an open menu marks as the UI's. One bundle keeps `asset_tile`'s signature
@@ -47,6 +51,12 @@ pub struct AssetTileWrites<'a> {
     /// The asset path a drag handed to the OS (W-0038 Stage 19): the shell
     /// reports it, the executable starts the OLE drag.
     pub drag_out: &'a mut Option<String>,
+    /// The rendered previews, by path (W-0049 Stage 11): a tile draws the one
+    /// it finds and keeps its icon otherwise.
+    pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
+    /// The tiles drawn this frame, which the executable turns into preview
+    /// requests: only what is on screen costs work.
+    pub preview_visible: &'a mut Vec<String>,
 }
 
 /// Log a tile's rectangle once per placement, so a suite can drag a file onto
@@ -113,7 +123,30 @@ pub fn asset_tile(
     } else {
         visuals.text_color()
     };
-    icons::paint_duotone(ui.painter(), icon_rect, asset_icon(row), tint);
+    // A finished preview takes the tile's picture area; the type icon stays in
+    // the picture's bottom-left corner, so a person still reads what the file
+    // is (W-0049 Stage 11). Until one exists the icon alone stands.
+    let preview = writes.previews.get(&row.path);
+    writes.preview_visible.push(row.path.clone());
+    match preview {
+        Some(preview) => {
+            let size = preview.size_vec2();
+            let scale = (icon_rect.width() / size.x).min(icon_rect.height() / size.y);
+            let drawn = egui::Rect::from_center_size(icon_rect.center(), size * scale);
+            ui.painter().image(
+                preview.id(),
+                drawn,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(drawn.min.x, drawn.max.y - ASSETS_TILE_BADGE_SIZE),
+                egui::Vec2::splat(ASSETS_TILE_BADGE_SIZE),
+            );
+            icons::paint_duotone(ui.painter(), badge, asset_icon(row), tint);
+        }
+        None => icons::paint_duotone(ui.painter(), icon_rect, asset_icon(row), tint),
+    }
     let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
     let job = tile_name_job(
         browser::file_name(&row.path),
@@ -263,6 +296,24 @@ pub fn asset_menu_items(
         );
         ui.close();
     }
+    // The row's own file or folder in the platform's file manager (W-0049
+    // Stage 10): the shell queues the project-relative path and the
+    // executable opens it.
+    if ui
+        .add(icons::IconButton::new(
+            icons::Icon::FolderOpen,
+            "Open in File Explorer",
+        ))
+        .clicked()
+    {
+        pending.reveal(row.path.clone());
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            path = row.path.as_str(),
+            "[editor] reveal queued"
+        );
+        ui.close();
+    }
     if row.kind == "folder" {
         return;
     }
@@ -305,11 +356,16 @@ pub fn asset_menu_items(
 ///
 /// Public because [`run_frame`]'s generated hot patch calls it through the
 /// package path.
+///
+/// Its rectangle joins the frame's overlay regions while it is open (W-0049):
+/// a click on a dialog button or in its name field is the dialog's, never a
+/// scene pick behind it.
 pub fn asset_dialog_window(
     context: &egui::Context,
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
     snapshot: &EditorSnapshot,
+    overlay_regions: &mut Vec<ShellRect>,
 ) {
     let Some(current) = dialog.as_ref() else {
         return;
@@ -320,7 +376,7 @@ pub fn asset_dialog_window(
     };
     let mut submit = false;
     let mut cancel = false;
-    egui::Window::new(title)
+    let window = egui::Window::new(title)
         .id(egui::Id::new("pill_editor_shell_egui.asset_dialog"))
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .collapsible(false)
@@ -389,6 +445,9 @@ pub fn asset_dialog_window(
                 }
             });
         });
+    if let Some(window) = window {
+        claim_pointer(window.response.rect, overlay_regions);
+    }
     if submit {
         match dialog.as_ref() {
             Some(AssetDialog::Create { .. }) => {

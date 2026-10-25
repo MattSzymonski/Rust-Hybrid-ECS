@@ -405,6 +405,10 @@ impl WebEditorApplication {
                     // A page has no OS clipboard the editor can write; the
                     // clipboard verbs are native (see the dispatch below).
                     paste_text: None,
+                    // Gizmo badges are the desktop runner's: the browser's
+                    // shell draws the scene view with no world projection to
+                    // anchor a chip to (W-0049).
+                    badges: Vec::new(),
                 };
             }
         }
@@ -641,9 +645,13 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::EditResource { .. } => "edit resource",
         ScriptedCommand::EditSelection { .. } => "edit selection",
         ScriptedCommand::Toolbar(_) => "toolbar",
+        ScriptedCommand::SceneNew => "scene new",
+        ScriptedCommand::SceneOpen(_) => "scene open",
+        ScriptedCommand::SceneSave(_) => "scene save",
         ScriptedCommand::DialogSetName(_) => "dialog set name",
         ScriptedCommand::DialogSubmit => "dialog submit",
         ScriptedCommand::EditAsset(_) => "edit asset",
+        ScriptedCommand::PickEntity { .. } => "pick entity",
         ScriptedCommand::EditSet { .. } => "edit set",
         ScriptedCommand::EditArray { .. } => "edit array",
         ScriptedCommand::EditAssetSettings { .. } => "edit asset-settings",
