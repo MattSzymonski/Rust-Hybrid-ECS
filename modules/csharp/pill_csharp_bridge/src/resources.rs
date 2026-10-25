@@ -57,9 +57,7 @@ use super::abi::ResourceView;
 use super::components::{stable_component_id, StableComponentId};
 use super::context::{resource_access_is_authorized, with_active_world, ACCESS_KIND_RESOURCE};
 use super::manifest::intern;
-use super::manifest_apply::{
-    apply_manifest, ManifestOutcome, ManifestSubject, RenamePredecessor, Settlement,
-};
+use super::manifest_apply::{ManifestOutcome, ManifestSubject, RenamePredecessor, Settlement};
 
 // =============================================================================
 // Types
@@ -235,7 +233,8 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
     })
 }
 
-/// Apply a reloaded generation's resource declarations to the live world.
+/// Resolve and apply a reloaded generation's resource declarations, one kind
+/// on its own.
 ///
 /// Five outcomes per resource, decided by the shared pipeline from the arriving
 /// declaration and the binding the previous generation left behind:
@@ -265,17 +264,49 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
 /// Returns a [`CSharpError`] when an alias is malformed or claims more than one
 /// predecessor, and when the engine refuses a registration, a relayout or a
 /// remap.
+///
+/// Resolve this manifest's resource entries without touching the engine.
+///
+/// A caller that has both kinds in hand resolves resources *and* components
+/// through this before either mutates: a refusal about one kind's shape must
+/// not leave the other kind's relayout already applied.
+///
+/// # Errors
+///
+/// The alias and addability refusals, all of which happen before any mutation.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(super) fn apply_resource_manifest_on_reload(
-    engine: &mut Engine,
-    resources: &[ManagedResourceDeclaration],
-) -> Result<ManifestOutcome, CSharpError> {
+pub(super) fn prepare_resource_manifest<'declaration>(
+    engine: &Engine,
+    resources: &'declaration [ManagedResourceDeclaration],
+) -> Result<
+    super::manifest_apply::PreparedManifest<
+        'declaration,
+        ManagedResourceDeclaration,
+        ResourceBinding,
+    >,
+    CSharpError,
+> {
     let previous = with_bindings(|table| table.clone());
-    let (result, table) = apply_manifest(&RESOURCE_SUBJECT, engine, previous, resources);
-    // The table is published on every exit, the failing one included. A reshape
-    // that already ran cannot be undone - reversing it would invent the bytes
-    // it dropped - so the pipeline leaves it applied, and publishing is what
-    // keeps the table describing the layout the engine actually holds.
+    super::manifest_apply::prepare_manifest(&RESOURCE_SUBJECT, engine, previous, resources)
+}
+
+/// Apply what [`prepare_resource_manifest`] resolved and publish the table.
+///
+/// The table is published on every exit, the failing one included. A reshape
+/// that already ran cannot be undone - reversing it would invent the bytes it
+/// dropped - so the pipeline leaves it applied, and publishing is what keeps
+/// the table describing the layout the engine actually holds.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+pub(super) fn execute_resource_manifest(
+    engine: &mut Engine,
+    prepared: super::manifest_apply::PreparedManifest<
+        '_,
+        ManagedResourceDeclaration,
+        ResourceBinding,
+    >,
+) -> Result<ManifestOutcome, CSharpError> {
+    let (result, table) =
+        super::manifest_apply::execute_manifest(&RESOURCE_SUBJECT, engine, prepared);
     publish_bindings(table);
     result
 }

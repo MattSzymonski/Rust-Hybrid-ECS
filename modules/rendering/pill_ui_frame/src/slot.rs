@@ -36,6 +36,14 @@ use crate::frame::UiFrame;
 pub struct UiFrameSlot {
     /// The frame a producer published; `None` until something drew.
     frame: Option<UiFrame>,
+    /// Bumped by a painter that starts with no textures of its own.
+    ///
+    /// A renderer module is rebuilt and swapped like any other, and its new
+    /// image begins with an empty texture map while the producer - a shared
+    /// library that outlives it - has already carried every image once. The
+    /// request is the way back: the producer compares this number with the one
+    /// it last served and re-carries every texture it holds when it changed.
+    texture_resend_generation: u64,
 }
 
 impl Resource for UiFrameSlot {
@@ -74,6 +82,23 @@ impl UiFrameSlot {
         if let Some(frame) = self.frame.as_mut() {
             frame.clear();
         }
+    }
+
+    /// Ask the producer to carry every texture again.
+    ///
+    /// Called by a painter whose texture map starts empty - a renderer module
+    /// that was just rebuilt - because the producer's dirty set is empty by
+    /// then and a one-shot push has no other way to know the images were lost.
+    pub fn request_texture_resend(&mut self) {
+        self.texture_resend_generation = self.texture_resend_generation.wrapping_add(1);
+    }
+
+    /// The newest resend request the painter has made.
+    ///
+    /// A producer re-carries its textures when this differs from the value it
+    /// last served.
+    pub fn texture_resend_generation(&self) -> u64 {
+        self.texture_resend_generation
     }
 }
 
@@ -131,5 +156,23 @@ mod tests {
             slot.take().is_empty(),
             "the second publish replaced the first frame"
         );
+    }
+
+    /// A painter that starts empty asks for the textures again, and the ask is
+    /// visible to the producer as a number it can compare.
+    #[test]
+    fn a_resend_request_bumps_the_generation_the_producer_watches() {
+        let mut slot = UiFrameSlot::new();
+        assert_eq!(slot.texture_resend_generation(), 0, "nothing asked yet");
+
+        slot.request_texture_resend();
+        let asked = slot.texture_resend_generation();
+        assert_ne!(asked, 0, "the request is visible");
+
+        // Publishing and draining are the frame's own business and leave the
+        // request alone.
+        slot.publish(drawn_frame());
+        let _ = slot.take();
+        assert_eq!(slot.texture_resend_generation(), asked);
     }
 }

@@ -271,6 +271,11 @@ pub(crate) fn initialize_generation(
     let persist_sequence = engine.world().persist_registration_sequence();
     let component_sequence = engine.world().component_registration_sequence();
     let resource_sequence = engine.world().resource_registration_sequence();
+    // What the world already held before this generation ran, taken only for
+    // the policy that has to tell this generation's registrations from a name
+    // another subject had already registered.
+    let registered_before = (first_load_failure == FirstLoadFailure::ClearGenerationData)
+        .then(|| engine.world().registered_component_names_since(0));
 
     // Step 2: The entry point, under the subject's registration scope when it
     // has one.
@@ -297,6 +302,42 @@ pub(crate) fn initialize_generation(
                     module = subject,
                     removed_systems = removed,
                     "cleared the failed generation's systems and kept the world"
+                );
+            }
+            FirstLoadFailure::ClearGenerationData => {
+                // Systems first, then the registrations this generation made -
+                // all of it while its image is still mapped, because a
+                // resource's drop function and a column's drop glue belong to
+                // the image that wrote them.
+                let removed_systems = engine.clear_systems_owned_by(clearing_owner);
+                let registered = engine
+                    .world()
+                    .registered_component_names_since(component_sequence);
+                let owned_components: Vec<String> = match &registered_before {
+                    // A name another subject already registered is not this
+                    // generation's to retire: dropping it would erase the
+                    // peer's data along with its registration.
+                    Some(before) => registered
+                        .into_iter()
+                        .filter(|name| !before.contains(name))
+                        .collect(),
+                    None => registered,
+                };
+                let owned_resources = engine
+                    .world()
+                    .resource_ids_registered_since(resource_sequence);
+                let dropped_resources = engine.world_mut().drop_resources(&owned_resources);
+                let dropped_rows = engine
+                    .world_mut()
+                    .drop_forgotten_components(&owned_components);
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = subject,
+                    removed_systems,
+                    dropped_resources,
+                    dropped_components = owned_components.len(),
+                    dropped_rows,
+                    "cleared the failed generation's own data and kept the world"
                 );
             }
         }
@@ -372,6 +413,11 @@ pub(crate) fn stale_components(world: &World, registered_schemas: &[(String, u64
 }
 
 /// What a failed first load of an artifact costs the world.
+// Every variant answers the same question - what is cleared - and names its
+// answer; the shared prefix is the subject, not noise. Dropping it would leave
+// `World`, `SystemsOnly` and `GenerationData`, which read worse at the call
+// sites where the policy is passed.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FirstLoadFailure {
     /// Replace the whole world ([`clear_failed_generation`]). The only sound
@@ -388,6 +434,18 @@ pub(crate) enum FirstLoadFailure {
     /// after the project has filled the world, which is why wiping the world
     /// there would cost the scene.
     ClearSystemsOnly,
+    /// Clear what the failed generation registered, and keep everything else.
+    ///
+    /// The policy for an artifact that may register data and still must not
+    /// cost the world: the retry an editor offers long after the project
+    /// loaded, where the artifact is the editor's own shell module and that
+    /// module registers components like any other. Its systems are removed,
+    /// the resources and component columns it registered in this attempt are
+    /// dropped, and every value another subject registered stays. The failed
+    /// image is parked rather than unmapped, so whatever survived inside it -
+    /// a drop function claimed by a peer, a table not yet re-homed - still
+    /// points at mapped code.
+    ClearGenerationData,
 }
 
 /// Release everything one failed generation owns, while its image is mapped.
@@ -858,9 +916,12 @@ impl ReloadTransaction<'_> {
         let newly_registered = engine
             .world()
             .persist_type_names_registered_since(registration_sequence);
-        let all_registered = engine
-            .world()
-            .registered_component_names_since(component_registration_sequence);
+        // The world's *current* registrations, not this generation's: a shared
+        // component another loaded artifact registered is not this subject's to
+        // retire, and it is still registered. Asking only what this reload
+        // declared made every peer's shared type look orphaned, so dropping its
+        // columns erased the peer's data and registration along with them.
+        let all_registered = engine.world().registered_component_names_since(0);
         let forgotten_type_names: Vec<String> = self
             .registered_type_names
             .iter()

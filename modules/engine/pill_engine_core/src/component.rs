@@ -33,19 +33,34 @@ use crate::error::WorldError;
 
 /// Component marker trait - all components must be `'static` and [`Send`].
 ///
-/// # Interior Mutability Warning
+/// `Send` is all a *mutable* query needs: the scheduler serializes two systems
+/// that touch the same component, and a parallel batch hands each thread a
+/// disjoint range of rows. A *read* query is the other case - two readers of one
+/// component never conflict, so they run together - and that is why
+/// [`QueryTarget`](crate::query::QueryTarget) is implemented for `&T` only when
+/// `T: Sync`. The bound is enforced at the query, not here, because a component
+/// that is only ever used mutably has no reason to be `Sync`.
 ///
-/// Components are accessed concurrently during parallel iteration. Although
-/// `Component` only requires [`Send`] (not [`Sync`]), parallel queries may
-/// create multiple `&T` references to the same component data across
-/// threads. Avoid [`Cell`](std::cell::Cell), [`RefCell`](std::cell::RefCell),
-/// or other interior-mutability types in component structs - they can
-/// cause data races when read concurrently through shared references.
+/// A component with interior mutability ([`Cell`](std::cell::Cell),
+/// [`RefCell`](std::cell::RefCell), ...) therefore cannot be read through a
+/// query at all; keep the mutable portion in a separate component and reach it
+/// with `&mut T` queries.
 ///
-/// If you need mutable state inside a component accessed by multiple
-/// systems, prefer splitting the mutable portion into a separate component
-/// type and using `&mut T` queries (which the scheduler serializes
-/// correctly).
+/// A read query cannot be built over such a component at all:
+///
+/// ```compile_fail
+/// # use pill_engine::*;
+/// use std::cell::Cell;
+///
+/// struct Stats {
+///     hits: Cell<u32>,
+/// }
+/// impl Component for Stats {}
+///
+/// # let mut world = World::new();
+/// # world.register_component::<Stats>();
+/// let _query = Query::<&Stats>::new(&mut world);
+/// ```
 ///
 /// # Examples
 ///

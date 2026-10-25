@@ -120,7 +120,13 @@ impl QueryTarget for Entity {
 /// Allows queries to include immutable component references, e.g.
 /// `Query<(&Transform, &Velocity)>`. Read-only access yields a plain `&T`
 /// and reports the component as a read for system dependency analysis.
-impl<T: Component> QueryTarget for &T {
+///
+/// `Sync` is what makes the shared reference sound: two systems that only read
+/// a component report no conflict, so the scheduler batches them and each
+/// thread iterating the batch holds a `&T` into the same column. A component
+/// with interior mutability would then be read from two threads at once, which
+/// is why one is refused here rather than in a comment.
+impl<T: Component + Sync> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<crate::archetype::ComponentColumn>;
 

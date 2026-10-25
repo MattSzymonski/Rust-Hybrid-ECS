@@ -28,15 +28,11 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 /// native component it binds to, without a schema hash both sides would have
 /// to agree on: the names and offsets are exactly the ones the generator in
 /// `pill_host` (`emit_typed_struct`) writes - PascalCase, one numbered field
-/// per array element. A component with no field layout, or with a heap container (which
-/// emits private handle fields rather than a public one), has no signature and
-/// is checked by size and alignment only.
+/// per array element. A component with no field layout, or with a heap-owned
+/// field (which emits private handle words rather than a public field), has no
+/// signature and is checked by size and alignment only.
 pub(super) fn generated_field_signature(fields: &[ComponentFieldDescriptor]) -> Option<String> {
-    if fields.is_empty()
-        || fields
-            .iter()
-            .any(|field| is_opaque_container_tag(field.type_tag))
-    {
+    if fields.is_empty() || fields.iter().any(|field| is_heap_owned_tag(field.type_tag)) {
         return None;
     }
     let mut declared: Vec<(usize, String, usize)> = Vec::new();
@@ -75,8 +71,27 @@ pub(super) fn field_signature_text(mut declared: Vec<(usize, String, usize)>) ->
 /// Whether a tag names a Rust-owned container field, which carries no C# field
 /// of its own: its pointer must never be exposed to managed code, so elements
 /// are reached through the generated accessor members instead.
+///
+/// This is narrower than [`is_heap_owned_tag`] on purpose. An engine-owned
+/// `dynbuf:` buffer carries three private header words in the mirror, so the
+/// generator must not skip it the way it skips a `vec:` - but managed code
+/// still reaches its contents through accessors.
 pub fn is_opaque_container_tag(tag: &str) -> bool {
     tag.starts_with("vec:") || tag == "string"
+}
+
+/// Whether a tag names a field whose bytes are a header for storage owned
+/// elsewhere: a `vec:`/`string` container the row owns, or an engine-owned
+/// `dynbuf:` native buffer.
+///
+/// This is the engine's own container rule (`is_container_tag` in
+/// `pill_engine_core::component_field`), restated because that copy is
+/// crate-private. Both sides must agree: the check below reads the rule to
+/// decide that a mirror's public field list cannot be stated at all, while the
+/// generator reads it to decide which fields it emits differently from a plain
+/// value.
+pub fn is_heap_owned_tag(tag: &str) -> bool {
+    tag == "string" || tag.starts_with("vec:") || tag.starts_with("dynbuf:")
 }
 
 /// Split an `array:<inner>` tag into its base tag and whether it is an array.
@@ -102,4 +117,50 @@ pub fn snake_to_pascal(name: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(
+        name: &'static str,
+        type_tag: &'static str,
+        offset: usize,
+    ) -> ComponentFieldDescriptor {
+        ComponentFieldDescriptor {
+            name,
+            type_tag,
+            offset,
+            size: 24,
+            align: 8,
+            element_count: 0,
+            decorators: std::borrow::Cow::Borrowed(&[]),
+        }
+    }
+
+    /// A component with an engine-owned buffer field is checked by size and
+    /// alignment: the generator hands managed code three private header words
+    /// there, so no list of public field names describes the struct. Stating a
+    /// signature anyway refused every such mirror at bind time.
+    #[test]
+    fn a_native_buffer_field_leaves_no_field_signature() {
+        let fields = [
+            descriptor("intensity", "f32", 0),
+            descriptor("points", "dynbuf:f32", 8),
+        ];
+        assert_eq!(generated_field_signature(&fields), None);
+    }
+
+    #[test]
+    fn a_plain_component_still_has_a_field_signature() {
+        let fields = [
+            descriptor("intensity", "f32", 0),
+            descriptor("name_id", "u32", 4),
+        ];
+        assert_eq!(
+            generated_field_signature(&fields).as_deref(),
+            Some("Intensity@0:24|NameId@4:24")
+        );
+    }
 }

@@ -65,6 +65,7 @@ use pill_core::warn;
 use crate::archetype::ComponentColumns;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
+use crate::error::WorldError;
 use crate::world::World;
 
 // =============================================================================
@@ -85,7 +86,18 @@ pub trait ComponentAdder: Send {
     ///
     /// The caller is responsible for having created the storage row for this
     /// adder's component type before invoking this method.
-    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns);
+    ///
+    /// # Errors
+    ///
+    /// Returns the column's refusal when it will not take the write. A caller
+    /// must report it rather than drop it: the row this adder was supposed to
+    /// fill is already in the archetype's other columns, so a silent failure
+    /// leaves one column short and every later row lookup reading another
+    /// component's value.
+    fn add_component_to_storage(
+        self: Box<Self>,
+        new_storage: &mut ComponentColumns,
+    ) -> Result<(), WorldError>;
 }
 
 /// Typed component adder that knows the concrete type `T`.
@@ -102,10 +114,14 @@ impl<T: Component + Send> ComponentAdder for TypedComponentAdder<T> {
         ComponentId::of::<T>()
     }
 
-    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns) {
+    fn add_component_to_storage(
+        self: Box<Self>,
+        new_storage: &mut ComponentColumns,
+    ) -> Result<(), WorldError> {
         // The storage row for `T` was allocated by the caller; append the
         // component value to it to finish the insertion.
         new_storage.column_of_mut::<T>().push::<T>(self.component);
+        Ok(())
     }
 }
 
@@ -127,7 +143,10 @@ impl ComponentAdder for ByteComponentAdder {
         self.component_id
     }
 
-    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns) {
+    fn add_component_to_storage(
+        self: Box<Self>,
+        new_storage: &mut ComponentColumns,
+    ) -> Result<(), WorldError> {
         // The storage row for the native component was allocated by the
         // caller; copy the raw ABI bytes into it.
         assert!(
@@ -137,7 +156,11 @@ impl ComponentAdder for ByteComponentAdder {
         let column = new_storage
             .get_mut(self.component_id)
             .expect("native column must exist for a registered component");
-        column.push_bytes(&self.bytes).ok();
+        // A refusal here used to be dropped on the floor. It cannot be: the
+        // destination archetype already has the entity's row in every other
+        // column, so a column left short shifts every later row of this
+        // component onto another entity's value.
+        column.push_bytes(&self.bytes)
     }
 }
 
@@ -475,9 +498,20 @@ impl CommandQueue {
         // Step 2: Insert the entity row and write its native components into storage.
         // A command never supplies the stable id: the world mints one, which
         // is what a managed `ReserveEntity` caller reads back afterwards.
+        //
+        // The row is already in every other column by the time an adder runs,
+        // so an adder that refuses cannot be retried or undone here. The
+        // failure is carried out of the closure and reported with the rest of
+        // the batch; dropping it, as this path used to, left the entity's
+        // columns out of step from then on.
+        let mut write_failure: Option<(ComponentId, WorldError)> = None;
         world.insert_entity_with_components(entity, component_ids, None, |storage| {
             for component_adder in component_adders {
-                component_adder.add_component_to_storage(storage);
+                let component_id = component_adder.component_id();
+                if let Err(error) = component_adder.add_component_to_storage(storage) {
+                    write_failure = Some((component_id, error));
+                    break;
+                }
             }
         });
 
@@ -490,6 +524,12 @@ impl CommandQueue {
         // `expect`, which panicked inside `process_frame` - and for a managed
         // project that unwinds across the C ABI.
         let mut errors = Vec::new();
+        if let Some((component_id, _error)) = write_failure {
+            errors.push(CommandError::ComponentWriteFailed {
+                entity,
+                component_id,
+            });
+        }
         for (component_id, bytes) in descriptor_components {
             if world
                 .set_descriptor_component_bytes(entity, component_id, &bytes)
@@ -609,10 +649,15 @@ impl CommandQueue {
         // by the move itself, so the only thing left to write is the component
         // being added. A migration failure (archetype missing, component column
         // missing) is collected rather than panicking inside the flush.
+        //
+        // The attach closure hands back a refused write for the same reason:
+        // `move_entity_to_archetype` restores the source archetype and undoes
+        // the destination row when it gets an error, so a column that would not
+        // take the new component fails the whole migration rather than leaving
+        // a half-written archetype behind.
         if let Err(error) =
             world.move_entity_to_archetype(entity, new_component_ids, |new_storage| {
-                component_adder.add_component_to_storage(new_storage);
-                Ok(())
+                component_adder.add_component_to_storage(new_storage)
             })
         {
             errors.push(CommandError::MigrationFailed {
@@ -1583,5 +1628,45 @@ mod tests {
             "a refused migration leaves the entity where it was, with the              component the removal targeted still on it"
         );
         assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
+    }
+
+    /// A raw-byte write the destination column refuses is reported, not
+    /// dropped.
+    ///
+    /// The adder used to end in `.ok()`. By the time it runs, the archetype
+    /// already holds the entity's row in every other column, so a swallowed
+    /// refusal left this one short: every later row of this component read
+    /// another entity's value, and a debug build tripped the archetype's
+    /// one-row-per-column assertion at the next migration.
+    #[test]
+    fn a_native_component_write_the_column_refuses_is_reported() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let component_id = ComponentId::of::<Position>();
+        let entity = world.reserve_entity();
+
+        // One byte short of the ABI layout `Position` was registered with,
+        // which is what a payload sized for a layout that has since changed
+        // looks like.
+        let short_payload = vec![0_u8; std::mem::size_of::<Position>() - 1];
+
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity,
+            vec![
+                Box::new(ByteComponentAdder::new(component_id, short_payload))
+                    as Box<dyn ComponentAdder>,
+            ],
+            Vec::new(),
+        );
+        let errors = queue
+            .execute_queued_commands(&mut world, true)
+            .expect_err("a refused native write must fail the flush");
+
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::ComponentWriteFailed { entity: failed_entity, component_id: failed_component }]
+                if *failed_entity == entity && *failed_component == component_id
+        ));
     }
 }

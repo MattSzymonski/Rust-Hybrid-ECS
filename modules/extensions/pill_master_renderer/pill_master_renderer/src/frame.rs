@@ -19,7 +19,7 @@
 
 // Standard library
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // External crates
 use pill_core::{info, warn};
@@ -222,6 +222,14 @@ type RenderingExtras<'w> = (
 /// frame say which producer is feeding it.
 static UI_PRODUCER: AtomicU8 = AtomicU8::new(PRODUCER_UNSET);
 
+/// Whether this renderer image has already asked the UI producer to re-carry
+/// its textures.
+///
+/// A module reload gives a fresh image with fresh statics, so the flag answers
+/// "has *this* painter asked?" - which is the same question as "is this the
+/// first frame after a rebuild?".
+static UI_TEXTURES_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// Nothing measured yet.
 const PRODUCER_UNSET: u8 = 0;
 /// The game's own egui UI.
@@ -388,6 +396,14 @@ pub fn rendering_system(
     // per frame.
     match ui_slot.get_mut() {
         Some(mut slot) => {
+            // A rebuilt painter begins with an empty texture map while the
+            // producer, a shared library that outlives this image, has already
+            // carried every image once. Ask for them again on the first frame
+            // this image runs - the statics below start fresh exactly when the
+            // module does, so this fires once per rebuild.
+            if !UI_TEXTURES_REQUESTED.swap(true, Ordering::Relaxed) {
+                slot.request_texture_resend();
+            }
             frame.ui = slot.take();
             note_ui_producer(PRODUCER_GAME, "game");
         }

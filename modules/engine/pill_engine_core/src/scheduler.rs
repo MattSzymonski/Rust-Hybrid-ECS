@@ -403,10 +403,13 @@ impl SystemScheduler {
     /// Uses a precomputed conflict matrix so that each pairwise check is
     /// an O(1) array lookup instead of a full `conflicts_with` call.
     ///
-    /// Systems are sorted by conflict count (ascending) before batching so
-    /// that the most independent systems are packed into early batches.
-    /// This makes the result independent of registration order and typically
-    /// reduces the total number of batches.
+    /// Batches are filled first-fit in registration order: each system joins
+    /// the earliest batch that holds nothing it conflicts with, and opens a new
+    /// batch at the end when no batch fits. Registration order is the only
+    /// ordering signal the engine offers - there is no `before`/`after` - so it
+    /// is what decides which of two conflicting systems runs first; the pair is
+    /// never merged, and the later one cannot join any batch the earlier one
+    /// already occupies.
     pub fn build_execution_graph(&mut self) {
         let _zone = crate::profile_scope!(
             "build execution graph",
@@ -420,42 +423,23 @@ impl SystemScheduler {
             return;
         }
 
-        // Step 2: Precompute conflict count per system and build a permutation
-        // sorted by ascending conflict count. Systems with fewest conflicts
-        // are scheduled first - they pack densely into early batches.
-        let mut order: Vec<usize> = (0..self.system_count).collect();
-        order.sort_by_key(|&i| self.conflict_matrix[i].iter().filter(|&&c| c).count());
-
-        // Step 3: Greedily assign systems to batches. Each system joins the
-        // current batch only if it conflicts with none of the systems already
-        // in it; otherwise it is deferred to a later batch.
-        let mut scheduled = vec![false; self.system_count];
-        let mut scheduled_count = 0;
-
-        while scheduled_count < self.system_count {
-            let remaining = self.system_count - scheduled_count;
-            let mut batch = Vec::with_capacity(remaining);
-
-            // Iterate in sorted order: most-independent systems first.
-            for &i in &order {
-                if scheduled[i] {
-                    continue;
-                }
-
-                // Check if this system conflicts with any system already in the batch.
-                let conflicts = batch.iter().any(|&j| self.conflict_matrix[i][j]);
-
-                if !conflicts {
-                    batch.push(i);
-                    scheduled[i] = true;
-                    scheduled_count += 1;
-                }
-            }
-
-            if !batch.is_empty() {
-                self.execution_graph.push(batch);
+        // Step 2: Fill the batches first-fit in registration order. The graph
+        // is moved out so this loop can read the conflict matrix while it
+        // appends - a batch's membership is decided by the systems already in
+        // it, never by the ones still to come.
+        let mut batches = std::mem::take(&mut self.execution_graph);
+        for system in 0..self.system_count {
+            let target = batches.iter().position(|batch| {
+                !batch
+                    .iter()
+                    .any(|&other| self.conflict_matrix[system][other])
+            });
+            match target {
+                Some(index) => batches[index].push(system),
+                None => batches.push(vec![system]),
             }
         }
+        self.execution_graph = batches;
     }
 
     /// Returns the execution graph: a slice of batches, where each batch
@@ -888,6 +872,38 @@ mod tests {
 
         // Systems must be in different batches (read-write conflict)
         assert_eq!(scheduler.execution_graph().len(), 2);
+    }
+
+    /// A system registered earlier runs before the systems it conflicts with.
+    ///
+    /// Registration order is the only ordering signal the API offers - there is
+    /// no `before`/`after` - so a producer registered first must run before the
+    /// consumers that read what it writes, however many conflicts each one has.
+    #[test]
+    fn conflicting_systems_keep_registration_order() {
+        let mut scheduler = SystemScheduler::new();
+
+        // System 0 writes A: it conflicts with both readers below.
+        let mut producer = SystemAccess::new();
+        producer.add_write(ComponentId::of::<TestComponentA>());
+        scheduler.register_system(producer);
+
+        // Systems 1 and 2 read A: they conflict with the writer, not each other.
+        for _ in 0..2 {
+            let mut consumer = SystemAccess::new();
+            consumer.add_read(ComponentId::of::<TestComponentA>());
+            scheduler.register_system(consumer);
+        }
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 3);
+        assert_eq!(
+            scheduler.execution_graph().to_vec(),
+            vec![vec![0], vec![1, 2]],
+            "the producer runs in the first batch and the two readers together after it"
+        );
     }
 
     /// Verifies that a Commands-using system conflicts with everything.

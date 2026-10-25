@@ -779,6 +779,18 @@ pub enum BuildError {
     /// the second build is refused rather than merged into the first.
     #[message("entity id ", debug_value(id), " already belongs to a live entity")]
     DuplicateEntityId { id: crate::entity::EntityId },
+
+    /// One component type was handed to `EntityBuilder::with` more than once.
+    ///
+    /// The component set defines the archetype's columns, so a second value of
+    /// the same type would grow one column by two rows for one entity row and
+    /// leave every later entity reading the wrong one.
+    #[message(
+        "component ",
+        debug_value(id),
+        " was handed to the entity builder twice"
+    )]
+    DuplicateComponent { id: ComponentId },
 }
 
 // =============================================================================

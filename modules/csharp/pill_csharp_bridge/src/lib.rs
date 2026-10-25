@@ -80,7 +80,9 @@ pub use csharp_runtime::DotnetRuntimeContext;
 pub use managed_buffer::{fetch_managed_buffer, ManagedBufferError};
 /// The naming rules a generated mirror follows, shared by the generator in
 /// `pill_host` and the binding check here.
-pub use mirror_naming::{is_opaque_container_tag, snake_to_pascal, split_array_tag};
+pub use mirror_naming::{
+    is_heap_owned_tag, is_opaque_container_tag, snake_to_pascal, split_array_tag,
+};
 /// A shipped C# project, started through `pill_runtime`'s external backend.
 pub use project_backend::CSharpBackend;
 

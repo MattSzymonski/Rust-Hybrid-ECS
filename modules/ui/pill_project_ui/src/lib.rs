@@ -94,6 +94,12 @@ pub struct GameUi {
     wants_pointer: bool,
     /// Whether the last pass wanted the keyboard.
     wants_keyboard: bool,
+    /// The painter's resend request this UI last served.
+    ///
+    /// A rebuilt renderer starts with an empty texture map and asks for every
+    /// image again; the request is a number so the producer can tell a fresh
+    /// one from the one it already answered.
+    served_resend_generation: u64,
 }
 
 impl Resource for GameUi {}
@@ -115,6 +121,7 @@ impl GameUi {
             draws: 0,
             wants_pointer: false,
             wants_keyboard: false,
+            served_resend_generation: 0,
         }
     }
 
@@ -163,6 +170,14 @@ impl GameUi {
         let mut list = DrawList::new();
         self.draws = convert(&primitives, &mut list);
         let mut frame = UiFrame::default();
+        // A painter that was rebuilt lost every texture it had and asks for
+        // them again; nothing else would re-send an image whose only change
+        // was the painter's own reload.
+        let resend_generation = slot.texture_resend_generation();
+        if resend_generation != self.served_resend_generation {
+            self.textures.resend_all();
+            self.served_resend_generation = resend_generation;
+        }
         self.textures.carry(&mut frame.textures);
         if !list.is_empty() {
             frame.draws.push(UiDraw {
