@@ -1318,34 +1318,37 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_module_pill_dummy_math"
+name = "host_module_pill_editor_shell_egui_editor"
 version = "0.1.0"
 dependencies = [
- "pill_dummy_math",
+ "pill_editor_shell_egui_editor",
  "pill_engine",
 ]
 
 [[package]]
-name = "host_module_pill_dummy_random"
+name = "host_module_pill_master_renderer"
 version = "0.1.0"
 dependencies = [
- "pill_dummy_random",
  "pill_engine",
+ "pill_master_renderer",
 ]
 
 [[package]]
-name = "host_module_pill_spline"
+name = "host_module_pill_master_renderer_data"
 version = "0.1.0"
 dependencies = [
  "pill_engine",
- "pill_spline",
+ "pill_master_renderer_data",
 ]
 
 [[package]]
-name = "host_project_project"
+name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
+ "glam",
+ "pill_dummy_color",
  "pill_engine",
+ "pill_master_renderer_data",
  "serde",
  "trait_type_map",
 ]

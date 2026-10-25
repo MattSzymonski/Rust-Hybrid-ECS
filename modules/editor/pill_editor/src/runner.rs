@@ -3098,6 +3098,25 @@ impl EditorWindow {
         );
     }
 
+    /// Move the shell's own pointer, as a real move arrives (W-0049).
+    ///
+    /// egui learns a pointer position only from an event, so a suite that
+    /// wants a tooltip or a resize cursor moves the pointer here. The carried
+    /// cursor keeps the position on later frames, exactly like a real move
+    /// that stopped moving.
+    fn scripted_hover_ui(&mut self, x: f32, y: f32) {
+        let position = pill_core::math::Vector2f::new(x, y);
+        self.shell_cursor = Some(position);
+        self.shell_events.push(InputEvent::CursorMoved { position });
+        self.demand.input = true;
+        info!(
+            target: telemetry_target::ENGINE,
+            x,
+            y,
+            "[editor] pointer hovered"
+        );
+    }
+
     /// Move one view's pointer and update the hovered handle - the scripted
     /// channel's stand-in for a real pointer move.
     fn scripted_hover(&mut self, view: usize, x: f32, y: f32) {
@@ -6921,6 +6940,7 @@ impl EditorWindow {
             }
             ScriptedCommand::CameraZoom(lines) => self.zoom_camera(self.active_view, lines),
             ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
+            ScriptedCommand::HoverUi { x, y } => self.scripted_hover_ui(x, y),
             ScriptedCommand::Drop(path) => self.drop_files(vec![std::path::PathBuf::from(path)]),
             ScriptedCommand::HoverFile(path) => self.preview_drop(std::path::Path::new(&path)),
             ScriptedCommand::DragOut(path) => self.start_drag_out(&path),
