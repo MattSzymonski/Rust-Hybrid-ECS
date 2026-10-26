@@ -37,8 +37,8 @@ use crate::INTEROP_CONTRACT_VERSION;
 thread_local! {
     /// C# profiling zones are entered and exited on the same scheduler thread.
     /// Keeping the guards thread-local avoids sending a non-Send Tracy guard
-    /// across threads and also makes an accidentally missing end harmless when
-    /// the managed invocation returns.
+    /// across threads, and [`end_unfinished_zones`] closes whatever a managed
+    /// invocation left open when it returns.
     static CSHARP_ZONES: RefCell<Vec<(u64, pill_core::profiling::TracyZone)>> =
         const { RefCell::new(Vec::new()) };
 }
@@ -92,6 +92,37 @@ extern "C" fn ffi_csharp_zone_end(token: u64) {
     });
 }
 
+/// Close every zone this invocation opened and never ended.
+///
+/// The managed side owns a zone's lifetime through `Profiler.Zone`, but a
+/// system that forgets to dispose one - or throws between begin and end - must
+/// not leave the guard open: a Tracy zone that outlives the invocation is
+/// recorded against the wrong span of the frame, and the vector holding it
+/// would grow by one entry per frame. Called from the invocation guard's
+/// teardown, where the boundary between "this system's work" and "the next"
+/// already sits.
+pub(super) fn end_unfinished_zones() {
+    CSHARP_ZONES.with(|zones| {
+        // A borrow held by a panicking `ffi_csharp_zone_begin` would poison the
+        // cell; the zones it was inserting are then already gone.
+        if let Ok(mut zones) = zones.try_borrow_mut() {
+            zones.clear();
+        }
+    });
+}
+
+/// Open a zone named `name` for a native test, returning its token.
+#[cfg(test)]
+pub(super) fn begin_managed_zone_for_test(name: &str) -> u64 {
+    ffi_csharp_zone_begin(name.as_ptr(), name.len() as u32)
+}
+
+/// How many zone guards the current thread is holding, for a native test.
+#[cfg(test)]
+pub(super) fn managed_zone_count_for_test() -> usize {
+    CSHARP_ZONES.with(|zones| zones.borrow().len())
+}
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -100,7 +131,9 @@ extern "C" fn ffi_csharp_zone_end(token: u64) {
 ///
 /// Set once per C# runtime startup by [`CsEngineApi::new`]; the two FFI
 /// callbacks below read it. It is replaced on every (re)start, and the strings
-/// are kept alive alongside the table for its whole lifetime. `Send`-safe by
+/// are kept alive alongside the table for its whole lifetime - and, once
+/// replaced, for as long as the graveyard holds it, because the copy callback
+/// hands those pointers out before the lock is released. `Send`-safe by
 /// construction (every row owns its strings; no raw pointers are stored), so
 /// the table can live in a `static`.
 static MIRROR_METHOD_TABLE: std::sync::Mutex<Option<MirrorMethodTable>> =
@@ -129,11 +162,26 @@ struct MirrorMethodTable {
     rows: Vec<MirrorMethodRow>,
 }
 
+/// How many retired mirror-method tables stay alive after a republish.
+///
+/// The copy callback hands managed code pointers into the table's strings and
+/// the lock is released before those pointers are read, so a republish must not
+/// free the table it replaced (W-0080). The recent ones are kept; a reload that
+/// has been overtaken more than this many times is long past its read window,
+/// and holding every table a session ever published would grow without bound.
+const RETIRED_TABLES_KEPT: usize = 16;
+
+/// Tables a republish replaced, newest last, oldest dropped past
+/// [`RETIRED_TABLES_KEPT`].
+static MIRROR_METHOD_GRAVEYARD: std::sync::Mutex<Vec<MirrorMethodTable>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// One mirrored Rust method the managed runtime can call.
 ///
 /// Field order and widths are part of the native/managed ABI and must stay
 /// synchronized with `EngineApi.cs`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(super) struct MirrorMethodEntry {
     /// Fully-qualified Rust type name (`pill_spline::OmoMO`), NUL-terminated.
     pub(super) type_name: *const std::ffi::c_char,
@@ -360,10 +408,32 @@ pub fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
             address: method.address,
         });
     }
-    *MIRROR_METHOD_TABLE.lock().unwrap() = Some(MirrorMethodTable { rows });
+    let previous = MIRROR_METHOD_TABLE
+        .lock()
+        .unwrap()
+        .replace(MirrorMethodTable { rows });
+    // The copy callback hands out pointers into these strings and releases the
+    // lock before managed code reads them, so the table a republish replaces
+    // retires instead of dropping.
+    if let Some(previous) = previous {
+        let mut graveyard = MIRROR_METHOD_GRAVEYARD.lock().unwrap();
+        graveyard.push(previous);
+        if graveyard.len() > RETIRED_TABLES_KEPT {
+            graveyard.remove(0);
+        }
+    }
     // Bumped after the rows are stored, so a managed refresh triggered by this
     // value copies the new table rather than the one it replaced.
     MIRROR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// How many tables the graveyard currently holds.
+#[cfg(test)]
+fn retired_table_count() -> usize {
+    MIRROR_METHOD_GRAVEYARD
+        .lock()
+        .map(|graveyard| graveyard.len())
+        .unwrap_or(0)
 }
 
 /// One pinned managed component value supplied to a deferred command.
@@ -483,4 +553,72 @@ pub(super) struct ResourceView {
     pub(super) length: u32,
     /// Token of the managed invocation this view was issued to.
     pub(super) scope_token: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One publishable mirror row: a callable method with a trampoline.
+    fn method(type_name: &str, method_name: &str, address: usize) -> crate::ResolvedMirrorMethod {
+        crate::ResolvedMirrorMethod {
+            type_name: type_name.to_owned(),
+            method_name: method_name.to_owned(),
+            return_tag: String::new(),
+            arg_tags: Vec::new(),
+            arg_names: Vec::new(),
+            address,
+            is_free_function: false,
+            crate_name: "pill_csharp_bridge".to_owned(),
+            receiver: "ref".to_owned(),
+            owner_kind: "object".to_owned(),
+        }
+    }
+
+    /// An entry slot for the copy callback to write into.
+    fn empty_entry() -> MirrorMethodEntry {
+        MirrorMethodEntry {
+            type_name: std::ptr::null(),
+            method: std::ptr::null(),
+            address: 0,
+        }
+    }
+
+    #[test]
+    fn a_republish_keeps_the_names_a_copy_handed_out_alive_and_stays_bounded() {
+        // One test, because the table and its graveyard are process globals: a
+        // second test running beside this one would evict the table whose
+        // pointers this one reads.
+        publish_mirror_methods(&[method("alpha::Probe", "read", 0x1000)]);
+        let mut entries = [empty_entry(); 4];
+        let written = ffi_copy_mirror_methods(entries.as_mut_ptr(), entries.len() as u32);
+        assert_eq!(written, 1, "the one callable row is copied");
+
+        // A module reload republishes while managed code still holds the
+        // pointers the copy above returned.
+        for round in 0..RETIRED_TABLES_KEPT - 1 {
+            publish_mirror_methods(&[method("beta::Probe", &format!("read{round}"), 0x2000)]);
+        }
+
+        // SAFETY: the replaced tables are kept alive by the graveyard, which is
+        // what this test proves: the pointers still name the strings the copy
+        // handed out.
+        let type_name = unsafe { std::ffi::CStr::from_ptr(entries[0].type_name) };
+        // SAFETY: the same lifetime argument as above.
+        let method_name = unsafe { std::ffi::CStr::from_ptr(entries[0].method) };
+        assert_eq!(type_name.to_str().unwrap(), "alpha::Probe");
+        assert_eq!(method_name.to_str().unwrap(), "read");
+        assert_eq!(entries[0].address, 0x1000);
+
+        // Past the bound the oldest tables go, so a session that reloads for
+        // hours does not accumulate every table it ever published.
+        for round in 0..8 {
+            publish_mirror_methods(&[method("gamma::Probe", &format!("read{round}"), 0x3000)]);
+        }
+        assert_eq!(
+            retired_table_count(),
+            RETIRED_TABLES_KEPT,
+            "the graveyard keeps the recent tables and drops the oldest"
+        );
+    }
 }

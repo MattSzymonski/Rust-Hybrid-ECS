@@ -28,7 +28,10 @@ use pill_engine::{
 };
 
 // Current crate
-use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
+use super::abi::{
+    begin_managed_zone_for_test, managed_zone_count_for_test, ComponentChunk, NativeComponentBlob,
+    NativeSystemAccess,
+};
 use super::backend::{
     checked_access_count, checked_system_count, derive_system_access, MAX_ACCESSES_PER_SYSTEM,
     MAX_COMPONENT_MANIFEST_BYTES, MAX_SYSTEMS_PER_ASSEMBLY,
@@ -3372,4 +3375,29 @@ fn parallel_dispatch_with_zero_items_runs_nothing() {
     });
     assert_eq!(status, PARALLEL_OK);
     assert_eq!(visited.load(Ordering::Relaxed), 0);
+}
+
+/// A managed zone that is begun and never ended is closed when the invocation
+/// returns, so a per-frame system that forgets to dispose one neither grows the
+/// guard list without bound nor leaves the Tracy timeline open.
+#[test]
+fn an_unclosed_managed_zone_does_not_outlive_its_invocation() {
+    let mut engine = Engine::new();
+    let bindings = ComponentBindings::default();
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        let token = begin_managed_zone_for_test("leaked");
+        assert_ne!(token, 0, "a zone was opened");
+        assert_eq!(
+            managed_zone_count_for_test(),
+            1,
+            "the guard is held until it is ended"
+        );
+        // Deliberately not ended: this is the managed-side mistake.
+    }
+    assert_eq!(
+        managed_zone_count_for_test(),
+        0,
+        "the invocation boundary closed the zone it was left holding"
+    );
 }

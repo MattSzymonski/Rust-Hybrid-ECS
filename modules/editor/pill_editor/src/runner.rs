@@ -254,6 +254,12 @@ const ASSET_REFRESH_FRAMES: u64 = 120;
 /// cannot see, without rewriting the file every frame.
 const RECOVERY_AUTOSAVE_FRAMES: u64 = 120;
 
+/// Frames between unconditional re-reads of the editor's state files
+/// (W-0089): a frame reads `preferences.json` and `keybindings.json` only when
+/// their metadata moved, so this is the longest an edit can take to reach the
+/// editor on a filesystem whose timestamps are too coarse to see it.
+const STATE_FILE_POLL_FRAMES: u64 = 30;
+
 /// How many asset rows the listing keeps.
 const ASSET_ROWS_MAX: usize = 256;
 
@@ -768,9 +774,14 @@ struct EditorWindow {
     /// The preferences file's text last read; the live reader applies the
     /// history limits and the snapping steps when it changes (Stage 20).
     preferences_text: Option<String>,
+    /// The preferences file's metadata when it was last read, so a frame only
+    /// reads a file that moved (W-0089).
+    preferences_stamp: FileStamp,
     /// The keybindings file's text last read; a change re-applies the preset
     /// and the overrides to the command registry (W-0038 Stage 2).
     keybindings_text: Option<String>,
+    /// The keybindings file's metadata when it was last read (W-0089).
+    keybindings_stamp: FileStamp,
     /// Whether the keybindings watcher ran once: the first pass applies the
     /// editor's default preset even when there is no file to differ from it.
     keybindings_applied: bool,
@@ -844,9 +855,6 @@ struct EditorWindow {
     /// The snapshot field whose change last asked for a frame, so the log
     /// names a churning reason once rather than every frame.
     snapshot_changed_field: Option<String>,
-    /// The snapshot the last frame published, with its frame index cleared:
-    /// what a change is measured against (W-0038 Stage 9).
-    last_snapshot: Option<EditorSnapshot>,
     /// One liveness marker per module that registered a panel (W-0038
     /// Stage 11). The executable owns the strong handle, so a module reload -
     /// which the registry is told about - is what makes its panels read
@@ -1121,7 +1129,9 @@ impl EditorWindow {
             asset_detail: None,
             asset_detail_path: None,
             preferences_text: None,
+            preferences_stamp: FileStamp::default(),
             keybindings_text: None,
+            keybindings_stamp: FileStamp::default(),
             keybindings_applied: false,
             log_buffer,
             preferences_document: serde_json::Map::new(),
@@ -1166,7 +1176,6 @@ impl EditorWindow {
             last_demand: FrameDemand::default(),
             polling: false,
             idle_frame_millis_max: 0.0,
-            last_snapshot: None,
             snapshot_changed_field: None,
             panel_markers: std::collections::HashMap::new(),
             panel_requests: Vec::new(),
@@ -2001,6 +2010,19 @@ impl EditorWindow {
                 let Some(path) = self.preview_in_flight.remove(&image.id) else {
                     continue;
                 };
+                // A refusal carries no pixels: the tile keeps its type icon and
+                // the grid moves on, rather than waiting on this file forever
+                // (W-0074).
+                if image.is_empty() {
+                    state.preview_refused.insert(path.clone());
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        path = path.as_str(),
+                        id = image.id,
+                        "[editor] preview refused"
+                    );
+                    continue;
+                }
                 let size = [image.width as usize, image.height as usize];
                 let texture = state.context.load_texture(
                     format!("preview:{path}"),
@@ -2029,7 +2051,9 @@ impl EditorWindow {
             state
                 .preview_visible
                 .iter()
-                .find(|path| !state.previews.contains_key(*path))
+                .find(|path| {
+                    !state.previews.contains_key(*path) && !state.preview_refused.contains(*path)
+                })
                 .cloned()
         };
         let Some(path) = next else {
@@ -2219,8 +2243,19 @@ impl EditorWindow {
             return;
         };
         let folder = self.drop_folder();
-        let sub_folder = folder.strip_prefix("res/").unwrap_or("").to_string();
-        let destination = if sub_folder.is_empty() {
+        let sub_folder = match pill_editor_core::browser::drop_folder_relative(&folder) {
+            Ok(relative) => relative,
+            Err(message) => {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    folder = folder.as_str(),
+                    "[editor] drop refused: {message}"
+                );
+                self.push_toast(NoticeLevel::Warning, format!("drop refused: {message}"));
+                return;
+            }
+        };
+        let destination = if sub_folder.as_os_str().is_empty() {
             asset_root.clone()
         } else {
             asset_root.join(&sub_folder)
@@ -4875,39 +4910,33 @@ impl EditorWindow {
             .unwrap_or((0, 0));
         snapshot.undo_depth = undo_depth;
         snapshot.redo_depth = redo_depth;
-        // The redraw cadence's change detector (Stage 9): the frame index is
-        // this frame's, so it is cleared on both sides before comparing - what
-        // is compared is the data the tabs draw, not when it was captured.
-        let mut compared = snapshot.clone();
-        compared.revision = 0;
-        // The two tiers a frame itself feeds: its own log lines reach the
-        // console, so treating them as a reason to draw would make every frame
-        // owe the next one. They are bounded-latency data instead - the idle
-        // poll draws them within its interval - which is what keeps an idle
-        // editor idle while its console still fills.
-        compared.console = pill_editor_core::console::ConsoleView::default();
-        compared.problems.clear();
-        self.demand.snapshot = self
-            .last_snapshot
-            .as_ref()
-            .is_some_and(|previous| previous != &compared);
-        if self.demand.snapshot {
-            // Which fields moved is the answer to "why is the editor drawing
-            // every frame?"; one line per new combination keeps the log
-            // honest without streaming.
-            if let Some(previous) = &self.last_snapshot {
-                let fields = snapshot_fields_changed(previous, &compared);
-                if self.snapshot_changed_field.as_deref() != Some(fields.as_str()) {
-                    self.snapshot_changed_field = Some(fields.clone());
-                    info!(
-                        target: telemetry_target::ENGINE,
-                        fields = fields.as_str(),
-                        "[editor] snapshot changed"
-                    );
-                }
-            }
+        // The redraw cadence's change detector (Stage 9): this frame's capture
+        // is compared against the one the shell still holds, which is the
+        // world resource itself - a copy of a 200k-row list to diff it cost
+        // more than the diff (W-0089). The frame index is not compared, since
+        // it is this frame's, and neither are the two tiers a frame itself
+        // feeds: its own log lines reach the console, so treating them as a
+        // reason to draw would make every frame owe the next one. They are
+        // bounded-latency data instead - the idle poll draws them within its
+        // interval - which is what keeps an idle editor idle while its console
+        // still fills.
+        let fields = engine
+            .world()
+            .get_resource::<EditorSnapshot>()
+            .map(|previous| snapshot_fields_changed(previous, &snapshot))
+            .unwrap_or_default();
+        self.demand.snapshot = !fields.is_empty();
+        // Which fields moved is the answer to "why is the editor drawing every
+        // frame?"; one line per new combination keeps the log honest without
+        // streaming.
+        if self.demand.snapshot && self.snapshot_changed_field.as_deref() != Some(fields.as_str()) {
+            self.snapshot_changed_field = Some(fields.clone());
+            info!(
+                target: telemetry_target::ENGINE,
+                fields = fields.as_str(),
+                "[editor] snapshot changed"
+            );
         }
-        self.last_snapshot = Some(compared);
         if let Some(resource) = engine.world_mut().get_resource_mut::<EditorSnapshot>() {
             *resource = snapshot;
         }
@@ -4930,6 +4959,7 @@ impl EditorWindow {
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(state) = world.get_resource_mut::<EguiShellState>() {
                 state.previews.clear();
+                state.preview_refused.clear();
             }
         }
         self.asset_entries = self
@@ -5132,13 +5162,25 @@ impl EditorWindow {
     /// halves - the history limits and the gizmo's snapping steps - and
     /// refresh the document the snapshot's view and the dump read.
     ///
+    /// The file is only read when its metadata moved (W-0089), and once per
+    /// [`STATE_FILE_POLL_FRAMES`] regardless, so a filesystem that reports a
+    /// coarse or unchanged timestamp still reaches the editor within a
+    /// fraction of a second.
+    ///
     /// The tool's mode, space and toggle stay whatever the world state
     /// holds, so the stale copy a persisting write leaves behind never moves
     /// the live tool; the snapping steps are the file's, one set for every
     /// project (D31).
     fn watch_preferences(&mut self) {
         let directory = layout_directory();
-        let text = std::fs::read_to_string(directory.join(PREFERENCES_FILE)).ok();
+        let path = directory.join(PREFERENCES_FILE);
+        let stamp = FileStamp::of(&path);
+        let due = self.frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
+        if !due && stamp == self.preferences_stamp {
+            return;
+        }
+        self.preferences_stamp = stamp;
+        let text = std::fs::read_to_string(&path).ok();
         if text == self.preferences_text {
             return;
         }
@@ -5148,12 +5190,23 @@ impl EditorWindow {
             .as_deref()
             .and_then(|text| serde_json::from_str::<EditorPreferences>(text).ok())
             .unwrap_or_default();
-        self.preferences_document = self
-            .preferences_text
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
+        self.preferences_document = match self.preferences_text.as_deref() {
+            Some(text) => match preferences::parse_document(text) {
+                Ok(document) => document,
+                Err(message) => {
+                    // A file the editor cannot parse is shown as the defaults
+                    // and said out loud; folding it into an empty document
+                    // silently is how a corrupt file goes unnoticed (W-0090).
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        error = message.as_str(),
+                        "[editor] preferences refused"
+                    );
+                    serde_json::Map::new()
+                }
+            },
+            None => serde_json::Map::new(),
+        };
         // The keymap preset the file names drives the viewport navigation
         // chords; Blender's table stands until the file says otherwise.
         let keymap = preferences::keymap_preset(&self.preferences_document);
@@ -5192,6 +5245,7 @@ impl EditorWindow {
                     .get_resource_mut::<EguiShellState>()
                 {
                     state.previews.clear();
+                    state.preview_refused.clear();
                 }
             }
             info!(
@@ -5243,7 +5297,14 @@ impl EditorWindow {
     /// is an empty one: the built-ins' own bindings stand.
     fn watch_keybindings(&mut self) {
         let directory = layout_directory();
-        let text = std::fs::read_to_string(directory.join(KEYBINDINGS_FILE)).ok();
+        let path = directory.join(KEYBINDINGS_FILE);
+        let stamp = FileStamp::of(&path);
+        let due = self.frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
+        if !due && self.keybindings_applied && stamp == self.keybindings_stamp {
+            return;
+        }
+        self.keybindings_stamp = stamp;
+        let text = std::fs::read_to_string(&path).ok();
         if self.keybindings_applied && text == self.keybindings_text {
             return;
         }
@@ -6853,11 +6914,16 @@ impl EditorWindow {
     /// The grammar lives in [`crate::scripted`]: this parses each line and
     /// dispatches it, and a line that cannot be parsed takes the one refusal
     /// path, so a suite sees it at once instead of waiting out a timeout.
+    ///
+    /// What a line queues is applied before the next line runs: one append
+    /// reaches the loop as one batch, so without this an append that edits and
+    /// then reads would answer the value the edit replaced (W-0109).
     fn poll_test_channel(&mut self) {
-        let Some(channel) = &mut self.test_channel else {
-            return;
+        let lines = match &mut self.test_channel {
+            Some(channel) => channel.poll(),
+            None => return,
         };
-        for line in channel.poll() {
+        for line in lines {
             // A scripted line arrives between frames; the loop must not stay
             // asleep over it (W-0038 Stage 9).
             self.demand.scripted = true;
@@ -6865,6 +6931,7 @@ impl EditorWindow {
                 Ok(command) => self.run_scripted(&line, command),
                 Err(error) => self.reject_scripted(&line, &error.reason),
             }
+            self.apply_pending_commands();
         }
     }
 
@@ -8143,6 +8210,33 @@ enum CommandAction {
     Step,
 }
 
+/// A state file's metadata: what a frame compares to decide whether the file
+/// needs reading at all (W-0089).
+///
+/// The editor's state files are written by hand or by another tool, so there
+/// is no in-process writer to hook; the metadata is the signal. A missing file
+/// stamps as the default, which differs from any file that exists, so creating
+/// one is noticed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FileStamp {
+    /// The file's modification time, when the filesystem reports one.
+    modified: Option<std::time::SystemTime>,
+    /// Its length in bytes.
+    length: u64,
+}
+
+impl FileStamp {
+    /// The stamp of `path`, or the default when it cannot be read.
+    fn of(path: &std::path::Path) -> Self {
+        std::fs::metadata(path)
+            .map(|metadata| Self {
+                modified: metadata.modified().ok(),
+                length: metadata.len(),
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// The snapshot fields that differ between two captures, comma-joined.
 ///
 /// The redraw cadence treats any change as a reason to draw, so this answers
@@ -8150,6 +8244,11 @@ enum CommandAction {
 /// own - a timer, a counter, an unordered collection - would keep the editor
 /// drawing forever, and naming it in the log is how that is caught rather
 /// than suspected.
+///
+/// This is also the change test itself (W-0089): an empty answer means the
+/// two captures draw the same data. The frame index and the two tiers a frame
+/// feeds itself - the console and the problems - are deliberately not
+/// compared, so a capture that only added log lines is not a reason to draw.
 fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) -> String {
     let mut changed: Vec<&str> = Vec::new();
     if previous.entities != current.entities {
@@ -8157,6 +8256,9 @@ fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) 
     }
     if previous.detail != current.detail {
         changed.push("detail");
+    }
+    if previous.selected_details != current.selected_details {
+        changed.push("selected_details");
     }
     if previous.systems != current.systems {
         changed.push("systems");
@@ -8188,17 +8290,20 @@ fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) 
     if previous.undo_depth != current.undo_depth || previous.redo_depth != current.redo_depth {
         changed.push("history");
     }
+    if previous.scene_title != current.scene_title
+        || previous.scene_open != current.scene_open
+        || previous.scene_save_path != current.scene_save_path
+    {
+        changed.push("scene");
+    }
     if previous.commands != current.commands {
         changed.push("commands");
     }
-    if previous.console != current.console {
-        changed.push("console");
-    }
-    if previous.problems != current.problems {
-        changed.push("problems");
-    }
     if previous.errors != current.errors {
         changed.push("errors");
+    }
+    if previous.resources != current.resources {
+        changed.push("resources");
     }
     changed.join(",")
 }
@@ -8592,5 +8697,78 @@ mod tests {
             height: 0.1,
         };
         assert_eq!(scaled_view_rect(tiny, 1.0, (1280, 800)), (4, 4, 1, 1));
+    }
+
+    /// The change detector compares the two captures field by field, so an
+    /// empty answer is the "nothing to draw" one - and the tiers a frame feeds
+    /// itself are not part of the comparison (W-0089).
+    #[test]
+    fn a_snapshot_only_demands_a_frame_when_a_drawn_field_moved() {
+        let snapshot = EditorSnapshot::default();
+        assert_eq!(snapshot_fields_changed(&snapshot, &snapshot), "");
+
+        // The frame index is this frame's, so two captures a frame apart are
+        // the same data.
+        let later = EditorSnapshot {
+            revision: 42,
+            ..Default::default()
+        };
+        assert_eq!(snapshot_fields_changed(&snapshot, &later), "");
+
+        // The two tiers a frame itself fills are bounded-latency data: its own
+        // log lines reach the console, and treating them as a reason to draw
+        // would make every frame owe the next one.
+        let logged = EditorSnapshot {
+            console: pill_editor_core::console::ConsoleView {
+                search: "render".to_string(),
+                visible: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(snapshot_fields_changed(&snapshot, &logged), "");
+
+        // A field a tab draws does demand one, and is named.
+        let paused = EditorSnapshot {
+            paused: true,
+            ..Default::default()
+        };
+        assert_eq!(snapshot_fields_changed(&snapshot, &paused), "paused");
+        let titled = EditorSnapshot {
+            scene_title: "level.scene*".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(snapshot_fields_changed(&snapshot, &titled), "scene");
+    }
+
+    /// A state file is read when its metadata moves, and not before - the
+    /// preference and keybinding watchers run every drawn frame (W-0089).
+    #[test]
+    fn a_state_file_stamp_follows_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("pill_state_stamp_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            FileStamp::of(&path),
+            FileStamp::default(),
+            "a missing file stamps as the default"
+        );
+
+        std::fs::write(&path, "{}").expect("write");
+        let first = FileStamp::of(&path);
+        assert_ne!(first, FileStamp::default());
+        assert_eq!(
+            FileStamp::of(&path),
+            first,
+            "an untouched file keeps its stamp"
+        );
+
+        // A rewrite that changes the length moves the stamp. A same-length one
+        // inside a single timestamp tick does not - the filesystem reports the
+        // same metadata - which is why the watchers also re-read every
+        // `STATE_FILE_POLL_FRAMES` frames instead of trusting the stamp alone.
+        std::fs::write(&path, "[ ]").expect("write");
+        assert_ne!(FileStamp::of(&path), first);
+        let _ = std::fs::remove_file(&path);
     }
 }

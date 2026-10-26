@@ -259,13 +259,39 @@ pub fn set_key(document: &mut Map<String, Value>, key: &str, value: Value) -> Re
     Ok(())
 }
 
-/// Read the preferences document; a missing or unreadable file is empty.
-pub fn read_document(directory: &Path) -> Map<String, Value> {
-    std::fs::read_to_string(directory.join(PREFERENCES_FILE))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+/// Read the preferences document a write will modify.
+///
+/// A missing file is an empty document - the first save creates it - but a file
+/// that exists and cannot be read or parsed is an error. Folding it into an
+/// empty document would let the next save write a file holding only the keys it
+/// set, erasing every unrelated preference (W-0090).
+///
+/// # Errors
+///
+/// A message naming the file when it cannot be read, is not JSON, or is not a
+/// JSON object.
+pub fn read_document(directory: &Path) -> Result<Map<String, Value>, String> {
+    let path = directory.join(PREFERENCES_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(error) => return Err(format!("{PREFERENCES_FILE}: {error}")),
+    };
+    parse_document(&text)
+}
+
+/// Parse a preferences file's text into its document.
+///
+/// # Errors
+///
+/// A message naming the file when the text is not JSON or is not a JSON object.
+pub fn parse_document(text: &str) -> Result<Map<String, Value>, String> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|error| format!("{PREFERENCES_FILE} is not valid JSON: {error}"))?;
+    match value {
+        Value::Object(document) => Ok(document),
+        _ => Err(format!("{PREFERENCES_FILE} is not a JSON object")),
+    }
 }
 
 /// Write the document through a temporary file and a rename, creating the
@@ -407,7 +433,7 @@ mod tests {
     #[test]
     fn the_document_round_trips_through_the_file() {
         let directory = scratch_directory("round-trip");
-        let mut document = read_document(&directory);
+        let mut document = read_document(&directory).unwrap();
         assert!(document.is_empty());
         set_key(&mut document, "theme", serde_json::json!("dark")).unwrap();
         set_key(
@@ -418,9 +444,53 @@ mod tests {
         .unwrap();
         write_document(&directory, &document).unwrap();
 
-        let read_back = read_document(&directory);
+        let read_back = read_document(&directory).unwrap();
         assert_eq!(read_back["theme"], serde_json::json!("dark"));
         assert_eq!(read_back["snapping_steps"]["scale"], serde_json::json!(0.2));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_corrupt_document_is_refused_rather_than_read_as_empty() {
+        // Folding "not JSON" into an empty document would let the next save
+        // erase every key the file held, including the ones this write never
+        // touched (W-0090).
+        let directory = scratch_directory("corrupt");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(PREFERENCES_FILE);
+        let corrupt = "{\"theme\": \"dark\",}";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let error = read_document(&directory).expect_err("a trailing comma is not a document");
+        assert!(
+            error.contains("not valid JSON"),
+            "unexpected message: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "the file is left exactly as it was"
+        );
+
+        // A missing file is still an empty document: the first save creates it.
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_document(&directory)
+            .expect("missing reads empty")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_document_that_is_not_an_object_is_refused() {
+        // A file holding `[1, 2]` parses as JSON but is not a document, so a
+        // save that modified it would have nowhere to put a key (W-0090).
+        let error = parse_document("[1, 2]").expect_err("a list is not a document");
+        assert!(
+            error.contains("not a JSON object"),
+            "unexpected message: {error}"
+        );
+        assert!(parse_document("{\"theme\": \"dark\"}")
+            .expect("an object is a document")
+            .contains_key("theme"));
     }
 }

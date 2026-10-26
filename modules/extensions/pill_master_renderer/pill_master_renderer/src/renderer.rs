@@ -237,7 +237,6 @@ impl Renderer {
             state,
             rendering_resources_manager,
             extra_targets,
-            queued_instances,
             ..
         } = self;
         let Some(target) = extra_targets.get_mut(&id) else {
@@ -261,7 +260,7 @@ impl Renderer {
             target.pipeline.passes(),
             frame,
             (&view.0, &view.1),
-            (queued_instances, render_queue),
+            render_queue,
             target.viewport,
         );
         drop(plan);
@@ -380,6 +379,12 @@ impl PillRenderer for Renderer {
             .overlay
             .answer_undrawn(&frame.pick_requests, &drawn_surfaces);
         if drawn_surfaces.is_empty() {
+            // Nothing drew, so no preview can be drawn either - but every
+            // request the frame took is answered, or the caller waits for a
+            // preview that will never come (W-0074).
+            for request in &frame.preview_requests {
+                self.state.preview.refuse(request.id);
+            }
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
@@ -409,6 +414,16 @@ impl PillRenderer for Renderer {
             &mut self.queued_instances,
         );
         drop(instances_zone);
+        // Once for the whole frame, before any surface draws: every geometry
+        // pass of every surface reads this one buffer, so a frame that draws N
+        // surfaces copies the instance bytes once rather than N times (W-0077).
+        let upload_zone = pill_core::profile_scope!("renderer: upload instances");
+        self.state.mesh_drawer.upload_instances(
+            &self.state.device,
+            &self.state.queue,
+            &self.queued_instances,
+        );
+        drop(upload_zone);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
@@ -439,7 +454,7 @@ impl PillRenderer for Renderer {
                 self.pipeline.passes(),
                 frame,
                 (&frame.camera, &frame.camera_transform),
-                (&self.queued_instances, &render_queue),
+                &render_queue,
                 self.viewport,
             )?;
         }
@@ -634,27 +649,33 @@ impl PillRenderer for Renderer {
 /// A texture is drawn from the GPU texture the asset sync already uploaded; a
 /// material is a sphere in the first colour parameter the material declares. A
 /// mesh has no preview yet - it needs the mesh pipeline's vertex layout, depth
-/// and a camera - so its request is answered by nothing, which leaves the
-/// tile's type icon in place.
+/// and a camera - so its request is refused, which leaves the tile's type icon
+/// in place.
+///
+/// Every request the frame took is answered: the first is drawn when the
+/// renderer is free, and anything not drawn is refused, because a caller that
+/// waits for an answer that never comes stops asking (W-0074).
 ///
 /// Its own encoder and submission, after the frame's surfaces: a preview never
 /// delays a presented frame, and the readback is mapped once this submission
 /// is in.
 fn record_preview(renderer: &mut Renderer, frame: &RenderFrame, assets_manager: &AssetManager) {
-    let Some(request) = frame.preview_requests.first() else {
-        return;
-    };
-    if !renderer.state.preview.ready() {
-        return;
-    }
-    let id = request.id;
-    if let Err(reason) = draw_preview(renderer, request, assets_manager) {
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::RENDERING,
-            id,
-            reason,
-            "[preview] not drawn"
-        );
+    let mut drawable = renderer.state.preview.ready();
+    for request in &frame.preview_requests {
+        if drawable {
+            drawable = false;
+            if let Err(reason) = draw_preview(renderer, request, assets_manager) {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    id = request.id,
+                    reason,
+                    "[preview] not drawn"
+                );
+            } else {
+                continue;
+            }
+        }
+        renderer.state.preview.refuse(request.id);
     }
 }
 
@@ -993,9 +1014,15 @@ impl State {
         passes: &[PassSlot],
         frame: &RenderFrame,
         (view_camera, view_transform): (&CameraComponent, &TransformComponent),
-        (instances, render_queue): (&[Instance], &[RenderQueueItem]),
+        render_queue: &[RenderQueueItem],
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
+        // A lost device draws nothing and reports nothing, so the loss the
+        // callback latched is the frame path's only chance to say so: returning
+        // it here ends the run with a reason instead of a frozen picture.
+        if let Some(detail) = crate::error::device_loss() {
+            return Err(RendererError::Other { detail });
+        }
         // Both borrows are of separate fields, so the surface can reconfigure
         // itself against the device that created it.
         let acquire_zone = pill_core::profile_scope!("renderer: acquire surface");
@@ -1049,11 +1076,6 @@ impl State {
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.begin_frame(&self.device, &self.queue);
         }
-        // Once for the whole frame: every geometry pass draws from it.
-        let upload_zone = pill_core::profile_scope!("renderer: upload instances");
-        self.mesh_drawer
-            .upload_instances(&self.device, &self.queue, instances);
-        drop(upload_zone);
         // One wgpu render pass per pass of the chain, into the same encoder: the
         // first clears the targets it writes, the rest add to what is there.
         for entry in plan {
@@ -1479,5 +1501,26 @@ mod tests {
             1280,
             800
         ));
+    }
+
+    /// The instance buffer is uploaded once per frame, not once per surface
+    /// (W-0077): `State::render` runs for the primary surface and again for
+    /// every extra one, all with the same queue.
+    ///
+    /// The upload needs a device, so this reads the frame path instead: one
+    /// upload call, in `Renderer::render`, and no instance slice threaded into
+    /// the per-surface path at all.
+    #[test]
+    fn the_instance_buffer_is_uploaded_once_per_frame() {
+        let source = include_str!("renderer.rs");
+        assert_eq!(
+            source.matches(concat!("upload_", "instances(")).count(),
+            1,
+            "a frame draws N surfaces from one instance buffer, so it uploads it once"
+        );
+        assert!(
+            !source.contains(concat!("(inst", "ances, render", "_queue)")),
+            "the per-surface path takes the queue only, not the instances"
+        );
     }
 }

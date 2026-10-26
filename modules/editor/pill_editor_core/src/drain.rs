@@ -68,9 +68,11 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
     for batch in batches {
         outcome.batches += 1;
         let recorded = EditorCommand::apply_recorded(engine, &batch.commands);
+        let failed = recorded.failures.len();
         pill_core::info!(
             target: telemetry_target::ENGINE,
             count = batch.commands.len(),
+            failed,
             "[editor] engine commands applied"
         );
         follow_selection(engine, &batch.commands);
@@ -86,6 +88,30 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                 message = %message,
                 "[editor] command failed"
             );
+        }
+        // A history step was popped before its commands ran, so a replay that
+        // failed has to put the cursor back: the step stays undoable instead of
+        // sitting in the opposite tail while the world still shows the edit
+        // (W-0090). The `history undo` line was logged when the step was
+        // queued, which is why this one says the walk did not happen.
+        if let Some(direction) = batch.replay {
+            let world = engine.world_mut();
+            if let Some(history) = world.get_resource_mut::<CommandHistory>() {
+                if failed > 0 {
+                    match direction {
+                        HistoryDirection::Undo => history.undo_rollback(),
+                        HistoryDirection::Redo => history.redo_rollback(),
+                    }
+                    pill_core::warn!(
+                        target: telemetry_target::ENGINE,
+                        direction = direction.name(),
+                        undo = history.undo_depth(),
+                        redo = history.redo_depth(),
+                        "[editor] history {} failed",
+                        direction.name()
+                    );
+                }
+            }
         }
         // A restore assigned fresh handles; the history follows them before
         // anything else is recorded, so a later undo cannot target the dead
@@ -275,7 +301,7 @@ pub fn step_history(engine: &mut Engine, direction: HistoryDirection) -> History
     };
     if let Some(commands) = commands {
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push(commands);
+            pending.push_replay(commands, direction);
         }
     }
     pill_core::info!(
@@ -410,6 +436,42 @@ mod tests {
         let engine = engine();
         let first = registry_stamp(engine.world());
         assert_eq!(first, registry_stamp(engine.world()));
+    }
+
+    #[test]
+    fn a_failed_undo_puts_the_step_back() {
+        // SA-0099's other half: the step was popped before the apply result
+        // was known, so an inverse that failed left the log saying the undo ran
+        // while the world still showed the edit and the step sat in the redo
+        // tail. A step that did not run must stay undoable.
+        let mut engine = engine();
+        let stale = HistoryEntry::engine(
+            "destroy an entity that is gone",
+            vec![EditorCommand::DestroyEntity {
+                entity: pill_engine::Entity::default(),
+            }],
+            vec![EditorCommand::DestroyEntity {
+                entity: pill_engine::Entity::default(),
+            }],
+        );
+        let world = engine.world_mut();
+        let Some(history) = world.get_resource_mut::<CommandHistory>() else {
+            panic!("the test engine carries a history");
+        };
+        history.push(stale, 0, CommandHistory::DEFAULT_COALESCE_WINDOW);
+
+        assert!(matches!(
+            step_history(&mut engine, HistoryDirection::Undo),
+            HistoryOutcome::Queued { .. }
+        ));
+        apply_pending(&mut engine, 0);
+
+        let world = engine.world();
+        let history = world
+            .get_resource::<CommandHistory>()
+            .expect("the test engine carries a history");
+        assert_eq!(history.undo_depth(), 1, "the failed step is undoable again");
+        assert_eq!(history.redo_depth(), 0, "and is not offered as redoable");
     }
 
     #[test]

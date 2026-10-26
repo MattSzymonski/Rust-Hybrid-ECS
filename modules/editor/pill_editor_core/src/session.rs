@@ -18,7 +18,7 @@
 //! code would then run from an unloaded image.
 
 // External crates
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Context, Pos2, Rect, TextureHandle, TextureOptions};
 use pill_engine::Resource;
@@ -58,6 +58,11 @@ pub struct EguiShellState {
     /// uploaded once, kept in memory so a tile redraws without another
     /// request.
     pub previews: BTreeMap<String, TextureHandle>,
+    /// The tiles the renderer answered with no pixels, by project-relative
+    /// path (W-0074): an undecodable file or a frame that drew nothing is
+    /// answered with a refusal, so the tile keeps its type icon and the grid
+    /// asks for the next one instead of waiting on this one forever.
+    pub preview_refused: BTreeSet<String>,
     /// The paths of the tiles the Assets grid drew this frame, so the
     /// executable asks only for previews on screen.
     pub preview_visible: Vec<String>,
@@ -624,6 +629,7 @@ impl EguiShellState {
             browser: ProjectBrowser::default(),
             mark: None,
             previews: BTreeMap::new(),
+            preview_refused: BTreeSet::new(),
             preview_visible: Vec::new(),
             menubar: MenubarSession::default(),
             inspector: InspectorSession::default(),

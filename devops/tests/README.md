@@ -273,6 +273,9 @@ runs. Every suite puts its files back when it finishes, including when it fails.
   afterwards. Rewinding the timestamp there would make cargo trust that stale
   artifact, so the file keeps a fresh timestamp and the next host start
   rebuilds it. Expect that rebuild after these suites; it is intended.
+- A suite that only learns whether it passed after its sessions ran passes the
+  verdict itself (`restore_all(reset_mtime=all_passed)`): a red or aborted run
+  keeps fresh timestamps, a green one rewinds (`test_hot_reload_suite.py`).
 
 ### Rules while a suite is running
 
@@ -374,7 +377,10 @@ with each suite's last recorded result from `.construction_site/runs/`.
 ## Writing a new end-to-end suite
 
 - Import from `core.suite_common` after putting `devops/` on `sys.path`, as the
-  existing suites do.
+  existing suites do. Wait for a token with the shared `require(monitor, token,
+  timeout, start, what)` rather than a local wrapper: it prints the `[OK]` /
+  `[FAIL]` line through the module's colourising `print`, and
+  `test_suite_standards.py` fails a suite that defines its own.
 - Call `ensure_host_lock()` first in `main`, before anything that reads or
   writes a shared path. `launch_process` and `kill_stale_hosts` take it too, so
   a suite that never touches a host pays nothing for it.
@@ -390,8 +396,11 @@ with each suite's last recorded result from `.construction_site/runs/`.
   original content; `BACKUP.captured(path)` tells you whether cleanup owns a
   file at all.
 - Edit with raw bytes when line endings matter, otherwise with `atomic_write`.
-- Take `start_index = monitor.line_count` before each edit and only search
-  output after it, so an earlier reload's line can't satisfy the wait.
+- Take `start_index = monitor.line_count` before each edit, so an earlier
+  reload's line can't satisfy the wait - and before the write itself: a host
+  can answer a body-only edit within the write's own turn, and a line counted
+  into the anchor is never seen by `output_since`. `test_suite_standards.py`
+  fails a suite whose anchor sits directly after its write.
 - Put new tokens in constants named `*_TOKEN` so `test_log_contract.py` checks them.
 - Give the file a `PROTECTS:` and a `TIER:` line: `run_all.py` finds every
   `test_*.py` here by itself and orders it by those, so there is no list to add

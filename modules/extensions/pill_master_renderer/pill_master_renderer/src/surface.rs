@@ -251,6 +251,7 @@ impl Surface {
                 detail: error.to_string(),
             })?;
         crate::error::report_uncaptured_errors(&device);
+        crate::error::latch_device_loss(&device);
         let capabilities = surface.get_capabilities(&adapter);
         let color_format =
             pick_color_format(&capabilities.formats).ok_or(RendererError::NoTextureFormats)?;

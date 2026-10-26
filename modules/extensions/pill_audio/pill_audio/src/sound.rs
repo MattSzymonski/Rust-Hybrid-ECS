@@ -426,8 +426,7 @@ mod tests {
     #[test]
     fn importing_an_unsupported_format_is_refused() {
         let error = Sound::import("sounds/notes.txt", &[1], &SoundImportSettings::default())
-            .err()
-            .expect("a text file is not a sound");
+            .expect_err("a text file is not a sound");
         assert!(
             matches!(error, AssetLoadError::Decode { ref label, .. } if label == "sounds/notes.txt")
         );

@@ -108,6 +108,25 @@ impl HotPatchSession {
         self.active_generations.get(qualified).copied().unwrap_or(0)
     }
 
+    /// Where a refused fan-out returns the copies it already redirected.
+    ///
+    /// `None` means the function is running generation zero, so the repair is
+    /// each artifact's own body. A prologue-delivered generation is not a
+    /// fallback either: its address is the body the patch compiled, reached by
+    /// overwriting a function's first bytes, so it cannot be installed into a
+    /// redirect slot.
+    pub(super) fn previous_install(&self, qualified: &str) -> Option<(usize, &str)> {
+        let number = self.active_generations.get(qualified)?;
+        let generation = self
+            .generations
+            .iter()
+            .find(|candidate| candidate.function == qualified && candidate.number == *number)?;
+        if generation.overwrote_prologues() {
+            return None;
+        }
+        Some((generation.address, generation.signature.as_str()))
+    }
+
     /// Every generation recorded for every function this session has patched.
     pub(crate) fn generations(&self) -> Vec<PatchGeneration> {
         self.generations
@@ -263,12 +282,17 @@ impl HotPatchSession {
                     // a rollback re-installs the same set and has nothing new
                     // to say about it.
                     source::HotFunctionKind::PlainFunction => {
+                        // A rollback is refused the same way a fresh install
+                        // is, and the copies it reached belong back on the
+                        // generation it was leaving.
+                        let previous = self.previous_install(qualified);
                         install_everywhere(
                             targets,
                             patches,
                             &generation.lookup_name,
                             generation.address,
                             &generation.signature,
+                            previous,
                         )?;
                     }
                 }

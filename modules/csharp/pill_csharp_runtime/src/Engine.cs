@@ -568,20 +568,26 @@ public static unsafe class Engine
         // refresh copies again instead of trusting a half-updated view.
         if (_api.MirrorEpoch != null)
             _mirrorEpoch = _api.MirrorEpoch();
-        MirrorMethods.Reset();
         uint count = _api.MirrorMethodCount();
-        if (count == 0)
-            return;
-        MirrorMethodEntry[] buffer = new MirrorMethodEntry[count];
-        uint written;
-        fixed (MirrorMethodEntry* pointer = buffer)
-            written = _api.CopyMirrorMethods(pointer, count);
-        for (int index = 0; index < written; index++)
+        // Built aside and published once: a call in flight during the refresh
+        // keeps resolving against the previous bind's complete table instead of
+        // a cleared one, and the generation moves once per bind rather than
+        // once per row.
+        Dictionary<(string TypeName, string Method), IntPtr> table = MirrorMethods.NewTable();
+        if (count != 0)
         {
-            string typeName = Marshal.PtrToStringAnsi(buffer[index].TypeName) ?? string.Empty;
-            string method = Marshal.PtrToStringAnsi(buffer[index].Method) ?? string.Empty;
-            MirrorMethods.Register(typeName, method, buffer[index].Address);
+            MirrorMethodEntry[] buffer = new MirrorMethodEntry[count];
+            uint written;
+            fixed (MirrorMethodEntry* pointer = buffer)
+                written = _api.CopyMirrorMethods(pointer, count);
+            for (int index = 0; index < written; index++)
+            {
+                string typeName = Marshal.PtrToStringAnsi(buffer[index].TypeName) ?? string.Empty;
+                string method = Marshal.PtrToStringAnsi(buffer[index].Method) ?? string.Empty;
+                MirrorMethods.Register(table, typeName, method, buffer[index].Address);
+            }
         }
+        MirrorMethods.Publish(table);
     }
 
     /// <summary>Build the stable component ID shared with the Rust adapter.</summary>
@@ -951,14 +957,19 @@ public readonly struct BufferView
 
 public static class MirrorMethods
 {
-    // Concurrent collections because `Resolve` is reachable from scheduled
-    // systems, and the scheduler runs batches of disjoint systems on parallel
-    // threads: a plain `Dictionary` mutated from two of them at once is a lost
-    // update at best and a corrupted bucket chain at worst. Every operation
-    // here is a single `TryGetValue` or indexer write, so the concurrent forms
-    // cover it without a lock.
-    private static readonly ConcurrentDictionary<(string TypeName, string Method), IntPtr> Addresses = new();
+    // Concurrent because `Resolve` is reachable from scheduled systems, and the
+    // scheduler runs batches of disjoint systems on parallel threads: a plain
+    // `Dictionary` mutated from two of them at once is a lost update at best
+    // and a corrupted bucket chain at worst. Every operation here is a single
+    // `TryGetValue` or indexer write, so the concurrent forms cover it without
+    // a lock.
     private static readonly ConcurrentDictionary<(string TypeName, string Method), (int Generation, Delegate Delegate)> Cache = new();
+
+    // One immutable table, swapped whole. A refresh builds the next one beside
+    // the live table and publishes it in one exchange, so a call in flight reads
+    // either the previous bind's complete table or the new bind's - never the
+    // cleared state in between (W-0079).
+    private static Dictionary<(string TypeName, string Method), IntPtr> _addresses = new();
     private static int _generation;
 
     /// <summary>
@@ -969,17 +980,55 @@ public static class MirrorMethods
     /// </summary>
     public static int Generation => global::System.Threading.Volatile.Read(ref _generation);
 
-    /// <summary>Drop all registered methods; called when the host rebinds.</summary>
-    internal static void Reset()
+    /// <summary>An empty table for a refresh to fill before it is published.</summary>
+    internal static Dictionary<(string TypeName, string Method), IntPtr> NewTable()
+        => new();
+
+    /// <summary>
+    /// Replace the address table in one step and invalidate every cached
+    /// delegate, which is what a host bind means.
+    /// </summary>
+    internal static void Publish(Dictionary<(string TypeName, string Method), IntPtr> table)
     {
-        Addresses.Clear();
+        global::System.Threading.Interlocked.Exchange(ref _addresses, table);
         Cache.Clear();
         global::System.Threading.Volatile.Write(ref _generation, _generation + 1);
     }
 
-    /// <summary>Register one mirrored method's trampoline address.</summary>
+    /// <summary>Drop all registered methods; called when the host rebinds.</summary>
+    internal static void Reset() => Publish(NewTable());
+
+    /// <summary>Register one mirrored method's trampoline address in a table.</summary>
+    internal static void Register(
+        Dictionary<(string TypeName, string Method), IntPtr> table,
+        string typeName,
+        string method,
+        IntPtr address)
+        => table[(typeName, method)] = address;
+
+    /// <summary>
+    /// Register one mirrored method into the live table, publishing a copy of
+    /// it so a concurrent reader never sees the write half done.
+    /// </summary>
     internal static void Register(string typeName, string method, IntPtr address)
-        => Addresses[(typeName, method)] = address;
+    {
+        Dictionary<(string TypeName, string Method), IntPtr> table =
+            new(global::System.Threading.Volatile.Read(ref _addresses));
+        Register(table, typeName, method, address);
+        global::System.Threading.Interlocked.Exchange(ref _addresses, table);
+    }
+
+    /// <summary>
+    /// Drop the resolved delegates without touching the addresses or the
+    /// generation.
+    /// </summary>
+    /// <remarks>
+    /// A collectible context unloading takes its delegate types with it, so the
+    /// cache that holds them must go - but the trampoline addresses the host
+    /// published are still the ones the next context calls, so the unload must
+    /// not clear them (W-0079).
+    /// </remarks>
+    internal static void DropDelegateCache() => Cache.Clear();
 
     /// <summary>
     /// Address of a mirrored Rust method's C-ABI trampoline, for generated
@@ -991,7 +1040,8 @@ public static class MirrorMethods
     /// </exception>
     public static MirrorTrampoline Address(string typeName, string method)
     {
-        if (!Addresses.TryGetValue((typeName, method), out IntPtr address))
+        if (!global::System.Threading.Volatile.Read(ref _addresses)
+                .TryGetValue((typeName, method), out IntPtr address))
         {
             throw new InvalidOperationException(
                 $"No mirrored Rust method {typeName}::{method} is registered. " +

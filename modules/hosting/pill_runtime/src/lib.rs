@@ -57,8 +57,8 @@ pub use pill_renderer_api::{
     SurfaceId, SurfaceOptions,
 };
 pub use runtime::{
-    insert_debug_resources, run_one_frame, set_surface_camera, setup, FrameDriver, FrameReport,
-    Runtime,
+    insert_debug_resources, mount_asset_pack, run_one_frame, set_surface_camera, setup,
+    setup_with_asset_database, FrameDriver, FrameReport, PackSource, Runtime,
 };
 pub use static_project::{
     ProjectBackend, StaticLogging, StaticModule, StaticProject, StaticProjectBackend,

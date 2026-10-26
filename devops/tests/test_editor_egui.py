@@ -4,7 +4,9 @@ PROTECTS: The egui editor: startup, shell module, dock rearrangement, patch and 
 TIER: editor
 SETS: editor
 
-Builds against an already-built `pill_editor` binary, starts it on
+Builds against an already-built `pill_editor` binary - verified before use, so
+a binary older than the sources it was compiled from is refused rather than
+trusted - and starts it on
 `italian_brainrot` - a three-entity project, so the frames are fast and the
 heartbeat waits are short - with the scripted input channel
 (`PILL_EDITOR_TEST_COMMANDS`), and asserts on its log tokens: startup and the
@@ -74,6 +76,7 @@ from core.editor_session import (  # noqa: E402
     run_directory,
 )
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, executable_name  # noqa: E402
+from core.suite_common import verify_editor_binary  # noqa: E402
 from core import win_clipboard  # noqa: E402
 
 # The suite tokens: the stable halves of the lines this suite asserts on, so
@@ -160,6 +163,7 @@ CLIPBOARD_PASTED_TOKEN = "[editor] clipboard pasted"
 DROP_PREVIEW_TOKEN = "[editor] drop preview"
 FILES_DROPPED_TOKEN = "[editor] files dropped"
 DROP_REFUSED_FOLDER_TOKEN = "[editor] drop refused: folder"
+DROP_REFUSED_PATH_TOKEN = "[editor] drop refused: "
 DRAG_OUT_PREPARED_TOKEN = "[editor] drag out prepared"
 # No pointer button is held during an automated run, so the drag has to end
 # before OLE's loop: that refusal is the deterministic half of drag-out.
@@ -790,11 +794,12 @@ def main() -> int:
     # native editor, whose binary is a different build and crashes at startup
     # against the egui editor's dylib split.
     binary = arguments.binary.resolve() if arguments.binary else EGUI_EDITOR_BINARY
-    if not binary.is_file():
-        raise SystemExit(
-            "editor binary not found at {}; build it with "
-            "`cargo build -p pill_editor` in modules/ first".format(EGUI_EDITOR_BINARY)
-        )
+    # Built by the gate, not by this suite, so it is verified rather than
+    # trusted: a binary older than the sources it was compiled from would test
+    # code that no longer exists and report green.
+    refusal = verify_editor_binary(binary)
+    if refusal:
+        raise SystemExit(refusal)
     shell_source = (
         MODULES_ROOT
         / "extensions"
@@ -2691,6 +2696,35 @@ def main() -> int:
         )
         print("  [OK] a dropped folder is refused with a toast")
 
+        # A drop folder the scripted channel climbed out of (W-0107): the join
+        # goes through the same validator every other asset command uses, so
+        # `res/../..` is refused instead of being joined onto the asset root -
+        # the copy would land in `examples/`, outside the project. Both lines go
+        # in one write: the channel polls once per frame, so the drop runs while
+        # the browser still holds the climbed-out folder (the listing settles it
+        # back to the root between frames).
+        begin = len(session.read_log())
+        session.send_many(["browser ../..", "drop {}".format(drop_source)])
+        session.wait(
+            re.escape(DROP_REFUSED_PATH_TOKEN)
+            + r".*is not a path inside the asset directory",
+            30,
+            "the traversal refusal",
+            begin,
+        )
+        # A queued import would copy on a later frame, so the assertions below
+        # are only worth anything if that frame had time to run.
+        time.sleep(0.5)
+        escaped = asset_root.parent.parent / drop_source.name
+        assert not escaped.exists(), (
+            "a drop carried the file outside the asset directory: {}".format(escaped)
+        )
+        assert not list(asset_root.rglob(drop_source.name)), (
+            "the refused drop still copied the file into the project"
+        )
+        print("  [OK] a drop folder outside the asset directory is refused")
+        session.send("browser root")
+
         # Step 3a12: the drag-out smoke test (W-0038 Stage 19). Dropping into
         # Explorer needs a person, so what this checks is everything up to
         # OLE: the asset's path resolves to a file and becomes a data object.
@@ -4467,23 +4501,26 @@ def main() -> int:
         ), f"the hidden field drew a row: {showcase_rows}"
         print("  [OK] the Inspector drew the decorated rows and hid the hidden field")
 
-        # A slider edit is one recorded step, like any other field write; the
-        # value it wrote answers through the field dump.
+        # A slider edit is one recorded step, like any other field write, and
+        # the value it wrote answers the field dump in the *same* append: a
+        # scripted line's batch is applied before the next line runs (W-0109).
         slider_entity = latest_detail_entity(session)
         begin = len(session.read_log())
-        session.send(f"edit set {slider_entity} ShowcaseComponent lean 0.25")
-        session.wait(
-            re.escape(HISTORY_PUSH_TOKEN) + r'\s+label="set ShowcaseComponent\.lean"',
-            30,
-            "the slider edit recorded a step",
-            begin,
+        session.send_many(
+            [
+                f"edit set {slider_entity} ShowcaseComponent lean 0.25",
+                f"dump field {slider_entity} ShowcaseComponent lean",
+            ]
         )
-        begin = len(session.read_log())
-        session.send(f"dump field {slider_entity} ShowcaseComponent lean")
         session.wait(re.escape(FIELD_TOKEN), 30, "the edited field", begin)
         dump = session.read_log()[begin:]
+        assert re.search(
+            re.escape(HISTORY_PUSH_TOKEN)
+            + r'\s+label="set ShowcaseComponent\.lean"',
+            dump,
+        ), f"the slider edit recorded no step: {dump[-400:]}"
         assert "0.25" in dump, f"the edit did not reach the field: {dump[-400:]}"
-        print("  [OK] a decorated field edit records and reads back")
+        print("  [OK] a decorated field edit records and reads back in one append")
 
         # Step 5: the dock rearranges - an undocked tab becomes a second
         # dock surface - through the scripted channel.

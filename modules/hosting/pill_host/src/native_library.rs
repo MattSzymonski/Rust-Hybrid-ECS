@@ -1105,7 +1105,7 @@ impl NativeLibrary {
                         )
                         .map_err(|source| LibraryError::LoadFailed {
                             path: path.display().to_string(),
-                            source,
+                            source: Box::new(source),
                         })?,
                     )
                 }
@@ -1118,7 +1118,7 @@ impl NativeLibrary {
                 unsafe {
                     Library::new(path).map_err(|source| LibraryError::LoadFailed {
                         path: path.display().to_string(),
-                        source,
+                        source: Box::new(source),
                     })?
                 }
             }
@@ -1130,7 +1130,7 @@ impl NativeLibrary {
             unsafe {
                 Library::new(path).map_err(|source| LibraryError::LoadFailed {
                     path: path.display().to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
             }
         };
@@ -1149,7 +1149,7 @@ impl NativeLibrary {
                 .map_err(|source| LibraryError::MissingExport {
                     subject: module_name.to_string(),
                     symbol: String::from_utf8_lossy(MODULE_INIT_SYMBOL).to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
         };
 
@@ -1451,7 +1451,8 @@ impl NativeLibrary {
 }
 
 impl Drop for NativeLibrary {
-    /// Unmap the module and delete its temporary copy.
+    /// Unmap the module and delete its temporary copy with the directory it
+    /// was staged in.
     ///
     /// The library handle is dropped explicitly before the file is removed
     /// because Windows refuses to delete a file that is still mapped into the
@@ -1474,7 +1475,7 @@ impl Drop for NativeLibrary {
 // Free Functions
 // =============================================================================
 
-/// Delete one temporary copy, reporting failures rather than swallowing them.
+/// Delete one temporary copy and the generation directory it was staged in.
 ///
 /// Shared by [`NativeLibrary`]'s `Drop` and [`TemporaryCopy`]'s, which remove
 /// the same kind of file for the same reason and must say the same thing when
@@ -1485,6 +1486,52 @@ fn remove_temporary_file(path: &Path) {
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "Failed to remove temporary DLL {}: {error}",
             path.display()
+        );
+    }
+    if let Some(directory) = path.parent() {
+        remove_generation_directory(directory);
+    }
+}
+
+/// Remove one generation's directory, keeping whatever the process still maps.
+///
+/// The copy is not all that is in there: the module's PDB is staged beside it,
+/// and in the isolated-engine posture so are copies of the engine dylibs - one
+/// directory per load, which is tens of megabytes per reload if nothing takes
+/// it away again. The copy and the PDB go with the library. A mapped engine
+/// dylib cannot be deleted on any platform that locks its images, so whatever
+/// refuses to go is named at debug level rather than warned about: it is
+/// expected, and the startup sweep collects it once this process is gone.
+///
+/// Never the process directory itself, whose name is this process's id and
+/// which holds the hot-patch scratch images that outlive every module: only a
+/// `<staging>/<pid>/<module>_<stamp>_<n>` directory is touched, recognised by
+/// its parent being named for a process.
+fn remove_generation_directory(directory: &Path) {
+    let owned_by_a_process_directory = directory
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.parse::<u32>().is_ok());
+    if !owned_by_a_process_directory {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut kept = 0_usize;
+    for entry in entries.filter_map(Result::ok) {
+        if std::fs::remove_file(entry.path()).is_err() {
+            kept += 1;
+        }
+    }
+    let _ = std::fs::remove_dir(directory);
+    if kept > 0 {
+        debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            path = %directory.display(),
+            kept,
+            "generation directory kept the files this process still maps"
         );
     }
 }
@@ -1894,5 +1941,35 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A rejected load must take its whole generation directory with it.
+    ///
+    /// The copy is not the only thing in there: the module's PDB is staged
+    /// beside it, and so are copies of the engine dylibs when the module needs
+    /// its own. Removing the copy alone left every one of those behind, one
+    /// directory per reload, for the life of the workspace.
+    #[test]
+    fn a_rejected_load_leaves_no_generation_directory() {
+        let workspace = ScratchDirectory::new("generation_directory");
+        let build_output = workspace.join("garbage.dll");
+        std::fs::write(&build_output, b"not a native library").expect("write the artifact");
+
+        let loaded = super::NativeLibrary::load_copy(&build_output, &workspace, "garbage_module");
+        assert!(loaded.is_err(), "a file that is not a library cannot load");
+
+        let process_directory = super::process_temporary_directory(&workspace);
+        let leftover: Vec<String> = std::fs::read_dir(&process_directory)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "the generation directory outlived its copy: {leftover:?}"
+        );
     }
 }

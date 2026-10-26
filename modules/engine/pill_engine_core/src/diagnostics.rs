@@ -1,13 +1,20 @@
-//! Periodic ECS state report, registered by the engine itself.
+//! Periodic ECS state report, opt-in through
+//! [`Engine::set_ecs_diagnostics_interval`](crate::Engine::set_ecs_diagnostics_interval).
 //!
 //! # Responsibilities
 //!
 //! - Gather a snapshot of world state: entities, archetypes, columns, the
 //!   component registry, systems and resources.
-//! - Render it as a fixed-width block and print it every N frames.
+//! - Render it as a fixed-width block and print it every interval.
 //! - Register that as an engine-owned system so it survives every hot reload.
 //!
 //! # Design
+//!
+//! Nothing is registered while the engine is built: a project asks for the
+//! report by calling the setter, and only that call registers it. It reads the
+//! whole world under exclusive access - a scheduler barrier every frame - and
+//! prints a multi-line block once per interval, so it is a debugging aid rather
+//! than something every build pays for.
 //!
 //! This runs as a real scheduler system rather than a call inside
 //! `process_frame`, so it appears in the system list, is attributed like any
@@ -41,11 +48,16 @@ use crate::archetype::ColumnIdentity;
 use crate::component::ComponentId;
 use crate::world::World;
 
-/// How often the report prints when the engine registers it.
+/// How often the report prints when a project turns it on.
 ///
 /// Wall-clock rather than a frame count: a frame count prints at whatever rate
 /// the project happens to run at, which is every 60 ms on a 1600 fps demo and
 /// every two seconds on a 50 fps one. A duration reads the same everywhere.
+///
+/// This is the interval [`Engine::set_ecs_diagnostics_interval`] is normally
+/// given; the engine itself registers nothing at it.
+///
+/// [`Engine::set_ecs_diagnostics_interval`]: crate::Engine::set_ecs_diagnostics_interval
 pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Name the diagnostics system is registered under.

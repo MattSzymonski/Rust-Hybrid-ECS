@@ -763,12 +763,7 @@ pub mod assets {
             unsafe {
                 let assets = store(args)?;
                 let handle = Handle::<T>::read_slot(slot(args, 1))?;
-                set_return_string(
-                    assets
-                        .guid_of(handle)
-                        .map(|guid| guid.to_string())
-                        .unwrap_or_default(),
-                );
+                set_return_string(guid_text(assets.guid_of(handle)));
             }
             Ok(())
         })
@@ -780,7 +775,8 @@ pub mod assets {
     ///
     /// Writes the handle at 0, whether the path was already loaded at 8 and
     /// where the guid came from at 9 (`0` a file, `1` written now, `2` memory
-    /// only); returns the guid through the string channel.
+    /// only); returns the guid through the string channel, empty when the
+    /// asset carries none - the encoding [`guid_of`] already uses.
     ///
     /// # Safety
     ///
@@ -816,7 +812,7 @@ pub mod assets {
                 outcome.handle.write_return(ret);
                 *ret.add(8) = u8::from(outcome.already_loaded);
                 *ret.add(9) = metadata_source_code(outcome.metadata);
-                set_return_string(outcome.guid.to_string());
+                set_return_string(guid_text(outcome.guid));
             }
             Ok(())
         })
@@ -843,7 +839,7 @@ pub mod assets {
                 outcome.handle.write_return(ret);
                 *ret.add(8) = u8::from(outcome.already_loaded);
                 *ret.add(9) = metadata_source_code(outcome.metadata);
-                set_return_string(outcome.guid.to_string());
+                set_return_string(guid_text(outcome.guid));
             }
             Ok(())
         })
@@ -852,6 +848,12 @@ pub mod assets {
     /// Parse a guid the managed side wrote as 32 hexadecimal digits.
     fn parse_guid(text: &str) -> MirrorResult<AssetGuid> {
         AssetGuid::parse(text).ok_or_else(|| format!("`{text}` is not a 32-digit hexadecimal guid"))
+    }
+
+    /// A guid as the string channel carries it: 32 hexadecimal digits, or the
+    /// empty string when the asset has none.
+    fn guid_text(guid: Option<AssetGuid>) -> String {
+        guid.map(|guid| guid.to_string()).unwrap_or_default()
     }
 
     /// The byte a metadata source crosses as.

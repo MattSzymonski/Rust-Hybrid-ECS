@@ -127,7 +127,7 @@ impl AssetDatabase {
         let mut database = Self::new();
         let mut paths: Vec<&str> = pack
             .paths()
-            .filter(|path| !is_metadata_path(path))
+            .filter(|path| !is_metadata_path(path) && !is_hidden_path(path))
             .collect();
         paths.sort_unstable();
         for path in paths {
@@ -307,6 +307,17 @@ fn is_metadata_path(path: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case(METADATA_EXTENSION))
+}
+
+/// Whether any component of `path` is a dot-file or a dot-directory.
+///
+/// `write_beside` writes a metadata update as `.<file>.meta.<pid>-<seq>.tmp`
+/// beside its source, and a crash leaves one behind. Such a file holds the
+/// asset's own header, so indexing it would take the guid from the asset it
+/// was written for; `files_under` skips dot-files on disk, and a pack must
+/// skip them too.
+fn is_hidden_path(path: &str) -> bool {
+    path.split('/').any(|component| component.starts_with('.'))
 }
 
 /// `path` with `/` separators, the form the index keys on.
@@ -729,6 +740,34 @@ mod tests {
         assert_eq!((note.path.as_str(), note.standalone), ("a.note", false));
         let card = database.by_guid(guid(CARD_GUID)).unwrap();
         assert_eq!((card.path.as_str(), card.standalone), ("b.card", true));
+    }
+
+    /// A metadata document left behind by a crashed `write_beside` is a
+    /// dot-file, and a dot-file is not an asset: it must not be indexed, and
+    /// must not take the guid its own asset holds.
+    #[test]
+    fn a_packed_metadata_temp_file_does_not_steal_the_guid() {
+        let meta = header(
+            "pill_engine::asset_database::tests::Note",
+            NOTE_GUID,
+            "settings",
+        )
+        .into_bytes();
+        let pack_bytes = pack(&[
+            ("textures/.a.note.meta.4242-0.tmp", meta.clone()),
+            ("textures/a.note", b"hello".to_vec()),
+            ("textures/a.note.meta", meta),
+        ]);
+        let pack = AssetPack::parse(pack_bytes).unwrap();
+        let database = AssetDatabase::from_pack(&pack);
+
+        assert_eq!(database.len(), 1, "only the note is an asset");
+        let note = database.by_guid(guid(NOTE_GUID)).unwrap();
+        assert_eq!(note.path, "textures/a.note");
+        assert!(
+            database.conflicts().is_empty(),
+            "the temp file must not claim the guid first"
+        );
     }
 
     /// The bytes of a version-1 pack holding `files`, as the pack writer lays

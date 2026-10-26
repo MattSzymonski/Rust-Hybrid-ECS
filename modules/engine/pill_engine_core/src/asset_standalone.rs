@@ -151,7 +151,8 @@ impl AssetManager {
     /// the same rules as [`Self::import`]: a path already loaded under that
     /// guid returns its handle with `already_loaded` set, and nothing is
     /// decoded; a guid another live `T` has is refused. Nothing is ever
-    /// written: the file is the asset.
+    /// written: the file is the asset. The outcome's guid is always `Some`: the
+    /// file's header holds it.
     ///
     /// # Errors
     ///
@@ -169,7 +170,7 @@ impl AssetManager {
             if loaded == Some(guid) {
                 return Ok(ImportOutcome {
                     handle,
-                    guid,
+                    guid: Some(guid),
                     metadata: MetadataSource::ReadFromFile,
                     already_loaded: true,
                 });
@@ -194,7 +195,7 @@ impl AssetManager {
             .expect("the path was checked to be unloaded before building");
         Ok(ImportOutcome {
             handle,
-            guid,
+            guid: Some(guid),
             metadata: MetadataSource::ReadFromFile,
             already_loaded: false,
         })
@@ -239,7 +240,7 @@ impl AssetManager {
             .expect("the handle was looked up by name just above") = asset;
         Ok(ReimportOutcome {
             handle,
-            guid,
+            guid: Some(guid),
             metadata: MetadataSource::ReadFromFile,
             replaced: true,
         })
@@ -473,7 +474,7 @@ mod tests {
         assert_eq!(swatch.name, "swatches/a.swatch");
         assert_eq!(swatch.tint, 9);
         assert_eq!(swatch.picture, picture);
-        assert_eq!(outcome.guid, AssetGuid::parse(GUID).unwrap());
+        assert_eq!(outcome.guid, Some(AssetGuid::parse(GUID).unwrap()));
         assert_eq!(outcome.metadata, MetadataSource::ReadFromFile);
         assert!(
             !res.root.join("swatches/a.swatch.meta").exists(),
@@ -586,7 +587,7 @@ mod tests {
         let outcome = assets
             .import_standalone::<Swatch>(Path::new("new.swatch"))
             .unwrap();
-        assert_eq!(outcome.guid, guid);
+        assert_eq!(outcome.guid, Some(guid));
         assert_eq!(
             standalone_document_json::<Swatch>(Path::new("new.swatch")).unwrap(),
             serde_json::json!({"tint": 5, "picture": null})

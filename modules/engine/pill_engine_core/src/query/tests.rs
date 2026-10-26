@@ -1519,3 +1519,40 @@ fn a_stale_reader_is_reported_once() {
     }
     assert_eq!(world.reported_schema_mismatches.len(), 1);
 }
+
+/// A zero batch size cannot reach the slice arithmetic (W-0092).
+///
+/// `min_len` is a divisor in both executors, so a caller-computed zero used to
+/// divide by zero inside `for_each` and take the host down mid-frame. The
+/// setter clamps, so the zero becomes the finest split the executor can make.
+#[test]
+fn a_zero_batch_size_does_not_panic() {
+    let mut world = setup_world();
+    let num_threads = rayon::current_num_threads();
+    let entity_count = num_threads * 1024;
+    for _ in 0..entity_count {
+        world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+    }
+
+    // Enough entities to clear the sequential fallback, so the slice division
+    // is reached rather than skipped.
+    let mut query = Query::<(&mut Position,)>::new(&mut world);
+    let stats = query
+        .par_iter_mut()
+        .with_batch_size(0)
+        .tracked()
+        .for_each(|(mut pos,)| {
+            pos.x = 1.0;
+        })
+        .unwrap();
+
+    assert_eq!(stats.total_entities, entity_count);
+    // Slices of one entity, grouped contiguously across the pool, so every
+    // thread group covers exactly the entities it was given.
+    assert_eq!(stats.min_batch_size, entity_count / num_threads);
+    assert_eq!(stats.max_batch_size, entity_count / num_threads);
+}

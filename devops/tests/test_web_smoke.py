@@ -21,7 +21,8 @@ DESCRIPTION
     errors the engine does not see are still reported.
 
     Asserted:
-      1. The embedded asset pack is mounted.
+      1. The project's asset pack was downloaded beside the page and mounted:
+         the module does not carry the project's assets (W-0105).
       2. The renderer presents a first frame with a camera.
       3. Frames keep running (frame statistics are reported).
       4. No engine error, WebGPU uncaptured error or page exception occurs.
@@ -91,9 +92,14 @@ PROJECT = "examples/master_renderer_test"
 BUILD_SCRIPT = REPOSITORY_ROOT / "devops" / "tools" / "build_web.py"
 
 # Tokens the page's console must show.
-PACK_TOKEN = "mounted the embedded asset pack"
+PACK_TOKEN = "mounted the fetched asset pack"
 FIRST_FRAME_TOKEN = "[render] First frame: Presented; camera=true"
 FRAME_TOKEN = "frame statistics"
+# The pack the page fetches, and the window of a `res` file the module must not
+# contain: a browser build keeps its assets out of the wasm (W-0105).
+ASSET_PACK_FILE_NAME = "assets.pillpack"
+EMBEDDED_PROBE_BYTES = 512
+MODULE_NAME = "pkg/pill_web_app_bg.wasm"
 
 # Input sent through the DevTools protocol once the first frame is up, and what
 # the project logs when its systems see it (`examples/master_renderer_test/
@@ -355,6 +361,29 @@ def observe_page(browser: str, url: str, seconds: float, send_input: bool, captu
     return console_lines, problems, variations
 
 
+def res_files_in_module(module_path: Path, res_directory: Path) -> list:
+    """The `res` files whose bytes the wasm module carries.
+
+    A window from the middle of each file that is comfortably larger than the
+    window, so a coincidental match is not plausible; a browser build fetches
+    its pack and leaves these out (W-0105).
+    """
+    if not module_path.is_file() or not res_directory.is_dir():
+        return []
+    module = module_path.read_bytes()
+    embedded = []
+    for source in sorted(res_directory.rglob("*")):
+        if not source.is_file():
+            continue
+        data = source.read_bytes()
+        if len(data) < EMBEDDED_PROBE_BYTES * 2:
+            continue
+        start = len(data) // 2
+        if data[start : start + EMBEDDED_PROBE_BYTES] in module:
+            embedded.append(str(source.relative_to(res_directory)))
+    return embedded
+
+
 def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capture) -> int:
     """Build, serve and open the web build of `project`, then check what it
     did; the last capture goes to `save_capture` when given."""
@@ -408,8 +437,19 @@ def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capt
     # Step 3: judge.
     console = "\n".join(console_lines)
     failures = list(problems)
+    pack_path = web_build_directory / ASSET_PACK_FILE_NAME
+    if not pack_path.is_file():
+        failures.append(f"the page has no {ASSET_PACK_FILE_NAME} beside it to fetch")
+    embedded = res_files_in_module(
+        web_build_directory / MODULE_NAME, REPOSITORY_ROOT / project / "res"
+    )
+    if embedded:
+        failures.append(
+            "the module carries the project's assets instead of fetching them: "
+            + ", ".join(embedded[:5])
+        )
     for token, meaning in (
-        (PACK_TOKEN, "the embedded asset pack was not mounted"),
+        (PACK_TOKEN, "the fetched asset pack was not mounted"),
         (FIRST_FRAME_TOKEN, "no first frame was presented with a camera"),
         (FRAME_TOKEN, "frames did not keep running"),
         *(INPUT_TOKENS if checks_input else ()),
@@ -425,7 +465,8 @@ def run_smoke_test(timeout_scale: float, seconds: float, project: str, save_capt
         print("\n  Console tail:\n" + console[-2000:])
         return 1
 
-    print("  [OK] the embedded asset pack was mounted")
+    print("  [OK] the asset pack was fetched and mounted")
+    print("  [OK] the module carries none of the project's assets")
     print("  [OK] the first frame was presented with a camera")
     print(f"  [OK] frames kept running ({console.count(FRAME_TOKEN)} statistics report(s))")
     if checks_input:

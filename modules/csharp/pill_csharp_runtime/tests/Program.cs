@@ -2061,6 +2061,88 @@ internal static class Program
                     throw new InvalidOperationException($"concurrent resolve failed: {failure}");
             });
 
+            Test("a mirror refresh never clears the table under a live call", () =>
+            {
+                // The GC unload of a retiring context reaches the refresh path
+                // on a runtime-chosen thread. A refresh must not leave a
+                // registered method unresolvable while it runs, or a correct
+                // system reports "no method registered" for a method that is
+                // there.
+                MockNativeWorld.MirroredRows = [];
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                IntPtr address = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr*, IntPtr*, byte>)
+                    &MockNativeWorld.AccessorView;
+                MockNativeWorld.PublishMirrorRow("TracyLive.Probe", "entries_view", address);
+
+                int spurious = 0;
+                Exception? failure = null;
+                bool stop = false;
+                Thread reader = new Thread(() =>
+                {
+                    while (!Volatile.Read(ref stop))
+                    {
+                        try
+                        {
+                            MirrorMethods.Address("TracyLive.Probe", "entries_view");
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            Interlocked.Increment(ref spurious);
+                        }
+                        catch (Exception error)
+                        {
+                            failure = error;
+                        }
+                    }
+                });
+                reader.Start();
+                for (int iteration = 0; iteration < 500; iteration++)
+                {
+                    MockNativeWorld.PublishMirrorRow("TracyLive.Probe", "entries_view", address);
+                    Engine.RefreshMirrorMethodsIfStale();
+                }
+                Volatile.Write(ref stop, true);
+                reader.Join();
+
+                if (failure is not null)
+                    throw new InvalidOperationException($"the reader failed: {failure}");
+                Equal(spurious, 0,
+                    "a refresh must not make a registered method unresolvable");
+            });
+
+            Test("an unloaded context drops its delegates and keeps the table", () =>
+            {
+                // What a collectible context's Unloading handler does: the
+                // delegate types it created go, the addresses the host
+                // published stay, and the generation a live accessor resolved
+                // against does not move under it.
+                MockNativeWorld.MirroredRows = [];
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                IntPtr address = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr*, IntPtr*, byte>)
+                    &MockNativeWorld.AccessorView;
+                MockNativeWorld.PublishMirrorRow("TracyLive.Probe", "entries_view", address);
+                MirrorMethods.Resolve<MockNativeWorld.ViewDelegate>(
+                    "TracyLive.Probe", "entries_view");
+                int generation = MirrorMethods.Generation;
+
+                MirrorMethods.DropDelegateCache();
+
+                Equal(MirrorMethods.Generation, generation,
+                    "an unload must not bump the generation a live call resolved against");
+                Equal(MirrorMethods.Address("TracyLive.Probe", "entries_view").Address, address,
+                    "an unload must not clear the host's address table");
+                MockNativeWorld.ViewDelegate after =
+                    MirrorMethods.Resolve<MockNativeWorld.ViewDelegate>(
+                        "TracyLive.Probe", "entries_view");
+                after((IntPtr)32, out IntPtr data, out IntPtr length);
+                Equal(data, (IntPtr)64, "the table still resolves the published trampoline");
+                Equal(length, (IntPtr)5, "the table still resolves the published trampoline");
+            });
+
             Test("accessor addresses resolve and re-resolve across a host rebind", () =>
             {
                 // Step 1: a fresh bind resolves the address a generated
@@ -2330,6 +2412,58 @@ internal static class Program
                     "a Rust resource has no C# value");
                 Equal(ResourceNames.Of(typeof(AssetManager)), "pill_engine::asset::AssetManager",
                     "the marker is named by the Rust shared name");
+            });
+
+            Test("a build that lands during a load is examined on the next poll", () =>
+            {
+                // The poll samples the assembly's write time and then loads the
+                // bytes it finds. A build renamed over the file while those
+                // bytes load has a later stamp and has not been examined, so a
+                // load must remember the stamp it was given - a fresh sample at
+                // the end of the load would skip the new build until the file
+                // changed again.
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                string directory = Path.Combine(
+                    Path.GetTempPath(), $"pill_write_time_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(directory);
+                try
+                {
+                    string path = Path.Combine(directory, "project_cs.dll");
+                    File.Copy(typeof(BallPhysicsSystem).Assembly.Location, path);
+                    DateTime first = new(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+                    File.SetLastWriteTimeUtc(path, first);
+
+                    var host = new ProjectHost(path);
+                    Equal((byte)host.Load(isReload: false, writeUtc: first),
+                        (byte)PollStatus.Reloaded, "the first version loads");
+                    Assert(host.SystemCount > 0, "the copied project's systems are discovered");
+                    Equal(host.LastExaminedWriteUtc, first,
+                        "a load remembers the stamp it examined");
+
+                    // A second build lands while that load runs: the file's
+                    // stamp has moved on, but the load read the bytes the poll
+                    // sampled `first` for.
+                    DateTime second = first.AddMinutes(1);
+                    File.SetLastWriteTimeUtc(path, second);
+                    Equal((byte)host.Load(isReload: false, writeUtc: first),
+                        (byte)PollStatus.Reloaded, "the racing load completes");
+                    Equal(host.LastExaminedWriteUtc, first,
+                        "a build that landed mid-load is not recorded as examined");
+
+                    // So the next poll still has a version to examine, and both
+                    // assemblies ran.
+                    host.RequestImmediatePoll();
+                    Equal((byte)host.PollReload(), (byte)PollStatus.Reloaded,
+                        "the build that landed during the load is examined next poll");
+                    Equal(host.LastExaminedWriteUtc, second,
+                        "the newer build is the examined version now");
+                }
+                finally
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
             });
 
             Console.WriteLine($"C# ECS runtime tests passed: {_passed}");

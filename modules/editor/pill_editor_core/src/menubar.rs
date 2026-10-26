@@ -504,7 +504,7 @@ mod tests {
             ]
         );
         // Only the sidecar write needs a selection, and nothing is selected.
-        assert_eq!(actions(&entries)[5].1, false);
+        assert!(!actions(&entries)[5].1);
         // One rule after the scene rows and one above Quit Editor.
         assert_eq!(separators(&entries), 2);
         assert!(matches!(entries[3], MenuEntry::Separator));
@@ -530,15 +530,15 @@ mod tests {
             ]
         );
         let rows = actions(&disabled);
-        assert_eq!(rows[0].1, false, "no undo history yet");
-        assert_eq!(rows[1].1, false, "no redo history yet");
-        assert_eq!(rows[5].1, false, "nothing selected to delete");
-        assert_eq!(rows[6].1, true, "the preferences tab always opens");
+        assert!(!rows[0].1, "no undo history yet");
+        assert!(!rows[1].1, "no redo history yet");
+        assert!(!rows[5].1, "nothing selected to delete");
+        assert!(rows[6].1, "the preferences tab always opens");
         // Copy and cut need something to carry; paste is always offered, because
         // whether the clipboard holds a payload is the executable's answer
         // (W-0038 Stage 17).
         assert_eq!((rows[2].1, rows[3].1), (false, false));
-        assert_eq!(rows[4].1, true, "paste is offered with nothing selected");
+        assert!(rows[4].1, "paste is offered with nothing selected");
 
         snapshot.undo_depth = 2;
         snapshot.redo_depth = 1;
@@ -551,9 +551,9 @@ mod tests {
         selection.select_only(entity);
         let enabled = entries(Menu::Edit, &view_over(&snapshot, &selection, &commands));
         let rows = actions(&enabled);
-        assert_eq!(rows[0].1, true);
-        assert_eq!(rows[1].1, true);
-        assert_eq!(rows[5].1, true);
+        assert!(rows[0].1);
+        assert!(rows[1].1);
+        assert!(rows[5].1);
         // A selection is something to copy and cut.
         assert_eq!((rows[2].1, rows[3].1), (true, true));
         match &enabled[6] {

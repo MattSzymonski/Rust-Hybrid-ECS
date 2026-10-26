@@ -8,6 +8,8 @@
 //!   draws.
 //! - The listing math both panes read: [`children`], [`child_folders`],
 //!   [`breadcrumb`], [`parent_folder`], [`file_name`] and [`tile_columns`].
+//! - [`drop_folder_relative`]: where a dropped file lands, validated so a
+//!   folder outside the asset directory is refused rather than joined.
 //!
 //! # Design
 //!
@@ -21,6 +23,7 @@
 // Standard library
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
+use std::path::PathBuf;
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -214,6 +217,30 @@ pub fn tile_columns(available_width: f32, cell_width: f32) -> usize {
     ((available_width / cell_width).floor() as usize).max(1)
 }
 
+/// The folder a drop lands in, relative to the asset root, from the browser's
+/// `res/…` folder label.
+///
+/// `res` itself is the asset root - an empty relative path - and everything
+/// under it goes through the same validator every other asset command uses, so
+/// a folder the scripted channel climbed out of (`res/../..`) is refused
+/// instead of joined onto the root: the copy would land outside the project
+/// (W-0107).
+///
+/// # Errors
+///
+/// The validator's message when the folder is not a path inside the asset
+/// directory.
+pub fn drop_folder_relative(folder: &str) -> Result<PathBuf, String> {
+    let sub_folder = match folder {
+        "res" => "",
+        other => other.strip_prefix("res/").unwrap_or(other),
+    };
+    if sub_folder.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    pill_engine::asset_metadata::checked_relative(sub_folder)
+}
+
 /// Folders before files, then case-insensitive by name.
 fn sort_rows(rows: &mut [&AssetListing]) {
     rows.sort_by(|left, right| {
@@ -351,5 +378,28 @@ mod tests {
         assert_eq!(tile_columns(79.0, 80.0), 1);
         assert_eq!(tile_columns(0.0, 80.0), 1);
         assert_eq!(tile_columns(400.0, 0.0), 1);
+    }
+
+    #[test]
+    fn a_drop_in_the_root_folder_is_the_asset_root() {
+        assert_eq!(drop_folder_relative("res"), Ok(PathBuf::new()));
+    }
+
+    #[test]
+    fn a_drop_in_a_named_folder_stays_under_the_root() {
+        assert_eq!(
+            drop_folder_relative("res/models/nested"),
+            Ok(PathBuf::from("models/nested"))
+        );
+    }
+
+    #[test]
+    fn a_drop_folder_that_climbs_out_is_refused() {
+        for folder in ["res/../..", "res/models/../../..", "../..", "/res/models"] {
+            assert!(
+                drop_folder_relative(folder).is_err(),
+                "`{folder}` was accepted as a drop folder"
+            );
+        }
     }
 }

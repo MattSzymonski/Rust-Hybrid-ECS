@@ -1319,7 +1319,7 @@ mod tests {
         let last = dashes.last().expect("a dash");
         let last_length = distance(last.0, last.1);
         assert!(
-            last_length >= 1.0 && last_length <= 2.0 + 1e-4,
+            (1.0..=2.0 + 1e-4).contains(&last_length),
             "last dash {last_length}"
         );
         // A very long line is capped rather than building thousands of dashes.

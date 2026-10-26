@@ -26,7 +26,7 @@
 //! to disk: the pixels cross to the editor as data (W-0049 Stage 11).
 
 // Standard library
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -40,6 +40,18 @@ pub const PREVIEW_SIZE: u32 = 128;
 
 /// Bytes one preview's pixels take: RGBA8, tightly packed.
 const PREVIEW_BYTES: u64 = (PREVIEW_SIZE as u64) * (PREVIEW_SIZE as u64) * 4;
+
+/// How many GPU bytes the decoded texture files a preview drew may hold
+/// (W-0076).
+///
+/// The cache exists so scrolling back to a tile costs no decode; it is not a
+/// residency list, so it is bounded rather than grown for the session. A 4K
+/// texture is 64 MB, so this holds one of those or a few dozen smaller ones.
+const SOURCE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many GPU bytes the decoded mesh files may hold. A mesh is far smaller
+/// than a texture, so the same budget covers a whole browsing session.
+const MESH_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The mapping state of the readback, shared with the map callback.
 const MAPPING_PENDING: u8 = 0;
@@ -131,9 +143,19 @@ pub(super) struct PreviewRenderer {
     /// The texture files previews drew, by path, with the modified time each
     /// was decoded from.
     sources: HashMap<String, (Option<SystemTime>, wgpu::TextureView)>,
+    /// The order the sources were last used in, oldest first, with the GPU
+    /// bytes each holds: what the budget is enforced over (W-0076).
+    source_order: VecDeque<(String, u64)>,
+    /// The GPU bytes `sources` holds.
+    source_bytes: u64,
     /// The mesh files previews drew, by path, with the modified time each was
     /// decoded from.
     meshes: HashMap<String, (Option<SystemTime>, MeshSource)>,
+    /// The order the meshes were last used in, oldest first, with the GPU
+    /// bytes each holds.
+    mesh_order: VecDeque<(String, u64)>,
+    /// The GPU bytes `meshes` holds.
+    mesh_bytes: u64,
     /// The request whose pixels are on their way, with its map state.
     in_flight: Option<(u64, Arc<AtomicU8>)>,
     /// Finished previews waiting for the next [`Self::collect`].
@@ -360,7 +382,11 @@ impl PreviewRenderer {
             sampler,
             white,
             sources: HashMap::new(),
+            source_order: VecDeque::new(),
+            source_bytes: 0,
             meshes: HashMap::new(),
+            mesh_order: VecDeque::new(),
+            mesh_bytes: 0,
             in_flight: None,
             finished: Vec::new(),
         }
@@ -370,6 +396,15 @@ impl PreviewRenderer {
     /// nothing is waiting to be handed over.
     pub(super) fn ready(&self) -> bool {
         self.in_flight.is_none() && self.finished.is_empty()
+    }
+
+    /// Answer a request this renderer will not draw, so the caller stops
+    /// waiting for it.
+    ///
+    /// The refusal joins the finished list, which is what `collect` hands over,
+    /// so a caller sees one answer per request it made.
+    pub(super) fn refuse(&mut self, id: u64) {
+        self.finished.push(PreviewImage::refused(id));
     }
 
     /// The source a texture preview samples: the file decoded and uploaded the
@@ -386,7 +421,12 @@ impl PreviewRenderer {
             .and_then(|metadata| metadata.modified().ok());
         if let Some((cached, view)) = self.sources.get(path) {
             if *cached == modified {
-                return Some((view.clone(), self.sampler.clone()));
+                let view = view.clone();
+                // Reused entries move to the front of the eviction queue: the
+                // budget drops what a person scrolled past, not what they are
+                // looking at.
+                self.touch_source(path);
+                return Some((view, self.sampler.clone()));
             }
         }
         let decoded = image::open(Path::new(path)).ok()?.to_rgba8();
@@ -423,7 +463,52 @@ impl PreviewRenderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.sources
             .insert(path.to_string(), (modified, view.clone()));
+        let bytes = u64::from(size.width) * u64::from(size.height) * 4;
+        self.store_source(path, bytes);
         Some((view, self.sampler.clone()))
+    }
+
+    /// Record `path` as the newest source of `bytes`, then drop the oldest
+    /// ones the budget can no longer hold.
+    fn store_source(&mut self, path: &str, bytes: u64) {
+        self.forget_source(path);
+        self.source_order.push_back((path.to_string(), bytes));
+        self.source_bytes += bytes;
+        let dropped = trim_to_budget(
+            &mut self.source_order,
+            &mut self.source_bytes,
+            SOURCE_BUDGET_BYTES,
+        );
+        for path in &dropped {
+            self.sources.remove(path);
+        }
+        if !dropped.is_empty() {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                dropped = dropped.len(),
+                bytes = self.source_bytes,
+                "[preview] source cache trimmed"
+            );
+        }
+    }
+
+    /// Move a source that was just used to the newest end of the eviction
+    /// queue.
+    fn touch_source(&mut self, path: &str) {
+        if let Some(index) = self.source_order.iter().position(|(key, _)| key == path) {
+            if let Some(entry) = self.source_order.remove(index) {
+                self.source_order.push_back(entry);
+            }
+        }
+    }
+
+    /// Forget a source's accounting, for the entry an insert replaces.
+    fn forget_source(&mut self, path: &str) {
+        if let Some(index) = self.source_order.iter().position(|(key, _)| key == path) {
+            if let Some((_, bytes)) = self.source_order.remove(index) {
+                self.source_bytes = self.source_bytes.saturating_sub(bytes);
+            }
+        }
     }
 
     /// Record one preview into `encoder`: the asset's texture through
@@ -507,7 +592,9 @@ impl PreviewRenderer {
             .and_then(|metadata| metadata.modified().ok());
         if let Some((cached, mesh)) = self.meshes.get(path) {
             if *cached == modified {
-                return Some(mesh.clone());
+                let mesh = mesh.clone();
+                self.touch_mesh(path);
+                return Some(mesh);
             }
         }
         let bytes = std::fs::read(Path::new(path)).ok()?;
@@ -538,7 +625,51 @@ impl PreviewRenderer {
         };
         self.meshes
             .insert(path.to_string(), (modified, source.clone()));
+        let bytes = source.vertices.size() + source.indices.size();
+        self.store_mesh(path, bytes);
         Some(source)
+    }
+
+    /// Record `path` as the newest mesh source of `bytes`, then drop the oldest
+    /// ones the budget can no longer hold.
+    fn store_mesh(&mut self, path: &str, bytes: u64) {
+        self.forget_mesh(path);
+        self.mesh_order.push_back((path.to_string(), bytes));
+        self.mesh_bytes += bytes;
+        let dropped = trim_to_budget(
+            &mut self.mesh_order,
+            &mut self.mesh_bytes,
+            MESH_BUDGET_BYTES,
+        );
+        for path in &dropped {
+            self.meshes.remove(path);
+        }
+        if !dropped.is_empty() {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                dropped = dropped.len(),
+                bytes = self.mesh_bytes,
+                "[preview] mesh cache trimmed"
+            );
+        }
+    }
+
+    /// Move a mesh that was just used to the newest end of the eviction queue.
+    fn touch_mesh(&mut self, path: &str) {
+        if let Some(index) = self.mesh_order.iter().position(|(key, _)| key == path) {
+            if let Some(entry) = self.mesh_order.remove(index) {
+                self.mesh_order.push_back(entry);
+            }
+        }
+    }
+
+    /// Forget a mesh's accounting, for the entry an insert replaces.
+    fn forget_mesh(&mut self, path: &str) {
+        if let Some(index) = self.mesh_order.iter().position(|(key, _)| key == path) {
+            if let Some((_, bytes)) = self.mesh_order.remove(index) {
+                self.mesh_bytes = self.mesh_bytes.saturating_sub(bytes);
+            }
+        }
     }
 
     /// Record one mesh preview into `encoder`, then copy the square out for
@@ -722,6 +853,28 @@ fn framing(vertices: &[crate::assets::MeshVertex]) -> Option<[[f32; 4]; 4]> {
     Some((projection * view).to_cols_array_2d())
 }
 
+/// The paths a cache must drop to fit `budget`, oldest first, and the bytes it
+/// holds afterwards.
+///
+/// The newest entry is never dropped, even when it alone is over the budget: a
+/// source bigger than the whole cache still previews, it just leaves nothing
+/// else resident (W-0076).
+fn trim_to_budget(
+    order: &mut VecDeque<(String, u64)>,
+    total: &mut u64,
+    budget: u64,
+) -> Vec<String> {
+    let mut dropped = Vec::new();
+    while *total > budget && order.len() > 1 {
+        let Some((path, bytes)) = order.pop_front() else {
+            break;
+        };
+        *total = total.saturating_sub(bytes);
+        dropped.push(path);
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,5 +940,48 @@ mod tests {
         // the mesh is, and a mesh of nothing but unplaced vertices is not.
         assert!(framing(&[vertex([f32::NAN, 0.0, 0.0])]).is_none());
         assert!(framing(&[vertex([f32::NAN, 0.0, 0.0]), vertex([1.0, 1.0, 1.0])]).is_some());
+    }
+
+    /// A megabyte of 4K texture is 64 MB, so browsing a folder of them must not
+    /// keep every one resident (W-0076).
+    #[test]
+    fn browsing_many_textures_keeps_the_cache_under_its_budget() {
+        let texture_bytes = 4096 * 4096 * 4;
+        let mut order = VecDeque::new();
+        let mut total = 0;
+        for index in 0..100u32 {
+            let path = format!("textures/t{index}.png");
+            order.push_back((path, texture_bytes));
+            total += texture_bytes;
+            let dropped = trim_to_budget(&mut order, &mut total, SOURCE_BUDGET_BYTES);
+            // The cache drops as it grows, so what it holds never climbs past
+            // the budget.
+            assert!(
+                total <= SOURCE_BUDGET_BYTES || order.len() == 1,
+                "{} bytes held after {index} textures",
+                total
+            );
+            assert_eq!(dropped.len(), usize::from(index > 0));
+        }
+        // The tile a person is on is the one that stays.
+        assert_eq!(
+            order.back().map(|(path, _)| path.as_str()),
+            Some("textures/t99.png")
+        );
+        assert_eq!(order.len(), 1);
+    }
+
+    /// A source larger than the whole cache still previews: it is the newest
+    /// entry, and the budget never drops the newest.
+    #[test]
+    fn a_source_larger_than_the_budget_is_still_kept() {
+        let mut order = VecDeque::from([("huge.png".to_owned(), SOURCE_BUDGET_BYTES * 4)]);
+        let mut total = SOURCE_BUDGET_BYTES * 4;
+
+        let dropped = trim_to_budget(&mut order, &mut total, SOURCE_BUDGET_BYTES);
+
+        assert!(dropped.is_empty());
+        assert_eq!(order.len(), 1);
+        assert_eq!(total, SOURCE_BUDGET_BYTES * 4);
     }
 }

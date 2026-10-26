@@ -464,6 +464,12 @@ impl CommandQueue {
     /// Creates the archetype row for the entity and writes both its native
     /// and type-erased components. Component data is trusted because managed
     /// command blobs are validated before being queued.
+    ///
+    /// The create has two failure points and only the first can be undone: a
+    /// refusal before the row exists recycles the slot the caller was given,
+    /// while a write that fails after the insert leaves the entity live (its
+    /// row is in every column already, so there is nothing to roll back to)
+    /// and only reports the failure.
     fn execute_create_entity(
         world: &mut World,
         entity: Entity,
@@ -489,6 +495,7 @@ impl CommandQueue {
             .find(|pair| pair[0] == pair[1])
             .map(|pair| pair[0])
         {
+            world.recycle_refused_entity(entity);
             return Err(vec![CommandError::DuplicateComponent {
                 entity,
                 component_id: duplicate,
@@ -1668,5 +1675,48 @@ mod tests {
             [CommandError::ComponentWriteFailed { entity: failed_entity, component_id: failed_component }]
                 if *failed_entity == entity && *failed_component == component_id
         ));
+    }
+    /// A refused deferred creation puts its entity slot back (W-0093).
+    ///
+    /// `Commands::create_entity` allocates the handle eagerly, before the
+    /// command is queued. A create the flush refuses used to return without
+    /// releasing it, so the slot was never handed out again and the handle the
+    /// caller was given named nothing forever.
+    #[test]
+    fn a_refused_deferred_create_releases_its_entity_slot() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let mut queue = CommandQueue::new();
+        let entity = {
+            let mut commands = Commands::new(&mut queue, &mut world);
+            commands
+                .create_entity()
+                .with(Position { x: 1.0, y: 2.0 })
+                .with(Position { x: 3.0, y: 4.0 })
+                .build()
+        };
+
+        let errors = queue
+            .execute_queued_commands(&mut world, true)
+            .expect_err("a duplicated component must fail the flush");
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::DuplicateComponent { component_id, .. }]
+                if *component_id == ComponentId::of::<Position>()
+        ));
+        assert!(
+            !world.entity_locations.contains_key(&entity),
+            "a refused creation leaves no entity behind"
+        );
+        let recycled = world.allocate_entity();
+        assert_eq!(
+            recycled.id(),
+            entity.id(),
+            "the refused create released its slot, so the next allocation reuses it"
+        );
+        assert_ne!(
+            recycled, entity,
+            "the recycled slot carries the next generation, so a handle the caller kept cannot name it"
+        );
     }
 }

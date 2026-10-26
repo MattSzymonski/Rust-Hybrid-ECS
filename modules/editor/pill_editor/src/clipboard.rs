@@ -20,15 +20,24 @@
 //! `OpenClipboard`/`CloseClipboard` pair per call - because an open clipboard
 //! blocks every other process, including the other editor instance a paste is
 //! coming from.
+//!
+//! A read is bounded by the block the clipboard reports (`GlobalSize`), never
+//! by the producer's terminator: any process can set the registered format,
+//! and a block with no NUL inside its own size is refused with a log line
+//! rather than walked past into this process's heap.
 
 // External crates
+use pill_core::telemetry::telemetry_target;
+use pill_core::warn;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{GlobalFree, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
 // Current crate
@@ -196,20 +205,35 @@ fn read_open() -> Result<Option<String>, String> {
         if pointer.is_null() {
             continue;
         }
-        // The block is a NUL-terminated UTF-16 string; its length is not
-        // reported, so it is measured by walking to the terminator.
+        // The block's own size is the only bound the read can trust: the
+        // terminator is a convention of the producer, not a property of the
+        // block, so a foreign block with no NUL in it must not walk the read
+        // out of the allocation.
+        // SAFETY: `handle` is the clipboard's data block; the query only reads
+        // the allocation's size, and neither frees nor unlocks it.
+        let bytes = unsafe { GlobalSize(HGLOBAL(handle.0)) };
+        let capacity = bytes / std::mem::size_of::<u16>();
         let mut length = 0usize;
-        // SAFETY: the pointer addresses the NUL-terminated UTF-16 block the
-        // clipboard handed over, and the walk stops at its first NUL.
-        while unsafe { *pointer.add(length) } != 0 {
+        // SAFETY: `pointer` addresses the locked block of `capacity` UTF-16
+        // units, so every index below `capacity` is inside the allocation.
+        while length < capacity && unsafe { *pointer.add(length) } != 0 {
             length += 1;
         }
-        // SAFETY: `pointer` is the locked block and `length` counts the
-        // UTF-16 units before its terminator.
+        let unterminated = length == capacity;
+        // SAFETY: `pointer` is the locked block and `length` counts the UTF-16
+        // units before its terminator, so the slice stays inside the block.
         let slice = unsafe { std::slice::from_raw_parts(pointer, length) };
         let text = String::from_utf16_lossy(slice);
         // SAFETY: the lock was taken above on this handle and is released once.
         let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
+        if unterminated {
+            warn!(
+                target: telemetry_target::ENGINE,
+                bytes = bytes,
+                "[editor] clipboard refused: the block carries no terminator"
+            );
+            continue;
+        }
         if !text.is_empty() {
             return Ok(Some(text));
         }
@@ -222,4 +246,77 @@ fn read_open() -> Result<Option<String>, String> {
 pub fn process_id() -> u32 {
     // SAFETY: `GetCurrentProcessId` takes no arguments and cannot fail.
     unsafe { GetCurrentProcessId() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clipboard is one process-wide resource, so the tests below take
+    /// turns: an `OpenClipboard` on one thread is closed by a `CloseClipboard`
+    /// on another.
+    static CLIPBOARD_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialise one test's use of the clipboard for its whole body.
+    fn clipboard_turn() -> std::sync::MutexGuard<'static, ()> {
+        CLIPBOARD_TURN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Put `units` UTF-16 `A`s on the clipboard under the payload format with
+    /// no terminator - the block shape a foreign application can hand over.
+    fn set_unterminated_block(units: usize) {
+        let format = payload_format().expect("the payload format registers");
+        // SAFETY: `HWND::default()` is the null owner, the documented form for
+        // a process without a clipboard-owning window.
+        unsafe { OpenClipboard(HWND::default()) }.expect("the clipboard opens");
+        // SAFETY: the clipboard is open and this call owns it.
+        unsafe { EmptyClipboard() }.expect("the clipboard empties");
+        let bytes = units * std::mem::size_of::<u16>();
+        // SAFETY: `GMEM_MOVEABLE` with a byte count is the documented
+        // allocation for clipboard data; a null return fails the test.
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) }.expect("the block allocates");
+        // SAFETY: `handle` is the allocation just made, locked once so it can
+        // be filled.
+        let target = unsafe { GlobalLock(HGLOBAL(handle.0)) }.cast::<u16>();
+        assert!(!target.is_null(), "the block locks");
+        for unit in 0..units {
+            // SAFETY: `unit` is inside the block just allocated and locked.
+            unsafe { *target.add(unit) = u16::from(b'A') };
+        }
+        // SAFETY: the lock was taken above on this handle and is released once.
+        let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
+        // SAFETY: the clipboard is open and takes ownership of the block.
+        unsafe { SetClipboardData(format, windows::Win32::Foundation::HANDLE(handle.0)) }
+            .expect("the block is accepted");
+        // SAFETY: the clipboard is open exactly once here.
+        let _ = unsafe { CloseClipboard() };
+    }
+
+    #[test]
+    fn an_unterminated_block_is_refused_rather_than_walked_past() {
+        let _turn = clipboard_turn();
+        const UNITS: usize = 4096;
+        set_unterminated_block(UNITS);
+        match read() {
+            Ok(None) => {}
+            Ok(Some(text)) => panic!(
+                "a block of {UNITS} units with no terminator was read as {} units",
+                text.chars().count()
+            ),
+            Err(message) => panic!("the read reported '{message}' instead of refusing the block"),
+        }
+    }
+
+    #[test]
+    fn a_terminated_block_is_read_back_whole() {
+        let _turn = clipboard_turn();
+        write("a payload the editor wrote itself").expect("the clipboard write succeeds");
+        match read() {
+            Ok(Some(text)) => assert_eq!(text, "a payload the editor wrote itself"),
+            Ok(None) => panic!("the block just written was not found"),
+            Err(message) => panic!("the read reported '{message}'"),
+        }
+    }
 }

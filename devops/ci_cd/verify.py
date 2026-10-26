@@ -150,23 +150,52 @@ STEPS: List[Step] = [
     # Also the default posture's compile check: the workspace has no
     # `default-members`, so a bare `cargo clippy` covers every member with its
     # default features - exactly what `cargo check --workspace` would compile.
-    Step("clippy", "Clippy (default posture)", [["cargo", "clippy", "--", "-D", "warnings"]], quick=True),
+    #
+    # `--all-targets` adds the test, example and bench targets. Without it a
+    # warning in a `#[cfg(test)]` module went unseen: those targets are built
+    # by `cargo test` and nextest, and neither denies warnings (W-0087).
+    Step(
+        "clippy",
+        "Clippy (default posture, every target)",
+        [["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]],
+        quick=True,
+    ),
+    # The posture checks below run clippy rather than `cargo check` so they can
+    # deny warnings: `cargo check` takes no rustc flags, and an `RUSTFLAGS`
+    # variable would replace the workspace's `-C prefer-dynamic` instead of
+    # adding to it (see `modules/.cargo/config.toml`). `-- -D warnings` reaches
+    # rustc without touching rustflags, so a warning in a posture fails its
+    # step (W-0087).
     Step(
         "check-hot-patch",
-        "Check (hot_patch posture)",
-        [["cargo", "check", "--workspace", "--features", HOT_PATCH_FEATURES]],
+        "Clippy (hot_patch posture)",
+        [["cargo", "clippy", "--workspace", "--features", HOT_PATCH_FEATURES, "--", "-D", "warnings"]],
     ),
     Step(
         "check-shipping",
-        "Check (shipping posture)",
+        "Clippy (shipping posture)",
         # `-p pill_standalone` alone: with `--workspace`, `pill_editor` would
         # bring `pill_host` and the dev posture back (see the crate's manifest).
-        [["cargo", "check", "-p", "pill_standalone", "--no-default-features", "--features", "shipping"]],
+        #
+        # The bundle is generated first: the committed stub is deliberately
+        # project-agnostic and refuses to compile, so without this step the
+        # shipping posture would either fail on the stub or - as it did before
+        # W-0082 - type-check against a stale generation of some other project.
+        [
+            # The generator is named by absolute path: the step runs from
+            # `modules/`, where the cargo command below has to run.
+            [PYTHON, str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"), "examples/project_rs"],
+            [
+                "cargo", "clippy", "-p", "pill_standalone",
+                "--no-default-features", "--features", "shipping",
+                "--", "-D", "warnings",
+            ],
+        ],
     ),
     Step(
         "check-rendering",
-        "Check (rendering posture)",
-        [["cargo", "check", "-p", "pill_standalone", "--features", "rendering"]],
+        "Clippy (rendering posture)",
+        [["cargo", "clippy", "-p", "pill_standalone", "--features", "rendering", "--", "-D", "warnings"]],
     ),
     Step(
         "default-lane-features",
@@ -223,6 +252,17 @@ STEPS: List[Step] = [
         [
             [PYTHON, "devops/tests/test_engine_layout.py", "--self-test"],
             [PYTHON, "devops/tests/test_engine_layout.py"],
+        ],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
+    Step(
+        "keycode-mirror",
+        "C# KeyCode mirror (names, order and numbers against the engine table)",
+        # The self test first proves the checker still catches each break.
+        [
+            [PYTHON, "devops/tests/test_keycode_mirror.py", "--self-test"],
+            [PYTHON, "devops/tests/test_keycode_mirror.py"],
         ],
         working_directory=REPOSITORY_ROOT,
         quick=True,

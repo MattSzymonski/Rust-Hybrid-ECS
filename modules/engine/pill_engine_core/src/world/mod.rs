@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 
 // External crates
-use pill_core::{error, warn};
+use pill_core::{error, info, warn};
 
 // Current crate
 use crate::archetype::{
@@ -423,10 +423,14 @@ pub struct World {
     /// Monotonically increasing world tick used for change detection.
     ///
     /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and
-    /// also each time a query that supports change tracking begins iteration.
-    /// Stored as a plain `u32`; wrap-around handling is intentionally simple
-    /// (and matches the expected lifetime of long-running games at 60 fps:
-    /// ~828 days before overflow).
+    /// also each time a query that supports change tracking begins iteration,
+    /// so a frame running N such queries costs N + 1 ticks. Stored as a plain
+    /// `u32` and compared with wrapping arithmetic
+    /// ([`Tick::is_newer_than`](crate::component::Tick::is_newer_than)), so a
+    /// wrap costs nothing: the budget is ~828 days at 60 fps when the frame's
+    /// only bump is the engine's own, and ~828/N days when a frame runs N
+    /// change-tracking queries - thirty of them wrap in ~28 days, and a frame
+    /// with several hundred wraps within a day.
     pub(crate) change_tick: u32,
     /// Last-run tick for the system that is currently fetching its
     /// parameters from this world.
@@ -880,6 +884,20 @@ impl World {
     /// conflicting generation.
     pub fn release_entity(&mut self, entity: Entity) {
         self.free_entity_ids.push((entity.id, entity.generation));
+    }
+
+    /// Recycle the slot of a create the command flush refused.
+    ///
+    /// Unlike [`Self::release_entity`], the handle this takes had already been
+    /// handed out, so the slot comes back with the next generation - the rule
+    /// [`Self::destroy_entity`] follows - and a handle the caller kept cannot
+    /// name whatever occupies the slot next. A slot at `u32::MAX` is retired
+    /// rather than wrapped, for the reason given there.
+    pub(crate) fn recycle_refused_entity(&mut self, entity: Entity) {
+        if entity.generation != u32::MAX {
+            self.free_entity_ids
+                .push((entity.id, entity.generation + 1));
+        }
     }
 
     /// Get or create an archetype for a given set of components

@@ -681,6 +681,10 @@ pub enum BuildError {
 ///
 /// Covers the temporary-directory staging, the copy into place, dynamic
 /// loading, and the `pill_module_init` entry-point contract.
+///
+/// The loader's own error is a boxed source: `pill_core` is the shared dylib
+/// every posture links, so it may not name `libloading` (W-0114). The cause is
+/// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::library)]
 pub enum LibraryError {
     /// The per-process temporary directory could not be created.
@@ -713,7 +717,7 @@ pub enum LibraryError {
     LoadFailed {
         path: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The artifact was linked against a different engine dylib than the host
@@ -792,7 +796,7 @@ pub enum LibraryError {
         subject: String,
         symbol: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// `pill_module_init` reported a failed generation.
@@ -868,6 +872,10 @@ pub enum ModuleError {
 ///
 /// Distinct from build failures: the watcher must start before any build can
 /// be triggered by a source change.
+///
+/// The watcher's own error is a boxed source: `pill_core` is the shared dylib
+/// every posture links, so it may not name `notify` (W-0114). The cause is
+/// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::watcher)]
 pub enum WatcherError {
     /// The configured watch directory does not exist.
@@ -878,7 +886,7 @@ pub enum WatcherError {
     #[message("failed to create file watcher")]
     CreationFailed {
         #[source]
-        source: notify::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The watch path could not be registered.
@@ -886,7 +894,7 @@ pub enum WatcherError {
     RegistrationFailed {
         path: String,
         #[source]
-        source: notify::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -894,6 +902,10 @@ pub enum WatcherError {
 ///
 /// Covers hostfxr discovery and loading, runtime delegates, the component
 /// manifest exchange, and reflected managed startup.
+///
+/// The loader's own error is a boxed source: `pill_core` is the shared dylib
+/// every posture links, so it may not name `libloading` (W-0114). The cause is
+/// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::csharp)]
 pub enum CSharpError {
     /// No hostfxr installation was found in any configured dotnet root.
@@ -909,7 +921,7 @@ pub enum CSharpError {
     HostfxrLoadFailed {
         path: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The NativeAOT library could not be found on disk.
@@ -921,7 +933,7 @@ pub enum CSharpError {
     AotLibraryLoadFailed {
         path: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// A required export is missing from the NativeAOT library.
@@ -929,7 +941,7 @@ pub enum CSharpError {
     AotExportMissing {
         symbol: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// A required hostfxr export is missing.
@@ -937,7 +949,7 @@ pub enum CSharpError {
     HostfxrExportMissing {
         symbol: String,
         #[source]
-        source: libloading::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Runtime initialization failed with a negative hostfxr status.
@@ -1159,6 +1171,24 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A boxed source still reports its cause through the chain.
+    ///
+    /// The variants that name the watcher's and the loader's own error box it
+    /// instead, because this crate is the shared dylib every posture links and
+    /// may not depend on either (W-0114). `format_error_chain` builds the
+    /// host's one-line reports, so the cause it walks to is what has to stay.
+    #[test]
+    fn a_boxed_source_still_reports_its_cause() {
+        let error = WatcherError::CreationFailed {
+            source: Box::new(std::io::Error::other("the platform watcher refused")),
+        };
+
+        assert_eq!(
+            crate::utils::format_error_chain(&error),
+            "failed to create file watcher: the platform watcher refused"
+        );
+    }
+
     /// The engine-dylib mismatch names both dylibs and both ways out.
     ///
     /// This is the message that replaces `os error 127`, which named neither

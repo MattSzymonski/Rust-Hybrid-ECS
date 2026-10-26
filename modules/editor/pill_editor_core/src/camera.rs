@@ -267,7 +267,10 @@ mod tests {
         let camera = OrbitCamera::default();
         let forward = camera.forward();
         assert!(forward[1] < 0.0, "the default looks down: {forward:?}");
-        assert!(close(camera.eye()[1] - camera.pivot[1], camera.distance * 0.2955) || true);
+        assert!(close(
+            camera.eye()[1] - camera.pivot[1],
+            DEFAULT_PITCH.sin() * camera.distance
+        ));
         // The eye sits one distance from the pivot, on the far side of the
         // forward direction.
         let offset = [

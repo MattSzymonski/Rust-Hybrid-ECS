@@ -269,7 +269,9 @@ macro_rules! create_project {
 ///
 /// # Panics
 ///
-/// Panics when `mask_range.end` reaches or exceeds the bit width of `T`.
+/// Panics when `mask_range.end` reaches or exceeds the bit width of `T`, or
+/// when `mask_range.start` is greater than `mask_range.end` (a reversed range
+/// has no run to set, and its length would underflow).
 pub fn create_bitmask_from_range<T>(mask_range: &core::ops::Range<T>) -> T
 where
     T: Copy
@@ -290,11 +292,18 @@ where
         panic!("Provided mask range exceeds mask size");
     }
 
-    // Step 3: Derive the run length and the shift aligning it to the MSB.
+    // Step 3: Reject a reversed range. Its length would underflow, and the
+    // shift that length feeds is masked to the type's width, so the caller
+    // would get a run of bits unrelated to the range it asked for.
+    if mask_range.start > mask_range.end {
+        panic!("Provided mask range is reversed");
+    }
+
+    // Step 4: Derive the run length and the shift aligning it to the MSB.
     let range_length: T = mask_range.end - mask_range.start + T::from(1);
     let mask_shift = mask_size - mask_range.end - T::from(1);
 
-    // Step 4: Build the mask, handling a full-width run separately because
+    // Step 5: Build the mask, handling a full-width run separately because
     // shifting by the full bit width would overflow.
     match range_length == mask_size {
         true => !(T::from(0)) << mask_shift,
@@ -356,4 +365,35 @@ pub fn get_indices_of_set_elements(bitmask: u16) -> Vec<usize> {
         test_mask >>= 1;
     }
     indices
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    // Current crate
+    use super::*;
+
+    /// The documented example: the first four bits of a `u16` are set.
+    #[test]
+    fn a_range_sets_its_run_of_bits() {
+        assert_eq!(
+            create_bitmask_from_range::<u16>(&(0..4)),
+            0b1111_1000_0000_0000
+        );
+    }
+
+    /// A reversed range is a caller error, not a request for a mask: the run
+    /// length would underflow, and the shift it feeds would then be masked to
+    /// something unrelated to the range.
+    #[test]
+    #[should_panic(expected = "Provided mask range is reversed")]
+    fn a_reversed_range_is_rejected() {
+        // Built from bindings: a reversed literal range is itself a lint.
+        let start = 5_u16;
+        let end = 3_u16;
+        let _ = create_bitmask_from_range::<u16>(&(start..end));
+    }
 }

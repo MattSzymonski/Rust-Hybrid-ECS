@@ -132,7 +132,11 @@ pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> 
             .get(imported.handle)
             .map(|scene| scene.document().clone())
             .ok_or_else(|| "the scene did not stay loaded".to_string())?;
-        (document, imported.guid)
+        // A standalone scene carries its guid in the file's own header.
+        let guid = imported
+            .guid
+            .ok_or_else(|| format!("the scene file `{path}` carries no guid"))?;
+        (document, guid)
     };
     let database = asset_database(&registry);
     clear_world(engine.world_mut());
@@ -205,6 +209,17 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
             "[editor] scene fields not written"
         );
     }
+    // A component the field layer cannot reach is not in the file at all, so
+    // reopening the scene brings the entity back without it. Same bargain: the
+    // save goes ahead, and the author is told what stayed behind.
+    if !report.skipped_components.is_empty() {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            count = report.skipped_components.len(),
+            components = report.skipped_components.join(", ").as_str(),
+            "[editor] scene components not written"
+        );
+    }
     let guid = match (open.as_ref(), path) {
         // Save to the open scene: keep its guid.
         (Some(open), None) => open.guid,
@@ -237,10 +252,12 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
             .reimport_standalone::<Scene>(Path::new(&target))
             .map_err(|error| format!("`{target}` was written but did not load back: {error}"))?
     };
-    if reopened.guid != guid {
+    if reopened.guid != Some(guid) {
         return Err(format!(
             "`{target}` was written with guid {guid} but reads back as {}",
-            reopened.guid
+            reopened
+                .guid
+                .map_or_else(|| "none".to_owned(), |guid| guid.to_string())
         ));
     }
     let open = OpenScene { path: target, guid };
@@ -266,7 +283,7 @@ fn existing_guid(engine: &mut Engine, path: &str) -> Option<AssetGuid> {
     assets
         .import_standalone::<Scene>(Path::new(path))
         .ok()
-        .map(|imported| imported.guid)
+        .and_then(|imported| imported.guid)
 }
 
 /// A fresh guid for a scene file that does not exist yet.

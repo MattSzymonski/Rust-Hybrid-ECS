@@ -717,8 +717,11 @@ public readonly struct ImportedAsset<T>
     /// <summary>The asset's handle.</summary>
     public readonly Handle<T> Handle;
 
-    /// <summary>The asset's guid, as the 32 hexadecimal digits its file holds.</summary>
-    public readonly string Guid;
+    /// <summary>
+    /// The asset's guid, as the 32 hexadecimal digits its file holds, or
+    /// <c>null</c> when it carries none (a source added in memory).
+    /// </summary>
+    public readonly string? Guid;
 
     /// <summary>The path was already loaded, and its existing handle was returned.</summary>
     public readonly bool AlreadyLoaded;
@@ -726,7 +729,7 @@ public readonly struct ImportedAsset<T>
     /// <summary>Where the guid came from.</summary>
     public readonly MetadataSource Metadata;
 
-    internal ImportedAsset(Handle<T> handle, string guid, bool alreadyLoaded, MetadataSource metadata)
+    internal ImportedAsset(Handle<T> handle, string? guid, bool alreadyLoaded, MetadataSource metadata)
     {
         Handle = handle;
         Guid = guid;
@@ -867,9 +870,15 @@ public static class AssetManagerExtensions
 
     private static ImportedAsset<T> ReadImport<T>(ref MirrorCall call) =>
         new(call.Result<Handle<T>>(),
-            call.ResultString(),
+            GuidFrom(call.ResultString()),
             call.ResultAt<byte>(8) != 0,
             (MetadataSource)call.ResultAt<byte>(9));
+
+    /// <summary>
+    /// The string channel carries an empty guid for an asset that has none,
+    /// so an empty string reads back as <c>null</c>.
+    /// </summary>
+    private static string? GuidFrom(string guid) => guid.Length == 0 ? null : guid;
 
     private static bool ContainsCore<T>(Handle<T> handle) where T : RustObject, IRustAsset<T>
     {
@@ -895,7 +904,6 @@ public static class AssetManagerExtensions
         call.PushResource<AssetManager>(QueryAccess.Read);
         call.Push(handle);
         call.Invoke();
-        string guid = call.ResultString();
-        return guid.Length == 0 ? null : guid;
+        return GuidFrom(call.ResultString());
     }
 }

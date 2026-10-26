@@ -409,6 +409,13 @@ pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, Co
             input: file.clone(),
             detail: "the path is not UTF-8".to_owned(),
         })?;
+        // A dot-file is never an asset: `write_beside` writes a metadata update
+        // as `.<file>.meta.<pid>-<seq>.tmp` and a crash can leave one behind,
+        // and the runtime's own walk of `res` skips dot-files. Packing one
+        // would let it stand in for the asset it was written for.
+        if key.iter().any(|part| part.starts_with('.')) {
+            continue;
+        }
         files.push((key.join("/"), file));
     }
     files.sort();
@@ -584,6 +591,12 @@ mod tests {
         fs::create_dir_all(source.join("models")).expect("scratch directory");
         fs::write(source.join("models").join("a.obj"), b"mesh").expect("input");
         fs::write(source.join("b.png"), b"image").expect("input");
+        // A metadata update that crashed part-way through leaves this behind.
+        fs::write(
+            source.join(".b.png.meta.4242-0.tmp"),
+            b"{\"format_version\":1}",
+        )
+        .expect("input");
         let output = directory.join("out").join("assets.pillpack");
 
         let packed = write_asset_pack(&source, &output).expect("pack");
@@ -597,6 +610,10 @@ mod tests {
         assert_eq!(&pack[16..20], &5u32.to_le_bytes());
         assert_eq!(&pack[20..25], b"b.png");
         assert!(pack.ends_with(b"imagemesh"));
+        assert!(
+            !pack.windows(7).any(|window| window == b"b.png.m"),
+            "the leftover metadata temp file is not packed"
+        );
         let _ = fs::remove_dir_all(&directory);
     }
 

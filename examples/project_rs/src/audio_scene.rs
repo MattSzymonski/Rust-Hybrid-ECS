@@ -139,7 +139,7 @@ mod tests {
             1
         );
         let mut query = Query::<&AudioSourceComponent>::new(engine.world_mut());
-        let sources: Vec<_> = query.iter_mut().map(|source| *source).collect();
+        let sources: Vec<_> = query.iter_mut().copied().collect();
         assert_eq!(sources.len(), 1);
         assert!(sources[0].play_on_awake);
         // The source names the one sound the store holds, which is what makes

@@ -715,6 +715,31 @@ def check_hook_and_ci_lint_the_same_files() -> None:
         fail("the hook must skip every non-lintable path without running the lint")
 
 
+def check_the_gate_denies_warnings_everywhere() -> None:
+    """Stage W-0087: `-D warnings` reaches every target and every posture.
+
+    The workspace's `Cargo.toml` promises a zero-warning build in every
+    feature configuration, but a lint only fails a build when the command
+    denies it. `cargo test` and nextest do not, and neither does `cargo check`,
+    so the default clippy step must add `--all-targets` (the test, example and
+    bench targets) and each posture step must pass `-D warnings` on to rustc.
+    """
+    verify_steps = load_module("ci_cd/verify.py", "verify_warning_steps")
+    steps = {step.name: step for step in verify_steps.STEPS}
+    for name in ("clippy", "check-hot-patch", "check-shipping", "check-rendering"):
+        if name not in steps:
+            fail(f"verify.py no longer has a {name} step")
+    clippy_command = [token for tokens in steps["clippy"].commands for token in tokens]
+    if "--all-targets" not in clippy_command:
+        fail(f"the clippy step runs {clippy_command}, which leaves the test targets unlinted")
+    for name in ("check-hot-patch", "check-shipping", "check-rendering"):
+        for command in steps[name].commands:
+            if not command or command[0] != "cargo":
+                continue
+            if "--" not in command or command[command.index("--") + 1:] != ["-D", "warnings"]:
+                fail(f"the {name} step runs {command}, which does not deny warnings")
+
+
 CHECKS: List[Tuple[str, Callable[[], None]]] = [
     ("every real analytics line parses", check_every_real_analytics_line_parses),
     ("names with spaces and commas survive", check_function_names_with_spaces_and_commas_survive),
@@ -738,6 +763,7 @@ CHECKS: List[Tuple[str, Callable[[], None]]] = [
      check_dependency_records_carry_kind_and_directory),
     ("example projects come from manifests", check_example_projects_come_from_manifests),
     ("hook and CI lint the same files", check_hook_and_ci_lint_the_same_files),
+    ("the gate denies warnings everywhere", check_the_gate_denies_warnings_everywhere),
 ]
 
 

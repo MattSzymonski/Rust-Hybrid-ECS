@@ -39,7 +39,7 @@ use pill_core::{error, info};
 use pill_core::telemetry::{log_block_colored, Colorize};
 use pill_engine::Engine;
 use pill_engine::EngineApi;
-use pill_engine::{InputEvent, RumbleRequest};
+use pill_engine::{AssetGuid, InputEvent, RumbleRequest};
 #[cfg(feature = "rendering")]
 use pill_renderer_api::{PillRenderer, RenderViewport, RendererError};
 use pill_runtime::registration::extension_owner;
@@ -1325,12 +1325,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
 
     print_startup_configuration(&workspace_root, &module_config);
 
-    if matches!(
-        module_config.backend,
-        ProjectModuleBackend::NativeLibrary { .. }
-    ) {
-        cleanup_temporary_files(&workspace_root);
-    }
+    // Step 2a: Sweep the staging an earlier run left, whatever backend this is.
+    //
+    // The staging directory holds loaded module copies, the engine dylibs
+    // staged beside them, and the hot-patch scratch images - none of it any
+    // build's to keep. It used to be swept only for a native project backend,
+    // so a C# host (whose extensions still stage native copies) never swept at
+    // all and the directory grew with every run.
+    cleanup_temporary_files(&workspace_root);
 
     // Step 3: Construct the engine and its stable API table.
     // EngineApi stores a raw pointer into the runtime's boxed engine, whose
@@ -2430,16 +2432,32 @@ fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
         }
     }
     if replaced {
-        forget_prologue_records(host);
-        // The editor's side of the swap, mirroring the extension reload's:
-        // a toast and a cleared problem list for the project.
-        notices::push(HostNotice::Reloaded {
-            module: host.module_config.name.clone(),
-            build_ms: 0,
-        });
+        note_managed_swap(host);
+    } else {
+        // Nothing was swapped, but the project still runs the sources on
+        // disk, so the patch classifier's baseline has to say so and the
+        // editor still refreshes its metadata.
+        resync_patch_baselines(host, true, &[]);
+        host.bump_editor_revision();
     }
-    // The project now runs the sources on disk, so the patch classifier's
-    // baseline has to say so too, and the editor must refresh its metadata.
+}
+
+/// Everything a replaced managed assembly invalidates, whichever site saw the
+/// swap: the recorded prologue addresses point into the retired image, the
+/// patch classifier's baseline is stale, and the editor needs its toast and a
+/// revision bump to drop its caches.
+///
+/// Both sites call this: the build completion, which collapses the loader's
+/// debounce and polls, and the frame-boundary poll that catches a swap whose
+/// debounce outlived Step 5.
+fn note_managed_swap(host: &mut DevHost) {
+    forget_prologue_records(host);
+    // The editor's side of the swap, mirroring the extension reload's: a
+    // toast and a cleared problem list for the project.
+    notices::push(HostNotice::Reloaded {
+        module: host.module_config.name.clone(),
+        build_ms: 0,
+    });
     resync_patch_baselines(host, true, &[]);
     host.bump_editor_revision();
 }
@@ -2907,9 +2925,10 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
         .loaded_project
         .poll_managed_reload(host.runtime.engine_mut())
     {
-        // The loader's debounce outlived Step 5, so the swap landed here. The
-        // records go stale for the same reason and are cleared the same way.
-        forget_prologue_records(host);
+        // The loader's debounce outlived Step 5, so the swap landed here. It
+        // is the same swap the build completion reports, so it runs the same
+        // bookkeeping - the editor's toast and revision bump included.
+        note_managed_swap(host);
     }
 
     // Step 7: Apply asset edits, after every reload of this boundary, so they
@@ -2952,6 +2971,12 @@ fn start_asset_watcher(
             None
         }
     }
+}
+
+/// A guid as its 32 hexadecimal digits, or `none` when the asset carries none
+/// (a path registered under a name alone, with no metadata file).
+fn guid_text(guid: Option<AssetGuid>) -> String {
+    guid.map_or_else(|| "none".to_owned(), |guid| guid.to_string())
 }
 
 /// Import or reimport every asset the watcher reported, through the world's
@@ -3040,7 +3065,7 @@ fn apply_asset_changes(host: &mut DevHost) {
                     Ok(outcome) if !outcome.previously_loaded => info!(
                         target: telemetry_target::HOT_RELOAD,
                         asset = source.as_str(),
-                        guid = %outcome.guid,
+                        guid = %guid_text(outcome.guid),
                         metadata = ?outcome.metadata,
                         "[assets] imported a new asset"
                     ),
@@ -3048,7 +3073,7 @@ fn apply_asset_changes(host: &mut DevHost) {
                         Ok(outcome) => info!(
                             target: telemetry_target::HOT_RELOAD,
                             asset = source.as_str(),
-                            guid = %outcome.guid,
+                            guid = %guid_text(outcome.guid),
                             through_metadata,
                             content_version_before = ?outcome.previous_content_version,
                             content_version = ?outcome.content_version,
@@ -3612,6 +3637,39 @@ mod tests {
             pause_after_boundary(None, false, RendererStep::Attached),
             None
         );
+    }
+
+    /// Every managed assembly swap runs the same bookkeeping, whether the
+    /// build completion saw it or the loader poll caught it after Step 5:
+    /// one helper holds the four steps and both sites call it.
+    ///
+    /// Read from this file's own source, because a swap needs a loaded
+    /// managed project and no unit test can build the host one runs on.
+    #[test]
+    fn every_managed_swap_site_runs_the_same_bookkeeping() {
+        let source = include_str!("runtime.rs");
+        // Spelled in two pieces so this test does not match itself.
+        let call = concat!("note_managed_swap", "(host);");
+        assert_eq!(
+            source.matches(call).count(),
+            2,
+            "the build completion and the loader poll each call the helper once"
+        );
+        let helper = source
+            .split("fn note_managed_swap")
+            .nth(1)
+            .expect("a managed swap helper")
+            .split("\n}")
+            .next()
+            .expect("a body");
+        for step in [
+            "forget_prologue_records(host)",
+            "HostNotice::Reloaded",
+            "resync_patch_baselines(host, true, &[])",
+            "bump_editor_revision()",
+        ] {
+            assert!(helper.contains(step), "the helper skips {step}");
+        }
     }
 
     /// A pause lasts until a renderer attaches, and only that ends it.
