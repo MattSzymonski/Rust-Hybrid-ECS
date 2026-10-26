@@ -644,6 +644,21 @@ class OutputMonitor:
             time.sleep(0.1)
         return None
 
+
+# =============================================================================
+# Waiting helpers
+# =============================================================================
+
+
+def require(monitor: OutputMonitor, token: str, timeout: float, start: int, what: str) -> bool:
+    """Waits for `token` after line `start`; prints the outcome."""
+    if monitor.wait_for(token, timeout, start):
+        print(f"  [OK] {what}")
+        return True
+    print(f"  [FAIL] {what}: no {token!r} within {timeout:.0f} s")
+    return False
+
+
 # =============================================================================
 # Process lifecycle helpers
 # =============================================================================
@@ -859,25 +874,72 @@ HOST_SOURCE_ROOTS = (
 # posture?" - it reads this record instead.
 HOST_BUILD_RECORD = MODULES_ROOT / "target" / "pill_suite_host_build.json"
 
-# Directories under a host source root that are not build inputs: cargo's own
+# What a `pill_editor` build compiles. The editor links the host and the
+# runtime, so every host source root counts, plus its own crates. Extension and
+# project sources are absent for the host's reason: the editor loads those as
+# DLLs, and this suite edits them.
+EDITOR_SOURCE_ROOTS = HOST_SOURCE_ROOTS + (
+    MODULES_ROOT / "editor",
+    MODULES_ROOT / "csharp" / "pill_csharp_bridge",
+)
+
+# Directories under a source root that are not build inputs: cargo's own
 # output, and the crates the host regenerates on every start.
 _NOT_HOST_SOURCE_DIRS = ("target", "generated")
 
 
-def _newest_host_source_mtime_ns() -> int:
-    """The newest modification time among the files a host build reads."""
+def newest_source_mtime_ns(roots: Sequence[Path]) -> Tuple[int, str]:
+    """The newest modification time under `roots`, and the file that carries it."""
     newest = 0
-    for root in HOST_SOURCE_ROOTS:
+    newest_path = ""
+    for root in roots:
         if root.is_file():
-            newest = max(newest, root.stat().st_mtime_ns)
+            stamp = root.stat().st_mtime_ns
+            if stamp > newest:
+                newest, newest_path = stamp, str(root)
             continue
         for directory, subdirectories, files in os.walk(root):
             subdirectories[:] = [
                 name for name in subdirectories if name not in _NOT_HOST_SOURCE_DIRS
             ]
             for name in files:
-                newest = max(newest, os.stat(os.path.join(directory, name)).st_mtime_ns)
-    return newest
+                path = os.path.join(directory, name)
+                stamp = os.stat(path).st_mtime_ns
+                if stamp > newest:
+                    newest, newest_path = stamp, path
+    return newest, newest_path
+
+
+def _newest_host_source_mtime_ns() -> int:
+    """The newest modification time among the files a host build reads."""
+    return newest_source_mtime_ns(HOST_SOURCE_ROOTS)[0]
+
+
+def verify_editor_binary(binary: Path) -> Optional[str]:
+    """Why the editor binary at `binary` cannot be trusted, or None when it can.
+
+    `pill_editor` is built by the gate, never by this suite, so the binary the
+    suite is handed may predate the tree it sits in: a run against one tests
+    code that no longer exists, and reports green. No editor build writes the
+    host's build record, so the check is the host's `--skip-build` comparison
+    alone - the binary's mtime against the newest source it is compiled from -
+    and its price is the one the host check already pays: a moved source forces
+    a rebuild before the suite will run.
+    """
+    if not binary.is_file():
+        return (
+            "editor binary not found at {}; build it with "
+            "`cargo build -p pill_editor` in modules/ first".format(binary)
+        )
+    newest_mtime_ns, newest_path = newest_source_mtime_ns(EDITOR_SOURCE_ROOTS)
+    binary_mtime_ns = binary.stat().st_mtime_ns
+    if newest_mtime_ns > binary_mtime_ns:
+        return (
+            "editor binary {} was built before {}, which is newer; it cannot "
+            "test this tree. Rebuild it with `cargo build -p pill_editor` in "
+            "modules/ first".format(binary, newest_path)
+        )
+    return None
 
 
 def _record_host_build(posture: HostPosture) -> None:
@@ -1156,6 +1218,7 @@ __all__ = [
     "snapshot_paths",
     "restore_paths",
     "OutputMonitor",
+    "require",
     "has_crash_signals",
     "launch_process",
     "terminate_process",

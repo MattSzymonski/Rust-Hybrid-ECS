@@ -112,8 +112,20 @@ fn tee_stderr(child: &mut Child) -> Option<std::thread::JoinHandle<()>> {
 // Constants
 // =============================================================================
 
-/// Maximum wall-clock time a single build command may run.
+/// Maximum wall-clock time one module's build command may run.
+///
+/// A module builds incrementally against the private tree, so this covers a
+/// rebuild of one crate and its changed dependencies.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum wall-clock time the startup batch may run.
+///
+/// The batch compiles every module, the project and the renderer in one cargo
+/// invocation, and on a fresh checkout it does so with nothing in the private
+/// build tree - the one case where a single command legitimately takes
+/// minutes. Killing it at the single-module cap made a first start fall back
+/// to per-module builds and need a second run.
+const STARTUP_BATCH_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How often the build watchdog checks for completion and cancellation.
 ///
@@ -888,7 +900,7 @@ const TREE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` guarantees the tree dies even when the
 /// last handle is closed rather than a termination being requested.
 #[cfg(windows)]
-struct BuildProcessTree {
+pub(crate) struct BuildProcessTree {
     /// The job object handle, closed on drop.
     job: isize,
 }
@@ -898,7 +910,7 @@ struct BuildProcessTree {
 /// The direct child is killed instead, which is all those platforms offer
 /// here; the type exists so the call sites need no platform `cfg` of their own.
 #[cfg(not(windows))]
-struct BuildProcessTree;
+pub(crate) struct BuildProcessTree;
 
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: closing the last handle to the job
 /// kills every process still in it.
@@ -1141,14 +1153,14 @@ impl Drop for BuildProcessTree {
 /// Must run before the spawn: a process started before it joins would sit
 /// outside the tree and survive a cancellation.
 #[cfg(windows)]
-fn create_process_tree() -> Option<BuildProcessTree> {
+pub(crate) fn create_process_tree() -> Option<BuildProcessTree> {
     BuildProcessTree::create()
 }
 
 /// Platforms without job objects have nothing to create; `Child::kill` is the
 /// whole of the vocabulary there.
 #[cfg(not(windows))]
-fn create_process_tree() -> Option<BuildProcessTree> {
+pub(crate) fn create_process_tree() -> Option<BuildProcessTree> {
     None
 }
 
@@ -1157,7 +1169,7 @@ fn create_process_tree() -> Option<BuildProcessTree> {
 /// A refusal is reported rather than fatal: the build still runs, it just
 /// keeps the weaker guarantee that a cancellation reaches the direct child.
 #[cfg(windows)]
-fn join_process_tree(tree: Option<&BuildProcessTree>, child: &Child) {
+pub(crate) fn join_process_tree(tree: Option<&BuildProcessTree>, child: &Child) {
     let Some(tree) = tree else {
         return;
     };
@@ -1172,7 +1184,7 @@ fn join_process_tree(tree: Option<&BuildProcessTree>, child: &Child) {
 
 /// Nothing to join on platforms without job objects.
 #[cfg(not(windows))]
-fn join_process_tree(_tree: Option<&BuildProcessTree>, _child: &Child) {}
+pub(crate) fn join_process_tree(_tree: Option<&BuildProcessTree>, _child: &Child) {}
 
 /// Stop a build and its whole tree.
 ///
@@ -1182,7 +1194,7 @@ fn join_process_tree(_tree: Option<&BuildProcessTree>, _child: &Child) {}
 /// its whole timeout, and an orphan writing into the staging directory would
 /// race the artifact the host is about to load.
 #[cfg(windows)]
-fn stop_process_tree(tree: Option<&BuildProcessTree>, child: &mut Child) {
+pub(crate) fn stop_process_tree(tree: Option<&BuildProcessTree>, child: &mut Child) {
     let Some(tree) = tree else {
         let _ = child.kill();
         let _ = child.wait();
@@ -1202,7 +1214,7 @@ fn stop_process_tree(tree: Option<&BuildProcessTree>, child: &mut Child) {
 /// Kill the direct child: without a job object, a grandchild cannot be reached
 /// at all.
 #[cfg(not(windows))]
-fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
+pub(crate) fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1213,6 +1225,10 @@ fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
 /// process handling, watchdog, cancellation, and failure reporting. Resolving
 /// and validating the produced artifact is left to the caller, because each
 /// module kind names and locates its output differently.
+///
+/// `timeout` is the caller's cap on the command's wall time, because the caps
+/// differ: one module's incremental build ([`BUILD_TIMEOUT`]) and the startup
+/// batch that compiles everything at once ([`STARTUP_BATCH_TIMEOUT`]).
 ///
 /// With the `hot_patch` feature this also harvests the compiler flags the fast
 /// patch pipeline needs, out of the build it was going to run anyway - see
@@ -1231,6 +1247,7 @@ pub(crate) fn run_build_command(
     build_environment: &[(String, String)],
     capture_entries: Option<&[(&str, &[String])]>,
     cancel_flag: Option<(&AtomicU64, u64)>,
+    timeout: Duration,
 ) -> Result<(), BuildError> {
     // Step 1: Split the configured command into its executable and arguments.
     //
@@ -1312,7 +1329,7 @@ pub(crate) fn run_build_command(
     // report.
     let build_started = Instant::now();
     let mut cargo_peak_bytes: u64 = 0;
-    let deadline = Instant::now() + BUILD_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         // A newer save during the build advances the generation beyond the
         // baseline captured when the reload started, which cancels this
@@ -1338,7 +1355,7 @@ pub(crate) fn run_build_command(
             stop_process_tree(process_tree.as_ref(), &mut child);
             return Err(BuildError::TimedOut {
                 name: name.to_string(),
-                seconds: BUILD_TIMEOUT.as_secs(),
+                seconds: timeout.as_secs(),
             });
         }
         std::thread::sleep(WATCHDOG_POLL_INTERVAL);
@@ -1456,6 +1473,7 @@ pub(crate) fn build_csharp_compiler(workspace_root: &Path) -> Result<PathBuf, Bu
         &[],
         None,
         None,
+        BUILD_TIMEOUT,
     )?;
     if !output_path.exists() {
         return Err(BuildError::OutputMissing {
@@ -1564,6 +1582,7 @@ pub(crate) fn build_project_module(
             &config.build_environment,
             Some(&[(config.name.as_str(), build_command.as_slice())]),
             cancel_flag,
+            BUILD_TIMEOUT,
         )?;
     }
 
@@ -2065,6 +2084,17 @@ pub(crate) fn build_extension_batch(
         modules = total,
         "building every module in one cargo invocation"
     );
+    // A cold private build tree is why the batch is given minutes rather than
+    // the single-module cap, so say so: a first start that takes a while is
+    // then explained in the log instead of looking like a hang.
+    let artifact_directory = workspace_root.join(crate::config::module_build_artifact_directory());
+    if !artifact_directory.exists() {
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            directory = %artifact_directory.display(),
+            "cold module build tree: the startup batch compiles every module from scratch"
+        );
+    }
     match run_build_command(
         workspace_root,
         "startup batch",
@@ -2072,6 +2102,7 @@ pub(crate) fn build_extension_batch(
         &crate::config::spawned_build_environment(),
         Some(&entries),
         None,
+        STARTUP_BATCH_TIMEOUT,
     ) {
         Ok(()) => {
             let mut validation = BatchValidation {
@@ -2245,6 +2276,7 @@ pub(crate) fn build_extension(
             &crate::config::spawned_build_environment(),
             Some(&[(config.name.as_str(), config.build_command.as_slice())]),
             cancel_flag,
+            BUILD_TIMEOUT,
         )?;
     }
 
@@ -2802,5 +2834,13 @@ dependency = { path = "../dependency" }
             .expect("the module crate's invocation");
         assert_eq!(line.program, r"C:\rustc.exe");
         assert!(line.args.contains(&"--edition=2021".to_string()));
+    }
+
+    /// The startup batch compiles several crates in one invocation, cold on a
+    /// first start, so it is given more wall-clock time than one module's
+    /// incremental build. One cap for both kills a fresh checkout's batch.
+    #[test]
+    fn the_startup_batch_is_given_more_time_than_one_module() {
+        assert!(STARTUP_BATCH_TIMEOUT > BUILD_TIMEOUT);
     }
 }

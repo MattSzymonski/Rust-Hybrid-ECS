@@ -462,6 +462,26 @@ impl CommandHistory {
         Some(entry)
     }
 
+    /// Put the cursor back where a failed undo left it.
+    ///
+    /// The step was popped before its inverse ran, so an inverse that failed
+    /// leaves the world showing the edit while the cursor offers the step as
+    /// redoable. Moving it back makes the step undoable again and drops it from
+    /// the redo tail, so neither direction claims a step that did not run
+    /// (W-0090).
+    pub fn undo_rollback(&mut self) {
+        if self.cursor < self.entries.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// Put the cursor back where a failed redo left it (W-0090).
+    pub fn redo_rollback(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
     /// Entries currently held (applied plus redoable).
     pub fn steps(&self) -> usize {
         self.entries.len()

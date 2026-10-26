@@ -1358,6 +1358,50 @@ fn test_add_component_to_nonexistent_entity() {
     );
 }
 
+/// A component type that was never registered.
+///
+/// Registration is what gives a component its archetype bit, so adding this
+/// type must be refused rather than silently resolved back to the source
+/// archetype.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Unregistered(pub u32);
+impl crate::component::Component for Unregistered {}
+
+/// Adding a component whose type the world never registered is refused.
+///
+/// The destination archetype is derived from component bits, so an
+/// unregistered type contributes none and the destination resolves to the
+/// entity's current archetype. The migration then short-circuits and the add
+/// reports success while storing nothing - a release build silently loses the
+/// component.
+#[test]
+fn test_add_component_refuses_unregistered_type() {
+    let mut world = setup_world();
+    let entity = world
+        .create_entity()
+        .with(Position { x: 1.0, y: 2.0 })
+        .build()
+        .unwrap();
+
+    let result = world.add_component(entity, Unregistered(7));
+
+    assert_eq!(
+        result,
+        Err(AddComponentError::ComponentNotRegistered {
+            id: ComponentId::of::<Unregistered>(),
+        }),
+        "adding an unregistered component must be refused"
+    );
+    assert!(
+        world.get_component::<Unregistered>(entity).is_none(),
+        "the refused component must not be stored"
+    );
+    assert!(
+        world.get_component::<Position>(entity).is_some(),
+        "the refusal must leave the existing components alone"
+    );
+}
+
 /// Tests removing a component from an entity that has multiple components.
 ///
 /// This test verifies that:
@@ -3687,5 +3731,55 @@ fn a_component_the_builder_is_given_twice_is_refused() {
     assert_eq!(
         world.get_component::<Position>(next),
         Some(&Position { x: 3.0, y: 0.0 })
+    );
+}
+
+/// A tick counter that wrapped is not "nothing changed" (W-0091).
+///
+/// A row written after the counter wrapped carries a small tick, so the plain
+/// `>` comparison `is_newer_than` used to make read it as older than the run
+/// before the wrap and the change was never seen again.
+#[test]
+fn a_wrapped_tick_counter_still_reports_a_change() {
+    let mut world = World::new();
+    let component = world
+        .register_component_descriptor(
+            0xDA,
+            "Project.Wrapped",
+            8,
+            4,
+            101,
+            Blittability::engine_verified(),
+        )
+        .unwrap();
+
+    // Step 1: the system's last run lands just below the top of the counter.
+    world.change_tick = u32::MAX - 2;
+    let last_run = world.increment_change_tick();
+    assert_eq!(last_run, Tick::new(u32::MAX - 1));
+
+    // Step 2: three bumps carry the counter past `u32::MAX`, so the run that
+    // sees the write is tick 1 - numerically smaller than the last run.
+    world.increment_change_tick();
+    world.increment_change_tick();
+    let this_run = world.increment_change_tick();
+    assert_eq!(this_run, Tick::new(1));
+
+    // Step 3: a row written now carries the small tick.
+    let entity = world
+        .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+        .unwrap();
+    let ticks = ticks_of_row(&world, entity, component);
+    assert_eq!(ticks.changed, this_run);
+
+    assert!(
+        ticks.is_changed(last_run, this_run),
+        "a write after the wrap is still newer than the run before it: \
+         changed={:?} last_run={last_run:?} this_run={this_run:?}",
+        ticks.changed
+    );
+    assert!(
+        ticks.is_added(last_run, this_run),
+        "an add after the wrap is still newer than the run before it"
     );
 }

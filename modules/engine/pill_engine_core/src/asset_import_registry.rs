@@ -78,8 +78,9 @@ pub struct ErasedImportOutcome {
     pub type_name: String,
     /// The asset's name: its normalized path.
     pub name: String,
-    /// The asset's guid.
-    pub guid: AssetGuid,
+    /// The asset's guid, or `None` when it has none - a path already loaded
+    /// under a name with no metadata file to draw one from.
+    pub guid: Option<AssetGuid>,
     /// The slot index of the asset's handle: with [`Self::generation`], the
     /// handle a typed caller rebuilds with [`Handle::from_raw`](crate::Handle::from_raw).
     pub index: u32,
@@ -304,6 +305,12 @@ fn reimport_erased<T: ImportedAsset>(assets: &mut AssetManager, path: &Path) -> 
 // Errors
 // =============================================================================
 
+/// ` with guid <guid>` for an asset that has one, empty otherwise: a
+/// wrong-type message names a guid only when the caller's answer carries one.
+fn guid_clause(guid: &Option<AssetGuid>) -> String {
+    guid.map_or_else(String::new, |guid| format!(" with guid {guid}"))
+}
+
 /// Why an erased import, reimport or settings call did not run.
 #[derive(Debug, thiserror::Error)]
 pub enum ErasedImportError {
@@ -340,10 +347,11 @@ pub enum ErasedImportError {
         guid: AssetGuid,
     },
     /// The asset with this guid is of another type than the one asked for.
-    #[error("the asset with guid {guid} is a `{found}`, not a `{expected}`")]
+    #[error("the asset{} is a `{found}`, not a `{expected}`", guid_clause(.guid))]
     WrongType {
-        /// The guid asked for.
-        guid: AssetGuid,
+        /// The guid asked for, when the caller named one: a path-based load
+        /// only knows it when the asset has one.
+        guid: Option<AssetGuid>,
         /// The type the caller asked for.
         expected: String,
         /// The type the asset is.
@@ -736,7 +744,7 @@ impl ImportRegistry {
         assets
             .handle_by_guid::<T>(guid)
             .ok_or_else(|| ErasedImportError::WrongType {
-                guid,
+                guid: Some(guid),
                 expected: std::any::type_name::<T>().to_owned(),
                 found: outcome.type_name,
             })
@@ -1448,7 +1456,8 @@ mod tests {
                 MetadataPolicy::CreateIfMissing,
             )
             .unwrap()
-            .guid;
+            .guid
+            .expect("an imported source has a guid");
         res.write(
             "a.label",
             &format!(

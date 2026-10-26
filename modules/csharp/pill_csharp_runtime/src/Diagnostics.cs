@@ -15,6 +15,11 @@ public static class Log
 /// <summary>Managed dynamic Tracy zones.</summary>
 public static class Profiler
 {
+    /// <summary>
+    /// Opens a zone that closes when the returned guard is disposed, or when
+    /// the managed invocation that opened it returns - whichever comes first,
+    /// so a leaked guard cannot outlive its system.
+    /// </summary>
     public static IDisposable Zone(string name) => new ZoneGuard(Engine.BeginZone(name));
 
     private sealed class ZoneGuard : IDisposable

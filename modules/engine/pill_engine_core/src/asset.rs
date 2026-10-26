@@ -406,6 +406,15 @@ struct AssetColumn {
     /// Reverse of `by_guid`, so freeing a slot can drop its guid without
     /// scanning the whole map.
     guids: HashMap<u32, AssetGuid>,
+    /// Import settings each slot was decoded with, as the JSON the metadata
+    /// layer writes.
+    ///
+    /// Only a sourced asset that was decoded without a metadata file has an
+    /// entry - that is exactly the asset a later `ensure_metadata` would
+    /// otherwise give the type's defaults. Held as JSON because
+    /// `ImportSettings` is only `Serialize + DeserializeOwned` and the column is
+    /// erased; keyed by slot, so freeing the slot drops it with the rest.
+    import_settings: HashMap<u32, serde_json::Value>,
 }
 
 // =============================================================================
@@ -968,6 +977,36 @@ impl AssetManager {
         self.metadata_of::<T>()?.guids.get(&handle.index).copied()
     }
 
+    /// Record the import settings `handle` was decoded with, as the JSON a
+    /// metadata file carries; see `asset_metadata`.
+    ///
+    /// The metadata layer calls this when it decoded an asset with settings of
+    /// its own - no metadata file supplied them - so a later `ensure_metadata`
+    /// writes those instead of the type's defaults.
+    pub(crate) fn set_import_settings<T>(&mut self, handle: Handle<T>, settings: serde_json::Value)
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        if !self.is_live(handle) {
+            return;
+        }
+        if let Some(metadata) = self.metadata_of_mut::<T>() {
+            metadata.import_settings.insert(handle.index, settings);
+        }
+    }
+
+    /// The import settings `handle` was decoded with, when they were recorded;
+    /// see [`Self::set_import_settings`].
+    pub(crate) fn import_settings<T>(&self, handle: Handle<T>) -> Option<&serde_json::Value>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        if !self.is_live(handle) {
+            return None;
+        }
+        self.metadata_of::<T>()?.import_settings.get(&handle.index)
+    }
+
     /// Remove and return the asset `handle` refers to.
     ///
     /// The slot is freed and its generation bumped, so every outstanding handle
@@ -1029,6 +1068,7 @@ impl AssetManager {
         if let Some(guid) = metadata.guids.remove(&handle.index) {
             metadata.by_guid.remove(&guid);
         }
+        metadata.import_settings.remove(&handle.index);
 
         self.revision = self.revision.wrapping_add(1);
 

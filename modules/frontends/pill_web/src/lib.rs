@@ -2,8 +2,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Start a shipped project ([`run`]): readable panics, console logging, and
-//!   the project's modules registered through `pill_runtime`.
+//! - Start a shipped project ([`run`]): readable panics, console logging, the
+//!   project's asset pack downloaded beside the page (W-0105), and the
+//!   project's modules registered through `pill_runtime`.
 //! - Put a `winit` window on the page's canvas, attach the renderer to it
 //!   asynchronously, and run one frame per browser animation frame.
 //! - Feed the canvas's keyboard and mouse events to the engine. The canvas is
@@ -12,11 +13,13 @@
 //! # Design
 //!
 //! The web counterpart of `pill_standalone`'s shipping posture, over the same
-//! `pill_runtime` and [`FrameDriver`]. Two things differ, both because a
+//! `pill_runtime` and [`FrameDriver`]. Three things differ, both because a
 //! browser only makes progress once control returns to it: the event loop is
-//! handed over with `spawn_app` rather than run, and the renderer attach - a
-//! future - is spawned onto that loop instead of blocked on. Frames start
-//! once it resolves.
+//! handed over with `spawn_app` rather than run, the renderer attach - a
+//! future - is spawned onto that loop instead of blocked on, and the asset
+//! pack is fetched rather than embedded, because a wasm module is downloaded
+//! whole and a project's assets must not sit inside it. Frames start once the
+//! attach resolves.
 //!
 //! The crate is empty on every other target: its dependencies are wasm-only,
 //! so the workspace's native builds do not see it.
@@ -57,31 +60,99 @@ pub mod scripted;
 /// Returns once the event loop is handed to the browser; the game then runs on
 /// its animation frames. Every failure is reported to the browser console.
 pub fn run(project: StaticProject, canvas_id: &str) {
+    let canvas_id = canvas_id.to_owned();
+    start_project(project, move |runtime| {
+        // Step 1: Hand the event loop to the browser; the canvas window and
+        // the renderer follow in `resumed`.
+        let event_loop = match EventLoop::new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => return report_failure("event loop creation", &error),
+        };
+        info!(target: telemetry_target::ENGINE, canvas = %canvas_id, "starting in the browser");
+        event_loop.spawn_app(WebApplication {
+            canvas_id: canvas_id.clone(),
+            runtime: Some(runtime),
+            window: None,
+            driver: Rc::new(RefCell::new(None)),
+        });
+    });
+}
+
+/// Start `project` and hand the running runtime to `launch`.
+///
+/// Readable panics and console logging come first, because everything below
+/// can fail. A project with an `asset_pack_url` is a browser build whose
+/// assets were kept out of the module (W-0105): its pack is downloaded and
+/// mounted before the project initializes, so an init that loads a `res` file
+/// finds it, exactly as the embedded path does. Both runners share this, so
+/// the game and editor postures cannot diverge.
+pub(crate) fn start_project<F>(project: StaticProject, launch: F)
+where
+    F: FnOnce(Runtime) + 'static,
+{
     // Step 1: Readable panics and console logging, before anything can fail.
     console_error_panic_hook::set_once();
     if let Err(error) = pill_runtime::init_telemetry(None) {
         web_sys::console::error_1(&format!("[web] telemetry failed to start: {error}").into());
     }
 
-    // Step 2: Register the linked modules and the project.
-    let runtime = match pill_runtime::setup(project) {
-        Ok(runtime) => runtime,
-        Err(error) => return report_failure("project setup", &error),
+    // Step 2: A project without a pack URL carries its assets in the module.
+    let Some(url) = project.asset_pack_url else {
+        match pill_runtime::setup(project) {
+            Ok(runtime) => launch(runtime),
+            Err(error) => report_failure("project setup", &error),
+        }
+        return;
     };
 
-    // Step 3: Hand the event loop to the browser; the canvas window and the
-    // renderer follow in `resumed`.
-    let event_loop = match EventLoop::new() {
-        Ok(event_loop) => event_loop,
-        Err(error) => return report_failure("event loop creation", &error),
-    };
-    info!(target: telemetry_target::ENGINE, canvas = canvas_id, "starting in the browser");
-    event_loop.spawn_app(WebApplication {
-        canvas_id: canvas_id.to_owned(),
-        runtime: Some(runtime),
-        window: None,
-        driver: Rc::new(RefCell::new(None)),
+    // Step 3: Otherwise download the pack, mount it, then initialize. The
+    // fetch runs on the browser's event loop, so the page keeps painting.
+    pill_core::platform::futures::spawn(async move {
+        let bytes = match fetch_asset_pack(url).await {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                error!(target: telemetry_target::ENGINE, error = %message, "asset pack download failed");
+                return;
+            }
+        };
+        let database = match pill_runtime::mount_asset_pack(
+            project.name,
+            pill_runtime::PackSource::Fetched,
+            bytes,
+        ) {
+            Ok(database) => database,
+            Err(error) => return report_failure("asset pack mount", &error),
+        };
+        match pill_runtime::setup_with_asset_database(project, Some(database)) {
+            Ok(runtime) => launch(runtime),
+            Err(error) => report_failure("project setup", &error),
+        }
     });
+}
+
+/// Download the asset pack at `url`, relative to the page.
+///
+/// The whole file arrives as one buffer: a pack is a single indexed blob, so
+/// there is nothing to stream before it is parsed.
+async fn fetch_asset_pack(url: &str) -> Result<Vec<u8>, String> {
+    let window = web_sys::window().ok_or_else(|| "the page has no window".to_owned())?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(|error| format!("{url}: {error:?}"))?;
+    let response: web_sys::Response = response
+        .dyn_into()
+        .map_err(|_| format!("{url}: the fetch did not answer with a response"))?;
+    if !response.ok() {
+        return Err(format!("{url}: HTTP {}", response.status()));
+    }
+    let buffer = wasm_bindgen_futures::JsFuture::from(
+        response
+            .array_buffer()
+            .map_err(|error| format!("{url}: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| format!("{url}: {error:?}"))?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
 // =============================================================================

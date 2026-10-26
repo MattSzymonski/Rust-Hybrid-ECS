@@ -100,15 +100,6 @@ def restore_source() -> None:
         common.atomic_write(GPU_MODULE_SOURCE, ORIGINAL_SOURCE)
 
 
-def require(monitor: OutputMonitor, token: str, timeout: float, start: int, what: str) -> bool:
-    """Waits for `token` after line `start`; prints the outcome."""
-    if monitor.wait_for(token, timeout, start):
-        print(f"  [OK] {what}")
-        return True
-    print(f"  [FAIL] {what}: no {token!r} within {timeout:.0f} s")
-    return False
-
-
 # =============================================================================
 # Suite
 # =============================================================================

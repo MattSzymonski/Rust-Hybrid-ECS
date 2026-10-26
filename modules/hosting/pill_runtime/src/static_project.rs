@@ -165,8 +165,16 @@ pub struct StaticProject {
     /// The project's `res` directory as an asset pack, embedded in the binary
     /// by the shipping bundle; mounted before anything initializes.
     ///
-    /// `None` for a project without a `res` directory.
+    /// `None` for a project without a `res` directory, and for the browser
+    /// posture, whose pack is fetched instead (see [`Self::asset_pack_url`]).
     pub asset_pack: Option<&'static [u8]>,
+    /// Where the browser posture fetches its asset pack from, relative to the
+    /// page: the shipping bundle names the file `build_web.py` puts beside it.
+    ///
+    /// Read by `pill_web` alone. A native build embeds its pack instead and
+    /// leaves this `None`, and the runtime ignores it: fetching is a browser's
+    /// job, so nothing outside a browser frontend can act on it.
+    pub asset_pack_url: Option<&'static str>,
     /// The `logging:` section of the project's settings, as the bundle
     /// generator validated it; [`StaticLogging::NONE`] for none.
     pub logging: StaticLogging,
@@ -282,7 +290,18 @@ impl StaticProject {
             }
             // No build, no codegen, no watcher: whatever the backend loads was
             // produced when this binary was built.
-            StaticProjectBackend::External(backend) => Some(backend.start(engine, &exposed_names)?),
+            //
+            // A managed project registers its components inside `start`, so
+            // its startup scene goes in once that returns - the earliest point
+            // at which its types exist. A native project's goes in between its
+            // registration and its `init`; see `initialize_linked`.
+            StaticProjectBackend::External(backend) => {
+                let guard = backend.start(engine, &exposed_names)?;
+                if let Some(path) = self.startup_scene {
+                    apply_project_startup_scene(engine, path);
+                }
+                Some(guard)
+            }
         };
 
         info!(
@@ -316,6 +335,22 @@ pub(crate) fn initialize_static_renderer(
     initialize_linked(engine, renderer.init, Some(owner), None)
 }
 
+/// Queue and load a project's startup scene, warning when it cannot be read.
+///
+/// A failure is a warning rather than an error: a missing or unreadable scene
+/// must not stop a project from starting with its own.
+fn apply_project_startup_scene(engine: &mut Engine, path: &str) {
+    pill_engine::queue_startup_scene(engine.world_mut(), path);
+    if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            path,
+            reason,
+            "[engine] startup scene not loaded"
+        );
+    }
+}
+
 /// Run one linked entry point the way its generated ABI wrapper would.
 ///
 /// `scope` scopes the registrations when present, which is what an extension
@@ -344,15 +379,7 @@ fn initialize_linked(
     // A project's startup scene goes in here: the component types exist, and
     // the project has not yet seeded its own entities over them.
     if let Some(path) = startup_scene {
-        pill_engine::queue_startup_scene(engine.world_mut(), path);
-        if let Some(Err(reason)) = pill_engine::apply_startup_scene(engine) {
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
-                path,
-                reason,
-                "[engine] startup scene not loaded"
-            );
-        }
+        apply_project_startup_scene(engine, path);
     }
     let status = register_scoped(engine, scope, init);
     let registration_error = engine.world_mut().take_registration_error();
@@ -379,6 +406,7 @@ fn initialize_linked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_engine::{render_standalone, save_scene, AssetGuid, EntityId};
 
     /// A module that registers nothing, for shape assertions.
     fn no_op(_engine: &mut Engine) -> u32 {
@@ -435,6 +463,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            asset_pack_url: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
             startup_scene: None,
@@ -466,6 +495,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            asset_pack_url: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
             startup_scene: None,
@@ -491,6 +521,7 @@ mod tests {
             modules: &[],
             renderer: None,
             asset_pack: None,
+            asset_pack_url: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
             startup_scene: None,
@@ -522,6 +553,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            asset_pack_url: None,
             logging: StaticLogging::NONE,
             debug_draw: false,
             startup_scene: None,
@@ -533,6 +565,95 @@ mod tests {
         assert!(
             !backend.seen.lock().unwrap().is_empty(),
             "the backend must see what the module registered"
+        );
+    }
+
+    /// Write a one-entity scene below a fresh temporary asset directory and
+    /// mount it, returning the directory (kept alive for the process) and the
+    /// id the entity carries.
+    fn one_entity_scene() -> (std::path::PathBuf, EntityId) {
+        let root =
+            std::env::temp_dir().join(format!("pill-runtime-startup-scene-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scenes")).unwrap();
+
+        let id = EntityId::from_name("seeded");
+        let mut writer = Engine::new();
+        writer
+            .world_mut()
+            .register_standalone_asset::<pill_engine::Scene>();
+        writer
+            .world_mut()
+            .create_entity()
+            .with_id(id)
+            .build()
+            .unwrap();
+        let registry = writer
+            .world()
+            .get_resource::<pill_engine::ImportRegistry>()
+            .cloned()
+            .expect("the engine registers its import registry");
+        let (document, report) = {
+            let world = writer.world();
+            let assets = world
+                .get_resource::<pill_engine::asset::AssetManager>()
+                .expect("the engine owns an asset manager");
+            save_scene(world, assets, &registry, None)
+        };
+        assert!(
+            report.skipped_fields.is_empty(),
+            "{:?}",
+            report.skipped_fields
+        );
+        let bytes = render_standalone::<pill_engine::Scene>(
+            AssetGuid::random().expect("a fresh guid"),
+            &document,
+        )
+        .expect("the scene renders");
+        std::fs::write(root.join("scenes/one.scene"), bytes).unwrap();
+        pill_engine::asset_store::mount_directory(root.clone());
+        (root, id)
+    }
+
+    /// A project's startup scene is loaded for a managed project too, not only
+    /// for a natively linked one.
+    #[test]
+    fn an_external_backend_starts_with_the_projects_startup_scene() {
+        let (_root, seeded) = one_entity_scene();
+
+        // A module registers the scene import, as a renderer's data crate does
+        // in a real project.
+        fn registers_the_scene_import(engine: &mut Engine) -> u32 {
+            engine
+                .world_mut()
+                .register_standalone_asset::<pill_engine::Scene>();
+            0
+        }
+        static MODULES: &[StaticModule] = &[StaticModule {
+            name: "scene",
+            init: registers_the_scene_import,
+        }];
+
+        let backend = Arc::new(RecordingBackend {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut engine = Engine::new();
+        let project = StaticProject {
+            name: "project",
+            backend: StaticProjectBackend::External(backend),
+            modules: MODULES,
+            renderer: None,
+            asset_pack: None,
+            asset_pack_url: None,
+            logging: StaticLogging::NONE,
+            debug_draw: false,
+            startup_scene: Some("scenes/one.scene"),
+        };
+        project.initialize(&mut engine).expect("it succeeds");
+
+        assert!(
+            engine.world().entity_by_id(seeded).is_some(),
+            "a managed project must start with the scene its settings name"
         );
     }
 }

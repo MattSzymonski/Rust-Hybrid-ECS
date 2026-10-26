@@ -47,10 +47,13 @@ pill_input = { path = "../pill_input", features = [
 # `shipping`. Cargo resolves every manifest in the workspace before it
 # evaluates features, so `optional = true` means "do not compile it", not "do
 # not look for it" - a missing directory fails resolution for the whole
-# workspace, `cargo run -p editor` included. A neutral stub crate is therefore
+# workspace, `cargo run -p editor` included. A stub crate is therefore
 # committed there (the one exception to `build/` being gitignored) so a fresh
-# clone builds with no generator step. A shipping build overwrites it, which
-# makes it show up as modified in `git status`; restore it afterwards with
+# clone resolves with no generator step. The stub is deliberately
+# project-agnostic and refuses to compile, so a shipping build cannot be
+# type-checked - or shipped - against some other project's generation; run the
+# generator first. A shipping build overwrites the stub, which makes it show
+# up as modified in `git status`; restore it afterwards with
 # `git checkout -- build/pill_shipping_bundle`.
 pill_shipping_bundle = { path = "../../../build/pill_shipping_bundle", optional = true }
 

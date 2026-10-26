@@ -53,7 +53,7 @@ impl AotRuntimeContext {
             libloading::Library::new(library_path).map_err(|source| {
                 CSharpError::AotLibraryLoadFailed {
                     path: library_path.display().to_string(),
-                    source,
+                    source: Box::new(source),
                 }
             })?
         };
@@ -81,7 +81,7 @@ impl AotRuntimeContext {
                 .get(&symbol_bytes)
                 .map_err(|source| CSharpError::AotExportMissing {
                     symbol: symbol.to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
         };
         Ok(*loaded)

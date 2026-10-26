@@ -149,8 +149,11 @@ internal sealed class ProjectHost
             // Dropping the resolved delegate cache here rather than only
             // before a successful swap covers every unload path, the
             // rejection one included, and keeps the runtime from being the
-            // thing that holds a retiring context alive.
-            Unloading += _ => Engine.ReloadMirrorMethods();
+            // thing that holds a retiring context alive. Only the cache goes:
+            // the trampoline addresses the host published still belong to the
+            // next context, so the unload neither clears the table nor bumps
+            // the generation a live call is resolving against (W-0079).
+            Unloading += _ => MirrorMethods.DropDelegateCache();
         }
 
         protected override Assembly? Load(AssemblyName assemblyName)
@@ -220,6 +223,17 @@ internal sealed class ProjectHost
     /// <summary>Number of systems exposed by the active project version.</summary>
     public int SystemCount => _systems.Length;
     public int StartupCount => _startups.Length;
+
+    /// <summary>
+    /// The write time of the version last examined, as the bookkeeping
+    /// remembers it.
+    /// </summary>
+    /// <remarks>
+    /// Never later than the stamp sampled before that version's bytes were
+    /// read, so a build that landed during the load is examined by the next
+    /// poll rather than skipped.
+    /// </remarks>
+    internal DateTime LastExaminedWriteUtc => _lastWriteUtc;
     public ReadOnlySpan<byte> ComponentManifest => _componentManifest;
 
     /// <summary>Return one reflected scheduler access.</summary>
@@ -248,7 +262,7 @@ internal sealed class ProjectHost
             LoadFromAotRegistry();
             return;
         }
-        Load(isReload: false);
+        Load(isReload: false, File.GetLastWriteTimeUtc(_assemblyPath));
     }
 
     /// <summary>
@@ -443,7 +457,7 @@ internal sealed class ProjectHost
 
         try
         {
-            if (Load(isReload: true) == PollStatus.ManifestPending)
+            if (Load(isReload: true, written) == PollStatus.ManifestPending)
             {
                 Console.WriteLine(
                     "[csharp_runtime] " +
@@ -548,7 +562,20 @@ internal sealed class ProjectHost
     /// Load one assembly version, validate its scheduler signature, then swap
     /// it atomically with the active collectible context.
     /// </summary>
-    private PollStatus Load(bool isReload)
+    /// <param name="isReload">Whether this is a swap over a running version.</param>
+    /// <param name="writeUtc">
+    /// The write time of the version being loaded, sampled before its bytes
+    /// were read. That is the stamp the load remembers: a build renamed over
+    /// the file while these bytes load has a later stamp and has not been
+    /// examined, so recording a fresh sample at the end would skip it until
+    /// the file changed again.
+    /// </param>
+    /// <remarks>
+    /// Internal so a test can drive one load with an explicit stamp and assert
+    /// what the bookkeeping remembers; the runtime only reaches it through
+    /// <see cref="PollReload"/> and <see cref="Init"/>.
+    /// </remarks>
+    internal PollStatus Load(bool isReload, DateTime writeUtc)
     {
         var bytes = ReadAllBytesWithRetry(_assemblyPath);
         var symbols = ReadMatchingSymbols(_assemblyPath, bytes);
@@ -586,8 +613,7 @@ internal sealed class ProjectHost
             if (isReload && !_componentManifest.AsSpan().SequenceEqual(manifest))
             {
                 _pending = new PendingReload(
-                    context, systems, startups, manifest,
-                    File.GetLastWriteTimeUtc(_assemblyPath));
+                    context, systems, startups, manifest, writeUtc);
                 return PollStatus.ManifestPending;
             }
 
@@ -605,7 +631,7 @@ internal sealed class ProjectHost
             _componentManifest = manifest;
             _lastSystemErrors = new string?[systems.Length];
             _lastAllocatedBytes = new long[systems.Length];
-            _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
+            _lastWriteUtc = writeUtc;
             if (oldContext is not null)
                 RetireContext(oldContext);
             return PollStatus.Reloaded;

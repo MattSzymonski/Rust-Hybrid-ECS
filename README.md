@@ -81,8 +81,11 @@ Build output lands under the project's `build/<timestamp>/` directory.
 
 A Rust project also runs in the browser, through WebGPU. The web build is the  
 shipping posture compiled for `wasm32-unknown-unknown` and run by `pill_web`:  
-one module, statically linked, assets packed in, no hot reload. C# projects  
-are not supported on the web.
+one module, statically linked, no hot reload. C# projects are not supported on  
+the web. Its assets travel beside the page rather than inside the module: the  
+build packs them into `assets.pillpack` next to `index.html`, and the module  
+downloads and mounts it before the project starts (W-0105). Serve the whole  
+directory, not just `pkg/`.
 
 ```bat
 :: once: rustup target add wasm32-unknown-unknown  and  cargo install wasm-pack

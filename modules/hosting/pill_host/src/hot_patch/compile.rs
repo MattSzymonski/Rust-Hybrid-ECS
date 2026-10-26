@@ -23,8 +23,10 @@
 //!     .output()?;
 //! ```
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 // =============================================================================
 // Flag classification
@@ -39,6 +41,16 @@ use std::process::Command;
 /// detect that: a parser fix leaves the manifests, the lockfile and the build
 /// command exactly as they were.
 const CACHE_FORMAT_VERSION: &str = "pill-hotpatch-flags-v3";
+
+/// How long one flag capture may take before it is abandoned.
+///
+/// The same budget the module build's watchdog allows, because the capture is a
+/// build of the same workspace - a lock held by a real build that long means
+/// something is wrong, and the edit falls back to a reload either way.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the capture checks whether its cargo has finished.
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 const TWO_TOKEN_FLAGS: &[&str] = &[
     "-C",
@@ -195,6 +207,17 @@ impl CargoRustcLine {
         package: &str,
         build_command: &[String],
     ) -> Result<Option<Self>, String> {
+        Self::try_capture_within(workspace_dir, package, build_command, CAPTURE_TIMEOUT)
+    }
+
+    /// [`Self::try_capture`] with an explicit deadline, so a test can watch one
+    /// expire without waiting two minutes for it.
+    fn try_capture_within(
+        workspace_dir: &Path,
+        package: &str,
+        build_command: &[String],
+        timeout: Duration,
+    ) -> Result<Option<Self>, String> {
         let (program, arguments) = build_command
             .split_first()
             .ok_or_else(|| "the build command is empty".to_string())?;
@@ -220,14 +243,59 @@ impl CargoRustcLine {
             command.envs(crate::config::spawned_build_environment());
             crate::build_runner::apply_cargo_host_overrides(&mut command, workspace_dir);
         }
-        let output = command
+        // This runs on the frame thread, so the child is supervised rather than
+        // waited on: a cargo blocked behind another build's package lock must
+        // not freeze the editor for as long as that build takes. Stderr is
+        // drained on its own thread while the poll runs, because a pipe nobody
+        // reads fills up and blocks the compiler instead.
+        let process_tree = crate::build_runner::create_process_tree();
+        let mut child = command
             .arg("-v")
-            .output()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| format!("cannot run cargo in {}: {error}", workspace_dir.display()))?;
+        crate::build_runner::join_process_tree(process_tree.as_ref(), &child);
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| "cargo's stderr was not captured".to_string())?;
+        let reader = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut text);
+            text
+        });
+
+        let deadline = pill_core::platform::Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|error| {
+                format!(
+                    "cannot wait for cargo in {}: {error}",
+                    workspace_dir.display()
+                )
+            })? {
+                break status;
+            }
+            if pill_core::platform::Instant::now() >= deadline {
+                // The whole tree goes: cargo's children hold the stderr pipe
+                // open, so joining the reader before them would wait for the
+                // very build this deadline exists to abandon.
+                crate::build_runner::stop_process_tree(process_tree.as_ref(), &mut child);
+                let _ = reader.join();
+                return Err(format!(
+                    "cargo build -p {package} did not finish within {}s, so its compiler flags could not be captured",
+                    timeout.as_secs()
+                ));
+            }
+            std::thread::sleep(CAPTURE_POLL_INTERVAL);
+        };
+        let stderr = reader
+            .join()
+            .map_err(|_| "the cargo stderr reader panicked".to_string())?;
 
         // Cargo writes the `Running` lines to stderr.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        if !status.success() {
             return Err(format!("cargo build -p {package} failed:\n{stderr}"));
         }
 
@@ -567,12 +635,17 @@ fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
 
 /// Bump a file's modification time without touching its contents.
 ///
-/// Rewriting the same bytes is enough for cargo's mtime-based freshness check
-/// and leaves version control untouched, since the content hash is unchanged.
+/// Rewriting the same bytes would also make cargo's mtime-based freshness check
+/// see a newer source, but it means writing back bytes read moments earlier -
+/// so a save that lands between the read and the write is silently reverted and
+/// the next build compiles source the person has already replaced. Bumping the
+/// timestamp alone leaves the contents to whoever owns them.
 fn touch(path: &Path) -> Result<(), String> {
-    let contents = std::fs::read(path)
-        .map_err(|error| format!("cannot read {} to touch it: {error}", path.display()))?;
-    std::fs::write(path, &contents)
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("cannot open {} to touch it: {error}", path.display()))?;
+    file.set_modified(std::time::SystemTime::now())
         .map_err(|error| format!("cannot touch {}: {error}", path.display()))
 }
 
@@ -1285,5 +1358,100 @@ mod tests {
                 "a newer {relative} must invalidate the cache"
             );
         }
+    }
+
+    /// A touch must never put back bytes it read before a save landed.
+    ///
+    /// The touch exists to bump the crate root's modification time so cargo
+    /// rebuilds it, and rewriting the bytes it just read was how it did that -
+    /// which reverts any save that lands between the read and the write, so the
+    /// next reload compiles source the person has already replaced.
+    ///
+    /// A save replaces the file atomically while the touch runs, so the crate
+    /// root holds either version cleanly. Reading a large one takes long enough
+    /// that the save lands inside the touch; the version on disk must then be
+    /// the saved one, never the one the touch read.
+    #[test]
+    fn a_touch_never_reverts_a_save_that_lands_while_it_runs() {
+        let filler =
+            "// filler line, long enough that reading the file takes time\n".repeat(160_000);
+        let mut reverted_at = None;
+        for delay_ms in 1..=12 {
+            let directory = ScratchDirectory::new("touch_race");
+            let path = directory.join("lib.rs");
+            let staged = directory.join("lib.rs.saved");
+            std::fs::write(&path, format!("{filler}// version 0\n")).expect("write the crate root");
+
+            let touching_path = path.clone();
+            let touching = std::thread::spawn(move || touch(&touching_path));
+
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            // An editor's save: the new text replaces the file in one step.
+            std::fs::write(&staged, format!("{filler}// version 1\n")).expect("stage the save");
+            std::fs::rename(&staged, &path).expect("replace the crate root");
+
+            touching
+                .join()
+                .expect("join the touch")
+                .expect("touch the crate root");
+            let observed = std::fs::read_to_string(&path).expect("read the crate root");
+            let version = observed
+                .rsplit("// version ")
+                .next()
+                .and_then(|tail| tail.trim().parse::<u64>().ok())
+                .expect("the crate root carries its version");
+            if version == 0 {
+                reverted_at = Some(delay_ms);
+                break;
+            }
+        }
+        assert_eq!(
+            reverted_at, None,
+            "the touch rewrote the crate root with bytes it read before a save landed"
+        );
+    }
+
+    /// A capture whose cargo never returns must give up on its own deadline.
+    ///
+    /// The capture runs on the frame thread, so a cargo blocked on another
+    /// build's package lock froze the editor for as long as that build took -
+    /// with no deadline, no cancellation and no way for the person to see why.
+    /// The command here never finishes on its own, which is what a lock wait
+    /// looks like from the host's side.
+    #[test]
+    fn a_capture_that_never_returns_is_given_up_on_its_deadline() {
+        // A script rather than an inline command: the capture appends `-v` to
+        // whatever it is given, which a real cargo accepts and a bare `ping`
+        // rejects. A script ignores it.
+        let directory = ScratchDirectory::new("capture_deadline");
+        #[cfg(windows)]
+        let (script, body) = (directory.join("slow.cmd"), "ping -n 30 127.0.0.1 >nul\n");
+        #[cfg(not(windows))]
+        let (script, body) = (directory.join("slow.sh"), "sleep 30\n");
+        std::fs::write(&script, body).expect("write the slow command");
+        let script_path = script.display().to_string();
+        #[cfg(windows)]
+        let command: Vec<String> = vec!["cmd".to_string(), "/c".to_string(), script_path];
+        #[cfg(not(windows))]
+        let command: Vec<String> = vec!["sh".to_string(), script_path];
+
+        let started = pill_core::platform::Instant::now();
+        let outcome = CargoRustcLine::try_capture_within(
+            Path::new("."),
+            "a_locked_package",
+            &command,
+            Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("a capture that never returns must fail");
+        assert!(
+            error.contains("did not finish"),
+            "the failure must name the deadline it ran out of: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the capture waited {elapsed:?} instead of giving up on its deadline"
+        );
     }
 }

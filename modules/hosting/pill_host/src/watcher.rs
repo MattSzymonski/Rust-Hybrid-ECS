@@ -311,7 +311,9 @@ where
         },
         Config::default(),
     )
-    .map_err(|source| WatcherError::CreationFailed { source })?;
+    .map_err(|source| WatcherError::CreationFailed {
+        source: Box::new(source),
+    })?;
 
     // Recursive watching covers nested trees without requiring every caller
     // to enumerate its own directory structure.
@@ -319,7 +321,7 @@ where
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|source| WatcherError::RegistrationFailed {
             path: root.display().to_string(),
-            source,
+            source: Box::new(source),
         })?;
 
     std::thread::Builder::new()
@@ -343,7 +345,7 @@ where
             }
         })
         .map_err(|source| WatcherError::CreationFailed {
-            source: notify::Error::io(source),
+            source: Box::new(source),
         })?;
     Ok(())
 }

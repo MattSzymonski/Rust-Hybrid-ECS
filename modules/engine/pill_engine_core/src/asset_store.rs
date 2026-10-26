@@ -117,9 +117,16 @@ impl AssetPack {
         }
         let count = reader.u32()?;
 
+        // The count comes from the header and is not to be trusted: sizing the
+        // map from it alone asks the allocator for hundreds of gigabytes before
+        // the first entry is read. An entry cannot be shorter than its path
+        // length, an empty path and the two `u64`s, so the bytes that are left
+        // bound how many there can really be; the loop below still refuses a
+        // count that overstates that bound.
+        let remaining = bytes.len() - reader.position;
+        let mut entries = HashMap::with_capacity((count as usize).min(remaining / MIN_ENTRY_LEN));
         // Each entry's range is checked here, once, so a lookup can slice
         // without checking again.
-        let mut entries = HashMap::with_capacity(count as usize);
         for index in 0..count {
             let path_length = reader.u32()? as usize;
             let path = std::str::from_utf8(reader.take(path_length)?)
@@ -159,6 +166,10 @@ impl AssetPack {
         self.entries.is_empty()
     }
 }
+
+/// The fewest bytes one index entry can occupy: a `u32` path length, an empty
+/// path, and the `u64` offset and length.
+const MIN_ENTRY_LEN: usize = 4 + 8 + 8;
 
 /// A cursor over a pack's index.
 struct PackReader<'bytes> {
@@ -246,6 +257,11 @@ pub fn mounted_directory() -> Option<PathBuf> {
 /// the development fallbacks: `res` in the working directory, in
 /// `$PROJECT_PATH`, and beside the executable.
 ///
+/// Once [`restrict_to_packs`] has been called - a shipped build, right after
+/// it mounts the pack it was built with - only the packs and a deliberately
+/// mounted directory are read, so a pack miss is a missing asset rather than a
+/// file the machine happens to have.
+///
 /// # Errors
 ///
 /// Returns [`AssetLoadError::PathNotFound`] when no mount has the path, or
@@ -290,6 +306,10 @@ pub(crate) fn pack_key(path: &Path) -> Option<String> {
 
 /// Find `path` on the filesystem: as is when absolute, else below the
 /// mounted directory and the development fallbacks.
+///
+/// The fallbacks are off once [`restrict_to_packs`] has been called - a
+/// shipped build reads what it was built with - while an absolute path and a
+/// deliberately mounted directory keep working.
 fn resolve_file(path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
         return path.is_file().then(|| path.to_owned());
@@ -298,18 +318,48 @@ fn resolve_file(path: &Path) -> Option<PathBuf> {
     if let Some(directory) = mounted_directory() {
         candidates.push(directory.join(path));
     }
-    candidates.push(path.to_owned());
-    candidates.push(Path::new("res").join(path));
-    if let Some(project) = std::env::var_os("PROJECT_PATH") {
-        candidates.push(PathBuf::from(project).join("res").join(path));
-    }
-    if let Some(parent) = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(Path::to_owned))
-    {
-        candidates.push(parent.join("res").join(path));
+    if !packs_only() {
+        candidates.push(path.to_owned());
+        candidates.push(Path::new("res").join(path));
+        if let Some(project) = std::env::var_os("PROJECT_PATH") {
+            candidates.push(PathBuf::from(project).join("res").join(path));
+        }
+        if let Some(parent) = std::env::current_exe()
+            .ok()
+            .and_then(|executable| executable.parent().map(Path::to_owned))
+        {
+            candidates.push(parent.join("res").join(path));
+        }
     }
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// Whether the store reads only what its packs hold.
+///
+/// Off until [`restrict_to_packs`] says otherwise: a development host runs a
+/// project straight out of its source tree, and the fallbacks are how it finds
+/// the files.
+static PACKS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read only what the mounted packs hold, never a development fallback.
+///
+/// A shipped build calls this where it mounts the pack it was built with: from
+/// then on a pack miss is a missing asset, not a file the machine it runs on
+/// happens to have at the same name.
+pub fn restrict_to_packs() {
+    PACKS_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`restrict_to_packs`] has been called.
+fn packs_only() -> bool {
+    PACKS_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Turn the pack-only posture back off, so one test does not decide it for the
+/// others.
+#[cfg(test)]
+fn set_packs_only(packs_only: bool) {
+    PACKS_ONLY.store(packs_only, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The filesystem path the asset at `path` resolves to, or `None` when it is
@@ -331,7 +381,8 @@ pub fn locate_file(path: &Path) -> Option<PathBuf> {
 /// The bytes go to a temporary sibling first and are linked into place only
 /// when complete, so a crash or a second writer never leaves a half-written
 /// file. An existing file is never replaced, even one that appears while this
-/// runs: it may hold a person's edits.
+/// runs: it may hold a person's edits. A filesystem without hard links takes
+/// the same write through a rename.
 ///
 /// # Errors
 ///
@@ -360,7 +411,7 @@ pub fn write_beside(
 
     let temporary = directory.join(temporary_name(file_name));
     std::fs::write(&temporary, bytes).map_err(write_error)?;
-    let placed = place_without_replacing(&temporary, &destination);
+    let placed = place_file(&temporary, &destination, Existing::Keep, hard_link);
     // The temporary is gone after a successful fallback rename; ignore that.
     let _ = std::fs::remove_file(&temporary);
     placed.map_err(write_error)?;
@@ -371,7 +422,9 @@ pub fn write_beside(
 ///
 /// The bytes go to a temporary sibling first and are linked into place only
 /// when complete, so a crash never leaves a half-written file, and an existing
-/// file - even one that appears while this runs - is never replaced. Missing
+/// file - even one that appears while this runs - is never replaced. A
+/// filesystem without hard links takes the same write through a rename, so a
+/// project on a removable or network drive can still create assets. Missing
 /// parent directories are not created: the caller names a folder that exists.
 ///
 /// # Errors
@@ -399,11 +452,11 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
     let temporary = directory.join(temporary_name(file_name));
     std::fs::write(&temporary, bytes).map_err(write_error)?;
     // A hard link fails when the destination exists, which is the guarantee
-    // wanted here; unlike `place_without_replacing`, an existing file is an
-    // error rather than someone else's equally good copy.
-    let linked = std::fs::hard_link(&temporary, destination);
+    // wanted here; unlike `write_beside`, an existing file is an error rather
+    // than someone else's equally good copy.
+    let placed = place_file(&temporary, destination, Existing::Refuse, hard_link);
     let _ = std::fs::remove_file(&temporary);
-    linked.map_err(write_error)
+    placed.map_err(write_error)
 }
 
 /// A sibling name for `file_name` that no other writer in this or another
@@ -417,19 +470,52 @@ fn temporary_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
     name
 }
 
-/// Move the complete file `temporary` to `destination`, leaving an existing
-/// `destination` untouched.
+/// How a file being placed treats a destination that already exists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Existing {
+    /// Someone else's file is as good as this one: leave it in place.
+    Keep,
+    /// A create must never replace one: report the collision.
+    Refuse,
+}
+
+/// The link operation [`place_file`] tries first, so a test can stand in a
+/// filesystem that has no hard links.
+type Link = fn(&Path, &Path) -> std::io::Result<()>;
+
+/// A hard link, as the one [`Link`] a real write uses.
+fn hard_link(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, destination)
+}
+
+/// Move the complete file `temporary` to `destination`, treating an existing
+/// `destination` as `existing` says.
 ///
-/// A hard link fails atomically when the destination exists, which no
-/// rename on Windows does. A filesystem without hard links falls back to a
-/// rename guarded by an existence check: the check and the rename are not one
-/// operation, but only two writers racing on one metadata file could slip
-/// between them.
-fn place_without_replacing(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    match std::fs::hard_link(temporary, destination) {
+/// A hard link fails atomically when the destination exists, which no rename on
+/// Windows does, so it is tried first. A filesystem that has no hard links -
+/// exFAT, FAT, some network shares - takes the rename instead, and there the
+/// existence check below stands in for the link's refusal: the check and the
+/// rename are not one operation, but only two writers racing on one file could
+/// slip between them.
+fn place_file(
+    temporary: &Path,
+    destination: &Path,
+    existing: Existing,
+    link: Link,
+) -> std::io::Result<()> {
+    match link(temporary, destination) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) if destination.exists() => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => match existing {
+            Existing::Keep => Ok(()),
+            Existing::Refuse => Err(error),
+        },
+        Err(_) if destination.exists() => match existing {
+            Existing::Keep => Ok(()),
+            Existing::Refuse => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "the file already exists",
+            )),
+        },
         Err(_) => std::fs::rename(temporary, destination),
     }
 }
@@ -468,6 +554,42 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"first");
         let leftovers = std::fs::read_dir(&directory).unwrap().count();
         assert_eq!(leftovers, 1, "no temporary file is left behind");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A filesystem with no hard links - exFAT, FAT, some network shares -
+    /// refuses the link every writer tries first, and a create used to surface
+    /// that refusal instead of writing the file (W-0096).
+    fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this filesystem has no hard links",
+        ))
+    }
+
+    #[test]
+    fn a_create_lands_on_a_filesystem_without_hard_links() {
+        let directory =
+            std::env::temp_dir().join(format!("pill-no-hard-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("a.render_pass");
+        let temporary = directory.join(".a.render_pass.tmp");
+        std::fs::write(&temporary, b"first").unwrap();
+
+        place_file(&temporary, &destination, Existing::Refuse, no_hard_links)
+            .expect("a filesystem without hard links still takes the new file");
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"first");
+        assert!(!temporary.exists(), "the temporary moved into place");
+
+        // The fallback must not turn a create into a replace: the file that is
+        // already there stays, and the second write is refused.
+        std::fs::write(&temporary, b"second").unwrap();
+        let error = place_file(&temporary, &destination, Existing::Refuse, no_hard_links)
+            .expect_err("a create never replaces an existing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"first");
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -518,6 +640,16 @@ mod tests {
         cut.truncate(cut.len() - 1);
         assert!(matches!(
             AssetPack::parse(cut),
+            Err(AssetPackError::Truncated)
+        ));
+        // A damaged header may declare far more entries than the pack can
+        // hold. Sizing the index map from that count alone asks the allocator
+        // for hundreds of gigabytes before the first entry is read, which
+        // aborts the process instead of reporting the truncation.
+        let mut huge_count = pack_of(&[]);
+        huge_count[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            AssetPack::parse(huge_count),
             Err(AssetPackError::Truncated)
         ));
     }
@@ -643,5 +775,29 @@ mod tests {
             read(Path::new("pill-store-test/nowhere.txt")),
             Err(AssetLoadError::PathNotFound { .. })
         ));
+    }
+
+    /// A shipped build reads exactly what it was built with. A file the
+    /// machine happens to have at a development fallback - here the working
+    /// directory - is not the asset, and a missing key is a missing asset.
+    #[test]
+    fn a_pack_only_store_never_reads_the_machines_files() {
+        let _lock = mounted_directory_test_lock();
+        let decoy = PathBuf::from(format!("pill-store-decoy-{}.txt", std::process::id()));
+        std::fs::write(&decoy, b"a file the machine happens to have").unwrap();
+
+        // The development posture resolves it: that is what the fallbacks are
+        // for.
+        assert_eq!(read(&decoy).unwrap(), b"a file the machine happens to have");
+
+        set_packs_only(true);
+        let miss = read(&decoy);
+        set_packs_only(false);
+        let _ = std::fs::remove_file(&decoy);
+
+        assert!(
+            matches!(miss, Err(AssetLoadError::PathNotFound { .. })),
+            "a pack-only store must not read the machine's files"
+        );
     }
 }

@@ -293,10 +293,13 @@ impl Engine {
             hot_patch_registry: crate::hot_patch::HotPatchRegistry::new(),
         };
 
-        // Engine-owned systems, registered before any project or module runs.
-        // Attributed to `SystemOwner::ENGINE`, which no reload retires.
-        // The binding needs to be `mut` again when this line is re-enabled.
-        // engine.register_ecs_diagnostics_system(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
+        // The ECS state report is opt-in: `set_ecs_diagnostics_interval` is the
+        // only thing that registers it. It is not registered here because it
+        // reads the whole world under exclusive access - a scheduler barrier
+        // every frame - and prints a multi-line block once per interval, which
+        // a shipping build must not pay for and no suite should have to filter
+        // out. Engine-owned when it is registered, attributed to
+        // `SystemOwner::ENGINE`, which no reload retires.
         engine
     }
 }
@@ -315,21 +318,22 @@ impl Engine {
 
     /// How often the built-in ECS state report prints.
     ///
-    /// `None` turns it off. The engine registers it at
-    /// [`DEFAULT_REPORT_INTERVAL`](crate::diagnostics::DEFAULT_REPORT_INTERVAL)
-    /// during [`Engine::new`], so this is for changing or silencing it:
+    /// The report is opt-in: [`Engine::new`] registers nothing, and this is the
+    /// call that registers it. `None` turns it off again, removing the system.
     ///
     /// ```no_run
     /// # use std::time::Duration;
+    /// # use pill_engine::diagnostics::DEFAULT_REPORT_INTERVAL;
     /// # let mut engine = pill_engine::Engine::new();
-    /// engine.set_ecs_diagnostics_interval(None);                          // silence it
-    /// engine.set_ecs_diagnostics_interval(Some(Duration::from_secs(10))); // every 10s
+    /// engine.set_ecs_diagnostics_interval(Some(DEFAULT_REPORT_INTERVAL)); // on
+    /// engine.set_ecs_diagnostics_interval(Some(Duration::from_secs(10)));  // slower
+    /// engine.set_ecs_diagnostics_interval(None);                           // off
     /// ```
     ///
-    /// The system stays registered either way and costs one `Duration`
-    /// comparison on the frames it does not print. Disabling it removes the
-    /// system entirely, which also removes the scheduler barrier it otherwise
-    /// costs every frame for being exclusive.
+    /// Each call re-registers, so exactly one such system is registered however
+    /// many times it is called. A registered report costs one `Duration`
+    /// comparison on the frames it does not print, plus the scheduler barrier
+    /// its exclusive world access makes every frame; `None` removes both.
     pub fn set_ecs_diagnostics_interval(&mut self, interval: Option<Duration>) {
         // Re-register rather than mutate: the interval is captured by the
         // closure, and replacing it keeps exactly one such system registered.
@@ -1942,8 +1946,9 @@ mod tests {
     fn system_snapshots_report_owners_and_toggle_by_index() {
         let mut engine = Engine::new();
         // This test is about project and module ownership and indexes the
-        // snapshot list directly, so the engine's own system is silenced to
-        // keep those indices meaning what they did.
+        // snapshot list directly. The ECS report is opt-in, so nothing is
+        // registered here today; the call keeps the indices meaning what they
+        // would if a project turned it on first.
         engine.set_ecs_diagnostics_interval(None);
         engine.register_system("duplicate", || {});
         engine.begin_module_registration(SystemOwner::extension(0));
@@ -1969,5 +1974,40 @@ mod tests {
         assert!(after[1].enabled);
         // The name-keyed query sees the first (now disabled) registration.
         assert_eq!(engine.is_system_enabled("duplicate"), Some(false));
+    }
+
+    /// The ECS report is opt-in: a fresh engine registers nothing and the
+    /// setter is the one call that registers it (W-0094).
+    ///
+    /// The docs on `Engine::new`, the setter and the `diagnostics` module all
+    /// promise this shape, so the test fails if either side drifts: registering
+    /// the report while the engine is built breaks the first assertion, and a
+    /// setter that no longer registers breaks the second.
+    #[test]
+    fn the_ecs_report_is_opt_in() {
+        let report_is_registered = |engine: &Engine| {
+            engine.system_snapshots().into_iter().any(|system| {
+                system.name == crate::diagnostics::SYSTEM_NAME
+                    && system.owner == SystemOwner::ENGINE
+            })
+        };
+
+        let mut engine = Engine::new();
+        assert!(
+            !report_is_registered(&engine),
+            "Engine::new registers no report; a project opts in"
+        );
+
+        engine.set_ecs_diagnostics_interval(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
+        assert!(
+            report_is_registered(&engine),
+            "the setter registers the report it documents"
+        );
+
+        engine.set_ecs_diagnostics_interval(None);
+        assert!(
+            !report_is_registered(&engine),
+            "None removes the report again"
+        );
     }
 }

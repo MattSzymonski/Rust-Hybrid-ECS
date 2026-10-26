@@ -21,8 +21,13 @@ crate-type = ["rlib", "dylib"]
 # `bytemuck` is part of the feature pin below.
 glam = { version = "0.33", features = ["serde", "bytemuck"] }
 pill_core_macros = { path = "../pill_core_macros" }
-libloading = "0.8"
-notify = "6"
+# This crate is the one `dylib` every posture links - the shipping and browser
+# builds included - so it names no development-host crate. `notify` (the source
+# watcher) and `libloading` (the module loader) stood here for eight error
+# variants that carried their concrete types; those fields are boxed sources
+# now, and the crates that own the failed operation construct the concrete
+# error. Adding either back puts a watcher and a loader in every shipped binary
+# (W-0114).
 # `FixedString64` serializes through `#[serde(into/from)]`; glam pulls serde
 # in already, but naming it here is what lets this crate's own types derive.
 # `rc` is part of the feature pin below (the egui editor's stack turns it on).
@@ -124,6 +129,14 @@ ttf-parser = { version = "0.25", features = ["gvar-alloc", "no-std-float"] }
 # cost ~100-160 ms of `rustc` link setup on every patch. Before re-adding any
 # pin here, count the `_imports_indirect.lib` entries in a patch link and keep
 # it near 24.
+#
+# One feature of the 0.61 pin came back on 2026-10-26 (W-0114): removing
+# `notify` took `walkdir` and its `winapi-util` out of this crate's own graph,
+# so every other build still reached `Win32_System_SystemInformation` and this
+# one stopped, and the drift check failed. The feature alone costs nothing -
+# it names `kernel32`, which the rest of this tree already links - while the
+# whole version would cost the 68 import libraries above.
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 # The platform layer (`src/platform`) on native: the rolling log file and
 # blocking on a future.

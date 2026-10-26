@@ -220,34 +220,79 @@ fn report_fan_out(
     Ok(())
 }
 
+/// The two operations a fan-out performs on one copy of the function.
+///
+/// The trait exists so the refusal handling below can be tested: in production
+/// the copy that takes a replacement and the copy that refuses it are both
+/// loaded images, and a unit test can build neither. [`PatchCopy`] is the only
+/// implementation that ships.
+trait RedirectSlot {
+    /// Point this copy's redirect slot at `address`.
+    fn install(&self, qualified: &str, address: usize, signature: &str) -> Result<bool, String>;
+
+    /// Empty this copy's redirect slot, restoring its own body.
+    fn reset(&self, qualified: &str) -> Result<bool, String>;
+}
+
+impl RedirectSlot for PatchCopy<'_> {
+    fn install(&self, qualified: &str, address: usize, signature: &str) -> Result<bool, String> {
+        self.install_plain_function(qualified, address, signature)
+    }
+
+    fn reset(&self, qualified: &str) -> Result<bool, String> {
+        self.reset_plain_function(qualified)
+    }
+}
+
 /// Offer one replacement to every loaded artifact, and report how many took it.
 ///
 /// A crate linked into several artifacts is compiled into each of them, so the
 /// project DLL runs its own embedded copy of a module it depends on. Installing
 /// only into the module's own DLL would leave that copy running the old code,
 /// which is exactly the situation that forces a cascading project reload today.
+///
+/// `previous` is the generation this function is running now, which a refusal
+/// returns the copies it already redirected to. Passing `None` means nothing
+/// was installed before, so generation zero is where they belong.
 pub(super) fn install_everywhere(
     targets: &[(&str, &NativeLibrary)],
     patches: &[LoadedPatch],
     qualified: &str,
     address: usize,
     signature: &str,
+    previous: Option<(usize, &str)>,
+) -> Result<usize, String> {
+    let copies: Vec<(String, PatchCopy<'_>)> = every_copy(targets, patches).collect();
+    install_across(&copies, qualified, address, signature, previous)
+}
+
+/// Offer one replacement to every copy in `copies`, and report how many took it.
+fn install_across<C: RedirectSlot>(
+    copies: &[(String, C)],
+    qualified: &str,
+    address: usize,
+    signature: &str,
+    previous: Option<(usize, &str)>,
 ) -> Result<usize, String> {
     let mut installed = Vec::new();
-    for (label, copy) in every_copy(targets, patches) {
-        match copy.install_plain_function(qualified, address, signature) {
-            Ok(true) => installed.push(label),
+    let mut redirected = Vec::new();
+    for (label, copy) in copies {
+        match copy.install(qualified, address, signature) {
+            Ok(true) => {
+                installed.push(label.clone());
+                redirected.push(copy);
+            }
             // This image simply does not link the crate.
             Ok(false) => {}
             // A refusal is reported rather than tolerated: leaving some
             // artifacts patched and others not would be worse than not
             // patching at all, and the caller falls back to a full reload.
             // The copies that already took the replacement are returned to
-            // their own bodies first, so a fan-out that failed halfway leaves
-            // no artifact running the new body while its siblings run the old
-            // one.
+            // what they were running first, so a fan-out that failed halfway
+            // leaves no artifact running the new body while its siblings run
+            // the old one - and none silently losing a patch it already had.
             Err(detail) => {
-                let unwind = match reset_everywhere(targets, patches, qualified) {
+                let unwind = match repair(&redirected, qualified, previous) {
                     Ok(()) => String::new(),
                     Err(unwind_detail) => {
                         format!("; the partial install could not be unwound: {unwind_detail}")
@@ -278,6 +323,26 @@ pub(super) fn install_everywhere(
     // How many copies were reached, which is what makes a fan-out visible in
     // the analytics line rather than assumed.
     Ok(installed.len())
+}
+
+/// Put the copies a refused fan-out redirected back on what they were running.
+///
+/// Generation zero - the body each artifact was built with - is only the right
+/// answer when nothing was installed before. A copy that was already running an
+/// earlier generation has to be re-aimed at that generation, or the refusal
+/// reverts a working patch while the session still records it as live.
+fn repair<C: RedirectSlot>(
+    redirected: &[&C],
+    qualified: &str,
+    previous: Option<(usize, &str)>,
+) -> Result<(), String> {
+    for copy in redirected {
+        match previous {
+            Some((address, signature)) => copy.install(qualified, address, signature),
+            None => copy.reset(qualified),
+        }?;
+    }
+    Ok(())
 }
 
 /// Export a generated prologue patch carries so the host can find its new body.
@@ -610,7 +675,101 @@ pub(super) fn reset_everywhere(
 
 #[cfg(test)]
 mod tests {
-    use super::check_recorded_declaration;
+    use std::cell::Cell;
+
+    use super::{check_recorded_declaration, install_across, RedirectSlot};
+
+    /// A stand-in for one loaded image's redirect slot.
+    ///
+    /// The slot holds an address; the tests use the generation number as the
+    /// address, so "where does this copy point" reads as "what is it running".
+    struct FakeCopy {
+        generation: Cell<u32>,
+        refuses: bool,
+    }
+
+    impl FakeCopy {
+        fn new(generation: u32) -> Self {
+            Self {
+                generation: Cell::new(generation),
+                refuses: false,
+            }
+        }
+
+        fn refusing() -> Self {
+            Self {
+                generation: Cell::new(0),
+                refuses: true,
+            }
+        }
+    }
+
+    impl RedirectSlot for FakeCopy {
+        fn install(
+            &self,
+            _qualified: &str,
+            address: usize,
+            _signature: &str,
+        ) -> Result<bool, String> {
+            if self.refuses {
+                return Err(String::from("`demo::function` changed shape"));
+            }
+            self.generation.set(address as u32);
+            Ok(true)
+        }
+
+        fn reset(&self, _qualified: &str) -> Result<bool, String> {
+            self.generation.set(0);
+            Ok(true)
+        }
+    }
+
+    /// A fan-out that fails halfway must leave every copy on the generation it
+    /// was running, not on the code its artifact was built with.
+    ///
+    /// Generation zero is only the right answer when nothing was installed
+    /// before: emptying the slot of a copy that was already running generation
+    /// one silently reverts that artifact to its compiled-in body while the
+    /// session keeps recording generation one as the live one.
+    #[test]
+    fn a_refused_fan_out_returns_the_copies_it_reached_to_the_generation_they_ran() {
+        let copies = vec![
+            (String::from("project"), FakeCopy::new(1)),
+            (String::from("module"), FakeCopy::refusing()),
+        ];
+
+        let error = install_across(&copies, "demo::function", 2, "fn()", Some((1, "fn()")))
+            .expect_err("a copy that refuses the replacement fails the fan-out");
+        assert!(error.contains("changed shape"), "{error}");
+        assert_eq!(
+            copies[0].1.generation.get(),
+            1,
+            "the copy that took the replacement is back on the generation it was running"
+        );
+        assert_eq!(
+            copies[1].1.generation.get(),
+            0,
+            "the copy that refused was never redirected"
+        );
+    }
+
+    /// With nothing installed before, a refused fan-out does return the copies
+    /// it reached to the body their artifact was built with.
+    #[test]
+    fn a_refused_fan_out_with_no_earlier_generation_restores_the_original_bodies() {
+        let copies = vec![
+            (String::from("project"), FakeCopy::new(0)),
+            (String::from("module"), FakeCopy::refusing()),
+        ];
+
+        install_across(&copies, "demo::function", 1, "fn()", None)
+            .expect_err("a copy that refuses the replacement fails the fan-out");
+        assert_eq!(
+            copies[0].1.generation.get(),
+            0,
+            "the copy that took the replacement is back on its own body"
+        );
+    }
 
     /// A reachable copy whose declaration is missing is refused, not waved
     /// through: the gate is the only check the prologue route can make, so

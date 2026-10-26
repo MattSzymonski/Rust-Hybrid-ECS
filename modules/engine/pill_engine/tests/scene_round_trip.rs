@@ -162,7 +162,8 @@ fn a_project_scene_saves_and_loads_back_with_its_references() {
             .import_standalone::<Scene>(Path::new("scenes/main.scene"))
             .expect("the scene file loads");
         assert_eq!(
-            imported.guid, scene_guid,
+            imported.guid,
+            Some(scene_guid),
             "the file keeps the guid it was saved with"
         );
         assets

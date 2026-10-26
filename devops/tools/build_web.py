@@ -13,6 +13,11 @@
 #   puts the page (`devops/tools/web/index.html`) beside the generated
 #   `pkg/` in `<project>/build/web/`. Serve that directory over HTTP to play.
 #
+#   The project's assets travel beside the page, not inside the module
+#   (W-0105): the bundle's build script packs them, this script copies
+#   `assets.pillpack` next to `index.html`, and `pill_web` fetches and mounts
+#   it before the project initializes.
+#
 #   The web app crate has a workspace of its own and is built from its own
 #   directory, so the engine workspace's `.cargo/config.toml` (whose
 #   `-C prefer-dynamic` a wasm build cannot use) does not apply. The engine
@@ -65,6 +70,11 @@ WORKSPACE_LOCK = Path("modules") / "Cargo.lock"
 WEB_TARGET_DIRECTORY = Path("build") / "build_meta" / "web_target"
 # The module wasm-pack writes, named after the web app crate.
 WEB_MODULE_NAME = "pill_web_app_bg.wasm"
+# The project's assets, packed by the bundle's build script and fetched by the
+# module at startup (W-0105). It sits beside the page, not inside the module.
+ASSET_PACK_FILE_NAME = "assets.pillpack"
+BUNDLE_DIRECTORY = Path("build") / "pill_shipping_bundle"
+WEB_PACK_DIRECTORY = "pack"
 
 
 def repository_root() -> Path:
@@ -172,11 +182,25 @@ def main() -> int:
     page_template = EDITOR_PAGE_TEMPLATE if editor else PAGE_TEMPLATE
     shutil.copyfile(root / page_template, output_directory / "index.html")
 
+    # The bundle's build script packed the project's `res` directory beside
+    # its crate; the page fetches it from its own directory, so it lands here.
+    pack_source = root / BUNDLE_DIRECTORY / WEB_PACK_DIRECTORY / ASSET_PACK_FILE_NAME
+    if not pack_source.is_file():
+        print(
+            f"error: the bundle did not pack {pack_source}",
+            file=sys.stderr,
+        )
+        return 2
+    pack_path = output_directory / ASSET_PACK_FILE_NAME
+    shutil.copyfile(pack_source, pack_path)
+
     # Step 4: report where it is and how to open it.
     module_path = package_directory / WEB_MODULE_NAME
     size_megabytes = module_path.stat().st_size / (1024 * 1024)
+    pack_megabytes = pack_path.stat().st_size / (1024 * 1024)
     print(f"web build: {output_directory}")
     print(f"  {WEB_MODULE_NAME}: {size_megabytes:.1f} MB")
+    print(f"  {ASSET_PACK_FILE_NAME}: {pack_megabytes:.1f} MB")
     print(f"  serve it with: python -m http.server 8000 -d \"{output_directory}\"")
     return 0
 

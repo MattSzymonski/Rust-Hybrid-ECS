@@ -246,6 +246,12 @@ impl Drop for ActiveSystemGuard {
                     observed.clear();
                 }
             });
+            // A managed system that opened a profiling zone and never ended it
+            // - or threw between the two - leaves a Tracy zone open across the
+            // boundary. Closing it here is what the zone vector's own doc
+            // promised: the guard list cannot grow per frame, and the timeline
+            // records the zone against the invocation that opened it.
+            super::abi::end_unfinished_zones();
             scope_slot.set(None);
         });
     }

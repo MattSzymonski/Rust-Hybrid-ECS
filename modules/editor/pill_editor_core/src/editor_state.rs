@@ -604,9 +604,11 @@ impl EditorSnapshot {
 
     /// The entity tier - the only expensive one: one row per live entity,
     /// each with owned label strings. A 200k-entity world spends real time
-    /// here in debug builds, so a caller that already holds a snapshot can
-    /// rebuild this tier on change (entity count, an edit) instead of every
-    /// frame; the runner does.
+    /// here in debug builds. The editor captures it every frame, because the
+    /// rows must follow a system that spawns, despawns or re-composes an
+    /// entity; caching it needs a change signal the world does not expose yet
+    /// (W-0089's follow-up: `entity_count` alone misses a spawn and a despawn
+    /// in the same frame).
     pub fn capture_entities(engine: &Engine) -> Vec<EntityListEntry> {
         engine
             .world()
@@ -1837,6 +1839,13 @@ impl EditorCommand {
                     .get_resource::<pill_engine::ImportRegistry>()
                     .cloned()
                     .ok_or_else(|| format!("{command:?}: no asset types are registered"))?;
+                // The store is taken before the file is written: an engine
+                // without one must refuse the create, not leave a file no
+                // asset manager will ever hold.
+                let assets = engine
+                    .world_mut()
+                    .get_resource_mut::<pill_engine::AssetManager>()
+                    .ok_or_else(|| format!("{command:?}: the engine has no AssetManager"))?;
                 let extension = registry
                     .standalone_types()
                     .into_iter()
@@ -1892,24 +1901,29 @@ impl EditorCommand {
                 let mut bytes = serde_json::to_vec_pretty(&file)
                     .map_err(|error| format!("{command:?}: {error}"))?;
                 bytes.push(b'\n');
+                let sidecar = pill_engine::asset_metadata::metadata_path_for(&relative);
+                let sidecar_existed = sidecar
+                    .as_ref()
+                    .is_some_and(|meta| root.join(meta).exists());
                 pill_engine::asset_store::write_new(&destination, &bytes)
                     .map_err(|error| format!("{command:?}: {error}"))?;
-                let assets = engine
-                    .world_mut()
-                    .get_resource_mut::<pill_engine::AssetManager>()
-                    .ok_or_else(|| format!("{command:?}: the engine has no AssetManager"))?;
-                registry
-                    .import(
-                        assets,
-                        &relative,
-                        pill_engine::MetadataPolicy::ReadIfPresent,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "{command:?}: `{}` was written but did not load: {error}",
-                            asset_slash(&relative)
-                        )
-                    })?;
+                if let Err(error) = registry.import(
+                    assets,
+                    &relative,
+                    pill_engine::MetadataPolicy::ReadIfPresent,
+                ) {
+                    // The file is only an asset once it imports, so a refusal
+                    // takes the write back rather than leaving a file the
+                    // project cannot load and no inverse covers.
+                    let _ = std::fs::remove_file(&destination);
+                    if let Some(meta) = sidecar.filter(|_| !sidecar_existed) {
+                        let _ = std::fs::remove_file(root.join(meta));
+                    }
+                    return Err(format!(
+                        "{command:?}: `{}` did not load: {error}",
+                        asset_slash(&relative)
+                    ));
+                }
                 Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
                     path: asset_slash(&relative),
                 }))
@@ -1937,7 +1951,18 @@ impl EditorCommand {
                     match std::fs::remove_file(root.join(&meta)) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(format!("{command:?}: {error}")),
+                        Err(error) => {
+                            // The asset file is already gone; put it back, so a
+                            // delete that cannot finish leaves nothing behind.
+                            return Err(match write_asset_bytes(&file, &bytes) {
+                                Ok(()) => format!(
+                                    "{command:?}: cannot delete `{path}`'s sidecar, so nothing was deleted: {error}"
+                                ),
+                                Err(restore) => format!(
+                                    "{command:?}: cannot delete `{path}`'s sidecar ({error}) and cannot restore the asset: {restore}"
+                                ),
+                            });
+                        }
                     }
                 }
                 Ok(CommandOutcome::inverse(EditorCommand::RestoreAssetFile {
@@ -2216,7 +2241,8 @@ impl EditorCommand {
                 // key another writer owns survive; blanks write nothing, so
                 // an untouched row keeps the consumer's own default.
                 let directory = crate::layout::layout_directory();
-                let mut document = crate::preferences::read_document(&directory);
+                let mut document = crate::preferences::read_document(&directory)
+                    .map_err(|message| format!("{command:?}: {message}"))?;
                 let mut written = 0usize;
                 for (key, text) in values {
                     if text.trim().is_empty() {
@@ -3364,6 +3390,7 @@ mod tests {
     /// one test: the mounted directory is process-wide.
     #[test]
     fn asset_picks_load_assign_undo_clear_and_refuse() {
+        let _mount = asset_mount_lock();
         let (mut engine, entity, name, root) = reference_engine("pick");
         assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
 
@@ -3598,5 +3625,129 @@ mod tests {
         let cleared = EditorCommand::apply_recorded(&mut engine, &[retarget(holder, &name, None)]);
         assert!(cleared.failures.is_empty(), "{:?}", cleared.failures);
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
+    }
+
+    /// The mounted asset directory is process-wide, so the tests that mount
+    /// one take this in turn.
+    fn asset_mount_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A standalone type that refuses every document, so a create writes its
+    /// file and then fails to import it (W-0088).
+    #[derive(Debug)]
+    struct Refused;
+    impl pill_engine::asset::Asset for Refused {}
+    trait_type_map::impl_trait_accessible!(dyn pill_engine::asset::Asset; Refused);
+
+    impl pill_engine::asset_standalone::StandaloneAsset for Refused {
+        type Document = RefusedDocument;
+        const FILE_EXTENSION: &'static str = "refused";
+
+        fn metadata_type_name() -> &'static str {
+            "pill_editor_core::tests::Refused"
+        }
+
+        fn from_document(
+            _name: &str,
+            _document: RefusedDocument,
+            _assets: &pill_engine::AssetManager,
+        ) -> pill_engine::AssetLoadResult<Self> {
+            Err(pill_engine::AssetLoadError::Decode {
+                label: "refused".to_owned(),
+                detail: "the test type refuses every document".to_owned(),
+            })
+        }
+    }
+
+    /// The refusing type's (empty) document.
+    #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct RefusedDocument {}
+
+    /// A create whose import refuses the file it just wrote leaves no file,
+    /// and a delete that cannot remove the sidecar puts the asset back
+    /// (W-0088).
+    #[test]
+    fn a_failed_create_or_delete_leaves_the_directory_as_it_found_it() {
+        let _mount = asset_mount_lock();
+        let root =
+            std::env::temp_dir().join(format!("pill-editor-asset-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = Engine::new();
+        engine.world_mut().register_standalone_asset::<Refused>();
+
+        let failures = EditorCommand::apply(
+            &mut engine,
+            &[EditorCommand::CreateStandaloneAsset {
+                type_name: "pill_editor_core::tests::Refused".to_owned(),
+                folder: String::new(),
+                name: "broken".to_owned(),
+            }],
+        );
+        assert_eq!(failures.len(), 1, "the refusing import fails the create");
+        assert!(
+            failures[0].1.contains("refuses every document"),
+            "{:?}",
+            failures[0].1
+        );
+        assert!(
+            !root.join("broken.refused").exists(),
+            "a create whose import refused the file must not leave it behind"
+        );
+
+        // A delete removes the asset file and then its sidecar. A sidecar
+        // another handle holds without delete sharing is the one state where
+        // the second step fails after the first one succeeded; a platform that
+        // cannot set that up has no way to reach the arm's rollback.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            let asset = root.join("kept.refused");
+            std::fs::write(&asset, "{\"asset_type\": \"refused\"}").unwrap();
+            let meta = root.join("kept.refused.meta");
+            std::fs::write(
+                &meta,
+                sidecar(
+                    "pill_editor_core::tests::Refused",
+                    "000000000000000000000000000000d1",
+                ),
+            )
+            .unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&meta)
+                .unwrap();
+            assert!(
+                std::fs::remove_file(&meta).is_err(),
+                "the sidecar must be unremovable for this test"
+            );
+
+            let failures = EditorCommand::apply(
+                &mut engine,
+                &[EditorCommand::DeleteAssetFile {
+                    path: "kept.refused".to_owned(),
+                }],
+            );
+            assert_eq!(
+                failures.len(),
+                1,
+                "the unremovable sidecar fails the delete"
+            );
+            assert!(
+                asset.exists(),
+                "a delete that could not finish must put the asset back: {}",
+                failures[0].1
+            );
+            drop(held);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

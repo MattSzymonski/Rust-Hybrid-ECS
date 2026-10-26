@@ -32,6 +32,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 // Current crate
+use crate::drain::HistoryDirection;
 use crate::editor_state::EditorCommand;
 use crate::layout::EditorTab;
 
@@ -1073,6 +1074,22 @@ impl PendingEditorCommands {
             record: false,
             label: String::new(),
             coalesce_key: None,
+            replay: None,
+        });
+    }
+
+    /// Queue the batch a history walk replays.
+    ///
+    /// Marked with the walk's direction, because the step is popped before its
+    /// commands run: a replay that fails puts the cursor back rather than
+    /// leaving the log claiming a step that never happened (W-0090).
+    pub fn push_replay(&mut self, commands: Vec<EditorCommand>, direction: HistoryDirection) {
+        self.batches.push(PendingCommandBatch {
+            commands,
+            record: false,
+            label: String::new(),
+            coalesce_key: None,
+            replay: Some(direction),
         });
     }
 
@@ -1102,6 +1119,7 @@ impl PendingEditorCommands {
             record: true,
             label: label.into(),
             coalesce_key,
+            replay: None,
         });
     }
 }
@@ -1118,6 +1136,8 @@ pub struct PendingCommandBatch {
     pub label: String,
     /// Continuous-edit key, when recorded.
     pub coalesce_key: Option<String>,
+    /// The history walk this batch replays, when it is one (W-0090).
+    pub replay: Option<HistoryDirection>,
 }
 
 impl pill_engine::Resource for PendingEditorCommands {}

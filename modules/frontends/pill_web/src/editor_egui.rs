@@ -75,45 +75,38 @@ const FRAME_HEARTBEAT_FRAMES: u64 = 60;
 /// runs on the scene's animation frames. Every failure is reported to the
 /// browser console.
 pub fn run_editor_egui(project: StaticProject, scene_canvas_id: &str, ui_canvas_id: &str) {
-    // Step 1: readable panics and console logging, before anything can fail.
-    console_error_panic_hook::set_once();
-    if let Err(error) = pill_runtime::init_telemetry(None) {
-        web_sys::console::error_1(&format!("[web] telemetry failed to start: {error}").into());
-    }
-
-    // Step 2: register the linked modules - the egui shell among them - and
-    // the project.
-    let runtime = match pill_runtime::setup(project) {
-        Ok(runtime) => runtime,
-        Err(error) => return report_failure("project setup", &error),
-    };
-
-    // Step 3: hand the event loop to the browser; the canvases and the
-    // renderers follow in `resumed`.
-    let event_loop = match EventLoop::new() {
-        Ok(event_loop) => event_loop,
-        Err(error) => return report_failure("event loop creation", &error),
-    };
-    info!(
-        target: telemetry_target::ENGINE,
-        scene = scene_canvas_id,
-        ui = ui_canvas_id,
-        "starting the editor in the browser"
-    );
-    event_loop.spawn_app(WebEditorApplication {
-        scene_canvas_id: scene_canvas_id.to_owned(),
-        ui_canvas_id: ui_canvas_id.to_owned(),
-        runtime: Some(runtime),
-        scene_window: None,
-        ui_window: None,
-        driver: Rc::new(RefCell::new(None)),
-        ui_surface: Rc::new(RefCell::new(None)),
-        pending_events: Vec::new(),
-        focused: true,
-        started: Instant::now(),
-        frames_per_second: 0.0,
-        last_frame_time: None,
-        frame_index: 0,
+    let scene_canvas_id = scene_canvas_id.to_owned();
+    let ui_canvas_id = ui_canvas_id.to_owned();
+    // The asset pack, the telemetry and the project registration are the
+    // game runner's; only the event loop differs.
+    crate::start_project(project, move |runtime| {
+        // Step 1: hand the event loop to the browser; the canvases and the
+        // renderers follow in `resumed`.
+        let event_loop = match EventLoop::new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => return report_failure("event loop creation", &error),
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            scene = %scene_canvas_id,
+            ui = %ui_canvas_id,
+            "starting the editor in the browser"
+        );
+        event_loop.spawn_app(WebEditorApplication {
+            scene_canvas_id: scene_canvas_id.clone(),
+            ui_canvas_id: ui_canvas_id.clone(),
+            runtime: Some(runtime),
+            scene_window: None,
+            ui_window: None,
+            driver: Rc::new(RefCell::new(None)),
+            ui_surface: Rc::new(RefCell::new(None)),
+            pending_events: Vec::new(),
+            focused: true,
+            started: Instant::now(),
+            frames_per_second: 0.0,
+            last_frame_time: None,
+            frame_index: 0,
+        });
     });
 }
 

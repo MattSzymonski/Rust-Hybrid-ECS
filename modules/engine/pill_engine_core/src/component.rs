@@ -162,6 +162,14 @@ pub trait Component: Send + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Tick(pub u32);
 
+/// Half the tick range: the boundary between "ahead of the baseline" and
+/// "behind it" once the counter wraps.
+///
+/// A distance larger than this is read as the other direction, so two ticks
+/// more than `u32::MAX / 2` apart cannot be ordered. That is the resolution the
+/// wrap-safe comparison trades for, and it is far longer than any single frame.
+const WRAP_HALF: u32 = u32::MAX / 2;
+
 impl Tick {
     // -------------------------------------------------------------------------
     // Construction
@@ -185,9 +193,20 @@ impl Tick {
 
     /// Returns true if this tick is strictly newer than `last_run`
     /// (and not in the future relative to `this_run`).
+    ///
+    /// The counter is a `u32` that wraps, so both comparisons are made on the
+    /// unsigned distance from the baseline rather than on the numbers
+    /// themselves: a tick written after a wrap is *smaller* than the baseline
+    /// but only a few ticks ahead of it. A distance in the upper half of the
+    /// range is a tick in the other direction, which is what makes the
+    /// comparison direction-safe without knowing the counter's position.
     #[inline]
     pub fn is_newer_than(self, last_run: Tick, this_run: Tick) -> bool {
-        self.0 > last_run.0 && self.0 <= this_run.0
+        let since_last_run = self.0.wrapping_sub(last_run.0);
+        let since_this_run = self.0.wrapping_sub(this_run.0);
+        since_last_run != 0
+            && since_last_run <= WRAP_HALF
+            && (since_this_run == 0 || since_this_run > WRAP_HALF)
     }
 }
 

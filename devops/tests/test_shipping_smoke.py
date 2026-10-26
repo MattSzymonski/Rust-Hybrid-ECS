@@ -13,24 +13,30 @@ DESCRIPTION
     its eight suites apply to a binary with reloading compiled out. This suite
     builds that binary, checks it statically, then checks that it actually runs.
 
-    Four things are asserted:
+    Five things are asserted:
 
-      0. The binary contains none of the strings only the reloading path
+      0. The committed bundle stub is project-agnostic, so no shipping binary
+         can be type-checked against a stale generation of another project
+         (W-0082). This runs before the bundle is generated, over the
+         committed files.
+      1. The binary contains none of the strings only the reloading path
          produces, which shows that machinery was gated out rather than merely
          unused (the same technique `test_log_contract.py` uses in the other
          direction).
-      1. The binary reaches the project loop and reports frames.
-      2. It prints the project's own probe line, so the statically linked
+      2. The binary reaches the project loop and reports frames.
+      3. It prints the project's own probe line, so the statically linked
          project and its extensions really did initialize - a build that
          linked them but never called their entry points would still start.
-      3. It never invokes cargo. The reloading host shells out to cargo before
+      4. It never invokes cargo. The reloading host shells out to cargo before
          the first frame; a shipping build must not, and the surest way to know
          is to watch for a cargo child process rather than to trust a grep. The
          watch polls from launch and fails when the process query itself cannot
          be run, rather than reporting a clean bill of health it did not earn.
 
     Nothing is edited, so this suite is safe to run against a dirty tree and
-    leaves nothing to restore.
+    leaves nothing to restore. The one exception is the bundle: the build
+    regenerates it and puts the stub back, so the check above sees the tree as
+    it was left.
 
 USAGE
   python devops/tests/test_shipping_smoke.py [--timeout-scale N]
@@ -124,6 +130,49 @@ BUILD_TIMEOUT = 1800
 # =============================================================================
 # Free Functions
 # =============================================================================
+
+
+def stub_failure() -> str:
+    """Checks that the shipping bundle stub in the tree is project-agnostic.
+
+    The stub is committed only so cargo can resolve `pill_standalone`'s
+    optional path dependency on a fresh clone. A stub that is a real
+    generation is a bundle that compiles, so the shipping posture can be
+    type-checked - and shipped - against some other project (W-0082).
+
+    A tree that holds a generated bundle (an earlier build's output) is asked
+    to restore the stub rather than skipped: the file it leaves behind is
+    exactly the one that must not be committed, and `git checkout --
+    build/pill_shipping_bundle` puts the stub back.
+    """
+    bundle = REPOSITORY_ROOT / "build" / "pill_shipping_bundle"
+    try:
+        source = (bundle / "src" / "lib.rs").read_text(encoding="utf-8")
+    except OSError as error:
+        return f"cannot read the bundle stub: {error}"
+    if "Generated shipping bundle" in source:
+        return (
+            "the tree holds a generated bundle where the stub belongs; restore "
+            "it with `git checkout -- build/pill_shipping_bundle`"
+        )
+    for relative, required, forbidden in (
+        ("Cargo.toml", ('name = "pill_shipping_bundle"',), ("[dependencies]",)),
+        ("src/lib.rs", ("compile_error!", "generate_shipping_bundle.py"), ("static_project",)),
+    ):
+        try:
+            content = (bundle / relative).read_text(encoding="utf-8")
+        except OSError as error:
+            return f"cannot read the bundle stub's {relative}: {error}"
+        for token in required:
+            if token not in content:
+                return f"the bundle stub's {relative} does not contain {token!r}"
+        for token in forbidden:
+            if token in content:
+                return (
+                    f"the bundle stub's {relative} contains {token!r}: it is a real "
+                    "generation, so a shipping build could compile against it"
+                )
+    return ""
 
 
 def build_shipping_binary(timeout: int) -> str:
@@ -264,6 +313,13 @@ def run_and_observe(timeout_scale: float) -> int:
     print("=" * 70)
     print("  Shipping Build Smoke Test")
     print("=" * 70)
+
+    print("\n  [STUB] the bundle stub is project-agnostic")
+    failure = stub_failure()
+    if failure:
+        print(f"  [FAIL] {failure}")
+        return 1
+    print("  [OK] the stub refuses to compile and names no project")
 
     print("\n  [BUILD] cargo build --release -p pill_standalone " + " ".join(SHIPPING_FEATURES))
     # The build regenerates the tracked shipping bundle (and may touch the

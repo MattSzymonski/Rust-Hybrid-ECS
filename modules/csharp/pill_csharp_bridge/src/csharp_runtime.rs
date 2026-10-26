@@ -133,7 +133,7 @@ impl DotnetRuntimeContext {
         let library = unsafe {
             Library::new(&library_path).map_err(|source| CSharpError::HostfxrLoadFailed {
                 path: library_path.display().to_string(),
-                source,
+                source: Box::new(source),
             })?
         };
 
@@ -147,7 +147,7 @@ impl DotnetRuntimeContext {
                 .get(b"hostfxr_initialize_for_runtime_config")
                 .map_err(|source| CSharpError::HostfxrExportMissing {
                     symbol: "hostfxr_initialize_for_runtime_config".to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
         };
         // SAFETY: These names and signatures are fixed by the hostfxr ABI.
@@ -156,7 +156,7 @@ impl DotnetRuntimeContext {
                 .get(b"hostfxr_get_runtime_delegate")
                 .map_err(|source| CSharpError::HostfxrExportMissing {
                     symbol: "hostfxr_get_runtime_delegate".to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
         };
         // SAFETY: These names and signatures are fixed by the hostfxr ABI.
@@ -165,7 +165,7 @@ impl DotnetRuntimeContext {
                 .get(b"hostfxr_close")
                 .map_err(|source| CSharpError::HostfxrExportMissing {
                     symbol: "hostfxr_close".to_string(),
-                    source,
+                    source: Box::new(source),
                 })?
         };
 

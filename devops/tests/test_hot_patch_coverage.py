@@ -450,9 +450,12 @@ def exercise(crate: Crate, monitor: OutputMonitor, backups: BackupRegistry) -> N
             crate.detail = f"edit text {crate.edit_from!r} not found as written"
             print(f"  [SKIP] {crate.name}: {crate.detail}")
             return
+        # The anchor is taken before the write: the host can answer a body-only
+        # edit within the write's own turn, and an outcome line counted into the
+        # anchor would never appear in `output_since` (W-0111).
+        start_index = monitor.line_count
         atomic_write(crate.edit_file, edited)
 
-        start_index = monitor.line_count
         deadline = time.time() + OUTCOME_TIMEOUT
         while time.time() < deadline:
             output = monitor.output_since(start_index)

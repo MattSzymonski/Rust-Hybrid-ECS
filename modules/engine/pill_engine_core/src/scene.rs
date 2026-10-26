@@ -28,7 +28,10 @@
 //! so rather than passing for a complete one. A field it can locate but not
 //! interpret (a `struct:` with no known layout) is written as its raw bytes,
 //! because a captured opaque payload writes back verbatim into the same
-//! layout.
+//! layout. A whole component the field layer cannot reach - no layout, or a
+//! row it cannot read - is left out and named in
+//! [`SceneSave::skipped_components`]: the entity is saved without it, which is
+//! the caller's to report.
 //!
 //! Loading is three passes: the components a reference lives in must exist
 //! before the field is written, and an entity reference may name an entity
@@ -140,6 +143,11 @@ pub struct SceneSave {
     /// One entry per field the field layer could not write, by
     /// `<entity>: <component>.<field>`.
     pub skipped_fields: Vec<String>,
+    /// One entry per component the save left out, by `<entity>: <component>`
+    /// and the reason. A component is written through the field layer, so one
+    /// with no layout of its own has no fields to write - the document then
+    /// holds the entity without it, which is a loss the caller has to see.
+    pub skipped_components: Vec<String>,
     /// How many components were written.
     pub components: usize,
 }
@@ -174,14 +182,25 @@ pub fn save_scene(
         let mut components = BTreeMap::new();
         for name in world.entity_component_names(entity).unwrap_or_default() {
             let Some(component_id) = world.resolve_entity_component_id(entity, &name) else {
+                report
+                    .skipped_components
+                    .push(format!("{id}: {name} is not registered on this entity"));
                 continue;
             };
             let Some(layout) = world.component_field_layout(component_id) else {
+                report
+                    .skipped_components
+                    .push(format!("{id}: {name} has no field layout"));
                 continue;
             };
             let values = match world.read_component_fields(entity, &name) {
                 Ok(values) => values,
-                Err(_) => continue,
+                Err(_) => {
+                    report
+                        .skipped_components
+                        .push(format!("{id}: {name} cannot be read"));
+                    continue;
+                }
             };
             let mut fields = BTreeMap::new();
             for (descriptor, value) in layout.iter().zip(values.iter()) {
@@ -421,23 +440,23 @@ pub fn load_scene(
                     continue;
                 };
                 let value = match decoded_field(tag, encoded) {
-                    Some(Decoded::Value(value)) => value,
-                    Some(Decoded::Asset(saved)) => {
+                    Ok(Decoded::Value(value)) => value,
+                    Ok(Decoded::Asset(saved)) => {
                         let assets = engine
                             .world_mut()
                             .get_resource_mut::<AssetManager>()
                             .expect("a world with an asset manager");
                         restore_asset_reference(assets, database, &registry, &saved)
                     }
-                    Some(Decoded::Entity(id)) => {
+                    Ok(Decoded::Entity(id)) => {
                         links.push(*entity, name, field, id);
                         continue;
                     }
-                    Some(Decoded::Cleared) => cleared_field(tag),
-                    None => {
+                    Ok(Decoded::Cleared) => cleared_field(tag),
+                    Err(reason) => {
                         report
                             .skipped_fields
-                            .push(format!("{entity}: {name}.{field} does not read"));
+                            .push(format!("{entity}: {name}.{field} {reason}"));
                         continue;
                     }
                 };
@@ -511,49 +530,114 @@ enum Decoded {
 }
 
 /// Decode one document value for the field tagged `tag`.
-fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Option<Decoded> {
+///
+/// `Err` carries the reason the value cannot be written, which the load report
+/// names next to the field: a shape a field cannot read, or a number that does
+/// not fit the field's type.
+fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Result<Decoded, String> {
     if encoded.is_null() {
-        return (is_handle_tag(tag) || tag == "entity").then_some(Decoded::Cleared);
+        return if is_handle_tag(tag) || tag == "entity" {
+            Ok(Decoded::Cleared)
+        } else {
+            Err("does not read".to_owned())
+        };
     }
     if is_handle_tag(tag) {
-        let saved: SavedAssetReference = serde_json::from_value(encoded.clone()).ok()?;
-        return Some(Decoded::Asset(saved));
+        let saved: SavedAssetReference =
+            serde_json::from_value(encoded.clone()).map_err(|_| "does not read".to_owned())?;
+        return Ok(Decoded::Asset(saved));
     }
     if tag == "entity" {
-        return Some(Decoded::Entity(EntityId::parse(encoded.as_str()?)?));
+        return encoded
+            .as_str()
+            .and_then(EntityId::parse)
+            .map(Decoded::Entity)
+            .ok_or_else(|| "does not read".to_owned());
     }
     if let Some(element_tag) = tag.strip_prefix("array:") {
         // The element tag is a prefix of the field's own `'static` tag, so the
         // same decoder applies; a handle or `entity` element is not reached,
         // because the field layer reads such an array as opaque bytes.
-        let elements = encoded.as_array()?;
+        let elements = encoded
+            .as_array()
+            .ok_or_else(|| "does not read".to_owned())?;
         let mut values = Vec::with_capacity(elements.len());
         for element in elements {
             match decoded_field(element_tag, element)? {
                 Decoded::Value(value) => values.push(value),
-                _ => return None,
+                _ => return Err("does not read".to_owned()),
             }
         }
-        return Some(Decoded::Value(FieldValue::Array(values)));
+        return Ok(Decoded::Value(FieldValue::Array(values)));
     }
     let value = match tag {
-        "f32" => FieldValue::F32(encoded.as_f64()? as f32),
-        "f64" => FieldValue::F64(encoded.as_f64()?),
-        "i8" => FieldValue::I8(encoded.as_i64()? as i8),
-        "i16" => FieldValue::I16(encoded.as_i64()? as i16),
-        "i32" => FieldValue::I32(encoded.as_i64()? as i32),
-        "i64" => FieldValue::I64(encoded.as_i64()?),
-        "u8" => FieldValue::U8(encoded.as_u64()? as u8),
-        "u16" => FieldValue::U16(encoded.as_u64()? as u16),
-        "u32" => FieldValue::U32(encoded.as_u64()? as u32),
-        "u64" => FieldValue::U64(encoded.as_u64()?),
-        "usize" => FieldValue::Usize(encoded.as_u64()? as usize),
-        "isize" => FieldValue::Isize(encoded.as_i64()? as isize),
-        "bool" => FieldValue::Bool(encoded.as_bool()?),
-        "string" => FieldValue::Text(encoded.as_str()?.to_owned()),
-        _ => return Some(Decoded::Value(opaque_field(tag, encoded)?)),
+        "f32" => FieldValue::F32(narrowed_f32(tag, encoded)?),
+        "f64" => FieldValue::F64(encoded.as_f64().ok_or_else(|| "does not read".to_owned())?),
+        "i8" => FieldValue::I8(narrowed_signed(tag, encoded)?),
+        "i16" => FieldValue::I16(narrowed_signed(tag, encoded)?),
+        "i32" => FieldValue::I32(narrowed_signed(tag, encoded)?),
+        "i64" => FieldValue::I64(encoded.as_i64().ok_or_else(|| "does not read".to_owned())?),
+        "u8" => FieldValue::U8(narrowed_unsigned(tag, encoded)?),
+        "u16" => FieldValue::U16(narrowed_unsigned(tag, encoded)?),
+        "u32" => FieldValue::U32(narrowed_unsigned(tag, encoded)?),
+        "u64" => FieldValue::U64(encoded.as_u64().ok_or_else(|| "does not read".to_owned())?),
+        "usize" => FieldValue::Usize(narrowed_unsigned(tag, encoded)?),
+        "isize" => FieldValue::Isize(narrowed_signed(tag, encoded)?),
+        "bool" => FieldValue::Bool(
+            encoded
+                .as_bool()
+                .ok_or_else(|| "does not read".to_owned())?,
+        ),
+        "string" => FieldValue::Text(
+            encoded
+                .as_str()
+                .ok_or_else(|| "does not read".to_owned())?
+                .to_owned(),
+        ),
+        _ => {
+            return Ok(Decoded::Value(
+                opaque_field(tag, encoded).ok_or_else(|| "does not read".to_owned())?,
+            ))
+        }
     };
-    Some(Decoded::Value(value))
+    Ok(Decoded::Value(value))
+}
+
+/// A whole number narrowed to a signed field's own type.
+///
+/// The arm used to cast (`as i8`), which wraps: a document saying 300 for an
+/// `i8` field loaded as 44, and the world held a number the document never
+/// said. A value that does not fit is refused instead, and the report names it.
+fn narrowed_signed<T: TryFrom<i64>>(
+    tag: &'static str,
+    encoded: &serde_json::Value,
+) -> Result<T, String> {
+    let number = encoded.as_i64().ok_or_else(|| "does not read".to_owned())?;
+    T::try_from(number).map_err(|_| format!("{encoded} does not fit a `{tag}`"))
+}
+
+/// A whole number narrowed to an unsigned field's own type, refusing a
+/// negative one and one that does not fit.
+fn narrowed_unsigned<T: TryFrom<u64>>(
+    tag: &'static str,
+    encoded: &serde_json::Value,
+) -> Result<T, String> {
+    let number = encoded
+        .as_u64()
+        .ok_or_else(|| format!("{encoded} does not fit a `{tag}`"))?;
+    T::try_from(number).map_err(|_| format!("{encoded} does not fit a `{tag}`"))
+}
+
+/// A number narrowed to an `f32`, refusing the one cast that changes its kind:
+/// a finite value whose magnitude exceeds `f32::MAX` became `inf`. Rounding
+/// within range is what the type is for, so it is not a refusal.
+fn narrowed_f32(tag: &'static str, encoded: &serde_json::Value) -> Result<f32, String> {
+    let number = encoded.as_f64().ok_or_else(|| "does not read".to_owned())?;
+    let narrowed = number as f32;
+    if number.is_finite() && !narrowed.is_finite() {
+        return Err(format!("{encoded} does not fit a `{tag}`"));
+    }
+    Ok(narrowed)
 }
 
 /// The raw bytes an opaque field was written from, tagged with the layout's own
@@ -818,10 +902,11 @@ mod tests {
                 .get_resource_mut::<AssetManager>()
                 .unwrap();
             let imported = assets
-                .import_standalone::<Scene>(&path)
+                .import_standalone::<Scene>(path)
                 .expect("the scene file loads");
             assert_eq!(
-                imported.guid, reference_guid,
+                imported.guid,
+                Some(reference_guid),
                 "the file keeps the guid it was saved with"
             );
             assets
@@ -944,6 +1029,63 @@ mod tests {
         }
     }
 
+    /// A component the world knows but has no field layout for is not written,
+    /// and the report says so instead of dropping it.
+    ///
+    /// The field layer is what writes a scene, so a component without a layout
+    /// has no fields to write. It used to leave the save without a word: the
+    /// document held one component fewer than the world did, `SceneSave` said
+    /// nothing, and gameplay state disappeared from the file silently.
+    #[test]
+    fn a_component_without_a_layout_is_reported_as_not_written() {
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        struct Plain {
+            value: u32,
+        }
+        impl Component for Plain {}
+
+        let mut scratch = Scratch::new("no-layout");
+        let world = scratch.engine.world_mut();
+        world.register_component::<Plain>();
+        let entity = world
+            .create_entity()
+            .with(Actor {
+                speed: 1.0,
+                note: Handle::default(),
+                target: Entity::NULL,
+            })
+            .with(Plain { value: 7 })
+            .build()
+            .expect("entity builds");
+        assert_eq!(
+            world.entity_component_names(entity).unwrap().len(),
+            2,
+            "the entity carries both components"
+        );
+        let id = world.entity_id(entity).expect("the entity has a stable id");
+        let registry = scratch.registry();
+        let (document, report) = {
+            let world = scratch.engine.world();
+            let assets = world.get_resource::<AssetManager>().unwrap();
+            save_scene(world, assets, &registry, None)
+        };
+
+        // The document holds the component the field layer can write, and only
+        // that one.
+        let written = &document.entities[0].components;
+        assert_eq!(report.components, 1, "one of the two is written");
+        assert!(written.contains_key(&actor_component()), "{written:?}");
+
+        // The other one is reported, by entity and name, with the reason.
+        let plain = ComponentRegistry::registered_name::<Plain>();
+        assert_eq!(
+            report.skipped_components,
+            vec![format!("{id}: {plain} has no field layout")],
+            "the component the save left out is named"
+        );
+    }
+
     /// AC2: a component the world does not know is reported, and the rest of
     /// the entity still loads.
     #[test]
@@ -975,5 +1117,88 @@ mod tests {
         assert_eq!(actor.speed, 1.25);
         assert_eq!(actor.target, Entity::NULL, "an absent reference is unset");
         assert_eq!(actor.note, Handle::default(), "and so is an absent handle");
+    }
+
+    /// A document value that does not fit its field's type is refused and
+    /// reported, instead of being narrowed into a different number.
+    ///
+    /// The integer arms used to cast (`as u8`), so `"amount": 300` wrapped to
+    /// 44 and the world held a number the document never said; the same cast
+    /// turned `1e40` into `inf` for an `f32`.
+    #[test]
+    fn a_value_that_does_not_fit_its_field_is_reported() {
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy, Default)]
+        struct Damage {
+            amount: u8,
+            scale: f32,
+        }
+        impl Component for Damage {}
+
+        static DAMAGE_FIELDS: &[ComponentFieldDescriptor] = &[
+            ComponentFieldDescriptor {
+                name: "amount",
+                type_tag: "u8",
+                offset: 0,
+                size: 1,
+                align: 1,
+                element_count: 0,
+                decorators: Cow::Borrowed(&[]),
+            },
+            ComponentFieldDescriptor {
+                name: "scale",
+                type_tag: "f32",
+                offset: 4,
+                size: 4,
+                align: 4,
+                element_count: 0,
+                decorators: Cow::Borrowed(&[]),
+            },
+        ];
+
+        let mut scratch = Scratch::new("narrow");
+        scratch
+            .engine
+            .world_mut()
+            .register_component_with_layout::<Damage>(DAMAGE_FIELDS);
+        let id = EntityId::from_name("hero");
+        let name = ComponentRegistry::registered_name::<Damage>();
+        let mut fields = BTreeMap::new();
+        fields.insert("amount".to_string(), serde_json::json!(300));
+        fields.insert("scale".to_string(), serde_json::json!(1.0e40));
+        let document = SceneDocument {
+            entities: vec![SceneEntity {
+                id,
+                components: BTreeMap::from([(name.clone(), fields)]),
+            }],
+        };
+
+        let report = load_scene(&mut scratch.engine, &AssetDatabase::new(), &document);
+        assert_eq!(report.components, 1, "the component still attaches");
+        assert_eq!(
+            report.skipped_fields.len(),
+            2,
+            "both out-of-range values are reported: {:?}",
+            report.skipped_fields
+        );
+        for (field, said) in [("amount", "300"), ("scale", "1e+40")] {
+            let entry = report
+                .skipped_fields
+                .iter()
+                .find(|skipped| skipped.contains(&format!("{name}.{field} ")))
+                .unwrap_or_else(|| panic!("{field} is reported: {:?}", report.skipped_fields));
+            assert!(
+                entry.contains(said) && entry.contains("does not fit"),
+                "{field} is reported with the value and the reason: {entry}"
+            );
+        }
+
+        // Refused, not narrowed: the component keeps the zero its image was
+        // built with, so nothing invents a number the document never said.
+        let world = scratch.engine.world_mut();
+        let hero = world.entity_by_id(id).expect("the entity exists");
+        let damage = world.get_component::<Damage>(hero).expect("it attached");
+        assert_eq!(damage.amount, 0, "300 did not wrap to 44");
+        assert_eq!(damage.scale, 0.0, "1e40 did not become inf");
     }
 }

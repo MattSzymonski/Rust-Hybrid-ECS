@@ -726,7 +726,8 @@ pub enum CommandError {
 /// Error type for `add_component` operations.
 ///
 /// Returned by the typed component insertion paths when the target entity
-/// is missing or already carries the component being added.
+/// is missing, already carries the component being added, or the type was
+/// never registered with the world.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AddComponentError {
@@ -737,6 +738,18 @@ pub enum AddComponentError {
     /// The entity already has a component of this type.
     #[message("component already exists on entity")]
     ComponentAlreadyExists,
+
+    /// The component type was never registered with this world.
+    ///
+    /// Registration is what gives a component its archetype bit, so an
+    /// unregistered type would resolve its destination archetype back to the
+    /// entity's current one - storing nothing while reporting success.
+    #[message(
+        "component ",
+        debug_value(id),
+        " not registered — call world.register_component::<T>() first"
+    )]
+    ComponentNotRegistered { id: ComponentId },
 }
 
 /// Error type for `remove_component` operations.

@@ -1096,6 +1096,10 @@ impl HotPatchSession {
         // Install at the frame boundary. Both routes refuse a signature that no
         // longer matches, so a reshaped function can never be applied behind a
         // call site compiled for the old shape.
+        //
+        // What the function is running now, for the fan-out below to return its
+        // copies to if one of them refuses the replacement.
+        let previous = self.previous_install(qualified);
         match kind {
             // A system is dispatched through the engine's own registry, which
             // lives once in this process because the engine is one shared
@@ -1154,6 +1158,7 @@ impl HotPatchSession {
                     slot_name,
                     found,
                     &found_signature,
+                    previous,
                 )
                 .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;

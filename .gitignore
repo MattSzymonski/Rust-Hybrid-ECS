@@ -68,7 +68,9 @@ modules/projects_generated/*
 # `shipping`, and including `cargo run -p editor`. `optional = true`
 # means "do not compile it", not "do not look for it".
 #
-# The committed stub is deliberately project-agnostic. A shipping build
+# The committed stub is deliberately project-agnostic and refuses to compile
+# (W-0082): a stub that is a real generation is a bundle the shipping posture
+# would type-check and ship instead of the project's own. A shipping build
 # overwrites both files through the generator's content-based writes, so a
 # stable tree shows no diff; run `git checkout -- build/pill_shipping_bundle`
 # to return to the neutral stub afterwards.

@@ -358,8 +358,13 @@ where
     /// Guidelines:
     /// - Light work (simple math): larger batches (1000-10000)
     /// - Heavy work (complex calculations): smaller batches (10-100)
+    ///
+    /// The batch size is the divisor the executors split work slices with, so
+    /// a zero becomes one entity per slice rather than a division by zero: a
+    /// batch size computed from a frame's entity count can legitimately come
+    /// out as zero, and that must not end the process mid-frame (W-0092).
     pub fn with_batch_size(mut self, size: usize) -> Self {
-        self.min_batch_size = Some(size);
+        self.min_batch_size = Some(size.max(1));
         self
     }
 

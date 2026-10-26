@@ -241,6 +241,10 @@ impl ScriptableRenderingPipeline {
             self.offscreen_key = Some(offscreen_key);
         }
 
+        // The slots the loop below builds replace the old ones, so what was
+        // said about the old ones goes with them.
+        self.forget_passes();
+
         // A pass builds its own pipeline from the shader's sources, and the
         // chain names that shader by key while the manager looks assets up by
         // handle. One walk of the shader column builds the way from one to the
@@ -383,9 +387,21 @@ impl ScriptableRenderingPipeline {
     /// calls this - moves neither. [`invalidate_targets`](Self::invalidate_targets)
     /// is the version for a surface size that did move.
     pub(crate) fn invalidate(&mut self) {
+        self.forget_passes();
+    }
+
+    /// Drop the built passes, the keys they were built from, and what was said
+    /// about them.
+    ///
+    /// The skip set dedupes the log per build - a pass that stays broken is
+    /// named once, not once per frame - so it may only live as long as the
+    /// slots it describes. Every path that replaces the slots goes through
+    /// here, or a pass that breaks, is fixed and breaks again stays silent.
+    fn forget_passes(&mut self) {
         self.passes.clear();
         self.signature = None;
         self.inputs = None;
+        self.skipped_passes.clear();
     }
 
     /// Forget the offscreen layout as well, targets included.
@@ -435,6 +451,52 @@ impl ScriptableRenderingPipeline {
     }
 }
 
+/// Why a pass cannot write a target scaled down from the surface, or `None`
+/// when it can.
+///
+/// A render pass's attachments must all be one size. The depth buffer is the
+/// surface's, and a geometry pass writes it while a skybox reads it, so neither
+/// can pair it with a smaller colour target. A fullscreen pass that tests no
+/// depth writes only its own target, so a scale there is the pass's own
+/// business.
+fn scaled_target_refusal(pass: &ResolvedPass) -> Option<String> {
+    if pass.target_scale.max(1) == 1 {
+        return None;
+    }
+    let depth = match pass.kind {
+        PassKind::Geometry => "writes",
+        PassKind::Skybox => "reads",
+        PassKind::Fullscreen => return None,
+    };
+    Some(format!(
+        "it {depth} the full-size depth buffer, so it cannot write a target scaled by {}",
+        pass.target_scale
+    ))
+}
+
+/// Why a pass with no shader of its own cannot draw into `pass`'s targets, or
+/// `None` when it can.
+///
+/// A geometry pass without a shader draws through each material's pipeline, and
+/// those pipelines are built for the surface's formats. A target that is not
+/// the surface would be recorded against the wrong format, so the pass is
+/// refused at plan time instead of refusing every draw.
+fn shaderless_target_refusal(pass: &ResolvedPass) -> Option<String> {
+    if pass.kind != PassKind::Geometry || pass.shader.is_some() {
+        return None;
+    }
+    // The first target that is not the surface, if any: that one has no
+    // material pipeline behind it.
+    std::iter::once(&pass.target)
+        .chain(pass.extra_targets.iter())
+        .find_map(|target| match target {
+            PassTarget::Surface => None,
+            PassTarget::Offscreen(name) => Some(format!(
+                "it names no shader, so it draws through the material pipelines built for the surface, and target '{name}' is not the surface"
+            )),
+        })
+}
+
 /// One pass's GPU object, or the reason there is none.
 ///
 /// `defined_targets` is what earlier passes of the chain declared so far; the
@@ -445,6 +507,17 @@ fn build_pass(
     defined_targets: &HashSet<String>,
     chain: &ChainContext<'_>,
 ) -> PassSlot {
+    // The depth buffer is the surface's size, so a pass that uses it cannot
+    // write a smaller target. Checked before the shader lookup: a geometry pass
+    // with no shader of its own attaches the same buffer.
+    if let Some(reason) = scaled_target_refusal(pass) {
+        return PassSlot::Unsupported(reason);
+    }
+    // A geometry pass with no shader of its own draws through each material's
+    // pipeline, and those are built for the surface's formats.
+    if let Some(reason) = shaderless_target_refusal(pass) {
+        return PassSlot::Unsupported(reason);
+    }
     // A geometry pass with no shader of its own draws through each material's
     // pipeline, and that is the only path that needs no object.
     let Some(shader_key) = pass.shader else {
@@ -463,14 +536,6 @@ fn build_pass(
     let Some(shader) = shaders_by_key.get(&shader_key).copied() else {
         return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
     };
-    // The depth buffer it tests against is the surface's size, and a render
-    // pass's attachments must all be one size.
-    if pass.kind == PassKind::Skybox && pass.target_scale.max(1) != 1 {
-        return PassSlot::Unsupported(
-            "a skybox tests against the full-size depth buffer, so it cannot write a scaled target"
-                .to_owned(),
-        );
-    }
     let Some(renderer_shader) = chain
         .shader_handles
         .get(&shader_key)
@@ -760,10 +825,95 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_that_uses_the_shared_depth_buffer_refuses_a_scaled_target() {
+        let scaled = |kind| {
+            let mut pass = pass(kind, PassTarget::Offscreen("half".to_owned()));
+            pass.target_scale = 2;
+            pass
+        };
+
+        assert!(
+            scaled_target_refusal(&scaled(PassKind::Geometry)).is_some(),
+            "a geometry pass writes the surface-sized depth buffer"
+        );
+        assert!(
+            scaled_target_refusal(&scaled(PassKind::Skybox)).is_some(),
+            "a skybox reads the surface-sized depth buffer"
+        );
+        assert!(
+            scaled_target_refusal(&scaled(PassKind::Fullscreen)).is_none(),
+            "a post-processing pass reads no depth, so a scaled target is its own business"
+        );
+        assert!(
+            scaled_target_refusal(&pass(PassKind::Geometry, PassTarget::Surface)).is_none(),
+            "a full-size target matches the depth buffer"
+        );
+    }
+
+    #[test]
     fn an_empty_queue_draws_no_range() {
         assert!(whole_queue(&[]).is_empty());
         let ranges = whole_queue(&[item_of_shader(0)]);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0], 0..1);
+    }
+
+    #[test]
+    fn a_shaderless_geometry_pass_that_writes_offscreen_is_refused() {
+        let offscreen = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
+        let reason = shaderless_target_refusal(&offscreen).expect(
+            "a material pipeline is built for the surface, so an offscreen target has none",
+        );
+        assert!(
+            reason.contains("hdr"),
+            "the reason names the target that has no pipeline: {reason}"
+        );
+
+        let mut extra = pass(PassKind::Geometry, PassTarget::Surface);
+        extra
+            .extra_targets
+            .push(PassTarget::Offscreen("normals".to_owned()));
+        assert!(
+            shaderless_target_refusal(&extra).is_some(),
+            "a second target is offscreen even when the first is the surface"
+        );
+    }
+
+    /// A pass that breaks, is fixed and breaks again has to be named twice: the
+    /// dedupe exists so a still-broken pass is not named every frame, not so a
+    /// new breakage is silent.
+    #[test]
+    fn a_pass_that_breaks_again_after_a_rebuild_is_named_again() {
+        let mut pipeline = ScriptableRenderingPipeline::new();
+        pipeline.report_skip("p", "it has no pipeline");
+        assert!(pipeline.skipped_passes.contains("p"));
+
+        // The rebuild replaces the passes the report described, so the report
+        // goes with them.
+        pipeline.invalidate();
+        assert!(
+            pipeline.skipped_passes.is_empty(),
+            "the report outlived the pass it was about"
+        );
+        pipeline.report_skip("p", "it has no pipeline");
+        assert!(
+            pipeline.skipped_passes.contains("p"),
+            "the second breakage is named"
+        );
+    }
+
+    #[test]
+    fn a_shaderless_geometry_pass_that_writes_only_the_surface_is_allowed() {
+        assert!(
+            shaderless_target_refusal(&pass(PassKind::Geometry, PassTarget::Surface)).is_none(),
+            "the material pipelines are built for the surface format"
+        );
+
+        let mut shaded = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
+        shaded.shader = Some(0);
+        assert!(
+            shaderless_target_refusal(&shaded).is_none(),
+            "a pass with a shader of its own gets a pipeline for its targets"
+        );
     }
 }

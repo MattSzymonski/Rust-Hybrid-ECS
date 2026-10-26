@@ -92,6 +92,30 @@ pub struct PreviewImage {
     pub rgba: Vec<u8>,
 }
 
+impl PreviewImage {
+    /// The answer to a request that was taken but could not be drawn: the id,
+    /// and no pixels.
+    ///
+    /// Every taken request is answered. A caller waiting for an answer that
+    /// never comes - an undecodable file, a frame that drew nothing, a
+    /// renderer that was still busy - waits forever, and an editor that asks
+    /// one question at a time stops asking. A refusal says "no preview for
+    /// this", so the caller clears its bookkeeping and moves on.
+    pub fn refused(id: u64) -> Self {
+        Self {
+            id,
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+        }
+    }
+
+    /// Whether this answer carries no pixels because the request was refused.
+    pub fn is_empty(&self) -> bool {
+        self.rgba.is_empty()
+    }
+}
+
 /// The previews the renderer finished.
 #[derive(Default)]
 pub struct PreviewResults {
@@ -119,5 +143,27 @@ pub fn ensure_preview_resources(world: &mut World) {
     }
     if !world.has_resource::<PreviewResults>() {
         world.insert_resource(PreviewResults::default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused answer names its request and carries no pixels, so a caller's
+    /// in-flight guard clears instead of waiting for a preview that will never
+    /// come.
+    #[test]
+    fn a_refused_preview_names_its_request_and_carries_no_pixels() {
+        let refused = PreviewImage::refused(7);
+        assert_eq!(refused.id, 7);
+        assert!(refused.is_empty());
+        assert!(!PreviewImage {
+            id: 8,
+            width: 1,
+            height: 1,
+            rgba: vec![0, 0, 0, 255],
+        }
+        .is_empty());
     }
 }

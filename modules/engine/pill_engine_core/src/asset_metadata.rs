@@ -289,8 +289,11 @@ pub enum MetadataSource {
 pub struct ImportOutcome<T: Asset> {
     /// The asset's handle.
     pub handle: Handle<T>,
-    /// The asset's guid.
-    pub guid: AssetGuid,
+    /// The asset's guid, or `None` when it has none: a path that is already
+    /// loaded and was registered under a name alone - [`AssetManager::add_named`]
+    /// rather than [`AssetManager::add_named_with_guid`] - with no metadata
+    /// file to draw one from. Every other import reads a guid or draws one.
+    pub guid: Option<AssetGuid>,
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
     /// `true` when the path was already loaded and its existing handle was
@@ -316,8 +319,10 @@ impl<T: Asset> std::fmt::Debug for ImportOutcome<T> {
 pub struct ReimportOutcome<T: Asset> {
     /// The asset's handle: the one it already had when it was loaded.
     pub handle: Handle<T>,
-    /// The asset's guid.
-    pub guid: AssetGuid,
+    /// The asset's guid, or `None` under the same conditions as
+    /// [`ImportOutcome::guid`]: a path imported afresh always has one, a path
+    /// already loaded without one still has none.
+    pub guid: Option<AssetGuid>,
     /// Where the settings came from: [`MetadataSource::ReadFromFile`], or
     /// [`MetadataSource::InMemoryOnly`] when the source has no metadata file
     /// and the type's default settings were used.
@@ -507,6 +512,18 @@ fn render_metadata<T: ImportedAsset>(
     Ok(bytes)
 }
 
+/// `settings` as the JSON a metadata file carries, for recording what decoded a
+/// loaded asset; see [`AssetManager::ensure_metadata`].
+fn settings_json<T: ImportedAsset>(
+    path: &Path,
+    settings: &T::ImportSettings,
+) -> AssetLoadResult<serde_json::Value> {
+    serde_json::to_value(settings).map_err(|error| AssetLoadError::Metadata {
+        path: path.to_owned(),
+        detail: format!("the settings cannot be recorded: {error}"),
+    })
+}
+
 // =============================================================================
 // AssetManager::import
 // =============================================================================
@@ -563,19 +580,26 @@ impl AssetManager {
 
         // Step 3: a path that is already loaded is either this same asset or a
         // conflict. Without a metadata file there is no guid to disagree with,
-        // so the loaded asset's own guid stands.
+        // so the loaded asset's own guid stands - and when it has none either,
+        // there is nothing to report but the handle.
         if let Some(handle) = self.handle_by_name::<T>(&asset_name) {
             let loaded = self.guid_of(handle);
             return match (&stored, loaded) {
                 (Some(stored), Some(loaded)) if stored.guid == loaded => Ok(ImportOutcome {
                     handle,
-                    guid: loaded,
+                    guid: Some(loaded),
                     metadata: MetadataSource::ReadFromFile,
                     already_loaded: true,
                 }),
                 (None, Some(loaded)) => Ok(ImportOutcome {
                     handle,
-                    guid: loaded,
+                    guid: Some(loaded),
+                    metadata: MetadataSource::InMemoryOnly,
+                    already_loaded: true,
+                }),
+                (None, None) => Ok(ImportOutcome {
+                    handle,
+                    guid: None,
                     metadata: MetadataSource::InMemoryOnly,
                     already_loaded: true,
                 }),
@@ -583,13 +607,6 @@ impl AssetManager {
                     path: asset_name,
                     loaded,
                     metadata: stored.guid,
-                }),
-                (None, None) => Err(AssetImportError::PathBoundToOtherGuid {
-                    path: asset_name,
-                    loaded: None,
-                    // There is no metadata guid either; report the conflict
-                    // against the nil guid rather than inventing one.
-                    metadata: AssetGuid::new(0),
                 }),
             };
         }
@@ -670,9 +687,15 @@ impl AssetManager {
         let handle = self
             .add_named_with_guid(asset_name, guid, asset)
             .expect("the path was checked to be unloaded before decoding");
+        // Step 8: the settings are this run's own rather than a file's, so
+        // remember them - a later `ensure_metadata` writes what actually
+        // decoded the asset instead of the type's defaults.
+        if metadata == MetadataSource::InMemoryOnly {
+            self.set_import_settings(handle, settings_json::<T>(&metadata_path, &settings)?);
+        }
         Ok(ImportOutcome {
             handle,
-            guid,
+            guid: Some(guid),
             metadata,
             already_loaded: false,
         })
@@ -755,9 +778,15 @@ impl AssetManager {
         *self
             .get_mut(handle)
             .expect("the handle was looked up by name just above") = asset;
+        // Without a metadata file the type's defaults decoded it, so that is
+        // what a sidecar created now has to say; an earlier record would name
+        // settings the loaded value no longer has.
+        if metadata == MetadataSource::InMemoryOnly {
+            self.set_import_settings(handle, settings_json::<T>(&metadata_path, &settings)?);
+        }
         Ok(ReimportOutcome {
             handle,
-            guid: loaded.unwrap_or(AssetGuid::new(0)),
+            guid: loaded,
             metadata,
             replaced: true,
         })
@@ -800,21 +829,40 @@ impl AssetManager {
             Err(AssetLoadError::PathNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
-        let loaded = self
-            .handle_by_name::<T>(&asset_name)
-            .and_then(|handle| self.guid_of(handle));
-        let guid = match loaded {
+        let loaded = self.handle_by_name::<T>(&asset_name);
+        let guid = match loaded.and_then(|handle| self.guid_of(handle)) {
             Some(guid) => guid,
             None => AssetGuid::random().map_err(|error| AssetLoadError::Metadata {
                 path: metadata_path.clone(),
                 detail: format!("no random source for a new guid: {error}"),
             })?,
         };
-        let document = render_metadata::<T>(&metadata_path, guid, &T::ImportSettings::default())?;
+        // An asset this run already decoded knows the settings it was decoded
+        // with; a source nothing has loaded gets the type's defaults. Writing
+        // defaults over a loaded asset's own settings would change how the
+        // asset decodes on the next run - a normal map read as sRGB.
+        let recorded = loaded.and_then(|handle| self.import_settings::<T>(handle));
+        let settings = match recorded {
+            Some(settings) => serde_json::from_value(settings.clone()).map_err(|error| {
+                AssetLoadError::Metadata {
+                    path: metadata_path.clone(),
+                    detail: format!("the recorded settings do not fit this type: {error}"),
+                }
+            })?,
+            None => T::ImportSettings::default(),
+        };
+        let document = render_metadata::<T>(&metadata_path, guid, &settings)?;
         match asset_store::write_beside(Path::new(&asset_name), &metadata_path, &document)? {
             // Another writer may have created the file meanwhile; its guid is
             // the file's truth, and it was not written here.
             Some(written) => {
+                pill_core::debug!(
+                    "metadata for `{asset_name}` written with {}",
+                    match recorded {
+                        Some(_) => "the settings the asset was loaded with",
+                        None => "the type's defaults",
+                    }
+                );
                 let bytes = std::fs::read(&written).map_err(|source| AssetLoadError::Read {
                     path: written.clone(),
                     source,
@@ -1175,7 +1223,7 @@ mod tests {
             .expect("the metadata file was written");
         let stored =
             parse_metadata::<Note>(Path::new("notes/a.note.meta"), written.as_bytes()).unwrap();
-        assert_eq!(stored.guid, outcome.guid);
+        assert_eq!(Some(stored.guid), outcome.guid);
         assert_eq!(stored.settings, settings(1, "initial"));
     }
 
@@ -1194,7 +1242,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.metadata, MetadataSource::ReadFromFile);
-        assert_eq!(outcome.guid, AssetGuid::parse(GUID_A).unwrap());
+        assert_eq!(outcome.guid, Some(AssetGuid::parse(GUID_A).unwrap()));
         assert_eq!(
             assets.get(outcome.handle).unwrap().settings,
             settings(3, "file")
@@ -1316,7 +1364,7 @@ mod tests {
             .import(request(key, MetadataPolicy::ReadIfPresent))
             .unwrap();
 
-        assert_eq!(outcome.guid, AssetGuid::parse(GUID_A).unwrap());
+        assert_eq!(outcome.guid, Some(AssetGuid::parse(GUID_A).unwrap()));
         assert_eq!(
             assets.get(outcome.handle).unwrap().settings,
             settings(2, "packed")
@@ -1385,6 +1433,38 @@ mod tests {
 
         assert!(second.already_loaded);
         assert_eq!((second.handle, second.guid), (first.handle, first.guid));
+    }
+
+    /// An asset a project registered by name alone carries no guid, so
+    /// re-importing its path has nothing to disagree with: the import is the
+    /// same asset, not a guid conflict.
+    #[test]
+    fn importing_a_named_asset_that_has_no_guid_is_not_a_conflict() {
+        let res = ScratchRes::new("reimport-named-no-guid");
+        res.write("a.note", "hello");
+        let mut assets = AssetManager::new();
+        let handle = assets
+            .add_named(
+                "a.note",
+                Note {
+                    name: "a.note".to_owned(),
+                    text: "hello".to_owned(),
+                    settings: settings(1, "initial"),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            assets.guid_of(handle),
+            None,
+            "the fixture must carry no guid"
+        );
+
+        let outcome = assets
+            .import(request("a.note", MetadataPolicy::ReadIfPresent))
+            .expect("a path registered without a guid re-imports as itself");
+
+        assert!(outcome.already_loaded);
+        assert_eq!(outcome.handle, handle);
     }
 
     #[test]
@@ -1491,7 +1571,7 @@ mod tests {
                         .import(request("a.note", MetadataPolicy::CreateIfMissing))
                         .unwrap();
                     assert!(again.already_loaded);
-                    outcome.guid
+                    outcome.guid.expect("an imported source has a guid")
                 })
             })
             .collect::<Vec<_>>()
@@ -1522,7 +1602,6 @@ mod tests {
         ));
     }
 
-    /// A version 1 asset pack of `files`, as `pill_assets` writes one.
     // -------------------------------------------------------------------------
     // Reimport
     // -------------------------------------------------------------------------
@@ -1595,7 +1674,7 @@ mod tests {
             error,
             AssetImportError::PathBoundToOtherGuid { .. }
         ));
-        assert_eq!(assets.guid_of(first.handle), Some(first.guid));
+        assert_eq!(assets.guid_of(first.handle), first.guid);
     }
 
     /// Reimporting a path that is not loaded imports it, and says so.
@@ -1660,9 +1739,40 @@ mod tests {
         std::fs::remove_file(res.root.join("a.note.meta")).unwrap();
 
         let written = assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap();
-
-        assert_eq!(written, Some(loaded.guid));
+        assert_eq!(written, loaded.guid);
         assert!(assets.reimport::<Note>(Path::new("a.note")).is_ok());
+    }
+
+    /// The settings a loaded asset was decoded with, not the type's defaults,
+    /// are what its missing metadata file is created with: the file must not
+    /// change how the asset decodes on the next run.
+    #[test]
+    fn ensure_metadata_writes_the_settings_the_asset_was_loaded_with() {
+        let res = ScratchRes::new("ensure-loaded-settings");
+        res.write("a.note", "hello");
+        let mut assets = AssetManager::new();
+        let loaded = assets
+            .import(request("a.note", MetadataPolicy::ReadIfPresent))
+            .unwrap();
+        assert_eq!(loaded.metadata, MetadataSource::InMemoryOnly);
+
+        let written = assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap();
+        assert_eq!(written, loaded.guid);
+        let file = res.read("a.note.meta").expect("the sidecar was written");
+        assert!(
+            file.contains("\"volume\": 1") && file.contains("\"initial\""),
+            "the settings the asset was loaded with: {file}"
+        );
+        let mut next = AssetManager::new();
+        let again = next
+            .import(request("a.note", MetadataPolicy::ReadIfPresent))
+            .unwrap();
+        assert_eq!(again.metadata, MetadataSource::ReadFromFile);
+        assert_eq!(
+            next.get(again.handle).map(|note| note.settings.clone()),
+            Some(settings(1, "initial")),
+            "the next run decodes what this one did"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1698,7 +1808,7 @@ mod tests {
             Some(first.handle)
         );
         assert_eq!(
-            assets.handle_by_guid::<Note>(first.guid),
+            assets.handle_by_guid::<Note>(first.guid.expect("an imported source has a guid")),
             Some(first.handle)
         );
         assert_eq!(decodes(), decodes_before, "a move decodes nothing");

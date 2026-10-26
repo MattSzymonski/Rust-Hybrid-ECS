@@ -37,6 +37,13 @@ DESCRIPTION
                         `dylib` (one copy per process) and links no UI framework,
                         window system or GPU crate (`dioxus`, `tao`, `wry`,
                         `winit`, `wgpu`), followed through every path dependency.
+      5. shared core  - the shared `pill_core` dylib names no development-host
+                        crate (`notify`, `libloading`, `walkdir`, `filetime`):
+                        none is in its library graph, and no source line under
+                        `pill_core/src` names one outside a comment. Every
+                        posture links the core, so a crate only the development
+                        host and the C# bridge reach must not sit inside it
+                        (W-0114).
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -87,6 +94,15 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     ("pill_editor_core", "editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
+
+# The shared core every posture links, by crate name and directory under
+# `modules/`, and the development-host crates it must never name (rule 5). The
+# dev host owns the module loader and the file watcher and the C# bridge owns
+# its own host loading; the core names their errors as a boxed
+# `std::error::Error` instead (W-0114). A crate not yet present is skipped.
+SHARED_CORE_CRATE = "pill_core"
+SHARED_CORE_DIRECTORY = "engine/pill_core"
+DEV_ONLY_CRATES = ("notify", "libloading", "walkdir", "filetime")
 
 
 # Walks every path dependency reachable from `start_directory`; returns the
@@ -179,6 +195,29 @@ def shared_dylib_failures(root):
     return found
 
 
+# Every break of rule 5: a development-host crate in the shared core's library
+# graph, or a non-comment source line under `pill_core/src` naming one.
+def shared_core_failures(root):
+    directory = root / "modules" / SHARED_CORE_DIRECTORY
+    if not (directory / "Cargo.toml").is_file():
+        return []
+    found = []
+    for dependency in Crate(directory / "Cargo.toml").linked():
+        if dependency.package in DEV_ONLY_CRATES:
+            found.append(f"{SHARED_CORE_CRATE}/Cargo.toml depends on `{dependency.package}`")
+    for source in sorted((directory / "src").rglob("*.rs")):
+        lines = source.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, 1):
+            stripped = line.lstrip()
+            if stripped.startswith("//"):
+                continue
+            for name in DEV_ONLY_CRATES:
+                if name in stripped:
+                    relative = source.relative_to(directory).as_posix()
+                    found.append(f"{SHARED_CORE_CRATE}/{relative}:{number}: {stripped}")
+    return found
+
+
 # Runs every rule against the repository at `root`; returns the failures.
 def check(root):
     core_directory = root / "modules" / ENGINE_FOLDER / CORE_CRATE
@@ -198,6 +237,10 @@ def check(root):
     failures.extend(
         f"shared UI: {failure} (a UI-independent shared dylib)"
         for failure in shared_dylib_failures(root)
+    )
+    failures.extend(
+        f"shared core: {failure} (a development-host crate in the shared core)"
+        for failure in shared_core_failures(root)
     )
     return failures
 
@@ -254,6 +297,24 @@ def self_test():
             "a comment naming the removed feature passes",
             {"pill_engine_core": []},
             {"pill_engine_core": "// wrappers replaced the module-abi feature\n"},
+            0,
+        ),
+        (
+            "a development-host crate in the shared core fails",
+            {"pill_engine_core": [], "pill_core": ["notify"]},
+            {},
+            1,
+        ),
+        (
+            "a source line naming a development-host crate fails",
+            {"pill_engine_core": [], "pill_core": []},
+            {"pill_core": "use libloading::Library;\n"},
+            1,
+        ),
+        (
+            "a comment naming a development-host crate passes",
+            {"pill_engine_core": [], "pill_core": []},
+            {"pill_core": "// the loader's libloading error arrives boxed\n"},
             0,
         ),
     ]
@@ -327,7 +388,8 @@ def main():
         return 1
     print(
         "  PASS  engine layout: the core does not link the facade, reads no registry, "
-        "module-abi is gone, and the shared UI dylibs are UI-independent dylibs"
+        "module-abi is gone, the shared UI dylibs are UI-independent dylibs, and the "
+        "shared core names no development-host crate"
     )
     return 0
 

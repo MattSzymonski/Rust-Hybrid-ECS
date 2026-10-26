@@ -252,7 +252,6 @@ impl World {
                 "component-type headroom is low; the 128-type ceiling is approaching"
             );
         }
-        let _ = bit;
 
         // Record the registration chronologically so the host can enumerate
         // which types one module's init registered at all (plain or
@@ -286,7 +285,18 @@ impl World {
         // the most recently loaded generation - the same last-writer-wins rule
         // the reload path already relies on, with `rehome_native_columns`
         // re-pointing live columns at it afterwards.
-        let storage_info = if T::shared_name().is_some() {
+        let storage_info = if let Some(shared) = T::shared_name() {
+            // A declared identity is what makes two binaries' registrations one
+            // component, and until now it was only visible in the periodic
+            // report - which needs frames, so a host that draws one frame never
+            // showed it. One line per registration puts the same fact in the
+            // startup and reload logs.
+            info!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                shared,
+                bit,
+                "component registered under a declared shared identity"
+            );
             crate::archetype::NativeColumnInfo::of::<T>(true)
         } else {
             crate::archetype::NativeColumnInfo::of::<T>(false)
@@ -1211,8 +1221,10 @@ impl World {
     /// # Errors
     ///
     /// Returns [`AddComponentError::EntityNotFound`] if the entity does not
-    /// exist, and [`AddComponentError::ComponentAlreadyExists`] if the entity
-    /// already carries the component `T`.
+    /// exist, [`AddComponentError::ComponentAlreadyExists`] if the entity
+    /// already carries the component `T`, and
+    /// [`AddComponentError::ComponentNotRegistered`] if `T` was never
+    /// registered with this world.
     pub fn add_component<T>(
         &mut self,
         entity: Entity,
@@ -1248,13 +1260,22 @@ impl World {
             return Err(AddComponentError::ComponentAlreadyExists);
         }
 
-        // Step 2: Build the destination component set with T appended.
+        // Step 2: Refuse a type this world never registered. The destination
+        // archetype is derived from component bits, and registration is what
+        // allocates one, so an unregistered type would resolve the destination
+        // back to the entity's current archetype - storing nothing while
+        // reporting success. `EntityBuilder::build` asks the same table.
+        if !self.storage_factories.contains_key(&component_id) {
+            return Err(AddComponentError::ComponentNotRegistered { id: component_id });
+        }
+
+        // Step 3: Build the destination component set with T appended.
         let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
         new_component_ids.extend_from_slice(&old_archetype.component_types);
         new_component_ids.push(component_id);
         new_component_ids.sort();
 
-        // Step 3: Migrate the entity. Existing components are carried by the
+        // Step 4: Migrate the entity. Existing components are carried by the
         // move; the only thing left to write is the component being added.
         self.move_entity_to_archetype(entity, new_component_ids, |new_storage| {
             new_storage.column_of_mut::<T>().push::<T>(component);

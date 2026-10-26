@@ -22,9 +22,12 @@ DESCRIPTION
     Two scenarios pin the arrangement:
 
     1. `shared_identity_binds_both_binaries` - with the attribute in place, the
-       engine's own ECS report shows exactly ONE `pill_spline::Spline` column
-       and lists the component under `shared identity`. One column is the whole
-       claim.
+       engine's registry reports a declared shared identity for
+       `pill_spline::Spline` at registration, the host starts without a peer
+       collision, and the ECS report the fixture opts in to shows exactly ONE
+       `pill_spline::Spline` column under `shared identity`. The registration
+       line is the required observation: it needs no frames, so the scenario
+       fails when the declaration is removed or made a no-op.
 
     2. `one_compiled_copy_needs_no_declaration` - the control, reworked for
        the wrapper. It used to prove the two `TypeId`s genuinely differed:
@@ -33,11 +36,12 @@ DESCRIPTION
        idempotent re-registration instead. The wrapper ended that arrangement
        on purpose - the project and the module compile ONE copy of the
        extension, so the collision cannot happen at all. The scenario pins the
-       new contract instead: without the attribute the host still starts, and
-       the module's registration still binds to the column the project
-       registered, because the identity now comes from the build rather than
-       from a declaration. (The peer-collision guard itself stays covered by
-       the engine's unit tests on `WorldError::ComponentNameCollision`.)
+       new contract instead: without the attribute the host still starts, the
+       module's registration still binds to the column the project registered,
+       and NO declared identity is reported for the component - the exact
+       observation scenario 1 requires. (The peer-collision guard itself stays
+       covered by the engine's unit tests on
+       `WorldError::ComponentNameCollision`.)
 
 USAGE
   python tests/test_shared_component_identity.py [--timeout-scale S]
@@ -95,9 +99,15 @@ modules:
   - "pill_spline"
 """
 
-# Emitted by the engine's built-in diagnostics system once per second.
+# Emitted once per interval by the engine's diagnostics system, which a project
+# opts into (nothing is registered by default).
 ECS_REPORT_TOKEN = "ECS state"
 SHARED_IDENTITY_HEADING = "shared identity"
+# Emitted once per registration by `World::register_component_inner` when the
+# type declares a shared identity. This is the frames-free form of the report's
+# `shared identity` section, and the suite's decisive observation: without the
+# declaration the line is not printed at all.
+SHARED_IDENTITY_TOKEN = "declared shared identity"
 
 # Emitted by `World::register_persistable_component` when a second live
 # registration claims one type name; see `WorldError::ComponentNameCollision`.
@@ -250,6 +260,17 @@ TIME_PROBE = """\
     );
 """
 
+# The ECS state report is opt-in: `Engine::new` registers nothing, so a host
+# that wants one asks for it. The first scenario's second confirmation is the
+# report's `shared identity` section, so the fixture opts in before it starts.
+REPORT_OPT_IN = """\
+    // Injected by the shared-identity suite: the engine's periodic ECS report
+    // is opt-in (W-0094), and this scenario reads the column count from it.
+    engine.set_ecs_diagnostics_interval(Some(
+        pill_engine::diagnostics::DEFAULT_REPORT_INTERVAL,
+    ));
+"""
+
 # The rollback scenario claims a resource only the *incoming* generation knows
 # about, then fails its init. The previous image has neither the type nor the
 # insert, so nothing can re-claim the value during the rollback - which is what
@@ -377,6 +398,21 @@ def install_shared_resource_in_module() -> None:
         raise RuntimeError(f"`register` anchor missing from {SPLINE_LIB_RS.name}")
     module = module.replace(register_anchor, register_anchor + RESOURCE_INSERT, 1)
     atomic_write(SPLINE_LIB_RS, module)
+
+
+def install_report_opt_in() -> None:
+    """Turns the engine's ECS report on in the project's `init`.
+
+    The report is opt-in, so the first scenario's column-count confirmation only
+    happens once something asks for it. The project is captured by the backup
+    registry, so the edit comes out again whatever the scenario does.
+    """
+    restore_then_install(PROJECT_LIB_RS)
+    project = read_source(PROJECT_LIB_RS)
+    init_anchor = "pub fn init(engine: &mut Engine) -> u32 {\n"
+    if project.count(init_anchor) != 1:
+        raise RuntimeError(f"`init` anchor missing from {PROJECT_LIB_RS.name}")
+    atomic_write(PROJECT_LIB_RS, project.replace(init_anchor, init_anchor + REPORT_OPT_IN, 1))
 
 
 def install_resource_probe() -> None:
@@ -522,6 +558,18 @@ def columns_named(report: List[str], component_name: str) -> List[int]:
     return bits
 
 
+def declares_shared_identity(output: str, component_name: str) -> bool:
+    """Whether the registry logged a declared identity for this component.
+
+    The registration-time form of the report's `shared identity` section: one
+    line per registration, printed whether or not a frame ever runs.
+    """
+    return any(
+        SHARED_IDENTITY_TOKEN in line and component_name in line
+        for line in output.splitlines()
+    )
+
+
 def lists_under_shared_identity(report: List[str], component_name: str) -> bool:
     """Whether the report's `shared identity` section names this component."""
     within_section = False
@@ -553,14 +601,17 @@ def scenario_shared_identity_binds_both_binaries() -> bool:
     here means the project's registration bound to the module's column rather
     than allocating its own.
 
-    Deliberately not asserted through the per-second ECS report: that needs
-    sustained frames, and a windowed host presents its first frame and then
-    waits for input under this harness, so the report may never arrive. It is
-    still parsed when one does appear, as a direct confirmation of the column
-    count, and its absence is reported rather than passed over in silence.
+    The decisive check is the registry's own report of the identity it derived
+    for the component (`SHARED_IDENTITY_TOKEN`, printed at registration), which
+    needs no frames: without the declaration, or with it made a no-op, nothing
+    is printed and this scenario fails. The per-second ECS report is parsed too
+    as a second confirmation of the column count - the fixture opts the report
+    in, since the engine registers none by default - but the pass does not rest
+    on it.
     """
     print("\n  [TEST] Shared identity: project and module bind one column.")
     set_shared_identity(True)
+    install_report_opt_in()
 
     process, monitor = launch_host()
     try:
@@ -599,8 +650,27 @@ def scenario_shared_identity_binds_both_binaries() -> bool:
             return False
         print("  [OK] The project's init succeeded with the module already loaded.")
 
-        # Direct confirmation when frames happen to run: exactly one column for
-        # the component, listed under the report's `shared identity` section.
+        # The claim, as the registry recorded it: the declaration produced a
+        # declared identity for this component. Removing `#[pill(shared)]` - or
+        # making it a no-op - prints nothing here, which is why this check is
+        # required rather than sampled.
+        if not declares_shared_identity(output, SHARED_COMPONENT_NAME):
+            print(
+                f"  [FAIL] No registration reported a declared shared identity "
+                f"for {SHARED_COMPONENT_NAME}. The attribute did not take "
+                f"effect, so nothing below would distinguish shared identity "
+                f"from a per-binary one."
+            )
+            print(f"  Output tail:\n{monitor.output_since(0)[-2000:]}")
+            return False
+        print(
+            f"  [OK] The registry registered {SHARED_COMPONENT_NAME} under its "
+            f"declared shared identity."
+        )
+
+        # Direct confirmation from the report the fixture opted in to: exactly
+        # one column for the component, listed under its `shared identity`
+        # section.
         if monitor.wait_for(ECS_REPORT_TOKEN, REPORT_SAMPLE_TIMEOUT, start_index):
             report = extract_latest_report(monitor.output_since(start_index))
             if report is None:
@@ -650,10 +720,13 @@ def scenario_one_compiled_copy_needs_no_declaration() -> bool:
     differ, because the project and the module compile the extension from one
     rlib. What the scenario pins now is the replacement guarantee - with
     `#[pill(shared)]` removed, the host starts, reports no peer collision, and
-    (when frames run) shows exactly one column for the component.
+    the registry reports NO declared identity for the component. That last one
+    is what makes it a control for the first scenario: the same observation
+    that the declaration produces there must be absent here.
     """
     print("\n  [TEST] Control: no declaration, one compiled copy, one component.")
     set_shared_identity(False)
+    install_report_opt_in()
 
     process, monitor = launch_host()
     try:
@@ -684,8 +757,22 @@ def scenario_one_compiled_copy_needs_no_declaration() -> bool:
             return False
         print("  [OK] No peer collision: the one compiled copy is one identity.")
 
-        # Direct confirmation when frames happen to run, exactly as in the
-        # first scenario: one column for the component.
+        # The control half of the first scenario's required check: without the
+        # declaration the registry must report no declared identity at all.
+        if declares_shared_identity(output, SHARED_COMPONENT_NAME):
+            print(
+                f"  [FAIL] A declared shared identity was reported for "
+                f"{SHARED_COMPONENT_NAME} without `#[pill(shared)]`. The first "
+                f"scenario's confirmation therefore distinguishes nothing."
+            )
+            return False
+        print(
+            f"  [OK] No declared identity was reported for "
+            f"{SHARED_COMPONENT_NAME}."
+        )
+
+        # Direct confirmation from the report the fixture opted in to, exactly
+        # as in the first scenario: one column for the component.
         if monitor.wait_for(ECS_REPORT_TOKEN, REPORT_SAMPLE_TIMEOUT, start_index):
             report = extract_latest_report(monitor.output_since(start_index))
             if report is None:

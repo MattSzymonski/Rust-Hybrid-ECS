@@ -379,10 +379,108 @@ impl FrameDriver for Runtime {
 // Free Functions
 // =============================================================================
 
-/// Create the engine and initialize a statically linked project.
+/// Where a project's asset pack came from, which the mount logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackSource {
+    /// Baked into the binary by the shipping bundle.
+    Embedded,
+    /// Downloaded beside the page by a browser frontend.
+    Fetched,
+}
+
+impl PackSource {
+    /// The mount line for this source. Two literals rather than one format
+    /// string, so the log contract can look for either in the source.
+    fn mounted_message(self) -> &'static str {
+        match self {
+            Self::Embedded => "mounted the embedded asset pack",
+            Self::Fetched => "mounted the fetched asset pack",
+        }
+    }
+
+    /// The database line for this source, for the same reason.
+    fn indexed_message(self) -> &'static str {
+        match self {
+            Self::Embedded => "[assets] database indexed from the embedded pack",
+            Self::Fetched => "[assets] database indexed from the fetched pack",
+        }
+    }
+}
+
+/// Parse an asset pack and index every asset in it.
+///
+/// Returns the database to insert as a resource: it holds every packed asset
+/// by guid and by path, so a reference can find and load one that is not
+/// loaded yet (W-0048). Built here because mounting consumes the pack, which
+/// is why this takes the bytes and mounts them in the same step.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::AssetPackInvalid`] when the bytes are not a pack.
+pub fn mount_asset_pack(
+    project_name: &str,
+    source: PackSource,
+    bytes: impl Into<std::borrow::Cow<'static, [u8]>>,
+) -> Result<pill_engine::AssetDatabase, HostError> {
+    let pack = pill_engine::asset_store::AssetPack::parse(bytes).map_err(|error| {
+        ConfigError::AssetPackInvalid {
+            project: project_name.to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+    info!(
+        target: telemetry_target::ENGINE,
+        files = pack.len(),
+        "{}",
+        source.mounted_message()
+    );
+    let database = pill_engine::AssetDatabase::from_pack(&pack);
+    info!(
+        target: telemetry_target::ENGINE,
+        assets = database.len(),
+        "{}",
+        source.indexed_message()
+    );
+    pill_engine::asset_store::mount_pack(pack);
+    // From here on the store reads what the pack holds and nothing else: a
+    // shipped build must not fall back to a file on the player's machine when
+    // an asset is missing from the bundle (W-0066).
+    pill_engine::asset_store::restrict_to_packs();
+    Ok(database)
+}
+
+/// Create the engine and initialize a statically linked project, mounting the
+/// pack the project embeds.
 ///
 /// Nothing is built, watched or loaded: the project and its extensions were
-/// linked into this binary, and the frontend passes their entry points in.
+/// linked into this binary, and the frontend passes their entry points in. A
+/// browser frontend cannot embed a pack, so it fetches one and calls
+/// [`setup_with_asset_database`] instead.
+///
+/// # Errors
+///
+/// Returns a typed [`HostError`] when the embedded pack is not a pack, when an
+/// extension's or the project's entry point reports a non-zero initialization
+/// status, or an external backend fails to start. There is no previous
+/// generation to fall back to on this path, so the first failure is fatal.
+pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
+    // Mount the embedded assets first: a module's or the project's init may
+    // already load a `res` file, and a shipped game must read the copy it was
+    // built with.
+    let database = match project.asset_pack {
+        Some(bytes) => Some(mount_asset_pack(project.name, PackSource::Embedded, bytes)?),
+        None => None,
+    };
+    setup_with_asset_database(project, database)
+}
+
+/// Create the engine and initialize a statically linked project whose pack has
+/// already been mounted.
+///
+/// `database` is the one [`mount_asset_pack`] returned, or `None` for a
+/// project without assets. It is inserted before any module or project init
+/// runs, which is why a fetched pack has to arrive here rather than be added
+/// afterwards.
 ///
 /// # Errors
 ///
@@ -390,7 +488,10 @@ impl FrameDriver for Runtime {
 /// point reports a non-zero initialization status, or an external backend
 /// fails to start. There is no previous generation to fall back to on this
 /// path, so the first failure is fatal.
-pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
+pub fn setup_with_asset_database(
+    project: StaticProject,
+    database: Option<pill_engine::AssetDatabase>,
+) -> Result<Runtime, HostError> {
     let mut runtime = Runtime::new();
     insert_debug_resources(runtime.engine_mut().world_mut(), project.debug_draw);
 
@@ -417,32 +518,9 @@ pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
         "ECS host starting (statically linked)"
     );
 
-    // Mount the embedded assets first: a module's or the project's init may
-    // already load a `res` file, and a shipped game must read the copy it was
-    // built with.
-    if let Some(bytes) = project.asset_pack {
-        let pack = pill_engine::asset_store::AssetPack::parse(bytes).map_err(|error| {
-            ConfigError::AssetPackInvalid {
-                project: project.name.to_owned(),
-                detail: error.to_string(),
-            }
-        })?;
-        info!(
-            target: telemetry_target::ENGINE,
-            files = pack.len(),
-            "mounted the embedded asset pack"
-        );
-        // Every packed asset by guid and by path, so a reference can find and
-        // load one that is not loaded yet (W-0048). Built here because mounting
-        // consumes the pack.
-        let database = pill_engine::AssetDatabase::from_pack(&pack);
-        info!(
-            target: telemetry_target::ENGINE,
-            assets = database.len(),
-            "[assets] database indexed from the embedded pack"
-        );
+    // Mounted by the caller, before this ran, because it has to precede init.
+    if let Some(database) = database {
         runtime.engine_mut().world_mut().insert_resource(database);
-        pill_engine::asset_store::mount_pack(pack);
     }
 
     // Register every module, then the project, in the order and under the
@@ -481,11 +559,52 @@ fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     /// A project that registers nothing.
     fn no_op(_engine: &mut Engine) -> u32 {
         0
+    }
+
+    /// Whether the project's init saw the asset database as a resource.
+    static MOUNTED_BEFORE_INIT: AtomicBool = AtomicBool::new(false);
+
+    /// An init that records whether the asset database was already there.
+    fn record_whether_the_pack_is_mounted(engine: &mut Engine) -> u32 {
+        MOUNTED_BEFORE_INIT.store(
+            engine
+                .world()
+                .get_resource::<pill_engine::AssetDatabase>()
+                .is_some(),
+            Ordering::SeqCst,
+        );
+        0
+    }
+
+    /// The bytes of an asset pack holding `files`, in the format
+    /// `AssetPack::parse` reads.
+    fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use pill_engine::asset_store::{ASSET_PACK_MAGIC, ASSET_PACK_VERSION};
+
+        let index_length: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
+        let mut offset = (8 + 4 + 4 + index_length) as u64;
+        let mut pack = Vec::new();
+        pack.extend_from_slice(ASSET_PACK_MAGIC);
+        pack.extend_from_slice(&ASSET_PACK_VERSION.to_le_bytes());
+        pack.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (path, bytes) in files {
+            pack.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            pack.extend_from_slice(path.as_bytes());
+            pack.extend_from_slice(&offset.to_le_bytes());
+            pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            offset += bytes.len() as u64;
+        }
+        for (_, bytes) in files {
+            pack.extend_from_slice(bytes);
+        }
+        pack
     }
 
     /// A statically linked project starts and runs frames; the first ones
@@ -498,6 +617,7 @@ mod tests {
             modules: &[],
             renderer: None,
             asset_pack: None,
+            asset_pack_url: None,
             logging: crate::StaticLogging::NONE,
             debug_draw: false,
             startup_scene: None,
@@ -505,6 +625,43 @@ mod tests {
         .expect("it starts");
         assert!(run_one_frame(&mut runtime).is_none());
         assert_eq!(runtime.current_frame_report().entity_count, 0);
+    }
+
+    /// A project whose pack was fetched gets the database the fetch mounted
+    /// inserted before it initializes, so an init that loads an asset finds
+    /// it - the browser path (W-0105).
+    #[test]
+    fn a_fetched_pack_is_mounted_before_the_project_initializes() {
+        let bytes = pack_of(&[("fetched/pack-probe.txt", b"from the pack")]);
+        let database =
+            mount_asset_pack("project", PackSource::Fetched, bytes).expect("the pack is valid");
+
+        let runtime = setup_with_asset_database(
+            StaticProject {
+                name: "project",
+                backend: crate::StaticProjectBackend::Native {
+                    init: record_whether_the_pack_is_mounted,
+                },
+                modules: &[],
+                renderer: None,
+                asset_pack: None,
+                asset_pack_url: None,
+                logging: crate::StaticLogging::NONE,
+                debug_draw: false,
+                startup_scene: None,
+            },
+            Some(database),
+        )
+        .expect("it starts");
+        assert!(
+            MOUNTED_BEFORE_INIT.load(Ordering::SeqCst),
+            "the project's init has to see the database the fetch mounted"
+        );
+        // The store serves the pack's bytes, not a file of the same name.
+        let bytes = pill_engine::asset_store::read(std::path::Path::new("fetched/pack-probe.txt"))
+            .expect("the packed entry reads back");
+        assert_eq!(bytes, b"from the pack");
+        assert!(runtime.current_frame_report().entity_count == 0);
     }
 
     /// The hook a host passes runs once per frame, after the systems.

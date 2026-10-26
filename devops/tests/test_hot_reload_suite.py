@@ -739,6 +739,7 @@ def main() -> None:
         BACKUP.capture(path)
 
     results: List[Tuple[str, bool]] = []
+    all_passed = False
     try:
         if not prepare_host(HOST_POSTURE, args, BUILD_TIMEOUT):
             sys.exit(1)
@@ -768,9 +769,13 @@ def main() -> None:
                     ),
                 )
             )
+        all_passed = all(passed for _, passed in results)
     finally:
-        # Always restore the developer's files, even on failure.
-        BACKUP.restore_all()
+        # Always restore the developer's files, even on failure. Rewind the
+        # mtimes only when every session finished: a failed or aborted run can
+        # leave an artifact the host built from an edit, and rewinding there
+        # would make the next start trust that stale artifact (W-0110).
+        BACKUP.restore_all(reset_mtime=all_passed)
         # Restore the project settings files last.
         for path in (
             project_settings_yaml(FIXTURE_PROJECT_ROOT),
@@ -782,11 +787,9 @@ def main() -> None:
     print(f"\n{'=' * 64}")
     print("  SUMMARY")
     print(f"{'=' * 64}")
-    all_passed = True
     for session_name, passed in results:
         status = "[PASS]" if passed else "[FAIL]"
         print(f"  {status} session {session_name}")
-        all_passed = all_passed and passed
 
     if all_passed:
         print("\n  [PASS] Full hot-reload suite passed.")
