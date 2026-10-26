@@ -416,6 +416,11 @@ pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, Co
         if key.iter().any(|part| part.starts_with('.')) {
             continue;
         }
+        // `res/editor/` is the editor's own content - its theme layers and the
+        // fonts they name (W-0127). A game never loads it, so it never ships.
+        if key.first() == Some(&"editor") {
+            continue;
+        }
         files.push((key.join("/"), file));
     }
     files.sort();
@@ -614,6 +619,38 @@ mod tests {
             !pack.windows(7).any(|window| window == b"b.png.m"),
             "the leftover metadata temp file is not packed"
         );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// `res/editor/` is the editor's own content (W-0127): a game pack never
+    /// carries it, and a game file that merely starts with the same letters
+    /// ("editorial.txt") still packs.
+    #[test]
+    fn an_asset_pack_skips_the_editor_directory() {
+        let directory = scratch("editor_directory");
+        let source = directory.join("res");
+        fs::create_dir_all(source.join("editor").join("fonts")).expect("scratch directory");
+        fs::create_dir_all(source.join("ui")).expect("scratch directory");
+        fs::write(source.join("editor").join("editor.theme"), b"{}").expect("input");
+        fs::write(source.join("editor").join("fonts").join("a.ttf"), b"font").expect("input");
+        fs::write(source.join("ui").join("accent.theme"), b"{}").expect("input");
+        fs::write(source.join("editorial.txt"), b"prose").expect("input");
+        let output = directory.join("assets.pillpack");
+
+        let packed = write_asset_pack(&source, &output).expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        let keys: Vec<String> = packed
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&source)
+                    .expect("below res")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(keys, ["editorial.txt", "ui/accent.theme"]);
+        assert!(!pack.windows(12).any(|window| window == b"editor.theme"));
         let _ = fs::remove_dir_all(&directory);
     }
 

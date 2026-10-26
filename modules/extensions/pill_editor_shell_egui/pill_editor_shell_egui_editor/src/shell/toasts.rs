@@ -94,14 +94,25 @@ pub fn draw_toasts(
             .fixed_pos(egui::pos2(TOAST_LEFT, top))
             .show(context, |ui| {
                 egui::Frame::new()
-                    .fill(style::PANEL_FILL)
-                    .stroke(egui::Stroke::new(1.0, style::BORDER))
+                    .fill(style::panel())
+                    .stroke(egui::Stroke::new(1.0, style::line()))
                     .inner_margin(egui::Margin::symmetric(8, 2))
                     .show(ui, |ui| {
                         ui.set_width(TOAST_WIDTH);
+                        // The level's accent bar down the left edge, as the
+                        // reference draws it.
+                        let bar = egui::Rect::from_min_size(
+                            ui.max_rect().left_top(),
+                            egui::vec2(3.0, ui.max_rect().height()),
+                        );
+                        ui.painter().rect_filled(
+                            bar,
+                            egui::CornerRadius::ZERO,
+                            level_colour(level),
+                        );
                         ui.horizontal(|ui| {
                             ui.colored_label(level_colour(level), level.name());
-                            ui.label(egui::RichText::new(&text).color(style::TEXT));
+                            ui.label(egui::RichText::new(&text).color(style::text()));
                         });
                     });
             });
@@ -136,9 +147,9 @@ pub fn draw_toasts(
 /// The colour of a level's marker.
 pub fn level_colour(level: NoticeLevel) -> egui::Color32 {
     match level {
-        NoticeLevel::Error => egui::Color32::from_rgb(217, 72, 62),
-        NoticeLevel::Warning => egui::Color32::from_rgb(222, 170, 56),
-        NoticeLevel::Note => egui::Color32::from_rgb(90, 160, 220),
+        NoticeLevel::Error => style::log_error(),
+        NoticeLevel::Warning => style::log_warn(),
+        NoticeLevel::Note => style::log_info(),
     }
 }
 

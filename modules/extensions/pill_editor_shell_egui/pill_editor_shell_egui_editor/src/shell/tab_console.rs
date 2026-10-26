@@ -83,7 +83,7 @@ pub fn console_tab(
             }
         ))
         .small()
-        .color(style::TEXT),
+        .color(style::text()),
     );
     egui::ScrollArea::vertical()
         .stick_to_bottom(true)
@@ -108,12 +108,12 @@ pub fn console_tab(
         });
 }
 
-/// The colour of a level's tag: the toast stack's colours, so one level reads
+/// The colour of a level's tag: the toast stack's roles, so one level reads
 /// the same everywhere.
 pub fn console_level_colour(level: u8) -> egui::Color32 {
     match level {
-        4 => egui::Color32::from_rgb(222, 170, 56),
-        5 => egui::Color32::from_rgb(217, 72, 62),
-        _ => egui::Color32::from_rgb(90, 160, 220),
+        4 => style::log_warn(),
+        5 => style::log_error(),
+        _ => style::log_info(),
     }
 }

@@ -92,6 +92,11 @@ mod scratch;
 // ===== Re-exports =====
 
 // Local host modules and the shared crate-root error surface.
+/// The editor-only settings file's name in the project root.
+pub use config::EDITOR_SETTINGS_FILE;
+/// The editor's own settings file (W-0127): read by the editor executable
+/// only, never by a game build.
+pub use config::{read_editor_settings, resolve_editor_theme, EditorSettings};
 pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 pub use extension::EXTENSION_ABI_VERSION;
 /// The notices an editor frontend drains each frame; see [`HostNotice`].

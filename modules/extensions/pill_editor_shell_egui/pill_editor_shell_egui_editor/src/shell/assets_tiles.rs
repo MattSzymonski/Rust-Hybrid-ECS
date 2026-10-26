@@ -26,8 +26,6 @@ pub const ASSETS_TILE_ICON_INSET: f32 = 6.0;
 
 pub const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
 
-pub const ASSETS_TILE_LABEL_SIZE: f32 = 11.0;
-
 /// The rows a tile's name may wrap to before it elides, like Unity's two.
 pub const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
@@ -147,7 +145,7 @@ pub fn asset_tile(
         }
         None => icons::paint_duotone(ui.painter(), icon_rect, asset_icon(row), tint),
     }
-    let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
+    let font = egui::TextStyle::Small.resolve(ui.style());
     let job = tile_name_job(
         browser::file_name(&row.path),
         &font,

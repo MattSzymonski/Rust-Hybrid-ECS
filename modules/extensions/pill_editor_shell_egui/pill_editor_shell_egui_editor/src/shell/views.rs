@@ -82,7 +82,7 @@ pub fn scene_overlay(
         button_rect,
         egui::Button::new("Example")
             .min_size(button_rect.size())
-            .fill(style::CONTROL_FILL)
+            .fill(style::control())
             .corner_radius(egui::CornerRadius::same(4)),
     );
     if button.clicked() {
@@ -101,16 +101,16 @@ pub fn scene_overlay(
     ui.painter().rect(
         counter_rect,
         egui::CornerRadius::same(5),
-        style::OVERLAY_FILL,
-        egui::Stroke::new(1.0, style::OVERLAY_BORDER),
+        style::overlay(),
+        egui::Stroke::new(1.0, style::overlay_border()),
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
         counter_rect.center(),
         egui::Align2::CENTER_CENTER,
         format!("{frames_per_second:.0} fps"),
-        egui::FontId::monospace(12.0),
-        style::TEXT_STRONG,
+        egui::TextStyle::Monospace.resolve(ui.style()),
+        style::text_strong(),
     );
 }
 
@@ -173,15 +173,15 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
             rect.center(),
             SCENE_BADGE_SIZE * 0.5,
             if hovered {
-                style::SELECTION_FILL
+                style::selection()
             } else {
-                style::OVERLAY_FILL
+                style::overlay()
             },
         );
         ui.painter().circle_stroke(
             rect.center(),
             SCENE_BADGE_SIZE * 0.5,
-            egui::Stroke::new(1.0, style::OVERLAY_BORDER),
+            egui::Stroke::new(1.0, style::overlay_border()),
         );
         let label = viewer
             .snapshot
@@ -196,14 +196,14 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
                 rect.shrink(3.0),
                 icon,
                 if hovered {
-                    style::TEXT_STRONG
+                    style::text_strong()
                 } else {
-                    style::TEXT
+                    style::text()
                 },
             ),
             None => {
                 ui.painter()
-                    .circle_filled(rect.center(), 3.0, style::TEXT_MUTED);
+                    .circle_filled(rect.center(), 3.0, style::text_muted());
             }
         }
         if response.clicked() {

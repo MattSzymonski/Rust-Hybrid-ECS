@@ -3,8 +3,9 @@
 //!
 //! # Responsibilities
 //!
-//! - [`install`]: register the vendored Phosphor fonts as families on an
-//!   egui context; [`crate::style::apply`] calls it with the theme.
+//! - [`append_font_definitions`]: append the vendored Phosphor fonts as
+//!   families to the definitions the UI kit is about to install;
+//!   [`crate::style::apply_theme`] passes it as the kit's built-in callback.
 //! - [`Icon`]: the icons the editor uses, as the fonts' codepoints.
 //! - [`rich`]: an icon and a label as one text run, for tab titles and the
 //!   widgets that only take text.
@@ -32,8 +33,8 @@ use std::sync::Arc;
 
 // External crates
 use egui::{
-    Color32, Context, FontData, FontDefinitions, FontFamily, FontId, Painter, Rect, Response,
-    Sense, StrokeKind, TextStyle, Ui, Vec2, Widget,
+    Color32, FontData, FontDefinitions, FontFamily, FontId, Painter, Rect, Response, Sense,
+    StrokeKind, TextStyle, Ui, Vec2, Widget,
 };
 
 /// The family of the regular-weight icons, falling back to the UI font.
@@ -61,14 +62,13 @@ const REGULAR_FONT: &[u8] = include_bytes!("../assets/Phosphor.ttf");
 const DUOTONE_FONT: &[u8] = include_bytes!("../assets/Phosphor-Duotone.ttf");
 
 /// The font definitions' keys for the two files.
-const REGULAR_KEY: &str = "phosphor";
+pub const REGULAR_KEY: &str = "phosphor";
 const DUOTONE_KEY: &str = "phosphor.duotone";
 
-/// Register the Phosphor fonts on `context` as [`FAMILY`] and
-/// [`DUOTONE_FAMILY`], each falling back to the context's proportional
-/// fonts so a label beside an icon still draws.
-pub fn install(context: &Context) {
-    let mut fonts = FontDefinitions::default();
+/// Append the Phosphor fonts to `fonts` as [`FAMILY`] and [`DUOTONE_FAMILY`],
+/// each falling back to the proportional family built so far so a label
+/// beside an icon still draws.
+pub fn append_font_definitions(fonts: &mut FontDefinitions) {
     fonts.font_data.insert(
         REGULAR_KEY.to_owned(),
         Arc::new(FontData::from_static(REGULAR_FONT)),
@@ -96,7 +96,6 @@ pub fn install(context: &Context) {
     fonts
         .families
         .insert(FontFamily::Name(DUOTONE_FAMILY.into()), family(DUOTONE_KEY));
-    context.set_fonts(fonts);
 }
 
 /// One Phosphor icon, named the way the package names it.

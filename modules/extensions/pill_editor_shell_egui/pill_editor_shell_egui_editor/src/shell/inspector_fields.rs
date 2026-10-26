@@ -197,7 +197,7 @@ pub fn inspector_field_row(
             ui.horizontal_wrapped(|ui| {
                 let label = ui.add_sized(
                     egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
-                    egui::Label::new(egui::RichText::new(field).color(style::TEXT_MUTED))
+                    egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
                         .truncate(),
                 );
                 if let Some(text) = tooltip.as_deref() {
@@ -332,7 +332,7 @@ pub fn inspector_field_row(
             ui.horizontal_wrapped(|ui| {
                 let label = ui.add_sized(
                     egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
-                    egui::Label::new(egui::RichText::new(field).color(style::TEXT_MUTED))
+                    egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
                         .truncate(),
                 );
                 if let Some(text) = tooltip.as_deref() {
@@ -516,8 +516,8 @@ pub fn inspector_asset_row(
     inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
         let width = (ui.available_width() - ASSET_ROW_CLEAR_WIDTH).max(40.0);
         let color = match label {
-            AssetReferenceLabel::Named(_) => style::TEXT,
-            _ => style::TEXT_MUTED,
+            AssetReferenceLabel::Named(_) => style::text(),
+            _ => style::text_muted(),
         };
         let icon = assets_tiles::asset_type_icon(input.asset_type.unwrap_or_default());
         let response = ui.add_sized(
@@ -693,8 +693,8 @@ pub fn inspector_entity_row(
     inspector_row(ui, &row_label, input.tooltip, &mut |ui| {
         let width = (ui.available_width() - 2.0 * ASSET_ROW_CLEAR_WIDTH).max(40.0);
         let color = match label {
-            EntityReferenceLabel::Live(_) => style::TEXT,
-            _ => style::TEXT_MUTED,
+            EntityReferenceLabel::Live(_) => style::text(),
+            _ => style::text_muted(),
         };
         let response = ui.add_sized(
             egui::vec2(width, 18.0),
@@ -1100,7 +1100,7 @@ pub fn inspector_row(
     ui.horizontal(|ui| {
         let label = ui.add_sized(
             egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
-            egui::Label::new(egui::RichText::new(label).color(style::TEXT_MUTED)).truncate(),
+            egui::Label::new(egui::RichText::new(label).color(style::text_muted())).truncate(),
         );
         if let Some(text) = tooltip {
             label.on_hover_text(text);

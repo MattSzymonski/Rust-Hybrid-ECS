@@ -325,6 +325,17 @@ STEPS: List[Step] = [
         ],
         environment={"RUSTFLAGS": "", "RUSTC_WRAPPER": ""},
     ),
+    # The theme pipeline's game half (W-0127): the headless host on
+    # `circus_demo`, the `.theme` override re-applying live, a refusal keeping
+    # the applied theme, a project reload keeping it too, and the pack writer
+    # keeping editor content out. A host-tier suite, so it runs before the
+    # editor lane - that lane's build must stay the last one.
+    Step(
+        "theme",
+        "Theme pipeline suite (the game UI's theme, end to end)",
+        [[PYTHON, "devops/tests/run_all.py", "--only", "test_ui_theme.py"]],
+        working_directory=REPOSITORY_ROOT,
+    ),
     # The end-to-end editor lane: the real executable, driven through its
     # scripted channel. Order is the whole point. The host-tier revision suite
     # builds its own narrowed `pill_standalone`, which re-splits the shared

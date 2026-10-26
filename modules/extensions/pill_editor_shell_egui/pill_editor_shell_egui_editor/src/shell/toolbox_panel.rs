@@ -64,23 +64,23 @@ pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view
     ui.painter().rect(
         panel,
         egui::CornerRadius::same(5),
-        style::OVERLAY_FILL,
-        egui::Stroke::new(1.0, style::OVERLAY_BORDER),
+        style::overlay(),
+        egui::Stroke::new(1.0, style::overlay_border()),
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
         egui::pos2(panel.center().x, handle.center().y),
         egui::Align2::CENTER_CENTER,
         "Tools",
-        egui::FontId::proportional(11.0),
-        style::TEXT_MUTED,
+        egui::TextStyle::Small.resolve(ui.style()),
+        style::text_muted(),
     );
     for item in toolbox::TOOLBOX_ITEMS {
         let rect = toolbox::item_rect(item, origin);
         let fill = if item.active(&state) {
-            style::SELECTION_FILL
+            style::selection()
         } else {
-            style::CONTROL_FILL
+            style::control()
         };
         let button = ui.put(
             rect,

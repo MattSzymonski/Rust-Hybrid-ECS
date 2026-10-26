@@ -341,7 +341,6 @@ pub use assets_tiles::ASSETS_TILE_ICON_INSET;
 pub use assets_tiles::ASSETS_TILE_LABEL_GAP;
 pub use assets_tiles::ASSETS_TILE_LABEL_HEIGHT;
 pub use assets_tiles::ASSETS_TILE_LABEL_ROWS;
-pub use assets_tiles::ASSETS_TILE_LABEL_SIZE;
 pub use toasts::{draw_toasts, push_notices};
 
 /// The [`tests`] module: the shell's unit tests.
@@ -381,6 +380,29 @@ pub fn run_frame(
 ) {
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
+    // The executable resolves the theme's layers and publishes the merge on
+    // the snapshot (W-0127 Stage 6); the shell installs it whenever the
+    // generation moves, on the main context and every popped-out one, so a
+    // preference or project edit restyles the editor without a restart.
+    if state.applied_theme_generation != snapshot.theme_generation {
+        state.applied_theme_generation = snapshot.theme_generation;
+        pill_editor_core::style::apply_theme(
+            &state.context,
+            &snapshot.theme,
+            &snapshot.theme_layers,
+            snapshot.theme_generation,
+            &snapshot.theme_fonts,
+        );
+        for context in state.popout_contexts.values() {
+            pill_editor_core::style::apply_theme(
+                context,
+                &snapshot.theme,
+                &snapshot.theme_layers,
+                snapshot.theme_generation,
+                &snapshot.theme_fonts,
+            );
+        }
+    }
     // The saved layout's module tabs name panel slots from the run that wrote
     // them; the ids it carried are what maps them to today's slots (Stage 11).
     // Once per session: a shell reload must not undo a dock the user moved.
@@ -530,7 +552,10 @@ pub fn run_frame(
         // collapse chevron and the panel-level close-all ✖, a panel closes
         // exactly when its last tab does.
         DockArea::new(dock.state_mut())
-            .style(style::dock_style(ui.ctx().global_style().as_ref()))
+            .style(style::dock_style(
+                ui.ctx().global_style().as_ref(),
+                &style::palette(),
+            ))
             .show_leaf_collapse_buttons(false)
             .show_leaf_close_all_buttons(false)
             .show_inside(ui, &mut viewer);

@@ -360,6 +360,9 @@ pub enum Dump {
     Systems,
     /// `dump preferences` - the preferences document and the live halves.
     Preferences,
+    /// `dump theme` - the theme the editor paints with, its layers and the
+    /// generation that produced it (W-0127 Stage 6).
+    Theme,
     /// `dump console` - the Console tab's filters and the rows they leave.
     Console,
     /// `dump problems` - the Problems rows and their locations.
@@ -915,6 +918,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "standalone-types" => Dump::StandaloneTypes,
         "systems" => Dump::Systems,
         "preferences" => Dump::Preferences,
+        "theme" => Dump::Theme,
         "console" => Dump::Console,
         "problems" => Dump::Problems,
         "stats" => Dump::Stats,
@@ -1771,6 +1775,10 @@ mod tests {
             Accept {
                 line: "dump preferences",
                 command: ScriptedCommand::Dump(Dump::Preferences),
+            },
+            Accept {
+                line: "dump theme",
+                command: ScriptedCommand::Dump(Dump::Theme),
             },
             Accept {
                 line: "dump console",
