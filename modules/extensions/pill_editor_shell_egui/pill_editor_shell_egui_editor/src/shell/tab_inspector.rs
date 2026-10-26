@@ -354,14 +354,14 @@ pub fn inspector_section_header(
         icons::Icon::CaretDown
     };
     let frame = egui::Frame::new()
-        .fill(style::CONTROL_FILL)
+        .fill(style::control())
         .corner_radius(3.0)
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let (caret_rect, _) =
                     ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                icons::paint_duotone(ui.painter(), caret_rect, caret, style::TEXT_MUTED);
+                icons::paint_duotone(ui.painter(), caret_rect, caret, style::text_muted());
                 let (icon_rect, _) =
                     ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 icons::paint_duotone(

@@ -50,6 +50,7 @@ Pass/fail suites for the hot-reload and persistence architecture, plus the
 python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_csharp_bridge.py
+python devops/tests/test_ui_theme.py            # the UI theme pipeline, `circus_demo`
 python devops/tests/test_shipping_smoke.py
 python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge
 
@@ -73,6 +74,39 @@ test drives it. `tools/wasm_size_report.py` explains a web build's size: the
 shipped module's sections, its gzip size, the embedded asset pack, and (with
 `twiggy` on PATH) the code by crate - engine, project, standard library and
 third-party families - from the binary wasm-opt has not stripped yet.
+
+### Styling a project or the editor
+
+A project's UI is the brutalist `Theme` its code default builds, sparsely
+overridden by one `.theme` file under `res`. The document names only what it
+changes:
+
+```json
+{
+  "format_version": 1,
+  "asset_type": "pill_ui_theme::ThemeOverrides",
+  "guid": "000000000000000000000000000000a1",
+  "asset": {
+    "palette": { "accent": "#33d17a" },
+    "text_styles": { "heading": { "size": 24.0 } },
+    "fonts": { "body": "fonts/Silkscreen-Regular.ttf" }
+  }
+}
+```
+
+The editor's own look is three layers - its code default, the user's file named
+by the `theme` row in `preferences.json`, and the project's `editor/` layer.
+A project configures the last one with `editor_settings.yaml` beside its
+`project_settings.yaml`:
+
+```yaml
+editor_theme: "editor/my_theme.theme"   # below res; default: editor/editor.theme
+```
+
+`res/editor/` is editor-only content: game packs never carry it. The pipeline
+is described in `AGENTS.md` ("The theme pipeline"), and
+`tests/test_ui_theme.py` proves the game half end to end while
+`tests/test_editor_egui.py` proves the editor half.
 
 ## core/
 

@@ -29,6 +29,12 @@ pill_engine_core = { path = "../../engine/pill_engine_core" }
 # tessellated output becomes this crate's plain data, and no egui type ever
 # crosses into `pill_renderer_api` (plan decision D1).
 pill_ui_frame = { path = "../../rendering/pill_ui_frame" }
+# The theme pipeline (W-0127): the shared plain theme data, and the rlib
+# translator + variants compiled into this dylib's own link unit. Only this
+# crate and `pill_editor_core` may depend on the kit; both re-export it as
+# `kit`.
+pill_ui_theme = { path = "../pill_ui_theme" }
+pill_ui_kit = { path = "../pill_ui_kit" }
 # egui, pinned here alone: every consumer names it through this crate's
 # re-export, so the whole engine has one egui (W-0026 moved the world to
 # 0.36.2). `default_fonts` is the one feature needed; the docking crate the

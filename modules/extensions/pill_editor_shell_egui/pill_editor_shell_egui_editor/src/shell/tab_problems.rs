@@ -40,7 +40,7 @@ pub fn problems_tab(ui: &mut egui::Ui, snapshot: &EditorSnapshot, request: &mut 
                     ui.label(
                         egui::RichText::new(format!("{module} ({})", indices.len()))
                             .strong()
-                            .color(style::TEXT),
+                            .color(style::text()),
                     );
                 });
                 for index in indices {

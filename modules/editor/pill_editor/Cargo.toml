@@ -74,5 +74,11 @@ egui-wgpu = "0.36.2"
 # on the resource types' identity across a reload; consumed by both the
 # executable's fallback UI and the reloadable shell.
 pill_editor_core = { path = "../pill_editor_core" }
+# The theme tokens and the `.theme` asset the editor's look is built from
+# (W-0127): this executable is the side that resolves the layers - the user's
+# file and the project's `res/editor/` file - and the shell installs the merge.
+# A shared dylib, so the `Theme` on the snapshot is the same type both sides
+# name.
+pill_ui_theme = { path = "../../ui/pill_ui_theme" }
 # The asset settings documents the Inspector's asset rows edit are JSON.
 serde_json = "1"

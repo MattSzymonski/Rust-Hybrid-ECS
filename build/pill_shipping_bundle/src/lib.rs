@@ -48,11 +48,12 @@ const LOGGING: StaticLogging = StaticLogging::NONE;
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
-        name: "Bouncing Balls",
+        name: "Editor Crates Test",
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),
-        asset_pack: None,
+        asset_pack: Some(include_bytes!(concat!(env!("OUT_DIR"), "/assets.pillpack"))),
+        asset_pack_url: None,
         logging: LOGGING,
         debug_draw: false,
         startup_scene: None,

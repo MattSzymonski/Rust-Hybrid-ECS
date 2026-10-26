@@ -255,7 +255,7 @@ pub fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> 
 /// One read-only (name, value) row.
 pub fn read_only_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(label).color(style::TEXT_MUTED));
+        ui.label(egui::RichText::new(label).color(style::text_muted()));
         ui.label(value);
     });
 }

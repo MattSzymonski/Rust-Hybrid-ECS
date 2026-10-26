@@ -128,6 +128,11 @@ pub fn entities_tab(
         for (entity, label) in entity_rows(snapshot) {
             let selected = selection.contains(entity);
             let response = ui.selectable_label(selected, label);
+            // The reference's selected row: egui fills it with the theme's
+            // `selection` colour, and the accent bar marks its left edge.
+            if selected {
+                style::selected_row_bar(ui, response.rect);
+            }
             // One layer senses the row's press both ways (W-0049): a press
             // that moves carries the entity for a drop on a reference field
             // (W-0048 Stage 6), and a press that does not is the row's click.

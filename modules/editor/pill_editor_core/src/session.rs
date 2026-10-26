@@ -38,6 +38,11 @@ pub struct EguiShellState {
     pub dock: EditorDock,
     /// Completed egui passes; the shell's log cadence reads it.
     pub frame_index: u64,
+    /// The executable's theme generation this session last installed
+    /// (W-0127 Stage 6). The executable resolves the layers and publishes the
+    /// merged theme on the snapshot; the shell installs it when this moves, so
+    /// a reloaded shell picks up the theme already in force.
+    pub applied_theme_generation: u64,
     /// The asset dialog that is open, if one is: the create or rename
     /// window's state, kept here so a shell reload keeps it.
     pub asset_dialog: Option<AssetDialog>,
@@ -623,6 +628,10 @@ impl EguiShellState {
             context,
             dock: crate::layout::load_or_default(),
             frame_index: 0,
+            // The record already holds whatever the executable resolved, and
+            // the install above put it in this context: the shell is current
+            // until the next generation arrives.
+            applied_theme_generation: crate::style::generation(),
             asset_dialog: None,
             preferences_draft: None,
             toolbox: ToolboxSession::default(),

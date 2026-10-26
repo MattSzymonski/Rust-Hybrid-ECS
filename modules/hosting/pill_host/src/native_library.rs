@@ -107,12 +107,17 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// `pill_editor_core` is the egui editor's shared copy (W-0017). Its
 /// frontend and shell exchange their types the same way, so it gets the same
 /// treatment.
-pub(crate) const ENGINE_DYLIB_STEMS: [&str; 5] = [
+/// `pill_ui_theme` is the theme value and the `.theme` asset (W-0127): the
+/// project, `pill_project_ui` and `pill_editor_core` all hold its `Handle`s
+/// and `Theme`, so a project that loads against its own copies needs the
+/// theme dylib staged beside them too.
+pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_core",
     "pill_engine_core",
     "pill_ui_frame",
     "pill_project_ui",
     "pill_editor_core",
+    "pill_ui_theme",
 ];
 
 /// Whether a module build produced engine dylibs different from the ones the

@@ -71,6 +71,11 @@
 pub use egui;
 pub use egui_dock;
 
+/// The UI kit: the theme-to-egui translator, the font installer and the
+/// scoped style variants (W-0127). Re-exported so the shell and the executable
+/// never name the rlib directly.
+pub use pill_ui_kit as kit;
+
 /// The Assets pipeline: the dialogs' state and the recorded file batches.
 pub mod assets;
 /// The plain data crossing the frontend/shell boundary.

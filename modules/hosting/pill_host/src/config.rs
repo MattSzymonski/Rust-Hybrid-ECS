@@ -430,8 +430,16 @@ pub(crate) fn module_build_artifact_directory() -> String {
 /// selected by `PROJECT_PATH` alone.
 const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 
+/// The editor-only settings file, resolved in the project root beside
+/// `project_settings.yaml` (W-0127). No game build reads it.
+pub const EDITOR_SETTINGS_FILE: &str = "editor_settings.yaml";
+
 /// A project's source asset directory, relative to the project root.
 const PROJECT_ASSET_DIRECTORY: &str = "res";
+
+/// The editor theme a project's editor layer uses when `editor_settings.yaml`
+/// names none and the file is there.
+const DEFAULT_EDITOR_THEME: &str = "editor/editor.theme";
 
 /// The renderer a project draws with when its settings name none.
 const DEFAULT_RENDERER: &str = "pill_master_renderer";
@@ -1649,6 +1657,69 @@ fn declares_dependency(table: &Table, crate_name: &str) -> bool {
     })
 }
 
+// =============================================================================
+// The editor's settings file
+// =============================================================================
+
+/// What `editor_settings.yaml` selected for the editor (W-0127).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditorSettings {
+    /// The `editor_theme:` value, as the file spells it: a path below the
+    /// project's `res`.
+    pub editor_theme: Option<String>,
+}
+
+/// Read the editor's settings file from the project root.
+///
+/// A project without the file is the normal case and an empty settings
+/// value. Unknown keys are refused rather than dropped, so a misspelled
+/// `editor_themes:` cannot quietly fall back to the default theme.
+///
+/// # Errors
+///
+/// A message naming the file when it exists but cannot be read, is not
+/// valid YAML, or names an unknown key.
+pub fn read_editor_settings(project_directory: &Path) -> Result<EditorSettings, String> {
+    let path = project_directory.join(EDITOR_SETTINGS_FILE);
+    if !path.is_file() {
+        return Ok(EditorSettings::default());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("`{}` could not be read: {error}", path.display()))?;
+    let file: EditorSettingsFile = serde_yaml::from_str(&text)
+        .map_err(|error| format!("`{}` is not valid YAML: {error}", path.display()))?;
+    Ok(EditorSettings {
+        editor_theme: file.editor_theme.filter(|value| !value.trim().is_empty()),
+    })
+}
+
+/// The project layer's theme path: the `editor_theme:` value when the file
+/// names one, otherwise `editor/editor.theme` when the project ships that
+/// file, otherwise none.
+///
+/// The path is below the project's `res` and is checked against the editor
+/// scope when it loads, not here, so a file naming `ui/x.theme` is refused
+/// with the rule the game's own loader states.
+pub fn resolve_editor_theme(project_directory: &Path, settings: &EditorSettings) -> Option<String> {
+    if let Some(path) = settings.editor_theme.clone() {
+        return Some(path);
+    }
+    project_directory
+        .join(PROJECT_ASSET_DIRECTORY)
+        .join("editor")
+        .join("editor.theme")
+        .is_file()
+        .then(|| DEFAULT_EDITOR_THEME.to_string())
+}
+
+/// Values declared by the project's own `editor_settings.yaml`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct EditorSettingsFile {
+    /// The editor theme the project's editor layer uses, below `res`.
+    editor_theme: Option<String>,
+}
+
 /// Values declared by the project's own `project_settings.yaml`.
 ///
 /// `name` and `build_binary_name` are required (the display/window title and
@@ -2513,6 +2584,83 @@ serde = { version = "1", features = ["derive"] }
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         assert!(read_project_settings_file(&directory).unwrap().is_none());
+    }
+
+    // =========================================================================
+    // editor settings file
+    // =========================================================================
+
+    /// The editor's settings file is optional, names a theme and refuses a
+    /// misspelled key: the key the editor reads is the only one it accepts.
+    #[test]
+    fn the_editor_settings_file_reads_the_theme_key() {
+        let directory = temp_root().join("editor_settings");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let absent = read_editor_settings(&directory).expect("no file is not an error");
+        assert_eq!(absent, EditorSettings::default());
+        assert_eq!(absent.editor_theme, None);
+
+        std::fs::write(
+            directory.join("editor_settings.yaml"),
+            "editor_theme: \"editor/alt.theme\"\n",
+        )
+        .unwrap();
+        let named = read_editor_settings(&directory).expect("the key parses");
+        assert_eq!(named.editor_theme.as_deref(), Some("editor/alt.theme"));
+
+        std::fs::write(directory.join("editor_settings.yaml"), "editor_theme:\n").unwrap();
+        assert_eq!(
+            read_editor_settings(&directory).unwrap().editor_theme,
+            None,
+            "an empty value is no selection"
+        );
+
+        std::fs::write(
+            directory.join("editor_settings.yaml"),
+            "editor_themes: \"editor/alt.theme\"\n",
+        )
+        .unwrap();
+        let error = read_editor_settings(&directory).expect_err("a misspelled key is refused");
+        assert!(error.contains("editor_themes"), "{error}");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The project layer falls back to `editor/editor.theme` only when the
+    /// project ships that file, and a named path always wins over the default.
+    #[test]
+    fn the_editor_theme_resolves_the_default_file() {
+        let directory = temp_root().join("editor_settings_default");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("res").join("editor")).unwrap();
+        let settings = EditorSettings::default();
+
+        assert_eq!(
+            resolve_editor_theme(&directory, &settings),
+            None,
+            "a project without the file has no project layer"
+        );
+
+        std::fs::write(
+            directory.join("res").join("editor").join("editor.theme"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_editor_theme(&directory, &settings).as_deref(),
+            Some("editor/editor.theme")
+        );
+
+        let named = EditorSettings {
+            editor_theme: Some("editor/alt.theme".to_string()),
+        };
+        assert_eq!(
+            resolve_editor_theme(&directory, &named).as_deref(),
+            Some("editor/alt.theme"),
+            "the key names the layer even when the default file exists"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// An `extensions/` directory holding the named crates, each in a folder

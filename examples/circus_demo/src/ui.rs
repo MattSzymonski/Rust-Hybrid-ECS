@@ -48,14 +48,14 @@ pub(crate) fn tuning_overlay_system(
     input: Res<Input>,
     mut slot: ResMut<UiFrameSlot>,
     time: Res<Time>,
-    state: Res<DemoState>,
+    mut state: ResMut<DemoState>,
 ) -> Result<(), SystemError> {
-    let (Some(mut game_ui), Some(input), Some(mut slot), Some(time), Some(state)) = (
+    let (Some(mut game_ui), Some(input), Some(mut slot), Some(time), Some(mut state)) = (
         game_ui.get_mut(),
         input.get(),
         slot.get_mut(),
         time.get(),
-        state.get(),
+        state.get_mut(),
     ) else {
         return Ok(());
     };
@@ -64,6 +64,11 @@ pub(crate) fn tuning_overlay_system(
     // resource mutably, so the snapshot is taken first and the borrow of the
     // engine's input ends with it.
     let input_frame = InputFrame::capture(input);
+
+    // The tokens the panel's widgets paint from: cloned out of the resource,
+    // because the pass itself borrows the UI mutably. A project reload installs
+    // the theme again, so the clone is this frame's.
+    let theme = game_ui.theme().clone();
 
     // The overlay lays out against its own size and sits in the window's
     // top-left corner, so it needs no window-size input; the monitor's scale
@@ -95,6 +100,34 @@ pub(crate) fn tuning_overlay_system(
                         section.label(format!("Epsilon {:.4}", state.curl_epsilon));
                     });
                     window.separator();
+                    // The brutalist recipe's own button (W-0127 Stage 8): a
+                    // face on a hard shadow it drops onto while held. One of
+                    // each face - the accent one acts, the selected one marks
+                    // the tuning as live, and the disabled one shows the
+                    // inert look.
+                    window.horizontal(|row| {
+                        if row
+                            .add(
+                                pill_project_ui::kit::ChunkyButton::new("Reset curls", &theme)
+                                    .accent(true),
+                            )
+                            .clicked()
+                        {
+                            let defaults = DemoState::default();
+                            state.curl_scale = defaults.curl_scale;
+                            state.curl_attraction = defaults.curl_attraction;
+                            state.curl_damping = defaults.curl_damping;
+                            state.curl_epsilon = defaults.curl_epsilon;
+                        }
+                        row.add(
+                            pill_project_ui::kit::ChunkyButton::new("Tuning on", &theme)
+                                .selected(true),
+                        );
+                        row.add_enabled(
+                            false,
+                            pill_project_ui::kit::ChunkyButton::new("Locked", &theme),
+                        );
+                    });
                     window.label("Tune: O/P, K/L, M/N, B/V");
                 });
         },

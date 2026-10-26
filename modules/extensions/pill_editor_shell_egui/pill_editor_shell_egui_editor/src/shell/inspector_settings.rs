@@ -100,7 +100,7 @@ pub fn asset_settings_row(
     }
     match value {
         JsonValue::Object(entries) => {
-            ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+            ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
             ui.indent(key.as_str(), |ui| {
                 for (child_key, child) in entries {
                     asset_settings_row(
@@ -118,7 +118,7 @@ pub fn asset_settings_row(
             });
         }
         JsonValue::Array(elements) => {
-            ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+            ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
             ui.indent(key.as_str(), |ui| {
                 for (index, child) in elements.iter().enumerate() {
                     asset_settings_row(
@@ -138,7 +138,7 @@ pub fn asset_settings_row(
         JsonValue::Bool(current) => {
             let mut edited = *current;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+                ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
                 if ui.checkbox(&mut edited, "").changed() {
                     settings_commit(pending, asset_path, root, &key, JsonValue::Bool(edited));
                 }
@@ -152,7 +152,7 @@ pub fn asset_settings_row(
                 Some(edited) => {
                     let mut changed = false;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+                        ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
                         changed = ui.add(egui::DragValue::new(edited)).changed();
                     });
                     if changed {
@@ -169,7 +169,7 @@ pub fn asset_settings_row(
                     let mut edited = current.as_f64().unwrap_or_default();
                     let mut changed = false;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+                        ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
                         changed = ui
                             .add(
                                 egui::DragValue::new(&mut edited)
@@ -195,7 +195,7 @@ pub fn asset_settings_row(
         JsonValue::String(current) => {
             let mut edited = current.clone();
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(key.as_str()).color(style::TEXT_MUTED));
+                ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
                 let response = ui.add(egui::TextEdit::singleline(&mut edited).desired_width(160.0));
                 if response.lost_focus() && edited != *current {
                     settings_commit(pending, asset_path, root, &key, JsonValue::String(edited));
@@ -267,7 +267,7 @@ pub fn colour_parameter_row(
     }
     ui.horizontal_wrapped(|ui| {
         let label = key.rsplit('.').next().unwrap_or(key);
-        ui.label(egui::RichText::new(label).color(style::TEXT_MUTED));
+        ui.label(egui::RichText::new(label).color(style::text_muted()));
         if ui
             .color_edit_button_rgba_unmultiplied(&mut edited)
             .changed()
@@ -322,7 +322,7 @@ pub fn texture_slot_row(
     let mut chosen: Option<Option<String>> = None;
     let mut button_rect = None;
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(slot.as_str()).color(style::TEXT_MUTED));
+        ui.label(egui::RichText::new(slot.as_str()).color(style::text_muted()));
         let response = ui.add_sized(
             egui::vec2(
                 (ui.available_width() - inspector_fields::ASSET_ROW_CLEAR_WIDTH).max(60.0),

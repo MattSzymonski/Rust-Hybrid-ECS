@@ -44,6 +44,17 @@ DESCRIPTION
                         posture links the core, so a crate only the development
                         host and the C# bridge reach must not sit inside it
                         (W-0114).
+      6. UI kit       - `pill_ui_kit` is an rlib for exactly the two UI
+                        dylibs, `pill_editor_core` and `pill_project_ui`: each
+                        embeds the translator and re-exports it. Any other
+                        manifest naming it would compile a third copy into a
+                        link unit that owns no UI.
+      7. staged dylibs - the development host's `ENGINE_DYLIB_STEMS` names
+                        every shared dylib and nothing else. The host stages
+                        those beside a module it isolates; one left out
+                        resolves from the host's own directory instead, and a
+                        module built from a different feature set then cannot
+                        import it.
 
 USAGE
   python devops/tests/test_engine_layout.py [--root <repository>]
@@ -60,6 +71,7 @@ EXAMPLE USAGE
 """
 
 import argparse
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -90,10 +102,27 @@ SHARED_UI_INDEPENDENT_DYLIBS = (
     # project links the UI without the windowing or GPU crates the frontends
     # own.
     ("pill_project_ui", "ui/pill_project_ui"),
+    # The theme pipeline's plain data (W-0127): one shared dylib across the
+    # project, `pill_project_ui`, the editor shell and `pill_editor_core`, so
+    # the `.theme` asset and the `Theme` value have one identity. Egui-free;
+    # the token-to-egui translator is an rlib compiled into each UI.
+    ("pill_ui_theme", "ui/pill_ui_theme"),
     # The egui editor's copy (W-0017): one shared dylib, same rule.
     ("pill_editor_core", "editor/pill_editor_core"),
 )
 UI_FRAMEWORK_CRATES = ("dioxus", "tao", "wry", "winit", "wgpu")
+
+# The UI kit is an rlib for exactly these two dylibs (rule 6).
+KIT_CRATE = "pill_ui_kit"
+KIT_DEPENDENTS = {"pill_editor_core", "pill_project_ui"}
+
+# The development host's list of the shared dylibs it stages beside a module it
+# isolates (rule 7), and the two the engine core owns rather than a UI crate.
+HOST_NATIVE_LIBRARY = Path("hosting") / "pill_host" / "src" / "native_library.rs"
+ENGINE_DYLIB_STEMS_PATTERN = re.compile(
+    r"ENGINE_DYLIB_STEMS: \[&str; \d+\] = \[(.*?)\];", re.DOTALL
+)
+ENGINE_CORE_DYLIBS = ("pill_core", "pill_engine_core")
 
 # The shared core every posture links, by crate name and directory under
 # `modules/`, and the development-host crates it must never name (rule 5). The
@@ -195,6 +224,27 @@ def shared_dylib_failures(root):
     return found
 
 
+# Every manifest outside the two UI dylibs that depends on the UI kit.
+def kit_dependents_failures(root):
+    modules = root / "modules"
+    if not modules.is_dir():
+        return []
+    found = []
+    for manifest in sorted(modules.rglob("Cargo.toml")):
+        relative = manifest.relative_to(modules).as_posix()
+        if relative.startswith(("target/", "pill_standalone_temp/")) or "/target/" in relative:
+            continue
+        if manifest.parent.name.startswith(("host_module_", "host_project_")):
+            continue
+        crate = Crate(manifest)
+        if crate.name in KIT_DEPENDENTS or crate.name == KIT_CRATE:
+            continue
+        if any(dependency.package == KIT_CRATE for dependency in crate.linked()):
+            allowed = " and ".join(sorted(KIT_DEPENDENTS))
+            found.append(f"{crate.name} depends on {KIT_CRATE}; only {allowed} may")
+    return found
+
+
 # Every break of rule 5: a development-host crate in the shared core's library
 # graph, or a non-comment source line under `pill_core/src` naming one.
 def shared_core_failures(root):
@@ -215,6 +265,32 @@ def shared_core_failures(root):
                 if name in stripped:
                     relative = source.relative_to(directory).as_posix()
                     found.append(f"{SHARED_CORE_CRATE}/{relative}:{number}: {stripped}")
+    return found
+
+
+# Every break of rule 7: a shared dylib the development host does not stage, or
+# a staged stem that is not a shared dylib.
+def host_stems_failures(root):
+    source = root / "modules" / HOST_NATIVE_LIBRARY
+    if not source.is_file():
+        return []
+    match = ENGINE_DYLIB_STEMS_PATTERN.search(source.read_text(encoding="utf-8"))
+    if match is None:
+        return [f"{HOST_NATIVE_LIBRARY.as_posix()} declares no `ENGINE_DYLIB_STEMS`"]
+    staged = set(re.findall(r'"([a-z0-9_]+)"', match.group(1)))
+    expected = set(ENGINE_CORE_DYLIBS) | {
+        name
+        for name, relative in SHARED_UI_INDEPENDENT_DYLIBS
+        if (root / "modules" / relative / "Cargo.toml").is_file()
+    }
+    found = [
+        f"{name} is a shared dylib but `ENGINE_DYLIB_STEMS` does not stage it"
+        for name in sorted(expected - staged)
+    ]
+    found.extend(
+        f"{name} is staged by `ENGINE_DYLIB_STEMS` but is not a shared dylib"
+        for name in sorted(staged - expected)
+    )
     return found
 
 
@@ -241,6 +317,14 @@ def check(root):
     failures.extend(
         f"shared core: {failure} (a development-host crate in the shared core)"
         for failure in shared_core_failures(root)
+    )
+    failures.extend(
+        f"UI kit: {failure} (the kit is an rlib for the two UI dylibs)"
+        for failure in kit_dependents_failures(root)
+    )
+    failures.extend(
+        f"staged dylibs: {failure} (the host stages every shared dylib)"
+        for failure in host_stems_failures(root)
     )
     return failures
 
@@ -317,6 +401,23 @@ def self_test():
             {"pill_core": "// the loader's libloading error arrives boxed\n"},
             0,
         ),
+        (
+            "an unexpected dependant on the UI kit fails",
+            {"pill_engine_core": ["pill_ui_kit"], "pill_ui_kit": []},
+            {},
+            1,
+        ),
+        (
+            "the two UI dylibs may depend on the UI kit",
+            {
+                "pill_engine_core": [],
+                "pill_editor_core": ["pill_ui_kit"],
+                "pill_project_ui": ["pill_ui_kit"],
+                "pill_ui_kit": [],
+            },
+            {},
+            0,
+        ),
     ]
     passed = True
     for description, crates, sources, expected_failures in cases:
@@ -367,6 +468,40 @@ def self_test():
         outcome = "PASS" if len(failures) == expected_failures else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # Rule 7: every shared dylib staged by the development host, nothing else.
+    for description, stems, expected_failures in (
+        (
+            "every shared dylib staged passes",
+            ["pill_core", "pill_engine_core", "pill_editor_core"],
+            0,
+        ),
+        ("a shared dylib the host does not stage fails", ["pill_core", "pill_engine_core"], 1),
+        (
+            "a staged stem that is not a shared dylib fails",
+            ["pill_core", "pill_engine_core", "pill_editor_core", "pill_gone"],
+            1,
+        ),
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "modules" / "editor" / "pill_editor_core"
+            (directory / "src").mkdir(parents=True, exist_ok=True)
+            (directory / "Cargo.toml").write_text(
+                '[package]\nname = "pill_editor_core"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            body = "\n".join(f'    "{stem}",' for stem in stems)
+            source = root / "modules" / HOST_NATIVE_LIBRARY
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                f"pub(crate) const ENGINE_DYLIB_STEMS: [&str; {len(stems)}] = [\n{body}\n];\n",
+                encoding="utf-8",
+            )
+            failures = host_stems_failures(root)
+        outcome = "PASS" if len(failures) == expected_failures else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -388,8 +523,9 @@ def main():
         return 1
     print(
         "  PASS  engine layout: the core does not link the facade, reads no registry, "
-        "module-abi is gone, the shared UI dylibs are UI-independent dylibs, and the "
-        "shared core names no development-host crate"
+        "module-abi is gone, the shared UI dylibs are UI-independent dylibs, the "
+        "shared core names no development-host crate, the UI kit is named only by "
+        "the two UI dylibs, and the host stages every shared dylib"
     )
     return 0
 

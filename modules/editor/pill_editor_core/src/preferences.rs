@@ -47,7 +47,7 @@ pub struct PreferenceField {
 }
 
 /// The editable rows, in the order the tab draws them.
-pub const PREFERENCE_FIELDS: [PreferenceField; 10] = [
+pub const PREFERENCE_FIELDS: [PreferenceField; 11] = [
     PreferenceField {
         key: "keymap_preset",
         label: "keymap preset",
@@ -98,7 +98,17 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 10] = [
         label: "undo memory MB",
         fallback: "",
     },
+    PreferenceField {
+        key: THEME_PREFERENCE_KEY,
+        label: "theme file",
+        fallback: "",
+    },
 ];
+
+/// The preference key the editor's user theme layer is named under: a
+/// `.theme`/`.json` file, absolute or relative to the state directory
+/// (W-0127 Stage 6).
+pub const THEME_PREFERENCE_KEY: &str = "theme";
 
 /// The keymap preset the file selects, or the default (Blender) when the
 /// key is absent, blank or unknown - the preset the viewport navigation

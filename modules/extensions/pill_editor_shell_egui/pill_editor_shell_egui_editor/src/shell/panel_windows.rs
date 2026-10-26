@@ -23,10 +23,6 @@
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 
-/// The dim a modal puts over the editor behind it.
-#[allow(dead_code)]
-const MODAL_DIM: egui::Color32 = egui::Color32::from_black_alpha(120);
-
 /// The panel data every window draw reads, gathered once per pass.
 pub struct PanelFeed {
     /// The world's entities, as the panels see them.

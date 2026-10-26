@@ -174,6 +174,21 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     ("test", "-p", "pill_ui_frame", "--offline"),
                                     "pill_project_ui changed"))
 
+    # The theme pipeline (W-0127): the token crate, the UI kit and the three
+    # places that configure it - the editor's style module, the editor's
+    # settings file in the host, and the game UI that installs it. The crates'
+    # unit tests plus the two suites that read the pipeline's log lines; the
+    # editor's own rule below already selects its crate tests and suite when
+    # the style module moves.
+    if has("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
+           "modules/editor/pill_editor_core/src/style.rs",
+           "modules/hosting/pill_host/src/config.rs"):
+        selected.append(cargo_check("test theme crates",
+                                    ("test", "-p", "pill_ui_theme", "-p", "pill_ui_kit",
+                                     "-p", "pill_project_ui", "--offline"),
+                                    "theme pipeline changed"))
+        selected.append(suite_check("test_ui_theme.py", "theme pipeline changed"))
+
     # The editor: the shell module, frontend and the editor-side crates.
     # The frontend-facing suites are picked per area; run_all handles the rest.
     # The egui editor: the shared model crate, the UI library, the reloadable
@@ -290,6 +305,9 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
 RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("pill-ui-frame", ("modules/rendering/pill_ui_frame/**",)),
     ("pill-project-ui", ("modules/ui/pill_project_ui/**",)),
+    ("theme-pipeline", ("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
+                        "modules/editor/pill_editor_core/src/style.rs",
+                        "modules/hosting/pill_host/src/config.rs")),
     ("egui-editor", ("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
                      "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),

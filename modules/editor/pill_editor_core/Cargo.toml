@@ -40,6 +40,12 @@ pill_renderer_api = { path = "../../rendering/pill_renderer_api" }
 egui = { version = "0.36.2", default-features = false, features = [
     "default_fonts",
 ] }
+# The theme pipeline (W-0127): the shared plain theme data, and the rlib
+# translator + variants compiled into this dylib's own link unit (so no egui
+# value crosses a DLL boundary). Only this crate and `pill_project_ui` may
+# depend on the kit; both re-export it as `kit`.
+pill_ui_theme = { path = "../../ui/pill_ui_theme" }
+pill_ui_kit = { path = "../../ui/pill_ui_kit" }
 # Docking (plan decision E2): tabs, splits and undocked windows. `serde`
 # lets the layout model persist the dock.
 egui_dock = { version = "0.21.1", default-features = false, features = [

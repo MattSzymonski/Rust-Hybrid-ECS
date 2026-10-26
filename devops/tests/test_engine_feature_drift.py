@@ -87,10 +87,12 @@ ENGINE_DYLIBS = (
     "pill_ui_frame",
 )
 
-# The egui editor's shared dylib: the egui boundary and its model. Only the
-# postures that load egui editor parts resolve it.
+# The egui editor's shared dylibs: the egui boundary and its model, and the
+# theme pipeline's plain data it links (W-0127). Only the postures that load
+# egui editor parts resolve them.
 EGUI_EDITOR_DYLIBS = (
     "pill_editor_core",
+    "pill_ui_theme",
 )
 
 # The editor family is the egui one alone (W-0043 retired the `pill_ui`

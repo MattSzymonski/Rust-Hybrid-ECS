@@ -58,12 +58,20 @@ pub fn init(engine: &mut Engine) -> u32 {
 
     // The tuning overlay's egui context: installed once and kept across a
     // project reload, so the reloaded overlay finds the same fonts and the same
-    // widget state (the shape `DemoState` uses). `install` claims both resource
-    // types every generation - the reload releases exactly the resources the
-    // new generation does not re-register - and inserts the values only when no
-    // earlier generation left them behind. The frame slot it installs is also
-    // what tells the renderer that this world's UI is the game's.
-    pill_project_ui::install(engine);
+    // widget state (the shape `DemoState` uses). `install_with_theme` claims
+    // both resource types every generation - the reload releases exactly the
+    // resources the new generation does not re-register - and inserts the
+    // values only when no earlier generation left them behind. The frame slot
+    // it installs is also what tells the renderer that this world's UI is the
+    // game's. The theme's code default is the brutalist recipe; the `.theme`
+    // file changes only the accent and the heading size, and the code default
+    // names the body font the project ships (W-0127).
+    let mut theme = pill_project_ui::Theme::brutalist();
+    theme.fonts.body = Some("fonts/Silkscreen-Regular.ttf".to_string());
+    pill_project_ui::install_with_theme(
+        engine,
+        pill_project_ui::ThemeInstall::new(theme).with_override("ui/accent.theme"),
+    );
 
     engine.register_system("fps_camera", camera::fps_camera_system);
     engine.register_system("camera_fov", camera::camera_fov_changing_system);

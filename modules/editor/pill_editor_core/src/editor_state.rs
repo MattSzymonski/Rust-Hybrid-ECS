@@ -448,6 +448,18 @@ pub struct EditorSnapshot {
     /// The preferences file's values and the current project's remembered
     /// entry (Stage 20); the Preferences tab's rows read them.
     pub preferences: crate::preferences::PreferencesView,
+    /// The theme the editor's UI paints with (W-0127 Stage 6): the code
+    /// default merged with the user's and the project's layers.
+    pub theme: pill_ui_theme::Theme,
+    /// How many themes the executable has resolved. The shell installs
+    /// [`Self::theme`] when this differs from the generation it applied.
+    pub theme_generation: u64,
+    /// The layers [`Self::theme`] was merged from, in apply order; the code
+    /// default is always first.
+    pub theme_layers: Vec<crate::style::ThemeLayerInfo>,
+    /// The font bytes the theme's layers resolved (W-0127 Stage 7), installed
+    /// with the theme.
+    pub theme_fonts: crate::kit::style::ThemeFonts,
     /// How many steps the undo history holds; the menu bar's Undo row greys
     /// out at zero.
     pub undo_depth: usize,
@@ -531,6 +543,13 @@ impl EditorSnapshot {
                 .map(|cameras| cameras.grid.enabled)
                 .unwrap_or(false),
             preferences: crate::preferences::PreferencesView::default(),
+            // The code default until the executable resolves its layers
+            // (W-0127 Stage 6): every postures' first frame paints the editor
+            // look rather than the crate's neutral fallback.
+            theme: crate::style::default_theme(),
+            theme_generation: 1,
+            theme_layers: vec![crate::style::ThemeLayerInfo::code()],
+            theme_fonts: crate::kit::style::ThemeFonts::default(),
             undo_depth: 0,
             redo_depth: 0,
             scene_title: engine
@@ -1963,6 +1982,21 @@ impl EditorCommand {
                                 ),
                             });
                         }
+                    }
+                }
+                // The file is gone, so the asset it held must go with it: a
+                // re-created path would otherwise collide with the loaded
+                // value on the guid the create writes (W-0122).
+                if let Some(registry) = engine
+                    .world()
+                    .get_resource::<pill_engine::ImportRegistry>()
+                    .cloned()
+                {
+                    if let Some(assets) = engine
+                        .world_mut()
+                        .get_resource_mut::<pill_engine::AssetManager>()
+                    {
+                        registry.remove_loaded(&mut *assets, &relative);
                     }
                 }
                 Ok(CommandOutcome::inverse(EditorCommand::RestoreAssetFile {
@@ -3747,6 +3781,81 @@ mod tests {
             );
             drop(held);
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A created asset that an undo deleted comes back when the step is
+    /// redone: the delete unloads the asset with its file, so the redo's
+    /// create can import the fresh file instead of colliding on a guid the
+    /// store still holds (W-0122).
+    #[test]
+    fn a_redone_create_writes_the_file_again() {
+        let _mount = asset_mount_lock();
+        let root =
+            std::env::temp_dir().join(format!("pill-editor-asset-redo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = Engine::new();
+        pill_ui_theme::register(engine.world_mut());
+        engine
+            .world_mut()
+            .insert_resource(crate::history::CommandHistory::default());
+        engine
+            .world_mut()
+            .insert_resource(crate::commands::PendingEditorCommands::default());
+
+        let create = EditorCommand::CreateStandaloneAsset {
+            type_name: "pill_ui_theme::ThemeOverrides".to_owned(),
+            folder: String::new(),
+            name: "probe".to_owned(),
+        };
+        let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&create));
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        let path = root.join("probe.theme");
+        assert!(path.exists(), "the create writes the file");
+        {
+            let world = engine.world_mut();
+            let history = world
+                .get_resource_mut::<crate::history::CommandHistory>()
+                .unwrap();
+            history.push(
+                crate::history::HistoryEntry::engine(
+                    "create asset probe".to_owned(),
+                    vec![create],
+                    recorded.inverses,
+                ),
+                0,
+                crate::history::CommandHistory::DEFAULT_COALESCE_WINDOW,
+            );
+        }
+
+        let undo = crate::drain::step_history(&mut engine, crate::drain::HistoryDirection::Undo);
+        assert!(
+            matches!(undo, crate::drain::HistoryOutcome::Queued { .. }),
+            "{undo:?}"
+        );
+        crate::drain::apply_pending(&mut engine, 1);
+        assert!(!path.exists(), "the undo deletes the file");
+
+        let redo = crate::drain::step_history(&mut engine, crate::drain::HistoryDirection::Redo);
+        assert!(
+            matches!(redo, crate::drain::HistoryOutcome::Queued { .. }),
+            "{redo:?}"
+        );
+        let replay = {
+            let world = engine.world_mut();
+            let pending = world
+                .get_resource_mut::<crate::commands::PendingEditorCommands>()
+                .unwrap();
+            std::mem::take(&mut pending.batches)
+        };
+        assert_eq!(replay.len(), 1, "the redo queues one batch");
+        let recorded = EditorCommand::apply_recorded(&mut engine, &replay[0].commands);
+        assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);
+        assert!(path.exists(), "the redo writes the file again");
 
         let _ = std::fs::remove_dir_all(&root);
     }

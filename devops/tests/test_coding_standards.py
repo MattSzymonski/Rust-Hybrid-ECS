@@ -33,6 +33,11 @@ DESCRIPTION
                           egui's `Context` (plan decision E4, W-0017): no
                           `data`/`data_mut`, repaint callbacks, plugin
                           callbacks or `PaintCallback` shapes.
+      7. colour literals - the editor's UI code takes its colours from the
+                          theme (W-0127): `pill_editor_core::style` owns the
+                          tokens and the shell asks for a role, so a
+                          `Color32::` literal there is refused except at the
+                          colour-maths sites listed beside the rule.
 
     The two window sizes are tunable through the environment, matching the
     shell version: `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES`
@@ -214,6 +219,88 @@ EGUI_CONTEXT_STORAGE_PATTERNS = (
 # previous generation's value uses it - production code in a reloadable crate
 # never does, and the exemption is per line so it cannot cover a module.
 EGUI_STATE_MARKER_PATTERN = re.compile(r"egui-state-ok")
+
+# The editor's look lives in theme tokens (W-0127): `pill_editor_core::style`
+# owns the tokens and the shell asks for a role ([`text`], [`panel`], ...). A
+# `Color32::` literal in the editor's UI code is a colour that bypasses the
+# theme, so it is refused everywhere except at the sites whose job IS colour
+# maths - listed below with the reason each needs one.
+COLOUR_LITERAL_PATTERN = re.compile(r"Color32::(from_[a-z_]+|[A-Z][A-Z_]+)")
+COLOUR_LITERAL_AREAS = (
+    "modules/editor/pill_editor_core/src",
+    "modules/editor/pill_editor/src",
+    "modules/extensions/pill_editor_shell_egui/",
+    "modules/frontends/pill_web/src",
+    # The kit translates and draws from the same tokens: a literal here would
+    # bypass the theme for both UIs at once (W-0127 Stage 8).
+    "modules/ui/pill_ui_kit/src",
+)
+
+# (path suffix, line fragment, why the site needs its own colour).
+COLOUR_LITERAL_ALLOWLIST = (
+    (
+        "pill_editor_core/src/style.rs",
+        "Color32::from_rgba_unmultiplied",
+        "the token-to-egui conversion",
+    ),
+    (
+        "pill_editor_core/src/style.rs",
+        "Color32::TRANSPARENT",
+        "an unfilled tab or an outline the fill alone replaces",
+    ),
+    (
+        "pill_editor_core/src/icons.rs",
+        "Color32::from_rgba_unmultiplied",
+        "the duotone layers' alpha maths",
+    ),
+    (
+        "pill_editor_core/src/icons.rs",
+        "Color32::from_rgb(200, 100, 50)",
+        "an icon test's sample colour",
+    ),
+    (
+        "pill_editor_core/src/brand.rs",
+        "Color32::from_white_alpha",
+        "the brand mark's coverage alpha",
+    ),
+    (
+        "pill_editor_core/src/inspector.rs",
+        "Color32::from_rgb",
+        "the axis colours shared with the gizmo",
+    ),
+    (
+        "pill_editor_core/src/inspector.rs",
+        "Color32::GRAY",
+        "the axis colour's fallback",
+    ),
+    (
+        "shell/assets_tiles.rs",
+        "Color32::WHITE",
+        "an untinted image",
+    ),
+    ("shell/bar.rs", "Color32::TRANSPARENT", "clearing a fill"),
+    ("shell/tests.rs", "Color32::WHITE", "a test's untinted image"),
+    (
+        "pill_ui_kit/src/style.rs",
+        "Color32::TRANSPARENT",
+        "an unfilled tab or an outline the fill alone replaces",
+    ),
+    (
+        "pill_ui_kit/src/style.rs",
+        "Color32::from_rgba_unmultiplied",
+        "the token-to-egui conversion",
+    ),
+    (
+        "pill_ui_kit/src/variants.rs",
+        "Color32::from_rgba_unmultiplied",
+        "the variant's token-to-egui conversion",
+    ),
+    (
+        "pill_ui_kit/src/widgets.rs",
+        "Color32::from_rgba_unmultiplied",
+        "the token-to-egui conversion",
+    ),
+)
 
 
 # =============================================================================
@@ -626,10 +713,42 @@ def check_egui_context_storage(
                 )
 
 
+# Flags a colour literal in the editor's UI code; see `COLOUR_LITERAL_AREAS`.
+def check_colour_literals(
+    lines: List[str], display_path: str, collector: ViolationCollector
+) -> None:
+    """Flags `Color32::` literals outside the theme's colour-maths allowlist.
+
+    The editor's look is a theme (W-0127): `pill_editor_core::style` translates
+    the tokens and the shell asks for a role, so a literal here is a colour the
+    next restyle will miss. The allowlist is per line fragment, so an exempt
+    site cannot cover the file it sits in.
+    """
+    if not any(display_path.startswith(area) for area in COLOUR_LITERAL_AREAS):
+        return
+    for index, line in enumerate(lines):
+        if COMMENT_LINE_PATTERN.match(line):
+            continue
+        match = COLOUR_LITERAL_PATTERN.search(line)
+        if match is None:
+            continue
+        allowed = any(
+            display_path.endswith(suffix) and fragment in line
+            for suffix, fragment, _reason in COLOUR_LITERAL_ALLOWLIST
+        )
+        if allowed:
+            continue
+        collector.record(
+            display_path,
+            "colour literal",
+            f"line {index + 1}: `{match.group(0)}` bypasses the theme; ask "
+            "`pill_editor_core::style` for a role instead (W-0127)",
+        )
+
+
 # =============================================================================
 # Self test
 # =============================================================================
-
 
 class SilentCollector(ViolationCollector):
     """A collector for the self test: counts violations without printing."""
@@ -720,6 +839,46 @@ def self_test() -> int:
         outcome = "PASS" if collector.violation_count == expected else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # Rule 7: a colour literal in the editor's UI code, unless allowlisted.
+    colour_cases = (
+        (
+            "a colour literal in the editor shell fails",
+            "modules/extensions/pill_editor_shell_egui/pill_editor_shell_egui_editor/src/shell/views.rs",
+            "let fill = egui::Color32::from_rgb(1, 2, 3);\n",
+            1,
+        ),
+        (
+            "a named colour in the editor core fails",
+            "modules/editor/pill_editor_core/src/session.rs",
+            "let clear = Color32::TRANSPARENT;\n",
+            1,
+        ),
+        (
+            "an allowlisted colour-maths line passes",
+            "modules/editor/pill_editor_core/src/inspector.rs",
+            "0 => Color32::from_rgb(214, 96, 96),\n",
+            0,
+        ),
+        (
+            "a colour literal outside the editor passes",
+            "modules/ui/pill_project_ui/src/lib.rs",
+            "let accent = Color32::from_rgb(1, 2, 3);\n",
+            0,
+        ),
+        (
+            "a comment naming a colour passes",
+            "modules/editor/pill_editor_core/src/style.rs",
+            "// Color32::from_rgb is only for the conversion helpers\n",
+            0,
+        ),
+    )
+    for description, display_path, source, expected in colour_cases:
+        collector = SilentCollector()
+        check_colour_literals(source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -769,7 +928,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--self-test",
         action="store_true",
         dest="self_test",
-        help="Run the planted-violation self test of the egui-state rule, then exit",
+        help="Run the planted-violation self tests, then exit",
     )
     parser.add_argument(
         "--report",
@@ -870,29 +1029,33 @@ def main() -> int:
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/6) Module header")
+    section("(1/7) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/6) Safety comments")
+    section("(2/7) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/6) Public item docs")
+    section("(3/7) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/6) Import group order")
+    section("(4/7) Import group order")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
 
-    section("(5/6) Tests at the bottom")
+    section("(5/7) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/6) egui state (reloadable crates)")
+    section("(6/7) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
+
+    section("(7/7) colour literals (editor UI)")
+    for _, display_path, lines, _text in sources:
+        check_colour_literals(lines, display_path, collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

@@ -32,7 +32,12 @@ and space switches), the Preferences tab (a seeded preferences file whose
 step cap the live reader applies at startup, a scripted row whose save
 reaches the file and the reader, the saved snapping step steering a
 snapped drag, the history trimming at a tiny cap, and a tool choice
-persisting into the project's remembered entry), the Game tab's viewport
+persisting into the project's remembered entry), the editor's theme layers
+(a user file named by the `theme` preference, a project file under
+`res/editor/` that `editor_settings.yaml` re-points, an out-of-scope path
+refused with the rule, a legacy name reported and a broken user file
+refused while the other layer applies - each checked through `dump theme`),
+the Game tab's viewport
 (the primary surface's child window placed at the tab's body while that tab
 is the visible one, and hidden with it), the floating toolbox (its rows
 switching the tool without picking the scene, and a scripted pointer drag
@@ -262,6 +267,17 @@ PREFERENCES_DUMP_TOKEN = "[test] preferences"
 PREFERENCES_APPLIED_TOKEN = "[editor] preferences applied"
 PREFERENCES_SAVED_TOKEN = "[editor] preferences saved"
 PREFERENCE_EDIT_QUEUED_TOKEN = "[editor] preference edit queued"
+# The editor's theme layers (W-0127 Stage 6): the executable logs each
+# resolution, the shell logs each install, the dump reports what the shell
+# would install, and a refused or legacy layer says so.
+EDITOR_THEME_RESOLVED_TOKEN = "[editor] theme resolved"
+EDITOR_THEME_APPLIED_TOKEN = "[editor] theme applied"
+EDITOR_THEME_DUMP_TOKEN = "[test] theme"
+EDITOR_THEME_REFUSED_TOKEN = "[editor] theme refused layer="
+EDITOR_THEME_LEGACY_TOKEN = "[editor] theme name"
+# The fonts a theme layer names (W-0127 Stage 7): an install, a refusal.
+EDITOR_FONTS_INSTALLED_TOKEN = "[editor] fonts installed"
+EDITOR_FONT_REFUSED_TOKEN = "[editor] font refused"
 GIZMO_PREFERENCES_WRITTEN_TOKEN = "[editor] gizmo preferences written"
 HISTORY_TRIMMED_TOKEN = "[editor] history trimmed"
 GAME_VIEW_RECT_TOKEN = "[editor] game view rect"
@@ -872,6 +888,11 @@ def main() -> int:
     for meta_path in inspector_metas:
         assert meta_path.is_file(), f"the settings step's sidecar is missing: {meta_path}"
         original_metas[meta_path] = meta_path.read_bytes()
+    # The theme layers' files (W-0127 Stage 6) live under `res/editor/` and in
+    # the project root; the example ships neither, so the step writes them and
+    # the finally block takes them off the disk again.
+    theme_root = asset_root / "editor"
+    editor_settings_path = asset_root.parent / "editor_settings.yaml"
     # The phases wait for two row heartbeats, a scene-selection probe, a
     # gizmo drag phase, the assets pipeline and a patch compile; the
     # executable's seconds deadline is a hang guard, kept comfortably above
@@ -3803,6 +3824,318 @@ def main() -> int:
         ), session.read_log()[begin:][-600:]
         print("  [OK] the project's remembered tool round-trips")
 
+        # Step 4d2: the editor's theme layers (W-0127 Stage 6). Three layers
+        # sit over the code default - the user's file, named by the `theme`
+        # preference and read from the state directory, and the project's file
+        # under `res/editor/`, named by `editor_settings.yaml` - and the
+        # project wins where both name the same item. Every step goes through
+        # the files a person would edit; `dump theme` reports the merge the
+        # shell installs.
+
+        def write_theme_file(path: Path, guid: str, body) -> None:
+            """Writes one standalone `.theme` document, the shape the loader reads."""
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "asset_type": "pill_ui_theme::ThemeOverrides",
+                        "guid": guid,
+                        "asset": body,
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        def dump_theme(label: str) -> str:
+            """One `dump theme` line: the merge the shell installs."""
+            text = session.request(
+                "dump theme", re.escape(EDITOR_THEME_DUMP_TOKEN), 30, label
+            )
+            return [
+                row for row in text.splitlines() if EDITOR_THEME_DUMP_TOKEN in row
+            ][-1]
+
+        def assert_theme(
+            line: str, layers: str, accent: str, panel: str, label: str
+        ) -> int:
+            """Asserts one dump and returns its generation."""
+            assert "layers={}".format(layers) in line, "{}: {}".format(label, line)
+            assert "accent={}".format(accent) in line, "{}: {}".format(label, line)
+            assert "panel={}".format(panel) in line, "{}: {}".format(label, line)
+            print("  [OK] {}".format(label))
+            return int(re.search(r"generation=(\d+)", line).group(1))
+
+        # 1. The user's file: an accent and a panel fill over the code default.
+        user_theme_path = session.sandbox / "RustHybridEcs" / "theme_user.json"
+        user_theme_path.write_text(
+            json.dumps({"palette": {"accent": "#ff488c", "panel": "#101820"}}),
+            encoding="utf-8",
+        )
+        begin = len(session.read_log())
+        session.send("edit preference theme theme_user.json")
+        session.wait(re.escape(PREFERENCES_SAVED_TOKEN), 30, "the theme row saved", begin)
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,user\s+generation=\d+",
+            60,
+            "the user layer merged",
+            begin,
+        )
+        session.wait(
+            re.escape(EDITOR_THEME_APPLIED_TOKEN)
+            + r"\s+layers=code,user\s+user=\S*theme_user\.json",
+            60,
+            "the shell installed the user layer",
+            begin,
+        )
+        user_generation = assert_theme(
+            dump_theme("the user layer dumped"),
+            "code,user",
+            "#ff488c",
+            "#101820",
+            "the user file's accent and panel fill applied",
+        )
+
+        # 2. The project's own file names only the accent: it wins over the
+        # user's accent and leaves the user's panel fill alone.
+        write_theme_file(
+            theme_root / "editor.theme",
+            "000000000000000000000000000000b1",
+            {"palette": {"accent": "#33d17a"}},
+        )
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN)
+            + r"\s+layers=code,user,project\s+generation=\d+",
+            60,
+            "the project layer merged",
+            begin,
+        )
+        project_generation = assert_theme(
+            dump_theme("the project layer dumped"),
+            "code,user,project",
+            "#33d17a",
+            "#101820",
+            "the project's accent won and the user's panel fill stayed",
+        )
+        assert project_generation > user_generation, (
+            "the project layer did not raise the generation: {}".format(
+                (user_generation, project_generation)
+            )
+        )
+
+        # 3. Editing the project's file reaches the editor: the store
+        # reimports it and the merge runs again.
+        write_theme_file(
+            theme_root / "editor.theme",
+            "000000000000000000000000000000b1",
+            {"palette": {"accent": "#0aa1ff"}},
+        )
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN)
+            + r"\s+layers=code,user,project\s+generation=\d+",
+            60,
+            "the edited project layer merged",
+            begin,
+        )
+        edited_generation = assert_theme(
+            dump_theme("the edited project layer dumped"),
+            "code,user,project",
+            "#0aa1ff",
+            "#101820",
+            "an edited project theme re-applied",
+        )
+        assert edited_generation > project_generation, (
+            "the edited project file did not raise the generation: {}".format(
+                (project_generation, edited_generation)
+            )
+        )
+
+        # 4. `editor_settings.yaml` points the project layer at another file
+        # without a restart.
+        write_theme_file(
+            theme_root / "alt.theme",
+            "000000000000000000000000000000b2",
+            {"palette": {"accent": "#d17a33"}},
+        )
+        editor_settings_path.write_text(
+            'editor_theme: "editor/alt.theme"\n', encoding="utf-8"
+        )
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN)
+            + r"\s+layers=code,user,project\s+generation=\d+",
+            60,
+            "the named project layer merged",
+            begin,
+        )
+        switched = dump_theme("the named project layer dumped")
+        assert "project=editor/alt.theme" in switched, switched
+        switched_generation = assert_theme(
+            switched,
+            "code,user,project",
+            "#d17a33",
+            "#101820",
+            "the settings file switched the project layer live",
+        )
+        assert switched_generation > edited_generation, (
+            "the switched layer did not raise the generation: {}".format(
+                (edited_generation, switched_generation)
+            )
+        )
+
+        # 5. A path outside `editor/` is refused with the rule, and the
+        # remaining layers still apply.
+        editor_settings_path.write_text('editor_theme: "ui/x.theme"\n', encoding="utf-8")
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_THEME_REFUSED_TOKEN)
+            + r"project: [^\n]*must be under `editor/`",
+            60,
+            "the out-of-scope theme refused with the rule",
+            begin,
+        )
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,user\s+generation=\d+",
+            60,
+            "the refused project layer skipped",
+            begin,
+        )
+        refused = dump_theme("the refused project layer dumped")
+        assert "project=none" in refused, refused
+        assert_theme(
+            refused,
+            "code,user",
+            "#ff488c",
+            "#101820",
+            "a refused project layer left the user's layer in force",
+        )
+
+        # 6. A name an earlier build understood names no file: it is reported
+        # once, and the project layer still applies.
+        editor_settings_path.unlink(missing_ok=True)
+        begin = len(session.read_log())
+        session.send("edit preference theme dark")
+        session.wait(
+            re.escape(EDITOR_THEME_LEGACY_TOKEN)
+            + r" 'dark' is not a file; no user layer",
+            60,
+            "the legacy theme name reported",
+            begin,
+        )
+        session.wait(
+            re.escape(EDITOR_THEME_RESOLVED_TOKEN) + r"\s+layers=code,project\s+generation=\d+",
+            60,
+            "the project layer alone applied",
+            begin,
+        )
+        assert_theme(
+            dump_theme("the legacy name dumped"),
+            "code,project",
+            "#0aa1ff",
+            "#1a1a1d",
+            "a legacy theme name left the project layer alone",
+        )
+
+        # 7. A user file the merge refuses is named with its item, and the
+        # project layer still applies: one broken file costs only itself.
+        broken_path = session.sandbox / "RustHybridEcs" / "broken.theme"
+        broken_path.write_text(
+            json.dumps({"palette": {"accent": "not-a-colour"}}), encoding="utf-8"
+        )
+        begin = len(session.read_log())
+        session.send("edit preference theme broken.theme")
+        session.wait(
+            re.escape(EDITOR_THEME_REFUSED_TOKEN)
+            + r"user: [^\n]*palette\.accent",
+            60,
+            "the broken user layer refused with its item",
+            begin,
+        )
+        assert_theme(
+            dump_theme("the broken user layer dumped"),
+            "code,project",
+            "#0aa1ff",
+            "#1a1a1d",
+            "a refused user layer left the project's layer in force",
+        )
+        print("  [OK] the theme layers merge in order, live, and refuse individually")
+
+        # 8. The project layer's font (W-0127 Stage 7). A `.ttf` under
+        # `res/editor/` loads through the project's asset store and installs
+        # ahead of the editor's own families; a path that ships nothing is
+        # refused by name and leaves that family to the built-ins.
+        font_directory = theme_root / "fonts"
+        font_directory.mkdir(parents=True, exist_ok=True)
+        (font_directory / "Silkscreen-Regular.ttf").write_bytes(
+            (
+                REPOSITORY_ROOT
+                / "examples"
+                / "circus_demo"
+                / "res"
+                / "fonts"
+                / "Silkscreen-Regular.ttf"
+            ).read_bytes()
+        )
+        write_theme_file(
+            theme_root / "font.theme",
+            "000000000000000000000000000000b3",
+            {
+                "palette": {"accent": "#33d17a"},
+                "fonts": {"body": "editor/fonts/missing.ttf"},
+            },
+        )
+        editor_settings_path.write_text(
+            'editor_theme: "editor/font.theme"\n', encoding="utf-8"
+        )
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_FONT_REFUSED_TOKEN) + r"[^\n]*missing\.ttf",
+            60,
+            "the missing font refused by name",
+            begin,
+        )
+        # The font that is there installs, and the signature is not the one the
+        # built-in families alone produce.
+        installed_before = re.findall(
+            r"signature=([0-9a-f]{16})", session.read_log()
+        )[-1]
+        write_theme_file(
+            theme_root / "font.theme",
+            "000000000000000000000000000000b3",
+            {
+                "palette": {"accent": "#33d17a"},
+                "fonts": {"body": "editor/fonts/Silkscreen-Regular.ttf"},
+            },
+        )
+        begin = len(session.read_log())
+        session.wait(
+            re.escape(EDITOR_FONTS_INSTALLED_TOKEN) + r"\s+signature=([0-9a-f]{16})",
+            60,
+            "the project's font installed",
+            begin,
+        )
+        installed_after = re.findall(r"signature=([0-9a-f]{16})", session.read_log()[begin:])[-1]
+        assert installed_after != installed_before, (
+            "the installed font set did not change the signature: {}".format(
+                (installed_before, installed_after)
+            )
+        )
+        assert_theme(
+            dump_theme("the project font dumped"),
+            "code,project",
+            "#33d17a",
+            "#1a1a1d",
+            "the font's layer kept its own accent and the editor's panel",
+        )
+        print("  [OK] a project font loads, installs and refuses with its name")
+        font_generation = int(
+            re.search(r"generation=(\d+)", dump_theme("the font step's last dump")).group(1)
+        )
+
         # Step 4e: the Game tab's viewport (Stage 21) - the primary
         # surface's child window sits at the active tab's body, so the
         # project shows through it, and hides when another tab of the
@@ -4727,6 +5060,10 @@ def main() -> int:
         reloads = occurrence_count(session, re.escape(EXTENSION_RELOAD_TOKEN))
         loads = occurrence_count(session, re.escape(EGUI_SHELL_LOADED_TOKEN))
         claims = occurrence_count(session, re.escape(SHELL_CONTEXT_CLAIMED_TOKEN))
+        # The theme the executable resolved before the reload (W-0127
+        # Stage 6): a reloaded shell seeds its applied generation from the
+        # record, so it installs nothing again.
+        applies = occurrence_count(session, re.escape(EDITOR_THEME_APPLIED_TOKEN))
         session.edit_source(shell_source, structural)
         session.wait_occurrence(
             re.escape(EXTENSION_RELOAD_TOKEN), reloads + 1, 180, "shell reload"
@@ -4758,6 +5095,16 @@ def main() -> int:
             session, highest, 120, "frame counter survived the reload"
         )
         print("  [OK] shell reloaded, dock and counter kept")
+        # The theme was not installed again: the record already held it, and
+        # the reloaded generation read its generation from there.
+        assert occurrence_count(session, re.escape(EDITOR_THEME_APPLIED_TOKEN)) == applies, (
+            "the shell reload installed the theme again"
+        )
+        themed = dump_theme("theme after the shell reload")
+        assert f"generation={font_generation}" in themed, (
+            "the reloaded shell lost the resolved theme: {}".format(themed)
+        )
+        print("  [OK] the theme survived the shell reload without a re-install")
 
         # The pop-out that was open across the reload kept its window: the
         # new generation cleared its context before drawing into it, and the
@@ -5010,6 +5357,16 @@ def main() -> int:
         # come back through undo.
         for meta_path, original in original_metas.items():
             meta_path.write_bytes(original)
+        # The theme layers' files, the font they name and the project's editor
+        # settings go together: the example ships none of them.
+        if theme_root.is_dir():
+            for theme_file in sorted(theme_root.rglob("*"), reverse=True):
+                if theme_file.is_file():
+                    theme_file.unlink(missing_ok=True)
+                elif theme_file.is_dir():
+                    theme_file.rmdir()
+            theme_root.rmdir()
+        editor_settings_path.unlink(missing_ok=True)
 
     # Step 11: the layout survives a restart (W-0026 Stage 4). The session
     # above quit through File -> Quit, which wrote the rearranged dock - the

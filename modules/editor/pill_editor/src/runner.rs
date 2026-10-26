@@ -77,6 +77,9 @@ use pill_editor_core::scripted::{
     AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
 };
 use pill_editor_core::session::{EguiShellState, HistoryRequest};
+use pill_editor_core::style::{
+    layers_text, merge_layers, ThemeLayer, ThemeLayerInfo, UserThemeSelection,
+};
 use pill_editor_core::systems;
 use pill_engine_core::common_components::TRANSFORM_SHARED_NAME;
 use pill_engine_core::debug_draw::{DebugDraw, DebugStyle};
@@ -90,6 +93,7 @@ use pill_runtime::{
     frame_grid, CameraBinding, CameraComponent, FrameDriver, PickHit, PickRequests, PickResults,
     SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
 };
+use pill_ui_theme::{load_overrides, ThemeOverrides, ThemePathScope};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
@@ -790,6 +794,23 @@ struct EditorWindow {
     /// The parsed preferences document the snapshot's view and the scripted
     /// dump build on.
     preferences_document: serde_json::Map<String, serde_json::Value>,
+    /// The theme the editor's UI paints with (W-0127 Stage 6): the code
+    /// default merged with the user's file and the project's layer.
+    theme: pill_ui_theme::Theme,
+    /// How many themes the layers have resolved to; the shell installs a new
+    /// one when this moves and leaves the current one alone when it does not.
+    theme_generation: u64,
+    /// The layers [`Self::theme`] was merged from, in apply order.
+    theme_layers: Vec<ThemeLayerInfo>,
+    /// The font bytes the layers resolved (W-0127 Stage 7): the snapshot
+    /// carries them beside the theme, so the shell installs both together.
+    theme_fonts: pill_editor_core::kit::style::ThemeFonts,
+    /// What the last theme resolution read, so a poll only merges when a
+    /// layer moved.
+    theme_watch: ThemeWatch,
+    /// The generation the fallback context paints, so the no-shell posture
+    /// follows a theme change the same way the shell does.
+    fallback_theme_generation: u64,
     /// The project directory name the per-project preferences are keyed by.
     gizmo_project: Option<String>,
     /// The gizmo settings last written to the preferences file, so an
@@ -863,6 +884,51 @@ struct EditorWindow {
     /// The newest request per panel id, kept so a panel can be registered
     /// again after an unload without the module running.
     panel_requests: Vec<PanelRequest>,
+}
+
+/// What the last theme resolution read (W-0127 Stage 6).
+///
+/// The executable is the side that resolves the layers: it reads the
+/// `theme` preference, the user's file, `editor_settings.yaml` and the
+/// project's layer through the asset store. Keeping what each read produced
+/// is what lets a poll skip the merge when nothing moved.
+#[derive(Default)]
+struct ThemeWatch {
+    /// The preference's value, as last resolved.
+    selection: UserThemeSelection,
+    /// The user file's metadata when it was last read.
+    user_stamp: FileStamp,
+    /// The legacy name already reported, so one value logs once.
+    legacy_logged: Option<String>,
+    /// `editor_settings.yaml`'s metadata when it was last read.
+    settings_stamp: FileStamp,
+    /// The settings file's last read, or the message that refused it.
+    settings: Option<Result<pill_host::EditorSettings, String>>,
+    /// The project layer's path, as last resolved.
+    project_path: Option<String>,
+    /// The project layer's file metadata when it was last read.
+    project_stamp: FileStamp,
+    /// The project layer's handle in the asset store.
+    project_handle: Option<pill_engine_core::Handle<ThemeOverrides>>,
+    /// The handle's content version when it was last merged.
+    project_version: Option<u64>,
+    /// Where each family's font comes from, as last resolved (body, display,
+    /// monospace).
+    font_sources: [Option<FontSource>; 3],
+    /// The resolved source files' metadata when they were last read.
+    font_stamps: [FileStamp; 3],
+    /// The font bytes the sources gave, as last installed.
+    fonts: pill_editor_core::kit::style::ThemeFonts,
+}
+
+/// Where one font family's bytes come from (W-0127 Stage 7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FontSource {
+    /// A `.ttf`/`.otf` below `res`, loaded through the project's asset store -
+    /// the project layer's fonts.
+    Project(String),
+    /// A file beside the user's theme document, read from disk.
+    User(std::path::PathBuf),
 }
 
 /// A scripted left-button drag in flight: where the press lands, where the
@@ -1012,6 +1078,10 @@ impl EditorWindow {
         // queue into (the registry, the inbox, the pending batches and the
         // undo history); the shell re-claims the same set on load.
         ensure_command_resources(world);
+        // The editor's project layer loads through the project's asset store
+        // (W-0127 Stage 6), so the `.theme` type is registered here even when
+        // the project itself installs no theme.
+        pill_ui_theme::register(world);
         // The Console tab's history and filters: filled each frame from the
         // telemetry capture ring (W-0038 Stage 5).
         world.register_resource::<ConsoleState>();
@@ -1135,6 +1205,15 @@ impl EditorWindow {
             keybindings_applied: false,
             log_buffer,
             preferences_document: serde_json::Map::new(),
+            // The code default until the first poll resolves the layers; the
+            // generation matches what `EguiShellState::new` installed, so a
+            // project with no layers never re-applies at startup.
+            theme: pill_editor_core::style::default_theme(),
+            theme_generation: 1,
+            theme_layers: vec![ThemeLayerInfo::code()],
+            theme_fonts: pill_editor_core::kit::style::ThemeFonts::default(),
+            theme_watch: ThemeWatch::default(),
+            fallback_theme_generation: 1,
             gizmo_project,
             gizmo_persisted: None,
             focused: true,
@@ -3582,6 +3661,35 @@ impl EditorWindow {
         );
     }
 
+    /// Log the theme the editor paints with, the layers it was merged from and
+    /// the generation that produced it (`dump theme`, W-0127 Stage 6).
+    ///
+    /// This is the executable's own resolution - what the shell installs - so
+    /// a suite can assert a layer change without reading the tab's pixels.
+    fn dump_theme(&mut self) {
+        let user = self
+            .theme_layers
+            .iter()
+            .find(|info| info.layer == ThemeLayer::User)
+            .map_or("none", ThemeLayerInfo::path_text);
+        let project = self
+            .theme_layers
+            .iter()
+            .find(|info| info.layer == ThemeLayer::Project)
+            .map_or("none", ThemeLayerInfo::path_text);
+        info!(
+            target: telemetry_target::ENGINE,
+            layers = %layers_text(&self.theme_layers),
+            user = %user,
+            project = %project,
+            generation = self.theme_generation,
+            accent = %self.theme.palette.accent.hex(),
+            panel = %self.theme.palette.panel.hex(),
+            corner = self.theme.shape.corner_radius,
+            "[test] theme"
+        );
+    }
+
     /// Open a folder in the Assets tab's browser (`root` opens the asset
     /// root), through the shell's session state - the scripted channel's
     /// stand-in for clicking the folder tree.
@@ -4328,6 +4436,7 @@ impl EditorWindow {
         // frame's edits left.
         self.persist_gizmo_settings();
         self.watch_preferences();
+        self.watch_theme();
         self.watch_keybindings();
         self.publish_console_lines();
         self.drain_problem_open();
@@ -4903,6 +5012,13 @@ impl EditorWindow {
             &self.preferences_document,
             self.gizmo_project.as_deref(),
         );
+        // The theme the shell installs (W-0127 Stage 6): the executable is
+        // the side that owns the layers, so the merge travels on the snapshot
+        // with the generation that tells the shell whether to install it.
+        snapshot.theme = self.theme.clone();
+        snapshot.theme_generation = self.theme_generation;
+        snapshot.theme_layers = self.theme_layers.clone();
+        snapshot.theme_fonts = self.theme_fonts.clone();
         let (undo_depth, redo_depth) = engine
             .world()
             .get_resource::<CommandHistory>()
@@ -5286,6 +5402,386 @@ impl EditorWindow {
             state.settings.rotate_step_degrees = steps.rotation_degrees;
             state.settings.scale_step = steps.scale;
         }
+    }
+
+    /// Re-resolve the editor's theme layers and record a new generation when
+    /// the result changed (W-0127 Stage 6).
+    ///
+    /// Three layers sit over the code default: the user's file, named by the
+    /// `theme` preference and read from disk, and the project's, named by
+    /// `editor_settings.yaml` and loaded through the project's asset store so
+    /// the host's watcher reimports an edited file. The project wins where two
+    /// name the same item. A layer that cannot be read, loaded or merged warns
+    /// and is skipped - one broken file never costs the others' values - and a
+    /// resolution that produces exactly the theme already applied leaves the
+    /// generation alone, so the shell is never asked to re-install for
+    /// nothing.
+    ///
+    /// The poll reads the settings file and the user file only when their
+    /// stamps moved, and re-merges at least once per
+    /// [`STATE_FILE_POLL_FRAMES`] frames regardless, like the preferences
+    /// reader.
+    fn watch_theme(&mut self) {
+        let due = self.frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
+        let state_directory = layout_directory();
+        // Step 1: the user layer. The preferences reader ran before this, so
+        // the document is this frame's.
+        let value = preferences::lookup(
+            &self.preferences_document,
+            preferences::THEME_PREFERENCE_KEY,
+        )
+        .and_then(|value| value.as_str().map(str::to_string));
+        let selection = UserThemeSelection::from_preference(value.as_deref(), &state_directory);
+        let user_stamp = match &selection {
+            UserThemeSelection::File(path) => FileStamp::of(path),
+            _ => FileStamp::default(),
+        };
+        let user_moved =
+            selection != self.theme_watch.selection || user_stamp != self.theme_watch.user_stamp;
+        self.theme_watch.selection = selection.clone();
+        self.theme_watch.user_stamp = user_stamp;
+        // A name an earlier build understood names no file; saying so once per
+        // value is all there is to do about it.
+        if let UserThemeSelection::Legacy(name) = &selection {
+            if self.theme_watch.legacy_logged.as_deref() != Some(name.as_str()) {
+                self.theme_watch.legacy_logged = Some(name.clone());
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] theme name '{name}' is not a file; no user layer"
+                );
+            }
+        }
+        // Step 2: the project layer's settings file. The project root is the
+        // parent of the asset directory the host resolved.
+        let project_directory = self
+            .host
+            .host()
+            .asset_directory()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf);
+        let settings_stamp = project_directory
+            .as_ref()
+            .map(|directory| FileStamp::of(&directory.join(pill_host::EDITOR_SETTINGS_FILE)))
+            .unwrap_or_default();
+        if settings_stamp != self.theme_watch.settings_stamp || self.theme_watch.settings.is_none()
+        {
+            self.theme_watch.settings_stamp = settings_stamp;
+            self.theme_watch.settings = Some(match &project_directory {
+                Some(directory) => pill_host::read_editor_settings(directory),
+                None => Ok(pill_host::EditorSettings::default()),
+            });
+            if let Some(Err(message)) = &self.theme_watch.settings {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] theme refused layer=project: {message}"
+                );
+            }
+        }
+        let project_path = match (&project_directory, &self.theme_watch.settings) {
+            (Some(directory), Some(Ok(settings))) => {
+                pill_host::resolve_editor_theme(directory, settings)
+            }
+            _ => None,
+        };
+        let path_moved = project_path != self.theme_watch.project_path;
+        self.theme_watch.project_path = project_path;
+        // The file itself, so an edit reaches the editor even when the host's
+        // watcher has not reimported it yet: one stat per poll.
+        let project_stamp = self
+            .host
+            .host()
+            .asset_directory()
+            .zip(self.theme_watch.project_path.as_ref())
+            .map(|(root, path)| FileStamp::of(&root.join(path)))
+            .unwrap_or_default();
+        let file_moved = project_stamp != self.theme_watch.project_stamp;
+        self.theme_watch.project_stamp = project_stamp;
+        // The font files the applied theme names (W-0127 Stage 7) move the
+        // same way: a stamp per family, and an edit re-installs the fonts
+        // without waiting for a theme change.
+        let fonts_moved = self.stamp_fonts();
+        if !user_moved
+            && !path_moved
+            && !file_moved
+            && !fonts_moved
+            && !due
+            && self.project_layer_settled()
+        {
+            return;
+        }
+        // Step 3: the project layer's document, loaded when the path changed
+        // and re-read when its file did.
+        let project_overrides = self.load_project_layer(path_moved, file_moved);
+        // Step 4: the user layer's document. A file that does not parse is a
+        // refused layer, not an empty one.
+        let user_overrides = match &selection {
+            UserThemeSelection::File(path) => match std::fs::read_to_string(path) {
+                Ok(text) => match ThemeOverrides::from_json_str(&text) {
+                    Ok(overrides) => Some(overrides),
+                    Err(error) => {
+                        warn!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] theme refused layer=user: {error}"
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] theme refused layer=user: `{}` could not be read: {error}",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        // Step 5: merge in order, and publish a new generation when the result
+        // is not the theme already painted.
+        let user_info = match &selection {
+            UserThemeSelection::File(path) => {
+                Some(ThemeLayerInfo::user(path.display().to_string()))
+            }
+            _ => None,
+        };
+        let project_info = self
+            .theme_watch
+            .project_path
+            .clone()
+            .map(ThemeLayerInfo::project);
+        let user_pair = user_info.as_ref().zip(user_overrides.as_ref());
+        let project_pair = project_info.as_ref().zip(project_overrides.as_ref());
+        let merge = merge_layers(
+            &pill_editor_core::style::default_theme(),
+            user_pair,
+            project_pair,
+        );
+        for (layer, message) in &merge.refused {
+            warn!(
+                target: telemetry_target::ENGINE,
+                "[editor] theme refused layer={layer}: {message}"
+            );
+        }
+        // Step 6: the fonts the applied layers name, each resolved against the
+        // layer that named it.
+        let user_directory = match &selection {
+            UserThemeSelection::File(path) => path.parent().map(std::path::Path::to_path_buf),
+            _ => None,
+        };
+        self.refresh_fonts(
+            &merge.theme,
+            user_overrides.as_ref(),
+            project_overrides.as_ref(),
+            user_directory.as_deref(),
+        );
+        if merge.theme == self.theme
+            && merge.layers == self.theme_layers
+            && self.theme_watch.fonts == self.theme_fonts
+        {
+            return;
+        }
+        self.theme = merge.theme;
+        self.theme_layers = merge.layers;
+        self.theme_fonts = self.theme_watch.fonts.clone();
+        self.theme_generation = self.theme_generation.wrapping_add(1);
+        info!(
+            target: telemetry_target::ENGINE,
+            layers = %layers_text(&self.theme_layers),
+            generation = self.theme_generation,
+            "[editor] theme resolved"
+        );
+    }
+
+    /// Stamp each family's resolved font source and report whether one moved.
+    ///
+    /// One `stat` per family per poll; the bytes are only read when a stamp
+    /// moved, which is what keeps a 30-frame poll from re-reading fonts.
+    fn stamp_fonts(&mut self) -> bool {
+        let mut moved = false;
+        for (index, source) in self.theme_watch.font_sources.iter().enumerate() {
+            let stamp = match source {
+                Some(FontSource::Project(path)) => self
+                    .host
+                    .host()
+                    .asset_directory()
+                    .map(|root| FileStamp::of(&root.join(path)))
+                    .unwrap_or_default(),
+                Some(FontSource::User(path)) => FileStamp::of(path),
+                None => FileStamp::default(),
+            };
+            if stamp != self.theme_watch.font_stamps[index] {
+                moved = true;
+            }
+            self.theme_watch.font_stamps[index] = stamp;
+        }
+        moved
+    }
+
+    /// Resolve the fonts the applied layers name into the bytes the kit
+    /// installs.
+    ///
+    /// The merged theme's paths say which family each layer named, so a layer
+    /// that names only `body` keeps the lower layer's other two. A project font
+    /// loads through the asset store (it must be under `editor/`); a user font
+    /// is a file relative to the user document's own directory. A font that
+    /// cannot be loaded warns and leaves its family to the built-in ones, with
+    /// the family name still registered.
+    fn refresh_fonts(
+        &mut self,
+        theme: &pill_ui_theme::Theme,
+        user: Option<&ThemeOverrides>,
+        project: Option<&ThemeOverrides>,
+        user_directory: Option<&std::path::Path>,
+    ) {
+        let families: [(&Option<String>, Option<&String>, Option<&String>); 3] = [
+            (
+                &theme.fonts.body,
+                user.and_then(|overrides| overrides.fonts.body.as_ref()),
+                project.and_then(|overrides| overrides.fonts.body.as_ref()),
+            ),
+            (
+                &theme.fonts.display,
+                user.and_then(|overrides| overrides.fonts.display.as_ref()),
+                project.and_then(|overrides| overrides.fonts.display.as_ref()),
+            ),
+            (
+                &theme.fonts.monospace,
+                user.and_then(|overrides| overrides.fonts.monospace.as_ref()),
+                project.and_then(|overrides| overrides.fonts.monospace.as_ref()),
+            ),
+        ];
+        let mut fonts = pill_editor_core::kit::style::ThemeFonts::default();
+        let mut sources: [Option<FontSource>; 3] = [None, None, None];
+        for (index, (merged, user_path, project_path)) in families.into_iter().enumerate() {
+            let Some(path) = merged.as_deref() else {
+                continue;
+            };
+            // The layer that named this family wins; the merged path is one of
+            // the two layer paths by construction.
+            let source = if project_path.map(String::as_str) == Some(path) {
+                FontSource::Project(path.to_string())
+            } else if user_path.map(String::as_str) == Some(path) {
+                let file = match user_directory {
+                    Some(directory) => directory.join(path),
+                    None => std::path::PathBuf::from(path),
+                };
+                FontSource::User(file)
+            } else {
+                // Named by the code default, which the editor does not do;
+                // there is no layer to resolve it against.
+                continue;
+            };
+            let bytes = self.read_font(&source);
+            sources[index] = Some(source);
+            match index {
+                0 => fonts.body = bytes,
+                1 => fonts.display = bytes,
+                _ => fonts.monospace = bytes,
+            }
+        }
+        self.theme_watch.font_sources = sources;
+        self.theme_watch.fonts = fonts;
+    }
+
+    /// The bytes one font source holds, or `None` with the refusal logged.
+    fn read_font(&mut self, source: &FontSource) -> Option<Vec<u8>> {
+        match source {
+            FontSource::Project(path) => {
+                let world = self.host.host_mut().engine_mut().world_mut();
+                match pill_ui_theme::load_font(world, path, ThemePathScope::Editor) {
+                    Ok(loaded) => world
+                        .get_resource::<pill_engine_core::AssetManager>()
+                        .and_then(|assets| assets.get(loaded.handle))
+                        .map(|font| font.bytes.clone()),
+                    Err(message) => {
+                        warn!(
+                            target: telemetry_target::ENGINE,
+                            "[editor] font refused: {message}"
+                        );
+                        None
+                    }
+                }
+            }
+            FontSource::User(file) => match std::fs::read(file) {
+                Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                Ok(_) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] font refused: `{}` is empty",
+                        file.display()
+                    );
+                    None
+                }
+                Err(error) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] font refused: `{}` could not be read: {error}",
+                        file.display()
+                    );
+                    None
+                }
+            },
+        }
+    }
+
+    /// Whether the project layer's content is the version last merged, so a
+    /// poll that found no stamp moved can stop before merging.
+    fn project_layer_settled(&mut self) -> bool {
+        let Some(handle) = self.theme_watch.project_handle else {
+            return true;
+        };
+        let world = self.host.host_mut().engine_mut().world();
+        let version = world
+            .get_resource::<pill_engine_core::AssetManager>()
+            .and_then(|assets| assets.content_version(handle));
+        version.is_none() || version == self.theme_watch.project_version
+    }
+
+    /// Load the project layer's document, reusing the cached handle.
+    ///
+    /// `path_moved` means the resolved path is not the one the handle was
+    /// loaded from, so the file is imported (and scope-checked) again;
+    /// `file_moved` means the same file changed, so the store's copy is
+    /// re-read.
+    fn load_project_layer(&mut self, path_moved: bool, file_moved: bool) -> Option<ThemeOverrides> {
+        let Some(path) = self.theme_watch.project_path.clone() else {
+            self.theme_watch.project_handle = None;
+            self.theme_watch.project_version = None;
+            return None;
+        };
+        if path_moved || self.theme_watch.project_handle.is_none() {
+            self.theme_watch.project_handle = None;
+            self.theme_watch.project_version = None;
+            let world = self.host.host_mut().engine_mut().world_mut();
+            match load_overrides(world, &path, ThemePathScope::Editor) {
+                Ok(handle) => self.theme_watch.project_handle = Some(handle),
+                Err(message) => {
+                    warn!(
+                        target: telemetry_target::ENGINE,
+                        "[editor] theme refused layer=project: {message}"
+                    );
+                    return None;
+                }
+            }
+        } else if file_moved {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            let assets = world.get_resource_mut::<pill_engine_core::AssetManager>()?;
+            if let Err(error) =
+                assets.reimport_standalone::<ThemeOverrides>(std::path::Path::new(&path))
+            {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    "[editor] theme refused layer=project: `{path}` did not load: {error}"
+                );
+                return None;
+            }
+        }
+        let handle = self.theme_watch.project_handle?;
+        let world = self.host.host_mut().engine_mut().world();
+        let assets = world.get_resource::<pill_engine_core::AssetManager>()?;
+        self.theme_watch.project_version = assets.content_version(handle);
+        assets.get(handle).cloned()
     }
 
     /// Applies the keybindings file whenever it changes (W-0038 Stage 2).
@@ -6715,6 +7211,19 @@ impl EditorWindow {
     /// a Retry that asks the host to rebuild the module. The scene keeps
     /// rendering behind this panel - the editor's own frame is untouched.
     fn fallback_frame(&mut self) -> EguiShellFrame {
+        // The fallback paints the same theme the shell would (W-0127
+        // Stage 6): a layer change reaches this posture too, and a theme
+        // change is a reason to draw once.
+        if self.fallback_theme_generation != self.theme_generation {
+            self.fallback_theme_generation = self.theme_generation;
+            pill_editor_core::style::apply_theme(
+                &self.fallback_context,
+                &self.theme,
+                &self.theme_layers,
+                self.theme_generation,
+                &self.theme_fonts,
+            );
+        }
         if !self.reported_fallback {
             self.reported_fallback = true;
             info!(
@@ -6986,6 +7495,7 @@ impl EditorWindow {
                 Dump::StandaloneTypes => self.dump_standalone_types(),
                 Dump::Systems => self.dump_systems(),
                 Dump::Preferences => self.dump_preferences(),
+                Dump::Theme => self.dump_theme(),
                 Dump::Console => self.dump_console(),
                 Dump::Problems => self.dump_problems(),
                 Dump::Stats => self.dump_stats(),
@@ -8286,6 +8796,11 @@ fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) 
     }
     if previous.preferences != current.preferences {
         changed.push("preferences");
+    }
+    if previous.theme_generation != current.theme_generation
+        || previous.theme_layers != current.theme_layers
+    {
+        changed.push("theme");
     }
     if previous.undo_depth != current.undo_depth || previous.redo_depth != current.redo_depth {
         changed.push("history");

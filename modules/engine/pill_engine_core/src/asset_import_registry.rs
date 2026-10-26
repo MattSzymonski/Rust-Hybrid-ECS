@@ -108,6 +108,8 @@ type SettingsJsonFunction = fn(&Path) -> AssetLoadResult<serde_json::Value>;
 type NormalizeSettingsFunction = fn(serde_json::Value) -> AssetLoadResult<serde_json::Value>;
 /// Whether an asset is loaded under a path's name.
 type IsLoadedFunction = fn(&AssetManager, &Path) -> bool;
+/// Drop the asset loaded under a path's name; `true` when one went.
+type RemoveLoadedFunction = fn(&mut AssetManager, &Path) -> bool;
 /// Follow a source moved with its metadata file; the old name, if it was one.
 type FollowMoveFunction = fn(&mut AssetManager, &Path) -> Result<Option<String>, AssetImportError>;
 /// A standalone type's default document, as JSON.
@@ -141,6 +143,7 @@ struct ImportFunctions {
     normalize_settings: NormalizeSettingsFunction,
     follow_move: FollowMoveFunction,
     is_loaded: IsLoadedFunction,
+    remove_loaded: RemoveLoadedFunction,
     identity: IdentityFunction,
     /// `Some` for a standalone type, whose file is the asset; `None` for a
     /// sourced one.
@@ -160,6 +163,7 @@ impl ImportFunctions {
             normalize_settings: normalize_settings_json::<T>,
             follow_move: AssetManager::follow_move::<T>,
             is_loaded: is_loaded::<T>,
+            remove_loaded: remove_loaded::<T>,
             identity: identity_of::<T>,
             default_document: None,
             ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
@@ -176,6 +180,7 @@ impl ImportFunctions {
             normalize_settings: normalize_standalone_document::<T>,
             follow_move: AssetManager::follow_standalone_move::<T>,
             is_loaded: is_loaded::<T>,
+            remove_loaded: remove_loaded::<T>,
             identity: identity_of::<T>,
             default_document: Some(default_standalone_document::<T>),
             ensure_metadata: None,
@@ -263,6 +268,17 @@ where
     T: crate::asset::Asset + trait_type_map::TraitAccessible<dyn crate::asset::Asset>,
 {
     pack_key(path).is_some_and(|name| assets.handle_by_name::<T>(&name).is_some())
+}
+
+/// Drop the `T` loaded under `path`'s normalized name, if any.
+fn remove_loaded<T>(assets: &mut AssetManager, path: &Path) -> bool
+where
+    T: crate::asset::Asset + trait_type_map::TraitAccessible<dyn crate::asset::Asset>,
+{
+    let Some(handle) = pack_key(path).and_then(|name| assets.handle_by_name::<T>(&name)) else {
+        return false;
+    };
+    assets.remove(handle).is_some()
 }
 
 /// The live asset a `T` handle with `index` and `generation` addresses, or
@@ -842,6 +858,14 @@ impl ImportRegistry {
     pub fn is_loaded(&self, assets: &AssetManager, path: &Path) -> bool {
         self.functions_for_path(path)
             .is_ok_and(|functions| (functions.is_loaded)(assets, path))
+    }
+
+    /// Drop the asset loaded under `path`'s name, if any: what a delete calls
+    /// once the file is gone, so re-creating the path does not collide with the
+    /// old asset on its guid (W-0122). `false` for a path nothing has loaded.
+    pub fn remove_loaded(&self, assets: &mut AssetManager, path: &Path) -> bool {
+        self.functions_for_path(path)
+            .is_ok_and(|functions| (functions.remove_loaded)(assets, path))
     }
 
     /// When `path` is a loaded asset moved here with its metadata file, rename

@@ -19,8 +19,9 @@
 #   automatically restore - the projects' project_settings.yaml files,
 #   devops/tests/project/src/lib.rs,
 #   examples/project_rs/src/lib.rs, examples/project_cs/src/Systems.cs and
-#   modules/extensions/pill_spline/pill_spline/src/lib.rs, so a normal developer workspace
-#   is left exactly as it was.
+#   modules/extensions/pill_spline/pill_spline/src/lib.rs, plus
+#   examples/circus_demo's theme file and project source (the theme suite), so
+#   a normal developer workspace is left exactly as it was.
 #
 #   Expected runtime: ~15-20 minutes (plus the initial host build unless
 #   --skip-build is used).

@@ -238,7 +238,7 @@ fn the_browser_draws_its_tree_path_and_tiles() {
                 };
                 assets_grid(ui, &snapshot, &mut browser, &mut writes);
             }
-            let font = egui::FontId::proportional(ASSETS_TILE_LABEL_SIZE);
+            let font = egui::TextStyle::Small.resolve(ui.style());
             let job = tile_name_job(
                 "a_name_that_is_much_too_long_for_a_tile.png",
                 &font,
