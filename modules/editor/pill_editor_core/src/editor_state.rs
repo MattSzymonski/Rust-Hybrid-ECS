@@ -281,6 +281,24 @@ impl AssetListing {
     }
 }
 
+/// An asset the store holds with no file of the project's behind it: a chain's
+/// built-in passes, the renderer's default material, a pass a module builds in
+/// code.
+///
+/// A picker offers these beside the listing's rows, badged as the engine's: no
+/// directory walk can find them, and a document that references one names its
+/// guid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineAsset {
+    /// The registered type name a picker matches on, as a listing row's
+    /// [`AssetListing::kind`].
+    pub kind: String,
+    /// The name the store holds it under (`pill.pbr.opaque`).
+    pub name: String,
+    /// Its guid: what a picker writes, because no path names it.
+    pub guid: Option<String>,
+}
+
 /// One standalone asset type a new file can be created for: a row of the
 /// create dialog, straight from the loaded modules' registrations.
 #[derive(Clone, Debug, PartialEq)]
@@ -329,6 +347,11 @@ pub struct AssetReferenceField {
     /// Whether the document writes `{ "guid": … }` (a named reference) rather
     /// than a bare guid string (a texture slot).
     pub nested: bool,
+    /// What the row reads for the asset the guid names: its path when the
+    /// listing holds it, otherwise the name the store loaded it under - a
+    /// chain's built-in passes have no file of their own - and `None` when
+    /// neither knows the guid.
+    pub label: Option<String>,
 }
 
 impl AssetDetail {
@@ -495,6 +518,9 @@ pub struct EditorSnapshot {
     pub components: Vec<RegisteredComponent>,
     /// The asset browser's rows (the Assets panel).
     pub assets: Vec<AssetListing>,
+    /// The store's own assets that no file backs: what a picker offers beside
+    /// [`Self::assets`], badged as the engine's.
+    pub engine_assets: Vec<EngineAsset>,
     /// The live standalone asset types: what a create dialog may
     /// offer.
     pub standalone_types: Vec<StandaloneTypeInfo>,
@@ -591,6 +617,7 @@ impl EditorSnapshot {
             systems: Self::capture_systems(engine, extension_names),
             components: Self::capture_components(engine),
             assets: Vec::new(),
+            engine_assets: Vec::new(),
             standalone_types: Vec::new(),
             asset_detail: None,
             paused: engine.systems_paused(),
@@ -777,8 +804,9 @@ impl EditorSnapshot {
     }
 }
 
-/// The asset value `reference` names - a path relative to `res`, or a guid in
-/// the world's asset database - loading the asset first when it is not loaded.
+/// The asset value `reference` names - a path relative to `res`, a guid the
+/// project's files carry, or a guid the store already holds - loading the asset
+/// first when it is not loaded.
 ///
 /// The value carries the type the asset loaded as, so the field write that
 /// follows refuses an asset of another type than the field references.
@@ -789,11 +817,28 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
         .cloned()
         .ok_or("no asset types are registered")?;
     let path = match pill_engine::AssetGuid::parse(reference) {
-        Some(guid) => world
+        Some(guid) => match world
             .get_resource::<pill_engine::AssetDatabase>()
             .and_then(|database| database.by_guid(guid))
             .map(|record| record.path.clone())
-            .ok_or_else(|| format!("no asset in the project has the guid {guid}"))?,
+        {
+            Some(path) => path,
+            None => {
+                // No file names the guid: the asset was built in code, and the
+                // store already holds it, so the handle is the whole answer.
+                let assets = world
+                    .get_resource::<pill_engine::AssetManager>()
+                    .ok_or("the world has no asset store")?;
+                let (asset_type, _name, index, generation) = registry
+                    .loaded_by_guid(assets, guid)
+                    .ok_or_else(|| format!("no asset in the project has the guid {guid}"))?;
+                return Ok(FieldValue::Asset {
+                    asset_type: Some(asset_type),
+                    index,
+                    generation,
+                });
+            }
+        },
         None => reference.to_owned(),
     };
     let assets = world
@@ -1244,6 +1289,13 @@ fn refuse_module_resource(command: &EditorCommand, relative: &Path) -> Result<()
 /// `path` as a `/`-separated string, the form asset commands carry.
 fn asset_slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// The guid a standalone asset's own header holds, when its bytes are one and
+/// the guid parses.
+fn document_guid(bytes: &[u8]) -> Option<pill_engine::AssetGuid> {
+    let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    pill_engine::AssetGuid::parse(document.get("guid")?.as_str()?)
 }
 
 /// Write `bytes` to `file` through a temporary sibling, so a reader never
@@ -1993,37 +2045,48 @@ impl EditorCommand {
                         asset_slash(&relative)
                     ));
                 }
-                let kept_guid = if existing && *overwrite == Some(true) {
-                    let text = std::fs::read_to_string(&destination).map_err(|error| {
+                // What the replace overwrites, so a write that fails to load
+                // can be taken back byte for byte.
+                let previous = if existing {
+                    Some(std::fs::read(&destination).map_err(|error| {
                         format!(
                             "{command:?}: cannot read `{}`: {error}",
                             asset_slash(&relative)
                         )
-                    })?;
-                    let previous: serde_json::Value = serde_json::from_str(&text)
-                        .map_err(|error| format!("{command:?}: {error}"))?;
-                    previous
-                        .get("guid")
-                        .and_then(|guid| guid.as_str())
-                        .map(str::to_owned)
+                    })?)
                 } else {
                     None
+                };
+                // The store's identity comes first: a path bound to a guid is
+                // what every reference names, so a file whose own header
+                // disagrees with it cannot take its place.
+                let loaded_guid = registry.guid_by_path(assets, &relative);
+                let kept_guid = match overwrite {
+                    Some(true) => {
+                        loaded_guid.or_else(|| previous.as_deref().and_then(document_guid))
+                    }
+                    _ => None,
                 };
                 let document = registry
                     .default_document(type_name)
                     .map_err(|error| format!("{command:?}: {error}"))?;
                 let guid = match kept_guid {
                     Some(guid) => guid,
-                    None => pill_engine::AssetGuid::random()
-                        .map_err(|error| {
-                            format!("{command:?}: no random source for a guid: {error}")
-                        })?
-                        .to_string(),
+                    None => pill_engine::AssetGuid::random().map_err(|error| {
+                        format!("{command:?}: no random source for a guid: {error}")
+                    })?,
                 };
+                // A stale asset under this path would refuse the import, and
+                // the file is the truth now: a fresh guid unloads it, a kept
+                // one reloads it from the file written below.
+                let reloads_loaded = loaded_guid == Some(guid);
+                if loaded_guid.is_some() && !reloads_loaded {
+                    registry.remove_loaded(assets, &relative);
+                }
                 let file = serde_json::json!({
                     "format_version": pill_engine::asset_metadata::METADATA_FORMAT_VERSION,
                     "asset_type": type_name,
-                    "guid": guid,
+                    "guid": guid.to_string(),
                     "asset": document,
                 });
                 let mut bytes = serde_json::to_vec_pretty(&file)
@@ -2040,17 +2103,40 @@ impl EditorCommand {
                     pill_engine::asset_store::write_new(&destination, &bytes)
                         .map_err(|error| format!("{command:?}: {error}"))?;
                 }
-                if let Err(error) = registry.import(
-                    assets,
-                    &relative,
-                    pill_engine::MetadataPolicy::ReadIfPresent,
-                ) {
-                    // The file is only an asset once it imports, so a refusal
+                // An asset that was loaded keeps its handle, so the file is
+                // read again through the value - an import would answer with
+                // the handle it already has and decode nothing.
+                let loaded = if reloads_loaded {
+                    registry
+                        .reimport(assets, &relative)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                } else {
+                    registry
+                        .import(
+                            assets,
+                            &relative,
+                            pill_engine::MetadataPolicy::ReadIfPresent,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                };
+                if let Err(error) = loaded {
+                    // The file is only an asset once it loads, so a refusal
                     // takes the write back rather than leaving a file the
-                    // project cannot load and no inverse covers.
-                    let _ = std::fs::remove_file(&destination);
-                    if let Some(meta) = sidecar.filter(|_| !sidecar_existed) {
-                        let _ = std::fs::remove_file(root.join(meta));
+                    // project cannot read: a replaced file gets its previous
+                    // bytes again, a new one goes.
+                    match previous {
+                        Some(previous) => {
+                            let _ =
+                                pill_engine::asset_store::write_replacing(&destination, &previous);
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(&destination);
+                            if let Some(meta) = sidecar.filter(|_| !sidecar_existed) {
+                                let _ = std::fs::remove_file(root.join(meta));
+                            }
+                        }
                     }
                     return Err(format!(
                         "{command:?}: `{}` did not load: {error}",
@@ -3586,6 +3672,53 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// A pick may name a guid the store holds with no file behind it: an asset
+    /// built in code resolves to its own handle instead of failing as an
+    /// unknown project guid, and a guid nothing holds is still refused by name.
+    #[test]
+    fn a_pick_takes_a_guid_the_store_holds_without_a_file() {
+        let mut engine = Engine::new();
+        pill_ui_theme::register(engine.world_mut());
+        let guid = pill_engine::AssetGuid::random().expect("a fresh guid");
+        {
+            let world = engine.world_mut();
+            let assets = world
+                .get_resource_mut::<pill_engine::AssetManager>()
+                .expect("the engine owns an asset store");
+            assets
+                .add_named_with_guid(
+                    "built.theme",
+                    guid,
+                    pill_ui_theme::ThemeOverrides::default(),
+                )
+                .expect("the name is free");
+        }
+        let value = resolve_asset_reference(&mut engine, &guid.to_string())
+            .expect("a stored guid resolves");
+        match value {
+            FieldValue::Asset {
+                asset_type,
+                index,
+                generation,
+            } => {
+                assert_eq!(asset_type.as_deref(), Some("pill_ui_theme::ThemeOverrides"));
+                let handle = engine
+                    .world()
+                    .get_resource::<pill_engine::AssetManager>()
+                    .and_then(|assets| {
+                        assets.handle_by_name::<pill_ui_theme::ThemeOverrides>("built.theme")
+                    })
+                    .expect("the asset stayed loaded");
+                assert_eq!((index, generation), (handle.index(), handle.generation()));
+            }
+            other => panic!("expected an asset value, got {other:?}"),
+        }
+
+        let unknown = pill_engine::AssetGuid::random().expect("a fresh guid");
+        let error = resolve_asset_reference(&mut engine, &unknown.to_string()).unwrap_err();
+        assert!(error.contains(&unknown.to_string()), "{error}");
+    }
+
     /// A component holding a reference to another entity, as the derive lays
     /// one out.
     #[repr(C)]
@@ -3969,5 +4102,174 @@ mod tests {
         assert!(path.exists(), "the redo writes the file again");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A replace keeps the identity the store already holds at the path, even
+    /// when the file's own header disagrees with it - and the value reloads,
+    /// because the handle stays what it was.
+    #[test]
+    fn a_replace_keeps_the_guid_the_store_holds_and_reloads_the_value() {
+        let _mount = asset_mount_lock();
+        let root =
+            std::env::temp_dir().join(format!("pill-editor-asset-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = Engine::new();
+        pill_ui_theme::register(engine.world_mut());
+
+        let create = |overwrite: Option<bool>| EditorCommand::CreateStandaloneAsset {
+            type_name: "pill_ui_theme::ThemeOverrides".to_owned(),
+            folder: String::new(),
+            name: "probe".to_owned(),
+            overwrite,
+        };
+        let path = root.join("probe.theme");
+        let failures = EditorCommand::apply(&mut engine, &[create(None)]);
+        assert!(failures.is_empty(), "{:?}", failures);
+
+        // The store's identity, and the version of the value it holds.
+        let (loaded_guid, loaded_version) = {
+            let world = engine.world();
+            let registry = world
+                .get_resource::<pill_engine::ImportRegistry>()
+                .cloned()
+                .unwrap();
+            let assets = world.get_resource::<pill_engine::AssetManager>().unwrap();
+            let guid = registry
+                .guid_by_path(assets, std::path::Path::new("probe.theme"))
+                .expect("the create loaded the file");
+            let version = assets
+                .handle_by_name::<pill_ui_theme::ThemeOverrides>("probe.theme")
+                .and_then(|handle| assets.content_version(handle));
+            (guid, version)
+        };
+
+        // A file whose header carries another guid - the state the person hit:
+        // the store cannot import it at that path, so the replace has to keep
+        // the guid the store knows instead of the one the file claims.
+        let other = pill_engine::AssetGuid::random().unwrap();
+        std::fs::write(&path, theme_document(other)).unwrap();
+
+        let failures = EditorCommand::apply(&mut engine, &[create(Some(true))]);
+        assert!(failures.is_empty(), "{:?}", failures);
+        assert_eq!(
+            document_guid(&std::fs::read(&path).unwrap()),
+            Some(loaded_guid),
+            "the replace keeps the guid the store holds"
+        );
+        let (after_guid, after_version) = {
+            let world = engine.world();
+            let registry = world
+                .get_resource::<pill_engine::ImportRegistry>()
+                .cloned()
+                .unwrap();
+            let assets = world.get_resource::<pill_engine::AssetManager>().unwrap();
+            let guid = registry.guid_by_path(assets, std::path::Path::new("probe.theme"));
+            let version = assets
+                .handle_by_name::<pill_ui_theme::ThemeOverrides>("probe.theme")
+                .and_then(|handle| assets.content_version(handle));
+            (guid, version)
+        };
+        assert_eq!(after_guid, Some(loaded_guid), "the identity survives");
+        assert_ne!(after_version, loaded_version, "the value reloaded");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path the store still holds with no file behind it binds the fresh
+    /// guid a create writes: the stale entry goes instead of refusing the
+    /// write the person asked for.
+    #[test]
+    fn a_create_over_a_stale_loaded_path_binds_the_fresh_guid() {
+        let _mount = asset_mount_lock();
+        let root =
+            std::env::temp_dir().join(format!("pill-editor-asset-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = Engine::new();
+        pill_ui_theme::register(engine.world_mut());
+        let create = |overwrite: Option<bool>| EditorCommand::CreateStandaloneAsset {
+            type_name: "pill_ui_theme::ThemeOverrides".to_owned(),
+            folder: String::new(),
+            name: "ghost".to_owned(),
+            overwrite,
+        };
+        let path = root.join("ghost.theme");
+        let failures = EditorCommand::apply(&mut engine, &[create(None)]);
+        assert!(failures.is_empty(), "{:?}", failures);
+        let stale = document_guid(&std::fs::read(&path).unwrap()).unwrap();
+
+        // The file goes, the store keeps the path loaded: nothing tells the
+        // editor the asset left.
+        std::fs::remove_file(&path).unwrap();
+
+        let failures = EditorCommand::apply(&mut engine, &[create(None)]);
+        assert!(failures.is_empty(), "{:?}", failures);
+        let fresh = document_guid(&std::fs::read(&path).unwrap()).unwrap();
+        assert_ne!(fresh, stale, "the create binds a fresh guid");
+        let bound = {
+            let world = engine.world();
+            let registry = world
+                .get_resource::<pill_engine::ImportRegistry>()
+                .cloned()
+                .unwrap();
+            let assets = world.get_resource::<pill_engine::AssetManager>().unwrap();
+            registry.guid_by_path(assets, std::path::Path::new("ghost.theme"))
+        };
+        assert_eq!(bound, Some(fresh), "the store holds the new identity");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A replace whose import refuses the file puts the bytes it replaced
+    /// back, rather than deleting what was there.
+    #[test]
+    fn a_refused_replace_restores_the_previous_file() {
+        let _mount = asset_mount_lock();
+        let root =
+            std::env::temp_dir().join(format!("pill-editor-asset-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = Engine::new();
+        engine.world_mut().register_standalone_asset::<Refused>();
+        let path = root.join("kept.refused");
+        let previous = b"{\"format_version\": 1, \"asset_type\": \"pill_editor_core::tests::Refused\", \"guid\": \"000000000000000000000000000000e1\", \"asset\": {}}".to_vec();
+        std::fs::write(&path, &previous).unwrap();
+
+        let failures = EditorCommand::apply(
+            &mut engine,
+            &[EditorCommand::CreateStandaloneAsset {
+                type_name: "pill_editor_core::tests::Refused".to_owned(),
+                folder: String::new(),
+                name: "kept".to_owned(),
+                overwrite: Some(true),
+            }],
+        );
+        assert_eq!(failures.len(), 1, "the refusing import fails the replace");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            previous,
+            "a replace that could not load leaves the file it replaced"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A theme overrides document with `guid` in its header, which is what a
+    /// standalone asset's own file holds.
+    fn theme_document(guid: pill_engine::AssetGuid) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "format_version": pill_engine::asset_metadata::METADATA_FORMAT_VERSION,
+            "asset_type": "pill_ui_theme::ThemeOverrides",
+            "guid": guid.to_string(),
+            "asset": {},
+        }))
+        .unwrap()
     }
 }

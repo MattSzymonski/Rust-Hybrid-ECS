@@ -4,11 +4,15 @@
 //!
 //! - `scalar_edit_decorated`: one field's control, decorated and committed through the core's helper.
 //! - The numeric editors (`scalar_edit`, `integer_slider`, `integer_drag`, `ascending`), the read-only row and the value formatters the component menu and the settings rows use.
+//! - `axis_slot` and `fixed_width_field`: a vector component's axis letter and its editor, both at fixed widths so a long value is cropped inside its field instead of widening the row.
 //!
 //! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+use pill_editor_shell_egui_editor::shell::tab_inspector::{
+    INSPECTOR_VECTOR_FIELD_HEIGHT, INSPECTOR_VECTOR_LABEL_WIDTH,
+};
 
 /// The edit control for one scalar, honouring the widget the row model chose:
 /// a slider over a `[Range]`, a drag value with a `[Min]` floor, and the plain
@@ -66,6 +70,49 @@ pub fn scalar_edit_decorated(
         }
         (_, Row::IntegerDrag { min }) => integer_edit(ui, &Number::of(value)?, None, Some(*min)),
         _ => scalar_edit(ui, value),
+    }
+}
+
+/// One axis letter in its fixed slot: the slot keeps every component's editor
+/// the same width, whatever the glyph's own advance is.
+pub fn axis_slot(ui: &mut egui::Ui, axis: usize) {
+    ui.add_sized(
+        egui::vec2(INSPECTOR_VECTOR_LABEL_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
+        egui::Label::new(
+            egui::RichText::new(inspector::axis_label(axis))
+                .color(inspector::axis_color(axis))
+                .small(),
+        ),
+    );
+}
+
+/// One vector component's editor at the width left in its group: the width is
+/// claimed exactly, and whatever the editor paints past it - a long value, the
+/// scrub surface of a drag value - is cropped instead of widening the row, so
+/// every component of a vector keeps the same width whatever its value.
+///
+/// The crop is the child Ui's clip rect, which also bounds the child's
+/// interaction, so a press past the field's edge never lands on this editor.
+/// `widget` is the decorator the row model chose, or `None` for the plain
+/// editor.
+pub fn fixed_width_field(
+    ui: &mut egui::Ui,
+    value: &FieldValue,
+    widget: Option<&inspector::FieldWidget>,
+) -> Option<FieldValue> {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), INSPECTOR_VECTOR_FIELD_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let mut field = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    field.set_clip_rect(rect.intersect(ui.clip_rect()));
+    match widget {
+        Some(widget) => scalar_edit_decorated(&mut field, value, widget),
+        None => scalar_edit(&mut field, value),
     }
 }
 

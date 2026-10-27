@@ -34,6 +34,7 @@ pub fn inspector_field_row(
     targets: &[Entity],
     details: &[EntityDetail],
     assets: &[AssetListing],
+    engine_assets: &[EngineAsset],
     scene: &[EntityListEntry],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
@@ -206,17 +207,16 @@ pub fn inspector_field_row(
                 }
                 for (element_index, element) in values.iter().take(*elements).enumerate() {
                     // One axis letter with its field as a unit, so a wrap
-                    // never separates a label from its widget.
+                    // never separates a label from its widget. The letter's
+                    // slot and the field's width are both fixed, so a long
+                    // value is cropped inside its field instead of widening
+                    // the row and shifting its neighbours.
                     ui.allocate_ui_with_layout(
-                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, 18.0),
+                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.label(
-                                egui::RichText::new(inspector::axis_label(element_index))
-                                    .color(inspector::axis_color(element_index))
-                                    .small(),
-                            );
-                            if let Some(edited) = scalar_edit(ui, element) {
+                            axis_slot(ui, element_index);
+                            if let Some(edited) = fixed_width_field(ui, element, None) {
                                 queue_element_edit(
                                     pending,
                                     targets,
@@ -344,15 +344,11 @@ pub fn inspector_field_row(
                         continue;
                     };
                     ui.allocate_ui_with_layout(
-                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, 18.0),
+                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.label(
-                                egui::RichText::new(inspector::axis_label(axis))
-                                    .color(inspector::axis_color(axis))
-                                    .small(),
-                            );
-                            if let Some(edited) = scalar_edit_decorated(ui, value, widget) {
+                            axis_slot(ui, axis);
+                            if let Some(edited) = fixed_width_field(ui, value, Some(widget)) {
                                 queue_field_edit(
                                     pending,
                                     targets,
@@ -386,6 +382,7 @@ pub fn inspector_field_row(
                     targets,
                     details,
                     assets,
+                    engine_assets,
                 },
                 pending,
                 session,
@@ -464,6 +461,9 @@ pub struct AssetRowInput<'a> {
     pub details: &'a [EntityDetail],
     /// The project's assets, as the Assets tab lists them.
     pub assets: &'a [AssetListing],
+    /// The store's own assets that no file backs: what the picker offers beside
+    /// the listing's rows, badged as the engine's.
+    pub engine_assets: &'a [EngineAsset],
 }
 
 /// One asset reference row: a button naming the referenced asset,
@@ -566,7 +566,7 @@ pub fn inspector_asset_row(
     if session.asset_picker.as_deref() == Some(key.as_str()) {
         if let Some((rect, _)) = button_rect {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
-            floating_popup(
+            let area = floating_popup(
                 ui,
                 picker_id,
                 rect,
@@ -579,28 +579,79 @@ pub fn inspector_asset_row(
                             .desired_width(f32::INFINITY),
                     );
                     let search = session.asset_search.to_lowercase();
+                    let (files, built) = inspector::picker_candidates(
+                        input.assets,
+                        input.engine_assets,
+                        input.asset_type,
+                    );
                     egui::ScrollArea::vertical()
                         .max_height(ASSET_PICKER_HEIGHT)
                         .show(ui, |ui| {
                             if ui.selectable_label(false, "None").clicked() {
                                 chosen = Some(None);
                             }
-                            for candidate in
-                                inspector::asset_candidates(input.assets, input.asset_type)
-                                    .into_iter()
-                                    .filter(|candidate| {
-                                        candidate.path.to_lowercase().contains(&search)
-                                    })
-                            {
+                            for candidate in files.into_iter().filter(|candidate| {
+                                candidate.path.to_lowercase().contains(&search)
+                            }) {
                                 let current = matches!(&label, AssetReferenceLabel::Named(name)
                                     if *name == candidate.path);
-                                if ui.selectable_label(current, &candidate.path).clicked() {
-                                    chosen = Some(Some(candidate.path.clone()));
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui.selectable_label(current, &candidate.path).clicked() {
+                                        chosen = Some(Some(candidate.path.clone()));
+                                    }
+                                    // The focus affordance the asset-settings
+                                    // picker carries: showing a candidate in the
+                                    // Assets panel keeps the picker open, so
+                                    // looking one up does not throw the edit
+                                    // away.
+                                    if ui
+                                        .small_button("o")
+                                        .on_hover_text("Show this asset in the Assets panel")
+                                        .clicked()
+                                    {
+                                        pending.focus_asset(candidate.key());
+                                    }
+                                });
+                            }
+                            // The engine's own assets: no file, so no folder to
+                            // reveal, and the pick writes their guid. One the
+                            // store holds by name alone reads but cannot be
+                            // chosen.
+                            for candidate in built.into_iter().filter(|candidate| {
+                                candidate.name.to_lowercase().contains(&search)
+                            }) {
+                                let current = matches!(&label, AssetReferenceLabel::Named(name)
+                                    if *name == candidate.name);
+                                let pickable = candidate.guid.is_some();
+                                ui.horizontal(|ui| {
+                                    engine_badge(ui);
+                                    let row = ui.add_enabled_ui(pickable, |ui| {
+                                        ui.selectable_label(current, &candidate.name).clicked()
+                                    });
+                                    if row.inner {
+                                        chosen = candidate.guid.clone().map(Some);
+                                    }
+                                    if !pickable {
+                                        row.response.on_hover_text(
+                                            "The store holds it by name only, so no reference can name it",
+                                        );
+                                    }
+                                });
                             }
                         });
                 },
             );
+            // Any press outside the picker and its row closes it, whatever
+            // button it was: a picker that only closes by picking fights the
+            // person who changed their mind. The press that opens the picker
+            // is on the row, so it never closes what it just opened.
+            let press =
+                ui.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
+            if let (true, Some(at)) = press {
+                if !rect.contains(at) && !area.response.rect.contains(at) {
+                    session.asset_picker = None;
+                }
+            }
         }
     }
 
@@ -827,30 +878,24 @@ pub fn remember_entity_row_text(session: &mut InspectorSession, key: &str, text:
 
 /// Log an entity row's rectangle once per placement, keyed by
 /// `entity.component.field`, so a suite can drop an entity onto it.
+///
+/// The placement is recorded either way - the shell's own tests read it - but
+/// the line is a scripted run's: it is there to aim a drop, and a person's
+/// console gains nothing from it.
 pub fn remember_entity_row_rect(
     session: &mut InspectorSession,
     key: &str,
     rect: egui::Rect,
     visible: bool,
 ) {
-    let existing = session
-        .entity_row_rects
-        .iter()
-        .position(|(logged_key, _)| logged_key == key);
     if !visible {
-        if let Some(index) = existing {
-            session.entity_row_rects.remove(index);
-        }
         return;
     }
-    if let Some(index) = existing {
-        let (_, logged) = &mut session.entity_row_rects[index];
-        if *logged == rect {
-            return;
-        }
-        *logged = rect;
-    } else {
-        session.entity_row_rects.push((key.to_owned(), rect));
+    let Some(rect) = record_row_placement(&mut session.entity_row_rects, key, rect) else {
+        return;
+    };
+    if !session.log_rects {
+        return;
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -861,6 +906,34 @@ pub fn remember_entity_row_rect(
         max_y = rect.max.y,
         "[editor] inspector entity row rect"
     );
+}
+
+/// Record `rect` as `key`'s placement, returning it when that is a placement
+/// the log has not named yet.
+///
+/// Rectangles compare in whole points: a panel that re-lays itself out with a
+/// fraction of a point of jitter sits in the same place, and a line per frame
+/// of that is what turned the row tokens into noise. A row that leaves the
+/// visible area keeps its last placement, so it does not log again when it
+/// scrolls back to where it was.
+pub fn record_row_placement(
+    logged: &mut Vec<(String, egui::Rect)>,
+    key: &str,
+    rect: egui::Rect,
+) -> Option<egui::Rect> {
+    let quantized = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x.round(), rect.min.y.round()),
+        egui::pos2(rect.max.x.round(), rect.max.y.round()),
+    );
+    if let Some((_, previous)) = logged.iter_mut().find(|(logged_key, _)| logged_key == key) {
+        if *previous == quantized {
+            return None;
+        }
+        *previous = quantized;
+        return Some(quantized);
+    }
+    logged.push((key.to_owned(), quantized));
+    Some(quantized)
 }
 
 /// Record the asset an asset row draws, returning whether it changed since
@@ -889,34 +962,24 @@ pub fn remember_asset_row_text(session: &mut InspectorSession, key: &str, text: 
 /// Log an asset row's rectangle once per placement, keyed by
 /// `entity.component.field`, so a suite can drop an asset onto it.
 ///
-/// Only a row whose centre is inside its visible area is logged: a row
-/// scrolled out of the panel cannot be clicked or dropped on, so the suite
-/// sees a rectangle only while the row is actually reachable, and a fresh one
-/// after it is scrolled back into view.
+/// Only a row whose centre is inside its visible area is drawn at all: a row
+/// scrolled out of the panel cannot be clicked or dropped on, so a visible row
+/// is the one whose rectangle reaches the log. The line itself is a scripted
+/// run's.
 pub fn remember_asset_row_rect(
     session: &mut InspectorSession,
     key: &str,
     rect: egui::Rect,
     visible: bool,
 ) {
-    let existing = session
-        .asset_row_rects
-        .iter()
-        .position(|(logged_key, _)| logged_key == key);
     if !visible {
-        if let Some(index) = existing {
-            session.asset_row_rects.remove(index);
-        }
         return;
     }
-    if let Some(index) = existing {
-        let (_, logged) = &mut session.asset_row_rects[index];
-        if *logged == rect {
-            return;
-        }
-        *logged = rect;
-    } else {
-        session.asset_row_rects.push((key.to_owned(), rect));
+    let Some(rect) = record_row_placement(&mut session.asset_row_rects, key, rect) else {
+        return;
+    };
+    if !session.log_rects {
+        return;
     }
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,

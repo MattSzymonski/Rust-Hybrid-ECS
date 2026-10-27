@@ -25,8 +25,8 @@ pub use pill_editor_core::console::{
 };
 pub use pill_editor_core::editor_state::{
     AssetListing, AssetReferenceField, AssetReferenceLabel, ComponentView, EditorCommand,
-    EditorSelection, EditorSnapshot, EntityDetail, EntityListEntry, EntityReferenceLabel,
-    ResourceFieldView, ResourceView,
+    EditorSelection, EditorSnapshot, EngineAsset, EntityDetail, EntityListEntry,
+    EntityReferenceLabel, ResourceFieldView, ResourceView,
 };
 pub use pill_editor_core::egui;
 pub use pill_editor_core::egui_dock::{

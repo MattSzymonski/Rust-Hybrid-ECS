@@ -228,7 +228,15 @@ fn the_browser_draws_its_tree_path_and_tiles() {
     let mut caption_width = 0.0f32;
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
-            assets_tree(ui, &snapshot, &mut browser, &mut selection, &mut pending);
+            assets_tree(
+                ui,
+                &snapshot,
+                &mut browser,
+                &mut selection,
+                &mut dialog,
+                &mut pending,
+                &mut regions,
+            );
             assets_path_bar(ui, &mut browser);
             assets_zoom_bar(ui, &snapshot.assets, &mut browser);
             {
@@ -406,6 +414,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
                         targets: std::slice::from_ref(&entity),
                         details: &[],
                         assets: &snapshot.assets,
+                        engine_assets: &[],
                     },
                     pending,
                     session,
@@ -658,5 +667,107 @@ fn field_values_format_for_display() {
     assert_eq!(
         format_field_value(&FieldValue::Text("hi".to_string())),
         "hi"
+    );
+}
+
+/// A list entry's reference key belongs to its family, which is what keeps a
+/// chain's raw `passes` array out of the settings walk.
+#[test]
+fn a_reference_keys_family_is_what_a_list_row_belongs_to() {
+    let entry = AssetReferenceField {
+        key: "passes[2]".to_string(),
+        target: "demo::RenderPass".to_string(),
+        guid: None,
+        nested: true,
+        label: None,
+    };
+    assert_eq!(inspector_settings::reference_family(&entry), Some("passes"));
+    let named = AssetReferenceField {
+        key: "shader".to_string(),
+        ..entry
+    };
+    assert_eq!(inspector_settings::reference_family(&named), None);
+}
+
+/// A row's rectangle is logged once per placement: sub-point jitter and a
+/// row that scrolls out and back do not log again, a real move does.
+#[test]
+fn a_rows_placement_is_logged_once_per_place() {
+    let mut logged = Vec::new();
+    let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 40.0));
+    assert!(inspector_fields::record_row_placement(&mut logged, "row", rect).is_some());
+    assert!(inspector_fields::record_row_placement(&mut logged, "row", rect).is_none());
+    let jittered = rect.translate(egui::vec2(0.2, -0.3));
+    assert!(
+        inspector_fields::record_row_placement(&mut logged, "row", jittered).is_none(),
+        "a fraction of a point is the same placement"
+    );
+    let moved = rect.translate(egui::vec2(0.0, 12.0));
+    assert!(
+        inspector_fields::record_row_placement(&mut logged, "row", moved).is_some(),
+        "a real move logs"
+    );
+}
+
+/// Every component of a vector keeps one width: a value long enough to need
+/// more room than its field is cropped there instead of widening the row, so
+/// the axes beside it never move.
+#[test]
+fn a_vectors_components_keep_one_width() {
+    let values = [
+        FieldValue::F32(1.0),
+        FieldValue::F32(-123_456.75),
+        FieldValue::F32(0.000_125),
+    ];
+    let context = egui::Context::default();
+    style::apply(&context);
+    let mut widths = Vec::new();
+    run_pass(&context, &mut |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.set_max_width(360.0);
+            for value in &values {
+                let row = ui.horizontal_wrapped(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(INSPECTOR_VECTOR_FIELD_WIDTH, INSPECTOR_VECTOR_FIELD_HEIGHT),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            axis_slot(ui, 1);
+                            fixed_width_field(ui, value, None);
+                        },
+                    );
+                });
+                widths.push(row.response.rect.width());
+            }
+        });
+    });
+    assert_eq!(
+        widths[0], widths[1],
+        "a long value widens the row: {widths:?}"
+    );
+    assert_eq!(
+        widths[0], widths[2],
+        "a value with many decimals widens the row: {widths:?}"
+    );
+    assert!(
+        widths[0] <= INSPECTOR_VECTOR_FIELD_WIDTH + 8.0,
+        "the row stays the width of its group: {widths:?}"
+    );
+    // The same value in a plain row does grow the row, which is what the fixed
+    // field's crop exists to prevent.
+    let mut plain_width = 0.0f32;
+    run_pass(&context, &mut |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.set_max_width(360.0);
+            let row = ui.horizontal_wrapped(|ui| {
+                axis_slot(ui, 1);
+                scalar_edit(ui, &values[1]);
+            });
+            plain_width = row.response.rect.width();
+        });
+    });
+    assert!(
+        plain_width > widths[1],
+        "an unconstrained editor already fits its value ({plain_width} vs {})",
+        widths[1]
     );
 }

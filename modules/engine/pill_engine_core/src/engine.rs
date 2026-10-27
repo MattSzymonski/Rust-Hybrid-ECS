@@ -272,6 +272,12 @@ impl Engine {
         world.insert_resource(crate::time::Time::new());
         world.insert_resource(crate::input::Input::new());
         world.insert_resource(crate::asset::AssetManager::new());
+        // The scene type is the engine's own, so every build lists and loads a
+        // `.scene` file without a module or a project registering it. This runs
+        // before any generation starts, so the registration marker it inserts
+        // sits outside every module's `registered_since` diff - which is what
+        // keeps a reload from retiring it.
+        world.register_standalone_asset::<crate::scene::Scene>();
 
         let engine = Self {
             systems: Vec::new(),

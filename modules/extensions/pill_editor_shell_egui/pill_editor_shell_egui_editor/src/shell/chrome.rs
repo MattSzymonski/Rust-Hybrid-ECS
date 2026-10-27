@@ -243,6 +243,22 @@ pub fn context_menu(
     mark_menu_region(opened, regions);
 }
 
+/// The badge an engine candidate carries in a picker: the asset is the
+/// engine's own - a chain's built-in pass, a module's default material - and
+/// not one of the project's files.
+///
+/// Public like every helper the shell re-exports, so a patch crate reaches it
+/// through the package path.
+pub fn engine_badge(ui: &mut egui::Ui) {
+    let background = ui.visuals().extreme_bg_color;
+    ui.label(
+        egui::RichText::new("engine")
+            .small()
+            .color(style::text_muted())
+            .background_color(background),
+    );
+}
+
 /// The three transform tools with their menu labels and icons, in the order
 /// every surface lists them: the viewport menu, the toolbox and the
 /// Preferences tab.

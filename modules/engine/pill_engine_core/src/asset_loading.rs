@@ -240,7 +240,6 @@ mod tests {
     fn a_scene_loads_from_code() {
         let scratch = Scratch::new("scene");
         let mut writer = Engine::new();
-        writer.world_mut().register_standalone_asset::<Scene>();
         let id = EntityId::from_name("crate");
         writer
             .world_mut()
@@ -270,7 +269,6 @@ mod tests {
         std::fs::write(scratch.root.join("scenes/a.scene"), bytes).unwrap();
 
         let mut engine = Engine::new();
-        engine.world_mut().register_standalone_asset::<Scene>();
         let loaded = engine
             .load_scene_file("scenes/a.scene")
             .expect("the scene loads");
@@ -279,5 +277,42 @@ mod tests {
             engine.world().entity_by_id(id).is_some(),
             "the entity kept the id the document gave it"
         );
+    }
+
+    /// The engine owns its scene type: a fresh engine lists it as a standalone
+    /// type and loads a `.scene` file with nothing else registered.
+    #[test]
+    fn the_engine_registers_its_own_scene_type() {
+        let scratch = Scratch::new("engine-scene");
+        let bytes = render_standalone::<Scene>(
+            AssetGuid::random().expect("a fresh guid"),
+            &crate::scene::SceneDocument::default(),
+        )
+        .expect("the scene renders");
+        std::fs::create_dir_all(scratch.root.join("scenes")).unwrap();
+        std::fs::write(scratch.root.join("scenes/empty.scene"), bytes).unwrap();
+
+        let mut engine = Engine::new();
+        let registry = engine
+            .world()
+            .get_resource::<ImportRegistry>()
+            .expect("the engine registers its import registry")
+            .clone();
+        assert!(
+            registry
+                .standalone_types()
+                .iter()
+                .any(|(type_name, extension)| {
+                    type_name
+                        == <Scene as crate::asset_standalone::StandaloneAsset>::metadata_type_name()
+                        && extension == "scene"
+                }),
+            "a fresh engine lists the scene type: {:?}",
+            registry.standalone_types()
+        );
+        let loaded = engine
+            .load_scene_file("scenes/empty.scene")
+            .expect("the scene loads without a caller registering it");
+        assert_eq!(loaded.entities, 0);
     }
 }

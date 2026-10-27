@@ -50,11 +50,11 @@ pub struct AssetTileWrites<'a> {
     /// The asset path a drag handed to the OS: the shell
     /// reports it, the executable starts the OLE drag.
     pub drag_out: &'a mut Option<String>,
-    /// The rendered previews, by path: a tile draws the one
+    /// The rendered previews, by row key: a tile draws the one
     /// it finds and keeps its icon otherwise.
     pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
-    /// The tiles drawn this frame, which the executable turns into preview
-    /// requests: only what is on screen costs work.
+    /// The tiles drawn this frame, by row key, which the executable turns into
+    /// preview requests: only what is on screen costs work.
     pub preview_visible: &'a mut Vec<String>,
 }
 
@@ -82,6 +82,51 @@ pub fn remember_tile_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::
         max_x = rect.max.x,
         max_y = rect.max.y,
         "[editor] assets tile rect"
+    );
+}
+
+/// Log a folder tree row's rectangle once per placement, keyed by the folder,
+/// so a suite can right-click the row without reading pixels.
+pub fn remember_tree_row_rect(browser: &mut ProjectBrowser, path: &str, rect: egui::Rect) {
+    let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
+    if let Some((_, logged)) = browser
+        .tree_rects
+        .iter_mut()
+        .find(|(logged_path, _)| logged_path == path)
+    {
+        if *logged == corners {
+            return;
+        }
+        *logged = corners;
+    } else {
+        browser.tree_rects.push((path.to_owned(), corners));
+    }
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        path,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] assets tree row rect"
+    );
+}
+
+/// Log the grid pane's rectangle once per placement: the area a right-click on
+/// empty space opens the container menu in.
+pub fn remember_pane_rect(browser: &mut ProjectBrowser, rect: egui::Rect) {
+    let corners = [rect.min.x, rect.min.y, rect.max.x, rect.max.y];
+    if browser.pane_rect == Some(corners) {
+        return;
+    }
+    browser.pane_rect = Some(corners);
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        min_x = rect.min.x,
+        min_y = rect.min.y,
+        max_x = rect.max.x,
+        max_y = rect.max.y,
+        "[editor] assets pane rect"
     );
 }
 
@@ -126,8 +171,8 @@ pub fn asset_tile(
     // A finished preview takes the tile's picture area; the type icon stays in
     // the picture's bottom-left corner, so a person still reads what the file
     // is. Until one exists the icon alone stands.
-    let preview = writes.previews.get(&row.path);
-    writes.preview_visible.push(row.path.clone());
+    let preview = writes.previews.get(&key);
+    writes.preview_visible.push(key.clone());
     match preview {
         Some(preview) => {
             let size = preview.size_vec2();
@@ -182,16 +227,36 @@ pub fn asset_tile(
     if response.secondary_clicked() {
         select_asset(writes.selection, &key);
     }
-    context_menu("assets", &response, writes.overlay_regions, &mut |ui| {
-        asset_menu_items(
-            ui,
-            snapshot,
-            row,
-            writes.selection,
-            writes.dialog,
-            writes.pending,
-        )
-    });
+    // A folder offers what a container is for; a file offers the two edits the
+    // panel has for an asset. A module's resource opens no menu at all: nothing
+    // in it may be written, and it is no folder to open either.
+    if browser::is_folder(row) || !row.read_only {
+        context_menu(
+            "assets tile",
+            &response,
+            writes.overlay_regions,
+            &mut |ui| {
+                if browser::is_folder(row) {
+                    asset_container_menu(
+                        ui,
+                        snapshot,
+                        writes.selection,
+                        writes.dialog,
+                        writes.pending,
+                        &key,
+                    );
+                } else {
+                    asset_menu_items(
+                        ui,
+                        snapshot,
+                        writes.selection,
+                        writes.dialog,
+                        writes.pending,
+                    );
+                }
+            },
+        );
+    }
     // Folders are drop targets (a tile lands inside one) and every tile is a
     // drag source, so a file moves by dragging it onto a folder. A module's
     // folder takes nothing: nothing may be written into it.
@@ -280,55 +345,17 @@ pub fn tile_name_job(
     job
 }
 
-/// The asset row's menu: the toolbar's actions on the row the right-click
-/// selected. Create always; rename, delete and the write-meta action only
-/// when they can act on that row, like the toolbar's buttons.
+/// The menu a file tile offers: renaming it and deleting it, the two things
+/// the panel does to an asset. Creating and opening a folder belong to a
+/// container's menu ([`asset_container_menu`]), so a file's menu never carries
+/// them.
 pub fn asset_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
-    row: &AssetListing,
     selection: &EditorSelection,
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
 ) {
-    if ui
-        .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
-        .clicked()
-    {
-        assets::open_create(
-            dialog,
-            selection,
-            &snapshot.assets,
-            &snapshot.standalone_types,
-        );
-        ui.close();
-    }
-    // The row's own file or folder in the platform's file manager: the shell
-    // queues the project-relative path and the executable opens it.
-    if !row.read_only
-        && ui
-            .add(icons::IconButton::new(
-                icons::Icon::FolderOpen,
-                "Open in File Explorer",
-            ))
-            .clicked()
-    {
-        pending.reveal(row.path.clone());
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
-            path = row.path.as_str(),
-            "[editor] reveal queued"
-        );
-        ui.close();
-    }
-    if row.kind == "folder" {
-        return;
-    }
-    // A module's resources are shown, never written: no rename, no meta, no
-    // delete.
-    if row.read_only {
-        return;
-    }
     if ui
         .add(icons::IconButton::new(
             icons::Icon::PencilSimple,
@@ -346,16 +373,51 @@ pub fn asset_menu_items(
         assets::delete_selection(pending, selection, &snapshot.assets);
         ui.close();
     }
-    if !row.standalone
-        && !row.has_meta
+}
+
+/// The menu a container offers - the grid's empty strip and a folder tile: the
+/// two things a folder is for, making an asset in it and opening it in the
+/// platform's file manager.
+///
+/// A module's folder is opened but not written into: its resources are shown
+/// and inspected, never created beside.
+pub fn asset_container_menu(
+    ui: &mut egui::Ui,
+    snapshot: &EditorSnapshot,
+    selection: &EditorSelection,
+    dialog: &mut Option<AssetDialog>,
+    pending: &mut PendingEditorCommands,
+    folder: &str,
+) {
+    if !assets::is_read_only_key(&snapshot.assets, folder)
         && ui
             .add(icons::IconButton::new(
-                icons::Icon::FileArrowDown,
-                "Write Asset Meta",
+                icons::Icon::Plus,
+                "Create New Asset...",
             ))
             .clicked()
     {
-        assets::write_meta_selection(pending, selection, &snapshot.assets);
+        assets::open_create(
+            dialog,
+            selection,
+            &snapshot.assets,
+            &snapshot.standalone_types,
+        );
+        ui.close();
+    }
+    if ui
+        .add(icons::IconButton::new(
+            icons::Icon::FolderOpen,
+            "Open Folder in File Explorer",
+        ))
+        .clicked()
+    {
+        pending.reveal(folder.to_owned());
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            path = folder,
+            "[editor] reveal queued"
+        );
         ui.close();
     }
 }
@@ -453,6 +515,14 @@ pub fn asset_dialog_window(
                                 .color(style::warning()),
                         );
                         let mut keep = overwrite.unwrap_or(true);
+                        // Confirming the warning is the answer to it. The
+                        // checkbox only moves the choice away from the
+                        // keep-the-guid default; leaving `overwrite` unset
+                        // would send the drain the same unanswered refusal
+                        // the warning exists to avoid.
+                        if overwrite.is_none() {
+                            *overwrite = Some(keep);
+                        }
                         if ui
                             .checkbox(&mut keep, "Keep the existing guid")
                             .on_hover_text(

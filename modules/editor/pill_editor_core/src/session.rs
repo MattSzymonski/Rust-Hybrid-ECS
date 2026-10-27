@@ -578,6 +578,12 @@ pub struct InspectorSession {
     /// Only a row on screen keeps an entry; see the shell's
     /// `remember_asset_row_rect`.
     pub asset_row_rects: Vec<(String, Rect)>,
+    /// Whether the row and section rectangles reach the log.
+    ///
+    /// The frontend sets it from the frame's [`crate::boundary::EguiShellInput`]:
+    /// a scripted run reads these rectangles to aim a click or a drop, and a
+    /// person's editor does not need a line per placement.
+    pub log_rects: bool,
     /// Each asset reference row's last logged text, keyed the same way: the
     /// row logs again whenever it draws a different asset.
     pub asset_row_texts: Vec<(String, String)>,

@@ -20,6 +20,15 @@ pub const INSPECTOR_LABEL_WIDTH: f32 = 80.0;
 /// field together, so a wrap moves the pair and never separates them.
 pub const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
 
+/// The slot an axis letter occupies inside its group, in points: fixed, so
+/// every component's editor gets the same width whatever the glyph's advance
+/// happens to be.
+pub const INSPECTOR_VECTOR_LABEL_WIDTH: f32 = 10.0;
+
+/// One vector component's height, in points: the height of the control the
+/// editors draw, and of the row itself.
+pub const INSPECTOR_VECTOR_FIELD_HEIGHT: f32 = 18.0;
+
 /// The Inspector tab: the selected entity's components as collapsible
 /// sections (a caret, the component's duotone icon and its label), the Add
 /// Component button in the tab's top-right, and the selected asset's import
@@ -107,6 +116,7 @@ pub fn inspector_tab(
                 &detail.key(),
                 settings,
                 &snapshot.assets,
+                &snapshot.engine_assets,
                 pending,
                 session,
                 overlay_regions,
@@ -326,6 +336,7 @@ pub fn entity_inspector(
                 &targets,
                 &snapshot.selected_details,
                 &snapshot.assets,
+                &snapshot.engine_assets,
                 &snapshot.entities,
                 pending,
                 session,

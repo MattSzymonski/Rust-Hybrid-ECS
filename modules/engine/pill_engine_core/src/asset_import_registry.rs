@@ -117,6 +117,12 @@ type EnsureMetadataFunction =
     fn(&AssetManager, &Path) -> Result<Option<AssetGuid>, AssetImportError>;
 /// What a handle of the type addresses, from its index and generation.
 type IdentityFunction = fn(&AssetManager, u32, u32) -> Option<AssetIdentity>;
+/// The guid the store holds a path's asset under, when it is loaded.
+type GuidByPathFunction = fn(&AssetManager, &Path) -> Option<AssetGuid>;
+/// What the store holds for a guid: its name and the handle's raw parts.
+type LoadedByGuidFunction = fn(&AssetManager, AssetGuid) -> Option<(String, u32, u32)>;
+/// Every live asset of the type, as its guid and its name.
+type LoadedFunction = fn(&AssetManager) -> Vec<(Option<AssetGuid>, String)>;
 
 /// The live asset a handle addresses, as a tool shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +149,9 @@ struct ImportFunctions {
     is_loaded: IsLoadedFunction,
     remove_loaded: RemoveLoadedFunction,
     identity: IdentityFunction,
+    guid_by_path: GuidByPathFunction,
+    loaded_by_guid: LoadedByGuidFunction,
+    loaded: LoadedFunction,
     /// `Some` for a standalone type, whose file is the asset; `None` for a
     /// sourced one.
     default_document: Option<DefaultDocumentFunction>,
@@ -163,6 +172,9 @@ impl ImportFunctions {
             is_loaded: is_loaded::<T>,
             remove_loaded: remove_loaded::<T>,
             identity: identity_of::<T>,
+            guid_by_path: guid_by_path::<T>,
+            loaded_by_guid: loaded_by_guid_of::<T>,
+            loaded: loaded_of::<T>,
             default_document: None,
             ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
         }
@@ -180,6 +192,9 @@ impl ImportFunctions {
             is_loaded: is_loaded::<T>,
             remove_loaded: remove_loaded::<T>,
             identity: identity_of::<T>,
+            guid_by_path: guid_by_path::<T>,
+            loaded_by_guid: loaded_by_guid_of::<T>,
+            loaded: loaded_of::<T>,
             default_document: Some(default_standalone_document::<T>),
             ensure_metadata: None,
         }
@@ -291,6 +306,44 @@ where
         guid: assets.guid_of(handle),
         name: assets.name_of(handle).map(str::to_owned),
     })
+}
+
+/// The guid a `T` is loaded under, addressed by its path's normalized name.
+fn guid_by_path<T>(assets: &AssetManager, path: &Path) -> Option<AssetGuid>
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    let handle = assets.handle_by_name::<T>(&pack_key(path)?)?;
+    assets.guid_of(handle)
+}
+
+/// The name a `T` with `guid` is loaded under, with the handle's raw parts.
+fn loaded_by_guid_of<T>(assets: &AssetManager, guid: AssetGuid) -> Option<(String, u32, u32)>
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    let handle = assets.handle_by_guid::<T>(guid)?;
+    Some((
+        assets.name_of(handle).unwrap_or_default().to_owned(),
+        handle.index(),
+        handle.generation(),
+    ))
+}
+
+/// Every live `T` in the store, as its guid and its name.
+fn loaded_of<T>(assets: &AssetManager) -> Vec<(Option<AssetGuid>, String)>
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    assets
+        .iter_handles::<T>()
+        .map(|(handle, _)| {
+            (
+                assets.guid_of(handle),
+                assets.name_of(handle).unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
 }
 
 /// [`AssetManager::reimport`] for `T`.
@@ -756,6 +809,55 @@ impl ImportRegistry {
     ) -> Option<AssetIdentity> {
         let functions = self.functions_for_type(type_name).ok()?;
         (functions.identity)(assets, index, generation)
+    }
+
+    /// The guid the store holds the asset at `path` under, when a live type of
+    /// this registry imports its extension and it is loaded.
+    ///
+    /// A caller replacing a file asks this before writing: the identity the
+    /// store already has is the one every reference names, and a file that
+    /// disagrees with it cannot be imported at the same path.
+    pub fn guid_by_path(&self, assets: &AssetManager, path: &Path) -> Option<AssetGuid> {
+        let functions = self.functions_for_path(path).ok()?;
+        (functions.guid_by_path)(assets, path)
+    }
+
+    /// The name the store holds the asset with `guid` under, with the type
+    /// that owns it and the handle's raw parts; `None` when no live type has
+    /// it loaded.
+    ///
+    /// An asset built in code - a chain's built-in passes, the default
+    /// material - has no file for a panel to read, so this is what turns the
+    /// guid a document stored back into a name to show and a handle to record.
+    pub fn loaded_by_guid(
+        &self,
+        assets: &AssetManager,
+        guid: AssetGuid,
+    ) -> Option<(String, String, u32, u32)> {
+        self.entries.iter().find_map(|entry| {
+            let registration = entry.current()?;
+            (registration.functions.loaded_by_guid)(assets, guid)
+                .map(|(name, index, generation)| (entry.type_name.clone(), name, index, generation))
+        })
+    }
+
+    /// Every live asset every type of this registry holds, as
+    /// `(type_name, guid, name)`.
+    ///
+    /// A directory walk sees files: a chain's built-in passes and the
+    /// renderer's default material are built in code and appear in none, so
+    /// this is the only place a picker learns they exist.
+    pub fn loaded_assets(&self, assets: &AssetManager) -> Vec<(String, Option<AssetGuid>, String)> {
+        let mut loaded = Vec::new();
+        for entry in &self.entries {
+            let Some(registration) = entry.current() else {
+                continue;
+            };
+            for (guid, name) in (registration.functions.loaded)(assets) {
+                loaded.push((entry.type_name.clone(), guid, name));
+            }
+        }
+        loaded
     }
 
     /// Load the asset at `path`, whether or not it is loaded yet: the same
@@ -1483,6 +1585,70 @@ mod tests {
                 resolved: document.text.try_resolve(assets).is_some(),
             })
         }
+    }
+
+    /// A path's guid and a guid's name and handle answer for what the store
+    /// holds, and a guid no type loaded answers nothing. The loaded list names
+    /// every asset of the type, which is how a picker learns about an asset
+    /// built in code.
+    #[test]
+    fn the_store_answers_a_paths_guid_and_a_guids_name() {
+        let text = ImportRegistrationMarker::<Text>::new();
+        let mut registry = ImportRegistry::default();
+        registry.register::<Text>(text.alive()).unwrap();
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::random().expect("a fresh guid");
+        assets
+            .add_named_with_guid("notes/a.txt", guid, Text("a".to_owned()))
+            .unwrap();
+        // An asset built in code: a name and a guid, no file behind either.
+        let built = AssetGuid::random().expect("a fresh guid");
+        let built_handle = assets
+            .add_named_with_guid("notes/built.txt", built, Text("built".to_owned()))
+            .unwrap();
+
+        assert_eq!(
+            registry.guid_by_path(&assets, Path::new("notes/a.txt")),
+            Some(guid)
+        );
+        let (type_name, name, index, generation) = registry
+            .loaded_by_guid(&assets, guid)
+            .expect("the file's guid answers");
+        assert_eq!(type_name, Text::metadata_type_name());
+        assert_eq!(name, "notes/a.txt");
+        let file_handle = assets.handle_by_name::<Text>("notes/a.txt").unwrap();
+        assert_eq!(
+            (index, generation),
+            (file_handle.index(), file_handle.generation())
+        );
+        let (type_name, name, index, generation) = registry
+            .loaded_by_guid(&assets, built)
+            .expect("an asset built in code answers too");
+        assert_eq!(type_name, Text::metadata_type_name());
+        assert_eq!(name, "notes/built.txt");
+        assert_eq!(
+            (index, generation),
+            (built_handle.index(), built_handle.generation())
+        );
+        assert_eq!(
+            registry.guid_by_path(&assets, Path::new("notes/missing.txt")),
+            None
+        );
+        let other = AssetGuid::random().expect("a fresh guid");
+        assert_eq!(registry.loaded_by_guid(&assets, other), None);
+
+        let loaded = registry.loaded_assets(&assets);
+        assert_eq!(loaded.len(), 2, "{loaded:?}");
+        assert!(loaded.contains(&(
+            Text::metadata_type_name().to_owned(),
+            Some(guid),
+            "notes/a.txt".to_owned()
+        )));
+        assert!(loaded.contains(&(
+            Text::metadata_type_name().to_owned(),
+            Some(built),
+            "notes/built.txt".to_owned()
+        )));
     }
 
     #[test]

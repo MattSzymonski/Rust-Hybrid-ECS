@@ -39,33 +39,52 @@ pub fn render_previews(document: &Map<String, Value>) -> bool {
 
 /// The preview a listing row asks for: a texture, a material or a mesh, when
 /// its type is one of those. A texture and a mesh are named by their file
-/// below `root`, because a project may load an asset under its own name or
-/// not load it at all; a material is named by the guid its sidecar carries.
+/// below their own root, because a project may load an asset under its own
+/// name or not load it at all; a material is named by the guid its sidecar
+/// carries.
 pub fn preview_asset(row: &AssetListing, root: &Path) -> Option<pill_renderer_api::PreviewAsset> {
     let kind = row.kind.rsplit("::").next().unwrap_or(row.kind.as_str());
     match kind {
         "Texture" => Some(pill_renderer_api::PreviewAsset::Texture {
-            path: root.join(&row.path).to_string_lossy().into_owned(),
+            path: preview_path(row, root)?.to_string_lossy().into_owned(),
         }),
         "Material" => Some(pill_renderer_api::PreviewAsset::Material {
             guid: row.guid.clone()?,
         }),
         "Mesh" => Some(pill_renderer_api::PreviewAsset::Mesh {
-            path: root.join(&row.path).to_string_lossy().into_owned(),
+            path: preview_path(row, root)?.to_string_lossy().into_owned(),
         }),
         _ => None,
     }
 }
 
-/// The preview a listing row's path asks for, by looking the row up.
+/// The file a row's preview reads: its path below the project's asset
+/// directory, or below its own module's directory - a module's resources do
+/// not live in the project at all. `None` when the row names a module that is
+/// no longer loaded, because the project's tree cannot stand in for it.
+fn preview_path(row: &AssetListing, root: &Path) -> Option<std::path::PathBuf> {
+    if row.root.is_empty() {
+        return Some(root.join(&row.path));
+    }
+    pill_engine::asset_store::module_roots()
+        .into_iter()
+        .find(|module_root| module_root.module == row.root)
+        .map(|module_root| module_root.directory.join(&row.path))
+}
+
+/// The preview a listing row's key asks for, by looking the row up.
+///
+/// The key is what the panel names a row by - the path for the project's own
+/// tree, prefixed with the extensions root for a module's file - so a module's
+/// texture and a project file that share a relative path cannot be confused.
 pub fn preview_asset_for<'a>(
     assets: impl IntoIterator<Item = &'a AssetListing>,
-    path: &str,
+    key: &str,
     root: &Path,
 ) -> Option<pill_renderer_api::PreviewAsset> {
     assets
         .into_iter()
-        .find(|row| row.path == path)
+        .find(|row| row.key() == key)
         .and_then(|row| preview_asset(row, root))
 }
 
@@ -188,5 +207,22 @@ mod tests {
         );
         assert!(preview_asset_for(&assets, "scenes/main.scene", root).is_none());
         assert!(preview_asset_for(&assets, "textures/missing.png", root).is_none());
+    }
+
+    /// A module's file resolves below its own root, and a row naming a module
+    /// that is not loaded asks for nothing rather than reading the project's
+    /// tree at the same path.
+    #[test]
+    fn a_modules_file_never_resolves_into_the_projects_tree() {
+        let root = Path::new("C:/project/res");
+        let mut module_row = row("textures/sky.png", "demo::Texture", Some("aa"));
+        module_row.root = "a-module-that-is-not-loaded".to_owned();
+        let key = module_row.key();
+        assert_eq!(
+            key,
+            "extensions/a-module-that-is-not-loaded/textures/sky.png"
+        );
+        assert_eq!(preview_asset(&module_row, root), None);
+        assert_eq!(preview_asset_for(&[module_row], &key, root), None);
     }
 }

@@ -65,6 +65,13 @@ pub struct EguiShellInput {
     /// so it is the side that can say where an entity lands on screen; the
     /// shell owns the icon atlas, so it is the side that draws the badge.
     pub badges: Vec<ShellBadge>,
+    /// Whether a scripted channel is driving this run.
+    ///
+    /// The row rectangles the Inspector logs exist for a suite - it drops an
+    /// asset onto one without reading pixels - and a person reading the console
+    /// gains nothing from a line per row placement. Only a scripted run asks
+    /// for them.
+    pub scripted: bool,
 }
 
 /// One entity's badge in one scene view.
@@ -99,6 +106,7 @@ impl Default for EguiShellInput {
             cursor: None,
             paste_text: None,
             badges: Vec::new(),
+            scripted: false,
         }
     }
 }
