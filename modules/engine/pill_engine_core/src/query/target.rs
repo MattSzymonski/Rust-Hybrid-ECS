@@ -4,7 +4,8 @@
 //!
 //! - Defines the [`QueryTarget`] trait that determines what data a query yields per row.
 //! - Implements `QueryTarget` for `&T`, `&mut T`, [`Entity`], and tuples of these.
-//! - Detects duplicate mutable borrows (`Query<(&mut T, &mut T)>`) at construction time.
+//! - Detects an aliasing target - two writes of one component, or a read beside
+//!   a write - at construction time.
 //!
 //! # Design
 //!
@@ -32,7 +33,7 @@ use crate::entity::Entity;
 /// - [`Entity`]: Access to entity IDs
 /// - `&T`: Immutable component reference
 /// - `&mut T`: Mutable component reference (yielded as [`Mut<T>`])
-/// - Tuples up to arity 4
+/// - Tuples up to arity 5
 ///
 /// State is used to cache archetype-specific data (e.g. storage pointers)
 /// for efficient access during parallel iteration. Each archetype that
@@ -124,8 +125,8 @@ impl QueryTarget for Entity {
 /// `Sync` is what makes the shared reference sound: two systems that only read
 /// a component report no conflict, so the scheduler batches them and each
 /// thread iterating the batch holds a `&T` into the same column. A component
-/// with interior mutability would then be read from two threads at once, which
-/// is why one is refused here rather than in a comment.
+/// with interior mutability would then be read from two threads at once, so
+/// the `T: Sync` bound is what keeps that impossible.
 impl<T: Component + Sync> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<crate::archetype::ComponentColumn>;
@@ -187,9 +188,8 @@ pub struct MutFetchState<T: Component> {
 // scheduler consults before placing two systems in the same parallel batch; it
 // only takes its bitmask fast path when both systems' masks are complete, and
 // otherwise compares the full access sets. That completeness rule is what makes
-// this impl sound - an earlier version inferred "no access" from an empty mask,
-// so two systems writing the same component could be batched together and this
-// state shared across threads for genuinely overlapping rows.
+// this impl sound: "no access" is never inferred from an empty mask, so two
+// systems writing the same component cannot be batched together.
 //
 // Within one batch, `ParQueryIter` assigns each thread a disjoint entity range,
 // so no two threads fetch the same row.
@@ -257,7 +257,7 @@ impl<T: Component> QueryTarget for &mut T {
 // Tuple Implementations
 // =============================================================================
 
-/// Implements `QueryTarget` for tuples up to arity 4, e.g.
+/// Implements `QueryTarget` for tuples up to arity 5, e.g.
 /// `(Entity, &Transform, &mut Velocity)`.
 macro_rules! impl_query_target_tuple {
     ($($T:ident),*) => {
@@ -289,8 +289,8 @@ macro_rules! impl_query_target_tuple {
                 // A tuple that aliases one component - two writes, or a read
                 // beside a write - produces overlapping borrows of one row,
                 // which is undefined behavior the moment iteration starts.
-                // This refuses in release too: the debug-only form let every
-                // optimized build through.
+                // The check runs in every build, not just debug ones, so an
+                // optimized build cannot start iteration on aliasing rows.
                 assert!(
                     $crate::query::target::find_aliasing_component(&reads, &writes).is_none(),
                     "query tuple reads and writes the same component; \
@@ -348,8 +348,8 @@ fn declared_shared_schema<T: Component>() -> Option<(ComponentId, u64)> {
 /// twice - the aliasing that produces overlapping `&`/`&mut` borrows of one
 /// row, which is undefined behavior.
 ///
-/// Catches both shapes the old duplicate-write check missed: two writes of one
-/// component (`Query<(&mut T, &mut T)>`) and a read aliasing a write
+/// Catches both shapes: two writes of one component
+/// (`Query<(&mut T, &mut T)>`) and a read aliasing a write
 /// (`Query<(&T, &mut T)>`, where `Mut<T>` writes the value *and* the tick the
 /// `&T` reads).
 #[inline]
@@ -357,8 +357,9 @@ pub(crate) fn find_aliasing_component(
     reads: &[ComponentId],
     writes: &[ComponentId],
 ) -> Option<ComponentId> {
-    // Small-N linear scan: tuples are at most arity 6, so O(n²) with n ≤ 8 is
-    // cheaper than allocating a HashSet on the construction path.
+    // Small-N linear scan: a query tuple contributes a handful of ids, so a
+    // quadratic scan is cheaper than allocating a HashSet on the construction
+    // path.
     for (index, write) in writes.iter().enumerate() {
         if writes[index + 1..].contains(write) || reads.contains(write) {
             return Some(*write);

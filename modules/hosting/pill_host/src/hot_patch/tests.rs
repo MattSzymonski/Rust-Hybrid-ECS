@@ -200,10 +200,9 @@ fn qualified_names_follow_the_source_tree() {
 /// A method's canonical name carries its type, because that is what a build
 /// script registers - it can read the `impl` block.
 ///
-/// This is the contract that was broken: the host asked for
-/// `pill_dummy_color::mix` while the inventory held
-/// `pill_dummy_color::Tint::mix`, so every method missed and the refusal
-/// blamed the build script.
+/// The host has to ask for that same name: `pill_dummy_color::Tint::mix`, not
+/// `pill_dummy_color::mix`. The bare form misses every method, and the refusal
+/// then blames the build script instead.
 #[test]
 fn a_method_is_named_through_its_type() {
     let directory = ScratchDirectory::new("method_naming");
@@ -341,9 +340,9 @@ fn default() -> Self { Spline(1) }\n}\n";
 
 /// The generated patch carries the body from the right `impl` block.
 ///
-/// Two types implementing one trait method is the case that made a bare-name
-/// search unsafe: it would compile the first `fn default` in the file and
-/// install it for whichever type was patched.
+/// Two types implementing one trait method is what makes a bare-name search
+/// unsafe: it would compile the first `fn default` in the file and install it
+/// for whichever type was patched.
 #[test]
 fn a_generated_trait_patch_carries_the_right_body() {
     let directory = ScratchDirectory::new("generate_trait_method");
@@ -490,7 +489,7 @@ fn patch_artifact_names_do_not_collide_across_sessions() {
 /// when it was read - filesystem time against filesystem time. Comparing
 /// against `SystemTime::now()` is not sound on Windows, where file times come
 /// from the coarse system clock and a file written after a snapshot can
-/// report an earlier time; that mistake made every classification miss.
+/// report an earlier time, so every classification would miss.
 #[test]
 fn an_untouched_file_is_not_re_read() {
     let directory = ScratchDirectory::new("classify_mtime_gate");
@@ -570,9 +569,9 @@ fn a_touched_file_is_re_read() {
 
 /// Classification hands on the modification time it read WITH the contents.
 ///
-/// The pair is what `try_patch` stores as the new snapshot. It used to
-/// re-stat the file after installing the patch, pairing older contents with
-/// a newer time - so a save made during the compile was recorded as already
+/// The pair is what `activate_attempt` stores as the new snapshot. Re-statting
+/// the file after installing the patch would pair older contents with a newer
+/// time - so a save made during the compile would be recorded as already
 /// delivered and then skipped by the modification-time gate.
 #[test]
 fn classify_returns_the_time_of_the_contents_it_read() {
@@ -726,13 +725,14 @@ fn session_over(directory: &Path, contents: &str) -> HotPatchSession {
     // recorded when it was read. Filesystem timestamps are coarse, so a test
     // that writes its edit within the same tick as this snapshot produces a
     // file that looks unchanged - and the test then fails intermittently,
-    // reporting "no change detected" for an edit that is plainly there. It
-    // surfaced under the parallel harness, where the write lands sooner.
+    // reporting "no change detected" for an edit that is plainly there. The
+    // parallel harness makes that more likely, because the write lands sooner.
     //
     // The gate's imprecision is harmless in production: a missed edit falls
     // through to a full reload, which still delivers it. It is only a
     // problem for a test that asserts on classification itself, so the wait
-    // lives here - once, for all 27 sessions - rather than in each test.
+    // lives here, once for every session a test builds, rather than in each
+    // test.
     std::thread::sleep(std::time::Duration::from_millis(20));
     session
 }
@@ -878,13 +878,11 @@ fn classify_refuses_everything_outside_a_hot_body() {
 
 /// A refused edit must not disable patching for the rest of the session.
 ///
-/// This is the bug that made live patching look broken: `classify` diffs
-/// against a snapshot of what is running, and only a *successful* patch
-/// advanced it. A refusal was followed by a full reload, which picked the
-/// edit up without telling the session - so the refused change stayed in
-/// every later diff, and each subsequent body-only edit was refused for a
-/// change that had already shipped. One unpatchable edit disabled the fast
-/// path until the host restarted.
+/// `classify` diffs against a snapshot of what is running, and only a
+/// *successful* patch advances it. A refusal is followed by a full reload,
+/// which picks the edit up without telling the session - so without the re-sync
+/// the refused change stays in every later diff, and each subsequent body-only
+/// edit is refused for a change that has already shipped.
 ///
 /// `refresh_snapshots` is what the frame loop calls after a reload to close
 /// that gap; this test pins the behaviour that depends on it.
@@ -935,9 +933,9 @@ fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
 
 /// Two bodies changed in one save are both reported, in a stable order.
 ///
-/// This used to be a refusal. Each body is an independent replacement, so
-/// the only cost of taking both is one compile apiece - cheaper than the
-/// full reload the refusal fell back to, and the world is never torn down.
+/// Each body is an independent replacement, so the only cost of taking both is
+/// one compile apiece - cheaper than a full reload, and the world is never torn
+/// down.
 #[test]
 fn classify_reports_every_changed_body() {
     let directory = ScratchDirectory::new("classify_two_bodies");
@@ -968,10 +966,10 @@ fn classify_reports_every_changed_body() {
 
 /// Stage timings add up across the bodies of one save.
 ///
-/// `apply` runs once per changed body with the same accumulator, and the
-/// total it reports spans all of them: writing instead of adding made the
-/// breakdown describe the last body alone, exactly when a slow multi-body
-/// save is the one being diagnosed.
+/// `install_body` runs once per changed body with the same accumulator, and the
+/// total it reports spans all of them: writing instead of adding would make the
+/// breakdown describe the last body alone, exactly when a slow multi-body save
+/// is the one being diagnosed.
 #[test]
 fn stage_timings_accumulate_across_bodies() {
     let mut total = PatchStages {
@@ -1114,7 +1112,8 @@ fn a_prologue_generation_a_reload_invalidated_says_so() {
     let directory = ScratchDirectory::new("rollback_dropped_history");
     let mut session = session_over(&directory, HOT_SOURCE);
 
-    // A generation delivered by overwriting code, as `apply` would record it.
+    // A generation delivered by overwriting code, as `install_body` records
+    // one.
     session.generations.push(Generation {
         function: "project::ordinary".to_string(),
         number: 1,
@@ -1187,7 +1186,7 @@ fn a_reload_forgets_slot_generations() {
     let directory = ScratchDirectory::new("reload_forgets_slots");
     let mut session = session_over(&directory, HOT_SOURCE);
 
-    // A generation delivered into a slot, as `apply` records one: no
+    // A generation delivered into a slot, as `install_body` records one: no
     // prologue was written, so there is nothing for the reload to prune.
     session.generations.push(Generation {
         function: "project::movement".to_string(),
@@ -1233,9 +1232,9 @@ fn a_reload_forgets_slot_generations() {
 /// An un-annotated function is patchable: the attribute chooses which
 /// mechanism delivers the replacement, not whether one is possible at all.
 ///
-/// This inverts what this case used to assert. Discovery now comes from the
-/// build script's address inventory rather than from an attribute, so a
-/// plain `fn` in a participating crate is as patchable as an annotated one.
+/// Discovery comes from the build script's address inventory rather than from
+/// an attribute, so a plain `fn` in a participating crate is as patchable as
+/// an annotated one.
 #[test]
 fn classify_accepts_an_un_annotated_function() {
     let directory = ScratchDirectory::new("classify_unannotated");
@@ -1277,8 +1276,8 @@ fn classify_refuses_a_file_with_no_functions() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// Editing a second function's body is now a patch of THAT function, not a
-/// structural change - one changed body is still the limit.
+/// Editing a second function's body is a patch of THAT function, not a
+/// structural change.
 #[test]
 fn classify_reports_whichever_body_changed() {
     let directory = ScratchDirectory::new("classify_other_body");

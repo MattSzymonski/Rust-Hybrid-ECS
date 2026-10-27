@@ -4,14 +4,14 @@
 //!
 //! - [`raw_input`]: one frame of [`RawInput`] from the events the frontend
 //!   collected for the shell this frame, plus the shell's geometry.
-//! - [`map_key`] and [`modifiers`]: the pure conversions it composes, kept
-//!   public so they stay testable.
+//! - [`map_key`], [`pointer_button`] and [`modifiers`]: the pure conversions
+//!   it composes, kept public so they stay testable.
 //!
 //! # Design
 //!
 //! The shell reads [`EguiShellInput::events`], never the game's `Input`: a
 //! key typed into an Inspector field belongs to the UI, and a project system
-//! must not see it (W-0038 Stage 1). The frontend routes window events by
+//! must not see it. The frontend routes window events by
 //! window - the editor's own windows feed this list, the game's window feeds
 //! the engine - and this bridge replays the list as egui events, carrying
 //! the pointer position and the modifiers forward so every event reports the
@@ -45,7 +45,7 @@ pub fn raw_input(shell_input: &EguiShellInput) -> RawInput {
         walk.push(event, scale, &mut events);
     }
     // The OS clipboard's text, when the frame carried a paste chord: egui
-    // only pastes from this event (W-0038 Stage 17).
+    // only pastes from this event.
     if let Some(text) = shell_input.paste_text.as_ref() {
         events.push(Event::Paste(text.clone()));
     }

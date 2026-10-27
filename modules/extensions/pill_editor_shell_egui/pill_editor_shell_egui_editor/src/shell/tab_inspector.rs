@@ -6,8 +6,7 @@
 //! - `entity_inspector` and its section headers: one collapsible section per component, expanded through the row builders.
 //! - `addable_components`: the components the popup offers.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -37,11 +36,9 @@ pub fn inspector_tab(
     session: &mut InspectorSession,
 ) {
     // No scroll area of its own: the dock wraps every tab body in one, and a
-    // nested area sizes itself to its content rather than to the body, so the
-    // rows were laid out below the body and nothing could scroll them into
-    // view (W-0048).
-    // A selected resource takes the tab: one selection shows one thing
-    // (W-0038 Stage 14).
+    // nested area sizes itself to its content rather than to the body, so its
+    // rows would sit outside the scrolled region.
+    // A selected resource takes the tab: one selection shows one thing.
     if let Some(view) = selection
         .resource
         .as_deref()
@@ -52,8 +49,9 @@ pub fn inspector_tab(
     }
     // The rows this tab reports are the ones it draws for the entity in front
     // of it: a new subject makes every row - and every rectangle - new again,
-    // so what the previous subject left in the memory cannot hide the new
-    // entity's rows or point a click at where a section used to be (W-0049).
+    // so what the previous subject left in the session cannot hide the new
+    // entity's rows or point a click at a rectangle a section no longer
+    // occupies.
     let subject = snapshot.detail.as_ref().map(|detail| detail.entity);
     if session.subject != subject {
         session.subject = subject;
@@ -85,24 +83,35 @@ pub fn inspector_tab(
     if let Some(detail) = snapshot
         .asset_detail
         .as_ref()
-        .filter(|detail| selected_asset == Some(detail.path.as_str()))
+        .filter(|detail| selected_asset == Some(detail.key().as_str()))
     {
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(format!("asset {}", detail.path)).strong());
+        ui.label(egui::RichText::new(format!("asset {}", detail.key())).strong());
         read_only_row(ui, "kind", &detail.kind);
         if detail.standalone {
             read_only_row(ui, "standalone", "yes");
+        }
+        // A module's resource is shown as it is: every row reads, and nothing
+        // here can repoint it.
+        if detail.read_only {
+            ui.label(
+                egui::RichText::new("provided by the engine - read-only")
+                    .weak()
+                    .italics(),
+            );
         }
         ui.separator();
         match detail.settings.as_ref() {
             Some(settings) => asset_settings_rows(
                 ui,
-                &detail.path,
+                &detail.key(),
                 settings,
                 &snapshot.assets,
                 pending,
                 session,
                 overlay_regions,
+                detail.read_only,
+                &detail.texture_slots,
             ),
             None => {
                 ui.label(egui::RichText::new("no editable settings").weak().italics());
@@ -328,8 +337,7 @@ pub fn entity_inspector(
 }
 
 /// The selected entities one component's edit reaches: the primary first, then
-/// every other selected entity whose detail carries the component (W-0038
-/// Stage 16).
+/// every other selected entity whose detail carries the component.
 pub fn inspector_targets(
     snapshot: &EditorSnapshot,
     primary: Entity,

@@ -24,14 +24,14 @@
 //! vocabulary, the camera - lives in `pill_renderer_api`, which this crate
 //! builds on; the types a game needs from it are re-exported here.
 //!
-//! The shaders live at the crate root (`shaders/`), not under `src/`, so a
-//! shader edit is not a Rust source edit. In development the host watches and
-//! re-cooks them, and hands each result to [`shader_hot_reload`]'s export -
-//! compiled into native development builds.
+//! The shader sources live at the crate root (`shader_sources/`), not under
+//! `src/`, so a shader edit is not a Rust source edit. Live reload is
+//! [`shader_hot_reload`]'s, compiled into native development builds: the
+//! development host re-cooks an edited source and hands the result to that
+//! module's export.
 
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
-
 /// The sRGB transfer curve the importer and the GPU module share.
 pub mod color_space;
 
@@ -47,7 +47,11 @@ mod rendering_manager;
 /// Development shader reload: puts WGSL the host re-cooked into the shader assets built from it.
 #[cfg(any(test, all(debug_assertions, not(target_arch = "wasm32"))))]
 pub mod shader_hot_reload;
+/// The name the host loads this module under: its crate name.
+pub const MODULE_NAME: &str = "pill_master_renderer_data";
 
+// Standard library
+use std::path::Path;
 // External crates
 pub use pill_engine::AssetLoader;
 use pill_engine::{pill_module, AssetManager, Engine, World};
@@ -57,10 +61,11 @@ pub use pill_renderer_api::frame::{
 
 // Current crate
 pub use assets::{
-    Material, MaterialBuilder, MaterialDocument, MaterialTexture, Mesh, MeshImportSettings,
-    MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline, Shader, ShaderBuilder,
-    ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture, TextureImportSettings,
-    TextureType,
+    load_shipped_texture, Material, MaterialBuilder, MaterialDocument, MaterialTexture, Mesh,
+    MeshImportSettings, MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline, Shader,
+    ShaderBuilder, ShaderImportSettings, ShaderParameterDeclaration, ShaderParameterSlot,
+    ShaderParameterType, ShaderTextureDeclaration, ShaderTextureSlot, Texture,
+    TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE, DEFAULT_NORMAL_TEXTURE,
 };
 pub use components::*;
 pub use rendering_manager::RenderingManager;
@@ -95,7 +100,8 @@ pub fn register(engine: &mut Engine) -> u32 {
     // which declares the asset type as well.
     engine.world_mut().register_imported_asset::<Mesh>();
     engine.world_mut().register_imported_asset::<Texture>();
-    engine.world_mut().register_asset::<Shader>();
+    // Shaders are `.hlsl` sources with a `.hlsl.meta` beside them.
+    engine.world_mut().register_imported_asset::<Shader>();
     // Materials are also files of their own (`.material`), loaded by extension.
     engine.world_mut().register_standalone_asset::<Material>();
     // Passes are also files of their own (`.render_pass`), loaded by extension.
@@ -115,6 +121,15 @@ pub fn register(engine: &mut Engine) -> u32 {
     if engine.world().get_resource::<RenderingManager>().is_none() {
         engine.world_mut().insert_resource(RenderingManager::new());
     }
+    // This crate's own assets: the default material the chain draws with,
+    // declared here from the crate's directory, so the store answers
+    // `defaults/pill.pbr.material` by name and the editor lists the folder
+    // read-only; a file that went missing stops the engine at this declaration
+    // instead of leaving a scene unlit.
+    //
+    // A shipped build links this crate statically and mounts its pack instead,
+    // so it has no module directory to declare.
+    declare_crate_roots();
     // The frame the renderer runs when a project declares none: the PBR chain,
     // installed as assets and pointed at by the manager. A project that sets
     // its own pipeline does so after this call, so its choice wins.
@@ -128,12 +143,58 @@ pub fn register(engine: &mut Engine) -> u32 {
     0
 }
 
+/// Declare the read-only roots this crate ships, from its own directory.
+///
+/// The default material under `res`, and the sources the chain's shaders are
+/// cooked from under `shader_sources`. The `.wgsl` beside each source is this
+/// crate's build product - the store answers it, because a shader's stages are
+/// read from it by path, and the editor's tree leaves it out so the person sees
+/// what they author. Declaring the same roots again is what a reload does and
+/// changes nothing, which is also what lets this crate's own tests read the
+/// files a running module reads.
+fn declare_crate_roots() {
+    let resources = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/res"));
+    if resources.is_dir() {
+        pill_engine::asset_store::declare_module_root(
+            MODULE_NAME,
+            resources,
+            &[
+                config::pbr_pipeline::DEFAULT_MATERIAL_PATH,
+                assets::DEFAULT_COLOR_TEXTURE,
+                assets::DEFAULT_NORMAL_TEXTURE,
+            ],
+        );
+    }
+    let sources = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/shader_sources"));
+    if sources.is_dir() {
+        pill_engine::asset_store::declare_module_root_hiding(
+            MODULE_NAME,
+            sources,
+            &[
+                "common_shaders/default_vertex.hlsl",
+                "pbr_pipeline/shaders/pbr_fragment.hlsl",
+                "post_processing/shaders/bloom_composite_fragment.hlsl",
+                "post_processing/shaders/bloom_prefilter_fragment.hlsl",
+                "post_processing/shaders/fullscreen_vertex.hlsl",
+                "post_processing/shaders/lens_fragment.hlsl",
+                "post_processing/shaders/tonemap_fragment.hlsl",
+                "simple_pipeline/shaders/default_lit_fragment.hlsl",
+                "skybox/shaders/skybox_cubemap_fragment.hlsl",
+                "skybox/shaders/skybox_equirect_fragment.hlsl",
+                "skybox/shaders/skybox_vertex.hlsl",
+            ],
+            &["wgsl"],
+        );
+    }
+}
+
 /// Install [`config::pbr_pipeline`] and point the manager at it.
 ///
 /// A failure is warned and not returned: a renderer that could not install the
 /// default pipeline still runs, through its built-in chain, and the log says
-/// what went wrong. Two things get in here: a name clash with an asset the
-/// project already owns, and a shader of ours that will not build.
+/// what went wrong. Three failures reach here: a name clash with an asset the
+/// project already owns, the default material's file not parsing or loading,
+/// and a shader of ours that will not build.
 fn install_default_pipeline(world: &mut World) {
     let installed = match world.get_resource_mut::<AssetManager>() {
         Some(assets) => config::pbr_pipeline::install(assets),
@@ -159,7 +220,7 @@ mod tests {
     use super::*;
     use pill_engine::{Engine, Handle, ImportRegistry, MetadataPolicy};
 
-    /// A mesh renderer's handle fields are typed asset references (W-0048):
+    /// A mesh renderer's handle fields are typed asset references:
     /// they read naming the registered asset type, another mesh's handle
     /// writes through the field layer into the component the renderer reads,
     /// and a material handle is refused for the mesh field.

@@ -12,32 +12,19 @@
 //!
 //! # Design
 //!
-//! These are universal rather than renderer-specific. A position is where a
-//! thing is; a colour is what shade it is. Neither names a GPU concept, both
-//! are plain `repr(C)` data, and a project, an editor, a rasterizer and a wgpu
-//! pipeline all want the same two. They lived in `pill_master_renderer`
-//! alongside the pipeline that draws them, which meant naming a `Position`
-//! cost a dependency on wgpu - and copies of both types accumulated in every
-//! other renderer besides.
-//!
+//! These are universal rather than renderer-specific: a position is where a
+//! thing is, a colour is what shade it is, and neither names a GPU concept.
 //! Renderer-specific mesh, camera and material contracts live in the rendering
-//! extension. These general gameplay data types remain usable without it.
+//! extension; these gameplay data types stay usable without it.
 //!
-//! The types are a deliberately shared ABI. Consumers that must reach another
-//! binary's rows resolve them by stable type name and verified `repr(C)` size
-//! rather than by `TypeId`, which was distinct per binary while every DLL
-//! embedded its own copy of the engine, and which separately built artifacts
-//! still cannot rely on. Keeping the definition in one crate is what makes that
-//! name agree across every artifact.
-//!
-//! [`TransformComponent`] came here from the renderer's data crate, because a
-//! placement is not a rendering concept. It keeps the shared name it was pinned
-//! to there, so the managed mirror's namespace and every live column for it are
-//! unaffected by the move. Like the other two it is declared by hand rather
-//! than with `#[derive(PillComponent)]`: that derive submits an inventory
-//! entry, and every artifact linking the engine would then register the
-//! component, and fold it into its persistable-schema fingerprint, whether it
-//! used it or not.
+//! The byte layout is a shared ABI. Another language binds these rows by the
+//! name they register under and the `repr(C)` size it verifies, because a
+//! `TypeId` is computed per compilation unit. [`TransformComponent`] also
+//! declares a shared name, so every binary that registers it resolves to one
+//! column. All three are declared by hand rather than with
+//! `#[derive(PillComponent)]`, whose inventory entry would make every artifact
+//! linking the engine register the component - and fold it into its
+//! persistable-schema fingerprint - whether it used it or not.
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -55,8 +42,8 @@ use pill_engine_macros::PillLayout;
 
 /// World-space position of an entity's draw origin, in pixels.
 ///
-/// Resolved across binaries by stable type name rather than by Rust `TypeId`,
-/// so a hot-loaded project and the host agree on one column.
+/// Plain `repr(C)` float pairs, so its byte layout is what another language
+/// binds against rather than a `TypeId`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PillLayout)]
 pub struct Position {
@@ -90,7 +77,7 @@ pub struct Color {
 impl Component for Color {}
 
 impl Color {
-    /// Opaque white, the default fill color of a mesh.
+    /// Opaque white, and what [`Default`] returns for a colour.
     pub const WHITE: Color = Color {
         r: 1.0,
         g: 1.0,
@@ -112,9 +99,9 @@ impl Default for Color {
 
 /// The shared name [`TransformComponent`] registers under.
 ///
-/// Pinned to the name the type carried in the renderer, before it moved to the
-/// engine. A name derived from the module path would register a different
-/// component and orphan every column a live world holds for this one.
+/// Pinned, not derived from the module path: a derived name would register a
+/// different component and orphan every column a live world holds for this
+/// one.
 pub const TRANSFORM_SHARED_NAME: &str = "pill_master_renderer::component::TransformComponent";
 
 /// Placement of an entity in the scene: position, orientation and scale.
@@ -175,11 +162,9 @@ pub const ROTATION_IDENTITY_EPSILON: f32 = 1.0e-8;
 /// Read a [`TransformComponent::rotation`] value as a normalize-or-identity
 /// quaternion array.
 ///
-/// The one implementation of the rule the field's documentation states: a
-/// non-finite or zero-length value reads as identity instead of being used
-/// as-is, and everything else is normalized. Systems, projects and the
-/// renderer share this rule and its tolerance rather than each spelling
-/// their own.
+/// The one implementation of the rule the field's documentation states, so
+/// systems, projects and the renderer share it and its tolerance rather than
+/// each spelling their own.
 pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
     let length_squared: f32 = rotation.iter().map(|value| value * value).sum();
     if rotation.iter().all(|value| value.is_finite()) && length_squared > ROTATION_IDENTITY_EPSILON
@@ -198,22 +183,14 @@ pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
 /// Register [`Position`], [`Color`] and [`TransformComponent`] with their
 /// editor layouts.
 ///
-/// [`TransformComponent`] is registered as persistable, exactly as the
-/// `PillComponent` derive registered it before the type moved here, so its
-/// values are migrated across reloads.
+/// [`TransformComponent`] is registered as persistable, so its values are
+/// migrated across reloads. Idempotent, so a hot reload re-running `init` is
+/// safe, and every type arrives in the inspector field-editable rather than as
+/// an opaque blob: the layouts come from `#[derive(PillLayout)]` on each
+/// struct.
 ///
-/// Idempotent, so a hot reload re-running `init` is safe, and it goes through
-/// `register_component_with_layout` so the components arrive field-editable in
-/// the inspector rather than as opaque blobs. The layouts come from
-/// `#[derive(PillLayout)]` on each struct: generated descriptors instead of
-/// hand-written offsets. These types are a shared ABI every binary links, so
-/// they must not carry `#[derive(PillComponent)]` - that derive also submits
-/// an inventory registration, which would put both columns in every world that
-/// merely links the engine.
-///
-/// A renderer calls this from its own registration entry point and then adds
-/// whatever it draws with; a project that only wants a position and a colour
-/// can call it directly and link no renderer at all.
+/// A renderer calls this from its registration entry point before adding
+/// whatever it draws with.
 pub fn register_common_components(world: &mut World) {
     world.register_component_with_layout::<Position>(Position::FIELD_LAYOUT);
     world.register_component_with_layout::<Color>(Color::FIELD_LAYOUT);
@@ -299,8 +276,8 @@ mod tests {
         );
     }
 
-    /// The transform keeps the shared name it had in the renderer; that string
-    /// is its identity across binaries and across the move.
+    /// The transform's pinned string is its identity across binaries, so the
+    /// test holds the name in place.
     #[test]
     fn the_transform_keeps_its_pinned_shared_name() {
         assert_eq!(

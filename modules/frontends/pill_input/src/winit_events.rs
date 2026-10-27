@@ -13,10 +13,11 @@
 //! The engine's [`KeyCode`] mirrors winit's variant for variant, so the key
 //! mapping is one list of names; a name the engine lacks fails to compile, and
 //! a count check catches a key left out. Positions and deltas stay in physical
-//! pixels, as winit reports them; the window is the game's whole area in both
-//! winit frontends. One window event can carry two engine events - a pressed
-//! key reports both its key change and its committed text - so the translation
-//! yields a small sequence rather than one optional event.
+//! pixels, as winit reports them, and a frontend gives the frame driver the
+//! window's whole inner size, so input and the drawn surface share one space.
+//! One window event can carry two engine events - a pressed key reports both
+//! its key change and its committed text - so the translation yields a small
+//! sequence rather than one optional event.
 
 // External crates
 use pill_core::math::Vector2f;

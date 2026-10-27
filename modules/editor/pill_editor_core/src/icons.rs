@@ -3,30 +3,25 @@
 //!
 //! # Responsibilities
 //!
-//! - [`append_font_definitions`]: append the vendored Phosphor fonts as
-//!   families to the definitions the UI kit is about to install;
-//!   [`crate::style::apply_theme`] passes it as the kit's built-in callback.
+//! - [`append_font_definitions`]: the two vendored Phosphor families, appended
+//!   to the definitions [`crate::style::apply_theme`] has the UI kit install.
 //! - [`Icon`]: the icons the editor uses, as the fonts' codepoints.
-//! - [`rich`]: an icon and a label as one text run, for tab titles and the
-//!   widgets that only take text.
-//! - [`paint_duotone`] and [`IconButton`]: Phosphor's duotone form - a fill
-//!   under the line art - for the editor's buttons, menus and tool rows.
+//! - [`rich`]: an icon and a label as one text run.
+//! - [`paint_duotone`] and [`IconButton`]: Phosphor's duotone form, a fill
+//!   under the line art, for the editor's buttons, menus and tool rows.
 //!
 //! # Design
 //!
-//! The vendored files are the `@phosphor-icons/web` package's
-//! `Phosphor.ttf` (regular) and `Phosphor-Duotone.ttf`. The duotone font
-//! carries every icon twice: its fill shape at the icon's codepoint and its
-//! line art one codepoint further - the pairing the package's stylesheet
-//! overlays with `:before`/`:after`, the fill at a fifth of the opacity.
-//! Painting both glyphs from one origin at [`DUOTONE_FILL_ALPHA`] gives the
-//! duotone look with no image atlas: the icons tint with the theme,
-//! rasterize at any size, and cost no texture memory.
+//! The vendored `Phosphor.ttf` (regular) and `Phosphor-Duotone.ttf` come from
+//! the `@phosphor-icons/web` package. In the duotone font each icon appears
+//! twice, its fill at the codepoint and its line art one further - the pairing
+//! the package's stylesheet overlays at a fifth of the opacity - and painting
+//! both from one origin at [`DUOTONE_FILL_ALPHA`] gives the look with no image
+//! atlas: the icons tint with the theme and need no texture of their own.
 //!
-//! Both families list the context's proportional fonts first and Phosphor
-//! after them: Phosphor's own character map also claims the lowercase
-//! Latin range (with empty glyphs), so a letter must always be answered by
-//! the UI font, and only an icon's private-use codepoint reaches Phosphor.
+//! Both families lead with their Phosphor face: the UI fonts claim this
+//! private-use range with glyphs of their own, so an icon listed behind them
+//! draws as a stray letter. [`rich`] carries the mixed-run rule.
 
 // Standard library
 use std::sync::Arc;
@@ -63,11 +58,17 @@ const DUOTONE_FONT: &[u8] = include_bytes!("../assets/Phosphor-Duotone.ttf");
 
 /// The font definitions' keys for the two files.
 pub const REGULAR_KEY: &str = "phosphor";
-const DUOTONE_KEY: &str = "phosphor.duotone";
+/// The key the duotone face is registered under.
+pub const DUOTONE_KEY: &str = "phosphor.duotone";
 
 /// Append the Phosphor fonts to `fonts` as [`FAMILY`] and [`DUOTONE_FAMILY`],
-/// each falling back to the proportional family built so far so a label
-/// beside an icon still draws.
+/// each leading with its icon face and falling back to the proportional
+/// family built so far so a label beside an icon still draws.
+///
+/// The icon face goes first because the UI fonts claim this private-use range
+/// with glyphs of their own, which would turn an icon into a letter. The
+/// regular face cannot lead a mixed run - it claims the lowercase range with
+/// blank glyphs - so [`rich`] takes its icon from the duotone face instead.
 pub fn append_font_definitions(fonts: &mut FontDefinitions) {
     fonts.font_data.insert(
         REGULAR_KEY.to_owned(),
@@ -82,12 +83,10 @@ pub fn append_font_definitions(fonts: &mut FontDefinitions) {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    // Phosphor goes LAST: its character map claims the lowercase Latin range
-    // (with empty glyphs), so a letter in a mixed run has to be answered by
-    // the UI fonts first, and only an icon's codepoint reaches Phosphor.
     let family = |icon_font: &str| {
-        let mut names = fallbacks.clone();
+        let mut names = Vec::with_capacity(fallbacks.len() + 1);
         names.push(icon_font.to_owned());
+        names.extend(fallbacks.iter().cloned());
         names
     };
     fonts
@@ -324,11 +323,16 @@ fn glyph(codepoint: u32) -> char {
     char::from_u32(codepoint).expect("a Phosphor codepoint is a scalar value")
 }
 
-/// `icon` and `label` as one text run: the icon from the regular font and
-/// the letters from the UI font the family falls back to.
+/// `icon` and `label` as one text run: the icon's line art from the duotone
+/// face and the letters from the UI fonts behind it.
+///
+/// The duotone face leads its family and claims no ASCII codepoint, so a
+/// label's letters reach the UI font; its line art at `codepoint + 1` is the
+/// regular face's outline. The regular face cannot carry a mixed run: it
+/// claims the lowercase range with blank glyphs.
 pub fn rich(icon: Icon, label: &str) -> egui::RichText {
-    egui::RichText::new(format!("{}  {label}", icon.glyph()))
-        .family(FontFamily::Name(FAMILY.into()))
+    let (_, line) = icon.duotone();
+    egui::RichText::new(format!("{line}  {label}")).family(FontFamily::Name(DUOTONE_FAMILY.into()))
 }
 
 /// `color` at `factor` of its opacity.
@@ -480,9 +484,9 @@ fn brighten(color: Color32, amount: u8) -> Color32 {
 mod tests {
     use super::*;
 
-    /// Every icon's codepoint, and the duotone font's line art one further,
-    /// are in both vendored fonts' character maps: a typo or a package
-    /// change fails here instead of drawing a blank.
+    /// Every icon's codepoint is in both vendored fonts' character maps, and
+    /// the duotone font also maps the line art one codepoint further: a typo
+    /// or a package change fails here instead of drawing a blank.
     #[test]
     fn every_icon_is_in_the_vendored_fonts() {
         let regular = codepoints(REGULAR_FONT);
@@ -514,11 +518,73 @@ mod tests {
     #[test]
     fn a_rich_label_starts_with_its_icon() {
         let grid = rich(Icon::GridFour, "Grid");
-        assert!(grid.text().starts_with(Icon::GridFour.glyph()));
+        let (_, grid_line) = Icon::GridFour.duotone();
+        assert!(grid.text().starts_with(grid_line));
         assert!(grid.text().ends_with("Grid"));
         let magnet = rich(Icon::Magnet, "Grid");
-        assert!(magnet.text().starts_with(Icon::Magnet.glyph()));
+        let (_, magnet_line) = Icon::Magnet.duotone();
+        assert!(magnet.text().starts_with(magnet_line));
         assert_ne!(grid.text(), magnet.text());
+    }
+
+    /// An icon's codepoint is answered by its Phosphor face, not by the UI font
+    /// the family falls back to. Inter carries alternates across this range, so
+    /// the UI font really does claim it - the two layouts differ, which is what
+    /// the icon family must not give it to.
+    #[test]
+    fn an_icon_is_drawn_by_its_phosphor_face() {
+        let mut definitions = pill_ui_kit::style::font_definitions(
+            &pill_ui_kit::style::ThemeFonts::default(),
+            crate::style::append_fonts,
+        );
+        definitions.families.insert(
+            FontFamily::Name("test.phosphor".into()),
+            vec![REGULAR_KEY.to_owned()],
+        );
+        let mut fonts =
+            egui::epaint::text::Fonts::new(egui::epaint::text::TextOptions::default(), definitions);
+
+        for icon in [Icon::Cube, Icon::Image, Icon::File, Icon::FolderOpen] {
+            let glyph = icon.glyph().to_string();
+            let phosphor = ink(&mut fonts, &glyph, FontFamily::Name("test.phosphor".into()));
+            let icons = ink(&mut fonts, &glyph, FontFamily::Name(FAMILY.into()));
+            let ui = ink(&mut fonts, &glyph, FontFamily::Proportional);
+            assert_eq!(icons, phosphor, "{} came from the UI font", icon.name());
+            assert_ne!(ui, phosphor, "the UI font does not claim {}", icon.name());
+        }
+    }
+
+    /// The ink rectangle `text` gets in `family`: layout only measures the
+    /// glyph, so the colour comes from the palette like every other one.
+    fn ink(fonts: &mut egui::epaint::text::Fonts, text: &str, family: FontFamily) -> Rect {
+        let color = crate::style::palette().text;
+        fonts
+            .with_pixels_per_point(1.0)
+            .layout_no_wrap(text.to_owned(), FontId::new(24.0, family), color)
+            .rect
+    }
+
+    /// Both icon families lead with their Phosphor face. The UI fonts a family
+    /// falls back to claim the private-use codepoints with glyphs of their own
+    /// (Inter carries alternates across the range), so an icon listed behind
+    /// them draws as a stray letter.
+    #[test]
+    fn the_icon_families_lead_with_their_phosphor_face() {
+        let mut fonts = FontDefinitions::default();
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "ui".to_owned());
+        append_font_definitions(&mut fonts);
+        for (family, key) in [(FAMILY, REGULAR_KEY), (DUOTONE_FAMILY, DUOTONE_KEY)] {
+            let names = &fonts.families[&FontFamily::Name(family.into())];
+            assert_eq!(names.first().map(String::as_str), Some(key), "{family}");
+            assert!(
+                names.iter().any(|name| name == "ui"),
+                "{family} lost its UI fallback"
+            );
+        }
     }
 
     /// The fade scales the colour's opacity and leaves a solid colour alone.

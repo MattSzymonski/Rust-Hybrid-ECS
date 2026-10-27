@@ -8,34 +8,25 @@
 //!
 //! # Design
 //!
-//! Resources are singletons: one `SimulationTime` per world, fetched by type
-//! through [`Res`](crate::query::Res). Meshes and textures are the opposite
-//! shape - a world holds hundreds, and the type alone does not name one. That
-//! is a different storage problem, so it gets different storage rather than a
+//! Resources are singletons, fetched by type through
+//! [`Res`](crate::query::Res); a mesh or a texture is one of hundreds, and the
+//! type alone does not name one, so assets get their own store rather than a
 //! reinterpretation of [`Resource`](crate::resource::Resource).
-//!
-//! [`AssetManager`] is itself a plain resource, so the whole store arrives
-//! through the existing `Res<AssetManager>` / `ResMut<AssetManager>` parameters
-//! and the scheduler's existing resource-conflict analysis already covers it -
-//! two systems writing assets serialise, a reader and a writer serialise, and
-//! an asset writer still runs beside a system touching only components. No
-//! scheduler change was needed to add this.
+//! [`AssetManager`] is itself a plain resource, so `Res<AssetManager>` /
+//! `ResMut<AssetManager>` reach it and the scheduler's resource-conflict
+//! analysis already covers it.
 //!
 //! Storage mirrors how components are held - an erased column per type in a
-//! `TraitTypeMap` - minus archetypes, which exist to group *entities* by their
-//! component set and have no meaning for an asset. The column is the same
-//! `ErasedVecStorage` the component side uses, so its per-type behaviour is a
-//! replaceable data table rather than a trait-object vtable: a handle keeps its
-//! slot index across an unload, and a column can be re-pointed at whichever
-//! generation is still mapped (see [`AssetManager::rehome`]).
+//! `TraitTypeMap` - minus archetypes, which group *entities* by component set
+//! and mean nothing for an asset. The column is the same `ErasedVecStorage` the
+//! component side uses, so its per-type behaviour is a replaceable data table
+//! rather than a trait-object vtable: a handle keeps its slot index across an
+//! unload, and a column can be re-pointed at whichever generation is still
+//! mapped (see [`AssetManager::rehome`]).
 //!
-//! # Handles are generational
-//!
-//! A [`Handle<T>`] carries an index and a generation. Freeing a slot bumps that
-//! slot's generation, so a handle kept across an unload resolves to `None`
-//! rather than silently addressing whatever was loaded into the slot next. That
-//! is the difference between a missing model and a wrong one, and the second is
-//! far harder to recognise.
+//! A [`Handle<T>`] is generational: freeing a slot bumps that slot's generation,
+//! so a handle kept across an unload resolves to `None` rather than silently
+//! addressing whatever was loaded into the slot next.
 
 // Standard library
 use std::any::TypeId;
@@ -84,17 +75,12 @@ pub trait Asset: Send + Sync + 'static {
     /// `None` to be identified by its `TypeId` alone.
     ///
     /// The asset counterpart of [`Component::shared_name`](crate::Component::shared_name).
-    /// Every binary that compiles its own copy of the defining crate - with
-    /// different cargo features, say, as a module and the crates that link it
-    /// do - gets a different `TypeId` for the same type, so a `TypeId`-keyed
-    /// store would hand each binary its own empty column. A shared name makes
-    /// them one column: the store keys it by the name's identity, and checks
-    /// each binary's type against the column by layout.
+    /// Each binary that compiles its own copy of the defining crate - a module
+    /// and the crates that link it, say - gets its own `TypeId` for the same
+    /// type, so a shared name keys them to one column, checked by layout.
     ///
     /// Pin a literal rather than deriving it from the module path, so moving
-    /// the type does not change its identity. Every copy must be compiled from
-    /// the same source; the column checks size and alignment, as it does for
-    /// shared components.
+    /// the type does not change its identity.
     fn shared_name() -> Option<&'static str>
     where
         Self: Sized,
@@ -406,14 +392,12 @@ struct AssetColumn {
     /// Reverse of `by_guid`, so freeing a slot can drop its guid without
     /// scanning the whole map.
     guids: HashMap<u32, AssetGuid>,
-    /// Import settings each slot was decoded with, as the JSON the metadata
-    /// layer writes.
+    /// Import settings each slot was decoded with, as JSON.
     ///
-    /// Only a sourced asset that was decoded without a metadata file has an
-    /// entry - that is exactly the asset a later `ensure_metadata` would
-    /// otherwise give the type's defaults. Held as JSON because
-    /// `ImportSettings` is only `Serialize + DeserializeOwned` and the column is
-    /// erased; keyed by slot, so freeing the slot drops it with the rest.
+    /// Only an asset decoded without a metadata file has an entry: that is the
+    /// one a later `ensure_metadata` would otherwise give the type's defaults.
+    /// JSON because `ImportSettings` is only `Serialize + DeserializeOwned` and
+    /// the column is erased; keyed by slot, so freeing the slot drops it.
     import_settings: HashMap<u32, serde_json::Value>,
 }
 
@@ -582,12 +566,12 @@ pub struct AssetManager {
     revision: u64,
 }
 
-/// The shared name C# reaches the store under, as
-/// `ResMut<TracyLive.AssetManager>`.
+/// The shared name the store's C# mirror registers under
+/// (`[NativeResource("pill_engine::asset::AssetManager")]`).
 ///
-/// Shared rather than `TypeId`-keyed so the identity is a name both languages
-/// can compute: the managed marker type hashes the same string, and every
-/// artifact that links the engine agrees on it without comparing `TypeId`s.
+/// Shared rather than `TypeId`-keyed so both languages compute one identity: the
+/// managed mirror hashes the same string, and every artifact that links the
+/// engine agrees on it without comparing `TypeId`s.
 pub const ASSET_MANAGER_SHARED_NAME: &str = "pill_engine::asset::AssetManager";
 
 impl Resource for AssetManager {
@@ -731,16 +715,15 @@ impl AssetManager {
     /// Store `asset` under `name` and return a handle to it.
     ///
     /// The name is a lookup key for code that resolves assets by string - a
-    /// scene file naming a mesh, say. A name that already addresses a live
-    /// asset is refused rather than rebound, so a second load of the same key
-    /// is reported instead of quietly adding a copy that nothing looks up.
-    /// Free the name with [`Self::remove`] first when a deliberate replacement
-    /// is wanted.
+    /// scene file naming a mesh, say. A name that already addresses a live asset
+    /// is refused rather than rebound, so a second load of the same key is
+    /// reported instead of quietly adding a copy nothing looks up; remove the
+    /// first with [`Self::remove`] when a deliberate replacement is wanted.
     ///
     /// # Errors
     ///
-    /// Returns [`AssetBindingError::NameInUse`] when `name` already addresses a
-    /// live asset. Nothing is stored and no handle is issued.
+    /// [`AssetBindingError::NameInUse`] when `name` already addresses a live
+    /// asset. Nothing is stored and no handle is issued.
     pub fn add_named<T>(
         &mut self,
         name: impl Into<String>,
@@ -1172,22 +1155,16 @@ impl AssetManager {
 
     /// Declare `T` as an asset type and re-point its column at this generation.
     ///
-    /// Creating the column is implicit in using the type - every `add` lands
-    /// here first - but a *declaration* also matters across a reload: the
-    /// column's per-type table is code from the artifact that filled it, so a
-    /// generation that owns an asset type should declare it in registration
-    /// even when it will not add an instance this run. Declaring twice is
-    /// harmless; the second call only refreshes the table.
+    /// Creating the column is implicit in using the type, but a *declaration*
+    /// also matters across a reload: the column's per-type table is code from
+    /// the artifact that filled it, so a generation that owns an asset type
+    /// should declare it in registration even when it adds no instance this run.
+    /// Declaring twice is harmless; the second call only refreshes it.
     ///
-    /// `register_type_storage` panics on a second registration, so the
-    /// existence check belongs here where it can be made idempotent.
-    ///
-    /// A shared asset type ([`Asset::shared_name`]) is keyed by the `TypeId`
-    /// of the first binary that registers it, and its column is built to check
-    /// element types by layout: every binary's copy of the type then reaches
-    /// that one column. A later registrant's copy must match its size and
-    /// alignment; one that does not is refused with a panic here, before it can
-    /// read a row.
+    /// A shared asset type ([`Asset::shared_name`]) is keyed by the `TypeId` of
+    /// the first binary that registers it; a later registrant whose copy has
+    /// another size or alignment is refused with a panic before it can read a
+    /// row.
     pub fn register<T>(&mut self)
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -1774,7 +1751,7 @@ mod tests {
     }
 
     /// The packed column swaps rows on removal; a handle follows its slot, not
-    /// the row that used to hold its value.
+    /// the row its value was moved out of.
     #[test]
     fn removing_the_middle_asset_keeps_the_others_addressable() {
         let mut assets = AssetManager::new();
@@ -1872,8 +1849,8 @@ mod tests {
         assert!(set.contains(&copy));
     }
 
-    /// The manager is a resource, so it reaches systems through the existing
-    /// `Res` / `ResMut` parameters with no scheduler change.
+    /// The manager is a resource, so it reaches systems through the `Res` /
+    /// `ResMut` parameters like any other.
     #[test]
     fn manager_round_trips_through_the_world_as_a_resource() {
         use crate::world::World;

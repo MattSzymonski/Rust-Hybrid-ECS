@@ -3,32 +3,29 @@
 //!
 //! # Responsibilities
 //!
-//! - Index each asset in a project's `res` by its guid and its path, with the
-//!   asset type its header names and whether it is standalone
-//!   ([`AssetRecord`]): read from the `.meta` sidecars and standalone headers
-//!   of a directory ([`AssetDatabase::from_directory`]) or of a shipping pack
+//! - Index each asset in a project's `res` by guid and by path, with the type
+//!   its header names and whether it is standalone ([`AssetRecord`]), from a
+//!   directory ([`AssetDatabase::from_directory`]) or a shipping pack
 //!   ([`AssetDatabase::from_pack`]).
-//! - Follow edits on disk one path at a time ([`AssetDatabase::refresh`]):
-//!   a new file, a deleted one, and a file moved with its `.meta`.
+//! - Follow edits on disk one path at a time ([`AssetDatabase::refresh`]): a
+//!   new file, a deleted one, and a file moved with its `.meta`.
 //! - Report a guid two files claim instead of indexing it twice
 //!   ([`AssetDatabase::conflicts`]).
 //!
 //! # Design
 //!
-//! The [`AssetManager`](crate::AssetManager) knows the assets that are
-//! loaded; this knows the ones that exist. A reference names an asset by guid
-//! (see [`AssetReference`](crate::AssetReference)), and resolving one that is
-//! not loaded yet needs the step from that guid to a path - the import
-//! registry loads by path ([`ImportRegistry::load_by_guid`]).
+//! The [`AssetManager`](crate::AssetManager) knows the assets that are loaded;
+//! this knows the ones that exist. A reference names an asset by guid (see
+//! [`AssetReference`](crate::AssetReference)), and resolving one that is not
+//! loaded yet needs the step from that guid to a path, which the import registry
+//! takes ([`ImportRegistry::load_by_guid`]).
 //!
-//! The identity rules are the importer's own (`asset_metadata.rs`): one path is
-//! one asset, its guid is the one its `.meta` (or, for a standalone file, its
-//! own header) holds, and a guid a second path claims is refused rather than
-//! moved. Only the header is read here - `format_version`, `asset_type` and
-//! `guid` - never the settings or the asset body, so building the index for a
-//! large project costs one small JSON read per asset.
-//!
-//! A source without a `.meta` has no guid yet and is not in the index; the
+//! The identity rules are the importer's (`asset_metadata.rs`): one path is one
+//! asset, its guid is the one its `.meta` (or, for a standalone file, its own
+//! header) holds, and a guid a second path claims is refused rather than moved.
+//! Only the header is read - `format_version`, `asset_type`, `guid` - never the
+//! settings or the body, so indexing a large project costs one small JSON read
+//! per asset. A source with no `.meta` has no guid yet and is not indexed; the
 //! write that gives it one is a change [`AssetDatabase::refresh`] picks up.
 //!
 //! [`ImportRegistry::load_by_guid`]: crate::ImportRegistry::load_by_guid
@@ -202,7 +199,7 @@ impl AssetDatabase {
             .filter(move |record| record.asset_type == asset_type)
     }
 
-    /// The guids a second path claimed, as of the last build or refresh.
+    /// The guids a second path claimed, as found by the last build or refresh.
     pub fn conflicts(&self) -> &[GuidConflict] {
         &self.conflicts
     }

@@ -19,8 +19,8 @@
 //!
 //! The module ABI is **Rust-to-Rust by design**: a loaded project or module
 //! receives an [`EngineApi`] carrying a pointer to the host's engine and calls
-//! the typed API through it. There is no language-neutral plugin table - see
-//! [`api`] for why one was removed rather than completed.
+//! the typed API through it. There is no language-neutral plugin table; see
+//! [`api`] for what one would cost.
 // The derive macros expand to `::pill_engine::...` paths, so the crate itself
 // needs that name in scope to use its own derives - `Position` and `Color`
 // derive `PillLayout` here rather than carrying hand-written offsets. Only
@@ -35,7 +35,7 @@ extern crate self as pill_engine;
 /// controlled by [`crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
 ///
 /// Not part of `profiling`: the allocator is generic, so it is instantiated in
-/// every DLL that links this rlib and calls Tracy's C entry points directly.
+/// every DLL that links it and calls Tracy's C entry points directly.
 /// Those live inside `pill_core.dll`, which exports only Rust symbols, so any
 /// extension DLL fails to link with "undefined symbol ___tracy_emit_memory_*".
 #[cfg(feature = "profiling-memory")]
@@ -58,8 +58,8 @@ pub mod archetype;
 ///
 /// The counterpart to [`resource`] for data a world holds several of - meshes,
 /// textures, materials - where the type alone does not name one value. The
-/// store is itself a resource, so it reaches systems through the existing
-/// `Res` / `ResMut` parameters.
+/// store is itself a resource, so it reaches systems through the `Res` /
+/// `ResMut` parameters.
 pub mod asset;
 
 /// Every asset of a project by guid and by path, loaded or not.
@@ -68,7 +68,7 @@ pub mod asset_database;
 /// Importing assets by file extension, for code that does not know their type.
 pub mod asset_import_registry;
 
-/// Loading assets and scenes from game code by path (W-0048 Stage 10).
+/// Loading assets and scenes from game code by path.
 pub mod asset_loading;
 
 /// Metadata files beside an asset's source (`<asset_name>.meta`).
@@ -105,16 +105,16 @@ pub mod config;
 /// system can draw and every renderer draws.
 pub mod debug_draw;
 
-/// Periodic ECS state report, registered by the engine and printed every N
-/// frames.
+/// Periodic ECS state report, registered on demand and printed once per
+/// configured interval.
 pub mod diagnostics;
 
 /// Engine-owned native dynamic buffer, re-exported from `pill_core`.
 ///
 /// The type lives beside the allocation service that owns its blocks, so a
 /// module can name it without depending on the whole ECS. Re-exported here
-/// because a component field is what it is for, and every existing
-/// `pill_engine::DynamicBuffer` import keeps resolving.
+/// because a component field is what it is for, so `pill_engine::DynamicBuffer`
+/// resolves from the place users expect.
 pub mod dynamic_buffer {
     pub use pill_core::dynamic_buffer::*;
 }
@@ -264,8 +264,8 @@ pub use world::{
 //
 // The profiling implementation and all its `#[macro_export]` macros live in
 // `pill_core::profiling`. Re-exporting the macros at the crate root keeps the
-// 100+ `crate::profile_scope!` call sites inside this crate compiling while
-// preserving a single flat namespace for downstream users.
+// crate's `crate::profile_*` call sites compiling and gives downstream users
+// one flat namespace.
 // ----------------------------------------------------------------------------
 pub use pill_core::{
     profile_error, profile_frame_mark, profile_init, profile_message, profile_non_continuous_frame,

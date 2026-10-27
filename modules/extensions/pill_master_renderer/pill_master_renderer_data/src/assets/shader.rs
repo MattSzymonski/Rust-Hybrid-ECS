@@ -9,9 +9,8 @@
 //!   packed layout disagreeing with the shader's own declarations.
 //! - Offer both ways in: [`ShaderBuilder::with_vertex_source`] reads the stages
 //!   from files when the shader is built, and [`ShaderBuilder::with_wgsl`] takes
-//!   sources already in memory, which is how a chain embedding its own stages
-//!   and the host bridge building them from what a C# project handed it both
-//!   work.
+//!   sources already in memory, which is how a chain embeds the stages it ships
+//!   and how the C# bridge hands over stages a project supplies.
 //!
 //! # Design
 //!
@@ -22,12 +21,16 @@
 //! renderer, which walks them in declaration order, by name, to size the
 //! uniform buffer and place each value.
 
+// Standard library
+use std::path::{Path, PathBuf};
+
 // External crates
 use indexmap::IndexMap;
 use pill_engine::{
     pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
-    AssetLoadResult, AssetLoader, PillMirror,
+    AssetLoadResult, AssetLoader, ImportedAsset, PillMirror,
 };
+use serde::{Deserialize, Serialize};
 
 // Current crate
 use super::TextureType;
@@ -36,7 +39,7 @@ use super::TextureType;
 ///
 /// The renderer writes a slot's bytes by this kind rather than by the kind of
 /// value it was handed, so the two have to agree or the value packs as zero.
-#[derive(Debug, Clone, PillMirror)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PillMirror)]
 #[repr(u8)]
 pub enum ShaderParameterType {
     /// A single float.
@@ -338,4 +341,104 @@ impl Asset for Shader {
             pill_engine::component::shared_component_identity(SHADER_SHARED_NAME);
         Some(IDENTITY)
     }
+}
+
+/// How to build a shader from its `.hlsl` source: what its `.hlsl.meta` holds.
+///
+/// Every field is part of the metadata file format, so a rename breaks
+/// existing files; `#[serde(default)]` lets a file written before a field
+/// existed still load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShaderImportSettings {
+    /// The vertex stage, by path relative to the same root as the source.
+    ///
+    /// One `.hlsl` holds one stage and a shader is two, so the meta says which
+    /// vertex stage this source pairs with.
+    pub vertex: String,
+    /// The uniforms the shader declares, in the order their values pack.
+    pub parameters: Vec<ShaderParameterDeclaration>,
+    /// The textures the shader declares, with the bindings it uses them at.
+    pub textures: Vec<ShaderTextureDeclaration>,
+    /// Whether the shader reads the engine's parameters, at set 0.
+    pub engine_parameters: bool,
+    /// Whether the shader reads the camera's parameters, at set 1.
+    pub camera_parameters: bool,
+}
+
+/// One uniform a `.hlsl.meta` declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShaderParameterDeclaration {
+    /// The name the source binds the uniform under.
+    pub name: String,
+    /// The kind of value it carries, which decides how it packs.
+    #[serde(rename = "type")]
+    pub parameter_type: ShaderParameterType,
+}
+
+/// One texture a `.hlsl.meta` declares, with the bindings it declares it at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShaderTextureDeclaration {
+    /// The name the source binds the texture under.
+    pub name: String,
+    /// The kind of texture the slot expects.
+    #[serde(rename = "type")]
+    pub texture_type: TextureType,
+    /// The binding the shader declares the texture at.
+    pub texture_binding: u32,
+    /// The binding the shader declares the sampler at.
+    pub sampler_binding: u32,
+}
+
+// The metadata type name defaults to the shared name above, so every binary's
+// copy of `Shader` reads the same files.
+impl ImportedAsset for Shader {
+    type ImportSettings = ShaderImportSettings;
+    const SOURCE_EXTENSIONS: &'static [&'static str] = &["hlsl"];
+
+    fn import(
+        name: &str,
+        _source_bytes: &[u8],
+        settings: &ShaderImportSettings,
+    ) -> AssetLoadResult<Self> {
+        if settings.vertex.is_empty() {
+            return Err(AssetLoadError::Decode {
+                label: name.to_owned(),
+                detail: "its `.hlsl.meta` names no vertex stage".to_owned(),
+            });
+        }
+        // The source bytes are the HLSL: what a shader is built from is the
+        // WGSL the build script cooks beside it, and the vertex stage its meta
+        // names.
+        let fragment = cooked_beside(name)?;
+        Shader::new(name.to_owned())
+            .with_vertex_source(AssetLoader::Path(settings.vertex.clone().into()))
+            .with_fragment_source(AssetLoader::Path(fragment))
+            .with_parameter_slots(settings.parameters.iter().map(|declared| {
+                ShaderParameterSlot::new(declared.name.clone(), declared.parameter_type)
+            }))
+            .with_texture_slots(settings.textures.iter().map(|declared| {
+                ShaderTextureSlot::new(
+                    declared.name.clone(),
+                    declared.texture_type,
+                    (declared.texture_binding, declared.sampler_binding),
+                )
+            }))
+            .with_engine_parameters(settings.engine_parameters)
+            .with_camera_parameters(settings.camera_parameters)
+            .build()
+    }
+}
+
+/// The WGSL file this crate's build script cooked beside a shader source.
+fn cooked_beside(source: &str) -> AssetLoadResult<PathBuf> {
+    let path = Path::new(source);
+    let cooked = path.with_extension("wgsl");
+    if cooked.file_name().is_none() {
+        return Err(AssetLoadError::Decode {
+            label: source.to_owned(),
+            detail: "it names no file to cook".to_owned(),
+        });
+    }
+    Ok(cooked)
 }

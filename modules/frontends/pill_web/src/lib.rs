@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Start a shipped project ([`run`]): readable panics, console logging, the
-//!   project's asset pack downloaded beside the page (W-0105), and the
+//!   project's asset pack downloaded beside the page, and the
 //!   project's modules registered through `pill_runtime`.
 //! - Put a `winit` window on the page's canvas, attach the renderer to it
 //!   asynchronously, and run one frame per browser animation frame.
@@ -13,13 +13,12 @@
 //! # Design
 //!
 //! The web counterpart of `pill_standalone`'s shipping posture, over the same
-//! `pill_runtime` and [`FrameDriver`]. Three things differ, both because a
+//! `pill_runtime` and [`FrameDriver`]. Three things differ, all because a
 //! browser only makes progress once control returns to it: the event loop is
 //! handed over with `spawn_app` rather than run, the renderer attach - a
 //! future - is spawned onto that loop instead of blocked on, and the asset
-//! pack is fetched rather than embedded, because a wasm module is downloaded
-//! whole and a project's assets must not sit inside it. Frames start once the
-//! attach resolves.
+//! pack is fetched rather than embedded, since a wasm module is downloaded
+//! whole. Frames start once the attach resolves.
 //!
 //! The crate is empty on every other target: its dependencies are wasm-only,
 //! so the workspace's native builds do not see it.
@@ -45,9 +44,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
-/// The egui editor posture (W-0029): the scene on one canvas, the egui
-/// shell's UI on a transparent canvas above it. The only editor posture
-/// since the `pill_ui` one retired (W-0030 Stage 2).
+/// The egui editor posture: the scene on one canvas, the egui shell's UI on a
+/// transparent canvas above it.
 #[cfg(target_arch = "wasm32")]
 pub mod editor_egui;
 
@@ -82,7 +80,7 @@ pub fn run(project: StaticProject, canvas_id: &str) {
 ///
 /// Readable panics and console logging come first, because everything below
 /// can fail. A project with an `asset_pack_url` is a browser build whose
-/// assets were kept out of the module (W-0105): its pack is downloaded and
+/// assets were kept out of the module: its pack is downloaded and
 /// mounted before the project initializes, so an init that loads a `res` file
 /// finds it, exactly as the embedded path does. Both runners share this, so
 /// the game and editor postures cannot diverge.
@@ -333,8 +331,8 @@ pub(crate) fn find_canvas(canvas_id: &str) -> Result<HtmlCanvasElement, String> 
 ///
 /// A plain `focus()` scrolls the element into view, which cancels any scroll
 /// in flight (for example a smooth scroll toward an anchor below the canvas)
-/// whenever it runs mid scroll. `web-sys` has no typed `focus(options)` yet,
-/// so the call goes through raw JS.
+/// whenever it runs mid scroll. `web-sys` has no typed `focus(options)`, so
+/// the call goes through raw JS.
 ///
 /// # Errors
 ///

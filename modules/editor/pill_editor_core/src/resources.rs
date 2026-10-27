@@ -1,10 +1,10 @@
-//! The resources the editor lets a person inspect and edit (W-0038 Stage 14).
+//! The resources the editor lets a person inspect and edit.
 //!
 //! # Responsibilities
 //!
 //! - List the world resources that are *editable*: the engine keeps no
 //!   resource reflection, so a resource joins this list by having a curated
-//!   field table beside it (today the gizmo settings, in
+//!   field table beside it (the gizmo settings, in
 //!   [`crate::gizmo::set_resource_field`]).
 //! - Read those fields into plain data the Inspector can draw, and name the
 //!   label each row shows.
@@ -14,7 +14,7 @@
 //! The table is the single source of the row order, the labels and the field
 //! names a write goes through, so the tab cannot offer a field the write path
 //! would refuse. Adding a resource is one entry here plus its own read/write
-//! table, the same shape the gizmo's already has.
+//! table, the shape the gizmo's has.
 
 // Current crate
 use crate::gizmo;

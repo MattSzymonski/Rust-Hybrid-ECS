@@ -26,14 +26,15 @@
 /// statically linked build has nothing to report.
 #[cfg(feature = "hot_reload")]
 mod analytics;
-/// Project-module build execution and output-path resolution.
+/// The startup build plan: the modules about to be built, announced up front
+/// and counted off as each build starts.
 #[cfg(feature = "hot_reload")]
 mod build_progress;
+/// Project-module build execution and output-path resolution.
 #[cfg(feature = "hot_reload")]
 mod build_runner;
 /// Project-module configuration shared by every host frontend.
 mod config;
-/// ANSI console helpers for the hot-reload log (colors, VT enabling).
 /// C# development tooling over `pill_csharp_bridge`: mirror generation and the
 /// in-process compiler, plus the bridge items the host names.
 ///
@@ -82,6 +83,7 @@ mod asset_watcher;
 #[cfg(feature = "hot_reload")]
 mod asset_browser;
 
+/// Re-cooks edited renderer shaders on a worker thread and queues the results.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod shader_watcher;
 
@@ -94,7 +96,7 @@ mod scratch;
 // Local host modules and the shared crate-root error surface.
 /// The editor-only settings file's name in the project root.
 pub use config::EDITOR_SETTINGS_FILE;
-/// The editor's own settings file (W-0127): read by the editor executable
+/// The editor's own settings file: read by the editor executable
 /// only, never by a game build.
 pub use config::{read_editor_settings, resolve_editor_theme, EditorSettings};
 pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};

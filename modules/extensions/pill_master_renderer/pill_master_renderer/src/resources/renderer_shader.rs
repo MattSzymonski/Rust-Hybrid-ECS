@@ -75,21 +75,17 @@ pub struct RendererShader {
 
 impl RendererShader {
     /// Builds a shader's render pipeline and group layouts from its cooked
-    /// WGSL.
+    /// WGSL, for the given color and depth formats.
     ///
-    /// The vertex and fragment modules are created from the WGSL the build
-    /// cooked from the authored HLSL, and the pipeline is built for the given
-    /// color and depth formats. The parameters and textures layouts exist only
-    /// when the shader declares slots of that kind; the pipeline layout pads a
-    /// missing one with an empty layout, so the shader keeps the engine's
-    /// fixed group convention either way.
+    /// The parameters and textures layouts exist only when the shader declares
+    /// slots of that kind; the pipeline layout pads a missing one with an empty
+    /// layout, so the shader keeps the engine's fixed group convention.
     ///
     /// # Errors
     ///
     /// Returns [`RendererError::Other`] when the pipeline fails wgpu
-    /// validation - a mistake in the shader asset. Validation is scoped so
-    /// the refusal is reported against the shader instead of panicking
-    /// through wgpu's uncaptured-error handler.
+    /// validation, a mistake in the shader asset: validation is scoped so the
+    /// refusal names the shader rather than panicking.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
@@ -106,11 +102,9 @@ impl RendererShader {
         pass_engine_parameters: bool,
         pass_camera_parameters: bool,
     ) -> Result<Self> {
-        // Create shader modules from the cooked WGSL. Nothing compiles a shader
-        // at runtime: the authored sources are HLSL next to the pipeline that
-        // draws through them, the build script's `slangc` rule produces the WGSL
-        // these strings carry, and wgpu parses that WGSL through naga like any
-        // other `ShaderSource::Wgsl`.
+        // Nothing compiles a shader at runtime: the authored sources are HLSL
+        // under the data crate's `shader_sources`, its build script cooks them
+        // to the WGSL these strings carry, and wgpu parses that through naga.
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("master_vertex_shader"),
             source: wgpu::ShaderSource::Wgsl(vertex_wgsl.into()),
@@ -144,7 +138,7 @@ impl RendererShader {
             }
         };
 
-        // Create bind group layout entries for textures - Bind group slot 3
+        // Textures bind at group 3, one texture and one sampler per slot.
         let textures_bind_group_layout = {
             if !texture_slots.is_empty() {
                 let mut entries = Vec::new();
@@ -200,12 +194,9 @@ impl RendererShader {
             }
         };
 
-        // Create pipeline layout. The four group slots are fixed by the
-        // engine's convention - engine parameters at 0, camera at 1, a
-        // material's or pass's parameters at 2, its textures at 3 - and an
-        // empty layout keeps a slot the shader does not declare, so every
-        // pipeline has the same shape the drawers bind against. The pass path
-        // pads its layout the same way.
+        // The four group slots are fixed by the engine's convention; a shader
+        // that declares neither parameters nor textures gets an empty layout in
+        // that slot, so every pipeline has the same shape to bind against.
         let pipeline_layout = {
             let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("shader_empty_bind_group_layout"),
@@ -231,7 +222,6 @@ impl RendererShader {
             })
         };
 
-        // Create color target states that specify what color outputs wgpu should set up
         let color_target_states = &[Some(wgpu::ColorTargetState {
             format: color_format,
             blend: Some(wgpu::BlendState {
@@ -285,9 +275,8 @@ impl RendererShader {
             cache: None,
         };
 
-        // Captured rather than left to wgpu's uncaptured-error handler: a shader
-        // the driver refuses is a mistake in the asset, and the pass or material
-        // that named it is what the message should be attached to.
+        // Captured so a shader the driver refuses is a mistake reported against
+        // the asset that named it, not through the uncaptured-error handler.
         let render_pipeline = crate::error::capturing_validation(device, || {
             device.create_render_pipeline(&render_pipeline_descriptor)
         })
@@ -304,9 +293,8 @@ impl RendererShader {
             pass_camera_parameters,
         };
 
-        // One line per shader, once its pipeline exists, hidden unless
-        // `engine::rendering` is at debug: the slots it declares
-        // and which engine uniform groups it reads.
+        // One line per shader, hidden unless `engine::rendering` is at debug:
+        // the slots it declares and the engine uniform groups it reads.
         let slot_names = |names: Vec<&String>| {
             names
                 .into_iter()

@@ -4,7 +4,7 @@
 //!
 //! - Own the ordered undo entries, the apply cursor, and the redo tail.
 //! - Merge continuous edits (a slider drag) into one entry by coalescing.
-//! - Enforce the step cap and the memory budget from the preferences (D31),
+//! - Enforce the step cap and the memory budget from the preferences,
 //!   dropping the oldest entries first and saying which limit did it.
 //! - Drop entries addressing component types or fields that a reload removed.
 //!
@@ -54,7 +54,8 @@ pub enum HistoryEntryKind {
         /// The commands that reverse it, in undo order.
         inverse: Vec<EditorCommand>,
     },
-    /// A selection change; undo restores `before`, redo applies `after`.
+    /// A selection change carrying one entity on each side; undo restores
+    /// `before`, redo applies `after`.
     Selection {
         /// The selection before the change.
         before: Option<Entity>,
@@ -195,8 +196,8 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                     + sources.iter().map(String::len).sum::<usize>()
                     + destination.len()
             }
-            // The stage 25 asset commands: the restore carries the deleted
-            // file's whole pre-image, which is what the budget counts.
+            // The asset commands: the restore carries the deleted file's whole
+            // pre-image, which is what the budget counts.
             EditorCommand::CreateStandaloneAsset {
                 type_name,
                 folder,
@@ -336,7 +337,7 @@ impl CommandHistory {
         self.memory_used_bytes = 0;
     }
 
-    /// Apply the preferences' limits (D31), trimming if they shrank.
+    /// Apply the preferences' limits, trimming if they shrank.
     ///
     /// Returns the trim that resulted, for the caller to log.
     pub fn set_limits(&mut self, step_cap: usize, memory_budget_bytes: usize) -> PushOutcome {
@@ -467,15 +468,14 @@ impl CommandHistory {
     /// The step was popped before its inverse ran, so an inverse that failed
     /// leaves the world showing the edit while the cursor offers the step as
     /// redoable. Moving it back makes the step undoable again and drops it from
-    /// the redo tail, so neither direction claims a step that did not run
-    /// (W-0090).
+    /// the redo tail, so neither direction claims a step that did not run.
     pub fn undo_rollback(&mut self) {
         if self.cursor < self.entries.len() {
             self.cursor += 1;
         }
     }
 
-    /// Put the cursor back where a failed redo left it (W-0090).
+    /// Put the cursor back where a failed redo left it.
     pub fn redo_rollback(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn the_memory_budget_counts_asset_pre_images() {
         // The undo of an asset delete carries the whole file as its
-        // pre-image; that is the memory the budget must count (Stage 25).
+        // pre-image; that is the memory the budget must count.
         let pre_image = vec![0u8; 64 * 1024];
         let forward = EditorCommand::DeleteAssetFile {
             path: "textures/helmet.png".to_string(),

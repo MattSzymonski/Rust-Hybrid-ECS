@@ -7,15 +7,16 @@
 //!   capped at [`TOASTS_MAX`].
 //! - [`draw_toasts`]: expire, place and draw the stack in the window's
 //!   top-left corner; log each toast once; publish each row's rectangle so a
-//!   click on a toast can never be a scene pick (W-0038 Stage 4).
+//!   click on a toast can never be a scene pick.
 //!
 //! # Design
 //!
 //! The executable folds `pill_host::HostNotice`s into
 //! [`EditorNotices`-shaped plain data][EditorNotices] each frame; this module
-//! only reads it and turns it into pixels. A toast is keyed by its notice id,
-//! so a redrawn frame neither re-queues a line nor repeats its log entry, and
-//! a shell reload that keeps [`ToastSession`] keeps the stack on screen.
+//! only reads it and turns it into pixels. A toast is keyed by its notice
+//! sequence number, so a redrawn frame neither re-queues a line nor repeats
+//! its log entry, and a shell reload that keeps [`ToastSession`] keeps the
+//! stack on screen.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -32,8 +33,8 @@ const TOAST_GAP: f32 = 4.0;
 
 /// Queue every notice the stack has not seen as a toast.
 ///
-/// The newest notice sits at the top of the stack, so the reason the user just
-/// saw activity is the one they read first.
+/// The newest notice sits at the top of the stack, so the most recent activity
+/// is the first row read.
 pub fn push_notices(state: &mut EguiShellState, notices: &EditorNotices) {
     let mut newest = state.toasts.last_seq;
     for event in &notices.events {
@@ -78,8 +79,8 @@ pub fn draw_toasts(
         toasts.logged.clear();
         return;
     }
-    // The rows are collected first: the stack is read while the log
-    // bookkeeping mutates it, and the newest row goes on top.
+    // Collect the rows first: the loop below mutates the log bookkeeping, and
+    // the newest row goes on top.
     let rows: Vec<(u64, NoticeLevel, String)> = toasts
         .toasts
         .iter()
@@ -99,8 +100,7 @@ pub fn draw_toasts(
                     .inner_margin(egui::Margin::symmetric(8, 2))
                     .show(ui, |ui| {
                         ui.set_width(TOAST_WIDTH);
-                        // The level's accent bar down the left edge, as the
-                        // reference draws it.
+                        // The level's accent bar down the left edge.
                         let bar = egui::Rect::from_min_size(
                             ui.max_rect().left_top(),
                             egui::vec2(3.0, ui.max_rect().height()),

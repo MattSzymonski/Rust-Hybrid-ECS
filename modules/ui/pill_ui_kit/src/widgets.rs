@@ -13,7 +13,7 @@
 //!
 //! Stock egui cannot draw the look that defines the brutalist recipe: a hard
 //! offset shadow, no blur, that the face drops onto while the button is held.
-//! `Button::fill` freezes every state (`research §6`), so this widget paints
+//! `Button::fill` freezes every state, so this widget paints
 //! its own face per state instead of dressing a stock button: the rectangle is
 //! allocated first, the state read from the response, then the shadow and the
 //! face painted - and nothing painted at all when the rectangle is clipped.

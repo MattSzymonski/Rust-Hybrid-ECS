@@ -1,34 +1,30 @@
 //! The editor's composition overlay: the UI layer drawn above the scene's
-//! own child window (Stage 8 of the egui frontend).
+//! own child window.
 //!
 //! # Responsibilities
 //!
 //! - [`OverlaySurface`]: the DirectComposition target and visual over the
-//!   editor window, the `wgpu` surface drawn through the visual, the
-//!   per-monitor size that keeps the swapchain in step with the window, and
-//!   the empty-frame gate that skips the GPU work of a blank overlay.
+//!   editor window, the `wgpu` surface drawn through it, the size that keeps
+//!   the swapchain in step with the window, and the empty-frame gate.
 //!
 //! # Design
 //!
 //! A flip-model swapchain on the window's `HWND` cannot be transparent over
 //! the scene's child window, but a DirectComposition visual on a `topmost`
-//! target can: the visual is composited by the desktop compositor above every
-//! child surface, so the overlay's pixels are per-pixel alpha over the scene.
-//! `wgpu` draws into it through `SurfaceTargetUnsafe::CompositionVisual`,
-//! which its DX12 backend implements by setting the swapchain as the visual's
-//! content - so the composition tree must be committed after every configure,
-//! and the visual must outlive the surface.
+//! target can: the desktop compositor draws it above every child surface, so
+//! the overlay's pixels are per-pixel alpha over the scene. `wgpu` draws into
+//! it through `SurfaceTargetUnsafe::CompositionVisual`, which its DX12
+//! backend implements by setting the swapchain as the visual's content - so
+//! the tree is committed after every configure and the visual outlives the
+//! surface.
 //!
-//! Everything here is the executable's: the DirectComposition device is
-//! created through the `windows` crate in the binary only, never in a shared
-//! dylib, whose every hot patch would otherwise import `dcomp.dll`.
+//! The content is the shell's `EguiShellFrame`, drawn premultiplied with
+//! `egui-wgpu`'s renderer on the editor's own device, which is what the
+//! compositor multiplies back out.
 //!
-//! The overlay's content is the shell's [`EguiShellFrame`]: its clipped
-//! meshes are drawn with `egui-wgpu`'s renderer on the editor's own device,
-//! with premultiplied composition - the transparent clear plus egui's
-//! premultiplied output is exactly what the compositor multiplies back out.
-//!
-//! [`EguiShellFrame`]: pill_editor_core::boundary::EguiShellFrame
+//! The DirectComposition device is created through the `windows` crate in the
+//! binary only, never in a shared dylib, whose every hot patch would otherwise
+//! import `dcomp.dll`.
 
 // Standard library
 use std::sync::Arc;
@@ -54,8 +50,8 @@ pub enum OverlayMode {
     Window,
 }
 
-/// The colour the window posture clears to: the shell's own background, so an
-/// uncovered region of the window is not black.
+/// The colour the window posture clears to: a dark neutral, so an uncovered
+/// region of the window is not black.
 const WINDOW_CLEAR: wgpu::Color = wgpu::Color {
     r: 0.09,
     g: 0.10,
@@ -346,7 +342,7 @@ impl OverlaySurface {
 }
 
 // =============================================================================
-// DirectComposition
+// Window handle
 // =============================================================================
 
 /// The window's `HWND`, as the composition target needs it.

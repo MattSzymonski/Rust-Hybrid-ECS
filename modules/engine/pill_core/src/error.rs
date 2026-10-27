@@ -8,8 +8,8 @@
 //! - Provide the plain and terminal renderers plus the miette presentation
 //!   adapter and report handler.
 //! - Declare every subsystem error ([`ConfigError`], [`BuildError`],
-//!   [`LibraryError`], [`WatcherError`], [`CSharpError`]) and their
-//!   transparent composition [`HostError`].
+//!   [`LibraryError`], [`ModuleError`], [`WatcherError`], [`CSharpError`]) and
+//!   their transparent composition [`HostError`].
 //!
 //! # Design
 //!
@@ -329,12 +329,11 @@ where
     }
 }
 
-/// Terminal-aware report handler combining the engine semantic message with
-/// miette's diagnostic metadata.
+/// Terminal-aware report handler: miette's graphical rendering over the
+/// engine's diagnostic metadata.
 ///
-/// Stage A renders the semantic primary message through
-/// [`StyledDiagnosticProxy`] and keeps miette's graphical rendering for
-/// codes, help, sources, and cause chains.
+/// The styled primary message comes from [`engine_report`], which wraps the
+/// error in [`StyledDiagnosticProxy`] before it becomes a report.
 #[derive(Debug)]
 pub struct EngineReportHandler {
     inner: miette::GraphicalReportHandler,
@@ -405,9 +404,9 @@ pub enum ConfigError {
     /// Every stored path is relative to that directory, and it is derived from
     /// this crate's own build location rather than from the process's working
     /// directory: the two agree only when the host happens to be started from
-    /// the workspace root, and a launcher that sets its own working directory
-    /// (the dioxus CLI runs the editor from `pill_editor/`) would otherwise
-    /// resolve `extensions/` to a directory that does not exist.
+    /// the workspace root, and a launcher that sets a working directory of its
+    /// own would otherwise resolve `extensions/` to a directory that does not
+    /// exist.
     #[message("engine workspace root could not be determined from the host build")]
     EngineWorkspaceRootUndetermined,
 
@@ -567,8 +566,8 @@ pub enum ConfigError {
     )]
     EditorCrateListed { name: String },
 
-    /// An editor crate is tagged for the retired `pill_ui` editor frontend,
-    /// which no host runs any more (W-0043).
+    /// An editor crate is tagged for the `pill_ui` editor frontend, which no
+    /// host implements.
     #[message(
         "editor crate ",
         value(name),
@@ -683,7 +682,7 @@ pub enum BuildError {
 /// loading, and the `pill_module_init` entry-point contract.
 ///
 /// The loader's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `libloading` (W-0114). The cause is
+/// every posture links, so it may not name `libloading`. The cause is
 /// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::library)]
 pub enum LibraryError {
@@ -757,7 +756,7 @@ pub enum LibraryError {
     },
 
     /// A named import the module needs is not exported by the copy of the
-    /// imported DLL the loader would use (Stage 27).
+    /// imported DLL the loader would use.
     ///
     /// Windows reports a missing named import as `LoadLibrary` error 127,
     /// "The specified procedure could not be found", naming neither the DLL
@@ -784,8 +783,8 @@ pub enum LibraryError {
     /// The library does not export a required entry point.
     ///
     /// Names the subject as well as the symbol: a project and an extension
-    ///  export the same entry points, so the symbol alone no longer says
-    /// which artifact is missing it.
+    /// export the same entry points, so the symbol alone does not say which
+    /// artifact is missing it.
     #[message(
         "native library for ",
         name_style(subject),
@@ -874,7 +873,7 @@ pub enum ModuleError {
 /// be triggered by a source change.
 ///
 /// The watcher's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `notify` (W-0114). The cause is
+/// every posture links, so it may not name `notify`. The cause is
 /// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::watcher)]
 pub enum WatcherError {
@@ -904,7 +903,7 @@ pub enum WatcherError {
 /// manifest exchange, and reflected managed startup.
 ///
 /// The loader's own error is a boxed source: `pill_core` is the shared dylib
-/// every posture links, so it may not name `libloading` (W-0114). The cause is
+/// every posture links, so it may not name `libloading`. The cause is
 /// still reported through `Error::source()` and the message chain.
 #[engine_error(namespace = host::csharp)]
 pub enum CSharpError {
@@ -1022,8 +1021,8 @@ pub enum CSharpError {
     ///
     /// The poll answers `0` (nothing happened), `1` (swapped) or `2`
     /// (rejected). Anything else is an ABI drift or a loader-level failure, and
-    /// filing it as "nothing happened" left the previous assembly running with
-    /// no indication anywhere.
+    /// filing it as "nothing happened" would leave the previous assembly
+    /// running with no indication anywhere.
     #[message("the managed loader reported unknown reload status ", value(status))]
     UnknownPollStatus { status: u8 },
 
@@ -1147,7 +1146,7 @@ pub enum HostError {
 /// Call once at the top-level reporting boundary, before any report is
 /// printed.
 pub fn install_engine_report_handler() {
-    // Install a hook that wraps every reported diagnostic in the styled proxy.
+    // Every report gets the engine handler.
     let _ = miette::set_hook(Box::new(
         |_error: &(dyn miette::Diagnostic + 'static)| -> Box<dyn miette::ReportHandler> {
             Box::new(EngineReportHandler::default())
@@ -1157,7 +1156,8 @@ pub fn install_engine_report_handler() {
 
 /// Convert one engine error into a miette report with semantic styling.
 ///
-/// This is the only error-handling call an executable boundary needs.
+/// The report's primary message is the error's own semantic definition,
+/// rendered for a terminal; miette keeps the codes, help, labels and sources.
 pub fn engine_report<E>(error: E) -> miette::Report
 where
     E: EngineMessage + miette::Diagnostic + Send + Sync + 'static,
@@ -1175,7 +1175,7 @@ mod tests {
     ///
     /// The variants that name the watcher's and the loader's own error box it
     /// instead, because this crate is the shared dylib every posture links and
-    /// may not depend on either (W-0114). `format_error_chain` builds the
+    /// may not depend on either. `format_error_chain` builds the
     /// host's one-line reports, so the cause it walks to is what has to stay.
     #[test]
     fn a_boxed_source_still_reports_its_cause() {
@@ -1191,7 +1191,7 @@ mod tests {
 
     /// The engine-dylib mismatch names both dylibs and both ways out.
     ///
-    /// This is the message that replaces `os error 127`, which named neither
+    /// Windows reports the same failure as `os error 127`, which names neither
     /// the dylib nor the feature that moved, so the parts a reader has to act
     /// on are worth pinning.
     #[test]

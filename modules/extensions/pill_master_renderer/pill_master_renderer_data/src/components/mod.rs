@@ -4,27 +4,25 @@
 //!
 //! - Declare this renderer's own components, one per submodule: the mesh
 //!   renderer and the directional light.
-//! - Re-export the scene components every renderer shares, so a game imports
-//!   all of its render components from this one module: the camera and the
-//!   viewport rectangle (renderer contract, `pill_renderer_api`) and the
-//!   transform (the engine's).
+//! - Re-export the scene components every renderer shares - the camera and the
+//!   viewport rectangle from the renderer contract, the transform from the
+//!   engine - so a game imports all of its render components from here.
 //! - Register all of them with the world through [`register_components`], field
 //!   layout included, for the managed codegen and the editor.
 //!
 //! # Design
 //!
-//! The component structs are `#[repr(C)]`, `Serialize` and `Deserialize`,
-//! because they are the renderer's public scene contract: projects set them,
-//! the managed mirror binds their fields, and the host serialises them when a
-//! project reloads.
+//! The structs are `#[repr(C)]`, `Serialize` and `Deserialize` because they are
+//! the renderer's public scene contract: projects set them, the managed mirror
+//! binds their fields, and the host serialises them when a project reloads.
 //!
 //! **Every component pins its shared name.** The `PillComponent` derive would
 //! otherwise build that name from `module_path!()`, which makes the identity
 //! follow the file layout rather than the type: a component moved to another
-//! module - or, as these did, to another crate - registers as a *different*
-//! component, and the columns a live world already holds for it are orphaned
-//! on the next reload. The pinned strings are the names these types carried
-//! when they shared a single `component.rs`, kept verbatim through every move.
+//! module, or to another crate, would register as a *different* component, and
+//! the columns a live world already holds are orphaned on the next reload. The
+//! pinned strings are a fixed identity - they do not spell this module's path -
+//! so keep them verbatim rather than re-deriving one.
 
 mod directional_light;
 mod mesh_renderer;
@@ -140,7 +138,7 @@ mod tests {
     /// are what makes the same component recognisable in the host, in a loaded
     /// module, and in a world that outlived the generation which registered it.
     /// Re-deriving one from `module_path!()` would silently orphan live data, so
-    /// the exact strings are asserted here, across the move between crates.
+    /// the exact strings are asserted here.
     #[test]
     fn the_components_keep_the_shared_names_they_were_pinned_to() {
         assert_eq!(

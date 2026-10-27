@@ -66,7 +66,7 @@ type GetDelegateFn =
 
 /// Signature of the `hostfxr_close` export.
 ///
-/// Releases a previously initialized runtime context.
+/// Closes an initialized runtime context.
 type CloseFn = unsafe extern "system" fn(RuntimeHandle) -> i32;
 
 /// Signature of the `load_assembly_and_get_function_pointer` runtime delegate.
@@ -96,7 +96,7 @@ pub struct DotnetRuntimeContext {
     _library: Library,
     /// Opaque hostfxr context handle returned by runtime initialization.
     handle: RuntimeHandle,
-    /// `hostfxr_close` export used to release the context in `Drop`.
+    /// `hostfxr_close` export that releases the context in `Drop`.
     close: CloseFn,
     /// `load_assembly_and_get_function_pointer` delegate used by `get_unmanaged_fn`.
     load_assembly: LoadAssemblyFn,

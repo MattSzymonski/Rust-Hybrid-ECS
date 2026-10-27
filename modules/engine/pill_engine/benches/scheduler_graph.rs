@@ -1,28 +1,25 @@
 //! Scheduler benchmarks for the engine's parallel batch scheduler.
 //!
-//! The scheduler analyzes component read/write access patterns across all
-//! registered systems to build a dependency graph, then groups independent
-//! systems into parallel batches. These benchmarks measure both halves of
-//! that pipeline.
+//! The scheduler analyzes component read/write access across the registered
+//! systems to build a dependency graph, then groups independent systems into
+//! parallel batches. These benchmarks measure both halves of that pipeline.
 //!
 //! # Responsibilities
 //!
-//! - `scheduler_graph_build`: measures pure O(n²) pairwise conflict analysis
-//!   using bitmask AND operations, simulating 10–200 systems with a realistic
-//!   1/3-write conflict pattern across 20 distinct component types.
+//! - `scheduler_graph_build`: measures the O(n²) pairwise conflict analysis
+//!   over 10-200 systems, with a 1/3-write conflict pattern across 20 distinct
+//!   component types.
 //! - `scheduler_batch_execution`: measures end-to-end frame dispatch with 100
-//!   entities carrying 20 components, isolating scheduler overhead from
-//!   system compute time.
+//!   entities carrying 20 components, isolating scheduler overhead from system
+//!   compute time.
 //!
 //! # Design
 //!
-//! The two benchmarks are deliberately decoupled. Graph build involves no
-//! real components or entities - just [`TypeId`] values. Batch execution runs
-//! a full frame dispatch where each system does trivial per-entity work so
-//! the benchmark measures scheduler overhead (graph walk, batch dispatch,
-//! thread wake-up) rather than system compute time. Together these reveal
-//! whether scaling bottlenecks are in conflict analysis or in the runtime
-//! dispatch machinery.
+//! The two benchmarks are deliberately decoupled. Graph build involves no real
+//! components or entities - just [`TypeId`] values. Batch execution runs a full
+//! frame dispatch where each system does trivial per-entity work, so what is
+//! measured is the graph walk, batch dispatch and thread wake-up rather than
+//! system compute.
 
 // Standard library
 use std::any::TypeId;
@@ -134,8 +131,9 @@ fn build_scheduler(system_count: usize) -> SystemScheduler {
 /// fully-populated entities.
 ///
 /// Registers all 20 component types, spawns 100 entities carrying every
-/// component, then registers one system per component type so the
-/// batch-execution benchmark has realistic work to dispatch.
+/// component, then registers `system_count` systems that each write one
+/// component type, so the batch-execution benchmark has realistic work to
+/// dispatch.
 fn build_engine_for_batch_execution(system_count: usize) -> Engine {
     // Step 1: Create an engine with parallel batch execution enabled.
     let mut engine = Engine::new();

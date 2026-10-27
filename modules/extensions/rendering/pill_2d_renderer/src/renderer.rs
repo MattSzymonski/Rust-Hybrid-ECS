@@ -1,24 +1,28 @@
-//! Window-surface renderer owned by the host's optional rendering feature.
+//! Window-surface renderer: the wgpu surface, device and frame loop a
+//! frontend drives.
 //!
 //! # Responsibilities
 //!
 //! - Creates the wgpu instance, surface, adapter, device, and queue.
-//! - Selects an uncapped presentation mode when the platform supports one.
+//! - Selects the surface's presentation and alpha modes, with fallback
+//!   candidates for a driver that refuses the preferred pair.
 //! - Reconfigures the surface after frontend resize notifications.
 //! - Acquires, draws, and presents one frame from the current [`Engine`].
 //!
 //! # Design
 //!
 //! Frontends retain ownership of their event loop and window. They pass a
-//! cloneable window handle into [`Renderer::new`], then interact only through
-//! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
-//! dependency on wgpu or an async executor.
+//! cloneable window handle into [`Renderer::new`], then drive the renderer
+//! through [`Renderer::resize`], [`Renderer::set_viewport`],
+//! [`Renderer::set_virtual_resolution`], [`Renderer::surface_size`] and
+//! [`Renderer::render`]. No frontend needs a direct dependency on wgpu or an
+//! async executor.
 
 // External crates
-use crate::component::{RenderViewport, VirtualResolution};
 use pill_engine::engine::Engine;
 
 // Current crate
+use crate::component::{RenderViewport, VirtualResolution};
 use crate::sprite::SpriteRenderer;
 
 // =============================================================================
@@ -28,7 +32,7 @@ use crate::sprite::SpriteRenderer;
 /// Rendering initialization or presentation failure without exposed wgpu types.
 ///
 /// The semantic error enum is declared in [`crate::error::RendererError`] and
-/// re-exported here for the pre-existing module path.
+/// re-exported here so a caller can name it through the `renderer` module.
 pub use crate::error::RendererError;
 
 // =============================================================================
@@ -72,18 +76,18 @@ pub struct Renderer {
 impl Renderer {
     /// Create the GPU surface and all resources needed to draw an engine world.
     ///
-    /// The supplied handle is retained by wgpu for the surface lifetime. An
-    /// `Arc<winit::window::Window>` satisfies this API without making the engine
-    /// depend on winit.
+    /// The supplied handle is retained by wgpu for the surface lifetime; an
+    /// `Arc<winit::window::Window>` satisfies it without this crate depending
+    /// on winit.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::SurfaceCreation`] when the window handle cannot
-    /// be bound to a wgpu surface, [`RendererError::AdapterRequest`] when no
-    /// compatible GPU adapter exists, and [`RendererError::DeviceCreation`]
-    /// when the device cannot be created from the adapter. A surface exposing
-    /// no texture formats or no alpha modes yields
-    /// [`RendererError::NoTextureFormats`] or [`RendererError::NoAlphaModes`].
+    /// [`RendererError::SurfaceCreation`] or [`RendererError::AdapterRequest`]
+    /// for a surface or adapter that cannot be created,
+    /// [`RendererError::DeviceCreation`] for a device that cannot be,
+    /// [`RendererError::NoTextureFormats`] or [`RendererError::NoAlphaModes`] for
+    /// a surface exposing neither, and [`RendererError::SurfaceConfigure`] when
+    /// every configuration offered was refused.
     pub fn new<W>(window: W, width: u32, height: u32) -> Result<Self, RendererError>
     where
         W: RendererWindow + 'static,
@@ -258,8 +262,8 @@ impl Renderer {
 
     /// Select the logical scene size that should fill the physical viewport.
     ///
-    /// `None` keeps the original one-logical-unit-per-surface-pixel behavior.
-    /// Invalid dimensions are rejected by disabling the override.
+    /// `None` keeps one logical unit per surface pixel. Invalid dimensions are
+    /// rejected by disabling the override.
     pub fn set_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
         self.virtual_resolution = resolution.filter(|resolution| resolution.is_valid());
     }
@@ -341,12 +345,11 @@ fn resolve_virtual_resolution(
 
 /// Presentation and alpha combinations to try, most preferred first.
 ///
-/// The first candidate is always the pair the selection helpers chose, so a
-/// driver that accepts it behaves exactly as before. The rest give up the two
-/// preferences the surface capability list does not guarantee: a compositing
-/// alpha mode needs a compositing window, and an uncapped present mode needs a
-/// flip-model swapchain. `Fifo` with `Opaque` is the pair every surface is
-/// required to support, so it is the last resort.
+/// The first candidate is always the pair the selection helpers chose. The rest
+/// give up the two preferences the surface capability list does not guarantee:
+/// a compositing alpha mode needs a compositing window, and an uncapped present
+/// mode needs a flip-model swapchain. `Fifo` with `Opaque` is the pair every
+/// surface is required to support, so it is the last resort.
 ///
 /// Never empty: the caller depends on at least one configuration being tried.
 fn configure_candidates(
@@ -370,18 +373,18 @@ fn configure_candidates(
 /// Vulkan driver on Windows advertises `Immediate` and then fails the swapchain
 /// with an out-of-memory error, which wgpu reports through the device's
 /// uncaptured-error path and which aborts the host before any `RendererError`
-/// can be constructed. Preferring the guaranteed mode keeps that failure off the
-/// startup path; an uncapped mode stays available as an opt-in for a driver that
-/// has been verified to create one.
+/// can be constructed. This selector therefore always answers `Fifo` and
+/// ignores the advertised list.
 fn select_present_mode(_supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     wgpu::PresentMode::Fifo
 }
 
-/// Prefer an alpha-composited surface for transparent UI overlays.
+/// Prefer an alpha-composited surface, so a host can composite its own UI over
+/// the rendered image.
 ///
-/// Standalone windows remain opaque at the platform window level, while
-/// Dioxus can opt its window into transparency and reveal this same surface
-/// beneath the webview layer.
+/// A window that the platform keeps opaque simply shows the rendered surface
+/// as it is; a host that opts its window into transparency reveals this same
+/// surface beneath its own layers.
 fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
     supported
         .iter()
@@ -453,7 +456,7 @@ mod tests {
             RenderViewport::new(80, 40, 50, 70).clamped_to(100, 90),
             Some(RenderViewport::new(80, 40, 20, 50))
         );
-        assert_eq!(P
+        assert_eq!(
             RenderViewport::new(100, 0, 20, 20).clamped_to(100, 90),
             None
         );

@@ -8,9 +8,9 @@
 //! - Size the instance batch the mesh drawer accumulates and uploads in one
 //!   command.
 //! - Hold the pipelines the renderer defines itself - [`simple_pipeline`], and
-//!   [`pbr_pipeline`] with its [`post_processing`] half - so a project can run a
-//!   frame without declaring one, each with its shaders in a `shaders/` folder
-//!   beside it.
+//!   [`pbr_pipeline`] with its [`post_processing`] and [`skybox`] parts - so a
+//!   project can run a frame without declaring one, each with its stages under a
+//!   `shaders/` directory in the crate's `shader_sources/` tree.
 //! - Declare every cooked shader file once ([`ConfigShaderFile`]), and which
 //!   shader asset each pair of them builds ([`all_shader_sources`]), so the
 //!   embedded text and a runtime reload of it can never name different files.
@@ -28,7 +28,7 @@
 //! wants a different frame calls `set_pipeline` after registering, and one that
 //! wants the renderer's own fallback chain clears the manager instead.
 
-/// Declares a [`ConfigShaderFile`] constant for a cooked file under `shaders/`.
+/// Declares a [`ConfigShaderFile`] constant for a cooked file under `shader_sources/`.
 ///
 /// One literal feeds both halves: `include_str!` embeds the file at build time,
 /// and the same path lets a runtime reload find it again. Written as a macro
@@ -38,21 +38,29 @@ macro_rules! config_shader_file {
         $(#[$attribute])*
         $visibility const $name: $crate::config::ConfigShaderFile = $crate::config::ConfigShaderFile {
             relative_path: $path,
-            embedded_source: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/", $path)),
+            embedded_source: include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/shader_sources/",
+                $path
+            )),
         };
     };
 }
 
+/// The PBR frame: the lit geometry pass and the post-processing half it
+/// composes.
 pub mod pbr_pipeline;
+/// The post-processing passes the PBR frame composes.
 pub mod post_processing;
 /// The built-in lit pipeline, the fallback a project can opt into.
 pub mod simple_pipeline;
+/// The sky pass drawn where the lit pass wrote nothing.
 pub mod skybox;
 
 /// A cooked WGSL file the renderer's own pipelines are built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigShaderFile {
-    /// Path relative to the crate's `shaders/`, e.g.
+    /// Path relative to the crate's `shader_sources/`, e.g.
     /// `pbr_pipeline/shaders/pbr_fragment.wgsl`.
     pub relative_path: &'static str,
     /// The file's text as `include_str!` embedded it when the crate was built.
@@ -95,7 +103,7 @@ pub fn all_shader_sources() -> impl Iterator<Item = &'static ShaderSourceRecord>
 /// a limit on how many instances a frame may draw.
 pub const INSTANCE_BATCH_SIZE: usize = 10000;
 
-/// Starting capacity of the drawer's staging instance vector.
+/// Initial capacity for a staging vector of instances, sized like one batch.
 pub const INITIAL_INSTANCE_VECTOR_CAPACITY: usize = 10000;
 
 /// Bind group the engine's per-frame parameters occupy in every shader.
@@ -139,7 +147,8 @@ mod tests {
     /// behind an `include_str!` of some other file.
     #[test]
     fn every_declared_file_is_the_file_it_names() {
-        let config_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+        let config_directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shader_sources");
         for record in all_shader_sources() {
             for file in [record.vertex, record.fragment] {
                 let on_disk = std::fs::read_to_string(config_directory.join(file.relative_path))

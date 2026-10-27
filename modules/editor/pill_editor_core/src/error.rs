@@ -27,7 +27,7 @@ use crate::layout::LayoutError;
 /// Failures while loading or saving the persisted dock layout.
 ///
 /// Loading failures are recovered by falling back to the default layout;
-/// saving failures leave the previously installed document untouched.
+/// saving failures leave the installed document untouched.
 #[engine_error(namespace = editor::layout, runtime = ::pill_core::error)]
 pub enum LayoutPersistenceError {
     /// The saved document is not valid JSON for the current layout schema.

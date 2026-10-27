@@ -8,11 +8,12 @@
 //! # Design
 //!
 //! Every test drives the [`Engine`] through the same ABI entry points the
-//! managed runtime uses, always inside an [`ActiveSystemGuard`] scope so the
-//! declared scheduler access is enforced exactly as in a live frame. Shared
-//! fixtures build a representative world of shared and descriptor components,
-//! while scheduler tests derive [`SystemAccess`] metadata from concise native
-//! access declarations.
+//! managed runtime uses, or through the engine API those entry points reach;
+//! a callback test runs inside an [`ActiveSystemGuard`] scope so the declared
+//! scheduler access is enforced exactly as in a live frame. Shared fixtures
+//! build a representative world of shared and descriptor components, while
+//! scheduler tests derive [`SystemAccess`] metadata from concise native access
+//! declarations.
 
 // Standard library
 use std::collections::HashSet;
@@ -73,11 +74,12 @@ use renderer_data_dependency_graph::MeshRendererComponent;
 // Constants
 // =============================================================================
 
-// ABI status codes returned by the native callbacks under test. Every
-// callback reports `1` on success; the chunk queries report `3` when no
-// managed system is active, while the command callbacks additionally report
-// `4` when the declared command scope cannot be entered and `5` when the
-// entity generation no longer matches the live handle.
+// ABI status codes returned by the native callbacks under test. The command
+// and chunk callbacks report `1` on success, while the entity count and the
+// stable-id query report `0`. The chunk queries report `3` when no managed
+// system is active, and the command callbacks additionally report `4` when
+// the declared command scope cannot be entered and `5` when the entity
+// generation no longer matches the live handle.
 const ABI_SUCCESS: u8 = 1;
 const ABI_OUT_OF_SCOPE: u8 = 3;
 const ABI_COMMAND_SCOPE_DENIED: u8 = 4;
@@ -337,9 +339,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
         9.0
     );
 
-    // The managed side reads the stable id of the entity it just created
-    // (W-0048 Stage 5): the two halves re-assemble into the id the world
-    // indexes, and a destroyed entity reports "not live" instead.
+    // The managed side reads the stable id of the entity it just created: the
+    // two halves re-assemble into the id the world indexes.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
@@ -598,7 +599,7 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
 
 /// A C#-only component's `Handle<T>` field is a typed asset reference: the
 /// manifest names `T` by its Rust type path, and the world records the type's
-/// registered name, the same one a Rust component's field gets (W-0048).
+/// registered name, the same one a Rust component's field gets.
 #[test]
 fn a_managed_handle_field_is_recorded_with_its_registered_asset_type() {
     let mut engine = Engine::new();
@@ -741,12 +742,10 @@ fn managed_manifest_registers_and_queries_a_new_descriptor_component() {
     }
 }
 
-/// A newly registered descriptor component still exposes its field layout.
+/// A newly registered descriptor component exposes its field layout.
 ///
-/// The layout computation leaks every field name and struct tag, so it moved
-/// from the top of the manifest loop - where it ran for entries that already
-/// had a binding and for manifests refused as shared - into the registration
-/// branch. The editor-visible outcome must not have changed with it.
+/// A descriptor component's field layout is what the editor's Inspector reads
+/// for it, so registering one through the manifest has to install it.
 #[test]
 fn descriptor_registration_still_installs_field_layout() {
     let mut engine = Engine::new();
@@ -1051,9 +1050,8 @@ fn module_native_binding_rejects_live_layout_mismatch() {
         "a binding that disagrees with the live column is not handed out"
     );
 
-    // A binding that predates the column change and is already in a store
-    // fails the query arm with the "unknown component" status instead of the
-    // debug assertion that aborted debug hosts and vanished in release.
+    // A stale binding already in a store fails the query arm with the
+    // "unknown component" status instead of being served.
     //
     // `MeshRendererComponent` stands in for the module's component here: it is real native
     // storage, which is exactly what the `ModuleNative` arm serves, and its
@@ -1165,8 +1163,8 @@ fn managed_shared_component_schema_mismatch_is_rejected() {
 
 /// Verify managed shared bindings use the renderer's concrete component types.
 ///
-/// Runs in every build: the components are unconditional now, so the managed
-/// bridge has one binding path rather than one per feature set.
+/// The engine's `Position` and the renderer data's `MeshRendererComponent` are
+/// unconditional, so the managed bridge has one binding path in every build.
 #[test]
 fn csharp_world_supports_the_renderable_renderer_query() {
     let mut engine = Engine::new();
@@ -1416,8 +1414,7 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
 /// Entity columns are handed out through the const `entities` slot only.
 ///
 /// The writable `data` slot stays null for them, so an aliasing write into
-/// engine-owned entity rows cannot be written by accident the way it could
-/// when both kinds of column shared one pointer field.
+/// engine-owned entity rows cannot be expressed by accident.
 #[test]
 fn entity_chunks_expose_a_const_pointer() {
     let mut engine = Engine::new();
@@ -1593,8 +1590,7 @@ fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
 /// `ComponentColumn` moves rows with `ptr::copy` and frees its buffer without
 /// running drop glue, and the engine shares those columns across threads on an
 /// `unsafe impl Send`/`Sync`. A field owning a managed resource would be
-/// duplicated on move, leaked on free, and raced on. Before this check the only
-/// constraint on a field's type was that its name was non-empty.
+/// duplicated on move, leaked on free, and raced on.
 #[test]
 fn a_non_blittable_field_type_is_rejected() {
     let mut engine = Engine::new();
@@ -1708,10 +1704,9 @@ fn unknown_poll_status_is_a_typed_error() {
     assert!(poll_status_is_known(POLL_NO_CHANGE));
     assert!(poll_status_is_known(POLL_RELOADED));
     assert!(poll_status_is_known(POLL_REJECTED));
-    // A parked version is a status the host answers, not one it rejects.
-    // Leaving it unknown is what made a C# declaration edit wedge the reload
-    // loop: the loader parked, the host reported an unknown status, and every
-    // later poll returned the same thing.
+    // A parked version is a status the host answers, not one it rejects:
+    // leaving it unknown would wedge the reload loop, with the loader parked
+    // and every later poll reporting the same unknown status.
     assert!(poll_status_is_known(POLL_MANIFEST_PENDING));
     assert!(!poll_status_is_known(4));
     assert!(!poll_status_is_known(u8::MAX));
@@ -1726,10 +1721,8 @@ fn unknown_poll_status_is_a_typed_error() {
 /// Verifies that managed-reported manifest lengths are bounded before any
 /// host allocation happens.
 ///
-/// The bound lives in the shared two-call protocol now, so this exercises it
-/// through the limit the manifest path passes: the generic behaviour is pinned
-/// beside the helper, and what is pinned here is that the manifest kind is the
-/// one asking for `MAX_COMPONENT_MANIFEST_BYTES`.
+/// The generic behaviour is pinned beside the helper; what is pinned here is
+/// that the manifest path asks for `MAX_COMPONENT_MANIFEST_BYTES`.
 #[test]
 fn manifest_length_bounds_reject_empty_and_oversized_values() {
     /// Run the protocol against a reported length, with a copy that refuses.
@@ -2468,8 +2461,8 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
     );
 }
 
-/// The three refusals: a module mirror that changed, a vanished component, and
-/// a manifest that cannot be trusted.
+/// Two refusals: a module mirror whose layout changed, and a manifest naming
+/// one identity twice.
 #[test]
 fn the_apply_refuses_what_it_cannot_migrate() {
     // A `ModuleNative` binding the manifest disagrees with: the Rust side owns

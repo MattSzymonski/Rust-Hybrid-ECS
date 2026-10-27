@@ -8,7 +8,7 @@
 //!   that exist, the component names attached to each, and which types are
 //!   registered at all.
 //! - Renders the archetype graph and estimates the world's memory, for the
-//!   diagnostics report and for `--dot`.
+//!   diagnostics report.
 //!
 //! # Design
 //!
@@ -70,23 +70,20 @@ impl World {
 
     /// Record the declared field layout of a foreign resource.
     ///
-    /// Overwrites any previous layout for the same id, so a manifest reload
-    /// replaces rather than accumulates - the same rule
-    /// [`Self::register_component_descriptor_with_layout`] follows.
-    ///
-    /// **A relayout clears the stored layout**, so this has to be called again
-    /// after one. That is deliberate: serving the previous generation's offsets
-    /// over the migrated bytes would be worse than serving nothing, and a
-    /// caller that forgets loses inspectability rather than correctness.
+    /// Overwrites any previous layout for the same id, as
+    /// [`Self::register_component_descriptor_with_layout`] does. **A relayout
+    /// clears it**, so it has to be called again after one: serving the
+    /// previous generation's offsets over migrated bytes would be worse than
+    /// serving nothing, and a caller that forgets loses inspectability rather
+    /// than correctness.
     ///
     /// # Errors
     ///
     /// Returns [`ComponentFieldError::UnsupportedField`](crate::component_field::ComponentFieldError::UnsupportedField)
     /// for a descriptor that reaches past the resource's registered size or
-    /// names a container tag. A foreign resource's bytes are as opaque as a
-    /// descriptor row, so it needs both checks for the same reason: the bound
-    /// keeps a reader inside the value, and the tag check keeps it from
-    /// following a `(pointer, length)` pair the bytes never held.
+    /// names a container tag: the bound keeps a reader inside the value, and
+    /// the tag check keeps it from following a `(pointer, length)` pair the
+    /// bytes never held.
     pub fn register_resource_field_layout(
         &mut self,
         resource_id: ResourceId,
@@ -278,7 +275,8 @@ impl World {
             total += archetype.memory_estimate(&self.component_registry);
         }
 
-        // Entity location map: ~32 bytes per entry (Entity key + EntityLocation value + HashMap overhead)
+        // Entity location map, at a fixed per-entry allowance for the key, the
+        // value and the table overhead.
         total += self.entity_locations.len() * 48;
 
         // Stable-id indexes: a handle-keyed map and its reverse, two entries
@@ -300,21 +298,14 @@ impl World {
         total
     }
 
-    /// Generate a Graphviz DOT representation of the world for debugging.
-    ///
-    /// Useful for debugging archetype fragmentation and visualizing the
-    /// relationship between component sets and entity counts. The output is
-    /// a `digraph` with one node per archetype, labelled with its component
-    /// names and entity count.
-    ///
-    /// # Example output
+    /// Generate a Graphviz DOT representation of the world: one node per
+    /// archetype, labelled with its component names and entity count.
     ///
     /// ```dot
     /// digraph World {
     ///     rankdir=LR;
     ///     node [shape=record];
     ///     "arch_0" [label="Position, Velocity | 3 entities"];
-    ///     "arch_1" [label="Position, Health | 1 entity"];
     /// }
     /// ```
     #[cold]

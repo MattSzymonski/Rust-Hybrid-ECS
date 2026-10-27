@@ -7,9 +7,9 @@
 //!
 //! # Design
 //!
-//! Its own file because both components and the manager name it, and because
-//! it is the discriminant that decides which of the two sink pools every
-//! playback operation touches.
+//! It has its own file because the source component and the manager both name
+//! it, and because it is the discriminant that decides which of the two sink
+//! pools every playback operation touches.
 
 // External crates
 use serde::{Deserialize, Serialize};

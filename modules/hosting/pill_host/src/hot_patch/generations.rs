@@ -67,8 +67,7 @@ pub(crate) struct Generation {
     /// The two are indistinguishable once the list is empty, and they need
     /// opposite answers: a slot-delivered generation is rolled back through its
     /// slot, while one whose addresses a reload invalidated cannot be rolled
-    /// back at all. Without this the second case took the first case's route and
-    /// failed claiming the crate was not loaded, which is not what went wrong.
+    /// back at all.
     pub(super) prologue_history_dropped: bool,
     /// When this generation went live, for `patch_generations` listings.
     pub(super) installed_at: Instant,
@@ -142,17 +141,16 @@ impl HotPatchSession {
 
     /// Forget the patch history a reload has invalidated.
     ///
-    /// A reload replaces an artifact's image, so the addresses recorded when a
-    /// prologue was overwritten no longer name that function - and the freshly
-    /// loaded copy is unpatched, so the redirect is lost anyway. Writing saved
-    /// bytes back to a stale address would corrupt whatever now occupies it, so
-    /// the record is dropped rather than kept.
+    /// A reload replaces an artifact's image, so a prologue address recorded
+    /// then no longer names its function, and the freshly loaded copy carries no
+    /// patch anyway. Writing saved bytes back to a stale address would corrupt
+    /// whatever now occupies it, so the record is dropped rather than kept.
     ///
     /// Slot-delivered generations keep their records but lose their active
-    /// entry: the rebuilt artifact re-creates its slot from the new sources,
-    /// so the baseline is whatever the artifact now ships, and a rollback must
-    /// not re-install a body from a previous revision into it. A new patch of
-    /// the function makes the history reachable again from that baseline.
+    /// entry: the rebuilt artifact re-creates its slot from the new sources, so
+    /// the baseline is whatever the artifact now ships, and a rollback must not
+    /// re-install a body from a previous revision into it. A new patch of the
+    /// function makes the history reachable again from that baseline.
     pub(crate) fn forget_prologue_patches(&mut self) {
         let mut functions: Vec<String> = Vec::new();
         for generation in &mut self.generations {
@@ -165,15 +163,14 @@ impl HotPatchSession {
             }
         }
         // Every function, not only the prologue-patched ones. A reload
-        // re-creates the slot from the rebuilt artifact, so a slot-delivered
-        // generation is as dead as a prologue patch over there: what runs now
-        // is the artifact's own body. Leaving the entry in place made
-        // `active_generation` name a generation that is not executing and let
-        // a rollback install a body from a previous revision into the fresh
-        // image. The `Generation` records stay - the listing and their
-        // `prologue_history_dropped` refusal still describe what happened -
-        // but nothing is reachable for a rollback until a new patch
-        // re-registers the function.
+        // re-creates the slot from the rebuilt artifact, so what runs now is
+        // the artifact's own body even for a slot-delivered generation, and an
+        // entry left in place would make `active_generation` name a generation
+        // that is not executing - and let a rollback install a body from a
+        // previous revision into the fresh image. The `Generation` records
+        // stay - the listing and their `prologue_history_dropped` refusal still
+        // describe what happened - but nothing is reachable for a rollback
+        // until a new patch re-registers the function.
         self.active_generations.clear();
 
         if functions.is_empty() {
@@ -198,10 +195,10 @@ impl HotPatchSession {
     /// Reinstall an earlier generation of one function.
     ///
     /// Generation zero is the original code the running artifact was built
-    /// with; one and up are patches, in the order they were applied. This is a
-    /// single pointer store per artifact - no rebuild, no reload, and nothing
-    /// is unloaded, which is the concrete payoff of dispatching through a slot
-    /// rather than overwriting a function's prologue.
+    /// with; one and up are patches, in the order they were applied. A slot
+    /// generation is a single pointer store per artifact - no rebuild, no
+    /// reload, nothing unloaded - which is the payoff of dispatching through a
+    /// slot rather than overwriting a function's prologue.
     ///
     /// # Errors
     ///

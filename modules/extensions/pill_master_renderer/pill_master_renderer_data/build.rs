@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Cook every HLSL source under `shaders/` to the WGSL the crate embeds,
-//!   through the routine the development host's shader watcher also runs.
+//! - Cook every HLSL source under `shader_sources/` to the WGSL the crate
+//!   embeds, through the routine the development host's shader watcher also runs.
 //! - Report every source directory, header and discovered input to cargo so
 //!   that a source edit rebuilds.
 //!
@@ -26,7 +26,7 @@ fn main() {
     // The shader trees live at the crate root rather than under `src/`, so a
     // shader edit is not a Rust source edit: a module watcher on `src/` never
     // rebuilds the crate for one.
-    let shaders_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders");
+    let shaders_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shader_sources");
 
     println!("cargo:rerun-if-changed=build.rs");
 

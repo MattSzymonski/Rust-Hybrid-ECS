@@ -10,8 +10,8 @@
 //!
 //! A source moved without its `.meta` loses its guid: the next import writes a
 //! fresh one beside it, and every saved reference to the old guid stops
-//! resolving. This is the one supported way to rename an asset; tools (the
-//! editor, scripts) call it instead of moving files themselves.
+//! resolving. This is the one supported way to rename an asset; the editor's
+//! asset commands call it instead of moving files themselves.
 //!
 //! The source moves first and the metadata second. When the second rename
 //! fails, the first is undone, so the pair is never left split on purpose. A
@@ -99,8 +99,7 @@ pub fn metadata_path_of(path: &Path) -> PathBuf {
 /// Move the source asset at `from` to `to`, together with its `.meta` file
 /// when it has one, creating `to`'s directory if needed.
 ///
-/// Both paths are filesystem paths. Nothing is overwritten: the move is
-/// refused when a file exists at `to` or at `to`'s metadata path.
+/// Both paths are filesystem paths; nothing is overwritten.
 ///
 /// # Errors
 ///

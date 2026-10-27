@@ -1,4 +1,4 @@
-//! Extension used to exercise dynamic module loading.
+//! Minimal extension module: one persistable component and one system.
 //!
 //! # Responsibilities
 //!
@@ -8,15 +8,18 @@
 //!
 //! # Design
 //!
-//! The crate is built as a `cdylib` and loaded by `pill_host` at runtime, next
-//! to and independently of the project module. All registration work lives in
+//! The crate is a plain `rlib`: the generated `host_module_pill_test` wrapper
+//! links it into the `cdylib` the host stages and loads at runtime, next to and
+//! independently of the project module. All registration work lives in
 //! [`register`], which is a plain Rust function, so the same crate can also be
-//! linked statically into a monolithic build. The `extern "C"` exports are thin
-//! wrappers that catch panics and translate them into a status code, because
-//! unwinding across the module boundary would abort the process.
+//! linked statically into a monolithic build. The `extern "C"` exports the
+//! `#[pill_module]` attribute emits are thin wrappers that catch panics and
+//! translate them into a status code, because unwinding across the module
+//! boundary would abort the process.
 //!
 //! The component is registered as persistable, so its values survive a reload:
-//! the host matches schemas by type name and migrates only changed layouts.
+//! snapshots are keyed by type name, an added field takes its default and a
+//! removed one is dropped.
 
 // External crates
 use pill_core::info;
@@ -33,10 +36,10 @@ use serde::{Deserialize, Serialize};
 /// count instead of spawning a fresh batch on every rebuild.
 const MODULE_TEST_ENTITY_COUNT: usize = 4;
 
-/// Frame interval at which the module reports progress to the host log.
+/// Frame interval a progress report would use.
 ///
-/// Used only by the progress-reporting block below, which is temporarily
-/// disabled; the allow goes away with it.
+/// No report is emitted, so nothing reads the constant and the `allow` keeps
+/// the dead-code lint quiet.
 #[allow(dead_code)]
 const REPORT_INTERVAL_FRAMES: u64 = 300;
 
@@ -73,21 +76,11 @@ pub struct ModuleTest {
 ///
 /// Registered under the name `module_test_processor`; the scheduler derives the
 /// system's access pattern from the query signature, so it is scheduled against
-/// the project's systems automatically. Progress is reported on one entity only,
-/// at a fixed frame interval, to keep the host console readable.
+/// the project's systems automatically.
 fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), SystemError> {
     for mut state in query.iter_mut() {
         state.processed_frame_count += 1;
         state.accumulated_time += FIXED_DELTA_TIME;
-
-        // if index == 0 && state.processed_frame_count % REPORT_INTERVAL_FRAMES == 0 {
-        //     info!(
-        //         target: pill_core::telemetry::telemetry_target::ECS,
-        //         frames = state.processed_frame_count,
-        //         seconds = state.accumulated_time,
-        //         "pill_test module still processing"
-        //     );
-        // }
     }
     Ok(())
 }

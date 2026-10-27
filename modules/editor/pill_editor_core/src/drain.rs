@@ -18,7 +18,7 @@
 //! at their own frame boundary, and one command-contract change lands once.
 //! The failure channels are the log lines the suites watch (`engine commands
 //! applied`, `command failed`, `history push`, `history undo`, `history
-//! remapped`), so both postures report an edit the same way.
+//! remap`), so both postures report an edit the same way.
 //!
 //! Nothing here names egui: this module runs in a browser build with no
 //! window at all.
@@ -52,10 +52,11 @@ pub struct DrainOutcome {
 
 /// Apply every queued batch, then prune a history a reload invalidated.
 ///
-/// A failed command never aborts the rest of its batch; a recorded batch
-/// lands in the history as one step; the shared selection follows a move and
-/// clears with a delete; and a batch that touched files reports
-/// `files_changed`, which the caller turns into an immediate listing walk.
+/// A failed command never aborts the rest of its batch; a recorded batch that
+/// inverted in full lands in the history as one step; the shared selection
+/// follows a move and clears with a delete; and a batch that touched files
+/// reports `files_changed`, which the caller turns into an immediate listing
+/// walk.
 pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
     let batches = {
         let world = engine.world_mut();
@@ -89,11 +90,11 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
                 "[editor] command failed"
             );
         }
-        // A history step was popped before its commands ran, so a replay that
-        // failed has to put the cursor back: the step stays undoable instead of
-        // sitting in the opposite tail while the world still shows the edit
-        // (W-0090). The `history undo` line was logged when the step was
-        // queued, which is why this one says the walk did not happen.
+        // A history step is popped before its commands run, so a replay that
+        // fails puts the cursor back: the step stays undoable instead of
+        // sitting in the opposite tail while the world still shows the edit.
+        // The `history undo` line is logged when the step is queued; this one
+        // reports the failure.
         if let Some(direction) = batch.replay {
             let world = engine.world_mut();
             if let Some(history) = world.get_resource_mut::<CommandHistory>() {
@@ -406,8 +407,8 @@ mod tests {
 
     #[test]
     fn a_step_without_a_queue_is_not_popped() {
-        // The half-state SA-0099 names: without the queue the step would be
-        // lost while the log claimed the undo ran.
+        // Without a queue the step would be lost while the log claimed the
+        // undo ran, so nothing is popped.
         let mut engine = Engine::default();
         let world = engine.world_mut();
         world.register_resource::<CommandHistory>();
@@ -440,10 +441,10 @@ mod tests {
 
     #[test]
     fn a_failed_undo_puts_the_step_back() {
-        // SA-0099's other half: the step was popped before the apply result
-        // was known, so an inverse that failed left the log saying the undo ran
-        // while the world still showed the edit and the step sat in the redo
-        // tail. A step that did not run must stay undoable.
+        // The step is popped before its commands run, so a failed inverse
+        // would leave the log saying the undo ran while the world still shows
+        // the edit and the step sits in the redo tail. A step that did not run
+        // must stay undoable, so the drain puts it back.
         let mut engine = engine();
         let stale = HistoryEntry::engine(
             "destroy an entity that is gone",

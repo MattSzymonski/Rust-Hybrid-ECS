@@ -1,4 +1,4 @@
-//! Asset previews (W-0049 Stage 11): what an editor asks a renderer to draw
+//! Asset previews: what an editor asks a renderer to draw
 //! off-screen, and the pixels it gets back.
 //!
 //! # Responsibilities
@@ -64,7 +64,7 @@ pub struct PreviewRequests {
 }
 
 impl PreviewRequests {
-    /// Queue one preview of `asset` and return the id its answer carries.
+    /// Queues one preview of `asset` and returns the id its answer carries.
     pub fn request(&mut self, asset: PreviewAsset) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);

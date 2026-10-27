@@ -35,16 +35,10 @@ use crate::Resource;
 /// - Allowing mutable access to resources
 /// - Automatically deferring all structural changes to the command queue
 ///
-/// Scripts cannot directly add/remove components or destroy entities on the world.
-/// All such operations go through the command queue and execute after all scripts complete.
-///
-/// # Why This Design?
-///
-/// In an archetype-based ECS, adding/removing components causes entity migration.
-/// If a script does `world.add_component(entity, ...)` while holding `&mut self`,
-/// the archetype migration invalidates `self`, causing use-after-free.
-///
-/// By only exposing deferred operations, this is impossible at compile time.
+/// In an archetype-based ECS, adding or removing components migrates the
+/// entity's row. A script that did that through `&mut World` while holding
+/// `&mut self` would be left holding a reference into storage that moved. Only
+/// deferred operations are exposed, so that is impossible at compile time.
 pub struct ScriptContext<'a> {
     /// Mutable access to world for component queries
     world: &'a mut World,
@@ -88,17 +82,11 @@ impl<'a> ScriptContext<'a> {
 
     /// Gets a mutable reference to a component on any entity.
     ///
-    /// IMPORTANT:
-    /// This function uses raw pointers internally to avoid Rust's aliasing restrictions,
-    /// which allows getting `&mut` to the same component type as the script itself.
-    /// There can be two mutable references to the same component type in caller update function scope.
-    /// One is the script's `&mut self`, the other is the returned `&mut T` from this function.
-    ///
-    /// SAFETY:
-    /// These two references are always valid. The only way to invalidate them is to add/remove
-    /// components from the entity immediately, which is impossible since all such operations are deferred.
-    /// This is still considered as undefined behavior in Rust abstract machine sense,
-    /// but in practice is sound - will never lead to any issues.
+    /// The script's own `&mut self` and the returned `&mut T` can name the same
+    /// component type. That is undefined behaviour by the abstract machine's
+    /// rules, and accepted here because it is sound in practice: the only way
+    /// to invalidate either reference is a structural change to the entity, and
+    /// every such operation on this context is deferred to the command queue.
     pub fn get_component_mut<T>(&mut self, entity: Entity) -> Option<&mut T>
     where
         T: Component,
@@ -110,15 +98,12 @@ impl<'a> ScriptContext<'a> {
         // Step 2: Reborrow the raw pointer as a `&mut T` reference.
         // SAFETY: `World::get_component_ptr_mut` either returns `None` (already
         // handled by `?`) or a valid, aligned, non-null pointer to a live `T`
-        // component. This call holds the exclusive `&mut self` borrow of the
-        // world for the whole lifetime of the returned reference, and every
-        // structural change (add/remove component, destroy entity) is deferred
-        // to the command queue, so the storage slot cannot be migrated or
-        // deallocated while the reference is alive. Deliberately creating a
-        // second `&mut T` for the script's own component type is the documented
-        // purpose of this API (see the doc comment above); it is sound in
-        // practice because no structural mutation can invalidate either
-        // reference during the borrow.
+        // component. The `&mut self` borrow lasts for the whole lifetime of the
+        // returned reference, and every structural change (add/remove
+        // component, destroy entity) is deferred to the command queue, so the
+        // storage slot cannot be migrated or deallocated while the reference is
+        // alive. Creating a second `&mut T` for the script's own component type
+        // is the documented purpose of this API (see the doc comment above).
         Some(unsafe { &mut *component_pointer })
     }
 
@@ -182,16 +167,10 @@ impl<'a> ScriptContext<'a> {
 /// Trait for components that can execute logic each frame
 ///
 /// Script components have an update() method that gets called by the scripting system.
-/// They receive a `ScriptContext` which provides safe, deferred access to the ECS.
-///
-/// # Design
-///
-/// The `ScriptContext` only exposes read-only world access and deferred commands.
-/// This prevents scripts from accidentally causing use-after-free by:
-/// - Adding/removing components (which would invalidate `&mut self`)
-/// - Destroying entities mid-update
-///
-/// All structural changes are queued and executed after ALL scripts complete.
+/// They receive a [`ScriptContext`], which exposes read-only world access and
+/// deferred structural commands only: adding or removing components, and
+/// destroying entities mid-update, all become queue entries that run after
+/// every script in the frame has returned.
 ///
 /// # Examples
 ///

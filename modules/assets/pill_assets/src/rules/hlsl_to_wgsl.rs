@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Compile every `shaders/*.hlsl` the pipeline root holds.
+//! - Compile every HLSL stage source the root holds, under `shaders/` or flat.
 //! - Infer the stage and entry point from the file name, refusing any name that
 //!   does not declare one.
 //! - Resolve the compiler to an explicit path, from `PILL_SLANGC` or `PATH`,
@@ -25,34 +25,23 @@ const SLANGC_EXECUTABLE: &str = if cfg!(windows) {
     "slangc"
 };
 
-/// Compiles `shaders/*.hlsl` to WGSL beside the source.
+/// Compiles `shaders/*.hlsl` to WGSL beside the source through `slangc`.
 ///
 /// The stage and entry point come from the file name: `*_vertex.hlsl` is a
 /// vertex stage entered at `vs_main`, `*_fragment.hlsl` a fragment stage entered
 /// at `fs_main`. Any other name fails instead of guessing, so adding a stage is
 /// a decision made here rather than something inferred from a typo.
 ///
-/// Sources `#include` an `include/` beside them, which costs nothing to set up
-/// and needs no configuration. [`HlslToWgsl::with_include`] adds directories for
-/// a header that several trees share: without it the header has to be copied
-/// into each `include/`, and copies drift.
-///
-/// Two layouts read from the root: [`HlslToWgsl::new`] takes a `shaders/`
-/// directory below it, which leaves room for an `include/` of headers that are
-/// not stages, while [`HlslToWgsl::flat`] takes the sources at the top of the
-/// root itself. A header cannot live in the second layout's top level - the
-/// glob would match it and no stage could be inferred - so it belongs in
-/// `include/` either way.
-///
-/// The compiler comes from `PILL_SLANGC` when that names one, and otherwise
-/// from the first `slangc` on `PATH`; a compiler that resolves inside the
-/// working directory is refused, so a project cannot have its own `slangc.exe`
-/// run by a cook.
+/// Sources `#include` an `include/` beside them; [`HlslToWgsl::with_include`]
+/// adds directories a header is shared from. [`HlslToWgsl::new`] reads a
+/// `shaders/` level below the root and [`HlslToWgsl::flat`] the root itself.
+/// The compiler comes from `PILL_SLANGC` or the first `slangc` on `PATH`, and
+/// one that resolves inside the working directory is refused.
 pub struct HlslToWgsl {
     /// Glob, relative to the root, selecting the sources.
     glob: &'static str,
-    /// Directories handed to `slangc -I`, searched after the source's own
-    /// directory and `include/`.
+    /// Directories handed to `slangc -I`, searched after the including file's
+    /// own directory, in the order given.
     include_dirs: Vec<PathBuf>,
 }
 
@@ -170,12 +159,12 @@ impl Rule for HlslToWgsl {
 
 /// The `slangc` a cook may run.
 ///
-/// A bare name is never handed to the OS. Both `CreateProcess` on Windows and
-/// `execvp` elsewhere search the working directory before `PATH`, so a project
-/// that carries a `slangc.exe` beside its crate would have it executed by a
-/// cook that was only asked to compile a shader. `PILL_SLANGC` names the
-/// compiler outright; without it the search walks `PATH` in order and refuses
-/// any candidate that resolves inside the working directory.
+/// A bare name is never handed to the OS. `CreateProcess` on Windows searches
+/// the working directory before `PATH`, and on any platform a `PATH` entry can
+/// name it, so a project carrying a `slangc.exe` beside its crate could have it
+/// executed by a cook that was only asked to compile a shader. `PILL_SLANGC`
+/// names the compiler outright; without it the search walks `PATH` in order and
+/// refuses any candidate that resolves inside the working directory.
 fn slangc_path() -> Result<PathBuf, String> {
     let working_directory = std::env::current_dir()
         .map_err(|error| format!("cannot read the working directory: {error}"))?;

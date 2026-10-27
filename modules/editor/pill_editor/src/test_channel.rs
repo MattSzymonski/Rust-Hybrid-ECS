@@ -1,5 +1,5 @@
 //! The editor's scripted test channel: the file the devops suites append
-//! commands to (Stage 8).
+//! commands to.
 //!
 //! # Responsibilities
 //!

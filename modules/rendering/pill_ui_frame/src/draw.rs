@@ -18,8 +18,7 @@
 //! [`DrawList::pop_clip`] belongs clipped to it.
 //!
 //! Every draw samples a texture its producer carried in the frame's texture
-//! set; a solid fill samples a white texel of one, the way egui's own
-//! tessellation does.
+//! set; a solid fill samples a white texel of one.
 
 // External crates
 use pill_core::math::Vector2f;
@@ -182,7 +181,7 @@ impl DrawList {
         DrawList::default()
     }
 
-    /// Whether nothing would be drawn: no vertices and no clip changes.
+    /// Whether nothing would be drawn: no vertices and no commands.
     pub fn is_empty(&self) -> bool {
         self.vertices.is_empty() && self.commands.is_empty()
     }

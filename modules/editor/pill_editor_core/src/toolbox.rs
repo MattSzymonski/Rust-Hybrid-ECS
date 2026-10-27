@@ -1,4 +1,4 @@
-//! The floating viewport toolbox (Stage 22): its rows, geometry and the
+//! The floating viewport toolbox: its rows, geometry and the
 //! commands a click on a row queues.
 //!
 //! # Responsibilities
@@ -18,12 +18,10 @@
 //!
 //! # Design
 //!
-//! Pure functions and plain constants over egui's geometry types, so the
-//! shell draws exactly what the tests pin: a click's target, the region a
-//! press must not turn into a scene pick, and the drag's clamp all read the
-//! same numbers. A row's command is the same `SetGizmoTool` edit the
-//! shortcuts, the viewport menu and the Preferences tab queue, so the
-//! toolbox adds a surface, not a fifth way to change the tool.
+//! Pure functions and plain constants over egui's geometry types: a click's
+//! target, the region a press must not become a scene pick and the drag's
+//! clamp all read the numbers the shell draws. A row queues the same
+//! `SetGizmoTool` edit the shortcuts, the viewport menu and Preferences do.
 
 // External crates
 use egui::{Pos2, Rect, Vec2};
@@ -51,8 +49,9 @@ pub const TOOLBOX_HANDLE_HEIGHT: f32 = 16.0;
 /// The gap between the handle and the first row, and between two rows.
 pub const TOOLBOX_ITEM_GAP: f32 = 4.0;
 
-/// One row's height, and the padding between a row and the panel's sides.
+/// One row's height.
 pub const TOOLBOX_ITEM_HEIGHT: f32 = 24.0;
+/// The inset between a row and the panel's sides, and below the last row.
 pub const TOOLBOX_PADDING: f32 = 6.0;
 
 /// The panel's size: the handle, then every row, with the bottom padding.
@@ -141,18 +140,18 @@ pub struct ToolboxState {
 /// One row of the floating toolbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolboxItem {
-    /// Select the translate tool: the `W` shortcut's edit.
+    /// Select the translate tool.
     Translate,
-    /// Select the rotate tool: the `E` shortcut's edit.
+    /// Select the rotate tool.
     Rotate,
-    /// Select the scale tool: the `R` shortcut's edit.
+    /// Select the scale tool.
     Scale,
     /// Toggle the gizmo's space between world and local; the label carries
     /// the space it is currently in.
     Space,
     /// Toggle the gizmo's snapping.
     Snap,
-    /// Toggle the scene grid under the viewport (Stage 23).
+    /// Toggle the scene grid under the viewport.
     Grid,
 }
 
@@ -180,8 +179,8 @@ impl ToolboxItem {
     }
 
     /// The row's icon: the tools' own marks, the globe or the map pin for
-    /// the space the row would leave the gizmo in, and the magnet, grid and
-    /// fader marks for the toggles.
+    /// the space the gizmo is in, and the magnet and grid marks for the
+    /// toggles.
     pub fn icon(self, state: &ToolboxState) -> Icon {
         match self {
             ToolboxItem::Translate => Icon::ArrowsOutCardinal,
@@ -196,9 +195,9 @@ impl ToolboxItem {
         }
     }
 
-    /// The row's label for the current state: the three tools and the two
-    /// gizmo toggles are static (the space row carries its space), the grid
-    /// row is static too.
+    /// The row's label for the current state: the tools and the two plain
+    /// toggles carry a fixed label, while the space row names the space the
+    /// gizmo is in.
     pub fn label(self, state: &ToolboxState) -> &'static str {
         match self {
             ToolboxItem::Translate => "Translate",
@@ -344,8 +343,8 @@ mod tests {
         assert_eq!(ToolboxItem::Grid.label(&state), "Grid");
     }
 
-    /// Each row names its own icon, and the space row's follows the space it
-    /// would leave the gizmo in.
+    /// Each row names its own icon; the space row's follows the space the
+    /// gizmo is in.
     #[test]
     fn icons_belong_to_their_rows() {
         let mut state = ToolboxState::default();

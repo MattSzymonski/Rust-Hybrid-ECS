@@ -1,4 +1,4 @@
-//! Transform gizmos: handle geometry, drag math and snapping (Stage 20).
+//! Transform gizmos: handle geometry, drag math and snapping.
 //!
 //! # Responsibilities
 //!
@@ -14,8 +14,7 @@
 //!
 //! Pure functions over plain arrays. The geometry and the math live here and
 //! the editor executable owns the camera and the world, so a drag is testable
-//! without a renderer or a window - the acceptance test drives the same
-//! functions with a headless contract stub. Handle ids are stable numbers
+//! without a renderer or a window. Handle ids are stable numbers
 //! (`1..=3` translate, `11..=13` rotate, `21..=23` scale), so a pick's
 //! `Handle(id)` names both the mode it belongs to and its axis
 //! ([`handle_axis`]), and the renderer never needs to know what a handle
@@ -32,10 +31,10 @@ use serde::{Deserialize, Serialize};
 /// The gizmo tool's live state: the settings the editor draws and drags with.
 ///
 /// A world resource rather than shell state, because the executable owns the
-/// drag - it holds the camera and the pick answers - while the shell owns the
-/// commands and the preferences file. Both sides meet here, so a reload of
-/// either keeps the other's view, and the draw, the pick and the drag can
-/// never disagree about which handles are on screen.
+/// drag - it holds the camera and the pick answers - and the preferences
+/// write, while the shell queues the commands. Both sides meet here, so a
+/// shell reload keeps the tool as it is, and the draw, the pick and the drag
+/// can never disagree about which handles are on screen.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GizmoState {
     /// What the tool edits, in which space, and how it snaps.
@@ -49,7 +48,7 @@ impl pill_engine::Resource for GizmoState {
 }
 
 // =============================================================================
-// Resource fields (Stage 25)
+// Resource fields
 // =============================================================================
 
 /// The name [`GizmoState`] answers to in `SetResourceField` - the same string
@@ -59,10 +58,10 @@ pub const RESOURCE_NAME: &str = "pill_editor_core::gizmo::GizmoState";
 /// Set one field of the gizmo settings from a field value, and return the
 /// previous value for the command's inverse.
 ///
-/// The engine keeps no resource reflection, so the writable fields are named
-/// here, one arm each; [`resource_field_value`] reads them back through the
-/// same table. An enum field travels as its `U32` discriminant, in
-/// declaration order, and a step as `F32`.
+/// The engine cannot read or write a Rust resource's fields generically, so
+/// the writable fields are named here, one arm each; [`resource_field_value`]
+/// reads them back through the same table. An enum field travels as its `U32`
+/// discriminant, in declaration order, and a step as `F32`.
 pub fn set_resource_field(
     settings: &mut GizmoSettings,
     resource: &str,
@@ -219,7 +218,7 @@ pub enum GizmoSpace {
 
 /// The tool's state: what it edits, in which space, and how it snaps.
 ///
-/// Lives in the preferences file (D31: snapping steps included), so a step is
+/// The preferences file holds it, snapping steps included, so a step is
 /// editable by hand and the panel and the file never disagree.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GizmoSettings {
@@ -394,8 +393,7 @@ pub const AXIS_COLORS: [[f32; 4]; 3] = [
     [0.30, 0.50, 0.95, 1.0],
 ];
 
-/// How much a hovered handle brightens, and how much an active one dims
-/// under its hover state: the two feedback states the handles show.
+/// How much a hovered handle brightens.
 pub const HOVER_BRIGHTEN: f32 = 1.35;
 /// The active handle's multiplier against its base colour.
 pub const ACTIVE_DIM: f32 = 0.70;
@@ -727,7 +725,8 @@ pub fn closest_axis_point(
 }
 
 /// Where the cursor ray meets the plane through `origin` whose normal is
-/// `normal`, or `None` when the ray runs parallel to it.
+/// `normal`, or `None` when the ray runs parallel to it or the hit lies behind
+/// the ray's origin.
 pub fn ray_plane_point(
     origin: [f32; 3],
     normal: [f32; 3],
@@ -944,8 +943,9 @@ pub fn hit_test(
 }
 
 /// How far along the ray and how far from it the closest approach to the
-/// segment `start..end` is; `None` when the ray points away from the
-/// segment entirely.
+/// segment `start..end` is; an approach behind the ray's origin clamps to the
+/// origin. `None` for a zero-length ray direction, or for a zero-length
+/// segment behind the origin.
 fn ray_segment_distance(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
@@ -985,7 +985,7 @@ fn ray_segment_distance(
 }
 
 /// How far along the ray a triangle is hit, by Möller-Trumbore; `None` for a
-/// miss, a back face or a triangle behind the ray's origin.
+/// miss or a triangle behind the ray's origin.
 pub fn ray_triangle_intersection(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
@@ -1018,7 +1018,7 @@ pub fn ray_triangle_intersection(
 // Small vector helpers
 // =============================================================================
 
-/// The three axes of the plane whose normal is `normal`, as two unit vectors.
+/// Two unit vectors spanning the plane whose normal is `normal`.
 pub fn plane_axes(normal: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     let normal = normalize(normal).unwrap_or([0.0, 1.0, 0.0]);
     let helper = if normal[0].abs() < 0.9 {

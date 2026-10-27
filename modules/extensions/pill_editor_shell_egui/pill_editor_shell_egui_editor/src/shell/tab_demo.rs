@@ -1,4 +1,4 @@
-//! The shell module's own editor panel (W-0038 Stage 11).
+//! The shell module's own editor panel.
 //!
 //! # Responsibilities
 //!
@@ -24,7 +24,7 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 /// The environment variable that makes the panel deliberately slow.
 pub const PANEL_SLOW_ENV: &str = "PILL_TEST_PANEL_SLOW";
 
-/// How many times the budget the slow posture burns.
+/// How many times the panel budget the slow posture burns.
 const SLOW_MULTIPLE: f32 = 3.0;
 
 /// The demo panel's confirmation window id.
@@ -36,7 +36,7 @@ pub const DEMO_CONFIRM_WINDOW: &str = "demo.confirm";
 /// would fail the build of the generated wrapper crate.
 pub fn demo_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     // The confirmation's own body: the shell draws its buttons and reads Enter
-    // and Escape, the answer comes back on the pass after (W-0038 Stage 13).
+    // and Escape, the answer comes back on the pass after.
     if context.window == Some(DEMO_CONFIRM_WINDOW) {
         ui.label("Confirm the demo action?");
         ui.monospace("Enter applies it, Escape dismisses.");

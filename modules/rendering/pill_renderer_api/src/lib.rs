@@ -1,4 +1,4 @@
-//! The renderer contract: what the host hands *any* renderer, and what every
+//! The renderer contract: what the host hands any renderer and what every
 //! renderer hands back, with no graphics stack behind it.
 //!
 //! # Responsibilities
@@ -11,25 +11,20 @@
 //! - Define the contract's scene components - the camera the frame embeds and
 //!   the viewport a frontend points a renderer at - and register them through
 //!   [`register_contract_components`].
-//! - Carry a window across to a renderer as plain data ([`RawWindowData`]).
-//! - Let one renderer draw into several surfaces, each through its own camera
-//!   ([`SurfaceId`], [`SurfaceCameras`]).
-//! - Carry the scene grid an editor draws in its view-bound surfaces
-//!   ([`SceneGrid`], [`FrameGrid`]).
-//! - Carry debug drawing, selection outlines and picking between the world and
-//!   any renderer ([`SelectionOutlines`], [`PickRequests`], [`PickResults`]).
+//! - Carry a window ([`RawWindowData`]), a surface set ([`SurfaceId`],
+//!   [`SurfaceCameras`]) and the scene grid ([`SceneGrid`], [`FrameGrid`]) as
+//!   plain data.
+//! - Carry debug drawing, selection outlines, picking and previews between the
+//!   world and any renderer ([`SelectionOutlines`], [`PickRequests`],
+//!   [`PickResults`], [`PreviewRequests`]).
 //!
 //! # Design
 //!
 //! This crate never depends on wgpu or winit, and holds nothing specific to
-//! one renderer. A renderer comes as two crates: its data (assets, its own
-//! components, pipelines, shaders - `pill_master_renderer_data` for the master
-//! renderer) and its GPU module. Both build on this contract, and so does the
-//! host, which drives any renderer through [`PillRenderer`] without naming its
-//! types.
-//!
-//! The host links this crate, so a change here needs a host restart; it
-//! therefore stays small and data-shaped.
+//! one renderer: a renderer comes as a data crate (assets, its own components,
+//! pipelines, shaders) plus a GPU module, and both build on this contract. The
+//! host links this crate in every posture, so a change here needs a host
+//! restart; the types stay small and data-shaped.
 
 /// The renderer contract a frontend drives, plus a headless stub.
 pub mod api;

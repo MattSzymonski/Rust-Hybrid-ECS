@@ -1,45 +1,35 @@
 //! Minimal source scanning for patch classification and generation.
 //!
-//! # Why this is its own crate
-//!
-//! Two very different consumers must agree, byte for byte, about where a
-//! function starts and what its declaration says: the **host**, which decides
-//! whether an edit is patchable, and each crate's **build script**, which
-//! records the addresses and signatures the host then asks for. When those two
-//! disagreed - a build script naming a method through its type while the host
-//! did not - every method silently failed to patch. One implementation, used
-//! from both, removes that class of bug rather than documenting it.
-//!
-//! It has no dependencies on purpose: build scripts run before everything else,
-//! so anything pulled in here is paid on every clean build. That constraint is
-//! what makes this the right home for any other build-script helper too.
-//!
 //! # Responsibilities
 //!
 //! - Locate one function's full text (attributes, signature and body) by name.
 //! - Enumerate every addressable function, with the type that owns it.
-//! - Produce the normalized declaration both sides compare.
+//! - Produce the normalized declaration the host and the build scripts compare.
 //! - Collect a file's top-level `use` statements.
 //! - Strip named function bodies, so a body-only edit can be told from any other.
 //! - Stage the toolchain's `std-*.dll` beside a binary built with
 //!   `-C prefer-dynamic`, so it runs without the toolchain on `PATH`.
 //!
-//! The last one is unrelated to scanning and lives here for one reason: it is
-//! also build-script-only and also has to be dependency-free, so a separate
-//! crate for one small function bought a workspace member and nothing else.
-//!
 //! # Design
 //!
-//! Deliberately a byte scanner rather than a syntax tree. The only questions
+//! The host, which decides whether an edit is patchable, and each crate's build
+//! script, which records the addresses and signatures the host then asks for,
+//! must agree byte for byte about where a function starts and what its
+//! declaration says; one implementation used from both keeps them so.
+//!
+//! Deliberately a byte scanner rather than a syntax tree: the only questions
 //! asked are "where does this function start and end" and "what changed outside
 //! the bodies", and both are answered by brace matching over a mask that marks
-//! which bytes are real code. Pulling `syn` into the host to answer them would
-//! add a parse of the whole file to every keystroke-triggered classification,
-//! and would still need the original byte spans to copy text verbatim.
+//! which bytes are real code. A syntax tree would add a full parse to every
+//! keystroke-triggered classification and would still need byte spans to copy
+//! text verbatim.
 //!
 //! The scanner is conservative by construction: anything it cannot confidently
 //! identify makes classification report "not body-only", which costs a full
-//! module reload rather than risking a wrong patch.
+//! module reload rather than risking a wrong patch. The crate has no
+//! dependencies - build scripts run before everything else, so anything pulled
+//! in is paid on every clean build - which is also why the std dylib staging
+//! lives here.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -209,9 +199,8 @@ pub struct FunctionText {
 /// Find the body of one method, scoped to the `impl` block that owns it.
 ///
 /// [`find_function`] searches by bare name and returns the first match, which
-/// stopped being sufficient once trait blocks were registered: a file may hold
-/// `impl Default for Alpha` and `impl Default for Beta`, or a type may carry
-/// both an inherent `draw` and a trait `draw`. Generating a patch from the first
+/// cannot tell `impl Default for Alpha` from `impl Default for Beta`, nor an
+/// inherent `draw` from a trait `draw`. Generating a patch from the first
 /// `fn draw` in the file would compile and install the wrong body - a silent
 /// wrong answer, which is the one outcome this subsystem must not produce.
 ///
@@ -253,11 +242,8 @@ pub fn find_function(source: &str, name: &str) -> Option<FunctionText> {
 /// [`find_function`] against a code mask the caller already computed.
 ///
 /// Building the mask allocates and scans the whole file, so a caller that asks
-/// about several functions - or about the same file twice - must not pay for it
-/// once per question. Classification asks about every function in a file twice
-/// (old contents and new), and body stripping asks once per function it strips;
-/// computing the mask per call made classification of a 500-line file cost tens
-/// of milliseconds of pure re-scanning.
+/// about several functions - or about the same file twice, as classification
+/// does for both revisions on every save - pays for that scan once.
 ///
 /// `mask` MUST be `code_mask(source)` for this exact `source`: it is indexed by
 /// the same byte offsets, so a mask built from different text silently reports
@@ -423,20 +409,20 @@ pub struct HotFunction {
     pub cfg_gated: bool,
     /// Whether the developer marked it with a `#[pill_hot…]` attribute.
     ///
-    /// An attribute no longer decides *whether* a function can be patched - the
-    /// build script's address inventory does that - it decides *how*. An
-    /// annotated function has a dispatch slot, which is preferred because it is
-    /// a plain atomic store; an un-annotated one is redirected by overwriting
-    /// its prologue, which needs writable code pages.
+    /// The attribute decides *how* the function is patched, not whether it can
+    /// be: the build script's address inventory decides that. An annotated
+    /// function has a dispatch slot, which is preferred because it is a plain
+    /// atomic store; an un-annotated one is redirected by overwriting its
+    /// prologue, which needs writable code pages.
     pub annotated: bool,
 }
 
-/// Names of the functions this file marks as hot-patchable.
+/// Names of the functions this file marks with `#[pill_hot]` or
+/// `#[pill_hot_fn]`.
 ///
-/// The attribute is the developer's opt-in, so it also defines the set of
-/// bodies a classification is allowed to treat as replaceable. Everything else
-/// in the file - including other functions' bodies - counts as a structural
-/// change and forces a full reload.
+/// This is the annotated set alone. What classification treats as replaceable
+/// is every function the host can address ([`all_functions`]); everything else
+/// in the file counts as a structural change and forces a full reload.
 pub fn hot_function_names(source: &str) -> Vec<String> {
     hot_functions(source)
         .into_iter()
@@ -873,9 +859,9 @@ pub fn strip_function_bodies(source: &str, names: &HashSet<String>) -> String {
     let mut cursor = 0usize;
 
     // One forward pass over the file, blanking each named body as it is
-    // reached. Asking `find_function` per name per round instead made the walk
-    // O(functions x names) full-file scans - 17 ms on a 500-line file, paid
-    // twice on every save, which was the largest single cost in classification.
+    // reached: asking `find_function` per name would make the walk O(functions
+    // x names) full-file scans, and classification strips both revisions on
+    // every save.
     for (_, found) in scan_named_functions(source, &mask, names, SkipStrategy::PastBody) {
         // Keep everything up to and including the opening brace, drop the body.
         let body_open = found.start + (found.text.len() - found.body.len() - 2);
@@ -892,14 +878,13 @@ pub fn strip_function_bodies(source: &str, names: &HashSet<String>) -> String {
 /// The body text of each named function that this source declares.
 ///
 /// Classification compares one revision's bodies against another's to decide
-/// which function actually changed. Asking [`find_function`] that question once
-/// per name re-scanned the whole file per name, twice per save; this answers
-/// every name in one pass.
+/// which function actually changed, and answers every name in one pass rather
+/// than scanning the file once per name.
 ///
 /// A name the source does not declare is simply absent from the map, which is
 /// the same answer [`find_function`] gives by returning `None`. Like
 /// [`find_function`], the FIRST declaration of a name wins, so a nested
-/// function shadows a later top-level one exactly as it did before.
+/// function shadows a later top-level one.
 pub fn function_bodies(source: &str, names: &HashSet<String>) -> HashMap<String, String> {
     let mask = code_mask(source);
     let mut bodies = HashMap::new();
@@ -1011,9 +996,8 @@ fn scan_named_functions(
 /// Whether a declaration carries an attribute that makes it the module ABI's
 /// entry point.
 ///
-/// This is the convention-driven replacement for a list that named `register`
-/// literally. A module is free to call its entry point anything; what makes it
-/// one is `#[pill_module]` or `#[pill_project]`, which is what generates the
+/// A module is free to call its entry point anything; what makes it one is
+/// `#[pill_module]` or `#[pill_project]`, which is what generates the
 /// `#[no_mangle]` export the host calls at load time.
 pub fn declaration_is_abi_entry_point(
     source: &str,
@@ -1035,30 +1019,6 @@ pub fn declaration_is_abi_entry_point(
 /// `#[pill_engine::pill_module]` are recognized.
 const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
 
-/// Generate this crate's function-address inventory into `OUT_DIR`.
-///
-/// The whole of a participating crate's build script:
-///
-/// ```no_run
-/// pill_hot_scan::generate_function_inventory();
-/// ```
-///
-/// and one line in its `lib.rs`:
-///
-/// ```ignore
-/// include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
-/// ```
-///
-/// Every addressable function - module-level, or an inherent method named
-/// through its type - is registered with its qualified path, its address, and
-/// the declaration it was built with, so the host can redirect any of them with
-/// nothing in the source annotated.
-///
-/// Living here rather than in each build script is the point: the host decides
-/// what is patchable using the same scanner, and the two must agree byte for
-/// byte. When they were separate implementations, every inherent method silently
-/// failed to patch.
-///
 /// Absolute path of the file Cargo compiles as this crate's root.
 ///
 /// Defaults to `src/lib.rs`, and a `[lib] path = "..."` in the manifest moves
@@ -1068,18 +1028,17 @@ const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
 /// exist, and the generated inventory would not compile.
 ///
 /// A crate renames its root to give the file a name unique across the
-/// dependency graph. Every crate has a `src/lib.rs`, so a debugger that falls
-/// back to matching a breakpoint by file name - which it must, for a module the
-/// host loads at runtime and that is therefore unmapped when the breakpoint is
-/// set - has hundreds of wrong candidates to choose between.
+/// dependency graph: a debugger matching a breakpoint by file name - which it
+/// must for a module the host loads at runtime, unmapped when the breakpoint is
+/// set - would otherwise have hundreds of candidates.
 ///
 /// The manifest is scanned by hand rather than parsed: this crate deliberately
 /// has no dependencies, because the host links it as well as every build
 /// script, and a TOML parser here would follow into both.
 ///
 /// Public because the host derives the same module paths when it compiles a
-/// patch, and the two must agree exactly: a patch registered under a path the
-/// inventory does not hold is a patch that never dispatches.
+/// patch: a patch registered under a path the inventory does not hold never
+/// dispatches.
 pub fn crate_root_file(manifest_directory: &Path) -> PathBuf {
     let default_root = manifest_directory.join("src").join("lib.rs");
     let Ok(manifest) = std::fs::read_to_string(manifest_directory.join("Cargo.toml")) else {
@@ -1119,6 +1078,26 @@ pub fn crate_root_file(manifest_directory: &Path) -> PathBuf {
     default_root
 }
 
+/// Generate this crate's function-address inventory into `OUT_DIR`.
+///
+/// The whole of a participating crate's build script:
+///
+/// ```no_run
+/// pill_hot_scan::generate_function_inventory();
+/// ```
+///
+/// and one line in its `lib.rs`:
+///
+/// ```ignore
+/// include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
+/// ```
+///
+/// Every addressable function - module-level, or an inherent method named
+/// through its type - is registered with its qualified path, its address, and
+/// the declaration it was built with, so the host can redirect any of them with
+/// nothing in the source annotated. The host decides what is patchable with the
+/// same scanner, and the two must agree byte for byte.
+///
 /// # Panics
 ///
 /// Panics when the generated file cannot be written, which would otherwise leave
@@ -1292,10 +1271,8 @@ pub fn generate_function_inventory() {
 /// trait `draw`, and two traits may each define `draw` for it; naming a trait
 /// method through its type alone would collide with all of them.
 ///
-/// This is the single definition both sides use. The build script records
-/// addresses under these names and the host asks for them under these names,
-/// and when the two were separate implementations every inherent method
-/// silently failed to patch.
+/// This is the single definition both sides use: the build script records
+/// addresses under these names, and the host asks for them under these names.
 pub fn inventory_name(
     crate_name: &str,
     module_segments: &[String],
@@ -1320,18 +1297,14 @@ fn receiver_path(function: &HotFunction) -> String {
 /// Whether a trait method's `impl` can be named from the crate root, where the
 /// generated inventory is included.
 ///
-/// The problem is real and not about naming: `impl Display for Spline` in a
-/// submodule relies on that file's `use std::fmt::Display;`, and a `use` is
-/// scoped to its own module. Emitting `<sub::Spline as Display>::fmt` into
-/// `lib.rs` would simply not compile.
-///
-/// Three cases can be named, and anything else is skipped rather than guessed:
-///
-/// 1. The `impl` is in the crate root file, so the same `use` declarations are
-///    already in scope where the inventory is included.
-/// 2. The trait path is already qualified (`crate::Drawable`, `pill_engine::Resource`).
-/// 3. The trait is declared in the same file, so it can be reached through that
-///    file's own module path.
+/// `impl Display for Spline` in a submodule relies on that file's
+/// `use std::fmt::Display;`, and a `use` is scoped to its own module, so
+/// `<sub::Spline as Display>::fmt` in `lib.rs` would not compile. Three cases
+/// can be named: the `impl` sits in the crate root file, where the same `use`s
+/// are already in scope; the trait path is already qualified
+/// (`crate::Drawable`, `pill_engine::Resource`); or the trait is declared in the
+/// same file, so its own module path reaches it. Anything else is skipped
+/// rather than guessed.
 fn trait_is_nameable_from_crate_root(
     trait_name: &str,
     module_segments: &[String],
@@ -1419,7 +1392,8 @@ pub fn stage_std_dylib() {
 /// Copy every `std-*.dll` from the active toolchain into the output directory.
 ///
 /// Warnings instead of hard errors: a missing or moved toolchain should not
-/// break the build, it should only leave the old `PATH` requirement in place.
+/// break the build, it should only leave the binary depending on the toolchain
+/// being on `PATH`.
 #[cfg(windows)]
 fn stage_std_dylib_windows() {
     // Step 1: Resolve the toolchain sysroot through the compiler cargo used,
@@ -1591,9 +1565,8 @@ fn movement_system_extra() {}
     /// A `#[test]` function is not in any artifact the host loads.
     ///
     /// Tests in a file of their own (`shell/tests.rs`) carry no `cfg` of their
-    /// own - the `#[test]` attribute is the gate - so before this they were
-    /// registered and the generated inventory did not compile outside
-    /// `cargo test`.
+    /// own - the `#[test]` attribute is the gate - so registering one would
+    /// make the generated inventory fail to compile outside `cargo test`.
     #[test]
     fn a_test_function_counts_as_cfg_gated() {
         let source = "\
@@ -1619,10 +1592,9 @@ fn a_decorated_case(value: u32) {}
     /// not by being called `register`.
     ///
     /// A module may name its entry point anything; what makes it one is
-    /// `#[pill_module]`. Keying off the name meant a module that renamed it got
-    /// an inventory entry for a function the host only ever calls through the
-    /// export table - and that any function actually named `register` was
-    /// silently excluded from patching for no reason.
+    /// `#[pill_module]`. Keying off the name would register a function the host
+    /// only ever calls through the export table, and would exclude any ordinary
+    /// function that happens to be called `register`.
     #[test]
     fn the_abi_entry_point_is_found_by_its_attribute() {
         let source = "\
@@ -1645,8 +1617,7 @@ fn register(value: u32) -> u32 { value }
         // Both attribute spellings mark an entry point, path-qualified included.
         assert!(by_name("set_up").abi_entry_point);
         assert!(by_name("boot").abi_entry_point);
-        // And an ordinary function called `register` is now patchable, which
-        // the literal blocklist made impossible.
+        // An ordinary function called `register` stays patchable.
         assert!(!by_name("register").abi_entry_point);
     }
 
@@ -1666,8 +1637,8 @@ impl Default for Spline {
         assert_eq!(functions[0].trait_name.as_deref(), Some("Default"));
     }
 
-    /// A generic block still has no single address, and that is not a naming
-    /// problem: there is one instantiation per set of type arguments.
+    /// A generic block has no single address, and that is not a naming problem:
+    /// there is one instantiation per set of type arguments.
     #[test]
     fn generic_impl_blocks_are_still_refused() {
         for source in [
@@ -1954,13 +1925,11 @@ fn also_not_annotated() {}
     // Single-pass scanning
     // -------------------------------------------------------------------------
 
-    /// The per-name algorithm the single-pass scanner replaced.
+    /// A deliberately naive oracle for the single-pass scanner.
     ///
-    /// Kept as the oracle rather than as production code: it is obviously
-    /// correct (one independent `find_function` per name) and obviously slow
-    /// (a full-file scan per name per function, 17 ms on a 500-line file,
-    /// paid twice on every save). The tests below assert the fast scanner
-    /// agrees with it.
+    /// One independent `find_function` per name, so its correctness is plain
+    /// to check and its cost is a full-file scan per name. The tests below
+    /// assert the fast scanner agrees with it.
     fn reference_strip(source: &str, names: &HashSet<String>) -> String {
         let mut stripped = String::with_capacity(source.len());
         let mut cursor = 0usize;
@@ -1985,11 +1954,10 @@ fn also_not_annotated() {}
 
     /// A file that exercises every shape the scanner has to survive.
     ///
-    /// The body-less trait declaration is the one that mattered: an early
-    /// version abandoned the whole scan when a declaration's braces did not
-    /// resolve, so every function BELOW such a declaration silently stopped
-    /// being stripped - and an edit to any of them was then reported as a
-    /// change outside a hot body and fell back to a full module reload.
+    /// The body-less trait declaration is the one that matters: a scan that
+    /// gives up when a declaration's braces do not resolve stops stripping
+    /// every function BELOW it, and an edit to any of them is then reported as
+    /// a change outside a hot body, falling back to a full module reload.
     fn awkward_source() -> &'static str {
         r#"
 //! A doc comment mentioning fn disguised in prose.

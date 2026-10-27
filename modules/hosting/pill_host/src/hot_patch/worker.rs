@@ -10,13 +10,13 @@
 //!
 //! # Design
 //!
-//! A patch build - one `rustc` invocation plus one `LoadLibrary` - is the
-//! hundreds of milliseconds that used to freeze the frame loop on every save.
-//! The frame thread prepares a [`PatchAttempt`], a worker turns it into
-//! [`BodyOutcome`]s, and the frame boundary installs them. Nothing in this
-//! file touches the engine, a loaded artifact or the session, which is what
-//! makes the middle step safe anywhere: no dispatch slot is written, no
-//! registry changes, nothing that belongs to the thread owning the boundary.
+//! A patch build - one `rustc` invocation plus one `LoadLibrary` - costs
+//! hundreds of milliseconds, so it runs off the frame thread: the frame thread
+//! prepares a [`PatchAttempt`], a worker turns it into [`BodyOutcome`]s, and the
+//! frame boundary installs them. Nothing in this file touches the engine, a
+//! loaded artifact or the session, which is what makes the middle step safe
+//! anywhere: no dispatch slot is written, no registry changes, nothing that
+//! belongs to the thread owning the boundary.
 
 // Standard library
 use std::path::PathBuf;
@@ -84,9 +84,8 @@ pub(crate) struct PreparedBody {
 pub(crate) enum BodyOutcome {
     /// Compiled and mapped; the frame boundary installs it.
     Built(BuiltBody),
-    /// The build failed. The running implementation is untouched, and every
-    /// body after this one was not attempted - the pipeline's stop-at-first-
-    /// failure rule, kept so a partially delivered save behaves as it did.
+    /// The build failed. The running implementation is untouched, and no body
+    /// after this one was attempted: the pipeline stops at the first failure.
     Failed(PatchRefusal),
 }
 
@@ -105,9 +104,9 @@ pub(crate) struct BuiltBody {
 
 /// Compile and map every body of one attempt.
 ///
-/// Runs on the build thread. Stops at the first failure, exactly as the
-/// in-line pipeline did: the bodies before it are still installable, and the
-/// snapshot is not advanced unless every body installs.
+/// Runs on the build thread. Stops at the first failure: the bodies before it
+/// are still installable, and the snapshot is not advanced unless every body
+/// installs.
 pub(crate) fn build_attempt(mut attempt: PatchAttempt) -> (PatchAttempt, Vec<BodyOutcome>) {
     let mut outcomes = Vec::with_capacity(attempt.bodies.len());
     for body in &attempt.bodies {
@@ -202,10 +201,9 @@ fn build_body(body: &PreparedBody) -> Result<BuiltBody, PatchRefusal> {
 
     // Read the freshly written image once, on this thread, before loading it.
     // The first read of a new multi-megabyte file pays the platform's
-    // anti-malware scan - measured at 93-108 ms for a project-sized patch and
-    // 7.8 ms once warm - and paying it here keeps it off the frame boundary;
-    // the `LoadLibrary` below then maps a page-cached file. The read is
-    // deliberately unchecked: a file that cannot be read will fail the load
+    // anti-malware scan, and paying it here keeps that cost off the frame
+    // boundary; the `LoadLibrary` below then maps a page-cached file. The read
+    // is deliberately unchecked: a file that cannot be read will fail the load
     // with a better error than this could produce.
     let _ = std::fs::read(artifact_path);
 

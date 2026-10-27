@@ -9,15 +9,15 @@
 //!
 //! # Contract
 //!
-//! The input is rustc's human-readable output as cargo prints it (the `-v`
-//! form and ANSI colour are stripped by the caller). Both one-line
-//! (`error: message`) and code-carrying (`error[E0425]: message`) headers are
-//! recognised, at any leading indentation; the location is the first `-->`
-//! span line within the following [`SPAN_LOOKAHEAD`] lines. Lines like
-//! `error: could not compile \`crate\`` are summaries of problems reported
-//! above them, so they are dropped.
+//! The input is rustc's human-readable output, one diagnostic per block: both
+//! one-line (`error: message`) and code-carrying (`error[E0425]: message`)
+//! headers are recognised, at any leading indentation, and the location is the
+//! first `-->` span line within the following [`SPAN_LOOKAHEAD`] lines. A
+//! coloured header matches nothing, so coloured output yields no problems.
+//! Lines like `error: could not compile \`crate\`` are summaries of problems
+//! reported above them, so they are dropped.
 
-/// How serious one problem is, in the order the panel groups them.
+/// How serious one problem is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     /// A compiler error: the build stopped.
@@ -44,7 +44,7 @@ impl Severity {
 pub struct Problem {
     /// Error, warning or note.
     pub severity: Severity,
-    /// The compiler's message, code included when it printed one.
+    /// The compiler's message, without its bracketed code.
     pub message: String,
     /// The file the first span names, when the problem carries one.
     pub file: Option<String>,
@@ -104,8 +104,8 @@ pub fn parse_build_output(output: &str) -> Vec<Problem> {
 
 /// The severity and message of a rustc header line, when it is one.
 ///
-/// `strip_diagnostics_prefix` in the caller removes cargo's `Compiling ...`
-/// status lines; this only has to judge the compiler's own shapes.
+/// Cargo's status lines (`Compiling ...`, `Finished ...`) do not start with a
+/// severity word, so they never match.
 fn parse_header(line: &str) -> Option<(Severity, String)> {
     let text = line.trim_start();
     let (severity, rest) = if let Some(rest) = text.strip_prefix("error") {
@@ -117,8 +117,9 @@ fn parse_header(line: &str) -> Option<(Severity, String)> {
     } else {
         return None;
     };
-    // `error[E0425]: msg` keeps the code in the message; `error: msg` is the
-    // bare form. Anything else (`error_span`, `errors`) is not a header.
+    // `error[E0425]: msg` carries a bracketed code before the colon;
+    // `error: msg` is the bare form. Anything else (`error_span`, `errors`) is
+    // not a header.
     let rest = if let Some(rest) = rest.strip_prefix('[') {
         let code_end = rest.find(']')?;
         let code = &rest[..code_end];

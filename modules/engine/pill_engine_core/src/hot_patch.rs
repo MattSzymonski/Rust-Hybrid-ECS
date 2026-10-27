@@ -32,7 +32,7 @@
 //! single non-null pointer-sized value, and the callee never reads it.
 //!
 //! It is an ABI assumption rather than a guarantee Rust makes, so
-//! [`verify_abi`] checks it at startup in debug builds: a toolchain or target
+//! [`verify_abi`] lets a host check it once at startup: a toolchain or target
 //! that breaks it fails loudly at initialization instead of silently corrupting
 //! a system's arguments at runtime.
 //!
@@ -40,13 +40,11 @@
 //!
 //! The dispatch behavior is gated behind the `hot_patch` feature, but
 //! [`HotPatchRegistry`] is a field on [`Engine`](crate::Engine)
-//! **unconditionally**. Gating the field would change `Engine`'s layout between
+//! **unconditionally**: gating it would change `Engine`'s layout between
 //! feature configurations, and a module built with the other configuration
-//! reconstructs `&mut Engine` from a raw pointer - so a layout difference is
-//! memory corruption, not a compile error. An unused empty map costs a few bytes
-//! once per engine and nothing at runtime; a layout divergence costs
-//! correctness. The same reasoning is why `rendering` is mirrored into every
-//! module build.
+//! reconstructs `&mut Engine` from a raw pointer, making a layout difference
+//! memory corruption rather than a compile error. The same reasoning is why
+//! `rendering` is mirrored into every module build.
 
 // Standard library
 use std::any::Any;
@@ -61,14 +59,14 @@ use crate::system::{SystemParam, SystemParamFunction};
 // Panic attribution
 // =============================================================================
 
-/// Consecutive panicking invocations that make a patched function's host roll
-/// it back (Stage 19, D22).
+/// Consecutive panicking invocations after which a patched function's host
+/// rolls it back.
 ///
-/// A system runs once per frame, so three consecutive invocations are the
-/// three consecutive frames the plan names. Counting invocations rather than
-/// frames keeps the decision where the panic is observable at all: this layer
-/// has no frame identity, and the dispatcher is the only place that knows
-/// which function failed.
+/// A system runs once per frame, so three consecutive invocations are three
+/// consecutive frames. Counting invocations rather than frames keeps the
+/// decision where the panic is observable at all: this layer has no frame
+/// identity, and the dispatcher is the only place that knows which function
+/// failed.
 pub const PANIC_ROLLBACK_FRAMES: u32 = 3;
 
 /// One function whose patched body kept panicking, queued for its host.
@@ -292,7 +290,8 @@ impl HotSlot {
     /// `Acquire` pairs with the `Release` in [`Self::install`] so a freshly
     /// loaded patch library's code is visible to whichever thread runs the
     /// system next. x86-64 is total-store-ordered and would tolerate a relaxed
-    /// load; aarch64 would not, and the engine targets both.
+    /// load, but the ordering is what carries the guarantee to any target the
+    /// engine grows rather than making it a property of this one.
     #[inline]
     pub fn current(&self) -> usize {
         self.current.load(Ordering::Acquire)
@@ -347,11 +346,9 @@ impl Default for HotSlot {
 
 /// Engine-owned map from registered system name to its dispatch slot.
 ///
-/// Lives on the [`Engine`](crate::Engine) rather than in a global. Written
-/// when the engine was an rlib embedded in every artifact, where a global would
-/// have been duplicated per DLL; the engine core is a shared dylib now, but
-/// keeping the slots with the `Engine` they belong to still ties their
-/// lifetime to it and keeps them out of process-wide state.
+/// Lives on the [`Engine`](crate::Engine) rather than in a global, which ties
+/// each slot's lifetime to the engine that owns it and keeps the slots out of
+/// process-wide state.
 #[derive(Debug, Default)]
 pub struct HotPatchRegistry {
     slots: HashMap<String, Arc<HotSlot>>,
@@ -368,7 +365,7 @@ impl HotPatchRegistry {
     /// Record a system's slot under its registration name.
     ///
     /// A repeated name replaces the previous entry, matching the engine's
-    /// existing behavior of allowing duplicate system names.
+    /// behaviour of allowing duplicate system names.
     pub fn insert(&mut self, name: impl Into<String>, slot: Arc<HotSlot>) {
         self.slots.insert(name.into(), slot);
     }
@@ -561,7 +558,7 @@ impl Default for PlainSlot {
 }
 
 // =============================================================================
-// Prologue patching (SPIKE, Windows x86-64 only)
+// Prologue patching (Windows x86-64 only)
 // =============================================================================
 
 /// The thread allowed to rewrite live code, claimed by the first patch.
@@ -590,8 +587,8 @@ fn current_thread_token() -> u64 {
 /// A host calls this from its frame loop. Idempotent, and cheap enough to call
 /// every frame: one relaxed load in the common case.
 ///
-/// Nothing forces a host to call it - a process that never does keeps the older
-/// behaviour of allowing any thread, which is what tests and offline tools want.
+/// Nothing forces a host to call it: a process that never does leaves every
+/// thread allowed to patch, which is what tests and offline tools want.
 pub fn declare_patching_thread() {
     let token = current_thread_token();
     if PATCHING_THREAD.load(Ordering::Relaxed) != token {
@@ -622,9 +619,9 @@ fn check_patching_thread() -> Result<(), String> {
 ///
 /// The absolute form is used rather than a 5-byte `E9 rel32` because ASLR
 /// routinely places a freshly loaded patch image several gigabytes from the
-/// base image - measured at +7.4 GB during the original research - so the
-/// relative form would need a trampoline on essentially every patch anyway.
-/// Twelve bytes is more of the function to overwrite, which is the trade.
+/// base image, so the relative form would need a trampoline on essentially
+/// every patch. Twelve bytes is more of the function to overwrite, which is
+/// the trade.
 #[cfg(all(windows, target_arch = "x86_64"))]
 const ABSOLUTE_JUMP_LENGTH: usize = 12;
 
@@ -896,8 +893,8 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
 //
 // The implementation above is Windows x86-64 only: it hand-encodes an absolute
 // jump and reads the exception directory through `RtlLookupFunctionEntry`, and
-// neither has a portable equivalent. Declaring those imports unconditionally
-// broke the build for every other target, which is why this exists.
+// neither has a portable equivalent, so every other target gets the stubs
+// below.
 //
 // The stubs refuse rather than pretend. Everything that does not depend on
 // rewriting live code - the dispatch slots, the registries, whole-module
@@ -959,10 +956,10 @@ pub unsafe fn restore_prologue(_target: usize, _original: &[u8]) -> Result<(), S
 /// argument, and every ABI the engine targets passes them identically - but
 /// that is an observation, not a guarantee Rust makes.
 ///
-/// Returns `true` when arguments survive the substitution intact. A host should
-/// call this once at startup in debug builds so a toolchain or target that
-/// breaks the assumption fails at initialization rather than corrupting a
-/// system's arguments mid-frame.
+/// Returns `true` when arguments survive the substitution intact. Calling this
+/// once at startup - in debug builds, where a broken assumption must not wait
+/// for a patch to surface - turns a silent argument shift into a failure at
+/// initialization.
 pub fn verify_abi() -> bool {
     /// Stands in for a system's zero-sized fn-item type.
     struct ZeroSized;
@@ -1066,7 +1063,7 @@ mod integration_tests {
     /// A patch whose body panics is contained by the dispatcher: each frame
     /// records one system failure instead of unwinding through the engine, and
     /// the third consecutive one queues the fault report a host rolls back
-    /// from (Stage 19, D22).
+    /// from.
     #[test]
     fn a_panicking_patch_is_contained_and_reported() {
         use panicking_patch as systems;
@@ -1496,9 +1493,9 @@ mod integration_tests {
         value + 2
     }
 
-    /// The guard that P0-1 was about: an address the exception directory does
-    /// not describe has no known length, so patching it is refused rather than
-    /// writing twelve bytes over whatever happens to be there.
+    /// An address the exception directory does not describe has no known
+    /// length, so patching it is refused rather than writing twelve bytes over
+    /// whatever happens to be there.
     #[test]
     fn an_address_with_no_function_entry_is_refused() {
         static NOT_A_FUNCTION: [u8; 64] = [0x90; 64];

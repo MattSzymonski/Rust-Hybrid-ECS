@@ -87,8 +87,7 @@ const MAX_SYSTEM_ERROR_BYTES: u32 = 4096;
 ///
 /// The count sizes the startup snapshot before a single system is reflected,
 /// so it needs the same kind of bound the manifest lengths above have: 4,096
-/// systems is far past any real project and keeps the snapshot under a
-/// megabyte even with its access lists.
+/// systems is far past any real project.
 pub(super) const MAX_SYSTEMS_PER_ASSEMBLY: u32 = 4096;
 
 /// Upper bound on the accesses one managed system may declare.
@@ -100,28 +99,15 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// the [`CsEngineApi`] table's field layout does - the managed runtime copies
 /// that struct field by field, so a new slot makes the two sides disagree
 /// about every slot after it - or when a struct the exports exchange changes
-/// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the chunk's const
-/// `entities` pointer, which a stale runtime would otherwise read as a
-/// 48-byte struct. The host refuses to start against a runtime built for a
-/// different version. Bumped to 10 by `NotifyAssemblyReplaced`, which the
-/// in-process compile path calls to collapse the loader's poll interval.
-/// Bumped to 11 by the managed logging and profiling callbacks appended to
-/// `CsEngineApi`. Bumped to 12 by the version and size header that opens
-/// `CsEngineApi`, which the managed side checks before copying the table.
-/// Bumped to 13 by the three asset import slots appended to `CsEngineApi`.
-/// Bumped to 14 by the rendering pipeline clear slot appended to
-/// `CsEngineApi`. Bumped to 15 by the standalone-material import and skybox
-/// slots, and the input and time query slots, appended to `CsEngineApi`.
-/// Bumped to 16 by the parallel-dispatch slot appended to `CsEngineApi`.
-/// Bumped to 17 by the mirror ABI: the renderer- and audio-specific asset
-/// slots left `CsEngineApi`, and the mirror text, native resource and asset
-/// store slots were appended. Bumped to 18 by the entity stable-id slot
-/// appended to `CsEngineApi`.
+/// shape. The host refuses to start against a runtime built for a different
+/// version, and the managed side refuses a table whose header it does not
+/// recognize.
 ///
-/// Collapsing the four length/copy export pairs into one pair keyed by a
-/// payload-kind number would save six exports here and six resolutions
-/// across the two export constructors. It was proposed and declined: see
-/// the design note in `LoaderInterop.cs` for why the named exports are kept.
+/// Each byte payload keeps its own named length/copy export pair rather than
+/// one generic pair keyed by a payload-kind number: a wrong name then fails at
+/// load, in the host's `get_unmanaged_fn`, naming the export it could not
+/// find, where a numeric kind would mis-dispatch at runtime on a live ABI that
+/// AOT projects forward by hand.
 pub const INTEROP_CONTRACT_VERSION: u32 = 18;
 
 // =============================================================================
@@ -180,17 +166,17 @@ type CommitReloadFn = extern "system" fn() -> u8;
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type AbortReloadFn = extern "system" fn() -> u8;
 
-/// Reflected metadata of one managed system, captured at startup.
-///
-/// The snapshot is compared against a re-reflection after every successful
-/// reload, so a managed-side bug that silently changes system metadata can
 // Every field below is resolved from the loaded assembly in both postures,
 // but only `verify_systems_unchanged` reads them, and that runs solely on the
 // reload path. The allowance is scoped to the configuration where the reader
 // is compiled out rather than applied unconditionally, so a field that becomes
 // genuinely unused still warns in a reloading build.
+/// Reflected metadata of one managed system, captured at startup.
+///
+/// The snapshot is compared against a re-reflection after every successful
+/// reload, so a managed-side bug that silently changes system metadata cannot
+/// run stale index bindings unnoticed.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-/// never run stale index bindings unnoticed.
 struct ManagedSystemSnapshot {
     /// Reflected native access list resolved at startup.
     accesses: Box<[NativeSystemAccess]>,
@@ -290,10 +276,9 @@ pub struct CSharpRuntime {
 
 /// The managed exports one system-registration pass needs.
 ///
-/// Bundled rather than passed loose: the pass has two callers - the shared
-/// startup and the reload that re-registers a changed system set - and nine
-/// loose function pointers per call site is how the two startups came to
-/// hold character-identical copies of the same loop.
+/// Bundled rather than passed loose: the pass has two callers - the startup
+/// and the reload that re-registers a changed system set - and both read the
+/// same nine function pointers.
 #[derive(Clone, Copy)]
 struct SystemExports {
     /// Reports how many systems the assembly registered.
@@ -316,20 +301,6 @@ struct SystemExports {
     copy_system_error: CopySystemErrorMessageFn,
 }
 
-/// Reflect every managed system and register it with the scheduler.
-///
-/// The single registration path: both startups and the reload re-registration
-/// call it, which is what keeps "how a system is registered" from drifting
-/// between the posture that starts one and the posture that replaces one. The
-/// returned snapshot is the metadata a later reload compares against to decide
-/// whether the set changed at all.
-///
-/// # Errors
-///
-/// Returns [`CSharpError::NoSystems`] for an assembly that registered none,
-/// [`CSharpError::SystemAccessFailed`] when an access cannot be read, and
-/// whatever [`derive_system_access`] refuses - an unregistered component or
-/// resource key, or an unknown access mode.
 /// One managed system resolved and validated, but not yet handed to the engine.
 ///
 /// The split this type exists for is the point: resolving a system can fail -
@@ -549,9 +520,9 @@ fn shipped_or_baked(workspace_root: &Path, baked_relative_dir: &str, file_name: 
 /// The postures differ only in how a function pointer is obtained - a
 /// `(assembly, type, method)` triple through hostfxr's delegate, or a
 /// `pill_*` symbol through `libloading`. Keeping that difference inside two
-/// constructors is what lets one startup consume both: the alternative was
-/// two near-identical 250-line lifecycles, straddling the `unsafe`
-/// system-registration closure and the transactional startup rollback.
+/// constructors lets one startup consume either, so the `unsafe`
+/// system-registration closure and the transactional startup rollback have
+/// one copy.
 struct ManagedExports {
     /// The managed runtime entry point that receives the API table.
     init: InitFn,
@@ -786,10 +757,10 @@ impl CSharpRuntime {
     ///
     /// `on_runtime_booted` sees the .NET runtime once it is up and before the
     /// project starts. Development tooling loads its own assemblies into it
-    /// there: `pill_host` starts its in-process compiler's warmup, about 1.6
-    /// seconds of JIT and metadata reading, so it overlaps component
-    /// registration, the startup methods and system registration instead of
-    /// landing on the developer's first edit. A shipping build passes a no-op.
+    /// there: `pill_host` starts its in-process compiler's warmup, so it
+    /// overlaps component registration, the startup methods and system
+    /// registration instead of landing on the developer's first edit. A
+    /// shipping build passes a no-op.
     ///
     /// # Errors
     ///
@@ -869,7 +840,7 @@ impl CSharpRuntime {
         module_exposed: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
-        // Step 0: Byte-level bindings for every native component exposed to
+        // Step 1: Byte-level bindings for every native component exposed to
         // managed code - the renderer data's and each extension's - so a
         // generated mirror whose full name matches resolves to the native
         // storage. No component type is bound by hand.
@@ -1043,9 +1014,10 @@ impl CSharpRuntime {
     /// # Errors
     ///
     /// Returns [`CSharpError::UnknownPollStatus`] for a code outside
-    /// [`POLL_NO_CHANGE`], [`POLL_RELOADED`] and [`POLL_REJECTED`]: a status the
-    /// host cannot interpret is a failure to report, not a change that never
-    /// happened. The currently loaded assembly is kept either way.
+    /// [`POLL_NO_CHANGE`], [`POLL_RELOADED`], [`POLL_REJECTED`] and
+    /// [`POLL_MANIFEST_PENDING`]: a status the host cannot interpret is a
+    /// failure to report, not a change that never happened. The currently
+    /// loaded assembly is kept either way.
     #[cfg(feature = "hot_reload")]
     pub fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
         // A world that took a manifest whose assembly never loaded cannot be
@@ -1094,12 +1066,10 @@ impl CSharpRuntime {
             // differs never reaches this arm. The managed loader parks such a
             // version instead (POLL_MANIFEST_PENDING), and that handshake
             // applies the manifest before the swap commits, while the outgoing
-            // assembly is still the running one. The re-read this arm used to
-            // perform therefore compared two payloads that were equal by
-            // construction. If that managed refusal is ever relaxed, re-read
-            // the swapped assembly's manifest here and apply it before the
-            // frame's systems run, so a migrated row is in place before the
-            // new generation reads one.
+            // assembly is still the running one. If that managed refusal is
+            // ever relaxed, re-read the swapped assembly's manifest here and
+            // apply it before the frame's systems run, so a migrated row is in
+            // place before the new generation reads one.
         }
         self.last_poll_status = status;
         Ok(status)
@@ -1244,7 +1214,7 @@ impl CSharpRuntime {
     /// Re-reflect the active project assembly and report whether its system
     /// metadata still matches the snapshot captured at registration.
     ///
-    /// This is no longer a gate but a fork: a match means the swap changed only
+    /// The answer is a fork, not a gate: a match means the swap changed only
     /// behaviour, so the scheduler graph stands and the reload costs one
     /// comparison, while a mismatch sends the reload through
     /// [`CSharpRuntime::reregister_systems`] to rebuild that graph. Comparing
@@ -1311,13 +1281,11 @@ pub(super) fn poll_status_is_known(status: u8) -> bool {
     )
 }
 
-/// Read one reported component manifest, reporting why not in the caller's own
-/// words.
+/// Read the parked version's component manifest, reporting why not in the
+/// operator's words.
 ///
-/// The parked manifest and the reloaded one are read the same way and differ
-/// only in how the failure reads to an operator: which assembly reported it,
-/// and what the host does next. Both are said here rather than twice, so the
-/// two can no longer drift into describing different protocols.
+/// `assembly` names which assembly reported it and `consequence` says what the
+/// host does next, so every failure line names both.
 #[cfg(feature = "hot_reload")]
 fn read_reported_manifest(
     length: impl FnOnce() -> u32,
@@ -1379,10 +1347,6 @@ pub(super) fn checked_access_count(count: u32) -> Result<usize, CSharpError> {
     Ok(count as usize)
 }
 
-/// Fetch the reflected managed name for one system.
-///
-/// Returns `None` when the name is missing, oversized, or not valid UTF-8;
-/// callers fall back to a synthetic index-based name.
 /// The name a system is registered under: the reflected one, or a synthetic
 /// fallback when the assembly exposes none.
 ///
@@ -1442,8 +1406,8 @@ fn managed_system_error_message(
 ///
 /// # Errors
 ///
-/// Returns an error if a declared component key is not registered or an
-/// access mode is neither read nor write.
+/// Returns an error if a declared component or resource key is not registered,
+/// or an access mode is neither read nor write.
 pub(super) fn derive_system_access(
     accesses: &[NativeSystemAccess],
     bindings: &ComponentBindings,

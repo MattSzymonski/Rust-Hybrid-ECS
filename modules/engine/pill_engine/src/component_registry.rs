@@ -14,16 +14,16 @@
 //!
 //! The registry is per linked artifact: every binary and every hot-reload
 //! generation DLL carries its own collection containing exactly the components
-//! its own sources declared with `#[derive(PillComponent)]`. This is what makes
-//! the collection safe across hot reload — a new generation's `init` sees only
-//! the new generation's components, so a type that a newer build stops declaring
-//! is never re-registered from a stale copy, and a generation DLL that is
-//! evicted takes its descriptors with it (nothing else references them).
+//! its own sources declared with `#[derive(PillComponent)]`. That is what makes
+//! it safe across hot reload - a new generation's `init` sees only the new
+//! generation's components, so a type a newer build stops declaring is never
+//! re-registered from a stale copy, and an evicted generation DLL takes its
+//! descriptors with it.
 //!
 //! It is per artifact because this crate is: `pill_engine` is embedded in every
-//! DLL, while the engine core (`pill_engine_core`) holds what is the same for
-//! all of them. The core never reads these collections; what it needs from one
-//! (a value type's layout) it receives from the calling DLL.
+//! DLL, while the engine core holds what is the same for all of them. What the
+//! core needs from a collection (a value type's layout) the calling DLL passes
+//! in.
 //!
 //! Registration order is unspecified (linker/initializer order), which is
 //! harmless: component registration is keyed by `TypeId` and idempotent.
@@ -94,12 +94,9 @@ pub struct PillValueTypeDescriptor {
 /// symbol here. The host resolves those symbols at load time and hands their
 /// addresses to the C# runtime under the operation names `<field>_view`,
 /// `<field>_resize`, `<field>_set`, `<field>_item`, `<field>_set_item` and
-/// `<field>_push`, so a generated mirror reaches the live buffer instead of
-/// copying its header out of the row.
-///
-/// Every trampoline receives the address of the live component value (the row
-/// a managed query is iterating) and works in place: no serialization, no
-/// buffer copy, and no allocation on the read path.
+/// `<field>_push`. Each trampoline takes the address of the live component
+/// value and works in place: no serialization, no buffer copy, no allocation
+/// on the read path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillFieldAccessorDescriptor {
     /// Fully-qualified component type name the field belongs to.
@@ -139,17 +136,16 @@ pub struct PillFieldAccessorDescriptor {
 }
 
 /// One mirrored Rust function, or one mirrored type, submitted by the mirror
-/// attributes: `#[pill_mirror_impl]` for the methods of an `impl` block,
-/// `#[pill_mirror_fn]` for a free function, `#[pill_mirror_object]`,
-/// `#[pill_mirror_resource]` and `#[derive(PillMirror)]` for the types
-/// themselves.
+/// attributes: `#[pill_mirror_impl]`/`#[pill_mirror_fn]` for functions,
+/// `#[pill_mirror_object]`/`#[pill_mirror_resource]`/`#[derive(PillMirror)]`
+/// for types.
 ///
 /// Every function gets a `#[no_mangle] extern "C"` trampoline with the one
-/// signature `pill_engine::mirror` defines - `(args, ret) -> status` - and is
-/// recorded here with its address, so a statically linked host reaches it
-/// with no symbol table and a loaded module's host reads the same address out
-/// of the module's copy of this descriptor. The host hands the table to the
-/// C# runtime, and the mirror codegen emits a typed C# member that calls it.
+/// signature `pill_engine::mirror` defines - `(args, ret) -> status` - recorded
+/// here with its address, so a statically linked host reaches it with no symbol
+/// table and a loaded module's host reads the same address out of the module's
+/// copy of this descriptor. The mirror codegen then emits a typed C# member
+/// that calls it.
 ///
 /// A row named [`MIRROR_TYPE_ROW`] describes a type rather than a function:
 /// what kind it is (`owner_kind`), its drop trampoline for an object, its
@@ -300,8 +296,9 @@ pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor>
 ///
 /// # Errors
 ///
-/// Returns the first registration failure recorded during the loop (currently
-/// only the 128-type ceiling) so the generated `init` can fail the reload
+/// Returns the first error a registration recorded during the loop - the
+/// component-type ceiling, a name collision, or a layout disagreement with an
+/// already registered type - so the generated `init` can fail the reload
 /// transactionally instead of running with a half-registered component set.
 pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
     let previous = install_value_type_layouts(world);
@@ -338,8 +335,8 @@ pub fn restore_value_type_layouts(world: &mut World, previous: Option<ValueTypeL
 /// project or module also registers components from its own `init` - the
 /// `__pill_register_<Type>` calls the derives generate - and a `struct:`-tagged
 /// field (a value type, or an array of one) can only expand into editable rows
-/// while a resolver is installed. Holding it for the whole entry point is what
-/// makes a control-point array editable in the editor.
+/// while a resolver is installed. Holding it for the whole entry point keeps
+/// such a field editable in the editor.
 ///
 /// The previous resolver is restored before returning, on every path, so no
 /// resolver is left pointing into this DLL after it unloads.
@@ -425,10 +422,10 @@ pub fn resolve_value_type_layout(path: &str) -> Option<&'static [ComponentFieldD
 /// Aggregate schema fingerprint of every persistable component.
 ///
 /// Deterministic across builds: descriptors are sorted by type name before
-/// hashing because the iterator makes no ordering guarantee. The fingerprint is
-/// exported by the project-module ABI; keeping it derived from the same
-/// registry that drives registration means a new persistable component can
-/// never be forgotten from the fingerprint.
+/// hashing because the iterator makes no ordering guarantee. The project
+/// entry-point macro exports it as `project_schema_fingerprint`. Keeping it
+/// derived from the same registry that drives registration means a new
+/// persistable component cannot be missing from the fingerprint.
 pub fn persistable_schema_fingerprint() -> u64 {
     let mut descriptors: Vec<&PillComponentDescriptor> = inventory::iter::<PillComponentDescriptor>
         .into_iter()

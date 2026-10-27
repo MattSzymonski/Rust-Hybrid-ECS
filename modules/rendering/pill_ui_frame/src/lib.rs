@@ -19,8 +19,7 @@
 //! in another draws it (`pill_renderer_api::RenderFrame.ui`) - so they live
 //! in their own shared crate: one type identity across every artifact that
 //! builds or draws UI, without the renderer contract depending on the UI
-//! library (W-0032). Everything here is owned plain data; the retired
-//! `pill_ui` library re-exported it under its own paths.
+//! library. Everything here is owned plain data.
 
 /// The draw vocabulary a backend consumes.
 pub mod draw;

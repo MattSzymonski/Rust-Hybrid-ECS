@@ -40,9 +40,13 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 
 # Resolve paths from this file instead of the caller's current directory. This
-# lets developers invoke the script from the workspace root, another folder, or
-# an IDE task without changing its behavior.
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+# lets developers invoke the script from the repository root, another folder,
+# or an IDE task without changing its behavior.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+# The Cargo workspace lives in modules/, and Cargo discovers modules/.cargo/
+# config.toml by walking up from its current directory, so every command runs
+# from there rather than from the repository root above it.
+WORKSPACE_ROOT = REPOSITORY_ROOT / "modules"
 MANIFEST_PATH = WORKSPACE_ROOT / "Cargo.toml"
 
 # Cargo metadata uses several target-kind labels for library-like targets. All
@@ -50,13 +54,20 @@ MANIFEST_PATH = WORKSPACE_ROOT / "Cargo.toml"
 # procedural macro and C-compatible dynamic-library crates.
 LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 
-# ``profiling`` and ``profiling-minimal`` deliberately configure incompatible
-# instrumentation modes in both pill_core and pill_engine. Cargo's
-# ``--all-features`` enables both and triggers their compile-time guard. Build
-# the nearly-all-features set explicitly in both output modes so documentation
-# covers full profiling and every other declared feature while omitting only
-# the minimal alternative.
-EXCLUDED_DOCUMENTATION_FEATURES = {"profiling-minimal"}
+# Some declared features are alternatives that cannot be enabled together, and
+# Cargo's ``--all-features`` would turn every one of them on. ``profiling`` and
+# ``profiling-minimal`` configure incompatible instrumentation modes in
+# pill_core and pill_engine, and pill_standalone refuses to compile with both
+# its ``dev`` and ``shipping`` postures selected. Documentation therefore
+# enables the full ``profiling`` mode and the default ``dev`` posture, and
+# omits only the alternative features listed here.
+EXCLUDED_DOCUMENTATION_FEATURES = {"profiling-minimal", "shipping"}
+
+# The development host writes and prunes these launcher crates on every start
+# under the gitignored ``generated/`` folders. They only re-export a project or
+# extension, so documenting them would duplicate that crate's API under a shim
+# name - and would race the host replacing their manifests mid-run.
+GENERATED_LAUNCHER_PREFIXES = ("host_project_", "host_module_")
 
 
 # =============================================================================
@@ -115,7 +126,9 @@ def workspace_packages() -> List[Dict[str, Any]]:
     ``cargo metadata`` can include dependency packages in its ``packages``
     array. Although ``--no-deps`` minimizes that data, filtering by the stable
     package IDs in ``workspace_members`` makes the intent explicit and prevents
-    dependencies from accidentally receiving their own rustdoc job.
+    dependencies from accidentally receiving their own rustdoc job. The
+    host-generated launcher crates are dropped for the reasons given beside
+    ``GENERATED_LAUNCHER_PREFIXES``.
 
     Returns:
         Cargo package objects belonging directly to the workspace.
@@ -140,12 +153,14 @@ def workspace_packages() -> List[Dict[str, Any]]:
     metadata = json.loads(result.stdout)
 
     # Set membership avoids repeatedly scanning the workspace member list when
-    # filtering larger workspaces.
+    # filtering larger workspaces. Host-generated launcher crates are skipped:
+    # they are regenerated on every host start and expose no API of their own.
     workspace_members = set(metadata["workspace_members"])
     return [
         package
         for package in metadata["packages"]
         if package["id"] in workspace_members
+        and not package["name"].startswith(GENERATED_LAUNCHER_PREFIXES)
     ]
 
 

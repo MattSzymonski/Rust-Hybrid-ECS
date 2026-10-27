@@ -8,10 +8,13 @@
 //! # Design
 //!
 //! Query sets are allocated once with a per-frame cap; each frame resolves into
-//! one slot of a three-deep ring, and the blocking readers take the slot one
-//! frame back, so a readback never waits on the frame being recorded. Every
-//! capability is optional: a device without the timestamp or pipeline
-//! statistics features simply gets `None` where a query set would be.
+//! one slot of an eight-deep ring (`FRAMES_IN_FLIGHT`), and a later frame
+//! collects a slot once the GPU has finished writing it, so a readback never
+//! waits on the frame being recorded. A slot still waiting costs its frame the
+//! queries rather than overwriting results nobody has read. Every capability is
+//! optional: a device without the timestamp or pipeline statistics features
+//! gets `None` where a query set would be, and occlusion queries need no
+//! feature at all.
 
 // Standard library
 use std::cell::Cell;
@@ -28,39 +31,19 @@ use wgpu::{
 };
 
 /*
-This module provides GPU-side profiling capabilities using wgpu.
+The three query kinds, and what each number answers:
 
-- Timestamp queries:
-  Measures: Time taken by sections of code (eg. shadow pass, main pass, post-processing, etc).
-  This is true GPU time, showing stalls and bottlenecks on GPU side
-  Result: Vector of u64 ticks, which can be converted to milliseconds using the provided conversion function.
-  Not available on the web (needs TIMESTAMP_QUERY feature)
-  Learnings:
-    - GPU bottlenecks: If a section takes too long, it indicates a GPU-side bottleneck.
-    - Frame time analysis: Helps understand how much time each rendering stage takes.
-
-- Occlusion queries:
-  Measures: How many samples (pixels at 1x sampling) passed the depth/stencil tests
-  during the draw region bracketed with begin_occlusion_query/end_occlusion_query.
-  Result: Vector of u64 counts, one per query. Will be 0 if fully occluded.
-  Learnings:
-    - Visible coverage: the samples that survived depth testing are the pixels the
-      pass actually shaded, so the count over a pass is its real coverage (not
-      overdraw - fragments failing the depth test are never counted).
-    - Visibility culling: a pass or object with a steady 0 is fully occluded by
-      everything drawn before it.
-    - Bound analysis: coverage far below the viewport means most of the scene is
-      off-screen or hidden.
-
-- Pipeline statistics:
-  Collects various pipeline statistics like:
-  - VERTEX_SHADER_INVOCATIONS - how many times the vertex shader ran (accounts for the vertex cache with indexed draws).
-  - CLIPPER_INVOCATIONS - number of times the clipper stage was invoked (equals triangles output by the vertex stage).
-  - CLIPPER_PRIMITIVES_OUT - primitives that survived clipping (triangles that actually proceed to rasterization).
-  - FRAGMENT_SHADER_INVOCATIONS - how many fragments executed the fragment shader (per-sample with MSAA; GPUs often execute in 2×2 quads for derivatives).
-  - COMPUTE_SHADER_INVOCATIONS - total compute shader invocations (dispatch count × workgroup size).
-  Result: Vector of u64 values, one per statistic type requested.
-  Not available on the web (needs PIPELINE_STATISTICS_QUERY feature)
+- Timestamps time a section of GPU work - a shadow pass, the main pass, a
+  post-processing step. The ticks convert to milliseconds with
+  `timestamp_ticks_to_ms`; a section that takes too long is a GPU-side
+  bottleneck.
+- Occlusion queries count the samples that passed the depth and stencil tests
+  while one query is open, so the count over a pass is its visible coverage,
+  not its drawn area: fragments that fail the depth test are never counted. A
+  pass with a steady 0 is fully occluded by what was drawn before it.
+- Pipeline statistics count what the stages did: vertex shader invocations
+  (already reduced by the vertex cache), primitives out of the clipper, and
+  fragments that ran the fragment shader (per sample with MSAA).
 */
 
 /// Environment variable that turns GPU profiling on (`PILL_GPU_PROFILE=1`).
@@ -73,7 +56,7 @@ pub(crate) const GPU_PROFILE_FEATURES: Features = Features::TIMESTAMP_QUERY
     .union(Features::PIPELINE_STATISTICS_QUERY);
 
 /// Whether `PILL_GPU_PROFILE` asks for GPU profiling. Off by default: the
-/// queries cost GPU time, and the periodic readback stalls a frame.
+/// queries cost GPU time on every frame that records them.
 pub(crate) fn gpu_profiling_requested() -> bool {
     std::env::var(GPU_PROFILE_VARIABLE).is_ok_and(|value| value != "0" && !value.is_empty())
 }
@@ -81,25 +64,25 @@ pub(crate) fn gpu_profiling_requested() -> bool {
 /// How many frames' results can wait for their readback at once.
 ///
 /// A frame whose ring slot is still waiting records no queries, so the ring
-/// has to be deeper than the GPU runs behind: with three slots, a GPU-bound
-/// frame uncapped by vsync got results for only every other frame. The slots
-/// are a few hundred bytes each.
+/// has to be deeper than the GPU runs behind: too shallow a ring drops results
+/// whenever the GPU is a few frames late. The slots are a few hundred bytes
+/// each.
 const FRAMES_IN_FLIGHT: usize = 8;
 
 /// GPU-side profiling using wgpu query sets.
 ///
 /// Owns one query set per category (timestamps, occlusion and pipeline
 /// statistics) plus a ring of resolve buffers per category, so a readback can
-/// map the previous frame while the current one still records.
+/// map one slot while a later frame still records into another.
 pub struct Profiler {
-    // Query sets (optional if feature unsupported)
     timestamp_query_set: Option<QuerySet>,
-    timestamp_query_names: Vec<String>, // To store names associated with each timestamp
+    // One name per timestamp recorded this frame, in query index order.
+    timestamp_query_names: Vec<String>,
     pipeline_statistics_query_set: Option<QuerySet>,
     pipeline_statistics_types: PipelineStatisticsTypes,
     occlusion_query_set: Option<QuerySet>,
 
-    // Maximum queries we allow per frame for each kind
+    // Per-frame caps, as passed to [`Profiler::new`].
     max_timestamp_queries: u32,
     max_pipeline_statistics_queries: u32,
     max_occlusion_queries: u32,
@@ -245,7 +228,6 @@ impl Profiler {
             .contains(Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let has_pipeline_statistics = features.contains(Features::PIPELINE_STATISTICS_QUERY);
 
-        // Timestamp query set
         let timestamp_query_set = if has_timestamps && max_timestamp_queries > 0 {
             Some(device.create_query_set(&QuerySetDescriptor {
                 label: Some("gpu_profiler.timestamp_query_set"),
@@ -256,7 +238,6 @@ impl Profiler {
             None
         };
 
-        // Pipeline statistics query set
         let pipeline_statistics_query_set =
             if has_pipeline_statistics && !pipeline_statistics_types.is_empty() {
                 Some(device.create_query_set(&QuerySetDescriptor {
@@ -345,7 +326,8 @@ impl Profiler {
     /// The timeline exists while a profiler is connected: Tracy drops every
     /// event until one connects, so a timeline created before that would
     /// never be announced, and the profiler would be sent zones of a
-    /// timeline it does not know. [`Self::begin_frame`] creates it.
+    /// timeline it does not know. [`Self::follow_profiler_connection`]
+    /// creates it.
     pub fn attach_timeline(&mut self, api: GpuApi) {
         if self.timestamp_query_set.is_some() {
             self.timeline_api = Some(api);
@@ -588,8 +570,8 @@ impl Profiler {
 
     // --- Timestamps ---
 
-    /// Returns the timestamp query set, or `None` when the adapter exposes no
-    /// timestamp support or the cap was zero.
+    /// Returns the timestamp query set, or `None` when the device was created
+    /// without the timestamp features or the cap was zero.
     ///
     /// For callers that want to write timestamps themselves; prefer
     /// [`Self::write_timestamp`], which keeps the index and name bookkeeping
@@ -598,8 +580,10 @@ impl Profiler {
         self.timestamp_query_set.as_ref()
     }
 
-    /// Write a timestamp (returns its query index)
-    /// Called before and after a region to time
+    /// Writes a timestamp and returns its query index.
+    ///
+    /// Called twice around a region to time: the pair's ticks are the region's
+    /// GPU time, and the pair shares the name given to the first call.
     pub fn write_timestamp(&mut self, encoder: &mut CommandEncoder, name: &str) -> Option<u32> {
         if self.skipping_frame {
             return None;
@@ -638,7 +622,7 @@ impl Profiler {
         }
     }
 
-    /// Resolve all timestamps recorded so far this frame into the ring buffer
+    /// Resolves the timestamps recorded this frame into the current ring slot.
     pub fn resolve_timestamp_queries(
         &mut self,
         device: &wgpu::Device,
@@ -668,21 +652,23 @@ impl Profiler {
         }
     }
 
-    /// Convert a delta of timestamp ticks to milliseconds.
+    /// Converts a delta of timestamp ticks to milliseconds.
     pub fn timestamp_ticks_to_ms(&self, delta_ticks: u64) -> f32 {
         (delta_ticks as f32 * self.timestamp_period_ns) / 1_000_000.0
     }
 
     // --- Pipeline statistics ---
 
-    /// Expose the pipeline stats query set (and mask) so you can begin/end in passes
+    /// Exposes the pipeline statistics query set beside its type mask, for a
+    /// caller that begins and ends the queries itself.
     pub fn pipeline_statistics_query_set(&self) -> Option<(&QuerySet, PipelineStatisticsTypes)> {
         self.pipeline_statistics_query_set
             .as_ref()
             .map(|query_set| (query_set, self.pipeline_statistics_types))
     }
 
-    /// Begin a pipeline statistics query in the pass; returns query index
+    /// Begins a pipeline statistics query in `render_pass` and returns its
+    /// index.
     pub fn begin_pipeline_statistics_query(
         &self,
         render_pass: &mut wgpu::RenderPass<'_>,
@@ -756,9 +742,9 @@ impl Profiler {
     /// Exposes the occlusion query set for a geometry pass's
     /// `RenderPassDescriptor.occlusion_query_set`.
     ///
-    /// `None` when the feature is unsupported or the cap was zero. A pass
-    /// only begins queries through [`Self::begin_occlusion_query`], which is
-    /// also what refuses during a skipped frame.
+    /// `None` when the cap was zero. A pass only begins queries through
+    /// [`Self::begin_occlusion_query`], which is also what refuses during a
+    /// skipped frame.
     pub fn get_occlusion_query_set(&self) -> Option<&QuerySet> {
         self.occlusion_query_set.as_ref()
     }
@@ -793,8 +779,8 @@ impl Profiler {
     /// Resolves the occlusion queries recorded this frame into the current
     /// ring slot.
     ///
-    /// A no-op when the feature is unsupported or no query was begun this
-    /// frame, mirroring [`Self::resolve_pipeline_statistics_queries`].
+    /// A no-op when no query set exists or no query was begun this frame,
+    /// mirroring [`Self::resolve_pipeline_statistics_queries`].
     pub fn resolve_occlusion_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
         if let Some(query_set) = &self.occlusion_query_set {
             let count = self.current_occlusion_query.get();

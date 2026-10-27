@@ -1,33 +1,27 @@
-//! The egui editor in the browser (W-0029): the game on one canvas, the
-//! egui shell's UI on a transparent canvas above it.
+//! The egui editor in the browser: the game on one canvas, the egui shell's UI
+//! on a transparent canvas above it.
 //!
 //! # Responsibilities
 //!
-//! - [`run_editor_egui`]: run a static project that links the egui shell,
-//!   put the scene on one canvas and the shell's epaint output on a canvas
-//!   above it, and drive the shell's plain-data boundary
+//! - [`run_editor_egui`]: put the scene on one canvas and the shell's epaint
+//!   output on a canvas above it, and drive the shell's plain-data boundary
 //!   (`EguiShellInput`/`EguiShellFrame`) the way the native executable does.
-//! - One frame per redraw: engine input, the boundary input, the entity and
-//!   system snapshot, the world frame (the shell's egui pass runs inside it),
-//!   the queued command batches, then the UI draw.
-//! - [`editor_command`]: the scripted channel's entry point, the web
-//!   counterpart of `PILL_EDITOR_TEST_COMMANDS`.
+//! - One frame per redraw: engine input, the queued command batches and
+//!   scripted lines, the boundary input and snapshot, the world frame (the
+//!   shell's egui pass runs inside it), then the UI draw.
+//! - [`editor_command`]: the scripted channel, the web counterpart of
+//!   `PILL_EDITOR_TEST_COMMANDS`.
 //!
 //! # Design
 //!
-//! The shell crate registers itself when the bundle calls its `register`
-//! (its system runs inside every engine update); this module owns the
-//! browser-only half. The scene canvas carries the project's own renderer,
-//! attached asynchronously like the game-only runner. The UI canvas gets its
-//! own `wgpu` device and an `egui-wgpu` renderer, because egui's meshes are
-//! plain data and the UI must not depend on the project's renderer, which
-//! can reload or fail (D8, D20).
-//!
-//! The UI canvas stays transparent where the dock draws nothing, and the page
-//! stacks it above the scene canvas, so the scene shows through the
-//! viewport holes - the browser counterpart of the native composition
-//! overlay (D24, D34). There is one scene view in this stage; per-view
-//! canvas pairs are follow-up work.
+//! The shell crate registers itself when the bundle's module init calls
+//! `register`, and its system runs inside every engine update; this module owns
+//! the browser-only half. The scene canvas carries the project's own renderer;
+//! the UI canvas gets its own `wgpu` device and `egui-wgpu` renderer, because
+//! egui's meshes are plain data and the UI must not depend on a renderer that
+//! can reload or fail. The UI canvas stays transparent where the dock draws
+//! nothing, so the scene shows through the viewport holes - the browser
+//! counterpart of the native composition overlay.
 
 // Standard library
 use std::cell::RefCell;
@@ -147,7 +141,7 @@ struct WebEditorApplication {
     focused: bool,
     /// The editor's monotonic clock origin, for the shell's input.
     started: Instant,
-    /// The scene's smoothed frame rate, for the shell's overlays.
+    /// The scene's smoothed frame rate, for the shell's input and overlays.
     frames_per_second: f32,
     /// When the previous frame ran, for the frame-rate smoothing.
     last_frame_time: Option<Instant>,
@@ -290,7 +284,8 @@ impl ApplicationHandler for WebEditorApplication {
         }
     }
 
-    /// Forward raw mouse motion from the UI window's device stream.
+    /// Forward raw mouse motion, which winit reports per device rather than
+    /// per window; it joins the UI's input stream.
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let Some(input) = pill_input::winit_events::translate_device_event(&event) {
             self.pending_events.push(input);
@@ -299,9 +294,9 @@ impl ApplicationHandler for WebEditorApplication {
 }
 
 impl WebEditorApplication {
-    /// One editor frame: input, boundary input, snapshot, the world frame
-    /// (the shell's egui pass runs inside it), the command drain, then the
-    /// UI draw.
+    /// One editor frame: input, the command drain, the boundary input and
+    /// snapshot, the world frame (the shell's egui pass runs inside it), then
+    /// the UI draw.
     fn frame(&mut self) {
         let Some(scene_window) = self.scene_window.clone() else {
             return;
@@ -348,9 +343,9 @@ impl WebEditorApplication {
             }
         }
 
-        // Step 4: apply the batches the shell queued last frame - the frame
-        // boundary `EditorCommand` names - then publish this frame's
-        // boundary input and snapshot.
+        // Step 4: apply the batches the shell queued last frame and the lines
+        // the page scripted, then publish this frame's boundary input and
+        // snapshot.
         apply_pending_commands(
             driver.engine_mut(),
             now.duration_since(self.started),
@@ -374,7 +369,7 @@ impl WebEditorApplication {
             if let Some(input) = world.get_resource_mut::<EguiShellInput>() {
                 // The pointer's last position is this frame's newest move, or
                 // the one the previous frame left: a release that arrives
-                // without a move still needs a place to land (W-0038 Stage 1).
+                // without a move still needs a place to land.
                 let carried = input.cursor;
                 let cursor = events
                     .iter()
@@ -391,16 +386,15 @@ impl WebEditorApplication {
                     time: now.duration_since(self.started).as_secs_f64(),
                     frames_per_second: self.frames_per_second,
                     // The browser's window is the whole editor, so every
-                    // event is the shell's as well as the game's (W-0029's
-                    // behaviour; the split rule is W-0038's, Stage 1).
+                    // event is the shell's as well as the game's.
                     events: events.clone(),
                     cursor,
                     // A page has no OS clipboard the editor can write; the
                     // clipboard verbs are native (see the dispatch below).
                     paste_text: None,
-                    // Gizmo badges are the desktop runner's: the browser's
-                    // shell draws the scene view with no world projection to
-                    // anchor a chip to (W-0049).
+                    // Gizmo badges are the desktop runner's: the browser
+                    // projects nothing into a scene view, so the list stays
+                    // empty.
                     badges: Vec::new(),
                 };
             }
@@ -424,7 +418,6 @@ impl WebEditorApplication {
         // Step 6: draw the shell's frame into the UI canvas.
         draw_ui(&ui_surface, driver.engine_mut());
         if self.frame_index.is_multiple_of(FRAME_HEARTBEAT_FRAMES) {
-            // NOTE: asserted on by the browser suite.
             let (entities, systems) = driver
                 .engine()
                 .world()
@@ -444,14 +437,15 @@ impl WebEditorApplication {
     }
 }
 
-/// Apply the command batches the shell queued last frame.
+/// Apply the batches the shell queued last frame and the lines the page
+/// scripted.
 ///
 /// The scripted lines go through the shared grammar
 /// ([`pill_editor_core::scripted`]) and then the shared core drain, so
 /// the browser parses, refuses and applies exactly what the desktop editor
 /// does - including the history recording, the remap and the selection
-/// follow. The listing flag has no work here: the browser stages no asset
-/// panel yet.
+/// follow. The drain's `files_changed` flag has no work here: the browser has
+/// no asset panel to refresh.
 fn apply_pending_commands(
     engine: &mut pill_engine_core::Engine,
     elapsed: std::time::Duration,
@@ -483,8 +477,8 @@ fn run_scripted_lines(engine: &mut pill_engine_core::Engine, lines: &[String]) {
 
 /// Run one parsed command the browser posture carries.
 ///
-/// The browser has no window chrome, no asset panel and no picking yet, so
-/// the verbs that need them are refused by name: a vocabulary that silently
+/// The verbs whose machinery this posture does not carry - window placement,
+/// the asset panel, picking - are refused by name: a vocabulary that silently
 /// ignores a line is worse than one that says which verb is missing.
 fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: ScriptedCommand) {
     match command {
@@ -568,7 +562,7 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
             queue_gizmo_tool(engine, None, Some(space), None);
         }
         // The page's data channel: the entity and system counts the shell's
-        // tabs list, which is what the browser's probe reads.
+        // tabs list.
         ScriptedCommand::Dump(Dump::Tabs) => {
             let (entities, systems) = engine
                 .world()
@@ -591,7 +585,7 @@ fn run_scripted(engine: &mut pill_engine_core::Engine, line: &str, command: Scri
 /// verb so the gap is readable in the page's console.
 fn refuse_in_browser(line: &str, command: &ScriptedCommand) {
     let reason = format!(
-        "'{}' is not available in the browser editor yet (W-0029)",
+        "'{}' is not available in the browser editor yet",
         scripted_name(command)
     );
     warn!(
@@ -660,7 +654,7 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::EntityDelete => "command editor.entity_delete",
         ScriptedCommand::SnapToggle => "command editor.tool_snap_toggle",
         ScriptedCommand::SpaceToggle => "command editor.tool_space_toggle",
-        // The native-only verbs (W-0038): a page has no OS clipboard, no OLE
+        // The native-only verbs: a page has no OS clipboard, no OLE
         // drag, one fixed scene view and no second OS window to pop a tab
         // into, so these parse but cannot run here.
         ScriptedCommand::Copy => "command editor.copy",
@@ -699,11 +693,11 @@ fn queue_gizmo_tool(
     }
 }
 
-/// Capture the entity and system tiers for the shell's data tabs.
+/// Capture the snapshot the shell's tabs read.
 ///
-/// The asset listing, standalone types and preferences document stay at
-/// their defaults until the browser stages that own them land (W-0029
-/// Stage 2).
+/// The entity, system and component tiers come from the world; the asset
+/// rows, the standalone types and the preferences document stay at their
+/// defaults.
 fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
     let selected = engine
         .world()
@@ -881,10 +875,10 @@ async fn attach_ui_surface(
         .ok_or("the UI canvas offers no surface configuration")?;
     configuration.format = format;
     // egui's output is premultiplied and the page stacks this canvas over the
-    // scene one, so the canvas must composite with alpha. wgpu 25's web
-    // backend supports it but its capability query reports only `Opaque`
-    // (the WebGPU backend's `surface_capabilities` hard-codes that list), so
-    // the mode is requested directly rather than picked from the list.
+    // scene one, so the canvas must composite with alpha. The web backend
+    // draws it but reports only `Opaque` in its surface capabilities (that
+    // list is hard-coded in wgpu's web backend), so the mode is requested
+    // directly rather than picked from the list.
     configuration.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
     info!(
         target: telemetry_target::RENDERING,

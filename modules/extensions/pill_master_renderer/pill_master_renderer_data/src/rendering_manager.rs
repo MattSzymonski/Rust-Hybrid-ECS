@@ -8,13 +8,13 @@
 //!
 //! # Design
 //!
-//! Inserted by `pill_master_renderer::register`, so it exists before any project
-//! code runs and `set_pipeline` never has to check for it. The shared name,
-//! given by `#[pill_mirror_resource]`, is what makes the host binary and a
-//! project module agree on the resource id, exactly as `RenderFrame` does;
-//! without it the renderer would read a resource the project never wrote. The
-//! same name is what C# computes for its `RenderingManager` marker, so a
-//! managed system declares `ResMut<RenderingManager>` and calls `Clear()`.
+//! Inserted by [`crate::register`], so it exists before any project code runs
+//! and `set_pipeline` never has to check for it. The shared name, given by
+//! `#[pill_mirror_resource]`, is what makes the host binary and a project module
+//! agree on the resource id, exactly as `RenderFrame` does; without it the
+//! renderer would read a resource the project never wrote. The same name is what
+//! C# computes for its `RenderingManager` marker, so a managed system declares
+//! `ResMut<RenderingManager>` and calls `Clear()`.
 
 use pill_engine::{pill_mirror_impl, pill_mirror_method, pill_mirror_resource, Handle};
 

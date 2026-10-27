@@ -12,10 +12,10 @@
 //! The engine's code lives in `pill_engine_core`, so `type_name` reports its
 //! types as `pill_engine_core::common_components::Position`. Everything else
 //! knows them by the public path, `pill_engine::common_components::Position`:
-//! C# projects import the namespace `pill_engine.common_components`, and
-//! snapshots and editor names were written under it.
-//! [`stable_type_name`](crate::type_names::stable_type_name) keeps that path
-//! by writing the core's crate name as `pill_engine`.
+//! C# projects import the namespace `pill_engine.common_components`, and the
+//! component names and persisted keys the managed side receives are spelled
+//! that way. [`stable_type_name`](crate::type_names::stable_type_name) keeps
+//! that path by writing the core's crate name as `pill_engine`.
 //!
 //! Names of types outside the engine pass through unchanged and without an
 //! allocation; a rewritten name is built once per type and kept for the

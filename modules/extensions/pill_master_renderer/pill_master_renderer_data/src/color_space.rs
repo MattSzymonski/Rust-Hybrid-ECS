@@ -4,9 +4,9 @@
 //!
 //! - [`srgb_to_linear`]: decode an sRGB-encoded channel to linear light, the
 //!   way texture import reads an 8-bit image.
-//! - [`linear_to_srgb`]: encode a linear channel as sRGB, the way the GPU
-//!   module hands a linear debug colour to the UI painter, which decodes it
-//!   again.
+//! - [`linear_to_srgb`]: encode a linear channel as sRGB, which is how the GPU
+//!   module prepares a linear debug label colour for the UI painter that
+//!   decodes sRGB vertex colours.
 //!
 //! # Design
 //!

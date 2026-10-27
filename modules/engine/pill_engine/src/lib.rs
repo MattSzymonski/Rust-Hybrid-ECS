@@ -4,7 +4,7 @@
 //!
 //! - Re-export the engine core (`pill_engine_core`) under the same paths, so
 //!   `use pill_engine::*` and every `::pill_engine::...` path the macros emit
-//!   resolve as before.
+//!   resolve.
 //! - Own the per-DLL `inventory` registries ([`component_registry`],
 //!   [`hot_patch`]) and re-export the `submit!` macro the derives expand to.
 //!
@@ -17,11 +17,11 @@
 //! that DLL's own lists. The core never reads them, and never depends on this
 //! crate; what it needs from a registry, code here passes in.
 
-// The derive macros expand to `::pill_engine::...` paths; this lets the
-// crate's own tests use them.
+// Lets `::pill_engine::...` resolve inside this crate, which is the path form
+// the derive and attribute macros emit.
 extern crate self as pill_engine;
 
-/// Everything in the engine core, under the paths it has always had.
+/// Everything in the engine core, re-exported under this crate's paths.
 pub use pill_engine_core::*;
 
 /// Per-DLL component, value-type, method, accessor and export registries.
@@ -30,8 +30,8 @@ pub mod component_registry;
 /// Per-DLL hot-patch registries over the core's hot-patch machinery.
 pub mod hot_patch;
 
-// The descriptor types the hot-patch macros submit, at the crate root as
-// before.
+// The hot-patch descriptor types, also reachable at the crate root so a
+// caller need not name the `hot_patch` module.
 pub use hot_patch::{PillHotFunctionDescriptor, PillHotSlotDescriptor};
 
 // The inventory submit macro the derives and attribute macros expand to, so

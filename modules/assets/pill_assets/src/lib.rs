@@ -2,45 +2,25 @@
 //!
 //! # Responsibilities
 //!
-//! - Discover each rule's inputs by glob, relative to a pipeline root.
-//! - Rebuild an output only when it is missing or older than its input, and
-//!   stamp an output the rule left untouched with its newest input's time, so
-//!   an unchanged rewrite still counts as fresh.
-//! - Report what was discovered, rebuilt and skipped, and how long each rebuilt
-//!   output took.
-//! - Write a project's `res` directory as one asset pack
-//!   ([`write_asset_pack`]), which a shipping build embeds and the engine's
-//!   asset store reads.
+//! - Discover each rule's inputs by glob under a pipeline root, rebuild the
+//!   stale outputs, and report what was discovered, rebuilt and skipped.
+//! - Stamp an output a rule left untouched with its newest input's time, so an
+//!   unchanged rewrite still counts as fresh.
+//! - Write a project's `res` as one asset pack ([`write_asset_pack`]), which a
+//!   shipping build embeds and the engine's asset store reads.
 //! - Move a source asset together with its `.meta` file ([`move_asset`]).
 //!
 //! # Design
 //!
-//! Dependency-free on purpose, like `pill_hot_scan`: this crate runs from build
-//! scripts, so a dependency here is paid on every clean build of every crate
-//! that cooks. Globbing covers the `directory/*.extension` shape the rules use,
-//! and timestamps come from `std::fs`.
+//! No dependencies beyond `pill_asset_format`'s constants, on purpose, like
+//! `pill_hot_scan`: this crate runs from build scripts, where a dependency is
+//! paid on every clean build. Globbing and timestamps come from `std::fs`.
 //!
-//! Shader cooking is not optional. [`default_rules`] always carries
+//! Shader cooking is not optional: [`default_rules`] always carries
 //! [`HlslToWgsl`], because a shader that was never cooked is a shader that does
-//! not exist, and a source of truth in HLSL only means anything if the build
-//! runs the compiler. Cooking meshes and textures is opt-in instead:
-//! [`Pipeline::with_manifest`] adds such a rule only when a manifest names it
-//! and the caller can supply it, so a project that decodes those at runtime
-//! pays neither the cook time nor the decoder's dependencies.
-//!
-//! # Examples
-//!
-//! A build script cooks the shaders under `src/shaders` and reports every
-//! discovered input back to cargo:
-//!
-//! ```no_run
-//! let root = std::path::PathBuf::from("src");
-//! let stats = pill_assets::Pipeline::new(root).run()?;
-//! for input in &stats.discovered {
-//!     println!("cargo:rerun-if-changed={}", input.display());
-//! }
-//! # Ok::<(), pill_assets::CookError>(())
-//! ```
+//! not exist. Cooking meshes and textures is opt-in through
+//! [`Pipeline::with_manifest`], so a project that decodes those at runtime pays
+//! neither the cook time nor the decoder's dependencies.
 
 // The one exception to the workspace ban on `std::time::Instant`: this crate
 // cooks assets in build scripts and the development host, never in a game, and
@@ -203,9 +183,10 @@ pub struct Stats {
     pub discovered: Vec<PathBuf>,
     /// Outputs written this run.
     pub rebuilt: Vec<PathBuf>,
-    /// Outputs that were already newer than their input.
+    /// Outputs already newer than their input and any extra inputs.
     pub skipped: Vec<PathBuf>,
-    /// One `(input, output, rule)` per produced file, rebuilt or skipped.
+    /// One `(input, output, rule)` per output a rule would produce, whether
+    /// planned, rebuilt or skipped.
     pub edges: Vec<(PathBuf, PathBuf, &'static str)>,
     /// How long each rebuilt output took.
     pub cook_times: Vec<(PathBuf, Duration)>,
@@ -243,15 +224,12 @@ impl Pipeline {
     ///
     /// The manifest is plain text: one rule name per line, with `#` comments and
     /// blank lines ignored. This is where a project opts into cooking meshes and
-    /// textures rather than decoding them at runtime; a manifest that is not
-    /// there is not an error, it just leaves the optional rules off, which is
-    /// the posture for a project that loads its assets as they are. `resolve` is
-    /// the caller's registry, so this crate never has to carry the decoders the
-    /// optional rules need.
+    /// textures; an absent manifest leaves the optional rules off. `resolve` is
+    /// the caller's registry, so this crate never carries the decoders.
     ///
     /// # Errors
     ///
-    /// Returns [`CookError::Io`] when the manifest exists but cannot be read, and
+    /// Returns [`CookError::Io`] when the manifest cannot be read, and
     /// [`CookError::UnknownRule`] when it names a rule `resolve` does not supply.
     pub fn with_manifest(
         mut self,
@@ -291,6 +269,18 @@ impl Pipeline {
     ///
     /// Returns the first failure, leaving outputs already cooked by this run in
     /// place: an output is only replaced by a successful build of its own rule.
+    ///
+    /// # Examples
+    ///
+    /// A build script reports every discovered input back to cargo:
+    ///
+    /// ```no_run
+    /// let stats = pill_assets::Pipeline::new("src").run()?;
+    /// for input in &stats.discovered {
+    ///     println!("cargo:rerun-if-changed={}", input.display());
+    /// }
+    /// # Ok::<(), pill_assets::CookError>(())
+    /// ```
     pub fn run(&self) -> Result<Stats, CookError> {
         self.walk(true)
     }
@@ -383,21 +373,19 @@ pub fn walk_files(directory: &Path) -> Result<Vec<PathBuf>, CookError> {
     Ok(files)
 }
 
-/// Write every file below `source` into one asset pack at `output`, and return
-/// the files packed - for a build script to report to cargo.
+/// Write every file below `source` into one asset pack at `output`, returning
+/// the packed files for a build script to report to cargo.
 ///
-/// The format is `pill_engine::asset_store`'s (version 1), and the two change
-/// together: `PILLPACK`, a `u32` version, a `u32` entry count, then per entry a
-/// `u32` path length, the path (UTF-8, `/`-separated, relative to `source`),
-/// and a `u64` offset and `u64` length of its bytes counted from the start of
-/// the pack, all little-endian; the bytes follow the index. Entries are sorted
-/// by path, so the same directory always gives the same pack. A `source` that
-/// does not exist gives an empty pack.
+/// The format is `pill_engine::asset_store`'s, and the two change together:
+/// `PILLPACK`, a `u32` version and entry count, then per entry a `u32` path
+/// length, the `/`-separated path below `source`, and a `u64` offset and
+/// length from the pack's start, all little-endian; the bytes follow the
+/// index, sorted by path. A missing `source` gives an empty pack.
 ///
 /// # Errors
 ///
-/// Returns [`CookError::Io`] when a file cannot be read or the pack cannot be
-/// written, and [`CookError::Rule`] for a file whose path is not UTF-8.
+/// [`CookError::Io`] when a file cannot be read or the pack written, and
+/// [`CookError::Rule`] for a path that is not UTF-8.
 pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, CookError> {
     // Name every file by its `/`-separated path below `source`.
     let mut files = Vec::new();
@@ -417,7 +405,7 @@ pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, Co
             continue;
         }
         // `res/editor/` is the editor's own content - its theme layers and the
-        // fonts they name (W-0127). A game never loads it, so it never ships.
+        // fonts they name. A game never loads it, so it never ships.
         if key.first() == Some(&"editor") {
             continue;
         }
@@ -509,21 +497,17 @@ fn expand(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, CookError> {
     Ok(matched)
 }
 
-/// Mark `output` as cooked against `inputs`, whether or not the rule rewrote it.
+/// Mark `output` as cooked against `inputs`, whether or not the rule rewrote
+/// it; an output the rule never produced is left for the next run to find
+/// missing.
 ///
-/// A tool may leave an output untouched when what it would write is identical;
-/// `slangc` does exactly that. After an edit that changes nothing in the
-/// output, such as a comment in a shared header, the output would then stay
-/// older than the header forever and be re-cooked on every run.
-///
-/// The stamp is the newest input's own timestamp, and only ever moves the
-/// output forward to it - the rule `make` uses. Stamping with the clock instead
-/// would be wrong: file times are coarser than `SystemTime::now()`, so an input
-/// saved a moment after the cook can carry an *earlier* time than a clock
-/// stamp, and that edit would never be cooked.
-///
-/// An output the rule did not produce at all is left for the next run to find
-/// missing, rather than reported here: the rule already said it succeeded.
+/// A tool may leave an output untouched when what it would write is
+/// identical - `slangc` does - so without a stamp an edit that changes nothing
+/// in the output would leave it older than its input and re-cooked every run.
+/// The stamp is the newest input's own timestamp, and only moves the output
+/// forward to it: a clock stamp would be wrong, because file times are coarser
+/// than `SystemTime::now()`, so an input saved just after the cook can carry
+/// an earlier time and never be cooked.
 fn stamp_output<'a>(
     output: &Path,
     inputs: impl IntoIterator<Item = &'a PathBuf>,
@@ -622,7 +606,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
     }
 
-    /// `res/editor/` is the editor's own content (W-0127): a game pack never
+    /// `res/editor/` is the editor's own content: a game pack never
     /// carries it, and a game file that merely starts with the same letters
     /// ("editorial.txt") still packs.
     #[test]

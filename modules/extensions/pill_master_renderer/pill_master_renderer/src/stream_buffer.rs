@@ -8,11 +8,11 @@
 //! # Design
 //!
 //! The overlay's geometry and the UI painter's lists are rebuilt on the
-//! processor each surface, so both used to face the same choice: allocate a
-//! buffer per draw, or keep one and rewrite it. This keeps one. A queue write
-//! lands before the next submission and every surface submits its own frame,
-//! so a buffer written once per surface serves every surface of a frame -
-//! which also means a caller must write it at most once per submission.
+//! processor each surface, so both need a buffer that is rewritten rather than
+//! allocated per draw. This keeps one buffer. A queue write lands before the
+//! next submission and every surface submits its own frame, so a buffer
+//! written once per surface serves every surface of a frame - which also means
+//! a caller must write it at most once per submission.
 
 /// A buffer rewritten every surface, grown when a frame outgrows it.
 pub(crate) struct StreamBuffer {

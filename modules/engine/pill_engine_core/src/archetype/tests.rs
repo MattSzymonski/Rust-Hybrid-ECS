@@ -34,8 +34,8 @@ fn column_with_rows(rows: &[[u8; 8]]) -> ComponentColumn {
     column
 }
 
-/// A layout carries its witness, and a layout with a release hook has that
-/// hook run once per live row - by `Drop` and by `swap_remove`.
+/// A layout carries its witness, and a column releases each live row once
+/// through its ops table - by `Drop` and by `swap_remove`.
 #[test]
 fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,11 +48,11 @@ fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
         "the constructor stores the witness it was handed"
     );
 
-    // Release is the ops table's job now, not a hook on the layout: one
-    // path serves a descriptor column (which reports `trivial_drop` and is
-    // skipped) and a native one (which runs the element type's glue).
-    // Counting calls holds both call sites - `Drop` and
-    // `swap_remove_discard` - to one release per row.
+    // Release is the ops table's job, not a hook on the layout: one path
+    // serves a descriptor column (which reports `trivial_drop` and is skipped)
+    // and a native one (which runs the element type's glue). Counting calls
+    // holds both call sites - `Drop` and `swap_remove_discard` - to one
+    // release per row.
     static RELEASES: AtomicUsize = AtomicUsize::new(0);
     unsafe fn count_releases(_rows: *mut u8, count: usize) {
         RELEASES.fetch_add(count, Ordering::SeqCst);
@@ -61,12 +61,10 @@ fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
     let layout =
         ColumnLayout::new(4, 4, 7, Blittability::from_manifest_fields()).expect("a valid layout");
     let mut column = ComponentColumn::new(layout).expect("a column");
-    // Rows go in while the column still reports plain data, then the
-    // counting table is installed. The byte mutators refuse a column whose
-    // rows own resources, so populating first is now the only order that
-    // works - and it is the honest one: a real column reaches a
-    // non-trivial table by re-homing, never by being born with one and
-    // then filled with zeroed bytes.
+    // Rows go in while the column still reports plain data, then the counting
+    // table is installed: the byte mutators refuse a column whose rows own
+    // resources, and a real column reaches a non-trivial table by re-homing
+    // rather than by being born with one and then filled with zeroed bytes.
     column
         .push_zeroed()
         .expect("the first row grows the column");
@@ -551,12 +549,9 @@ fn generated_ops_drop_each_row_once() {
 
 /// A column's ticks track its rows through every mutator, by construction.
 ///
-/// This is the invariant the parallel `HashMap<ComponentId,
-/// Vec<ComponentTicks>>` used to carry by hand across 21 maintenance sites
-/// in `World`, guarded by a panic and two debug assertions whose only job
-/// was to catch the desync. With the ticks owned by the column there is one
-/// length to maintain, so the desync is unrepresentable rather than
-/// checked - and this test is what pins that every mutator maintains it.
+/// The ticks live beside the rows, so there is one length to maintain and the
+/// desync a parallel tick map would allow is unrepresentable rather than
+/// checked. This test pins that every mutator maintains it.
 #[test]
 fn a_columns_ticks_track_its_rows_through_every_mutator() {
     let mut column = ComponentColumn::new_native::<u32>(7, false).expect("column");
@@ -644,16 +639,14 @@ fn reserving_rows_preserves_contents() {
 /// A descriptor column that gains alignment reallocates rather than
 /// reinterpreting its old stride.
 ///
-/// This is the descriptor-lane counterpart of audit item 4.18, and it is
-/// why that lane needs no registration-time refusal of its own. The native
-/// hazard was a column re-homed onto a newer ops table and then *read
-/// through the incoming type* at the old stride. A descriptor column has no
-/// typed reading at all, and a relayout that changes size or alignment
-/// moves every row into a freshly allocated, correctly aligned buffer, so
-/// the misaligned read the guard exists to prevent is unrepresentable here.
+/// The native lane's hazard is a column re-homed onto a newer ops table and
+/// then read through the incoming type at the old stride. A descriptor column
+/// has no typed reading at all, and a relayout that changes size or alignment
+/// moves every row into a freshly allocated, correctly aligned buffer, so that
+/// misaligned read is unrepresentable here.
 #[test]
 fn a_descriptor_relayout_that_widens_alignment_reallocates() {
-    // Two 4-byte fields, align 4 - the shape audit 4.18 widened.
+    // A 12-byte row at align 4: three 4-byte values.
     let old = ColumnLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
     let mut column = ComponentColumn::new(old).expect("column");
     column

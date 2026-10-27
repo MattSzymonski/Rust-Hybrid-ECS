@@ -1,4 +1,4 @@
-//! Dragging a project asset out to the OS (W-0038 Stage 19).
+//! Dragging a project asset out to the OS.
 //!
 //! # Responsibilities
 //!
@@ -9,27 +9,19 @@
 //!
 //! # Design
 //!
-//! The shell cannot do this: a drag is `DoDragDrop`, which runs a modal loop on
-//! the thread that starts it, and only this executable names the `windows`
-//! crate (the shared-dylib rule). The shell therefore reports the asset's path
-//! through the frame it already hands back, and this module starts the drag
-//! from the frame boundary.
+//! The shell cannot do this: `DoDragDrop` runs a modal loop on the thread that
+//! starts it, and only this executable names the `windows` crate. The shell
+//! reports the asset's path through the frame it hands back, and this module
+//! starts the drag from the frame boundary through `SHCreateDataObject`, which
+//! wraps the path's PIDL into an `IDataObject` offering `CF_HDROP`.
 //!
-//! The data object is the shell's, not one written here:
-//! `SHCreateDataObject` wraps a PIDL into an `IDataObject` that offers the
-//! file under `CF_HDROP`, which is the format every drop target understands.
-//! That keeps this module to the parts only the editor can supply - the file
-//! list and the drop source's lifetime rules.
-//!
-//! The drop source's policy is "when in doubt, end the drag": it reports a
-//! drop as soon as the left button is not held, and a cancel on Escape. A drag
-//! source that answered "continue" on a button it could not read would leave
-//! the modal loop spinning with the editor's frame frozen.
+//! The drop source ends the drag "when in doubt": a drop as soon as the left
+//! button is not held, a cancel on Escape. Answering "continue" on a button it
+//! could not read would spin the modal loop with the editor's frame frozen.
 //!
 //! The same rule applies before the loop: `DoDragDrop` only asks its drop
 //! source for a verdict when input arrives, so a drag started with no button
-//! held would wait forever. [`start`] therefore reads the button itself first
-//! and reports [`DragOutOutcome::NoButtonHeld`] instead of entering the loop.
+//! held would wait forever; [`start`] reads the button first and starts none.
 
 // External crates
 use windows::core::implement;
@@ -89,22 +81,18 @@ pub enum DragOutOutcome {
 }
 
 /// Whether the left button is held right now.
-///
-/// # Safety
-///
-/// `GetAsyncKeyState` takes a virtual-key code and cannot fail; the top bit of
-/// its result is the key's held state.
 fn left_button_held() -> bool {
-    // SAFETY: see the function's contract - a virtual-key code, no pointers.
+    // SAFETY: `GetAsyncKeyState` takes a virtual-key code, reads no pointer and
+    // cannot fail; the high bit of its result is the key's held state.
     (unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } as u16) & 0x8000 != 0
 }
 
 /// Hand `absolute_path` to OLE as a file drag; blocks until the drag ends.
 ///
-/// Logs `[editor] drag out prepared` once the data object exists, which is the
-/// point after which the drag is the OS's; the caller logs the outcome's line.
-/// A drag started with no button held is refused rather than run, because the
-/// modal loop would never see the input that ends it.
+/// Logs `[editor] drag out prepared` once the data object exists, and a warning
+/// naming the reason when a step fails; the runner logs the outcome. A drag
+/// started with no button held is refused rather than run, because the modal
+/// loop would never see the input that ends it.
 pub fn start(absolute_path: &str) -> DragOutOutcome {
     if !initialize_ole() {
         return DragOutOutcome::Failed;
@@ -133,8 +121,9 @@ pub fn start(absolute_path: &str) -> DragOutOutcome {
         );
         return DragOutOutcome::Failed;
     }
-    // The shell's data object over that one PIDL: `CF_HDROP` for every target
-    // that takes files, which is what a drag out of a project panel needs.
+    // The Windows shell's data object over that one PIDL: `CF_HDROP` for every
+    // target that takes files, which is what a drag out of a project panel
+    // needs.
     let data_object: windows::core::Result<windows::Win32::System::Com::IDataObject> =
         // SAFETY: `pidl` is the item list just parsed and stays alive for the
         // whole call; the data object copies what it needs.

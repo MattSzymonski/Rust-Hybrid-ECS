@@ -5,8 +5,8 @@
 //! - Show that a component registered through `register_all_components`
 //!   expands a field of a mirrored value type into dotted leaf rows: the
 //!   facade hands the engine core this artifact's value types for the loop.
-//! - Show that the value types are handed over only for that loop, so nothing
-//!   outside it resolves through them.
+//! - Show that the value types are handed over only for that loop, so the
+//!   resolver is restored and a component registered outside it sees none.
 
 use pill_engine::component_registry::{register_all_components, ComponentFieldDescriptor};
 use pill_engine::{Component, ComponentId, PillComponent, PillMirror, World};

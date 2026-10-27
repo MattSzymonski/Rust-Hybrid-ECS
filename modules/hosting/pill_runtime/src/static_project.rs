@@ -11,13 +11,12 @@
 //!
 //! # Design
 //!
-//! The dependency direction is what forces this shape. The runtime cannot name
-//! the project crate - it does not depend on it, and must not, or every game
-//! would need its own runtime. So the crate that *does* link both (the
-//! generated shipping bundle) passes the functions in, which also makes the set
-//! of linked modules explicit at the call site. That is what a shipping build
-//! wants: a project's `project_settings.yaml` is a development convenience and
-//! should not decide what a released binary contains.
+//! The dependency direction forces this shape: the runtime cannot name the
+//! project crate, or every game would need its own runtime, so the crate that
+//! links both - the generated shipping bundle - passes the functions in. That
+//! also makes the set of linked modules explicit at the call site, which is what
+//! a shipping build wants: `project_settings.yaml` is a development convenience
+//! and should not decide what a released binary contains.
 //!
 //! For the same reason the runtime names no C# type: a managed project arrives
 //! as a [`StaticProjectBackend::External`] backend the bridge implements, so a
@@ -38,7 +37,6 @@
 //!
 //! Statically there is no ABI to unwind across, so a panic here is an ordinary
 //! Rust panic and is left alone - converting it would only hide the backtrace.
-//! Registration is reproduced exactly, per init, matching the wrappers.
 
 // Standard library
 use std::any::Any;
@@ -69,9 +67,8 @@ pub struct StaticModule {
     pub name: &'static str,
     /// The function `#[pill_module]` was written on.
     ///
-    /// The generated wrapper for a loaded module calls the same function
-    /// through its `pill_module_init` export; statically it is called
-    /// directly, with no export involved either way.
+    /// A loaded module reaches the same function through its `pill_module_init`
+    /// export; here the runtime calls it directly.
     pub init: fn(&mut Engine) -> u32,
 }
 
@@ -182,8 +179,9 @@ pub struct StaticProject {
     /// `false` when absent. A system can still switch it at runtime.
     pub debug_draw: bool,
     /// The scene the project's settings named as its startup scene, loaded
-    /// after every component is registered and before the project's `init`
-    /// seeds anything (`startup_scene:` in `project_settings.yaml`).
+    /// once every component is registered: before a natively linked project's
+    /// `init` seeds anything, and once an external backend's `start` has
+    /// returned (`startup_scene:` in `project_settings.yaml`).
     pub startup_scene: Option<&'static str>,
 }
 

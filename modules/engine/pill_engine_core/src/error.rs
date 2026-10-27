@@ -5,17 +5,18 @@
 //!
 //! - Declare the engine's subsystem errors ([`WorldError`],
 //!   [`CommandError`], [`AddComponentError`], [`RemoveComponentError`],
-//!   [`BuildError`]).
+//!   [`BuildError`], [`PersistenceError`], [`SystemError`] and
+//!   [`SystemFailure`]).
 //! - Compose them transparently into the top-level [`EngineError`] together
 //!   with the shared host errors from `pill_core`.
 //!
 //! # Design
 //!
-//! Every variant carries a single `#[message(...)]` definition rendered
-//! through the `pill_core` diagnostics runtime. Error enums never import a
-//! styling crate, never convert sources to text, and compose with `?`
-//! through transparent `#[from]` wrappers. Frontends receive the composed
-//! [`EngineError`] at their boundary and report it exactly once.
+//! Each error variant states its wording once, as a `#[message(...)]`
+//! definition rendered through the `pill_core` diagnostics runtime. Error enums
+//! never import a styling crate and never convert sources to text; they compose
+//! with `?` through transparent `#[from]` wrappers. Frontends receive the
+//! composed [`EngineError`] at their boundary and report it exactly once.
 
 // Standard library
 use std::fmt;
@@ -156,7 +157,7 @@ pub enum WorldError {
     /// the migration plan was validated against.
     ///
     /// Signals that a column and the storage factory describing it have drifted
-    /// apart, which a partially applied relayout used to produce.
+    /// apart, which a partially applied relayout produces.
     #[message(
         "descriptor component ",
         debug_value(component_id),
@@ -336,16 +337,14 @@ pub enum WorldError {
     /// different [`ComponentId`]s.
     ///
     /// The persistable-registration path evicts a same-name entry from the
-    /// persist maps on the assumption that it is a superseded hot-reload
-    /// generation. A generation that has been superseded has no live rows
-    /// left, so when the older column still holds entities the two
-    /// registrations are concurrent peers - two binaries that each linked the
-    /// same component type and therefore each got their own `TypeId` for it -
-    /// and evicting one would silently drop its rows at the next reload.
+    /// persist maps, assuming it is a superseded hot-reload generation - which
+    /// has no live rows left. When the older column still holds entities the
+    /// two registrations are concurrent peers (two binaries that each linked
+    /// the type and got their own `TypeId`), and evicting one would silently
+    /// drop its rows at the next reload.
     ///
-    /// The fix is to give the type a shared identity with
-    /// `#[pill(shared)]`, which makes both binaries resolve to one column
-    /// instead of two.
+    /// Give the type a shared identity with `#[pill(shared)]`, which makes
+    /// both binaries resolve to one column instead of two.
     #[message(
         "component ",
         name_style(type_name),
@@ -378,9 +377,8 @@ pub enum WorldError {
     /// debug hosts and is undefined behaviour in release, so the registration
     /// is refused and the host rolls the reload back instead.
     ///
-    /// A size change that keeps the alignment is not refused: the old
-    /// column's slots stay validly aligned for the incoming type, and the
-    /// add-a-field reloads depend on that shape migrating.
+    /// A size change that keeps the alignment is accepted: the add-a-field
+    /// reloads depend on that shape migrating.
     #[message(
         "component ",
         name_style(type_name),
@@ -470,19 +468,15 @@ pub enum WorldError {
     /// Two different Rust types claim the same shared component name.
     ///
     /// A shared name is a process-wide identity, so two types holding it are
-    /// one component as far as the engine is concerned: one bit, one column,
-    /// and every write through either type landing on the other's rows. When
-    /// their layouts also agree, nothing downstream can notice - the reads
+    /// one component: one bit, one column, and every write through either type
+    /// landing on the other's rows - and with matching layouts, the reads
     /// succeed and silently return another component's data.
     ///
-    /// The legitimate case this must not reject is one type compiled into two
-    /// binaries, which is the entire point of shared identity. Those are told
-    /// apart by their Rust path: the same type compiled twice reports the same
-    /// [`std::any::type_name`], while two different types never do.
-    ///
-    /// Give the two components distinct names. The default derived from
-    /// `module_path!()` is already distinct; this is reachable only by
-    /// overriding it with `#[pill(shared = "...")]`.
+    /// One type compiled into two binaries must not be rejected - that is what
+    /// shared identity is for - and the two are told apart by their Rust path:
+    /// the same type compiled twice reports the same [`std::any::type_name`].
+    /// Overriding the name with `#[pill(shared = "...")]` is the only way to
+    /// reach this; the default is already distinct per module path.
     #[message(
         "shared component name ",
         name_style(shared_name),
@@ -620,8 +614,8 @@ pub(crate) const COMPONENT_NAME_COLLISION_REFUSAL: &str =
 /// The refusal logged when a reloading generation re-registers a persistable
 /// component with a layout the previous generation's column cannot host.
 ///
-/// One source of truth for the sentence the host prints and the migration
-/// suite greps for, following [`COMPONENT_NAME_COLLISION_REFUSAL`]: the
+/// One source of truth for the sentence the host prints and the tests assert
+/// on, following [`COMPONENT_NAME_COLLISION_REFUSAL`]: the
 /// [`WorldError::ComponentLayoutChanged`] record and the log line beside it
 /// both point here.
 pub(crate) const COMPONENT_LAYOUT_CHANGED_REFUSAL: &str =

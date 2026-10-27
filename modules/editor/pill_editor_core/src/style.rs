@@ -16,15 +16,12 @@
 //!
 //! # Design
 //!
-//! Styling is egui `Style`/`Visuals` data, never CSS (plan decision E5). The
-//! look is a [`Theme`] - plain tokens from `pill_ui_theme` - and this module is
-//! the only place in the editor that names a colour: the shell asks for a role
-//! and holds no value of its own.
-//!
-//! [`apply_theme`] is the only writer of the recorded palette. The record lives
-//! in this crate, a shared dylib that never reloads, so a shell reload leaves it
-//! untouched and the reloaded shell reads the same roles. It holds `Color32`
-//! copies only: nothing a module image owns outlives its image.
+//! Styling is egui `Style`/`Visuals` data, never CSS: the shell asks for a role
+//! and holds no colour value of its own. [`apply_theme`] is the only writer of
+//! the recorded palette, and the record lives in this crate - a shared dylib
+//! that never reloads - so a shell reload leaves it untouched and the reloaded
+//! shell reads the same roles. It holds `Color32` copies only: nothing a module
+//! image owns outlives its image.
 
 // Standard library
 use std::sync::{Arc, OnceLock, RwLock};
@@ -341,9 +338,9 @@ pub fn selected_row_bar(ui: &egui::Ui, rect: egui::Rect) {
 
 /// The editor's look as a complete theme: one flat, compact dark style.
 ///
-/// The values are sampled from the item's reference image: near-black panels,
-/// a crimson accent on links, the active tab and the selected row's bar, and
-/// compact controls drawn in Inter and JetBrains Mono.
+/// The values follow the editor's reference look: near-black panels, a crimson
+/// accent on links, the active tab and the selected row's bar, and compact
+/// controls drawn in Inter and JetBrains Mono.
 pub fn default_theme() -> Theme {
     let mut theme = Theme::fallback();
     theme.name = "editor".to_owned();
@@ -419,9 +416,7 @@ pub fn default_theme() -> Theme {
         ),
     };
 
-    // Compact metrics, as the reference draws them. The row height metrics
-    // stay as they were: the inspector's collapse-and-scroll logic and the
-    // editor suite's rectangle checks are built on them.
+    // Compact metrics: tight item spacing and a compact control size.
     theme.spacing.item_spacing = [6.0, 3.0];
     theme.spacing.button_padding = [8.0, 4.0];
     theme.spacing.interact_size = [24.0, 20.0];
@@ -466,7 +461,7 @@ pub fn default_theme() -> Theme {
 // The theme layers
 // =============================================================================
 
-/// Where one layer of the editor's theme came from (W-0127 Stage 6).
+/// Where one layer of the editor's theme came from.
 ///
 /// The executable merges the layers in this order and the shell installs the
 /// result; a launch stamps the generation so a shell that was reloaded knows
@@ -554,7 +549,8 @@ pub enum UserThemeSelection {
     /// The preference is absent or blank: no user layer.
     #[default]
     None,
-    /// A name a build before files used (`dark`, `light`): kept, but no layer.
+    /// A bare theme name, as preferences written before theme files spell it
+    /// (`dark`, `light`): kept, but adds no layer.
     Legacy(String),
     /// A theme file, absolute or relative to the editor's state directory.
     File(std::path::PathBuf),
@@ -564,7 +560,7 @@ impl UserThemeSelection {
     /// Read the preference's value.
     ///
     /// A value ending in `.json` or `.theme` is a file; anything else is a
-    /// name an earlier build understood. A relative path resolves against
+    /// bare theme name, which adds no layer. A relative path resolves against
     /// `state_directory`, where the preferences file itself lives.
     pub fn from_preference(value: Option<&str>, state_directory: &std::path::Path) -> Self {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -653,12 +649,12 @@ fn color(value: Rgba) -> Color32 {
 
 /// Install `theme` on `context` and record it as the editor's look.
 ///
-/// This is the one entry point that resolves a theme: the executable resolves
-/// the layers, the shell installs the merged theme with the layers and the
-/// generation it came from, and the pop-out windows and the no-shell fallback
-/// call [`apply`] to install whatever is recorded. The theme is installed
-/// through the UI kit, with the Phosphor families as the built-in ones, so the
-/// chrome's icons draw in the families the kit registers.
+/// The executable resolves the layers and the shell installs the merged theme
+/// with the layers and the generation it came from; a context created later - a
+/// pop-out window, the no-shell fallback - calls [`apply`] to install whatever
+/// is recorded. The install goes through the UI kit with `append_fonts` as
+/// its callback, so a theme layer's font leads each UI family, the editor's own
+/// fonts follow it, and each icon family leads with its Phosphor face.
 pub fn apply_theme(
     context: &Context,
     theme: &Theme,
@@ -723,9 +719,10 @@ pub fn apply_theme(
 }
 
 /// Append the editor's own families to `fonts`: Inter for the UI, JetBrains
-/// Mono for code and numbers, then the icon families - Phosphor last, because
-/// its regular font claims the lowercase Latin range with empty glyphs.
-fn append_fonts(fonts: &mut egui::FontDefinitions) {
+/// Mono for code and numbers, then the icon families. Phosphor joins no UI
+/// family, because its regular font claims the lowercase Latin range with
+/// empty glyphs.
+pub(crate) fn append_fonts(fonts: &mut egui::FontDefinitions) {
     fonts.font_data.insert(
         BODY_KEY.to_owned(),
         Arc::new(egui::FontData::from_static(BODY_FONT)),
@@ -774,7 +771,8 @@ pub fn apply(context: &Context) {
 /// The `egui_dock` styling for the shell's `DockArea`, derived from
 /// `egui_style` and overridden to the editor's look: flat tabs that merge
 /// with their active bodies, a dark tab strip, and thin separators between
-/// panels. Every colour is a role of `palette`.
+/// panels. Colours come from `palette`; only an inactive tab's fill is
+/// transparent.
 pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Style {
     let mut style = egui_dock::Style::from_egui(egui_style);
     style.main_surface_border_stroke = Stroke::NONE;
@@ -801,7 +799,7 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
     style.tab.tab_body.corner_radius = CornerRadius::ZERO;
     style.tab.tab_body.stroke = Stroke::NONE;
     // Panel boundaries: one thin line, with a grab band several times its
-    // width so the splitter is easy to catch (W-0049), brightened while
+    // width so the splitter is easy to catch, brightened while
     // interacted with - the line stepped towards the text colours rather than
     // a second pair of literals.
     style.separator.width = 1.0;
@@ -1004,8 +1002,8 @@ mod tests {
         assert_eq!(context.theme(), egui::Theme::Dark);
     }
 
-    /// The restyle's signature values: the reference's crimson accent on
-    /// near-black chrome, with tight corners.
+    /// The default theme's signature values: a crimson accent on near-black
+    /// chrome, with tight corners.
     #[test]
     fn the_default_theme_samples_the_reference() {
         let theme = default_theme();
@@ -1037,7 +1035,7 @@ mod tests {
     }
 
     /// The preference's value: a file (absolute or beside the state files), a
-    /// name an earlier build understood, or nothing.
+    /// bare theme name, or nothing.
     #[test]
     fn the_user_layer_reads_a_preference_value() {
         let directory = std::path::Path::new("C:/state");
@@ -1192,17 +1190,21 @@ mod tests {
         );
         let duotone =
             &definitions.families[&egui::FontFamily::Name(crate::icons::DUOTONE_FAMILY.into())];
+        assert_eq!(
+            duotone.first().map(String::as_str),
+            Some(crate::icons::DUOTONE_KEY),
+            "Phosphor's duotone face leads its own family"
+        );
         assert!(
-            duotone
-                .last()
-                .is_some_and(|name| name.ends_with("phosphor.duotone")),
-            "Phosphor stays last in its own family"
+            duotone.iter().any(|name| name == BODY_KEY),
+            "Inter follows it as the label's fallback"
         );
     }
 
-    /// A theme layer's font leads, the editor's own families follow it as the
-    /// fallback, and Phosphor stays last - in its families and in the icon
-    /// list that copies the proportional one.
+    /// A theme layer's font leads the UI families, the editor's own fonts
+    /// follow it as the fallback, and an icon family leads with its Phosphor
+    /// face - the UI fonts claim the icons' private-use codepoints with glyphs
+    /// of their own, so an icon listed behind them would draw as a letter.
     #[test]
     fn a_theme_font_leads_the_editors_own_families() {
         let fonts = kit::style::ThemeFonts {
@@ -1232,14 +1234,13 @@ mod tests {
         let icons = &definitions.families[&egui::FontFamily::Name(crate::icons::FAMILY.into())];
         assert_eq!(
             icons.first().map(String::as_str),
-            Some(kit::style::THEME_BODY_KEY),
-            "the icon family's fallback list carries the theme's body font"
+            Some(crate::icons::REGULAR_KEY),
+            "Phosphor's regular face leads the icon family"
         );
-        assert!(
-            icons
-                .last()
-                .is_some_and(|name| name == crate::icons::REGULAR_KEY),
-            "Phosphor stays last"
+        assert_eq!(
+            icons.get(1).map(String::as_str),
+            Some(kit::style::THEME_BODY_KEY),
+            "the theme's body font follows it as the fallback"
         );
     }
 }

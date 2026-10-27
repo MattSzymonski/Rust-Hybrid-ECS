@@ -6,7 +6,7 @@
 //! # Responsibilities
 //!
 //! - Defines the `Position`, `Velocity`, and `Health` components used by the
-//!   demo and makes them accessible through trait objects.
+//!   demo.
 //! - Defines systems that move entities, decay and apply damage to health,
 //!   and spawn a fresh entity each frame.
 //! - Runs the engine's frame loop with parallel execution enabled and prints
@@ -23,8 +23,6 @@
 // =============================================================================
 // Imports
 // =============================================================================
-
-// External crates
 
 // Current crate
 use pill_engine::*;
@@ -65,8 +63,6 @@ impl Component for Velocity {}
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
-
-// Make components accessible through trait objects
 
 // =============================================================================
 // Systems
@@ -147,10 +143,9 @@ fn main() {
     engine.world_mut().register_component::<Velocity>();
     engine.world_mut().register_component::<Health>();
 
-    // Step 3: Register systems - these can run in parallel!
-    // movement_system: writes Position, reads Velocity
-    // health_system: writes Health
-    // No conflicts! Can run in parallel.
+    // Step 3: Register the systems. `movement` and `health` touch disjoint
+    // components, so they share a batch; `damage` and `xxx` touch the same data
+    // as those two and are serialised behind them.
     engine.register_system("movement", movement_system);
     engine.register_system("health", health_system);
     engine.register_system("damage", damage_system);

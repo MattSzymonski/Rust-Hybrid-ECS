@@ -1,39 +1,27 @@
-//! The scripted test channel's grammar: one typed parse of the lines the
-//! suites append to the command file.
+//! The scripted test channel's grammar: one typed parse of a command line.
 //!
 //! # Responsibilities
 //!
-//! - Parse one scripted line into a [`ScriptedCommand`] ([`ScriptedCommand::parse`]),
-//!   or explain why it cannot run.
-//! - Keep the grammar - the verbs, their arguments and their value forms -
-//!   in one file instead of a runner, so it can be listed and table-tested
-//!   without launching an editor.
+//! - Parse one scripted line into a [`ScriptedCommand`], or explain why it
+//!   cannot run.
+//! - Keep the grammar - verbs, arguments and value forms - in one file, so
+//!   it can be table-tested without launching an editor.
 //!
 //! # Design
 //!
 //! The vocabulary is the suites' API: `test_editor_egui.py` writes these
 //! lines, so a verb name or an argument order cannot change without the suite
-//! noticing. The desktop editor and the browser editor both parse with this
-//! module and dispatch the commands their posture can run, so the two
-//! vocabularies cannot drift; a verb a posture cannot run is refused through
-//! the same `[editor] scripted command rejected` line the Python side raises
-//! on.
+//! noticing. Both editors parse with this module and dispatch what their
+//! posture can run; a verb a posture cannot run is refused through the same
+//! `[editor] scripted command rejected` line the Python side raises on. The
+//! module names only model types, so the browser build can link it.
 //!
-//! The module is UI-free and window-free (it only names the model types),
-//! which is what lets the browser build link it.
-//!
-//! Arguments are whitespace-separated words, except where the trailing value
-//! is free text: `edit set`, `edit array`, `edit asset-settings`,
-//! `edit preference`, `dialog set name`, `browser`, `select asset` and the
-//! asset-edit paths take the rest of the line, so a value keeps its spaces.
-//! One pair of surrounding double quotes is removed and `\"` / `\\` are
-//! resolved, so a value that needs its own leading or trailing space can be
-//! quoted (`edit set 3v0 ShowcaseComponent note "  padded  "`).
-//!
-//! `key <chord>` injects a keyboard chord (`ctrl+z`, `shift+delete`, `w`):
-//! the names are the modifier words `ctrl`, `shift`, `alt`, `super` joined to
-//! the key with `+`, and the key is a letter, a digit, `f1`..`f24` or one of
-//! the named editing keys listed by [`key_code_name`].
+//! Arguments are whitespace-separated words, except a trailing free-text
+//! value (`edit set`, a path, a name), which takes the rest of the line so it
+//! keeps its spaces; surrounding double quotes are removed and a backslash
+//! escapes the character after it. `key <chord>` takes `ctrl`, `shift`, `alt`
+//! or `super` joined with `+`, then a letter, a digit, `f1`..`f24` or a named
+//! editing key from [`key_code_name`].
 
 // External crates
 use pill_engine::KeyCode;
@@ -66,14 +54,13 @@ pub enum ScriptedCommand {
     /// `safe_mode retry` - press the safe-mode panel's Retry button.
     SafeModeRetry,
     /// `panel unload <source>` - drop one module's liveness marker, the state
-    /// its unload leaves: its panels read "module not loaded" (W-0038
-    /// Stage 11).
+    /// its unload leaves: its panels read "module not loaded".
     PanelUnload(String),
     /// `panel restore <source>` - bind that module's panels again, the state a
     /// reload leaves.
     PanelRestore(String),
-    /// `panel window <slot> <id>` - ask the panel in that slot to open the    /// window it calls `id`, as clicking its own button would (W-0038
-    /// Stage 13).
+    /// `panel window <slot> <id>` - ask the panel in that slot to open the
+    /// window it calls `id`, as clicking its own button would.
     PanelWindow {
         /// The panel's registry slot.
         slot: u16,
@@ -98,7 +85,8 @@ pub enum ScriptedCommand {
         /// The point's y in physical pixels.
         y: f32,
     },
-    /// `drag <x1> <y1> <x2> <y2>` - a left-button drag, one stage per frame.
+    /// `drag <x1> <y1> <x2> <y2>` - a left-button drag: press, move and
+    /// release arrive one per frame.
     Drag {
         /// Where the press lands.
         from: (f32, f32),
@@ -149,7 +137,7 @@ pub enum ScriptedCommand {
     ///
     /// The UI's hover state is egui's, and egui learns a position from an
     /// event: this is how a suite makes a tooltip or a cursor appear without
-    /// a mouse (W-0049).
+    /// a mouse.
     HoverUi {
         /// The pointer's x in physical pixels.
         x: f32,
@@ -160,18 +148,17 @@ pub enum ScriptedCommand {
     SelectAsset(String),
     /// `select entity <handle>` - move the shared selection onto an entity.
     SelectEntity(String),
-    /// `select add <handle>` - extend the selection as a Ctrl-click does
-    /// (W-0038 Stage 16).
+    /// `select add <handle>` - extend the selection as a Ctrl-click does.
     SelectAdd(String),
     /// `select range <handle>` - extend the selection over the Entities list's
-    /// range from the primary, as a Shift-click does (W-0038 Stage 16).
+    /// range from the primary, as a Shift-click does.
     SelectRange(String),
     /// `select resource <name>` - move the shared selection onto an editable
-    /// world resource (W-0038 Stage 14).
+    /// world resource.
     SelectResource(String),
     /// `panel field <component> <field> <value>` - queue the component-field
-    /// write a module panel's own row would queue, against the selected entity
-    /// (W-0038 Stage 12).
+    /// write a module panel's own row would queue, against the selected
+    /// entity.
     PanelField {
         /// The component's registered name, or its `::Name` suffix.
         component: String,
@@ -191,7 +178,7 @@ pub enum ScriptedCommand {
     },
     /// `toolbar <create|rename|delete|meta>` - press one Assets toolbar button.
     Toolbar(ToolbarAction),
-    /// `scene new` - start an empty scene (W-0048 Stage 9).
+    /// `scene new` - start an empty scene.
     SceneNew,
     /// `scene open <path>` - open a `.scene` file, replacing the world.
     SceneOpen(String),
@@ -205,7 +192,7 @@ pub enum ScriptedCommand {
     /// `edit asset <action> ...` - queue one recorded asset-file edit.
     EditAsset(AssetEdit),
     /// `pick entity <entity> <component> <field>` - arm an entity reference
-    /// row, so the next scene press names its reference (W-0048 Stage 6).
+    /// row, so the next scene press names its reference.
     PickEntity {
         /// The entity the field belongs to.
         entity: String,
@@ -240,7 +227,7 @@ pub enum ScriptedCommand {
     },
     /// `edit selection <component> <field> <value>` - one recorded field edit
     /// written to every selected entity that carries the component, as the
-    /// Inspector's row queues it (W-0038 Stage 16).
+    /// Inspector's row queues it.
     EditSelection {
         /// The component's registered name, or its suffix.
         component: String,
@@ -287,7 +274,7 @@ pub enum ScriptedCommand {
     Redo,
     /// `command editor.scene_new_view` - dock one more scene view.
     NewSceneView,
-    /// `popout <tab>` - move a tab into its own OS window (W-0038 Stage 23);
+    /// `popout <tab>` - move a tab into its own OS window;
     /// `popout <tab> redock` puts it back in the dock.
     Popout {
         /// The tab to move.
@@ -307,25 +294,23 @@ pub enum ScriptedCommand {
     SnapToggle,
     /// `command editor.tool_space_toggle` - flip world/local space.
     SpaceToggle,
-    /// `command editor.copy` - put the selection on the OS clipboard
-    /// (W-0038 Stage 17).
+    /// `command editor.copy` - put the selection on the OS clipboard.
     Copy,
     /// `command editor.cut` - copy the selection and delete it.
     Cut,
     /// `command editor.paste` - read the OS clipboard and apply it.
     Paste,
-    /// `drop <path>` - hand one path to the drop handler as the OS would
-    /// (W-0038 Stage 18).
+    /// `drop <path>` - hand one path to the drop handler as the OS would.
     Drop(String),
     /// `hover file <path>` - the same path as a drag preview.
     HoverFile(String),
-    /// `drag out <path>` - hand one file to the OS drag (W-0038 Stage 19).
+    /// `drag out <path>` - hand one file to the OS drag.
     /// With no mouse button held the drag ends at once, which is what makes it
     /// safe to smoke-test from the scripted channel.
     DragOut(String),
 }
 
-/// What a `palette` line asks of the command palette (W-0038 Stage 3).
+/// What a `palette` line asks of the command palette.
 ///
 /// The suite drives the palette's model rather than its pixels: the popup's
 /// own keys (arrows, Enter, Escape) take the same state changes a person's do.
@@ -361,7 +346,7 @@ pub enum Dump {
     /// `dump preferences` - the preferences document and the live halves.
     Preferences,
     /// `dump theme` - the theme the editor paints with, its layers and the
-    /// generation that produced it (W-0127 Stage 6).
+    /// generation that produced it.
     Theme,
     /// `dump console` - the Console tab's filters and the rows they leave.
     Console,
@@ -369,20 +354,18 @@ pub enum Dump {
     Problems,
     /// `dump stats` - the Statistics tab's frame and per-tab timings.
     Stats,
-    /// `dump cadence` - the redraw counters (W-0038 Stage 9).
+    /// `dump cadence` - the redraw counters.
     Cadence,
-    /// `dump panels` - the module panels and their timings (W-0038 Stage 11).
+    /// `dump panels` - the module panels and their timings.
     Panels,
-    /// `dump windows` - the panel windows on screen (W-0038 Stage 13).
+    /// `dump windows` - the panel windows on screen.
     Windows,
-    /// `dump entities` - the entity list with each row's component names
-    /// (W-0038 Stage 15): what a collection test needs to find its subject.
+    /// `dump entities` - the entity list with each row's component names:
+    /// what a collection test needs to find its subject.
     Entities,
-    /// `dump selection` - the selected entities, primary last (W-0038
-    /// Stage 16).
+    /// `dump selection` - the selected entities, primary last.
     Selection,
-    /// `dump resources` - the editable world resources and their values
-    /// (W-0038 Stage 14).
+    /// `dump resources` - the editable world resources and their values.
     Resources,
     /// `dump field <entity> <component> <field>` - one component field's value.
     Field {
@@ -549,7 +532,7 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::ActivateTab(tab))
             }
             // `popout <tab>` moves a tab into its own OS window, and
-            // `popout <tab> redock` brings it back (W-0038 Stage 23).
+            // `popout <tab> redock` brings it back.
             "popout" => {
                 let tab = tab(&mut cursor, "popout needs a tab name")?;
                 let redock = match cursor.word() {
@@ -577,8 +560,8 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::RightClick { x, y })
             }
             // `drag x1 y1 x2 y2` is a pointer gesture; `drag out <path>` hands
-            // one file to the OS drag (W-0038 Stage 19), which ends at once
-            // when no mouse button is held - safe to drive from the file.
+            // one file to the OS drag, which ends at once when no mouse
+            // button is held - safe to drive from the file.
             "drag" => {
                 let drag_out = {
                     let rest = cursor.rest();
@@ -662,7 +645,7 @@ impl ScriptedCommand {
                     })
                 }
                 // The write a panel's own row queues, driven from the test
-                // channel instead of the pointer (W-0038 Stage 12).
+                // channel instead of the pointer.
                 Some("field") => {
                     let reason = "panel field needs a component, a field and a value";
                     let component = cursor.word().ok_or_else(|| ParseError::new(reason))?;
@@ -701,8 +684,7 @@ impl ScriptedCommand {
                 Ok(ScriptedCommand::Key(chord))
             }
             // The OS drop, driven from the file: winit's own events cannot be
-            // synthesised from here, and this calls the handler they call
-            // (W-0038 Stage 18).
+            // synthesised from here, and this calls the handler they call.
             "drop" => {
                 let path = cursor.text("drop needs a path")?;
                 Ok(ScriptedCommand::Drop(path))
@@ -1157,7 +1139,7 @@ fn command(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
         "editor.copy" => ScriptedCommand::Copy,
         "editor.cut" => ScriptedCommand::Cut,
         "editor.paste" => ScriptedCommand::Paste,
-        // One more scene view, the Window menu's own row (W-0038 Stage 21).
+        // One more scene view, the Window menu's own row.
         "editor.scene_new_view" => ScriptedCommand::NewSceneView,
         other => {
             return Err(ParseError::new(format!(
@@ -1530,12 +1512,12 @@ fn point(cursor: &mut Cursor<'_>, reason: &str) -> Result<(f32, f32), ParseError
 fn tab_by_name(name: &str) -> Option<EditorTab> {
     // A module panel's tab is named by its slot: `module:0`. The registry owns
     // the ids, so the parser only carries the number and the executable
-    // resolves it (W-0038 Stage 11).
+    // resolves it.
     if let Some(slot) = name.strip_prefix("module:") {
         return slot.parse().ok().map(EditorTab::Module);
     }
     // A scene view is `scene`, `scene2`, `scene3`: one past the view's own
-    // index, because a person counts views from one (W-0038 Stage 21).
+    // index, because a person counts views from one.
     if let Some(count) = name.strip_prefix("scene") {
         if count.is_empty() {
             return Some(EditorTab::Scene(0));

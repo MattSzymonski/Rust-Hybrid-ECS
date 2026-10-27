@@ -6,12 +6,14 @@
 //!   entities and adding/removing components without holding `&mut World`.
 //! - Implements the two-phase frame lifecycle: systems queue commands during
 //!   execution, then the engine applies them after all systems finish.
-//! - Defines [`CommandError`] for queue-execution failures.
+//! - Re-exports [`CommandError`], the failure a queued command reports when the
+//!   flush cannot apply it.
 //! - Provides [`DeferredEntityBuilder`] for ergonomic entity construction via commands.
 //!
 //! # Design
 //!
-//! The ECS uses a two-phase execution model each frame:
+//! Systems never mutate the world's structure directly. They queue, and the
+//! flush that follows the last system applies each command:
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -32,11 +34,9 @@
 //! └─────────────────────────────────┴───────────────────────────┘
 //! ```
 //!
-//! ## Why Deferred?
-//!
-//! 1. Thread Safety: Multiple systems can queue commands without locks
-//! 2. Consistency: World state doesn't change mid-iteration
-//! 3. Batching: Commands can be optimized before execution
+//! Deferring is what lets systems run in parallel without locks, and what keeps
+//! every archetype's rows fixed for as long as an iterator holds them: nothing
+//! migrates an entity to another archetype before the flush.
 //!
 //! ## Usage Example
 //!
@@ -127,10 +127,10 @@ impl<T: Component + Send> ComponentAdder for TypedComponentAdder<T> {
 
 /// Type-erased component adder that writes raw bytes into a native column.
 ///
-/// Used by the C# backend to create or add components that an extension
-///  registered as native, so the host never names the concrete type.
-/// The byte payload must match the component's ABI layout exactly; the
-/// binding validates the size before this adder is queued.
+/// Lets a caller that holds only a component id and its ABI bytes - the C#
+/// backend, the editor's command batches - create or add a component without
+/// naming the concrete Rust type. The payload must match the component's ABI
+/// layout exactly; the queuing caller validates the size before it is queued.
 pub struct ByteComponentAdder {
     /// Native component identity the bytes belong to.
     component_id: ComponentId,
@@ -156,10 +156,9 @@ impl ComponentAdder for ByteComponentAdder {
         let column = new_storage
             .get_mut(self.component_id)
             .expect("native column must exist for a registered component");
-        // A refusal here used to be dropped on the floor. It cannot be: the
-        // destination archetype already has the entity's row in every other
-        // column, so a column left short shifts every later row of this
-        // component onto another entity's value.
+        // The refusal cannot be dropped: the destination archetype already has
+        // the entity's row in every other column, so a column left short shifts
+        // every later row of this component onto another entity's value.
         column.push_bytes(&self.bytes)
     }
 }
@@ -350,9 +349,10 @@ impl CommandQueue {
     ///
     /// This is called by the Engine after all systems have run.
     ///
-    /// When `exit_on_error` is `true`, any command failure causes an
-    /// immediate `Err` return.  When `false`, failures are logged to
-    /// stderr and execution continues (backward-compatible behaviour).
+    /// When `exit_on_error` is `true`, any command failure returns every
+    /// collected error. When `false`, failures are logged through the
+    /// telemetry warn target and the profile error channel, and the flush
+    /// reports success.
     pub(crate) fn execute_queued_commands(
         &mut self,
         world: &mut World,
@@ -373,9 +373,8 @@ impl CommandQueue {
         for command in self.commands.drain(..) {
             // Every executor reports failure by appending to `errors`; a
             // command that appended nothing succeeded. Counting from the
-            // vector length keeps one source of truth and avoids the
-            // double-counting an unconditional `succeeded += 1` used to
-            // introduce for the non-create arms.
+            // vector length keeps one source of truth - an unconditional
+            // `succeeded += 1` would count the create arms' failures too.
             let errors_before = errors.len();
             match command {
                 DeferredCommand::CreateEntity {
@@ -386,7 +385,7 @@ impl CommandQueue {
                     // Entity creation can fail to write one or more components
                     // after the row exists; every failure is collected rather
                     // than panicking inside the flush, and a creation that did
-                    // not fully materialise is no longer counted as succeeded.
+                    // not fully materialise is not counted as succeeded.
                     if let Err(mut failures) = Self::execute_create_entity(
                         world,
                         entity,
@@ -483,7 +482,7 @@ impl CommandQueue {
             .collect();
         component_ids.extend(descriptor_components.iter().map(|(id, _)| *id));
 
-        // Step 1b: Refuse a repeated id before the row exists. The set defines
+        // Step 2: Refuse a repeated id before the row exists. The set defines
         // the archetype's columns, so a duplicate would push two rows for one
         // entity row - or panic inside the archetype insert when it found the
         // id already present. `create_descriptor_entity` and the C# create path
@@ -502,15 +501,15 @@ impl CommandQueue {
             }]);
         }
 
-        // Step 2: Insert the entity row and write its native components into storage.
+        // Step 3: Insert the entity row and write its native components into storage.
         // A command never supplies the stable id: the world mints one, which
         // is what a managed `ReserveEntity` caller reads back afterwards.
         //
         // The row is already in every other column by the time an adder runs,
         // so an adder that refuses cannot be retried or undone here. The
         // failure is carried out of the closure and reported with the rest of
-        // the batch; dropping it, as this path used to, left the entity's
-        // columns out of step from then on.
+        // the batch: dropping it would leave the entity's columns out of step
+        // from then on.
         let mut write_failure: Option<(ComponentId, WorldError)> = None;
         world.insert_entity_with_components(entity, component_ids, None, |storage| {
             for component_adder in component_adders {
@@ -522,14 +521,14 @@ impl CommandQueue {
             }
         });
 
-        // Step 3: Write type-erased components once the entity row exists.
+        // Step 4: Write type-erased components once the entity row exists.
         //
         // These were validated when the command was queued, not now. A reload
         // that retires a component type between the queue and the flush leaves
         // this naming storage that no longer exists, so the failure is
-        // collected and reported with the rest of the batch. It used to be an
-        // `expect`, which panicked inside `process_frame` - and for a managed
-        // project that unwinds across the C ABI.
+        // collected and reported with the rest of the batch. A panic here
+        // would unwind inside the flush - and for a managed project, across
+        // the C ABI.
         let mut errors = Vec::new();
         if let Some((component_id, _error)) = write_failure {
             errors.push(CommandError::ComponentWriteFailed {
@@ -592,9 +591,9 @@ impl CommandQueue {
         // The blob was validated when the command was queued, not now. A
         // reload that retires a component type between the queue and the
         // flush leaves this naming storage that no longer exists, so the
-        // failure is collected with the rest of the batch. It used to be an
-        // `expect`, which panicked inside the flush - and for a managed
-        // project that unwinds across the C ABI.
+        // failure is collected with the rest of the batch. A panic here would
+        // unwind inside the flush - and for a managed project, across the C
+        // ABI.
         if let Err(_error) = world.add_descriptor_component(entity, component_id, &bytes) {
             errors.push(CommandError::ComponentWriteFailed {
                 entity,
@@ -784,9 +783,9 @@ impl Default for CommandQueue {
 /// Commands allows systems to perform deferred entity operations
 ///
 /// This is a system parameter that provides access to the command queue
-/// and world.  Entity IDs are allocated eagerly from the free list at
-/// `build()` time so the caller can track them immediately, even though
-/// the entity won't exist in the world until deferred commands are flushed.
+/// and world.  [`Self::create_entity`] allocates the entity id eagerly from
+/// the free list, so the caller can track it immediately even though the
+/// entity won't exist in the world until deferred commands are flushed.
 pub struct Commands<'a> {
     /// The queue that deferred operations are appended to.
     command_queue: &'a mut CommandQueue,
@@ -863,7 +862,10 @@ pub struct DeferredEntityBuilder<'a> {
 
 impl<'a> DeferredEntityBuilder<'a> {
     /// Create a new DeferredEntityBuilder with a pre-allocated entity ID.
-    /// Called by [`Commands::create_entity`] and [`ScriptContext::create_entity`].
+    ///
+    /// Called by [`ScriptContext::create_entity`](crate::scripting::ScriptContext::create_entity);
+    /// [`Commands::create_entity`] builds the same state inline because it
+    /// already holds the world it allocated the handle from.
     pub fn new(command_queue: &'a mut CommandQueue, world: &mut World) -> Self {
         Self {
             command_queue,
@@ -975,19 +977,8 @@ mod tests {
 
     impl Component for OwningComponent {}
 
-    /// Tests basic entity creation through the deferred command queue.
-    ///
-    /// This test verifies that:
-    /// - Commands can queue entity creation without immediate execution
-    /// - The entity is only created when execute_queued_commands() is called
-    /// - The created entity is properly tracked in the world
-    /// - Components are correctly added to the entity's archetype
-    ///
-    /// Expected results:
-    /// - Before execution: 0 entities exist in the world
-    /// - After execution: 1 entity exists with 2 components (Position+Velocity)
-    /// - 1 archetype is created to store the entity
-    /// - The archetype contains the correct component types
+    /// A queued creation stays invisible until the flush, then appears as one
+    /// entity in one archetype carrying both components.
     #[test]
     fn test_create_command() {
         let mut world = World::new();
@@ -1029,18 +1020,7 @@ mod tests {
         );
     }
 
-    /// Tests the EntityBuilder fluent API for creating entities.
-    ///
-    /// This test verifies that:
-    /// - EntityBuilder provides a fluent interface for entity creation
-    /// - Multiple components can be chained using .with() method
-    /// - The .build() method queues the creation command
-    /// - Entity creation is deferred until execute_queued_commands() is called
-    ///
-    /// Expected results:
-    /// - Before execution: World contains 0 entities
-    /// - After execution: World contains 1 entity with both components
-    /// - The fluent API works correctly without errors
+    /// The builder's chained `with` calls queue one deferred creation.
     #[test]
     fn test_entity_builder() {
         let mut world = World::new();
@@ -1204,15 +1184,15 @@ mod tests {
         );
     }
 
-    /// An archetype migration moves a component that owns memory; it does not
-    /// clone it and drop the original.
+    /// A component that owns memory travels across an archetype migration as a
+    /// move, not a clone-and-drop.
     ///
-    /// This is the property the copier used to break. A row travelled by deep
-    /// clone followed by a deep drop, so a component holding a `Vec` paid an
-    /// allocation and a free on every archetype change, and any `Clone` impl
-    /// with side effects ran during what the engine calls a relocation. The
-    /// live count is the witness: it may not move while the entity does, and it
-    /// must reach zero exactly once when the entity is destroyed.
+    /// A row must not be deep-cloned and then dropped: a component holding a
+    /// `Vec` would pay an allocation and a free on every archetype change, and
+    /// any `Clone` impl with side effects would run during what the engine
+    /// calls a relocation. The live count is the witness: it may not move while
+    /// the entity does, and it must reach zero exactly once when the entity is
+    /// destroyed.
     #[test]
     fn a_migration_moves_an_owning_component_rather_than_cloning_it() {
         let _guard = owning_component_test_guard();
@@ -1301,22 +1281,8 @@ mod tests {
         assert!(world.destroy_entity(entity));
     }
 
-    /// Tests entity archetype migration and automatic cleanup when components are removed.
-    ///
-    /// This test verifies that:
-    /// - An entity can be created with multiple components through the command queue
-    /// - Components can be removed from an entity after creation
-    /// - Removing a component migrates the entity to a new archetype
-    /// - The old archetype is automatically cleaned up when it becomes empty
-    /// - The entity remains valid and properly tracked after component removal
-    /// - Scope-based borrow management allows sequential command queueing and execution
-    ///
-    /// Expected results:
-    /// - Initially: Entity created with Position+Velocity components
-    /// - After removing Velocity: Entity migrates to Position-only archetype
-    /// - Old Position+Velocity archetype is automatically deleted
-    /// - Only 1 archetype remains in the world (Position-only)
-    /// - Entity continues to exist with correct component set
+    /// Removing a component migrates the entity to the smaller archetype and
+    /// retires the one it left once that archetype is empty.
     #[test]
     fn test_entity_builder_archetype_deletion() {
         let mut world = World::new();
@@ -1380,22 +1346,8 @@ mod tests {
         archetype.print_info(&world.component_registry);
     }
 
-    /// Tests creating multiple entities with different component combinations through commands.
-    ///
-    /// This test verifies that:
-    /// - Multiple entity creation commands can be queued before execution
-    /// - Entities with different component sets are created in separate archetypes
-    /// - All queued commands are executed correctly in a single execute_queued_commands() call
-    /// - The command queue properly handles entities with varying component combinations
-    /// - Archetype system correctly categorizes entities based on their components
-    ///
-    /// Expected results:
-    /// - 3 entities are created in total
-    /// - 3 different archetypes are created:
-    ///   1. Position+Velocity archetype for entity 1
-    ///   2. Position-only archetype for entity 2
-    ///   3. Velocity-only archetype for entity 3
-    /// - All entities are properly tracked in the world
+    /// Three queued creates with different component sets land in three
+    /// archetypes in one flush.
     #[test]
     fn test_multiple_create_commands() {
         let mut world = World::new();
@@ -1502,11 +1454,11 @@ mod tests {
     /// A queued removal of the very component whose storage vanished completes
     /// and leaves the entity consistent.
     ///
-    /// The migration used to refuse this, because the source release walked
-    /// every component the source archetype named and demanded a column for
-    /// each. Now a component the destination does not take has nothing left to
-    /// release, so the removal is exactly the repair the desynced entity needs:
-    /// it lands in a well-formed archetype and the broken one is retired.
+    /// The source release walks the components the source archetype actually
+    /// holds columns for, so a component the destination does not take has
+    /// nothing left to release: the removal is exactly the repair the desynced
+    /// entity needs, landing it in a well-formed archetype and retiring the
+    /// broken one.
     #[test]
     fn a_queued_remove_of_a_component_whose_storage_vanished_completes() {
         let mut world = World::new();
@@ -1567,10 +1519,9 @@ mod tests {
     /// A migration that cannot carry a column across is reported as
     /// `MigrationFailed`, never panicked on.
     ///
-    /// The migration path used to `expect("descriptor storage missing")`, which
-    /// aborted the frame inside the flush. The desync is collected as a typed
-    /// `WorldError` and surfaced through the command error list instead - and
-    /// it is refused before anything moves, so the entity stays where it was.
+    /// The desync arrives as a typed `WorldError` and is surfaced through the
+    /// command error list, and it is refused before anything moves, so the
+    /// entity stays where it was.
     #[test]
     fn a_queued_migration_that_cannot_carry_a_column_is_reported() {
         let mut world = World::new();
@@ -1640,11 +1591,11 @@ mod tests {
     /// A raw-byte write the destination column refuses is reported, not
     /// dropped.
     ///
-    /// The adder used to end in `.ok()`. By the time it runs, the archetype
-    /// already holds the entity's row in every other column, so a swallowed
-    /// refusal left this one short: every later row of this component read
-    /// another entity's value, and a debug build tripped the archetype's
-    /// one-row-per-column assertion at the next migration.
+    /// By the time the adder runs, the archetype already holds the entity's row
+    /// in every other column, so a swallowed refusal would leave this one short:
+    /// every later row of this component would read another entity's value, and
+    /// a debug build trips the archetype's one-row-per-column assertion at the
+    /// next migration.
     #[test]
     fn a_native_component_write_the_column_refuses_is_reported() {
         let mut world = World::new();
@@ -1676,12 +1627,12 @@ mod tests {
                 if *failed_entity == entity && *failed_component == component_id
         ));
     }
-    /// A refused deferred creation puts its entity slot back (W-0093).
+    /// A refused deferred creation puts its entity slot back.
     ///
     /// `Commands::create_entity` allocates the handle eagerly, before the
-    /// command is queued. A create the flush refuses used to return without
-    /// releasing it, so the slot was never handed out again and the handle the
-    /// caller was given named nothing forever.
+    /// command is queued, so a create the flush refuses must release that slot:
+    /// otherwise it is never handed out again and the handle the caller was
+    /// given names nothing forever.
     #[test]
     fn a_refused_deferred_create_releases_its_entity_slot() {
         let mut world = World::new();

@@ -17,10 +17,9 @@
 //! [`SlotMap`] stays generic over the key, so one implementation serves every
 //! kind of resource a crate wants to address this way.
 //!
-//! This is deliberately not the engine's asset storage. `pill_engine` addresses
-//! assets through per-type columns and its own handle, because assets are
-//! registered by type and outlive a reload; a flat cache of built objects is a
-//! different problem, and this is the smaller tool for it.
+//! This is deliberately not the engine's asset storage: an asset is registered
+//! by type, addressed by a guid and has to outlive a reload, while this is a
+//! flat arena of built objects with no identity beyond its slot.
 
 // Standard library
 use std::{marker::PhantomData, num::NonZeroU32};

@@ -12,24 +12,21 @@
 //!
 //! # Design
 //!
-//! The surface, the device and the queue cannot be built independently: adapter
-//! selection needs a compatible surface, device creation needs the adapter, and
-//! the surface cannot be configured until a device exists. [`Surface::create`]
-//! therefore returns all three. It owns what is surface state - the swapchain,
-//! its configuration, and the format chosen from the surface's capabilities -
-//! and takes the device as an argument wherever it needs one, so a type named
-//! for the surface does not quietly become the device's owner.
+//! The surface, the device and the queue are built together by
+//! [`Surface::create`], because none of the three can be created without the
+//! others. The type owns what is surface state - the swapchain, its
+//! configuration, and the format chosen from the surface's capabilities - and
+//! takes the device as an argument wherever it needs one, so a type named for
+//! the surface does not quietly become the device's owner.
 //!
 //! Nothing here names a windowing crate: the surface is built from a
 //! [`RawWindowData`] - the window's platform handles as plain data - and the
-//! sizes that reach it are plain pixels. That is what lets a frontend on any
+//! sizes that reach it are plain pixels, which is what lets a frontend on any
 //! windowing crate (winit in the standalone host, tao in the editor) attach
-//! this renderer, and what keeps a windowing crate out of this one.
+//! this renderer.
 
 // External crates
 use pill_core::{info, warn};
-
-// External crates
 use pill_renderer_api::RawWindowData;
 
 // Current crate
@@ -88,9 +85,9 @@ fn preferred_present_mode(
 
 /// The colour format every pipeline rendering to this surface declares.
 ///
-/// Preference order taken from the reference: an sRGB target where the surface
-/// offers one, Rgba ahead of Bgra because it needs no channel swizzle, and
-/// finally whatever the surface does advertise rather than refusing to start.
+/// An sRGB target where the surface offers one, Rgba ahead of Bgra because it
+/// needs no channel swizzle, and finally whatever the surface does advertise
+/// rather than refusing to start.
 fn pick_color_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
     [
         wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -154,10 +151,8 @@ pub struct Surface {
 impl Surface {
     /// Builds the GPU bootstrap: instance, surface, adapter, device and queue.
     ///
-    /// Returns the surface beside the device and queue it was configured with,
-    /// because the three cannot be created separately - adapter selection needs
-    /// a compatible surface, and the surface cannot be configured before there
-    /// is a device to configure it on.
+    /// Returns the surface beside the device and queue it was configured with;
+    /// none of the three can be created separately.
     ///
     /// # Errors
     ///
@@ -469,17 +464,17 @@ impl Surface {
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::SurfaceOutOfMemory`] when the surface is out of
-    /// memory, [`RendererError::SurfaceLost`] when it is still lost or outdated
-    /// after one reconfiguration, and [`RendererError::SurfaceTextureFailed`]
-    /// for anything else.
+    /// Returns [`RendererError::SurfaceLost`] when the swapchain is still lost
+    /// or outdated after one reconfiguration, and
+    /// [`RendererError::SurfaceTextureFailed`] with wgpu's status for any other
+    /// acquisition failure.
     pub fn acquire(&mut self, device: &wgpu::Device) -> Result<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Ok(frame),
             // A lost or outdated swapchain is recovered by reconfiguring and
-            // retrying once; reporting it and returning left the renderer dead
-            // until some later resize event happened to arrive.
+            // retrying once; a second failure is reported, because waiting for
+            // a later resize event leaves the renderer dead until one arrives.
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.reconfigure(device)?;
                 match self.surface.get_current_texture() {

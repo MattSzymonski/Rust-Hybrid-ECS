@@ -1,16 +1,9 @@
 //! The smoke-test benchmark: one hot path, one size, fast to run.
 //!
-//! This is the target the documentation reaches for when it wants a quick check
-//! that the benchmark harness itself works - `--bench minimal --quick`. It is
-//! deliberately NOT a coverage target. `query_iteration.rs` measures query
-//! iteration across sixteen groups and three entity counts, and
-//! `archetype_migration.rs` covers migration; anything added here would
-//! duplicate them at a single hardcoded size.
-//!
-//! It previously declared four benchmarks in its documentation while three of
-//! them sat commented out of `criterion_group!`, so it measured a quarter of
-//! what it claimed. Those three duplicated groups that the dedicated targets
-//! already cover more thoroughly, and were removed rather than re-enabled.
+//! `--bench minimal --quick` runs it as a check that the benchmark harness
+//! itself works. It is deliberately not a coverage target: `query_iteration.rs`
+//! covers the iteration variants and `archetype_migration.rs` covers migration,
+//! so a case added here would only duplicate them at a single hardcoded size.
 //!
 //! # Responsibilities
 //!
@@ -19,13 +12,9 @@
 //!
 //! # Design
 //!
-//! Every benchmark builds a fresh [`World`](pill_engine::World) populated with
-//! a fixed number of entities before measuring, so each run starts from
-//! identical state. Change-detection benchmarks dirty every entity and bump
-//! the world tick before measuring so the [`Changed`] filter matches the full
-//! set. The archetype-migration benchmark uses Criterion's batched mode with
-//! [`BatchSize::LargeInput`] to rebuild the world per iteration, keeping setup
-//! cost out of the measurement.
+//! The world is rebuilt before measuring, populated with [`QUERY_ENTITIES`]
+//! entities carrying [`Position`] and [`Velocity`], so every run starts from
+//! identical state and the measured cost is the iteration loop alone.
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -35,14 +24,14 @@ use pill_engine::{Component, Entity, Query, World};
 // Constants
 // =============================================================================
 
-/// Number of entities populated for the query iteration benchmarks.
+/// Number of entities the benchmark's world is populated with.
 const QUERY_ENTITIES: usize = 100_000;
 
 // =============================================================================
 // Position
 // =============================================================================
 
-/// Two-dimensional position component used by the query benchmarks.
+/// Two-dimensional position component used by the query benchmark.
 ///
 /// Larger than a scalar component, so reading it stresses the iterator's
 /// memory-bandwidth path.
@@ -59,9 +48,9 @@ impl Component for Position {}
 // Velocity
 // =============================================================================
 
-/// Two-dimensional velocity component used by the query benchmarks.
+/// Two-dimensional velocity component used by the query benchmark.
 ///
-/// Read alongside [`Position`] so unfiltered queries iterate two components
+/// Read alongside [`Position`] so the unfiltered query iterates two components
 /// per entity.
 #[derive(Clone)]
 struct Velocity {
@@ -73,22 +62,14 @@ struct Velocity {
 impl Component for Velocity {}
 
 // =============================================================================
-// Trait Accessibility
-// =============================================================================
-
-// Registers the component types as trait-accessible so the type-erased
-// query machinery can downcast to them at runtime.
-
-// =============================================================================
 // Free Functions
 // =============================================================================
 
 /// Builds a fresh [`World`](pill_engine::World) pre-populated with
 /// `entity_count` entities.
 ///
-/// Every entity carries [`Position`] and [`Velocity`] components so all
-/// entities match the unfiltered query archetype and setup cost stays uniform
-/// across benchmarks.
+/// Every entity carries [`Position`] and [`Velocity`] components, so every
+/// entity matches the unfiltered query archetype.
 ///
 /// Returns the world together with the handles of the created entities.
 fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {

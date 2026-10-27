@@ -1,31 +1,25 @@
-//! `#[engine_error]` — one semantic error definition generating plain and
+//! `#[engine_error]` - one semantic error definition generating plain and
 //! styled messages.
 //!
 //! # Responsibilities
 //!
 //! - Parse the `#[engine_error]` attribute and its `#[message(...)]` DSL.
 //! - Generate `thiserror::Error` plain `Display` messages from the semantic
-//!   message AST — never the other way around.
-//! - Generate `miette::Diagnostic` implementations with stable diagnostic
-//!   codes derived from the namespace and variant name.
-//! - Generate [`EngineMessage`] implementations that render the semantic
-//!   message into a [`MessageRenderer`].
+//!   message AST, never the other way around.
+//! - Generate `miette::Diagnostic` implementations with stable diagnostic codes
+//!   derived from the namespace and variant name.
+//! - Generate `EngineMessage` implementations that render the semantic message
+//!   into a `MessageRenderer`.
 //!
 //! # Design
 //!
-//! The DSL supports the following message nodes:
-//!
-//! - `"plain text"` — ordinary text.
-//! - `general_style("Renderer")` / `specific_style(...)` /
-//!   `module_style(...)` / `name_style(...)` — static semantic tokens.
-//! - `general_style(field)` etc. — dynamic values rendered with a role.
-//! - `value(field)` — plain dynamic value.
-//! - `debug_value(field)` — debug representation of a dynamic value.
-//!
-//! `#[transparent]` variants delegate both plain and semantic rendering to
-//! the wrapped error and are the only supported composition mechanism.
-//! Diagnostic codes default to `namespace::snake_case_variant` and can be
-//! overridden with `#[code(other_name)]`.
+//! The DSL nodes are on `MessageNode`: plain text, the four styled-token roles
+//! (`general_style`, `specific_style`, `module_style`, `name_style`) with either
+//! a static string or a field, and `value` / `debug_value` for plain dynamic
+//! values. `#[transparent]` variants delegate both plain and semantic rendering
+//! to the wrapped error and are the only composition mechanism; diagnostic codes
+//! default to `namespace::snake_case_variant` and `#[code(other_name)]`
+//! overrides one.
 
 extern crate proc_macro;
 
@@ -555,9 +549,9 @@ fn existing_derives(item: &ItemEnum) -> HashSet<String> {
 // Entry Point
 // =============================================================================
 
-/// Generates `thiserror::Error` display output, `miette::Diagnostic` codes,
-/// and an `EngineMessage` implementation from one `#[message(...)]`
-/// definition per variant.
+/// Generates `thiserror::Error` display output, `miette::Diagnostic` codes and
+/// an `EngineMessage` implementation from one `#[message(...)]` definition per
+/// variant.
 ///
 /// # Errors
 ///
@@ -572,20 +566,15 @@ fn existing_derives(item: &ItemEnum) -> HashSet<String> {
 /// # Examples
 ///
 /// ```ignore
-/// use pill_core::error::EngineMessage;
-///
-/// #[engine_error(namespace = "host::build", runtime = "pill_core::error")]
+/// #[engine_error(namespace = host::build)]
 /// pub enum BuildError {
 ///     #[message("failed to link {general_style(crate_name)}")]
 ///     LinkFailed { crate_name: String },
 ///
 ///     #[transparent]
-///     Io(std::io::Error),
+///     Toolchain(#[from] ToolchainError),
 /// }
 /// ```
-///
-/// The example is marked `ignore` because proc-macro expansion cannot run
-/// inside a doc-test of the macro crate itself.
 #[proc_macro_attribute]
 pub fn engine_error(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(attribute as MacroArguments);

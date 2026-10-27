@@ -100,8 +100,6 @@ struct Position {
 
 impl Component for Position {}
 
-// Make components accessible through trait objects
-
 // =============================================================================
 // Entry Point
 // =============================================================================

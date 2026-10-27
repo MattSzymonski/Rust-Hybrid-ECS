@@ -3,35 +3,28 @@
 //!
 //! # Responsibilities
 //!
-//! - Watch the `shaders/` directory of the renderer's data crate for HLSL
-//!   edits, and debounce them like source edits.
-//! - Cook the whole tree on the worker thread with
-//!   [`pill_assets::cook_shader_tree`], the routine the data crate's build
-//!   script runs, so a runtime cook and a build agree on files and headers.
+//! - Watch the data crate's `shaders/` for HLSL edits, debounced like source
+//!   edits, and cook the whole tree with [`pill_assets::cook_shader_tree`] -
+//!   the routine the crate's build script runs, so both agree on outputs.
 //! - Queue each re-cooked file as a [`CookedShader`] for the main thread, which
 //!   hands it to the data crate's `pill_render_data_shader_changed` export.
 //!
 //! # Design
 //!
-//! The worker thread runs only host code and `slangc`: it never calls into a
-//! module image, so a data crate reload can swap the image at any time without
-//! a thread running inside the one being retired. The main thread delivers the
-//! queue at the frame boundary, after the reloads, through the export of the
-//! data generation current at that moment.
+//! The worker thread runs only host code and `slangc`, never inside a module
+//! image, so a data crate reload can swap the image at any time. The main
+//! thread delivers the queue at the frame boundary, after the reloads, through
+//! the export of the data generation current at that moment.
 //!
-//! Cooking only writes stale outputs, and a header is an input of every source,
-//! so an edited source re-cooks that source and an edited header re-cooks every
-//! source. A cook `slangc` rejects is logged and queues nothing: the assets keep
-//! their text, and the previous shader keeps drawing until a save fixes it.
-//!
-//! What is queued is every output whose text differs from the last text the
-//! worker knew for it, not only what this cook rebuilt: a data crate rebuild
-//! runs the same cook from its build script, and when that one gets to an
-//! edited source first, the worker finds nothing stale - the edit still has to
-//! reach the assets the running world holds.
-//!
-//! Only `.hlsl` events count. The cooked `.wgsl` files are written beside the
-//! sources, so the worker's own output would otherwise feed back in as edits.
+//! Cooking writes only stale outputs, so an edited header re-cooks every
+//! source. A cook `slangc` rejects is logged and queues nothing, and the
+//! previous shader keeps drawing. What is queued is every output whose text
+//! differs from the last text the worker knew for it, not only what this cook
+//! rebuilt: a data crate rebuild runs the same cook from its build script, and
+//! when that one gets to an edited source first the worker finds nothing stale,
+//! so the edit still has to reach the running world. Only `.hlsl` events count;
+//! the cooked `.wgsl` files sit beside the sources and would otherwise feed
+//! back in as edits.
 
 // Standard library
 use std::collections::HashMap;
@@ -82,9 +75,8 @@ impl ShaderWatcher {
             return Ok(None);
         }
 
-        // Step 1: Spawn the shared watcher worker with the shader acceptance
-        // (`.hlsl` sources only; the cooked `.wgsl` files are written beside
-        // them and would otherwise feed back in as edits) and the cook step.
+        // Spawn the shared watcher worker with the shader acceptance (`.hlsl`
+        // sources only) and the cook step.
         let (cooked_sender, cooked) = channel::<CookedShader>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

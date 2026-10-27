@@ -3,27 +3,24 @@
 //!
 //! # Responsibilities
 //!
-//! - Build what a material's draws need: the parameters bind group over the
-//!   values its shader reads and the textures bind group over the slots it
-//!   declares ([`RendererMaterial`]).
-//! - Pack uniform values one 16-byte slot each, in the order the shader
-//!   declares them. A pass packs through the same two functions, so the two
-//!   cannot drift apart on what they hand a shader.
-//! - Fall back to the renderer's default texture for a slot's type when a
-//!   material leaves it unbound, and refuse a depth slot instead of filling
-//!   it: depth belongs to a pass, the only thing that can hand it to a
-//!   shader. A texture whose shape (2D or cube) differs from its slot's is
-//!   refused by name.
+//! - Build the parameters and textures bind groups a material's draws bind,
+//!   following the slots its shader declares ([`RendererMaterial`]).
+//! - Pack uniform values one 16-byte slot each, in declaration order. A pass
+//!   packs through the same two functions, so a material and a pass cannot
+//!   hand a shader different layouts.
+//! - Fall back to the renderer's default texture for a slot's type, and
+//!   refuse a depth slot: depth belongs to a pass, the only thing that can
+//!   hand it to a shader. A texture whose shape (2D or cube) differs from its
+//!   slot's is refused by name.
 //!
 //! # Design
 //!
 //! Built during asset sync, when the material's own content version moves,
 //! not per frame - a frame only binds what was built. A shader or texture
-//! rebuilt under a material takes the material with it: the sync forgets the
-//! materials that read the rebuilt key, so this path runs again against the
-//! new object. The struct keeps handles and bind groups, never the uniform
-//! buffer itself: a bind group holds what it references, so the buffer lives
-//! exactly as long as the group that reads it.
+//! rebuilt under a material takes the material with it, because the sync
+//! forgets the materials that read the rebuilt key. The struct keeps bind
+//! groups, never the uniform buffer: a bind group holds what it references,
+//! so the buffer lives exactly as long as the group that reads it.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -77,21 +74,16 @@ pub struct RendererMaterial {
 impl RendererMaterial {
     /// Builds one material's bind groups against the shader it names.
     ///
-    /// Both groups follow the shader's declared slots rather than the
-    /// material's maps, so a value or texture bound under a name the shader
-    /// never declares is ignored, and a declared slot the material leaves
-    /// unbound falls back to its default. A shader that declares no slots of
-    /// a kind gets no group of that kind.
+    /// Both groups follow the shader's declared slots rather than the material's
+    /// maps: a value or texture bound under a name the shader never declares is
+    /// ignored, and a declared slot left unbound falls back to its default.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::RendererResourceNotFound`] when the shader
-    /// handle names no loaded shader, and [`RendererError::Other`] when a
-    /// bind group fails to build - validation is scoped so a mismatch between
-    /// what the shader declares and what the material supplies is reported
-    /// against the material instead of panicking through wgpu's
-    /// uncaptured-error handler. A texture slot declared as depth is also an
-    /// error: only a pass can read the renderer's depth buffer.
+    /// Returns [`RendererError::RendererResourceNotFound`] when the handle
+    /// names no loaded shader, [`RendererError::Other`] when a bind group
+    /// fails to build, including a depth texture slot: only a pass can read
+    /// the depth buffer.
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -109,10 +101,8 @@ impl RendererMaterial {
         let parameter_slots = &shader.parameter_slots;
         let texture_slots = &shader.texture_slots;
 
-        // Create parameters uniform buffer and bind group if there are parameter slots
         let parameters_bind_group = {
             if !parameter_slots.is_empty() {
-                // Calculate uniform buffer size, create buffer if needed and write data to it
                 let parameters_uniform_buffer_size = Self::calculate_uniform_size(parameter_slots);
 
                 let parameters_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -122,7 +112,6 @@ impl RendererMaterial {
                     mapped_at_creation: false,
                 });
 
-                // Write parameter data to buffer
                 Self::write_parameters_to_buffer(
                     queue,
                     &parameters_uniform_buffer,
@@ -130,9 +119,8 @@ impl RendererMaterial {
                     parameters,
                 )?;
 
-                // Create parameters uniform buffer bind group; scoped so a
-                // binding mismatch is reported against the material instead of
-                // panicking through the uncaptured-error handler.
+                // Scoped so a binding mismatch is reported against the material
+                // instead of panicking through the uncaptured-error handler.
                 let parameters_bind_group = capturing_validation(device, || {
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some(&format!("{}_material_parameters_bind_group", name)),
@@ -155,7 +143,6 @@ impl RendererMaterial {
             }
         };
 
-        // Create texture bind group
         let textures_bind_group = if !texture_slots.is_empty() {
             Some(Self::create_textures_bind_group(
                 device,
@@ -210,14 +197,13 @@ impl RendererMaterial {
     ///
     /// Walks the shader's slots in declaration order and writes one 16-byte
     /// region per slot, so a value is placed by the name the shader gave it
-    /// rather than by position in the map. A declared slot with no value
-    /// writes as zero, which keeps a partially filled material drawing
-    /// instead of refusing it.
+    /// rather than by position in the map.
     ///
     /// # Errors
     ///
-    /// Infallible today: a slot with no value packs as zero rather than
-    /// being refused, so no input reaches an error path.
+    /// Never returns an error: a declared slot with no value packs as zero,
+    /// which keeps a partially filled material drawing, and the pass path
+    /// calls this same function.
     pub(crate) fn write_parameters_to_buffer(
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
@@ -227,14 +213,13 @@ impl RendererMaterial {
         // Stage every slot in one vector so the GPU buffer is written once.
         let mut data = Vec::new();
 
-        // NOTE: Each parameter takes a full 16-byte slot (vec4 alignment in
-        // WGSL), padding included. Packing by type would use less buffer
-        // space, but the fixed slot is simpler and keeps a material and a
-        // pass packed identically.
+        // Each parameter takes a full 16-byte slot (vec4 alignment in WGSL),
+        // padding included. Packing by type would use less buffer space, but
+        // the fixed slot is simpler and keeps a material and a pass packed
+        // identically.
         for (slot_name, slot) in parameter_slots {
             match slot.parameter_type {
                 ShaderParameterType::Color => {
-                    // Color parameter (3 floats + padding)
                     if let Some(MaterialParameter::Color(value)) = parameters.get(slot_name) {
                         data.extend_from_slice(&value[0].to_le_bytes());
                         data.extend_from_slice(&value[1].to_le_bytes());
@@ -245,7 +230,6 @@ impl RendererMaterial {
                     }
                 }
                 ShaderParameterType::Scalar => {
-                    // Scalar parameter (1 float + padding)
                     if let Some(MaterialParameter::Scalar(value)) = parameters.get(slot_name) {
                         data.extend_from_slice(&value.to_le_bytes());
                         data.extend_from_slice(&[0u8; 12]); // Padding to 16 bytes
@@ -254,7 +238,6 @@ impl RendererMaterial {
                     }
                 }
                 ShaderParameterType::Bool => {
-                    // Bool parameter (1 u32 + padding)
                     if let Some(MaterialParameter::Bool(value)) = parameters.get(slot_name) {
                         let value: u32 = if *value { 1 } else { 0 };
                         data.extend_from_slice(&value.to_le_bytes());
@@ -278,15 +261,13 @@ impl RendererMaterial {
     /// Walks the shader's slots rather than the material's bindings, so each
     /// entry lands at the binding the shader declared and a slot the material
     /// left unbound falls back to the renderer's default color or normal
-    /// texture. Depth is refused rather than filled: a pass is the only thing
-    /// that can hand a shader a depth buffer, so a material shader that asks
-    /// for one has a mistake worth naming.
+    /// texture. Depth is refused rather than filled: only a pass can hand a
+    /// shader a depth buffer.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::Other`] for a depth slot, or when wgpu
-    /// rejects the group - creation is scoped so the failure names the
-    /// material instead of panicking through the uncaptured-error handler.
+    /// Returns [`RendererError::Other`] for a depth slot, or when wgpu rejects
+    /// the group - creation is scoped so the failure names the material.
     fn create_textures_bind_group(
         device: &wgpu::Device,
         rendering_resource_storage: &RendererResourceStorage,
@@ -298,7 +279,6 @@ impl RendererMaterial {
         let mut entries = Vec::new();
 
         for (slot_name, slot) in texture_slots {
-            // Get texture from material texture map or use default
             let renderer_texture_handle = match textures
                 .iter()
                 .find(|(k, _)| k == slot_name)
@@ -331,13 +311,11 @@ impl RendererMaterial {
                 texture,
             )?;
 
-            // Add texture view entry
             entries.push(wgpu::BindGroupEntry {
                 binding: slot.texture_binding,
                 resource: wgpu::BindingResource::TextureView(&texture.texture_view),
             });
 
-            // Add sampler entry
             entries.push(wgpu::BindGroupEntry {
                 binding: slot.sampler_binding,
                 resource: wgpu::BindingResource::Sampler(&texture.sampler),

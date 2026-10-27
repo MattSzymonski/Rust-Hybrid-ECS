@@ -9,10 +9,11 @@
 //!
 //! # Design
 //!
-//! These wrappers hold plain addresses with no ownership semantics. Moving
-//! them between threads is harmless; sharing `&SendPtr<T>` only allows
-//! copying the address. Actual dereference requires `unsafe` blocks that
-//! the query system protects through the scheduler's disjoint-access guarantee.
+//! These wrappers exist so a query resolves component storage once per
+//! archetype and then reads or writes rows on any worker thread without
+//! repeated `HashMap` lookups. They carry addresses and no ownership: the
+//! query holds the exclusive `World` borrow that keeps the pointed-to storage
+//! alive, un-reallocated and disjoint across threads.
 
 // =============================================================================
 // SendPtr
@@ -21,10 +22,9 @@
 /// Thread-safe wrapper around a `*const T` used to share read-only component
 /// pointers across worker threads.
 ///
-/// The wrapper holds a plain address with no ownership semantics; moving it
-/// between threads is harmless and sharing `&SendPtr<T>` only allows copying
-/// the address. Dereference requires `unsafe` and is protected by the query
-/// scheduler's disjoint-access guarantee.
+/// The wrapper holds a plain address with no ownership semantics, so moving or
+/// sharing it is harmless. Dereferencing requires `unsafe` and is protected by
+/// the query scheduler's disjoint-access guarantee.
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(*const T);
 
@@ -32,12 +32,12 @@ pub struct SendPtr<T>(*const T);
 // transferring it across threads moves only an address; no data race or
 // aliasing violation can arise from the move itself.
 //
-// Bounded on `T` rather than unconditional. The wrapper alone would be sound
-// for any `T`, because it never dereferences - but its whole purpose is to be
-// dereferenced on a worker thread, and an unbounded impl would silently make
-// `SendPtr<Rc<_>>` cross threads with nothing but an `unsafe` block between
-// that and a data race. The bound puts the requirement where the type system
-// can see it. Every current use is a `T: Component`, which is already `Send`.
+// Bounded on `T: Send` rather than unconditional. The wrapper alone would be
+// sound for any `T`, because it never dereferences - but its whole purpose is
+// to be dereferenced on a worker thread, and an unbounded impl would silently
+// let `SendPtr<Rc<_>>` cross threads with nothing but an `unsafe` block
+// between that and a data race. The bound puts the requirement where the type
+// system can see it.
 unsafe impl<T: Send> Send for SendPtr<T> {}
 // SAFETY: Shared access `&SendPtr<T>` only permits copying the stored address
 // out; the wrapper never dereferences the pointer, so no `&mut` aliasing or

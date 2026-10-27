@@ -27,7 +27,8 @@ use std::{
 // Type-name reflection
 // =============================================================================
 
-/// Short name of `T` with any module path stripped.
+/// Short name of `T`: its full name with everything up to and including the
+/// last `:` removed, so `std::vec::Vec<u8>` reads as `Vec<u8>`.
 ///
 /// # Examples
 ///
@@ -46,7 +47,8 @@ pub fn get_type_name<T>() -> String {
         .to_string()
 }
 
-/// Short name of the type of `value`, with any module path stripped.
+/// Short name of the type of `value`: its full name with everything up to and
+/// including the last `:` removed.
 ///
 /// # Examples
 ///
@@ -74,14 +76,8 @@ pub fn get_value_type_name<T>(_: &T) -> String {
 /// ```
 /// use pill_core::utils::enum_variant_eq;
 ///
-/// #[derive(Debug)]
-/// enum Choice {
-///     First,
-///     Second,
-/// }
-///
-/// assert!(enum_variant_eq(&Choice::First, &Choice::First));
-/// assert!(!enum_variant_eq(&Choice::First, &Choice::Second));
+/// assert!(enum_variant_eq(&Some(1), &Some(2)));
+/// assert!(!enum_variant_eq(&Some(1), &None::<i32>));
 /// ```
 pub fn enum_variant_eq<T>(a: &T, b: &T) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
@@ -96,14 +92,8 @@ pub fn enum_variant_eq<T>(a: &T, b: &T) -> bool {
 /// ```
 /// use pill_core::utils::get_enum_variant_type_name;
 ///
-/// #[derive(Debug)]
-/// enum Shape {
-///     Circle(f32),
-///     Square,
-/// }
-///
-/// assert_eq!(get_enum_variant_type_name(&Shape::Circle(2.0)), "Circle");
-/// assert_eq!(get_enum_variant_type_name(&Shape::Square), "Square");
+/// assert_eq!(get_enum_variant_type_name(&Some(2.0)), "Some");
+/// assert_eq!(get_enum_variant_type_name(&None::<f32>), "None");
 /// ```
 pub fn get_enum_variant_type_name<T: core::fmt::Debug>(value: &T) -> String {
     // The `Debug` representation starts with the variant name, optionally
@@ -152,20 +142,10 @@ pub enum AssetPathError {
 /// ```
 /// use pill_core::utils::get_project_error_message;
 ///
-/// #[derive(Debug)]
-/// struct ProjectError;
-///
-/// impl std::fmt::Display for ProjectError {
-///     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-///         formatter.write_str("project exploded")
-///     }
-/// }
-///
-/// impl std::error::Error for ProjectError {}
-///
-/// let result: Result<(), ProjectError> = Err(ProjectError);
-/// let message = get_project_error_message(result).expect("error should format");
-/// assert!(message.contains("project exploded"));
+/// let error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing preset");
+/// let message = get_project_error_message(Err(error)).expect("an error formats");
+/// assert!(message.starts_with("Pill project error: missing preset"));
+/// assert!(get_project_error_message(Ok::<(), std::io::Error>(())).is_none());
 /// ```
 pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) -> Option<String> {
     result.err().map(|error| {
@@ -185,11 +165,10 @@ pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) ->
 
 /// Format an error and its full source chain on a single line.
 ///
-/// Console reports render errors with `Display`, which shows only the outermost
-/// message. The cause that names the actual problem - which import could not be
-/// resolved, which file was not found - sits under it in the chain, so a report
-/// built from `Display` alone says an operation failed without saying why.
-/// Causes are appended in order, separated by `: `.
+/// A console report built from `Display` shows only the outermost message, and
+/// the cause that names the actual problem - which import could not be
+/// resolved, which file was not found - sits under it in the chain. Causes are
+/// appended in order, separated by `: `.
 ///
 /// Use [`get_project_error_message`] where a multi-line report is wanted: this
 /// one is shaped for one log line.
@@ -199,18 +178,8 @@ pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) ->
 /// ```
 /// use pill_core::utils::format_error_chain;
 ///
-/// #[derive(Debug)]
-/// struct ProjectError;
-///
-/// impl std::fmt::Display for ProjectError {
-///     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-///         formatter.write_str("project exploded")
-///     }
-/// }
-///
-/// impl std::error::Error for ProjectError {}
-///
-/// assert_eq!(format_error_chain(&ProjectError), "project exploded");
+/// let error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing preset");
+/// assert_eq!(format_error_chain(&error), "missing preset");
 /// ```
 pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut message = error.to_string();
@@ -284,26 +253,25 @@ where
         + Add<Output = T>
         + Not<Output = T>,
 {
-    // Step 1: Compute the bit width of `T` as a `T`-typed value.
+    // Step 1: Compute the bit width of `T` and reject a range whose end
+    // reaches or exceeds it.
     let mask_size = T::from(std::mem::size_of::<T>() as u8 * 8);
-
-    // Step 2: Reject ranges whose end reaches or exceeds the mask width.
     if mask_range.end >= mask_size {
         panic!("Provided mask range exceeds mask size");
     }
 
-    // Step 3: Reject a reversed range. Its length would underflow, and the
+    // Step 2: Reject a reversed range. Its length would underflow, and the
     // shift that length feeds is masked to the type's width, so the caller
     // would get a run of bits unrelated to the range it asked for.
     if mask_range.start > mask_range.end {
         panic!("Provided mask range is reversed");
     }
 
-    // Step 4: Derive the run length and the shift aligning it to the MSB.
+    // Step 3: Derive the run length and the shift aligning it to the MSB.
     let range_length: T = mask_range.end - mask_range.start + T::from(1);
     let mask_shift = mask_size - mask_range.end - T::from(1);
 
-    // Step 5: Build the mask, handling a full-width run separately because
+    // Step 4: Build the mask, handling a full-width run separately because
     // shifting by the full bit width would overflow.
     match range_length == mask_size {
         true => !(T::from(0)) << mask_shift,

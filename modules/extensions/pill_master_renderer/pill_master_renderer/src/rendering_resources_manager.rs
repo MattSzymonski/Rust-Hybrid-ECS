@@ -16,16 +16,13 @@
 //! # Design
 //!
 //! A mirror, not a cache: `AssetManager` looks assets up by handle and this
-//! caches by key, so every sync walks the store's column for its own type. That
-//! walk is the only way back from a cached key to whether the asset behind it is
-//! still live - a key with no asset is a removal, and its object goes with it.
+//! caches by key, so every sync walks the store's column for its own type - the
+//! only way back from a cached key to whether the asset behind it is still live.
 //!
-//! Failures are per-asset, never fatal. A texture that will not upload, a shader
-//! that will not compile, a material whose pipeline will not build: each is
-//! named in the log and skipped, and the rest of the revision still reaches the
-//! GPU. A running game losing one asset's picture is a better outcome than the
-//! frame not happening at all, and leaving the version unrecorded is what makes
-//! the next revision try that one asset again.
+//! Failures are per-asset, never fatal: a texture that will not upload, a shader
+//! that will not compile, a material whose pipeline will not build is named in
+//! the log and skipped, and the unrecorded version is what makes the next
+//! revision try it again.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -179,10 +176,10 @@ impl RenderingResourcesManager {
         // The last mesh and material keys resolved, with what they resolved to.
         // Instances that share both are usually many and adjacent (one
         // archetype's worth), so remembering one pair skips nearly every
-        // lookup: with 50,000 pills on one mesh and material, the lookups were
-        // almost all of this function's time. Nothing changes the caches
-        // during the call, so a remembered answer is the answer a fresh
-        // lookup would give.
+        // lookup - and those lookups are the whole of this function's time once
+        // thousands of instances share one mesh and material. Nothing changes
+        // the caches during the call, so a remembered answer is the answer a
+        // fresh lookup would give.
         let mut last_resolved = None;
         for (index, instance) in frame.instances.iter().enumerate() {
             let resolved = match last_resolved {
@@ -554,10 +551,10 @@ impl RenderingResourcesManager {
 /// together and kept as one pair.
 ///
 /// The lit WGSL is the shipped pipeline's own, not a copy of it: the vertex stage
-/// from `config/common_shaders`, the fragment from
-/// `config/simple_pipeline/shaders`. `simple_pipeline` names the same shader with
-/// the same declared slots, so a material written for this fallback draws there
-/// without being rebuilt.
+/// from `shader_sources/common_shaders/default_vertex.wgsl`, the fragment from
+/// `shader_sources/simple_pipeline/shaders/default_lit_fragment.wgsl`.
+/// `simple_pipeline` names the same shader with the same declared slots, so a
+/// material written for this fallback draws there without being rebuilt.
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {

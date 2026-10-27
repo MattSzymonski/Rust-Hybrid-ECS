@@ -3,18 +3,18 @@
 //! # Responsibilities
 //!
 //! - The scene viewport's menu: the gizmo tools, snapping, the space and the scene grid.
-//! - The composition menu's component list.
+//! - The Inspector's component menu: remove one component, or add any addable
+//!   one the entity does not carry.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
 /// The component menu: detach the heading's component, and attach any
-/// registered one the entity does not carry yet - both recorded under the
-/// native labels (`add {short}` / `remove {short}`).
+/// registered one the entity does not carry yet - both recorded through the
+/// shared builders, labelled `add {short}` / `remove {short}`.
 pub fn component_menu_items(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -37,9 +37,9 @@ pub fn component_menu_items(
     ui.menu_button(
         icons::rich(icons::Icon::PlusCircle, "Add Component"),
         |ui| {
-            // The same list the Inspector's Add popup offers (W-0049
-            // Stage 9): one rule decides what is addable, so the menu and the
-            // popup cannot disagree about a component the entity carries.
+            // The same list the Inspector's Add popup offers: one rule decides
+            // what is addable, so the menu and the popup cannot disagree about
+            // a component the entity carries.
             for type_name in addable_components(snapshot, detail) {
                 let short = inspector::short_component_name(type_name);
                 if ui
@@ -55,9 +55,10 @@ pub fn component_menu_items(
     );
 }
 
-/// The scene viewport's menu: the transform tools, snapping and the
-/// space, checked against the snapshot's gizmo settings. The items queue
-/// the same `SetGizmoTool` edit the tools' shortcuts land in.
+/// The scene viewport's menu: the transform tools, snapping, the space and the
+/// scene grid, checked against the snapshot's settings. The tool, space and
+/// snapping items queue the same `SetGizmoTool` edit the shortcuts queue; the
+/// Grid item queues `SetGrid`.
 #[pill_hot_fn]
 pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
     let settings = viewer.snapshot.gizmo;

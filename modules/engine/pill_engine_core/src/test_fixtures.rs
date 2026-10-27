@@ -10,15 +10,12 @@
 //!
 //! # Design
 //!
-//! The world, query and commands test modules each grew their own copies of
-//! these components, and the copies drifted: `Health` was a tuple in one
-//! module, `{ hp }` in another and `{ value: u32 }` in a third (SA-0071).
-//! One definition here keeps the suites testing the same shapes - a fixture
-//! that drifts makes a passing suite prove less than it reads like it does.
+//! One definition serves every suite, so the world, query and commands tests
+//! build their worlds out of the same shapes. A fixture that drifts between
+//! suites makes a passing test prove less than it reads like it does.
 //!
 //! `Health` is a tuple struct on purpose: the query suite writes it as a
-//! literal more than a hundred times, and a named field buys nothing a
-//! comment cannot.
+//! literal throughout, and a named field buys nothing a comment cannot.
 
 // Current crate
 use crate::component::Component;

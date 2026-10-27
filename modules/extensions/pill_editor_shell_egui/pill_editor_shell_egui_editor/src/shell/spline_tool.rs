@@ -1,4 +1,4 @@
-//! The Spline Tool panel (W-0038 Stage 12).
+//! The Spline Tool panel.
 //!
 //! # Responsibilities
 //!
@@ -6,7 +6,7 @@
 //!   show its values, and edit them through the same recorded commands the
 //!   Inspector uses.
 //! - [`reseed_window`]: the re-seed confirmation, a modal the shell owns and
-//!   this panel draws (W-0038 Stage 13).
+//!   this panel draws.
 //! - [`reseed_command`]: the write the confirmation applies, shared by the
 //!   modal's answer and the scripted channel so a test drives the same code
 //!   the button does.
@@ -84,8 +84,8 @@ pub fn spline_tool_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
         return;
     };
     ui.separator();
-    // The control points. Stage 15's expanded layout turns an element of a
-    // struct array into one scalar row per leaf (`control_points[0].x`), so a
+    // The control points. The engine's expanded layout names an element of a
+    // struct array as one scalar row per leaf (`control_points[0].x`), so a
     // point is three ordinary fields and the same recorded write path serves
     // it - no struct value ever has to cross this crate's boundary.
     let points = spline_point_count(component);

@@ -14,12 +14,11 @@
 //!
 //! The [`PillStyle`] trait is implemented for `&str` behind two
 //! `#[cfg(target_arch = ...)]` gates. The native build emits colored, bold
-//! text; the `wasm32` build returns the plain string (wrapping names in
-//! quotation marks) so callers share one styling API across targets. The
-//! trait is re-exported at the crate root and used by [`telemetry`] for
-//! semantic styling decisions.
+//! text; the `wasm32` build returns the plain string (quoting names) so
+//! callers share one styling API across targets. The trait is re-exported at
+//! the crate root and is what [`error`]'s terminal renderer styles through.
 //!
-//! [`telemetry`]: crate::telemetry
+//! [`error`]: crate::error
 
 // =============================================================================
 // PillStyle trait
@@ -48,7 +47,7 @@ pub trait PillStyle {
 
     /// Style a general object (Scene, Component, System, Resource, and so on).
     ///
-    /// Changes the color and adds bold weight.
+    /// Changes the color.
     fn general_object_style(self) -> String;
 
     /// Style a specific object (CameraComponent, Texture, Mesh, and so on).
@@ -94,7 +93,7 @@ impl PillStyle for &str {
     }
 
     /// Style a general object (Scene, Component, System, Resource, and so on):
-    /// changes the color and adds bold weight.
+    /// changes the color.
     #[inline]
     fn general_object_style(self) -> String {
         use colored::Colorize;

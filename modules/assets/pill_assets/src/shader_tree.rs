@@ -2,25 +2,22 @@
 //!
 //! # Responsibilities
 //!
-//! - Find the directories under a `shaders/` root that hold stage sources, and
-//!   the `include/` directories that hold headers ([`shader_tree_layout`]).
-//! - Cook every stale source in all of them in one call ([`cook_shader_tree`]),
-//!   with every header directory on the include path.
+//! - Find a `shaders/` root's source and header directories
+//!   ([`shader_tree_layout`]) and cook every stale source in one call
+//!   ([`cook_shader_tree`]), with every header directory on the include path.
 //!
 //! # Design
 //!
 //! One routine for the two places a crate's shaders are cooked: its build
 //! script, before the crate compiles, and the development host's shader
-//! watcher, while the crate runs. Both call this with the same root, so a
-//! runtime cook can never compile a different set of files, or resolve a header
-//! differently, than the build did - and neither has to name the crate's
-//! directories.
+//! watcher, while the crate runs. Both call it with the same root, so a runtime
+//! cook cannot compile a different set of files, or resolve a header
+//! differently, than the build did.
 //!
 //! # Convention
 //!
-//! - A directory named `include` holds headers. Every one of them in the tree
-//!   is on every source's include path: a source's own `include/` first (the
-//!   rule searches it anyway), then the rest in path order.
+//! - A directory named `include` holds headers, and every one in the tree is
+//!   on every source's include path: its own `include/` first, then the rest.
 //! - Any other directory that directly holds `.hlsl` files is a source
 //!   directory. Its sources are cooked to `.wgsl` beside them, with the stage
 //!   named by the file (see [`HlslToWgsl`]).

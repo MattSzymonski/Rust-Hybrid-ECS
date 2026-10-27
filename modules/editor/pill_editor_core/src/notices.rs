@@ -17,7 +17,7 @@
 //! executable owns this resource, and the shell draws from it, which is why it
 //! lives in this shared `dylib` rather than in the reloadable shell module: its
 //! identity survives a shell generation, and no field may point into a module
-//! image the reload unmaps (W-0038 Stages 4 and 6).
+//! image the reload unmaps.
 
 // External crates
 use pill_engine::Resource;

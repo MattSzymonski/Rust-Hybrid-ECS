@@ -48,8 +48,9 @@ pub struct Res<'w, T: Resource> {
 impl<'w, T: Resource> Res<'w, T> {
     /// Creates a new [`Res`] wrapper around the given [`World`].
     ///
-    /// Constructed by the system runner rather than called directly;
-    /// [`Res<T>`] parameters are built automatically when a system runs.
+    /// The system runner builds this through
+    /// [`SystemParam::fetch`](crate::system::SystemParam::fetch); calling it
+    /// directly is not the intended path.
     pub fn new(world: &'w World) -> Self {
         Self {
             world,
@@ -100,8 +101,9 @@ pub struct ResMut<'w, T: Resource> {
 impl<'w, T: Resource> ResMut<'w, T> {
     /// Creates a new [`ResMut`] wrapper around the given [`World`].
     ///
-    /// Constructed by the system runner rather than called directly;
-    /// [`ResMut<T>`] parameters are built automatically when a system runs.
+    /// The system runner builds this through
+    /// [`SystemParam::fetch`](crate::system::SystemParam::fetch); calling it
+    /// directly is not the intended path.
     pub fn new(world: &'w mut World) -> Self {
         // Take the debug write lock here rather than in `get_mut`, so acquire
         // and release share one granularity: this guard's lifetime, which is
@@ -133,7 +135,8 @@ impl<'w, T: Resource> ResMut<'w, T> {
     }
 }
 
-/// Releasing the debug write lock is what scopes it to one system.
+/// Dropping a `ResMut` releases its debug write lock, which is what scopes the
+/// lock to one system.
 ///
 /// A `ResMut` is built when a system's parameters are fetched and dropped when
 /// that system returns, so the lock it holds spans exactly the window in which

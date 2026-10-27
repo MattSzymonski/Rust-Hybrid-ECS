@@ -31,16 +31,16 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 # Hardcoded repository locations
 # =============================================================================
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+# The generator and Cargo both run from the Cargo workspace directory, which
+# is modules/ rather than the repository root that holds this script's folder.
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2] / "modules"
 DOCUMENTATION_GENERATOR_SCRIPT = Path(__file__).resolve().with_name(
     "generate_documentation.py"
 )
-OUTPUT_DIRECTORY = Path(
-    r"Z:\OtherProjects\Other\Pill-Engine-Website\docs\pages\reference"
-)
-SIDEBAR_DATA_FILE = Path(
-    r"Z:\OtherProjects\Other\Pill-Engine-Website\docs\.vitepress\reference-sidebar.ts"
-)
+# The generated tree is purged and rewritten on every run; the sidebar module
+# sits beside it, outside the purge root, so a run never deletes its own output.
+OUTPUT_DIRECTORY = Path(r"D:\Programming\Pill-Docs\reference")
+SIDEBAR_DATA_FILE = Path(r"D:\Programming\Pill-Docs\reference-sidebar.ts")
 CODE_REFERENCE_ROUTE = "/reference"
 
 # Primary items appear as full entries in a crate page. Fields, variants, and
@@ -1873,9 +1873,7 @@ def purge_output_directory() -> None:
     """Delete every existing entry from the exact hardcoded output directory."""
     # Resolve both paths before comparison so alternate path spellings cannot
     # bypass the hardcoded destructive-operation guard.
-    expected = Path(
-        r"Z:\OtherProjects\Other\Pill-Engine-Website\docs\pages\reference"
-    ).resolve()
+    expected = Path(r"D:\Programming\Pill-Docs\reference").resolve()
     resolved = OUTPUT_DIRECTORY.resolve()
 
     # Guard the recursive operation even though the value is hardcoded. Any
@@ -1925,9 +1923,7 @@ def write_sidebar_data(sidebar_data: str) -> Path:
     """Atomically replace the exact hardcoded generated sidebar module."""
     # This file lives outside the purged reference tree, so guard its exact path
     # independently rather than relying on write_output_file's root check.
-    expected = Path(
-        r"Z:\OtherProjects\Other\Pill-Engine-Website\docs\.vitepress\reference-sidebar.ts"
-    ).resolve()
+    expected = Path(r"D:\Programming\Pill-Docs\reference-sidebar.ts").resolve()
     destination = SIDEBAR_DATA_FILE.resolve()
     if destination != expected or destination.name != "reference-sidebar.ts":
         raise RuntimeError(

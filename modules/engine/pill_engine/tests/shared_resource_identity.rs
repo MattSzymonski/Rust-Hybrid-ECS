@@ -3,32 +3,25 @@
 //! # Responsibilities
 //!
 //! - Pin that one shared resource name binds two distinct types to one value.
-//! - Pin rehoming that refreshes the ops table without touching the bytes.
+//! - Pin the guards: a refused claim or removal leaves the stored value and
+//!   its claim untouched, and a rolled-back reload keeps it readable.
 //!
-//! # What is being simulated
+//! # Design
 //!
-//! The situation cannot be reproduced literally in one test binary: it needs
-//! one resource type compiled into two artifacts loaded into the same process,
-//! which is what gives that single type two `TypeId`s.
-//!
-//! Two distinct Rust types declaring the *same* shared name reproduce it
-//! faithfully, because that is exactly what the engine sees in the real case -
-//! two `TypeId`s, one declared identity, identical layouts - and it is the only
-//! thing the engine ever sees of it. The two live in modules and share the
-//! type's own name, as the real case does: `Settings` is `Settings` in whichever
-//! artifact compiled it, and only the module path differs.
+//! One resource type compiled into two artifacts gets two `TypeId`s, which one
+//! test binary cannot produce; two distinct Rust types declaring the *same*
+//! shared name stand in, because that is what the engine sees in the real case.
+//! They live in modules and share the type's own name, as the real case does:
+//! `Settings` is `Settings` in whichever artifact compiled it, and only the
+//! module path differs.
 //!
 //! The cross-artifact behaviour itself is covered end to end by
-//! `devops/tests/test_shared_component_identity.py`, whose resource scenario
-//! inserts from a module DLL and reads from the project, and whose writers make
-//! the scheduler keep them apart.
-//!
-//! The scheduler side is covered at five levels here: the pairwise answer
-//! (`conflicts_with`), the fallback when a caller mutates the sets after
-//! `build_component_masks`, the batching decision built on top of both
-//! (`SystemScheduler::build_execution_graph`), the rebuild a reload's `retain`
-//! does, and the running engine, where two systems that were batched together
-//! would trip the debug write lock.
+//! `devops/tests/test_shared_component_identity.py`. The scheduler side is
+//! covered here at five levels: the pairwise answer (`conflicts_with`), the
+//! fallback when a caller mutates the sets after `build_component_masks`, the
+//! batching decision above both (`SystemScheduler::build_execution_graph`), the
+//! rebuild a reload's `retain` does, and the running engine, where two systems
+//! batched together would trip the debug write lock.
 
 use pill_engine::query::{Res, ResMut};
 use pill_engine::scheduler::{SystemAccess, SystemScheduler};

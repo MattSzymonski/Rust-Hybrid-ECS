@@ -2,29 +2,26 @@
 //!
 //! # Responsibilities
 //!
-//! - Decide whether a source change is a body-only edit of a `#[pill_hot]`
-//!   function, and refuse loudly when it is anything else.
+//! - Decide whether a source change is a body-only edit of a function the host
+//!   can address, and refuse loudly when it is anything else.
 //! - Generate, compile and load a small patch library for that one function.
 //! - Install the replacement into the engine's dispatch slot at a frame
 //!   boundary.
 //!
 //! # Design
 //!
-//! This never replaces the existing reload. It runs first, and everything it
-//! refuses falls through to [`LoadedProject::reload`](crate::project_module) as
-//! before, so the worst outcome of a refusal is the behavior that existed
-//! before this module.
+//! This never replaces the whole-module reload: it runs first, and everything
+//! it refuses falls through to [`LoadedProject::reload`](crate::project_module).
 //!
-//! The classification is deliberately conservative. It strips the bodies of the
-//! annotated functions from the old and new revisions and compares what is
-//! left; a body-only edit vanishes from that comparison and anything else -
-//! signatures, types, constants, imports, other functions - survives it. A
-//! false negative costs one full reload. A false positive would install code
-//! compiled against a layout the running world no longer has, so the gate errs
-//! toward refusing.
+//! The classification is deliberately conservative: it strips the addressable
+//! functions' bodies from the old and new revisions and compares what is left,
+//! so a body-only edit vanishes while signatures, types, constants, imports and
+//! other functions survive it. A false negative costs one reload; a false
+//! positive would install code compiled against a layout this world no longer
+//! has, so the gate errs toward refusing.
 //!
-//! Patch libraries are never unloaded. A slot may hold an address inside one
-//! for the rest of the process, and nothing re-homes those addresses.
+//! Patch libraries are never unloaded: a slot may hold an address inside one
+//! for the rest of the process.
 
 // A development-only facility, refused at compile time in an optimized build.
 //
@@ -73,9 +70,8 @@ pub(crate) use compile::{flags_cache_path, parse_rustc_line};
 // build and installs its product at a later frame boundary.
 pub(crate) use worker::{build_attempt, BodyOutcome, PatchAttempt};
 
-// The three install routes and the patch-image plumbing they share. Re-exported
-// rather than referenced through `routes::` at every call site, so the session
-// below reads the same as it did when these lived in this file.
+// The three install routes and the patch-image plumbing they share, re-exported
+// rather than referenced through `routes::` at every call site.
 use routes::{
     install_everywhere, prologue_patch_everywhere, reset_everywhere, resolve_in,
     resolve_patch_address, resolve_plain_in,
@@ -85,9 +81,9 @@ pub(crate) use routes::{LoadedPatch, PrologueRestore};
 ///
 /// The implementation lives in `pill_hot_scan` because the host and the build
 /// scripts must agree byte for byte about where a function starts and what its
-/// declaration says. They previously had separate scanners, and the moment they
-/// disagreed - a build script naming a method through its type while the host
-/// did not - every method silently failed to patch.
+/// declaration says. Two scanners that disagree - one naming a method through
+/// its type while the other does not - silently fail to patch every method they
+/// disagree about.
 ///
 /// Re-exported under this name so `source::` call sites read as what they are:
 /// a question about source text, not about the scanning crate.
@@ -115,9 +111,9 @@ pub(super) const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 /// Also not optional. Linking the project's rlib pulls in that crate's
 /// `#[pill_hot]` descriptors too, so a patch DLL contains BOTH the old and the
 /// new entry for the same function. Asking for the bare name resolves whichever
-/// the linker happened to order first - measured, and it was the OLD address,
-/// with a matching signature hash, so the patch would have installed silently
-/// and changed nothing.
+/// the linker happened to order first, which can be the OLD address with a
+/// matching signature hash - a patch that installs silently and changes
+/// nothing.
 const PATCH_NAME_PREFIX: &str = "pill_patch::";
 
 /// Export that reports where a patched plain function lives.
@@ -239,10 +235,9 @@ pub(crate) enum PatchOutcome {
 
 /// What starting a patch attempt found, and whether a build is owed.
 ///
-/// The frame loop reads these the same way it read the in-line pipeline's
-/// outcomes: `Unchanged` and `NotPatchable` leave the pending edit for the
-/// reload path, `Failed` reports what is still running, and `Ready` hands the
-/// build to a worker whose product is installed by
+/// The frame loop reads them this way: `Unchanged` and `NotPatchable` leave the
+/// pending edit for the reload path, `Failed` reports what is still running, and
+/// `Ready` hands the build to a worker whose product is installed by
 /// [`HotPatchSession::activate_attempt`].
 pub(crate) enum BeginOutcome {
     /// Nothing relevant changed.
@@ -273,14 +268,14 @@ pub(crate) struct PatchStages {
     pub classify: f64,
     /// Producing the patch source.
     pub generate: f64,
-    /// Asking cargo for the compiler flags. Zero on every patch after the
-    /// first, because the answer is cached.
+    /// Asking cargo for the compiler flags. Zero once this session has cached
+    /// the answer.
     pub flags: f64,
     /// `rustc` compiling and linking the patch library.
     pub compile: f64,
     /// `LoadLibrary` on the produced artifact.
     pub load: f64,
-    /// Resolving the new address and storing it into the dispatch slot.
+    /// Resolving the new address and installing it into every running copy.
     pub activate: f64,
 }
 
@@ -337,10 +332,8 @@ struct ApplyResult {
 /// One watched source file as this session last read it.
 ///
 /// Contents and modification time are one value because they are one fact: the
-/// time is when *these* contents were read. Held as two parallel maps they had
-/// to be written together by hand, and a patch that updated the contents while
-/// leaving the time behind is a bug that happened. The pairing is now the
-/// type's job rather than the caller's.
+/// time is when *these* contents were read. Kept in the type so no caller can
+/// update one half without the other.
 struct Snapshot {
     /// The file's contents at the moment it was read.
     contents: String,
@@ -385,8 +378,8 @@ impl Snapshot {
 /// The four fields travel together for the same reason [`Snapshot`] is one
 /// value: the modification time is when *these* contents were read. A step that
 /// re-derives either half from a later stat pairs one observation's bytes with
-/// another's timestamp - which is how a save made during the patch came to be
-/// recorded as already delivered.
+/// another's timestamp - which records a save made during the patch as already
+/// delivered.
 #[derive(Debug)]
 struct ClassifiedEdit {
     /// The changed file.
@@ -442,8 +435,9 @@ pub(crate) struct HotPatchSession {
 impl HotPatchSession {
     /// Prepare a session and take the baseline snapshot of the project sources.
     ///
-    /// Returns `None` when the project has no `#[pill_hot]` function, so a
-    /// project that has not opted in pays nothing.
+    /// Returns `None` when the project has no function the host could address,
+    /// so a project with no such function pays nothing, and when the crate's
+    /// own rlib was not built - a patch could not link it.
     pub(crate) fn new(
         workspace_root: &Path,
         package: &str,
@@ -491,8 +485,7 @@ impl HotPatchSession {
         // An attribute chooses the mechanism, not whether patching is possible,
         // so a crate with no annotations at all is still armed - and a crate
         // whose build script emits no address inventory gets a clear refusal on
-        // its first edit rather than silently falling back to a full reload,
-        // which is exactly the confusion this used to cause.
+        // its first edit rather than an unexplained fall back to a full reload.
         let addressable: usize = session
             .snapshots
             .values()
@@ -584,8 +577,7 @@ impl HotPatchSession {
 
         // Step 2: Generate each changed body's source and collect its build
         // inputs. A failure here leaves nothing of this attempt live - the
-        // running implementation is untouched - so the caller reloads, the
-        // same outcome the in-line pipeline reported for it.
+        // running implementation is untouched - so the caller reloads.
         let mut bodies = Vec::with_capacity(edit.declarations.len());
         for declaration in edit.declarations {
             // The path the running artifact recorded for this function, which
@@ -631,7 +623,7 @@ impl HotPatchSession {
     // Classification
     // -------------------------------------------------------------------------
 
-    /// Identify a body-only edit of exactly one annotated function.
+    /// Identify body-only edits in exactly one source file.
     ///
     /// `Ok(None)` means nothing changed. `Err` carries the reason the change is
     /// out of scope, phrased for the console. A match carries the file's
@@ -682,18 +674,16 @@ impl HotPatchSession {
             }
 
             // Every function the host could address, annotated or not. An
-            // attribute is no longer the opt-in: a crate whose build script
-            // emits the address inventory makes all of its functions
-            // patchable, and the attribute only chooses which mechanism
-            // delivers the replacement.
+            // attribute is not the opt-in: a crate whose build script emits the
+            // address inventory makes all of its functions patchable, and the
+            // attribute only chooses which mechanism delivers the replacement.
             let functions = source::all_functions(&new_contents);
             // Two declarations sharing a bare name cannot be told apart by
             // the machinery below: the map keeps the *last* declaration while
             // `function_bodies` keeps the *first*, so an edit to the first
             // would install the second's body under the first's address. The
-            // scanner returns both deliberately - deduplicating by bare name
-            // once silently dropped declarations - which is why the collision
-            // is refused here, matching the module doc.
+            // scanner returns both deliberately rather than deduplicating by
+            // bare name, which is why the collision is refused here.
             {
                 let mut seen: std::collections::HashSet<&str> =
                     std::collections::HashSet::with_capacity(functions.len());
@@ -767,8 +757,8 @@ impl HotPatchSession {
 
             // Several bodies in one save are patched in sequence rather than
             // refused. Each is an independent replacement, so the cost is one
-            // compile apiece - still cheaper than the full reload this used to
-            // fall back to, and the world is never torn down.
+            // compile apiece - still cheaper than the full reload it replaces,
+            // and the world is never torn down.
             changed.sort();
             let mut declarations = Vec::with_capacity(changed.len());
             for function in changed {
@@ -852,8 +842,7 @@ impl HotPatchSession {
     ///
     /// `slot_name` is carried, not read: activation files the slot route
     /// under it. `totals` receives this body's timings once preparation
-    /// succeeds, so a failed body's partial cost stays out of the report -
-    /// the same rule the in-line pipeline had.
+    /// succeeds, so a failed body's partial cost stays out of the report.
     fn prepare_body(
         &mut self,
         new_contents: &str,
@@ -1032,10 +1021,9 @@ impl HotPatchSession {
     /// Install one built patch: park the image, resolve the replacement and
     /// write it into the running artifact(s).
     ///
-    /// One iteration of what used to be `apply`, from the mapped image to the
-    /// recorded generation. The compile, the load and the artifact inspection
-    /// that used to precede it run on a worker thread now; what remains is
-    /// exactly the part that must happen at the frame boundary.
+    /// The compile, the load and the artifact inspection already happened on a
+    /// worker thread; what runs here is exactly the part that must happen at
+    /// the frame boundary.
     fn install_body(
         &mut self,
         engine: &mut Engine,
@@ -1429,9 +1417,9 @@ impl HotPatchSession {
     fn qualified_name(&self, path: &Path, declaration: &source::HotFunction) -> String {
         let segments = self.module_segments(path);
         // Built by the scanner rather than here, so the host asks for exactly
-        // the name the build script recorded. When the two were separate
-        // implementations every inherent method silently failed to patch, and a
-        // trait method - whose name carries both the type and the trait - has
+        // the name the build script recorded. Two hand-written implementations
+        // disagree: an inherent method is named through its receiver type, and
+        // a trait method - whose name carries both the type and the trait - has
         // more to disagree about, not less.
         source::inventory_name(&self.package, &segments[1..], declaration)
     }
@@ -1457,30 +1445,18 @@ impl HotPatchSession {
     /// Bring the staged rlib back in step with cargo's own output.
     ///
     /// A patch links a half-frozen closure: the crate's own rlib comes from the
-    /// staged copy, which only changes when the host rebuilds that module, while
-    /// every `--extern` for its dependencies comes from the replayed cargo line
-    /// and points into the module build tree, which moves whenever anything
-    /// rebuilds. Let those drift apart and the compile fails with
-    /// `error[E0463]: can't find crate for <this crate>` - which names the wrong
-    /// crate and says nothing about staleness.
+    /// staged copy, while its dependencies' `--extern` entries come from the
+    /// replayed cargo line and point into the module build tree. Let those drift
+    /// apart and the compile fails with `error[E0463]: can't find crate for
+    /// <this crate>` - naming the wrong crate, and saying nothing about
+    /// staleness.
     ///
-    /// The source of truth is the same place the module reload stages from and
-    /// the flag-capture build writes into: the private module build tree under
-    /// the host's profile directory ([`crate::config::module_build_artifact_directory`],
-    /// e.g. `target/hot/build/debug` for a dev host or
-    /// `target/hot/build/desktop-dev` under the dioxus CLI). The previous
-    /// hardcoded `target/debug` only matched a bare default-directory build, which
-    /// the host never runs: when a launcher injects a custom profile that path
-    /// holds a stale dev-profile rlib (or nothing), and refreshing the staged
-    /// copy from it linked the patch against a differently configured engine -
-    /// every type got a different `TypeId` and rustc reported `error[E0463]`.
-    ///
-    /// Re-copying costs a few milliseconds and keeps the closure consistent.
-    /// The staged copy is still what the host *loads*, so the protection it was
-    /// added for - another build overwriting the shared slot - is unchanged: a
-    /// wrong-featured rlib copied here can only make this one patch fail to
-    /// compile, which is the same outcome as leaving it stale, and the module's
-    /// next real build restages it correctly.
+    /// The source of truth is the private module build tree under the host's
+    /// profile directory ([`crate::config::module_build_artifact_directory`]);
+    /// a bare `target/debug` holds nothing the host built. The staged copy is
+    /// still what the host *loads*, so a wrong-featured rlib copied here can
+    /// only make this one patch fail to compile, and the next real build
+    /// restages it.
     fn refresh_staged_rlib(&self) -> Result<(), String> {
         // A wrapper build compiles the extension as a dependency, so the
         // newest rlib under the build's `deps` directory is the one that
@@ -1527,22 +1503,19 @@ impl HotPatchSession {
             // Deliberately NOT the crate root. The flags describe the dependency
             // graph and feature set, which a source edit cannot change - and the
             // crate root is precisely the file being edited, so including it
-            // invalidated the cache on every single patch and re-ran a full
+            // would invalidate the cache on every single patch and re-run a full
             // `cargo build -v` to re-derive flags that were already correct.
-            // That cost about 1.2 s of a 1.9 s patch.
             //
-            // The crate's own freshly built rlib IS included, though. The flags
+            // The crate's own freshly built rlib IS included: the flags
             // describe the dependency closure this crate links, and that
-            // closure only changes when the crate is rebuilt - at startup, on a
-            // module reload, or whenever the engine feature set the build
-            // resolves with changes (a host rebuilt with profiling or another
-            // engine feature moves it; a cache captured against one feature set
-            // goes silently stale against another and rustc reports
-            // `error[E0463]` when the patch tries to link the freshly staged
-            // rlib against the old externs). The rlib's mtime moves exactly
-            // when that happens, so keying on it re-captures precisely when the
-            // world changed and stays hot across plain source edits and
-            // patches.
+            // closure changes exactly when the crate is rebuilt - at startup, on
+            // a module reload, or when the engine feature set the build resolves
+            // with changes. A cache captured against one feature set goes
+            // silently stale against another, and rustc then reports
+            // `error[E0463]` when the patch links the freshly staged rlib
+            // against the old externs. The rlib's mtime moves exactly when that
+            // happens, so keying on it re-captures precisely when the world
+            // changed and stays hot across plain source edits and patches.
             //
             // The staged copy, not a build-tree path: a wrapper build leaves
             // the extension's rlib under a hashed name the session cannot

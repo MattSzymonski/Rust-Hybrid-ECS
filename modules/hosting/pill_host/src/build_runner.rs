@@ -37,7 +37,7 @@ use crate::analytics::{self, ModuleKind};
 use crate::{ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
-// Build output (Stage 19)
+// Build output
 // =============================================================================
 
 /// The tail of the most recent build's stderr, for the editor's Problems
@@ -146,7 +146,7 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// dylibs from - a GUI frontend's module build needs a different engine
 /// variant than the host runs, and rewriting the shared slot would make cargo
 /// delete a DLL the host has loaded. The produced artifacts are staged into
-/// the module's private hot-load directory, exactly as before.
+/// the module's private hot-load directory.
 fn cargo_module_output_subdirectory() -> String {
     crate::config::module_build_artifact_directory()
 }
@@ -154,12 +154,12 @@ fn cargo_module_output_subdirectory() -> String {
 /// Private directory the host stages the project's loadable artifacts into,
 /// and the default an extension's configuration also names.
 ///
-/// The same protection extensions have always had, extended to the
-/// project. Cargo writes `project.dll` to a shared per-crate slot that any
-/// other `cargo build` of the same package overwrites - with a different
-/// feature set, and therefore a differently configured `pill_engine` compiled
-/// into it. Loading that produces an access violation inside `LoadLibrary`,
-/// before any of the host's own diagnostics can run.
+/// The same protection an extension's output has: cargo writes `project.dll`
+/// to a shared per-crate slot that any other `cargo build` of the same package
+/// overwrites - with a different feature set, and therefore a differently
+/// configured `pill_engine` compiled into it. Loading that produces an access
+/// violation inside `LoadLibrary`, before any of the host's own diagnostics can
+/// run.
 pub(crate) const PROJECT_HOT_OUTPUT_SUBDIRECTORY: &str = "target/hot";
 
 /// Directory holding one stamp per module, recording what the host built.
@@ -167,19 +167,13 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 
 /// Host feature set that module builds must mirror.
 ///
-/// A host rebuilt with a different feature set invalidates every cached
-/// module artifact, because both features below change the crate metadata on
-/// one side of the DLL boundary or the other.
-///
-/// `hot_patch` is mirrored into every module and project build directly, so
-/// it changes the engine each module links.
-///
-/// `rendering` no longer touches the module's own engine - the renderer left
-/// `pill_engine`, and module builds resolve the engine crates from
-/// `pill_core`'s feature pin plus the host's explicit engine features (see
-/// [`host_engine_features`]). It still belongs here: a windowed host loads
-/// the wgpu renderer beside its engine dylibs, and a cached module artifact
-/// is only trusted for the posture it was built for.
+/// A host rebuilt with a different feature set invalidates every cached module
+/// artifact. `hot_patch` is mirrored into every module and project build
+/// directly, so it changes the engine each module links. `rendering` does not
+/// touch the module's own engine - the renderer is outside `pill_engine` - but
+/// still belongs here: a windowed host loads the wgpu renderer beside its
+/// engine dylibs, and a cached artifact is only trusted for the posture it was
+/// built for.
 const HOST_MODULE_FEATURE_SET: &str =
     match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch")) {
         (true, true) => "rendering+hot_patch",
@@ -206,16 +200,11 @@ const HOST_PROFILING_FEATURE_SET: &str = if cfg!(feature = "profiling-fine") {
 /// The profile and target belong here for the same reason the feature set
 /// does: both change the crate-metadata hash on both sides of the DLL
 /// boundary, so an artifact built under one and loaded under the other fails
-/// to resolve its exports. Without the profile in this identity, switching
-/// between a debug and a release host would silently reuse the other profile's
-/// staged copies; without the target, switching between a native host and a
-/// `--target` host (a plain `cargo run` vs the dioxus CLI) reuses artifacts
-/// whose symbols no longer match. The spawned environment belongs here too:
-/// [`crate::config::spawned_build_environment`] decides whether module builds
-/// strip `-C prefer-dynamic` (LTO and the fail-safe dx fallback) and whether
-/// they mirror the dioxus CLI's `RUSTC_WORKSPACE_WRAPPER`, both of which
-/// change every member crate's metadata hash. All of these present as
-/// `LoadLibrary` error 127 rather than as anything that names a cause.
+/// to resolve its exports. The spawned environment decides whether module
+/// builds strip `-C prefer-dynamic` and whether they mirror the dioxus CLI's
+/// `RUSTC_WORKSPACE_WRAPPER`, both of which change every member crate's
+/// metadata hash. All of these present as `LoadLibrary` error 127 rather than
+/// as anything that names a cause.
 fn host_build_identity() -> String {
     let mut spawned_environment = crate::config::spawned_build_environment();
     // The pairs are compared as a set, so ordering never matters.
@@ -305,17 +294,11 @@ fn artifact_stamp_path(workspace_root: &Path, module_name: &str) -> PathBuf {
 /// Describe the artifacts a build produced, together with the host identity,
 /// the sources and the command that produced them.
 ///
-/// `build_info` is [`current_build_info`]: the toolchain and the host's feature
-/// set, profile, target and spawned environment. It stays in the stamp because
-/// two host processes with different feature sets can share one workspace and
-/// one staging directory: a stamp either of them could satisfy would let one
-/// process load the other's artifact, which fails inside `LoadLibrary` naming
-/// nothing.
-///
-/// `source_identity` is the watch directory, which is what distinguishes two
-/// projects that share a package name - and therefore an output path, a stamp
-/// file and a build command. Without it, switching the host between two such
-/// projects leaves every earlier check satisfied by the other project's DLL.
+/// `build_info` is [`current_build_info`], and `source_identity` the watch
+/// directory. Both stay in the stamp because a stamp either of two host
+/// processes - or two projects sharing a package name, output path and stamp
+/// file - could satisfy would let one load the other's artifact, which fails
+/// inside `LoadLibrary` naming nothing.
 ///
 /// Returns `None` when any artifact is missing or unreadable, which the callers
 /// treat as "not host-built" and therefore as a reason to run cargo.
@@ -378,20 +361,12 @@ fn record_artifact_stamp(
 
 /// Whether the artifacts on disk are the ones this host built with this command.
 ///
-/// The modification-time check alone cannot tell a host-built artifact from one
+/// A modification-time check alone cannot tell a host-built artifact from one
 /// an unrelated `cargo build` wrote to the same path moments later: both are
-/// newer than every source file, so both look up to date. Recording the build
-/// command alongside each artifact's size and modification time closes that
-/// gap. Anything the host did not write itself - a different feature set, a
-/// plain `cargo build`, a `cargo build --workspace` - no longer matches, and
-/// falls through to a real build instead of being loaded.
-///
-/// The recorded `source_identity` closes the remaining gap: package names are
-/// not unique across projects, so `examples/project_rs` and a test fixture
-/// project both build `project.dll` into the same slot with the same command.
-/// Every timestamp check then passes, because the artifact really is newer than
-/// the sources - just the wrong sources. The host would load one project's
-/// code while watching another's.
+/// newer than every source file. The recorded command, size and time close
+/// that gap, and the recorded `source_identity` closes the rest - package names
+/// are not unique across projects, so two projects build `project.dll` into the
+/// same slot and every timestamp passes for the wrong sources.
 fn artifacts_are_host_built(
     workspace_root: &Path,
     module_name: &str,
@@ -456,28 +431,20 @@ fn confirm_staged_artifacts(
 /// needs, regardless of which path spawns it.
 ///
 /// The full module-reload path and the per-function hot-patch path both invoke
-/// the module's configured `cargo build ...` command, and both must agree with
-/// the host binary that is running right now:
+/// the module's configured `cargo build`, and both must agree with the running
+/// host binary:
 ///
 /// - `CARGO_TARGET_DIR` redirects into the private module build tree so cargo
-///   never has to delete a DLL the host has mapped, and both paths share one
-///   artifact set (see [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]).
-/// - The host's own engine features ([`host_engine_features`]) are passed to
-///   the build explicitly. `pill_core.dll` and `pill_engine_core.dll` are
-///   loaded once per process and their exported names hash the features their
-///   dependency trees resolved, so a module or project built with a different
-///   engine feature set cannot resolve its imports against the single
-///   instances the host already has loaded (Windows deduplicates loaded
-///   modules by name). `devops/tests/test_engine_feature_drift.py` checks
-///   that every posture agrees.
-/// - A launcher-injected profile (the dioxus CLI builds the editor under
-///   `--profile desktop-dev`) is not declared in the module workspaces, so
-///   cargo would reject `--profile <name>` here. It is defined on the spawned
-///   build as an inheritor of `dev` so the module compiles under the same
-///   profile name the host binary itself used - profile name is part of
-///   cargo's crate-metadata hash, so a differently named profile would produce
-///   a module whose DLL imports cannot resolve against the engine dylib the
-///   host already has loaded. Built-in profiles need no definition.
+///   never has to delete a DLL the host has mapped (see
+///   [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]).
+/// - The host's engine features ([`host_engine_features`]) are passed
+///   explicitly: the shared dylibs' exported names hash their dependency
+///   trees' features, so a differently featured module cannot resolve its
+///   imports against them (`test_engine_feature_drift.py` checks every posture).
+/// - A launcher-injected profile (the dioxus CLI's `desktop-dev`) is not
+///   declared in the module workspaces, so the spawned build defines it as an
+///   inheritor of `dev`; the profile name is part of cargo's metadata hash.
+///   Built-in profiles need no definition.
 ///
 /// Only cargo builds take these overrides; `dotnet` module builds ignore them.
 pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: &Path) {
@@ -583,11 +550,10 @@ fn host_anchor_package() -> Option<String> {
     Some(stem)
 }
 
-/// Whether an executable's package is one of the editor anchors: the
-/// retired Dioxus frontend (`editor`), the retired `pill_ui` editor, or the
-/// egui editor. Their dependency graphs carry the renderer and UI unions a reload
-/// build must reproduce; a plain game host needs only the explicit engine
-/// features.
+/// Whether an executable's package is an editor anchor: the Dioxus frontend
+/// (`editor`) or the egui editor (`pill_editor`). Their dependency graphs carry
+/// the renderer and UI unions a reload build must reproduce; a plain game host
+/// needs only the explicit engine features.
 fn is_editor_anchor(package: &str) -> bool {
     matches!(package, "editor" | "pill_editor")
 }
@@ -676,27 +642,19 @@ fn read_declared_features(workspace_root: &Path, package: &str) -> Option<Vec<St
 /// A fast patch replays the exact compiler line cargo uses for the module, so
 /// the patch links the identical dependency closure. Discovering that line
 /// costs a `cargo build -v`, and cargo only prints the invocation when it
-/// actually compiles - so when the crate is already fresh the discovery path
-/// has to TOUCH the crate root and force a rebuild of the module crate.
-/// Measured before the wrapper layout, that was 1.8-3.4 s under the standalone
-/// host and up to ~15 s under the editor (the old cargo anchor rebuilt the
-/// frontend beside the module), paid on the first patch after every module
-/// reload, because a reload is exactly what makes the cached line stale.
-///
-/// The build the host just ran compiled that crate for real. Asking it for
-/// `-v` and reading the line out of its output makes the discovery free and
-/// makes the cache fresh at the same instant the artifact it describes appears.
+/// actually compiles - so a fresh crate has to be touched to force a rebuild,
+/// on the first patch after every module reload, because a reload is what makes
+/// the cached line stale. The build the host just ran compiled that crate for
+/// real, so asking it for `-v` makes the discovery free.
 ///
 /// # How
 ///
 /// `-v` is appended at spawn time only, never to the configured build command:
-/// that command is part of the cache key and of the artifact stamp, and adding
-/// a flag to it would invalidate both. Cargo's stderr is piped rather than
-/// inherited so it can be scanned, and every line is written straight back out
-/// so the console still streams compiler progress live - minus the two kinds of
-/// line `-v` itself adds (`Running` and `Fresh`), which would otherwise bury
-/// the diagnostics. Colour is requested explicitly when the host's own stderr
-/// is a terminal, because cargo turns it off for a pipe.
+/// that command is part of the cache key and of the artifact stamp. Cargo's
+/// stderr is piped rather than inherited so it can be scanned, and every line
+/// is written straight back out so the console still streams - minus the
+/// `Running` and `Fresh` lines `-v` adds. Colour is requested explicitly when
+/// the host's own stderr is a terminal, because cargo turns it off for a pipe.
 #[cfg(feature = "hot_patch")]
 struct VerboseCapture {
     /// Crate names to look for: the modules one invocation builds.
@@ -832,8 +790,8 @@ impl VerboseCapture {
 
 /// Whether a line exists only because the build was asked for `-v`.
 ///
-/// Filtered out on the way to the console so the reload output reads exactly as
-/// it did before the capture was added; nothing else is touched.
+/// Filtered out on the way to the console so the reload output shows what it
+/// shows without the capture; nothing else is touched.
 ///
 /// Cargo colours its status words, so the label is preceded by ANSI escape
 /// sequences whenever the host's stderr is a terminal - matching on the raw
@@ -1221,20 +1179,14 @@ pub(crate) fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Ch
 
 /// Run one module's build command to completion.
 ///
-/// Shared by the project module and by extensions so both use the same
-/// process handling, watchdog, cancellation, and failure reporting. Resolving
-/// and validating the produced artifact is left to the caller, because each
-/// module kind names and locates its output differently.
-///
-/// `timeout` is the caller's cap on the command's wall time, because the caps
-/// differ: one module's incremental build ([`BUILD_TIMEOUT`]) and the startup
-/// batch that compiles everything at once ([`STARTUP_BATCH_TIMEOUT`]).
+/// Shared by the project module and by extensions so both use the same process
+/// handling, watchdog, cancellation, and failure reporting; resolving the
+/// produced artifact is left to the caller. `timeout` is the caller's cap:
+/// [`BUILD_TIMEOUT`] for one module, [`STARTUP_BATCH_TIMEOUT`] for the batch.
 ///
 /// With the `hot_patch` feature this also harvests the compiler flags the fast
-/// patch pipeline needs, out of the build it was going to run anyway - see
-/// [`VerboseCapture`]; `capture_entries` names the crates to harvest and pairs
-/// each with the build command its flags cache records. An empty or absent
-/// list skips the harvest and keeps the child's streams inherited.
+/// patch pipeline needs, out of the build it runs anyway (see
+/// [`VerboseCapture`]); `capture_entries` names the crates to harvest.
 ///
 /// # Errors
 ///
@@ -1290,9 +1242,8 @@ pub(crate) fn run_build_command(
     #[cfg(not(feature = "hot_patch"))]
     let _ = capture_entries;
     // A cargo build without the capture still tees its stderr into the ring:
-    // a failed build's Problems entry is parsed from it (Stage 19). The child
-    // used to inherit the stream outright, which lost the text once the
-    // terminal scrolled.
+    // a failed build's Problems entry is parsed from it. A child that inherits
+    // the stream outright loses the text once the terminal scrolls.
     #[cfg(feature = "hot_patch")]
     let tee_needed = capture.is_none() && program == "cargo";
     #[cfg(not(feature = "hot_patch"))]
@@ -1511,13 +1462,13 @@ pub(crate) fn build_project_module(
     // locates its loadable artifact differently. Native outputs use platform
     // naming conventions; managed outputs always use an assembly `.dll`.
     //
-    // A native project has two: the slot cargo writes into, and the private
-    // copy the host loads from. They are kept apart for the reason extensions
-    //  already keep them apart - any other `cargo build` of the same
-    // package overwrites cargo's slot, and for the project that means a DLL
-    // carrying a differently configured `pill_engine`, which access-violates
-    // inside `LoadLibrary`. The managed backend has no such collision and
-    // loads from where its build wrote.
+    // A native project has two paths: the slot cargo writes into, and the
+    // private copy the host loads from. They are kept apart for the reason
+    // extension outputs are: any other `cargo build` of the same package
+    // overwrites cargo's slot, and for the project that means a DLL carrying a
+    // differently configured `pill_engine`, which access-violates inside
+    // `LoadLibrary`. The managed backend has no such collision and loads from
+    // where its build wrote.
     let (build_output, output_path) = match &config.backend {
         ProjectModuleBackend::NativeLibrary {
             library_name,
@@ -1551,13 +1502,12 @@ pub(crate) fn build_project_module(
             .join(format!("lib{}.rlib", config.name)),
     );
 
-    // Step 2: Run cargo and let it decide what needs rebuilding. The host used
-    // to keep its own freshness engine - modification-time stamps, a toolchain
-    // marker, a recursive walk of every path dependency - which duplicated
-    // cargo's fingerprint check and had to model features, targets and
-    // environment overrides by hand. Cargo still owns freshness: every build
-    // runs unless the startup batch already ran it (the token below), and a
-    // fresh workspace answers in a few hundred milliseconds with `Finished`.
+    // Step 2: Run cargo and let it decide what needs rebuilding. Cargo owns
+    // freshness: every build runs unless the startup batch already ran it (the
+    // token below), and a fresh workspace answers in a few hundred
+    // milliseconds with `Finished`. The host keeps no freshness engine of its
+    // own, so features, targets and environment overrides need no second
+    // model.
 
     // A managed build also captures the compiler command line MSBuild computed,
     // so a later hot reload can replay it in-process instead of paying for
@@ -1746,11 +1696,10 @@ fn stage_engine_dylib(workspace_root: &Path) {
 
 /// Copy everything one build produced into the host's private hot-load paths.
 ///
-/// Both build paths end the same way, and that ending is where two real bugs
-/// have already been found: the shared-slot collision that made the host load a
-/// differently-featured artifact, and the missing dependency staging that made
-/// the first patch after any external `cargo build` fail. Both fixes had to be
-/// written twice because this sequence existed twice. It exists once now.
+/// Both build paths end the same way, so the sequence lives here once: the
+/// shared-slot collision that makes the host load a differently-featured
+/// artifact, and the missing dependency staging that breaks the first patch
+/// after an external `cargo build`, are both handled here.
 ///
 /// `rlib` is `None` for a crate that produces none. `require_rlib` says whether
 /// a missing one is an error: the project always produces an rlib and a missing
@@ -1843,28 +1792,19 @@ pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 /// Copy every shared per-crate rlib out of cargo's `deps` directory.
 ///
 /// Cargo gives a workspace crate's rlib an unhashed, per-crate path -
-/// `deps/libpill_dummy_color.rlib` - and *overwrites it in place* on every
-/// build. Third-party crates get a metadata hash in their filename and are
-/// therefore safe; workspace crates share one slot per crate name across every
-/// feature configuration of that crate.
+/// `deps/libpill_dummy_color.rlib` - and overwrites it in place on every build.
+/// Third-party crates get a metadata hash and are safe; a workspace crate
+/// shares one slot per crate name across every feature configuration. The host
+/// builds modules with `--features pill_engine/hot_patch`, while a plain
+/// `cargo build` writes a differently-featured artifact to the same path; a
+/// generated patch then links a module rlib built against one variant while
+/// its dependency's `--extern` names the other - refused as `error[E0463]:
+/// can't find crate`, naming the module rather than the dependency.
 ///
-/// That slot is the whole problem. The host builds modules with
-/// `--features pill_engine/hot_patch`; a developer running a plain
-/// `cargo build` in a terminal writes a differently-featured artifact to the
-/// same path. A generated patch then links a module rlib built against one
-/// variant while the `--extern` for its dependency names the other, and rustc
-/// refuses with `error[E0463]: can't find crate for <the module>` - which names
-/// the module rather than the dependency that actually moved.
-///
-/// Copying them here, immediately after a host build produced a consistent set,
-/// makes the patch link closure immune to anything written to those slots
-/// afterwards. It is the same protection [`stage_artifact`] already gives the
-/// module's own rlib, extended to what that rlib links against.
-///
-/// Only files whose staged copy is out of date are copied, so the steady-state
-/// cost is a handful of `stat` calls. Failures are reported and not fatal: a
-/// missing staged dependency only means the patch links the shared slot as
-/// before.
+/// Copying them right after a host build produced a consistent set makes the
+/// patch link closure immune to anything written afterwards: the protection
+/// [`stage_artifact`] gives the module's own rlib, extended to what it links
+/// against. Only out-of-date copies are made; failures are reported, not fatal.
 #[cfg(feature = "hot_patch")]
 pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
     let source_directory = workspace_root
@@ -2001,31 +1941,24 @@ fn with_batch_validation<T>(callback: impl FnOnce(&mut Option<BatchValidation>) 
 /// Build every module of the startup plan in one cargo invocation.
 ///
 /// Every module build otherwise pays cargo's fixed cost - process start,
-/// workspace resolve, fingerprint scan - once per module, and that cost grows
-/// with the workspace, so a project with hundreds of modules would restart
-/// cargo hundreds of times per start. The extensions' wrappers, the native
-/// project's member and the renderer's wrapper (windowed postures only)
-/// differ only in `--package`, so one invocation selects them all; its flags
-/// mirror a single module's build exactly, which keeps every unit's
-/// fingerprints identical to a per-module build's. The modules it validated
+/// workspace resolve, fingerprint scan - once per module. The extensions'
+/// wrappers, the native project's member and the renderer's wrapper (windowed
+/// postures only) differ only in `--package`, so one invocation selects them
+/// all with flags that mirror a single module's build, keeping every unit's
+/// fingerprint identical to a per-module build's. The modules it validated
 /// skip their own build when they load (see [`take_batch_validation`]); an
-/// edit later still rebuilds a module on its own, and the first patch of a
-/// module the batch recompiled re-captures its compiler flags on demand.
+/// edit later still rebuilds a module on its own.
 ///
-/// A managed (C#) project is never selected: its `dotnet` build shares none
-/// of cargo's fixed cost. The renderer's wrapper joins the batch because it
-/// is an ordinary wrapper build; only its load waits for the window (see
-/// `crate::renderer_module`), and a rebuild request drops its token so a
-/// reloaded data crate still forces a compile.
+/// A managed (C#) project is never selected: its `dotnet` build shares none of
+/// cargo's fixed cost. The renderer's wrapper joins the batch because it is an
+/// ordinary wrapper build; only its load waits for the window (see
+/// `crate::renderer_module`), and a rebuild request drops its token.
 ///
-/// Feature unification is the one difference from per-module builds: a
-/// selected package that depends on another selected package would receive
-/// the union of both feature requests. Independent modules - the common case,
-/// and the case in every project this workspace ships - see no union at all.
+/// Feature unification is the one difference: a selected package that depends
+/// on another selected package receives the union of both feature requests.
 ///
-/// Returns whether the batch ran and validated the modules. A failure is not
-/// an error: the modules then build individually, which keeps per-module
-/// failure reporting exactly as it was.
+/// Returns whether the batch ran and validated the modules. A failure is not an
+/// error: the modules then build individually.
 pub(crate) fn build_extension_batch(
     workspace_root: &Path,
     configs: &[ExtensionConfig],
@@ -2550,13 +2483,10 @@ no-rendering+hot_patch",
     /// Two projects can share a package name, and therefore an output path, a
     /// stamp file and a build command. Only the watched sources differ.
     ///
-    /// This is not hypothetical: `examples/project_rs` and the test fixture at
-    /// `devops/tests/project` are both package `project`, both build
-    /// `target/debug/project.dll`, and both are launched by
-    /// `cargo build --package project`. Running one after the other left the
-    /// second host loading the first project's DLL and reporting it as up to
-    /// date, because the artifact genuinely was newer than every source it
-    /// checked - they were just the wrong sources.
+    /// `examples/project_rs` and the test fixture at `devops/tests/project`
+    /// are both package `project`, both build `target/debug/project.dll`, and
+    /// both are launched by `cargo build --package project`, so without the
+    /// source identity one host adopts an artifact it never built.
     #[test]
     fn a_different_project_with_the_same_package_name_is_not_host_built() {
         let root = ScratchDirectory::new("stamp_other_project");
@@ -2729,7 +2659,7 @@ no-rendering+hot_patch",
     /// The artifact's modification time is dated explicitly, ahead of every
     /// input, instead of pausing between the writes: the stamp tests rest on
     /// "newer than the inputs", and dating it makes that true by construction
-    /// rather than by clock resolution (SA-0069).
+    /// rather than by clock resolution.
     fn test_workspace() -> (ScratchDirectory, PathBuf) {
         let root = ScratchDirectory::new("build_runner");
 

@@ -2,20 +2,13 @@
 //!
 //! # Responsibilities
 //!
-//! - Declare
-//!   [`ComponentFieldDescriptor`](crate::component_registry::ComponentFieldDescriptor),
-//!   the field layout the derive macros emit and the world stores for the
-//!   editor and the C# mirror codegen.
-//! - Declare
-//!   [`FieldDecorator`](crate::component_registry::FieldDecorator), the
-//!   presentation metadata a field declares for the editor's Inspector.
-//! - Declare the
-//!   [`ComponentLayout`](crate::component_registry::ComponentLayout) trait the
-//!   derives implement.
-//! - Declare
-//!   [`ValueTypeLayoutResolver`](crate::component_registry::ValueTypeLayoutResolver),
-//!   through which the world finds the layout of a value type a component
-//!   field nests.
+//! - Declare [`ComponentFieldDescriptor`], the field layout the derive macros
+//!   emit and the world stores for the editor and the C# mirror codegen.
+//! - Declare [`FieldDecorator`], the presentation metadata a field declares
+//!   for the editor's Inspector.
+//! - Declare the [`ComponentLayout`] trait the derives implement, and
+//!   [`ValueTypeLayoutResolver`], through which the world finds the layout of
+//!   a value type a component field nests.
 //!
 //! # Design
 //!
@@ -70,12 +63,12 @@ pub enum FieldDecorator {
     /// Unity's `[Min(value)]`: a numeric field's drag value never goes below
     /// the minimum.
     Min(f32),
-    /// W-0049: the field is a colour. An array of three or four numbers draws
-    /// as one colour row with a popup picker, and consecutive scalar leaves
-    /// sharing a dotted prefix (a nested `Color`, say) collapse into one.
+    /// The field is a colour. An array of three or four numbers draws as one
+    /// colour row with a popup picker, and consecutive scalar leaves sharing a
+    /// dotted prefix (a nested `Color`, say) collapse into one.
     Color,
-    /// W-0049: consecutive scalar leaves sharing a dotted prefix draw as one
-    /// vector row - X/Y/Z/W side by side - instead of one row each.
+    /// Consecutive scalar leaves sharing a dotted prefix draw as one vector
+    /// row - X/Y/Z/W side by side - instead of one row each.
     Vector,
 }
 
@@ -213,8 +206,7 @@ mod tests {
     }
 
     /// Registering the same type first as plain, then as persistable, stays
-    /// idempotent: one registry entry, one bit. This pins the invariant the
-    /// unified per-type registration (audit 4.2) must preserve.
+    /// idempotent: one registry entry, one bit.
     #[test]
     fn plain_then_persistable_registration_stays_idempotent() {
         let mut world = World::new();

@@ -11,14 +11,14 @@
 //!
 //! The scheduler sets these in the host's engine code, and a system reads them
 //! in the code of the artifact that declares it: `Query` is generic, so its
-//! tick reads compile into the project or extension DLL. Kept in `pill_engine`
-//! (an rlib embedded in every DLL), each DLL had its own copy, so a module's
-//! system never saw the value the scheduler installed. Here they exist once
-//! per process, like the Rayon pool.
+//! tick reads compile into the project or extension DLL. A thread-local in an
+//! rlib would exist once per DLL, so a module's system would never see the
+//! value the scheduler installed; here they exist once per process, like the
+//! Rayon pool.
 //!
-//! The values are raw `u32` ticks; `pill_engine` wraps them in its `Tick`.
-//! Every accessor is `#[inline(never)]` so its thread-local is always the one
-//! inside `pill_core.dll`, never a copy inlined into a caller.
+//! The values are raw `u32` ticks; the world wraps them in its `Tick` when it
+//! reads them. Every accessor is `#[inline(never)]` so its thread-local is
+//! always the one inside `pill_core.dll`, never a copy inlined into a caller.
 
 // Standard library
 use std::cell::Cell;

@@ -83,8 +83,8 @@ impl SceneSession {
 
 /// Note that an edit touched the open document.
 ///
-/// Called for every recorded step and for the commands that change the world
-/// outside the history (a scene load resets it instead).
+/// Called once per recorded step that applied; the document commands reset
+/// the marker themselves.
 pub fn mark_dirty(world: &mut World) {
     if let Some(session) = world.get_resource_mut::<SceneSession>() {
         session.dirty = true;
@@ -112,8 +112,8 @@ pub fn new_scene(engine: &mut Engine) -> usize {
 ///
 /// # Errors
 ///
-/// Returns why the file could not be read, or what part of it could not be
-/// instantiated.
+/// Returns why the file could not be imported, when it carries no guid, or
+/// when no asset types are registered to instantiate it.
 pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
     let registry = engine
         .world()

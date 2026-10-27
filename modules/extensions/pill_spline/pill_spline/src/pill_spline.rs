@@ -8,24 +8,20 @@
 //!
 //! # Design
 //!
-//! The curve is a centripetal-style Catmull-Rom spline, chosen because it
-//! passes exactly through every control point, which is what makes a
-//! hand-placed path behave the way it looks in an editor. The first and last
-//! control points are duplicated as their own outer neighbours, so the curve
-//! starts and ends precisely on them rather than overshooting.
+//! The curve is a uniform Catmull-Rom spline, chosen because it passes exactly
+//! through every control point, which is what makes a hand-placed path behave
+//! the way it looks in an editor. The first and last control points are
+//! duplicated as their own outer neighbours, so the curve starts and ends
+//! precisely on them rather than overshooting.
 //!
-//! Control points are stored in a fixed-size array rather than a `Vec`. The
-//! component is copied between archetypes by the engine and lives in world
-//! memory owned by the host, while this module is a separately loaded library:
-//! keeping the component plain data means no heap allocation is created by one
-//! library and released by another, and it keeps the `#[repr(C)]` layout
-//! meaningful across a hot reload.
+//! Control points live in a fixed-size array rather than a `Vec`, so the
+//! component stays plain data across the module boundary: nothing is allocated
+//! by one library and freed by another, and `#[repr(C)]` survives a reload.
 //!
-//! Registration work lives in [`register`], a plain Rust function, so the same
-//! crate can be linked statically into a monolithic build. Another module or
-//! the project can also depend on this crate directly to use [`Spline`],
-//! provided it is built in the same workspace, which is what keeps the
-//! component's type identity the same on both sides.
+//! Registration lives in [`register`], a plain Rust function, so the crate can
+//! also be linked statically. A project that depends on the crate and the
+//! module DLL the host loads hold separate copies of the type; `#[pill(shared)]`
+//! on [`Spline`] is what makes them one component.
 
 // External crates
 use pill_core::math::Vector3f;
@@ -92,21 +88,15 @@ impl std::error::Error for TooManyControlPoints {}
 /// A path through an ordered set of control points.
 ///
 /// Only the first `control_point_count` entries of `control_points` are part of
-/// the curve; the remainder is unused storage. Use [`Self::from_points`] to
-/// build one and [`Self::control_points`] to read back just the active points.
+/// the curve; the remainder is unused storage. The host serializes this
+/// component across hot-reload generations, so the layout stays `#[repr(C)]`
+/// and every field stays serde compatible.
 ///
-/// The host serializes this component across hot-reload generations, so the
-/// layout is pinned with `#[repr(C)]` and every field stays serde compatible.
-///
-/// `#[pill(shared)]` because this type is linked by two artifacts at once: the
-/// project depends on this crate directly so it can write `Query<&Spline>`,
-/// *and* the host loads this crate as a hot-swappable module DLL. Each binary
-/// gets its own `TypeId` for the type, so without a declared identity the
-/// engine would see two components, allocate two columns, and let neither side
-/// see the other's entities - and the reload path would silently drop whichever
-/// one registered first. The declared name is `pill_spline::Spline`, which is
-/// what `std::any::type_name` already produced, so every name-keyed consumer -
-/// the C# bindings, the editor, `project_settings.yaml` - is unaffected.
+/// `#[pill(shared)]` because a project depending on this crate and the module
+/// DLL the host loads are two copies of the type, each with its own `TypeId`.
+/// The declared name (`pill_spline::Spline`, the string `std::any::type_name`
+/// reports) is what makes them one component with one column; without it the
+/// engine would allocate two and keep whichever registered first.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
 #[pill(persistable, shared)]
@@ -115,9 +105,9 @@ pub struct Spline {
     pub control_points: [Vector3f; MAX_CONTROL_POINTS],
     /// How many leading entries of `control_points` are in use.
     pub control_point_count: u32,
-
+    /// Scalar carried by [`Self::default`]; no method here reads it, and the
+    /// C# fixture copies it so a managed-built spline matches the Rust default.
     pub elo: f32,
-    ///////
 }
 
 impl Default for Spline {
@@ -135,11 +125,11 @@ impl Default for Spline {
 //
 // `Vector3f` is `glam::Vec3`, a foreign type that cannot carry
 // `#[derive(PillMirror)]`; without this declaration the managed mirror falls
-// back to an opaque byte blob and C# has to write points by offset. The name
-// is the path the field is written with (`array:struct:Vector3f`), so managed
-// code gets typed `X`/`Y`/`Z` members instead. glam guarantees `#[repr(C)]`
-// with `x`, `y`, `z` in order; the macro takes the offsets from the compiler
-// and fails the build if the declared fields stop covering the type.
+// back to an opaque byte blob and C# has to write points by offset. The
+// declared name must match the field's spelling, which tags it
+// `array:struct:Vector3f`, so managed code gets typed `X`/`Y`/`Z` members. The
+// macro reads the offsets from the compiler and fails the build if the
+// declared fields stop covering the type.
 pill_engine::pill_value_type! {
     Vector3f {
         x: f32,
@@ -148,9 +138,8 @@ pill_engine::pill_value_type! {
     }
 }
 
-/// A mirrored value type used by the interop suites: two coordinates, and a
-/// handful of mirrored methods that prove the trampoline surface changes
-/// between generations.
+/// Two coordinates and a handful of mirrored methods: the value type the C#
+/// bridge and hot-patch suites drive through the mirror trampolines.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillMirror)]
 pub struct OmoMO {
@@ -162,8 +151,8 @@ pub struct OmoMO {
 impl OmoMO {
     /// Sum of both coordinates; mirrored to C# as `GetSum()`.
     ///
-    /// Integration builds add one so a hot-reload suite can watch the mirror
-    /// trampoline change value; shipping builds return the plain sum.
+    /// The `test-hooks` feature adds one so a suite can watch the mirrored
+    /// value change; a default build returns the plain sum.
     #[doc(hidden)]
     #[pill_mirror_method]
     pub fn get_sum(&self) -> u64 {
@@ -173,13 +162,13 @@ impl OmoMO {
         sum
     }
 
-    /// The `x` coordinate; mirrored to C# as `GetA()`.
+    /// The `x` coordinate offset by 1200; mirrored to C# as `GetA()`.
     #[pill_mirror_method]
     pub fn get_a(&self) -> u64 {
         self.x + 1200
     }
 
-    /// The `y` coordinate; mirrored to C# as `GetB()`.
+    /// The `y` coordinate offset by 1200; mirrored to C# as `GetB()`.
     #[pill_mirror_method]
     pub fn get_b(&self) -> u64 {
         self.y + 1200
@@ -330,9 +319,8 @@ impl Spline {
 ///
 /// The contract carries primitives only, so the `Vector3f` return of
 /// [`Spline::get_location_at`] crosses one axis at a time and points are
-/// written one `x`/`y` pair at a time. Managed code therefore samples and
-/// edits the curve through the module instead of copying its math or its
-/// byte layout.
+/// written one `x`/`y` pair at a time, which keeps managed code from carrying
+/// the curve's byte layout across the ABI.
 #[pill_mirror_impl]
 impl Spline {
     /// `x` of [`Spline::get_location_at`], mirrored to C# as `GetLocationX`.
@@ -351,9 +339,10 @@ impl Spline {
     /// the demo scene lives in; mirrored to C# as `SetControlPointLocation`.
     ///
     /// The write goes through the value the managed call was made on, so a
-    /// component row is edited in place. Returns `false` when `index` is at
-    /// or beyond [`MAX_CONTROL_POINTS`], so a caller sees the capacity limit
-    /// instead of a silent no-op.
+    /// component row is edited in place. `index` addresses the raw array, so a
+    /// slot past the active points is storage the curve does not use yet.
+    /// Returns `false` at or beyond [`MAX_CONTROL_POINTS`], so a caller sees
+    /// the capacity limit instead of a silent no-op.
     #[pill_mirror_method]
     pub fn set_control_point_location(&mut self, index: u32, x: f32, y: f32) -> bool {
         let Some(slot) = self.control_points.get_mut(index as usize) else {
@@ -787,5 +776,3 @@ mod tests {
         assert_eq!(fields, [("x", "f32", 0), ("y", "f32", 4), ("z", "f32", 8)]);
     }
 }
-
-// panels suite reload check

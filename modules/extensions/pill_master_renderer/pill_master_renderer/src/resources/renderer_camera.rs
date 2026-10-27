@@ -43,8 +43,8 @@ pill_core::define_slot_key!(RendererCameraHandle);
 /// `CameraParams` constant buffer.
 ///
 /// The two sides are one layout written twice: a field changed here has to be
-/// changed in `config/common_shaders/common.hlsl` as well, or the shader reads
-/// the next value from wherever the padding lands.
+/// changed in `shader_sources/common_shaders/include/common.hlsl` as well, or
+/// the shader reads the next value from wherever the padding lands.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraParametersData {
@@ -96,7 +96,6 @@ impl CameraParametersData {
         transform_component: &TransformComponent,
         aspect: f32,
     ) -> Option<String> {
-        // Update position
         self.position = Vector4f::new(
             transform_component.translation[0],
             transform_component.translation[1],
@@ -104,15 +103,13 @@ impl CameraParametersData {
             0.0,
         );
 
-        // Update view-projection. The projection inputs are sanitized first:
-        // an impossible field of view or near/far pair would otherwise become
-        // infinities and NaNs in the matrix, which paint nothing and leave no
-        // error to look at.
+        // The projection inputs are sanitized first: an impossible field of
+        // view or near/far pair would otherwise become infinities and NaNs in
+        // the matrix, which paint nothing and leave no error to look at.
         let (vertical_fov, near, far, anomaly) = sanitized_projection(camera_component);
         self.view_projection_matrix =
             CameraParametersData::calculate_projection_matrix(vertical_fov, near, far, aspect)
                 * CameraParametersData::calculate_view_matrix(transform_component);
-        // Sanitized inputs give an invertible matrix, so the inverse is finite.
         self.inverse_view_projection_matrix = self.view_projection_matrix.inverse();
         anomaly
     }
@@ -241,9 +238,7 @@ impl RendererCamera {
     /// # Errors
     ///
     /// Never returns an error: buffer and bind group creation are wgpu calls
-    /// that report nothing to check, and `Ok` is the only value produced. The
-    /// `Result` keeps the call site uniform with the renderer's other resource
-    /// constructors.
+    /// that report nothing to check, and `Ok` is the only value produced.
     pub fn new(
         device: &wgpu::Device,
         camera_bind_group_layout: wgpu::BindGroupLayout,
@@ -260,7 +255,7 @@ impl RendererCamera {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &camera_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
-                binding: 0, // (set = X, binding = 0)
+                binding: 0, // (set = 1, binding = 0)
                 resource: parameters_uniform_buffer.as_entire_binding(),
             }],
             label: Some("camera_parameters_bind_group"),

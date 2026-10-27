@@ -19,10 +19,9 @@
 //! fullscreen triangle at the far plane, depth-tested against what the
 //! geometry pass drew, so the sky shows only where no mesh does.
 //!
-//! The equirect shader's guid is `5628c9e4d9278fec79998a7adab65bc3`
-//! ([`EQUIRECT_SHADER_GUID`]) and the cubemap one's
-//! `a6dfb611b11dfb57c5039dd8b6fc1a46` ([`CUBEMAP_SHADER_GUID`]); a sky
-//! material file names one of them:
+//! A sky material file names its shader by guid -
+//! `5628c9e4d9278fec79998a7adab65bc3` ([`EQUIRECT_SHADER_GUID`]) or
+//! `a6dfb611b11dfb57c5039dd8b6fc1a46` ([`CUBEMAP_SHADER_GUID`]):
 //!
 //! ```json
 //! "asset": {

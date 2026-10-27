@@ -10,9 +10,8 @@
 //! Every field is plain data, so the component survives a hot reload and can
 //! be mirrored into C#. The sound is held as a [`Handle<Sound>`], like a mesh
 //! or a material: `Handle` is `#[repr(C)]` two-integer data with no allocation,
-//! so it crosses the module boundary as safely as the fixed-size name it
-//! replaced, and it names one loaded sound instead of a string somebody has to
-//! resolve again on every play.
+//! so it crosses the module boundary safely, and it names one loaded sound
+//! instead of a string somebody has to resolve again on every play.
 
 // External crates
 use pill_engine::Handle;
@@ -31,8 +30,7 @@ use crate::sound_type::SoundType;
 /// Plays a [`Sound`] from an entity.
 ///
 /// Holds the *intent* to play; [`audio_system`] performs it and records the
-/// result back here. Every field is plain data, so the component survives a
-/// hot reload and can be mirrored into C#.
+/// result back here.
 ///
 /// The sound is a [`Handle<Sound>`], the same reference every other component
 /// uses for its assets. A handle that no longer resolves - its sound was

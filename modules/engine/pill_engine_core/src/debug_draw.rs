@@ -102,7 +102,8 @@ pub struct DebugLine {
 pub struct DebugLabel {
     /// Where it is placed.
     pub anchor: LabelAnchor,
-    /// What it says; printable ASCII is drawn, anything else as `?`.
+    /// What it says; the renderer's bitmap font draws it in uppercase and
+    /// substitutes `?` for a character it lacks.
     pub text: String,
     /// Its colour.
     pub color: DebugColor,
@@ -117,7 +118,8 @@ pub struct GizmoLine {
     pub end: [f32; 3],
     /// Its colour.
     pub color: DebugColor,
-    /// The id a pick of it reports (`1..=0x7FFF_FFFF`; `0` is not pickable).
+    /// The id a pick of it reports; it must fit in the low 31 bits, because
+    /// the top bit marks a handle in the pick buffer.
     pub handle: u32,
 }
 
@@ -129,7 +131,8 @@ pub struct GizmoTriangle {
     pub corners: [[f32; 3]; 3],
     /// Its colour.
     pub color: DebugColor,
-    /// The id a pick of it reports (`1..=0x7FFF_FFFF`; `0` is not pickable).
+    /// The id a pick of it reports; it must fit in the low 31 bits, because
+    /// the top bit marks a handle in the pick buffer.
     pub handle: u32,
 }
 

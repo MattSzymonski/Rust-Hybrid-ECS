@@ -148,18 +148,17 @@ pub fn plain_function_entry(qualified_name: &str) -> Option<(usize, &'static str
 }
 
 // =============================================================================
-// Macro-free function inventory (SPIKE)
+// Macro-free function inventory
 // =============================================================================
 
 /// One function this artifact can report the address of, contributed by a
 /// crate's build script rather than by an attribute.
 ///
-/// This is the macro-free half of the Live++ style approach: a build script
-/// scans the crate's own sources, finds every function, and emits one of these
-/// per function. Nothing in the source is annotated, and because `inventory`
-/// collects per artifact, a DLL ends up with an entry for every function in
-/// every crate linked into it - which is exactly the fan-out a multi-artifact
-/// engine needs.
+/// This is the macro-free route: a build script scans the crate's own sources,
+/// finds every function, and emits one of these per function. Nothing in the
+/// source is annotated, and because `inventory` collects per artifact, a DLL
+/// ends up with an entry for every function in every crate linked into it -
+/// which is exactly the fan-out a multi-artifact engine needs.
 pub struct PillFunctionAddress {
     /// Fully-qualified path, as `module_path!() + "::" + fn name`.
     pub qualified_name: &'static str,
@@ -220,7 +219,7 @@ pub fn functions_with_known_extent() -> (usize, usize) {
     (known, total)
 }
 
-/// Stable hash of a signature string, used only to report a mismatch.
+/// Hash of a signature string, used only to report a mismatch.
 fn text_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -240,7 +239,7 @@ fn text_hash(text: &str) -> u64 {
 /// works.
 ///
 /// The registry is **per linked artifact**: the host executable, each extension
-///  DLL and the project DLL each carry exactly the descriptors their own
+/// DLL and the project DLL each carry exactly the descriptors their own
 /// sources declared. That is what makes it correct across a reload - a
 /// generation that stops declaring a function simply stops submitting it, and
 /// an evicted DLL takes its descriptors with it.
@@ -288,11 +287,9 @@ mod tests {
     // Registry
     // -------------------------------------------------------------------------
     //
-    // `#[pill_hot]` cannot be used inside `pill_engine` itself: its generated
-    // code refers to `::pill_engine`, which does not resolve in the defining
-    // crate. These tests therefore submit a descriptor by hand, exactly as the
-    // macro would, which is the same approach `component_registry` takes. The
-    // macro's own expansion is covered downstream, where it can actually run.
+    // `#[pill_hot]` is exercised downstream, where a project or module crate
+    // expands it. These tests submit a descriptor by hand instead, exactly as
+    // the macro would - the same approach `component_registry` takes.
 
     /// Stands in for a `#[pill_hot]` system.
     fn registry_probe_system() {}

@@ -11,9 +11,10 @@
 //!
 //! The variants carry plain strings rather than `wgpu` error values: the host
 //! links this crate in every posture and reports renderer failures without
-//! naming a graphics type; the renderer module turns its wgpu errors into these. The `engine::renderer` namespace
-//! is shared with the sibling renderer backends, so a diagnostic code keeps
-//! its meaning whichever one a build links.
+//! naming a graphics type, while the renderer module turns its wgpu errors into
+//! these. The `engine::renderer` namespace is shared with the other renderer
+//! backends, so a failure's diagnostic code names the same condition whichever
+//! backend a build links.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -82,7 +83,7 @@ pub type Result<T> = std::result::Result<T, RendererError>;
 /// description of what the caller was doing.
 ///
 /// Implemented for every `Result<T, E>` whose error implements `Display`, and
-/// for `Option<T>`, so a call site can name its own operation - loading this
+/// for `Option<T>`, so a call site names its own operation - loading this
 /// texture, building this pass - instead of the enum growing a variant per
 /// operation.
 pub trait ErrorContext<T> {

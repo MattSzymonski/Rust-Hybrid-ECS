@@ -68,7 +68,7 @@ struct PlainMarker {
     value: u32,
 }
 
-/// A second ordinary component used to force an archetype that differs.
+/// A second ordinary component that forces a different archetype.
 #[derive(Clone, Debug, Default, PillComponent)]
 struct OtherMarker {
     value: u32,
@@ -661,13 +661,9 @@ use project_persisted::PersistedSpline as ProjectPersistedSpline;
 
 /// Rows survive a reload migration no matter which copy registered them.
 ///
-/// This is the failure the whole plan started from. Before shared identity the
-/// two copies were two components with the same type name, and registering the
-/// second evicted the first's inserter from the persist maps - so at the next
-/// reload the evicted copy's rows were dropped with no error at all. With one
-/// identity there is only ever one registration to evict or keep, which is what
-/// lets the selective migration resolve the name to a single id and carry every
-/// row across.
+/// Both copies resolve to one identity, so the persist maps hold one
+/// registration per shared name. The selective migration resolves the name to
+/// that single id and carries every row across, whichever copy created it.
 #[test]
 fn shared_rows_survive_a_migration_from_either_copy() {
     let mut world = World::new();
@@ -761,8 +757,9 @@ fn a_shared_persistable_component_appears_once_in_the_manifest() {
 
 // Two artifacts deliberately writing the *same qualified* name is the one
 // route into a collision the derive cannot close - it is indistinguishable, at
-// the macro, from the legitimate declaration two copies of one type make. The
-// bare `"Transform"` these would otherwise use is now a compile error.
+// the macro, from the legitimate declaration two copies of one type make. A
+// bare `"Transform"` is a compile error, so a collision needs a qualified name
+// written on purpose.
 
 /// One crate's `Transform`.
 #[derive(Clone, Debug, Default, PillComponent)]
@@ -875,7 +872,7 @@ pub mod relaid_current {
 
 /// The previous layout of [`relaid_current::Relaid`].
 pub mod relaid_previous {
-    /// The layout a binary built before the edit declares.
+    /// The layout a stale binary declares, with the fields swapped.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     #[repr(C)]
     pub struct Relaid {
@@ -924,7 +921,7 @@ static RELAID_PREVIOUS_FIELDS: [pill_engine::component_registry::ComponentFieldD
 /// A reload of a subject that was current for a shared component may re-lay
 /// it out; a subject already stale for it (a failed rebuild's rollback) may
 /// not take it back, and without the host's announcement the old layout is a
-/// mismatch as before.
+/// plain mismatch.
 #[test]
 fn only_a_current_subject_may_re_lay_out_a_shared_component() {
     const NAME: &str = "audit::Relaid";

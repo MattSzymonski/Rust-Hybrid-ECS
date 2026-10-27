@@ -1,38 +1,28 @@
 //! Native project-library loading and Windows-safe temporary-copy handling.
 //!
-//! Loaded modules are copied to unique paths before opening. This permits a
-//! newly compiled DLL to replace the build output while an older generation
-//! remains mapped for outstanding function pointers and vtables.
+//! Loaded modules are copied to unique paths before opening, so a rebuilt DLL
+//! can replace the build output while an older generation stays mapped for the
+//! pointers and vtables compiled into it.
 //!
 //! # Responsibilities
 //!
-//! - Load native project libraries from unique temporary paths.
-//! - Validate required exports before returning a loaded library.
-//! - Call native registration and per-frame update entry points.
+//! - Load native libraries from unique temporary paths.
+//! - Validate required exports and call the registration entry point.
 //! - Remove temporary copies left behind by earlier host processes.
 //!
 //! # Design
 //!
 //! The native ABI is a fixed export contract, and there is exactly one of it.
-//! A project and an extension are the same loadable artifact - same
-//! exports, same loader, same reload transaction, same graveyard - so the
-//! loader has nothing to parameterise:
-//!
-//! - `pill_module_init(*const EngineApi) -> u32` — required. Registers
-//!   components and systems before the first frame and returns zero on
-//!   success; any other status aborts the load transaction.
-//! - `pill_module_abi_version() -> u32` — optional, read before anything else
-//!   is called so an incompatible artifact is rejected rather than invoked.
-//!
-//! The exports are resolved and cached when the library is loaded, so the
-//! frame loop never performs a dynamic lookup or panics on a missing optional
-//! export. `pill_module_init` must be idempotent: a failed generation is
-//! rolled back by re-initializing the previous artifact.
-//!
-//! What differs between a project and a module is policy, not contract - a
-//! project is singular where modules are an ordered list, and a module's
-//! components are mirrored to C# - and that lives in the config and the reload
-//! transaction rather than here.
+//! A project and an extension are the same loadable artifact - same exports,
+//! same loader, same reload transaction, same graveyard - so the loader has
+//! nothing to parameterise:
+//! - `pill_module_init(*const EngineApi) -> u32` - required: registers
+//!   components and systems before the first frame and returns zero on success;
+//!   any other status aborts the load transaction.
+//! - `pill_module_abi_version() -> u32` - optional: read before anything else
+//!   is called, so an incompatible artifact is rejected rather than invoked.
+//! Exports are cached at load time, and `pill_module_init` must be idempotent:
+//! a failed generation rolls back by re-initializing the previous artifact.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -98,19 +88,12 @@ const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
 /// The engine's shared libraries, by file stem: every module, project and
 /// patch imports them, and each exists once per process unless a module needs
 /// the isolated copies (see [`engine_dylib_needs_isolation`]).
-/// `pill_ui_frame` carries the frame's UI draw data that the UI painters and the
-/// renderer contract share (W-0032); every artifact that builds or draws UI
-/// lists imports it, so it stages like the rest.
-/// `pill_project_ui` is the in-game egui UI (W-0028): a project draws into its
-/// context and the renderer drains its frame, so a project reload must find
-/// the same copy the host loaded - the whole point of the crate being shared.
-/// `pill_editor_core` is the egui editor's shared copy (W-0017). Its
-/// frontend and shell exchange their types the same way, so it gets the same
-/// treatment.
-/// `pill_ui_theme` is the theme value and the `.theme` asset (W-0127): the
-/// project, `pill_project_ui` and `pill_editor_core` all hold its `Handle`s
-/// and `Theme`, so a project that loads against its own copies needs the
-/// theme dylib staged beside them too.
+///
+/// Every one is a type-identity boundary: the UI frame and draw data
+/// (`pill_ui_frame`), the in-game egui UI and its editor core
+/// (`pill_project_ui`, `pill_editor_core`), and the `Theme`/`Handle`s of
+/// `pill_ui_theme`. A reload must find the same instance the host loaded, so
+/// all of them stage.
 pub(crate) const ENGINE_DYLIB_STEMS: [&str; 6] = [
     "pill_core",
     "pill_engine_core",
@@ -159,7 +142,7 @@ struct UnresolvedImport {
     path: PathBuf,
 }
 
-/// What the gathered evidence says about a failed load (Stage 27).
+/// What the gathered evidence says about a failed load.
 #[derive(Debug, PartialEq, Eq)]
 enum LoadFailureExplanation {
     /// A named import no candidate copy of its DLL exports; the concrete
@@ -176,7 +159,7 @@ enum LoadFailureExplanation {
     Unknown,
 }
 
-/// The explanation the gathered evidence supports (Stage 27).
+/// The explanation the gathered evidence supports.
 ///
 /// The named import wins in general: it names a symbol and a file. It yields
 /// to the engine-dylib story only when the import belongs to an engine dylib
@@ -235,7 +218,7 @@ fn explanation_error(
 }
 
 /// The first named import of `artifact` that a copy of its DLL the loader
-/// would consider does not export (Stage 27).
+/// would consider does not export.
 ///
 /// The copies checked are the ones the staging puts in reach: the host's own
 /// directory (a copy the process already maps wins by basename), beside the
@@ -312,7 +295,7 @@ fn unresolved_engine_mismatch(
     (!matches).then_some((host_engine, module_engine))
 }
 
-/// Explain a load failure with the best evidence available (Stage 27).
+/// Explain a load failure with the best evidence available.
 ///
 /// The module's own import tables are read first: a symbol that no candidate
 /// copy of its DLL exports is a concrete answer, naming both the DLL and the
@@ -506,7 +489,7 @@ type PlainFunctionResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32
 #[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
 
-/// SPIKE: signature of the build-script-backed address resolver.
+/// Signature of the build-script-backed address resolver.
 #[cfg(feature = "hot_patch")]
 type FunctionAddressFn =
     unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
@@ -582,11 +565,10 @@ const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors
 ///
 /// One name for both kinds. A project and an extension export the same
 /// symbols, load the same way, reload through the same transaction and retire
-/// into the same graveyard; what used to separate them was a prefix on these
-/// three names, which is a difference in a string rather than in a contract.
-/// The differences that are real - a project is singular where modules are an
-/// ordered list, a module's components are mirrored to C# - are policy, and
-/// live in the config and the reload transaction rather than in the loader.
+/// into the same graveyard. The differences that are real - a project is
+/// singular where modules are an ordered list, a module's components are
+/// mirrored to C# - are policy, and live in the config and the reload
+/// transaction rather than in the loader.
 const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
 
 /// Optional ABI revision export, read at load time when present.
@@ -624,9 +606,9 @@ pub(crate) struct NativeLibrary {
 
 /// A copied artifact path that deletes itself if the load never takes it over.
 ///
-/// `load_copy` writes the copy before the library exists, so the `?` on a
-/// rejected load used to leave the file behind for the life of the process:
-/// the `Drop` that removes it lives on `NativeLibrary`, which the failure path
+/// `load_copy` writes the copy before the library exists, so without the guard
+/// a rejected load leaves the file behind for the life of the process: the
+/// `Drop` that removes it lives on `NativeLibrary`, which the failure path
 /// never constructs. The guard owns the path from the moment the copy succeeds
 /// and is disarmed only once the library owns the file.
 struct TemporaryCopy {
@@ -810,8 +792,7 @@ impl NativeLibrary {
         // crates), the module must resolve ITS copy or symbol lookup fails at
         // load time. The matching copy is staged into the hot-load directory
         // by the build; when the two copies are byte-identical (a plain CLI
-        // host) the module keeps loading the host's single instance exactly as
-        // before.
+        // host) the module keeps loading the host's single instance.
         //
         // Staging is a best effort, not a guarantee, and Step 3 says so when it
         // does not pay off: the loader resolves an already-mapped DLL by module
@@ -1261,18 +1242,15 @@ impl NativeLibrary {
     /// Reject an artifact built against a different revision of the module ABI.
     ///
     /// Every loadable artifact exports the same optional
-    /// `pill_module_abi_version`, and the host checks it before anything calls
-    /// into the artifact: a contract mismatch means the two sides disagree
-    /// about what the entry points expect, and the failure mode of proceeding
-    /// is a call through a signature one side never agreed to. An artifact
-    /// with no revision export at all predates the versioned contract and
-    /// cannot be assumed compatible.
+    /// `pill_module_abi_version`, checked before anything calls into it: a
+    /// mismatch means the two sides disagree about what the entry points
+    /// expect, and proceeding would call through a signature one never agreed
+    /// to. No export at all predates the versioned contract.
     ///
     /// # Errors
     ///
-    /// Returns [`ModuleError::AbiVersionMismatch`] when the artifact reports a
-    /// different revision, and [`ModuleError::AbiVersionMissing`] when it has
-    /// no revision export.
+    /// Returns [`ModuleError::AbiVersionMismatch`] for a different revision and
+    /// [`ModuleError::AbiVersionMissing`] when the export is absent.
     pub(crate) fn check_module_abi(&self, module_name: &str) -> Result<(), ModuleError> {
         let host_version = pill_engine::module_abi::MODULE_ABI_VERSION;
         match self.abi_version() {
@@ -1500,18 +1478,16 @@ fn remove_temporary_file(path: &Path) {
 
 /// Remove one generation's directory, keeping whatever the process still maps.
 ///
-/// The copy is not all that is in there: the module's PDB is staged beside it,
-/// and in the isolated-engine posture so are copies of the engine dylibs - one
-/// directory per load, which is tens of megabytes per reload if nothing takes
-/// it away again. The copy and the PDB go with the library. A mapped engine
-/// dylib cannot be deleted on any platform that locks its images, so whatever
-/// refuses to go is named at debug level rather than warned about: it is
-/// expected, and the startup sweep collects it once this process is gone.
+/// The directory holds the copy, the module's PDB, and - with an isolated
+/// engine - copies of the engine dylibs: one directory per load, tens of
+/// megabytes if nothing takes it away. A mapped engine dylib cannot be deleted
+/// on any platform that locks its images, so whatever refuses to go is named at
+/// debug level rather than warned about; the startup sweep collects it once
+/// this process is gone.
 ///
-/// Never the process directory itself, whose name is this process's id and
-/// which holds the hot-patch scratch images that outlive every module: only a
-/// `<staging>/<pid>/<module>_<stamp>_<n>` directory is touched, recognised by
-/// its parent being named for a process.
+/// Only a `<staging>/<pid>/<module>_<stamp>_<n>` directory is touched, never
+/// the process directory itself, which holds hot-patch scratch images that
+/// outlive every module.
 fn remove_generation_directory(directory: &Path) {
     let owned_by_a_process_directory = directory
         .parent()
@@ -1578,17 +1554,14 @@ fn process_is_alive(pid: u32) -> bool {
 
 /// Remove temporary copies left by earlier runs of this host process.
 ///
-/// Three rules, in order. This process's own directory always goes - a
-/// previous run under the same process id left it, and nothing of ours is
-/// mapped yet. Another process's directory goes once it has been quiet for
-/// [`STAGING_GRACE_PERIOD`], which is how a dead host is told from a live one
-/// without probing the process table. And whatever survives both is capped at
-/// [`MAX_RETAINED_STAGING_DIRECTORIES`], oldest evicted first, so a burst of
-/// host runs inside one grace period cannot accumulate without bound.
+/// Three rules, in order. This process's own directory always goes - a previous
+/// run under the same process id left it. Another process's directory goes once
+/// it has been quiet for [`STAGING_GRACE_PERIOD`], which is how a dead host is
+/// told from a live one without probing the process table. Whatever survives is
+/// capped at [`MAX_RETAINED_STAGING_DIRECTORIES`], oldest evicted first.
 ///
-/// Removal failures are reported rather than swallowed, because on Windows a
-/// failure is informative: a live host keeps its mapped modules locked, so a
-/// refusal is the operating system saying the directory is still in use.
+/// Removal failures are reported rather than swallowed: on Windows a live host
+/// keeps its mapped modules locked, so a refusal says the directory is in use.
 pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
     let temporary_root = workspace_root.join(TEMPORARY_DIRECTORY);
     let Ok(entries) = std::fs::read_dir(&temporary_root) else {
@@ -1735,7 +1708,7 @@ mod tests {
 
     use crate::scratch::ScratchDirectory;
 
-    /// The Stage 27 case: the artifact imports a symbol `pill_ui_frame` does not
+    /// A failing load: the artifact imports a symbol `pill_ui_frame` does not
     /// export while `pill_core`'s copies differ. The message must name
     /// `pill_ui_frame` and the symbol - the mismatch story must not win and bury
     /// the real answer.
@@ -1952,8 +1925,8 @@ mod tests {
     ///
     /// The copy is not the only thing in there: the module's PDB is staged
     /// beside it, and so are copies of the engine dylibs when the module needs
-    /// its own. Removing the copy alone left every one of those behind, one
-    /// directory per reload, for the life of the workspace.
+    /// its own. Removing the copy alone would leave every one of those behind,
+    /// one directory per reload, for the life of the workspace.
     #[test]
     fn a_rejected_load_leaves_no_generation_directory() {
         let workspace = ScratchDirectory::new("generation_directory");

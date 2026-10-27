@@ -2,7 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines all tunable constants (slice sizes, thread counts, profiling knobs).
+//! - Defines all tunable constants (slice sizes, work-group counts, profiling
+//!   knobs).
 //! - Provides `default_entities_per_slice()` for adaptive parallel work sizing.
 //! - Reports the parallel-execution configuration at engine startup.
 //!
@@ -11,15 +12,14 @@
 //! All magic numbers live here so they can be adjusted without hunting through
 //! source files. The [`ParallelProcessingConfig`] struct groups related knobs;
 //! free functions handle slice-size computation and the startup report.
-//! Re-exported at the crate root via `crate::config`.
 //!
-//! The startup report (`print_parallel_config`) emits
-//! through the tracing stack under `telemetry_target::SYSTEM` so they can be
-//! filtered, redirected to the file lane, or silenced like any other engine
-//! output. It is one multi-line event (`log_block`), which the
-//! terminal formatter prints as a block below its time, level and target. The
-//! system hardware report lives in `pill_runtime` (its `system_specs` module),
-//! so `sysinfo` stays out of the shared engine dylib.
+//! The startup report (`print_parallel_config`) emits through the tracing
+//! stack under `telemetry_target::SYSTEM`, so it can be filtered, redirected to
+//! the file lane, or silenced like any other engine output. It is one
+//! multi-line event (`log_block`), which the terminal formatter prints as a
+//! block below its time, level and target. The system hardware report lives in
+//! `pill_runtime` (its `system_specs` module), so `sysinfo` stays out of the
+//! shared engine dylib.
 
 // External crates
 use pill_core::info;
@@ -58,12 +58,12 @@ impl ProfilingConfig {
 //           │
 //           └─ par_iter_mut().for_each()
 //                │
-//                ├─ iterator_slices (4096 entities each)  ← ITERATOR_PARALLEL_DEFAULT_ENTITIES_PER_SLICE
+//                ├─ iterator_slices (4096 entities each)  ← DEFAULT_ITERATOR_SLICE_SIZE
 //                │   iterator_slice 0: entities 0..4096
 //                │   iterator_slice 1: entities 4096..8192
 //                │   ...
 //                │
-//                └─ iterator_work_groups (1 per rayon task)  ← ITERATOR_PARALLEL_TARGET_WORK_GROUP_DURATION
+//                └─ iterator_work_groups (1 per rayon task)  ← TARGET_ITERATOR_WORK_GROUP_DURATION
 //                    iterator_work_group 0: iterator_slices [0,1,2,3]  → rayon task 0
 //                    iterator_work_group 1: iterator_slices [4,5,6,7]  → rayon task 1
 
@@ -92,20 +92,16 @@ impl ParallelProcessingConfig {
     /// More groups than threads lets a long loop balance itself when the
     /// threads do not run equally fast (efficiency cores on a hybrid CPU, two
     /// hyperthreads on one core): the faster threads take the groups the
-    /// slower ones have not reached yet. Measured on an i7-12700KF (8
-    /// performance cores with hyperthreading plus 4 efficiency cores) with one
-    /// group per thread, the threads were idle a third of every loop, waiting
-    /// for the group on the slowest one.
+    /// slower ones have not reached yet.
     pub const WORK_GROUPS_PER_THREAD: usize = 4;
 
     /// Default entities per parallel work slice.
     ///
-    /// This is an arbitrary but well-tested starting point.  Benchmarked
-    /// values between 256 and 50000 show no measurable difference for
-    /// standard workloads - the streaming access pattern and hardware
-    /// prefetching make the exact number non-critical.  The clamped
-    /// formula (see [`default_entities_per_slice`]) scales this down
-    /// per-query for unusually large components.
+    /// A starting point chosen for streaming access rather than fine-tuned by
+    /// measurement: the access pattern and hardware prefetching make the exact
+    /// number non-critical. The clamped formula (see
+    /// [`default_entities_per_slice`]) scales it down per query for unusually
+    /// large components.
     pub const DEFAULT_ITERATOR_SLICE_SIZE: usize = 4096;
 
     /// Minimum entities per thread before parallel execution kicks in.
@@ -158,12 +154,11 @@ impl QueryConfig {
 
 /// Default number of entities per parallel work slice, clamped by component size.
 ///
-/// Returns a value between [`MINIMUM_SLICE_SIZE`] (256) and
-/// [`DEFAULT_ITERATOR_SLICE_SIZE`] (4096).  The slice scales inversely
-/// with the total bytes per entity so that larger components get smaller
-/// slices, keeping per-slice overhead bounded.
-///
-/// Set the `ECS_SLICE_SIZE` environment variable to override at runtime.
+/// Without an override it lands between
+/// `ParallelProcessingConfig::MINIMUM_SLICE_SIZE` (256) and
+/// `ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE` (4096), scaled
+/// inversely with the bytes per entity so per-slice overhead stays bounded.
+/// A positive `ECS_SLICE_SIZE` environment variable overrides that.
 ///
 /// # Examples
 ///
@@ -188,16 +183,18 @@ pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
     // Step 2: Fall back to the size-scaled default, clamped to the configured range.
     let default = ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE;
     let min = ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
-    // Scale: keep total data per slice constant (~32 KiB for 8 B baseline).
-    // bytes_per_entity is already clamped to at least 8 in the caller.
+    // Scale: keep total data per slice constant (~32 KiB for an 8 B baseline).
+    // The query path clamps bytes_per_entity to at least 8, so this cannot
+    // divide by zero.
     (default * 8 / bytes_per_entity).clamp(min, default)
 }
 
 /// Report the active parallel-iterator configuration through the telemetry stack.
 ///
-/// Shows the Rayon thread-pool size and every tunable in
-/// [`ParallelProcessingConfig`], under the same `telemetry_target::SYSTEM`
-/// target as the runtime's system-specs report.
+/// Shows the Rayon thread-pool size and the knobs the report lists - the
+/// work-group duration target, the averaging window, the default slice size
+/// and the minimum - under the same `telemetry_target::SYSTEM` target as the
+/// runtime's system-specs report.
 ///
 /// Called during [`Engine::new`](crate::Engine::new).
 pub fn print_parallel_config() {

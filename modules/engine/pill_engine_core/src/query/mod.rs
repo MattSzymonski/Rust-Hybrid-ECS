@@ -10,22 +10,20 @@
 //!
 //! # Design
 //!
-//! The query is parameterized by a target (what data to fetch) and a filter
-//! (which entities to skip). Both fold their component requirements into a
-//! single [`ComponentMask`] used to skip non-matching archetypes via bitwise
-//! AND. For parallel iteration, per-archetype state caches raw pointers so
-//! worker threads access components without repeated lookups.
+//! A query is parameterized by a target (what data to fetch) and a filter
+//! (which entities to skip). The target folds its component ids into one
+//! [`ComponentMask`](crate::component::ComponentMask); the filter contributes
+//! `(include, exclude)` mask pairs that are OR-ed, and an archetype is skipped
+//! unless the target mask and some filter pair both pass their bitwise AND.
+//! Both levels resolve archetype storage once and hand worker threads raw
+//! pointers, so parallel iteration never repeats a lookup.
 //!
-//! ## Module layout
+//! [`query`] holds [`Query`] itself; the rest are [`target`], [`filter`],
+//! [`iter`], [`ptr`] (thread-safe raw-pointer wrappers), [`resource`] ([`Res`] /
+//! [`ResMut`]) and [`change_detection`] (the `Mut` smart pointer for tick
+//! tracking).
 //!
-//! - [`target`] - the [`QueryTarget`] trait and its impls
-//! - [`filter`] - the [`QueryFilter`] trait and concrete filters
-//! - [`iter`] - sequential and parallel iterator types
-//! - [`ptr`] - thread-safe raw-pointer wrappers
-//! - [`resource`] - [`Res`] / [`ResMut`] system parameters
-//! - [`change_detection`] - [`Mut`] smart pointer for tick tracking
-//!
-//! ## Usage Examples
+//! # Examples
 //!
 //! ```no_run
 //! # use pill_engine::*;
@@ -53,12 +51,13 @@
 //! }
 //! ```
 
-/// [`Mut`] smart pointer with tick-based change detection for components.
+/// [`Mut`](change_detection::Mut) smart pointer with tick-based change
+/// detection for components.
 pub(crate) mod change_detection;
 mod filter;
 mod iter;
 
-/// Thread-safe raw-pointer wrappers for parallel query iteration.
+/// Thread-safe raw-pointer wrappers shared by query targets and filters.
 pub(crate) mod ptr;
 #[allow(clippy::module_inception)]
 mod query;

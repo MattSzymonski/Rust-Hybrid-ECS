@@ -15,8 +15,8 @@
 //! the old code, so all three routes fan out across both kinds - which is why
 //! they share one traversal ([`every_copy`]) rather than each walking their own.
 //!
-//! Leaving the patches out of that walk is what made a chain of hot functions
-//! freeze at whatever the callee looked like when the caller was compiled.
+//! Leaving the patches out of that walk freezes a chain of hot functions at
+//! whatever the callee looked like when the caller was compiled.
 
 // External crates
 use libloading::{Library, Symbol};
@@ -111,7 +111,7 @@ pub(super) fn resolve_plain_in(
 /// generated patch links its own copy of whatever its body calls. Both kinds
 /// therefore hold code that a replacement has to reach, and every fan-out below
 /// walks both. The enum exists so that walk is written once: the two kinds
-/// expose the same three operations with slightly different signatures, and
+/// expose the same operations with slightly different signatures, and
 /// normalizing them here keeps the difference out of the callers.
 enum PatchCopy<'a> {
     /// A module or project DLL the host loaded.
@@ -141,10 +141,10 @@ impl PatchCopy<'_> {
 
     /// Empty this copy's redirect slot, restoring its own body.
     ///
-    /// Both arms pass their detail through untouched: a patch now reports a
-    /// missing resolver export as an error the same way an artifact does, so
-    /// a copy that cannot be interrogated aborts the rollback instead of
-    /// being skipped as one that declares nothing.
+    /// Both arms pass their detail through untouched: a patch reports a
+    /// missing resolver export as an error the same way an artifact does, so a
+    /// copy that cannot be interrogated aborts the rollback instead of being
+    /// skipped as one that declares nothing.
     fn reset_plain_function(&self, qualified: &str) -> Result<bool, String> {
         match self {
             Self::Artifact(artifact) => artifact.reset_plain_function(qualified),
@@ -178,10 +178,9 @@ impl PatchCopy<'_> {
 
 /// Every image that could carry a copy of a function, labelled for diagnostics.
 ///
-/// Artifacts first, then patches, which is the order every fan-out used before
-/// they shared this walk. Leaving the patches out is what made a chain of hot
-/// functions freeze at whatever the callee looked like when the caller was
-/// compiled, so the two are deliberately not separable.
+/// Artifacts first, then patches. Leaving the patches out is what freezes a
+/// chain of hot functions at whatever the callee looked like when the caller
+/// was compiled, so the two are deliberately not separable.
 fn every_copy<'a>(
     targets: &'a [(&'a str, &'a NativeLibrary)],
     patches: &'a [LoadedPatch],
@@ -249,7 +248,7 @@ impl RedirectSlot for PatchCopy<'_> {
 /// A crate linked into several artifacts is compiled into each of them, so the
 /// project DLL runs its own embedded copy of a module it depends on. Installing
 /// only into the module's own DLL would leave that copy running the old code,
-/// which is exactly the situation that forces a cascading project reload today.
+/// which is what would otherwise force a cascading project reload.
 ///
 /// `previous` is the generation this function is running now, which a refusal
 /// returns the copies it already redirected to. Passing `None` means nothing
@@ -360,14 +359,14 @@ const PATCH_INSTALL_RESOLVER: &[u8] = b"pill_patch_resolve_install";
 /// Slot reset a generated patch exports.
 const PATCH_RESET_RESOLVER: &[u8] = b"pill_patch_resolve_reset";
 
-/// One previously loaded patch, offered as a target for later patches.
+/// An earlier loaded patch, offered as a target for later patches.
 ///
 /// A patch links its own copy of everything its body calls, and those copies are
 /// as stale as any other artifact's the moment a callee is patched. Without
 /// this, a chain of hot functions freezes at whatever the callee looked like
-/// when the caller's patch was compiled: patch `Spline::get_color_a`, then patch
-/// `pill_dummy_color::get_color_a`, and the first patch keeps calling the old
-/// second one.
+/// when the caller's patch was compiled: patch a caller of
+/// `pill_dummy_color::get_color_a`, then patch `get_color_a` itself, and the
+/// caller's patch keeps running the `get_color_a` it was compiled with.
 pub(crate) struct LoadedPatch {
     /// The function this patch replaced, used as its label.
     pub function: String,
@@ -382,8 +381,8 @@ impl LoadedPatch {
     /// Offer a replacement to this patch's own copy of one `#[pill_hot_fn]`.
     ///
     /// A patch links its own copy of whatever its body calls, slots included,
-    /// and those slots start empty. Skipping them is what made a patched caller
-    /// keep calling the compiled-in version of a callee patched afterwards.
+    /// and those slots start empty. Skipping them leaves a patched caller
+    /// calling the compiled-in version of a callee patched afterwards.
     pub(super) fn install_plain_function(
         &self,
         qualified: &str,
@@ -451,10 +450,10 @@ impl LoadedPatch {
 
     /// Address and recorded declaration of one function inside this patch.
     ///
-    /// The declaration is `None` when the patch recorded none. That case used
-    /// to be flattened into an empty string, which the prologue gate read as
-    /// "no gate" - the exact reading a missing declaration must never get, so
-    /// the absence is kept visible here.
+    /// The declaration is `None` when the patch recorded none. That absence is
+    /// kept visible rather than flattened into an empty string, which the
+    /// prologue gate would read as "no gate" - the exact reading a missing
+    /// declaration must never get.
     fn function_address(&self, qualified: &str) -> Option<(usize, Option<String>)> {
         type AddressFn =
             unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
@@ -581,10 +580,10 @@ pub(super) fn prologue_patch_everywhere(
         // about what it jumps to, so the shape has to be checked before the
         // write - and checked against what THIS artifact was built with, not
         // against another copy. A copy that cannot report a declaration at all
-        // is refused rather than exempted: a missing signature used to pass
-        // the gate silently, and older staged artifacts are exactly where the
-        // data goes missing. Classification should already have refused a
-        // changed signature; this is what catches it having been wrong.
+        // is refused rather than exempted: an absent signature passing the gate
+        // silently is exactly how a stale staged artifact would be patched.
+        // Classification should already have refused a changed signature; this
+        // is what catches it having been wrong.
         check_recorded_declaration(&label, qualified, signature.as_deref(), expected_signature)?;
         reachable.push((label, address, copy));
     }

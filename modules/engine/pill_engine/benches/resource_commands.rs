@@ -1,29 +1,26 @@
-//! Resource and Commands benchmarks for the `pill_engine` world API.
+//! Resource and commands benchmarks for the `pill_engine` world API.
 //!
 //! Resources are singleton data (time, input, config) stored in the `World`
-//! and accessed via `Res<T>` / `ResMut<T>` system parameters. Commands are
-//! the deferred-operation queue that lets systems schedule structural changes
-//! (create/destroy entities, add/remove components) without holding a
-//! `&mut World`.
+//! and accessed through `Res<T>` / `ResMut<T>` system parameters. Commands are
+//! the deferred-operation queue that lets a system schedule structural changes
+//! - create or destroy entities, add components - without holding `&mut World`.
 //!
 //! # Responsibilities
 //!
-//! - Measure the four resource CRUD operations: insert (HashMap + Box
-//!   allocation), get (immutable downcast), get_mut (mutable downcast + change
-//!   tick update), and remove (HashMap removal + deallocation).
-//! - Measure the full deferred-command pipeline: queue the operation during
-//!   system execution, then apply it during the post-frame command flush.
-//! - Cover entity creation (2 components), entity destruction, and component
-//!   addition via `add_component_to_entity`.
+//! - Measures the four resource operations: insert (map insert plus heap
+//!   allocation), get (immutable lookup and downcast), get_mut (mutable lookup
+//!   and downcast, untracked) and remove (lookup removal and deallocation).
+//! - Measures the deferred-command pipeline: queue the operation during system
+//!   execution, apply it during the frame's command flush.
+//! - Covers entity creation with two components, entity destruction, and
+//!   component addition via `add_component_to_entity`.
 //!
 //! # Design
 //!
-//! Together these cover the two main ways systems interact with the `World`
-//! outside of component queries. Resource benchmarks drive a fresh [`World`]
-//! directly through the four CRUD methods, while command benchmarks register
-//! a system that queues work and flush it through `Engine::process_frame`.
-//! Fixture component and resource types are defined here so every harness
-//! shares one set of registrations.
+//! Resource benchmarks drive a fresh [`World`] through the CRUD methods;
+//! command benchmarks register a system that queues work and then run
+//! `Engine::process_frame` to flush it. Fixture component and resource types
+//! are defined here so every harness shares one set of registrations.
 
 #![allow(dead_code)]
 
@@ -84,8 +81,7 @@ impl Resource for ProjectTime {}
 
 /// Mouse position and button state singleton resource.
 ///
-/// Unused fixture type that exercises the world's ability to store multiple
-/// distinct resource types alongside `ProjectTime`.
+/// Declared for the fixture set; no benchmark registers or measures it.
 #[derive(Debug)]
 struct InputState {
     mouse_x: f32,
@@ -96,8 +92,7 @@ impl Resource for InputState {}
 
 /// Global simulation configuration singleton resource.
 ///
-/// Third resource fixture type; not measured directly but confirms the world
-/// holds several resources without interference.
+/// Declared for the fixture set; no benchmark registers or measures it.
 #[derive(Debug)]
 struct Config {
     gravity: f32,
@@ -110,7 +105,7 @@ impl Resource for Config {}
 // =============================================================================
 
 /// Inserts the same `ProjectTime` resource `count` times into a fresh `World` (last write wins).
-/// Measures HashMap insertion overhead for singleton resources, including the `Any` box allocation.
+/// Measures the map insert plus the heap allocate-and-free each insert performs.
 fn bench_resource_insert(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_insert");
     for &count in &[100, 1_000, 10_000] {
@@ -164,7 +159,8 @@ fn bench_resource_get(criterion: &mut Criterion) {
 }
 
 /// Mutates a `ProjectTime` resource `count` times via `world.get_resource_mut()`.
-/// Measures the mutable borrow path including change-detection tick updates.
+/// Measures the mutable lookup and downcast path; the untracked accessor leaves
+/// change ticks alone.
 fn bench_resource_get_mut(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_get_mut");
     for &count in &[1_000, 10_000, 100_000] {
@@ -192,7 +188,7 @@ fn bench_resource_get_mut(criterion: &mut Criterion) {
 }
 
 /// Removes and drops a `ProjectTime` resource from the `World`.
-/// Measures HashMap removal + `Box` deallocation cost for resources.
+/// Measures the map removal and the deallocation of the erased value.
 fn bench_resource_remove(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_remove");
     for &count in &[100, 1_000, 10_000] {
@@ -231,13 +227,10 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
             BenchmarkId::from_parameter(count),
             &count,
             |benchmark, &count| {
-                // Engine construction is setup, not workload. `Engine::new`
-                // warms the Rayon pool and prints a system-spec banner, and
-                // leaving it inside the measured closure made this benchmark
-                // report ~90 ms at every size - MORE entities came out FASTER,
-                // because the number was engine startup rather than the command
-                // pipeline this is meant to measure. The two benchmarks below
-                // already use `iter_batched` for exactly this reason.
+                // Engine construction is setup, not workload: `Engine::new`
+                // warms the Rayon pool and prints the parallel-iteration
+                // configuration, which would otherwise dominate a small
+                // workload and hide the command pipeline the benchmark is for.
                 benchmark.iter_batched(
                     || {
                         // Setup: a fresh engine with the component types the
@@ -248,8 +241,9 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
                         engine
                     },
                     |mut engine| {
-                        // Measured: queue `count` creations through `Commands`,
-                        // then flush them in `process_frame`.
+                        // Measured: register the spawning system, queue `count`
+                        // creations through `Commands`, then flush them in
+                        // `process_frame`.
                         engine.register_system("spawner", move |mut commands: Commands| {
                             for i in 0..count {
                                 commands

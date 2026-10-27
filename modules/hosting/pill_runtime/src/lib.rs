@@ -47,8 +47,9 @@ mod telemetry;
 
 // ===== Re-exports =====
 
-/// The renderer contract's types that appear in this crate's API
-/// ([`FrameDriver`], the windowed runtime), re-exported for frontends.
+/// The engine's and the renderer contract's types that appear in this crate's
+/// API - the windowed runtime, [`FrameDriver`] - re-exported so a frontend
+/// names this crate alone.
 pub use pill_engine::common_components::TransformComponent;
 pub use pill_renderer_api::{
     ensure_preview_resources, frame_grid, CameraBinding, CameraComponent, FrameGrid, PickHit,

@@ -2,20 +2,21 @@
 //!
 //! # Responsibilities
 //!
-//! - `preferences_tab`: the editor-wide rows (seeded into the session's draft buffers, saved as one batch) and the project's gizmo rows.
+//! - `preferences_tab`: the editor-wide rows (seeded into the session's draft
+//!   buffers, saved as one batch) and the project's gizmo rows.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths: a generated patch crate replays this
+//! file's top-level `use` lines, so a `super::`-relative glob would not
+//! resolve there.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Preferences tab (Stage 20): the editor-wide rows seeded from the
-/// preferences file and saved as one read-modify-write batch, then the
-/// project's remembered gizmo choices with the tool buttons that change
-/// them - the same queued commands the shortcuts, the menus and the
-/// scripted channel land in.
+/// The Preferences tab: the editor-wide rows seeded from the preferences file
+/// and saved as one read-modify-write batch, then the project's remembered
+/// gizmo choices - the same `SetGizmoTool` commands the shortcuts, the menus
+/// and the scripted channel queue.
 #[pill_hot_fn]
 pub fn preferences_tab(
     ui: &mut egui::Ui,
@@ -36,9 +37,9 @@ pub fn preferences_tab(
         );
         for field in preferences::PREFERENCE_FIELDS {
             let buffer = buffers.entry(field.key.to_string()).or_default();
-            // The previews switch is a real checkbox (W-0049 Stage 11): a
-            // boolean row a person can see the state of, written back as the
-            // text the document's parser reads.
+            // The previews switch is a real checkbox - a boolean row whose
+            // state the person can see - written back as the text the
+            // document's parser reads.
             if field.key == pill_editor_core::previews::RENDER_PREVIEWS_KEY {
                 let mut enabled = buffer.trim().eq_ignore_ascii_case("true");
                 if ui.checkbox(&mut enabled, field.label).changed() {
@@ -122,7 +123,7 @@ pub fn preferences_tab(
                     }]);
                 }
             }
-            // The Preferences row is narrow, so the spaces wear their short
+            // The Preferences row is narrow, so the spaces use their short
             // names here rather than the menu's.
             for (space, _label, icon) in SPACE_ROWS {
                 let short = match space {

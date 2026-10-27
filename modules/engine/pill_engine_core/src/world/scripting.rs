@@ -11,14 +11,14 @@
 //!
 //! A script component is an ordinary component first: it registers through the
 //! same path as any other, and the script half is a second table beside it.
-//! Dispatch is by plain function pointer rather than a trait object, so no
-//! vtable belonging to a retired artifact is ever called, and the pointers are
-//! replaced wholesale when a generation re-registers.
+//! Dispatch goes through a plain function pointer rather than a trait object,
+//! so the only thing an updater can be is a non-capturing function: it cannot
+//! capture state, stash the raw pointers it is handed, or keep anything alive
+//! past the call. Registering the type again overwrites its entry.
 //!
 //! The updater receives raw pointers to the world and the command queue because
 //! it needs both while the world is already borrowed to walk the columns. They
-//! are valid for exactly the duration of one dispatch, which a non-capturing
-//! function pointer is what guarantees: it cannot stash them.
+//! are valid for exactly the duration of one dispatch.
 
 use super::*;
 
@@ -28,13 +28,17 @@ use super::*;
 
 /// Function that updates a script component.
 ///
-/// Takes: (storage, index, entity, world_ptr, commands_ptr).
-/// Uses raw pointers to create a `ScriptContext` inside `update_scripts`.
+/// Arguments: the component storage, the row index, the entity, and raw
+/// pointers to the world and command queue that `update_scripts` turns into a
+/// [`ScriptContext`] for one dispatch.
 ///
-/// SAFETY: The raw-pointer arguments (`world_ptr`, `commands_ptr`) are only
-/// valid during the `update_scripts` call. Using a plain function pointer
-/// (not a closure) guarantees that no state is captured and the callee
-/// cannot stash the pointers for later use.
+/// # Safety
+///
+/// The two raw-pointer arguments are valid only for the duration of the call
+/// that passes them. An implementation must not store either one, and a caller
+/// must pass pointers that stay valid for the whole call. Being a plain `fn`
+/// and not a closure is part of the contract: it cannot capture, so it has
+/// nowhere to keep them.
 pub(super) type ScriptUpdater =
     fn(&mut ComponentColumns, usize, Entity, *mut World, *mut CommandQueue);
 
@@ -43,10 +47,11 @@ pub(super) type ScriptUpdater =
 // =============================================================================
 
 impl World {
-    /// Register a script component type with the World
+    /// Registers a component type whose `update` runs once per frame per
+    /// entity.
     ///
-    /// Script components have an update() method that gets called by update_scripts().
-    /// This must be called for each script component type before it can be used.
+    /// Registers `T` as an ordinary component first, then records the bit and
+    /// the updater `update_scripts` dispatches through.
     pub fn register_script_component<T>(&mut self)
     where
         T: ScriptComponent,
@@ -58,19 +63,18 @@ impl World {
                 std::any::type_name::<T>()
             )]
         );
-        // First register as a normal component
+        // Step 1: Register it as an ordinary component, so the registry holds
+        // a bit to address its column by.
         self.register_component::<T>();
 
-        // Then track it as a script component
+        // Step 2: Record the bit and the updater beside it.
         let component_id = ComponentId::of::<T>();
         if let Some(bit) = self.component_registry.get_bit(&component_id) {
             self.script_components.push((component_id, bit));
 
-            // Register updater callback for this script component.
-            // Uses a non-capturing closure coerced to a function pointer
-            // so that no state (especially no raw pointer) is captured.
-            // The raw pointers are passed fresh by `update_scripts` on
-            // every invocation.
+            // Step 3: Store the updater. The closure captures nothing, so it
+            // coerces to the function pointer; the raw pointers are handed in
+            // fresh on every dispatch.
             self.script_updaters.insert(
                 component_id,
                 (|storage: &mut ComponentColumns,
@@ -78,7 +82,6 @@ impl World {
                   entity: Entity,
                   world_ptr: *mut World,
                   commands_ptr: *mut CommandQueue| {
-                    // Get mutable reference to the component
                     let component = storage.column_of_mut::<T>().get_mut::<T>(index);
                     // SAFETY: `world_ptr` and `commands_ptr` are derived from
                     // `&mut World` / `&mut CommandQueue` that are valid for the
@@ -96,15 +99,14 @@ impl World {
         }
     }
 
-    /// Update all script components
+    /// Runs `update` on every script component of every entity that carries
+    /// one, once per frame.
     ///
-    /// Calls update() on every script component in the world.
-    /// Scripts receive a `ScriptContext` with:
-    /// - Read-only world access for queries
-    /// - Deferred command queue for structural changes
-    ///
-    /// This ensures all structural changes (add/remove component, destroy entity)
-    /// are automatically deferred, preventing use-after-free bugs.
+    /// Scripts receive a [`ScriptContext`] with component and resource reads, a
+    /// mutable component borrow, and the command queue. Every structural change
+    /// (add/remove component, destroy entity) is deferred there, so it is
+    /// applied after all scripts have finished and no script can migrate a row
+    /// out from under itself.
     pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
         let _zone = crate::profile_scope!(
             "update scripts",
@@ -119,28 +121,25 @@ impl World {
         let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> =
             Vec::with_capacity(total_entities);
 
-        // Take raw pointers once, BEFORE any field borrows on self.
+        // Taken once, before any field borrow of `self`.
         let world_ptr = self as *mut World;
         let commands_ptr = commands as *mut CommandQueue;
 
         // Step 2: For each script component type, gather every entity that
         // carries it.
         for &(component_id, comp_bit) in &self.script_components {
-            // Get the updater for this component type.
-            // Function pointers are Copy - no allocation here.
+            // A type that registered no updater is skipped.
             let updater = match self.script_updaters.get(&component_id) {
                 Some(&u) => u,
                 None => continue,
             };
 
-            // Collect entities that have this script component
+            // Every entity of an archetype whose mask carries the script bit.
             for (archetype_id, archetype) in &self.archetypes {
-                // Check if this archetype has the script component using bitmask
                 let mut mask = ComponentMask::empty();
                 mask.set(comp_bit);
 
                 if archetype.matches_mask(&mask) {
-                    // Collect all entities in this archetype
                     for (index, &entity) in archetype.entities.iter().enumerate() {
                         entities_to_update.push((entity, *archetype_id, index));
                     }
@@ -154,7 +153,6 @@ impl World {
 
             for (entity, archetype_id, index) in entities_to_update.drain(..) {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
-                    // Call the updater with mutable storage access
                     updater(
                         &mut archetype.component_storages,
                         index,

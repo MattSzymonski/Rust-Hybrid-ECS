@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Draw the palette while it is open: the query field, the filtered rows and
-//!   the row the arrows select (W-0038 Stage 3).
+//!   the row the arrows select.
 //! - Run the selected row through [`run_menu_action`], the same call a menu
 //!   entry makes, so a palette run and a menu click take one path.
 //! - Report the popup's rectangle as an overlay region, so a click inside the
@@ -29,8 +29,8 @@ pub const PALETTE_WIDTH: f32 = 360.0;
 
 /// The commands whose titles contain `query`, in registration order.
 ///
-/// A substring match on the title, case-insensitively; fuzzy ranking is out
-/// of scope for this stage.
+/// A case-insensitive substring match on the title; an empty query matches
+/// every command.
 pub fn matches<'a>(commands: &'a [CommandView], query: &str) -> Vec<&'a CommandView> {
     let needle = query.trim().to_lowercase();
     commands

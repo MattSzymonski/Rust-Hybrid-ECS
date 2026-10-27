@@ -432,7 +432,8 @@ impl WindowedApplication {
         // Step 2: Present one frame to the hidden window's surface.
         match host.run_frame() {
             Ok(_) => {
-                // Step 3: Reveal the window now that it holds rendered content.
+                // Step 3: Reveal the window, which already holds rendered
+                // content.
                 window.set_visible(true);
                 self.window_shown = true;
                 window.request_redraw();

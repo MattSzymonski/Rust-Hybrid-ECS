@@ -1,4 +1,4 @@
-//! The `.ttf`/`.otf` font a theme layer names (W-0127 Stage 7).
+//! The `.ttf`/`.otf` font a theme layer names.
 //!
 //! # Responsibilities
 //!

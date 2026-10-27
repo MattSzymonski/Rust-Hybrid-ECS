@@ -431,7 +431,7 @@ impl AttachedRenderer {
     }
 
     /// Move the previews the renderer has read back since the last call into
-    /// the world's [`pill_renderer_api::PreviewResults`] (W-0049 Stage 11).
+    /// the world's [`pill_renderer_api::PreviewResults`].
     ///
     /// Like a pick, a preview is answered frames after it was asked; a world
     /// without the resource drops it.

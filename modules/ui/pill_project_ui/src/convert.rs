@@ -10,11 +10,10 @@
 //! # Design
 //!
 //! egui tessellates premultiplied sRGB colour into triangle lists in *points*,
-//! while `pill_ui_frame::Color` is straight alpha and the renderer's UI painter blends
-//! `SrcAlpha`, so the converter unpremultiplies per vertex and per texel (see
-//! the W-0028 Stage 1 decision record, Q2). Vertices are not scaled: the
-//! painter takes the monitor scale and applies it itself, which keeps one
-//! `pixels_per_point` per frame (D8).
+//! while `pill_ui_frame::Color` is straight alpha and the renderer's UI painter
+//! blends `SrcAlpha`, so the converter unpremultiplies per vertex and per
+//! texel. Vertices are not scaled: the painter takes the monitor scale and
+//! applies it itself, which keeps one `pixels_per_point` per frame.
 
 // External crates
 use egui::{ClippedPrimitive, Color32, TextureId as EguiTextureId};

@@ -56,13 +56,13 @@ impl MeshRendererComponentBuilder {
 /// instance per surviving pair, skipping any whose handles no longer resolve
 /// in the asset manager, so a dangling handle draws nothing instead of failing
 /// the frame. The shared name is pinned explicitly instead of being derived
-/// from the module path, keeping the identity stable across the split into
-/// separate files.
+/// from the module path, so the identity follows the type rather than the file
+/// it sits in.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PillComponent)]
-// Pinned to the name this type carried before it moved into `components/`. A
-// derived name follows `module_path!()`, so re-deriving it would register a
-// different component and orphan every column a live world holds for this one.
+// Pinned so the identity does not follow the module path. A derived name
+// follows `module_path!()`, so re-deriving it would register a different
+// component and orphan every column a live world holds for this one.
 #[pill(
     shared = "pill_master_renderer::component::MeshRendererComponent",
     persistable

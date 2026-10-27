@@ -38,6 +38,9 @@ DESCRIPTION
                           tokens and the shell asks for a role, so a
                           `Color32::` literal there is refused except at the
                           colour-maths sites listed beside the rule.
+      8. comment content - a `modules/` comment carries no work-item id,
+                          stage number, plan decision or construction-site
+                          path. The rule is strict: there is no allowance.
 
     The two window sizes are tunable through the environment, matching the
     shell version: `SAFETY_WINDOW_LINES` (default 30) and `DOC_WINDOW_LINES`
@@ -162,6 +165,19 @@ IMPORT_GROUP_HEADERS = (
 
 # A `mod tests` inside a file this short is not worth flagging.
 TESTS_PLACEMENT_MINIMUM_LINES = 20
+
+# Comment text that describes the work that produced the code rather than the
+# code itself. Mirrors `devops/tools/comment_audit.py`; keep the two in step.
+PROCESS_REFERENCE_PATTERNS = (
+    ("work item", re.compile(r"\bW-\d{4}\b")),
+    ("stage", re.compile(r"\bstage \d+\b", re.IGNORECASE)),
+    ("plan decision", re.compile(r"\bdecision [A-Z]\d+\b")),
+    ("site path", re.compile(r"\.construction_site\b|\.agents/")),
+)
+
+# The content guard covers the engine's sources only. Example projects and
+# the non-Rust tooling have their own cleanup item.
+COMMENT_CONTENT_SCOPE = "modules/"
 
 # The APIs that keep boxed `Any`/`Fn` values inside egui's `Context` (plan
 # decision E4, W-0017). A reloadable crate that stores its own types or
@@ -747,6 +763,59 @@ def check_colour_literals(
 
 
 # =============================================================================
+# Check 8/8 - comments carry no development-process references
+# =============================================================================
+
+
+def count_process_references(lines: List[str]) -> Tuple[int, List[str]]:
+    """Counts process references in full-line comments.
+
+    Returns the total and the per-pattern breakdown, with the first line that
+    carries one. A trailing comment is not measured, matching the recon tool.
+    """
+    counts = {name: 0 for name, _pattern in PROCESS_REFERENCE_PATTERNS}
+    first_line: Optional[int] = None
+    for index, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if not stripped.startswith("//"):
+            continue
+        for name, pattern in PROCESS_REFERENCE_PATTERNS:
+            found = len(pattern.findall(stripped))
+            if found:
+                counts[name] += found
+                if first_line is None:
+                    first_line = index
+    details = [f"{name} {count}" for name, count in counts.items() if count]
+    if first_line is not None:
+        details.append(f"first at line {first_line}")
+    return sum(counts.values()), details
+
+
+def check_comment_content(
+    lines: List[str],
+    display_path: str,
+    collector: ViolationCollector,
+) -> None:
+    """Refuses a process reference in a `modules/` comment.
+
+    Applies to `modules/` only: example projects are outside this guard's
+    scope. A reference in code (a string literal, for instance) is not a
+    comment and is not measured.
+    """
+    if not display_path.startswith(COMMENT_CONTENT_SCOPE):
+        return
+    total, details = count_process_references(lines)
+    if total == 0:
+        return
+    detail = ", ".join(details) if details else "no details"
+    collector.record(
+        display_path,
+        "comment content",
+        f"{total} process reference(s): {detail}",
+    )
+
+
+# =============================================================================
 # Self test
 # =============================================================================
 
@@ -762,7 +831,7 @@ class SilentCollector(ViolationCollector):
 # Runs the egui-storage rule against planted sources: the rule must fire on
 # a reloadable crate and stay quiet everywhere else.
 def self_test() -> int:
-    """Proves the egui-storage rule fails its plant and only its plant."""
+    """Proves each planted violation fires and only its plant does."""
     cases = (
         (
             "a plant in an extension crate fails",
@@ -876,6 +945,64 @@ def self_test() -> int:
     for description, display_path, source, expected in colour_cases:
         collector = SilentCollector()
         check_colour_literals(source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
+
+    # Rule 8: process references in engine comments.
+    comment_cases = (
+        (
+            "a clean comment passes",
+            "modules/ui/acme/src/lib.rs",
+            "// The value is cached until the next reload.\n",
+            0,
+        ),
+        (
+            "a work-item reference fails",
+            "modules/ui/acme/src/lib.rs",
+            "// the cache exists for this path (W-0001)\n",
+            1,
+        ),
+        (
+            "a doc comment reference fails",
+            "modules/ui/acme/src/lib.rs",
+            "/// Stage 3 behaviour.\n",
+            1,
+        ),
+        (
+            "a plan decision fails",
+            "modules/ui/acme/src/lib.rs",
+            "// decision E5\n",
+            1,
+        ),
+        (
+            "a construction-site path fails",
+            "modules/ui/acme/src/lib.rs",
+            "// see .construction_site/items\n",
+            1,
+        ),
+        (
+            "a reference inside code passes",
+            "modules/ui/acme/src/lib.rs",
+            'let id = "W-0001";\n',
+            0,
+        ),
+        (
+            "an example project is outside the guard",
+            "examples/acme/src/lib.rs",
+            "// W-0001\n",
+            0,
+        ),
+        (
+            "a SAFETY comment passes",
+            "modules/ui/acme/src/lib.rs",
+            "// SAFETY: the pointer is live for the call.\n",
+            0,
+        ),
+    )
+    for description, display_path, source, expected in comment_cases:
+        collector = SilentCollector()
+        check_comment_content(source.splitlines(), display_path, collector)
         outcome = "PASS" if collector.violation_count == expected else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
@@ -1025,37 +1152,41 @@ def main() -> int:
         return 0
 
     collector = ViolationCollector()
-    # Every file is read once and its lines reused by all six checks; the
+    # Every file is read once and its lines reused by all eight checks; the
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/7) Module header")
+    section("(1/8) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/7) Safety comments")
+    section("(2/8) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/7) Public item docs")
+    section("(3/8) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/7) Import group order")
+    section("(4/8) Import group order")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
 
-    section("(5/7) Tests at the bottom")
+    section("(5/8) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/7) egui state (reloadable crates)")
+    section("(6/8) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
 
-    section("(7/7) colour literals (editor UI)")
+    section("(7/8) colour literals (editor UI)")
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
+
+    section("(8/8) comment content (modules/)")
+    for _, display_path, lines, _text in sources:
+        check_comment_content(lines, display_path, collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

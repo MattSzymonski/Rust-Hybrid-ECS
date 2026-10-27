@@ -7,8 +7,8 @@
 //!   through the arriving generation's deserializer and inserter.
 //! - Chooses the strategy per type: an in-place column swap when the id is
 //!   unchanged, a full archetype remap when the reload moved the id.
-//! - Reports what it migrated and what it had to skip, so the host can log
-//!   the difference the way the full-restore path would have.
+//! - Reports what it migrated and what it had to skip, so the host can log the
+//!   difference between the two.
 //!
 //! # Design
 //!
@@ -36,8 +36,8 @@ impl World {
     /// Entities outside the set were spawned by the new generation: they
     /// already carry the current schema, so where a column rebuild touches
     /// them they are round-tripped through the current serializer rather than
-    /// the retiring generation's. Pass `None` when every entity predates the
-    /// migration (for example when restoring a snapshot).
+    /// the retiring generation's. Pass `None` when the arriving generation
+    /// spawned nothing during `init`, so every entity predates the migration.
     pub fn migrate_changed_persistable_components(
         &mut self,
         previous_metadata_by_name: &HashMap<String, PersistTypeMetadata>,
@@ -222,12 +222,10 @@ impl World {
     /// removes the old storage column, recreates it through the registered
     /// storage factory, and inserts the migrated values.
     ///
-    /// Entities the incoming generation spawned during `init` are part of the
-    /// same archetype when the schema change kept the component's layout
-    /// identical (a widened `Vec<f32>` element type, for example). Those
-    /// already hold current-layout values, so they are serialized with
-    /// `serialize_current_component` instead of the retiring generation's
-    /// serializer, which would reinterpret their bytes under the old shape.
+    /// `serialize_current_component` is what reads the rows the incoming
+    /// generation spawned during `init`: they already hold current-layout
+    /// values, and the retiring serializer would reinterpret their bytes under
+    /// the old shape.
     ///
     /// # Errors
     ///
@@ -347,14 +345,8 @@ impl World {
     ///
     /// Serializes each old component value, deserializes it with the new
     /// schema (falling back to `{}`), moves the unchanged components across
-    /// bitwise, and re-inserts the migrated component.  Used when a reload
-    /// changes the [`ComponentId`] assigned to a type name.
-    ///
-    /// Entities are moved from the back of the source archetype forward, so
-    /// every unchanged column hands over its last row and the rows that remain
-    /// keep the indices the serialized values were read at. The old column is
-    /// deliberately not moved: it still holds the retiring generation's values
-    /// and is released with the source archetype.
+    /// bitwise, and re-inserts the migrated value. Used when a reload changes
+    /// the [`ComponentId`] assigned to a type name.
     ///
     /// # Errors
     ///

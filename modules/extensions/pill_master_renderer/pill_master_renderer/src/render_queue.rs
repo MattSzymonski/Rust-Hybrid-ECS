@@ -1,4 +1,4 @@
-//! Packed sort key used by the transferred mesh drawer.
+//! The packed sort key a frame's draws are ordered by.
 //!
 //! # Responsibilities
 //!
@@ -19,11 +19,6 @@
 //! material order byte so the sort bands a pass by draw order first, then
 //! pairs each slot index with the version its handle was issued at, so keys
 //! from different incarnations of one slot stay apart.
-//!
-//! Each slot index and version is packed as a single byte, so a key truncates
-//! any version above 255 to its low byte - a known limitation tracked
-//! separately. Compose and decompose are exact inverses for values that fit
-//! in a byte; beyond it the key aliases.
 
 // Current crate
 use crate::resources::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle};
@@ -80,13 +75,11 @@ pub struct RenderQueueKeyFields {
 /// - bits 0-7: unused, always zero.
 ///
 /// Pairing each slot index with its handle version makes a key name one
-/// incarnation of a slot, and the order byte leads the key so the sort bands a
-/// pass's draws by material order before it groups resource runs.
+/// incarnation of a slot.
 ///
 /// The packing is lossy: every index and version occupies a single byte, so a
-/// value above 255 truncates to its low byte and aliases a lower one. This is
-/// a known limitation tracked separately, so do not read a key back as a
-/// substitute for the handle it was packed from.
+/// value above 255 truncates to its low byte and aliases a lower one. Do not
+/// read a key back as a substitute for the handle it was packed from.
 pub fn compose_render_queue_key(
     order: u8,
     shader: RendererShaderHandle,

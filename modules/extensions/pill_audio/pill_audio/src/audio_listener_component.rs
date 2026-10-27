@@ -31,9 +31,8 @@ pub struct AudioListenerComponent {
     pub enabled: bool,
     /// Direction the listener faces, in degrees counter-clockwise from +X.
     ///
-    /// Stands in for the old engine's rotation component: this engine's
-    /// `Position` is 2D and carries no orientation, so a listener that can
-    /// turn needs to say so itself.
+    /// This engine's `Position` is 2D and carries no orientation, so a
+    /// listener that can turn needs to say so itself.
     pub facing_degrees: f32,
 }
 

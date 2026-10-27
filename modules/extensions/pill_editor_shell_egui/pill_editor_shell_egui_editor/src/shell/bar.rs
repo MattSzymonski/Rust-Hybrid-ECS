@@ -2,12 +2,11 @@
 //!
 //! # Responsibilities
 //!
-//! - The bar's menus and their items, drawn from the shell's mark and the project's menu state.
+//! - The bar's menus and their items, drawn from the shell's mark and the frame's menu model.
 //! - The actions a menu item runs (`File/Quit`, the window toggles, the gizmo rows), each queueing the same recorded command the shortcuts queue.
 //! - The About window the Help menu opens.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -20,9 +19,9 @@ pub const MENU_TITLE_GAP: f32 = 2.0;
 ///
 /// Drawn as a top panel before the dock, so the dock's layout and every
 /// viewport rectangle the frame reports start below the strip. The bar's
-/// geometry is logged once per placement (the toolbox's pattern), so a suite
-/// can click a title without guessing at fonts or theme metrics, and an open
-/// menu's entries log theirs for the same reason.
+/// geometry is logged once per placement, so a suite can click a title without
+/// guessing at fonts or theme metrics, and an open menu's entries log theirs
+/// for the same reason.
 ///
 /// Public because a hot patch of [`run_frame`] calls it through the package
 /// path, like every other function a patch can reach.
@@ -214,11 +213,11 @@ pub fn run_menu_action(
             .push(pill_editor_core::session::HistoryRequest::Redo),
         menubar::MenuAction::ActivateTab(tab) => session.pending_tab = Some(tab),
         // The dock is borrowed by the `DockArea` while this menu draws, so the
-        // new view is docked after the pass (W-0038 Stage 21).
+        // new view is docked after the pass.
         menubar::MenuAction::NewSceneView => session.new_scene_view = true,
         menubar::MenuAction::About => session.about_open = true,
         menubar::MenuAction::Quit => session.quit_requested = true,
-        // The clipboard (W-0038 Stage 17): the shell builds the payload and
+        // The clipboard: the shell builds the payload and
         // queues the request; the executable's OS bridge carries it out.
         menubar::MenuAction::Clipboard(action) => {
             let summary = pill_editor_core::clipboard::queue_action(
@@ -250,7 +249,7 @@ pub fn run_menu_action(
 
 /// The About window: the mark, the editor's name and the shell's version.
 ///
-/// Its rectangle joins the frame's overlay regions while it is open (W-0049),
+/// Its rectangle joins the frame's overlay regions while it is open,
 /// so a click on it is the UI's and never a scene pick.
 pub fn about_window(
     context: &egui::Context,

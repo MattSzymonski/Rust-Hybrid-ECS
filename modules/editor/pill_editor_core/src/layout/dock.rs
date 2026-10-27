@@ -2,10 +2,10 @@
 //!
 //! # Responsibilities
 //!
-//! - [`EditorTab`]: the editor's eight tabs - the game viewport and the
-//!   two scene viewports' placeholders, the world's entities and systems,
-//!   the selection's inspector, the assets mock, and the preferences form -
-//!   and their titles.
+//! - [`EditorTab`]: the editor's built-in tabs - the scene views' and the
+//!   game viewport's placeholders, entities, systems, inspector, assets,
+//!   console, problems, statistics and preferences - with their titles and
+//!   wire names.
 //! - [`EditorDock`]: the `egui_dock` state with the default layout (the
 //!   scene and game views in the center, the entity column on the left, the
 //!   inspector above the system column on the right, the assets row below),
@@ -46,7 +46,7 @@ pub enum EditorTab {
     /// A scene view's placeholder: the shell measures this tab's body and
     /// draws nothing, so that view's child window shows through. The payload
     /// is the view's index, which is what pairs the tab with a child window,
-    /// a renderer surface and a camera (W-0038 Stage 21).
+    /// a renderer surface and a camera.
     Scene(u8),
     /// The game viewport's placeholder: like the scene tabs, but its child
     /// window carries the primary surface, so it shows the project through
@@ -58,29 +58,28 @@ pub enum EditorTab {
     Systems,
     /// The selected entity's detail: its components and their field values.
     Inspector,
-    /// The assets panel's mock: fixed rows until the asset store is ported.
+    /// The project's assets: the folder tree, the tile grid and the toolbar.
     Assets,
-    /// The engine's and the project's recent log lines (W-0038 Stage 5).
+    /// The engine's and the project's recent log lines.
     Console,
-    /// Build errors and warnings, grouped by module (W-0038 Stage 6).
+    /// Build errors and warnings, grouped by module.
     Problems,
-    /// Frame, pass and per-tab timings (W-0038 Stage 7).
+    /// Frame, pass and per-tab timings.
     Statistics,
     /// The preferences file's editor-wide rows and the current project's
     /// remembered gizmo choices.
     Preferences,
-    /// A panel a module registered (W-0038 Stage 11): the payload is the
-    /// panel's slot in the registry, which is stable across that module's
-    /// reload. The tab's title comes from the registry, so a panel whose
-    /// module unloaded reads "module not loaded".
+    /// A panel a module registered: the payload is the panel's slot in the
+    /// registry, which is stable across that module's reload. The tab's title
+    /// comes from the registry, which marks a panel whose module unloaded.
     Module(u16),
 }
 
 impl<'de> Deserialize<'de> for EditorTab {
-    /// Reads the current form (`{"Scene": 2}`) and the one every document
-    /// before v12 wrote (a bare `"Scene"`, `"SecondScene"`), because the
-    /// layout's migrations carry old documents forward instead of replacing
-    /// them. Only JSON is read: the layout file is the only format.
+    /// Reads the current form (`{"Scene": 2}`) and the unit-name form a
+    /// stored layout document may hold (a bare `"Scene"`, `"SecondScene"`),
+    /// reading the latter as views 0 and 1 so the document keeps its layout.
+    /// Only JSON is read: the layout file is the only format.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -89,7 +88,8 @@ impl<'de> Deserialize<'de> for EditorTab {
         let value = serde_json::Value::deserialize(deserializer)?;
         if let Some(name) = value.as_str() {
             return match name {
-                // The two viewports every document before v12 had.
+                // The two viewports a document written before scene views were
+                // numbered names.
                 "Scene" => Ok(EditorTab::Scene(0)),
                 "SecondScene" => Ok(EditorTab::Scene(1)),
                 "Game" => Ok(EditorTab::Game),
@@ -126,7 +126,7 @@ impl<'de> Deserialize<'de> for EditorTab {
 }
 
 impl EditorTab {
-    /// Every tab, in tab-strip order.
+    /// Every built-in tab, in tab-strip order.
     pub const ALL: [EditorTab; 11] = [
         EditorTab::Scene(0),
         EditorTab::Scene(1),
@@ -211,11 +211,11 @@ pub struct EditorDock {
     /// The schema this document was written with.
     schema_version: u32,
     /// The panel id each module tab's slot named when the document was
-    /// written (W-0038 Stage 11): a slot means nothing to the next run, the
+    /// written: a slot means nothing to the next run, the
     /// id does, so a panel that registers again finds its tab.
     #[serde(default)]
     panel_ids: Vec<String>,
-    /// The tabs popped out into their own OS windows (W-0038 Stage 23). A
+    /// The tabs popped out into their own OS windows. A
     /// popped-out tab is *not* in the dock tree; redocking puts it back in the
     /// focused leaf.
     #[serde(default)]
@@ -233,8 +233,8 @@ impl Default for EditorDock {
 impl EditorDock {
     /// A dock with the default layout: the game and scene viewports tabbed
     /// together in the center, the entity list as the left column, the
-    /// inspector above the system list on the right, and the assets mock as
-    /// a bottom row across the window.
+    /// inspector above the system list on the right, and the assets, console,
+    /// problems and statistics tabs as a bottom row across the window.
     pub fn new() -> Self {
         let mut state = DockState::new(vec![
             EditorTab::Scene(0),
@@ -311,7 +311,7 @@ impl EditorDock {
     }
 
     /// The tab a new scene view takes: one past the highest view index the
-    /// dock holds today (W-0038 Stage 21).
+    /// dock holds today.
     ///
     /// Highest plus one rather than "one per view", so a view the user closed
     /// in the middle never hands its index to a second tab - the closed
@@ -332,7 +332,7 @@ impl EditorDock {
     ///
     /// A popped-out view counts: it is still a view, its child window
     /// replaced by a window of its own, and dropping its slot would hand its
-    /// index to the next view opened (W-0038 Stage 23).
+    /// index to the next view opened.
     pub fn scene_view_count(&self) -> usize {
         self.state
             .iter_all_tabs()
@@ -410,10 +410,9 @@ impl EditorDock {
     /// Rewrite every module tab's slot from the ids the document carried to
     /// the slots `ids` assigns today.
     ///
-    /// A tab whose panel is no longer registered keeps its slot value only
-    /// when that slot still exists; otherwise it points past the registry and
-    /// the shell draws the "module panel" placeholder - the tab is the user's
-    /// and is not taken away without a word.
+    /// A tab whose panel is not registered today points past the registry
+    /// (`u16::MAX`): the tab is the user's and stays, and the shell titles it
+    /// `Module panel` and draws its body as not loaded.
     pub fn remap_panel_slots(&mut self, ids: &[String]) {
         let recorded = std::mem::take(&mut self.panel_ids);
         for (_path, tab) in self.state.iter_all_tabs_mut() {
@@ -699,8 +698,8 @@ mod tests {
 
     #[test]
     fn a_v11_document_reads_its_two_scene_tabs_as_views() {
-        // What every document before v12 wrote: bare variant names, which the
-        // migration then carries forward instead of dropping the layout.
+        // The unit-name form a stored document may hold: bare variant names,
+        // read as views instead of dropping the layout.
         let tab: EditorTab = serde_json::from_str("\"Scene\"").expect("the legacy scene tab");
         assert_eq!(tab, EditorTab::Scene(0));
         let tab: EditorTab =

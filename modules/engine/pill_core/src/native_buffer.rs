@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Allocate, retain and release the element blocks behind `pill_engine`'s
-//!   `DynamicBuffer<T>` handles.
+//! - Allocate, retain and release the element blocks behind
+//!   [`DynamicBuffer`](crate::DynamicBuffer) handles.
 //! - Keep live block accounting observable, so a leaked or double-freed block
 //!   is a failing assertion rather than a mystery.
 //!
@@ -12,17 +12,14 @@
 //! One block is one allocation: a reference-count header first, then the
 //! element area. The returned pointer addresses the *elements*, so a handle
 //! can be stored - and mirrored to C# - as plain `(ptr, len, cap)` words,
-//! while the count lives in a place no handle can see or corrupt.
+//! while the count lives where no handle can see or corrupt it.
 //!
-//! This service lives in `pill_core` (the dylib shared by the host and every
-//! loaded artifact) rather than in `pill_engine` (an rlib compiled into each
-//! of them) on purpose: a block's lifetime then never depends on which DLL
-//! allocated it, and a release executed by a reloaded generation runs the
-//! same instance the original allocation did.
+//! The service lives in `pill_core`, the dylib every artifact links, not in
+//! `pill_engine`, which is an rlib compiled into each of them: a block's
+//! lifetime then never depends on which DLL allocated it, and a release run by
+//! a reloaded generation reaches the same instance the allocation did.
 //!
 //! # Address-stability contract
-//!
-//! The service guarantees, and callers may rely on:
 //!
 //! - a block's element pointer never moves while it is alive - growth
 //!   allocates a *new* block rather than relocating an existing one;

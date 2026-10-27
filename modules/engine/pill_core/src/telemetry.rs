@@ -2,30 +2,29 @@
 //!
 //! # Responsibilities
 //!
-//! - Define the static tracing targets for the `engine::dev`, `engine::*`,
-//!   and `profile::*` telemetry lanes.
-//! - Provide strict [`LoggingConfig`] → `EnvFilter` construction with a
-//!   reload handle for live filter changes.
-//! - Provide the [`EngineTerminalFormatter`] that owns all terminal styling
-//!   decisions (severity, target, semantic fields) using [`PillStyle`].
-//! - Hold the process-wide [`TimestampFormat`] every log line's local time is
-//!   written in (`date_time` or `time`), and whether lines end with their
-//!   source location ([`set_show_source_location`]).
-//! - Build the subscriber stack (terminal + optional file + optional Tracy)
-//!   with independent per-layer filters through [`TelemetryBuilder`].
+//! - Define the static tracing targets of the `engine::dev`, `engine::*` and
+//!   `profile::*` lanes.
+//! - Build strict [`LoggingConfig`] → `EnvFilter` filters, with reload handles
+//!   for live changes.
+//! - Own the [`EngineTerminalFormatter`], and with it every terminal appearance
+//!   decision (severity, target, fields, timestamp, source location), which it
+//!   draws through the `colored` crate.
+//! - Hold the process-wide [`TimestampFormat`] and the source-location switch
+//!   ([`set_show_source_location`]), so every DLL's lines agree.
+//! - Assemble the subscriber stack (terminal, optional file, optional capture,
+//!   optional Tracy) with independent per-layer filters through
+//!   [`TelemetryBuilder`].
 //!
 //! # Design
 //!
-//! The engine emits structured meaning through `tracing`; output layers
-//! decide where it goes and how it appears. The three lanes are kept apart:
+//! The engine emits structured meaning through `tracing`; the output layers
+//! decide where it goes and how it looks. The three lanes stay apart:
 //!
-//! - `engine::dev` — scratch developer logs from the `log!`/`dev_warn!`/`dev_error!`
-//!   macros, feature-gated behind `dev-logs`.
-//! - `engine::*` — permanent structured engine logs.
-//! - `profile::*` — profiling spans routed to Tracy through `TracyLayer`,
-//!   controlled independently of terminal verbosity.
-//!
-//! [`PillStyle`]: crate::PillStyle
+//! - `engine::dev` - scratch developer logs from `log!`/`dev_warn!`/`dev_error!`,
+//!   feature-gated behind `dev-logs`.
+//! - `engine::*` - permanent structured engine logs.
+//! - `profile::*` - the profiling lane: a `TracyZone` asks the Tracy layer's
+//!   filter whether its target is enabled, independently of terminal verbosity.
 
 // Standard library
 use std::fmt;
@@ -49,7 +48,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
-/// Bounded in-process log capture for the editor console (Stage 17).
+/// Bounded in-process log capture for the editor console.
 pub mod capture;
 
 // Current crate
@@ -79,20 +78,20 @@ pub mod telemetry_target {
     pub const SYSTEM: &str = "engine::system";
     /// Renderer activity.
     pub const RENDERING: &str = "engine::rendering";
-    /// The UI library: fonts, text, icons and the draw list.
+    /// The in-game UI layer: texture mirroring and the draw lists it publishes.
     pub const UI: &str = "engine::ui";
     /// Resource loading and storage.
     pub const RESOURCES: &str = "engine::resources";
 
-    /// Coarse profiling spans (frame/system/pass architecture).
+    /// The coarse profiling lane: frame, system and pass zones.
     pub const PROFILE_COARSE: &str = "profile::coarse";
-    /// Fine profiling spans (temporary deep investigation).
+    /// The fine profiling lane, for temporary deep investigation.
     pub const PROFILE_FINE: &str = "profile::fine";
 }
 
-/// Targets used by the engine's profiling spans.
+/// The target of the coarse profiling lane.
 pub const PROFILE_COARSE_TARGET: &str = telemetry_target::PROFILE_COARSE;
-/// Targets used by fine-grained investigative profiling spans.
+/// The target of the fine investigative profiling lane.
 pub const PROFILE_FINE_TARGET: &str = telemetry_target::PROFILE_FINE;
 
 // =============================================================================
@@ -159,10 +158,9 @@ impl LoggingConfig {
 
     /// Validate a complete `RUST_LOG`-style filter string strictly.
     ///
-    /// The filter a project configures is applied by building a
-    /// [`LoggingConfig`] from its settings and calling
+    /// The project's `logging:` settings reach the subscriber through
     /// [`LoggingConfig::build_env_filter`]; this checks the same string early,
-    /// so a mistyped configuration fails loudly instead of silently degrading.
+    /// so a mistyped configuration fails loudly.
     ///
     /// # Errors
     ///
@@ -613,7 +611,9 @@ impl TelemetryBuilder {
         self
     }
 
-    /// Route `profile::*` spans to Tracy through `TracyLayer`.
+    /// Install the Tracy lane: `TracyLayer` filtered to the `profile::*`
+    /// targets, which is also the filter a `TracyZone` reads to decide whether
+    /// the profiler wants its zone.
     pub fn with_tracy(mut self, enabled: bool) -> Self {
         self.tracy = enabled;
         self
@@ -627,9 +627,9 @@ impl TelemetryBuilder {
 
     /// Build, install, and return the reload handles.
     ///
-    /// Installs the subscriber stack once per process; a second call returns
-    /// the previously installed handles without reinstalling. Concurrent
-    /// callers are serialized so only one ever touches the global subscriber.
+    /// Installs the subscriber stack once per process; a later call returns the
+    /// handles of that first install without reinstalling. Concurrent callers
+    /// are serialized so only one ever touches the global subscriber.
     ///
     /// # Errors
     ///
@@ -648,11 +648,10 @@ impl TelemetryBuilder {
     pub fn init(self) -> Result<TelemetryHandles, TelemetryError> {
         // Exactly-once install. `OnceLock::get_or_init` runs the installer at
         // most once process-wide and blocks concurrent callers until it
-        // completes, so the double guard of a second `Mutex` adds nothing: the
-        // lock existed to serialize check-and-install, which the OnceLock does
-        // itself. The stored value is the install's `Result`, flattened to a
-        // message so it can be shared with every caller - the error itself is
-        // not `Clone` (it boxes the underlying parse/appender source).
+        // completes, which is the whole of the serialization this needs: a
+        // second `Mutex` around check-and-install would only repeat it. The
+        // stored value is the install's `Result` flattened to a message, since
+        // `TelemetryError` is not `Clone` (it boxes its sources).
         static INSTALLED: OnceLock<Result<TelemetryHandles, String>> = OnceLock::new();
         match INSTALLED.get_or_init(|| Self::install(self).map_err(|error| error.to_string())) {
             Ok(handles) => Ok(handles.clone()),
@@ -665,7 +664,8 @@ impl TelemetryBuilder {
     /// Build the full subscriber stack (terminal, optional file, optional
     /// Tracy) and install it as the process-wide default subscriber.
     ///
-    /// Invoked exactly once by [`Self::init`] under its install lock.
+    /// Invoked exactly once per process by [`Self::init`], through its
+    /// `OnceLock`.
     fn install(self) -> Result<TelemetryHandles, TelemetryError> {
         // Step 1: Build the terminal lane with its own reloadable filter.
         let terminal_filter = self.logging.build_env_filter()?;
@@ -932,16 +932,15 @@ pub enum TelemetryError {
 
 /// Join a heading and its lines into one multi-line log message.
 ///
-/// The terminal formatter prints any message with a line break as a block:
-/// the time, level and target alone on the first line, then the message from
-/// the left edge. The block ends with a line break, so an empty line separates
-/// it from the next log entry.
+/// The terminal formatter prints any message with a line break as a block: the
+/// time, level and target alone on the first line, then the message from the
+/// left edge. The block ends with a line break, so an empty line separates it
+/// from the next log entry:
 ///
 /// ```text
 /// [21:51:45:003] INFO  engine::hot_reload
 /// Modules to build:
 /// 1. pill_spline  extension
-/// 2. project      project
 ///
 /// ```
 ///
@@ -972,11 +971,10 @@ where
 /// Join a heading and its lines into one multi-line log message, where any
 /// part may carry color.
 ///
-/// The same as [`log_block`], but the heading and the lines are anything that
-/// displays - plain strings, or text styled with [`Colorize`] (re-exported
-/// here) or [`PillStyle`](crate::PillStyle). Colors show in an interactive
-/// terminal only: the formatter strips them for the file log and for piped
-/// output.
+/// The same as [`log_block`] for parts that display their own styling - plain
+/// strings, or text styled with [`Colorize`] (re-exported here) or
+/// [`PillStyle`](crate::PillStyle). The formatter strips the colors for the
+/// file log and for piped output.
 ///
 /// # Examples
 ///
@@ -1063,7 +1061,7 @@ const MODULE_FIELD_NAMES: &[&str] = &["module", "extension"];
 
 /// `log` targets the bridge drops, each with the reason it is noise.
 ///
-/// - `wgpu_hal::vulkan::conv`: wgpu 25 warns `Unrecognized present mode
+/// - `wgpu_hal::vulkan::conv`: wgpu warns `Unrecognized present mode
 ///   1000361000` on every surface query when the driver offers
 ///   `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`, which it does not know yet and
 ///   skips. The module only logs such unknown-value notices.
@@ -1424,9 +1422,8 @@ mod tests {
     /// Concurrent `init` calls install the subscriber exactly once, and every
     /// caller receives the same installed handle set.
     ///
-    /// This is the property the old `OnceLock` + `Mutex` double guard existed
-    /// to provide; the single `OnceLock` must preserve it. Uses a file lane
-    /// like `reload_handles_work_for_terminal_and_file_lanes` so the two tests
+    /// The single `OnceLock` is what provides this. Uses a file lane like
+    /// `reload_handles_work_for_terminal_and_file_lanes` so the two tests
     /// agree on what "installed" means whichever one wins the process-wide race.
     #[test]
     fn concurrent_init_installs_exactly_once() {

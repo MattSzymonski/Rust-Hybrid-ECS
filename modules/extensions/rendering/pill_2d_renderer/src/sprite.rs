@@ -5,20 +5,16 @@
 //! - Owns the WGSL sprite shader and the render pipeline built from it.
 //! - Owns the reusable viewport-uniform and per-instance GPU buffers.
 //! - Draws every `(Position, Sprite)` entity the world reports through
-//!   [`World::sprite_instances`](pill_engine::world::World::sprite_instances).
+//!   [`component::sprite_instances`](crate::component::sprite_instances).
 //!
 //! # Design
 //!
-//! The GPU half of the split whose data half is [`pill_engine::render`]: the
+//! The GPU half of the split whose data half is [`crate::component`]: the
 //! components, their field layouts, the viewport types and the instance
-//! record. That split is what lets a module or a hot patch link the
-//! renderer's DATA contract without linking wgpu - `pill_engine` is an rlib
-//! compiled into every loaded DLL, so anything this crate touches would
-//! otherwise land in all of them.
+//! record all live there, in a module that names no `wgpu` type.
 //!
-//! The GPU record below is deliberately private and separate from
-//! `pill_engine::render::SpriteInstance`, so `bytemuck` stays on this side of
-//! the split too.
+//! The upload record below is deliberately private and separate from
+//! [`SpriteInstance`], so `bytemuck` stays on this side of the split too.
 
 // External crates
 use crate::component::{self, RenderViewport, SpriteInstance, VirtualResolution};
@@ -348,8 +344,7 @@ impl SpriteRenderer {
     /// background before drawing; sprite pixels are transformed and clipped to
     /// `viewport`. The clear covers the whole target, not just `viewport`, so a
     /// UI framework compositing above this surface sees the background colour
-    /// wherever its own panels do not paint - it used to see through to
-    /// whatever was behind.
+    /// wherever its own panels do not paint.
     pub fn render_in_viewport(
         &mut self,
         world: &mut World,
@@ -372,7 +367,7 @@ impl SpriteRenderer {
     ///
     /// Sprite positions and sizes are interpreted in `virtual_resolution`.
     /// wgpu then scales that complete coordinate space to fill `viewport`, and
-    /// the scissor rectangle prevents pixels from escaping the dock panel.
+    /// the scissor rectangle prevents pixels from escaping that rectangle.
     pub fn render_in_viewport_with_resolution(
         &mut self,
         world: &mut World,

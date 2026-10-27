@@ -10,23 +10,15 @@
 //!
 //! # Design
 //!
-//! The [`World`] is the central hub of the ECS. It allocates entity IDs,
-//! manages archetype storage, tracks entity-to-archetype mappings, and stores
-//! resources (singleton data). Component types must be registered before use
-//! so the world can assign bit indices for archetype mask matching. Entity
-//! destruction recycles IDs through a free list with generation counters
-//! to prevent dangling-handle bugs.
+//! Component types must be registered before use so the world can assign bit
+//! indices for archetype mask matching, and entity destruction recycles IDs
+//! through a free list with generation counters to prevent dangling handles.
 //!
-//! One type, several jobs, one `impl` per job. `World` is what every other part
-//! of the engine reaches through, so its surface is the engine's effective API,
-//! and a single block holding all of it is more than a reader can keep in view.
-//! The jobs are genuinely separable - script dispatch has nothing to do with
-//! resource claims, which have nothing to do with field reflection - so each
-//! gets a file of the module tree below, and the directory listing says what
-//! they are instead of section banners inside one file. Nothing about the type
-//! or its API changes: an `impl World` block in a child module is the same
-//! `impl World`, and a child module reaches the struct's private fields, so the
-//! split widens no visibility.
+//! One type, several jobs, one `impl` per job: `World` is the engine's
+//! effective API, and its jobs - script dispatch, resource claims, field
+//! reflection - are separable enough to live in their own files of the module
+//! tree below. A child module's `impl World` is the same `impl World` and
+//! reaches the struct's private fields, so the split widens no visibility.
 
 // Standard library
 use std::collections::HashMap;
@@ -52,10 +44,7 @@ use crate::scripting::{ScriptComponent, ScriptContext};
 // Module Tree
 // =============================================================================
 //
-// `World` is one type with several jobs, so its `impl` is split across these
-// files by responsibility rather than kept in one block. Every file is part of
-// the same module tree, which is what lets them reach the struct's private
-// fields without any of those fields being widened for the split.
+// One file per job, split by responsibility; the module header says why.
 
 mod components;
 mod reflection;
@@ -84,32 +73,21 @@ const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
 // Per-Thread Last-Run Tick (thread-local statics)
 // =============================================================================
 //
-// In parallel mode, multiple systems run on different threads simultaneously.
-// Each system needs its own "last ran at tick X" value so change-detection
-// filters compare against the correct baseline.  A single shared field on
-// World would race, so we use thread-local storage instead.
+// In parallel mode several systems run on different threads at once, so each
+// needs its own "last ran at tick X" baseline for change-detection filters; a
+// field on `World` would race. The scheduler stores the baseline before a system
+// runs and restores the previous value afterwards, so both overrides are `None`
+// in sequential mode and queries fall back to the shared world fields.
 //
-// How it works:
-//   1. Before running system A on thread 1:  store tick 5 in thread-local
-//   2. Before running system B on thread 2:  store tick 3 in thread-local
-//   3. Inside each system, world.system_last_run() checks the thread-local
-//      first → each thread sees its own value, no sharing, no race.
-//   4. After the system finishes: restore the previous value (usually None).
+// The same storage carries each parallel system's "this run" tick: a batch runs
+// every system against one world, so bumping the shared counter there would be
+// an unsynchronized read-modify-write. The engine instead allocates one tick per
+// batch member on the dispatch thread and installs it here.
 //
-// The same storage reserves each parallel system's "this run" tick. A batch
-// runs every system against the same world, so a bump there would be an
-// unsynchronized read-modify-write; instead the engine allocates one tick per
-// batch member on the dispatch thread and installs it here, and
-// `increment_change_tick` serves it without touching the shared counter.
-//
-// In sequential mode both overrides stay None, so queries fall back to the
-// shared world fields.
-//
-// The thread-locals live in `pill_core::system_ticks`, not here. The scheduler
-// writes them from the host's engine code, but a system's queries read them
-// from the DLL that declares the system (`Query` is generic). With the
-// thread-locals in this rlib each DLL had its own copy, and a module's
-// systems never saw the scheduler's values.
+// The thread-locals live in `pill_core::system_ticks`, not here: `Query` is
+// generic, so a system's queries read them from the DLL that declares the
+// system, and a copy in this rlib would be per-DLL - a module's systems would
+// never see the scheduler's values.
 
 /// This thread's "my system last ran at tick ___" value; `None` outside a
 /// parallel batch.
@@ -177,10 +155,10 @@ pub(crate) struct EntityLocation {
 /// Shared state for per-label iterator timing feedback.
 ///
 /// Every label is an owned copy. A label is usually a string literal of the
-/// module whose system ran the iterator, and the world outlives that
-/// module's DLL: a borrowed `&'static str` kept here pointed into an image
-/// the reload graveyard unmaps, and the next lookup that compared it read
-/// unmapped memory and took the host down.
+/// module whose system ran the iterator, and the world outlives that module's
+/// DLL: a borrowed `&'static str` kept here would point into an image the
+/// reload graveyard unmaps, and the next comparison against it would read
+/// unmapped memory.
 pub(crate) struct IteratorTimings {
     /// Per-label splitting hint duration (ns), ~32-frame average.
     pub per_iterator_label_average_duration: std::collections::HashMap<String, u64>,
@@ -251,19 +229,17 @@ pub struct EntityRow {
 
 /// One component's field list, in the two forms the world needs.
 ///
-/// Native components submit a `&'static` slice from their declaring
-/// artifact's static data; components defined by another language describe
-/// themselves in a runtime manifest, so their layout is owned by the `World`
-/// instead. The difference is storage, not meaning, so each form lives in a
-/// `Cow`.
+/// Native components submit a `&'static` slice from their declaring artifact's
+/// static data; components defined by another language describe themselves in a
+/// runtime manifest, so their layout is owned by the `World`. The difference is
+/// storage, not meaning, so each form lives in a `Cow`.
 ///
-/// The list is kept twice because the two readers want different things. The
-/// **declared** fields are what the type actually contains, which is what a
-/// generated mirror (the C# struct) has to describe. The **editor** view
-/// flattens `struct:` fields into one dotted leaf row per channel
-/// (`position.x`), which is what makes a nested colour editable row by row
-/// but describes no declaration a mirror could emit. Both views are the same
-/// slice when nothing needed flattening.
+/// The list is kept twice because the two readers want different things: the
+/// **declared** fields are what a generated mirror (the C# struct) has to
+/// describe, while the **editor** view flattens `struct:` fields into one dotted
+/// leaf row per channel (`position.x`), which makes a nested colour editable row
+/// by row but describes no declaration a mirror could emit. Both views are the
+/// same slice when nothing needed flattening.
 #[derive(Debug, Clone)]
 pub(crate) struct ComponentFieldLayout {
     /// The fields exactly as the declaring artifact registered them.
@@ -334,7 +310,7 @@ pub struct World {
     ///
     /// World metadata rather than a component: it is one row per entity the
     /// archetypes would otherwise have to carry through every move, and no
-    /// query ever needs it as data (W-0048 Stage 5).
+    /// query ever needs it as data.
     entity_ids: HashMap<Entity, EntityId>,
     /// Reverse of [`Self::entity_ids`], so a saved reference resolves in O(1).
     entity_handles: HashMap<EntityId, Entity>,
@@ -401,15 +377,15 @@ pub struct World {
     pub(crate) shared_resource_claims: HashMap<ResourceId, SharedResourceClaim>,
     /// Monotonic counter stamped onto each resource registration.
     pub(crate) resource_registration_sequence: u64,
-    /// First registration sequence stamped for each resource id.
+    /// Most recent registration sequence stamped for each resource id.
     ///
     /// The resource twin of the component registration log, and needed for the
     /// same reason: `resource_factories` accumulates and never forgets, so it
     /// cannot distinguish "registered by the generation now running" from
-    /// "registered by a generation that has since been retired". One entry per
-    /// id, not per registration: `insert_resource` documents itself as the
-    /// *replace* path, and stamping every replacement grew this for the
-    /// process lifetime while each reload diff scanned and sorted it.
+    /// "registered by a generation since retired". One entry per id, not per
+    /// registration, because `insert_resource` is the replace path - a stamp
+    /// per replacement would grow for the process lifetime and every reload
+    /// diff would scan and sort it.
     pub(crate) resource_registration_stamps: HashMap<ResourceId, u64>,
     /// How many subjects currently claim each resource id.
     ///
@@ -417,20 +393,15 @@ pub struct World {
     /// the project and a module, say - and `drop_resources` is how one of them
     /// retires what its generation stopped registering. Without this count the
     /// first subject to retire the id destroys a value the other still uses,
-    /// claim and all. Ids with no entry are dropped unconditionally, exactly
-    /// as before.
+    /// claim and all. Ids with no entry are dropped unconditionally.
     pub(crate) resource_claim_counts: HashMap<ResourceId, u32>,
     /// Monotonically increasing world tick used for change detection.
     ///
-    /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and
-    /// also each time a query that supports change tracking begins iteration,
-    /// so a frame running N such queries costs N + 1 ticks. Stored as a plain
-    /// `u32` and compared with wrapping arithmetic
+    /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and by
+    /// each query that supports change tracking when its iteration begins.
+    /// Stored as a plain `u32` and compared with wrapping arithmetic
     /// ([`Tick::is_newer_than`](crate::component::Tick::is_newer_than)), so a
-    /// wrap costs nothing: the budget is ~828 days at 60 fps when the frame's
-    /// only bump is the engine's own, and ~828/N days when a frame runs N
-    /// change-tracking queries - thirty of them wrap in ~28 days, and a frame
-    /// with several hundred wraps within a day.
+    /// wrap is harmless.
     pub(crate) change_tick: u32,
     /// Last-run tick for the system that is currently fetching its
     /// parameters from this world.
@@ -449,28 +420,22 @@ pub struct World {
     /// the cached list is still valid. Solely optimization reasons.
     pub(crate) archetype_generation: u64,
 
-    /// Debug-only: Tracks which resources currently have an active
-    /// mutable borrow.  Used to catch scheduler bugs where two systems
-    /// obtain `&mut` to the same resource simultaneously.
-    ///
-    /// Cleared at the start of every frame by the Engine.
+    /// Debug-only: resources with an active mutable borrow, so a scheduler bug
+    /// that hands two systems `&mut` to one resource is caught. Cleared at the
+    /// start of every frame by the [`Engine`](crate::engine::Engine).
     ///
     /// Behind a mutex because the systems of one parallel batch each rebuild
-    /// `&mut World` from the same pointer and run concurrently, so two of them
-    /// taking `ResMut` of *different* resources would otherwise mutate this set
-    /// from two threads at once. Their resource ids are disjoint - the
-    /// scheduler guarantees that - but a `HashSet` is not safe to mutate
-    /// concurrently whatever the keys are.
+    /// `&mut World` from the same pointer and run concurrently: their resource
+    /// ids are disjoint, but a `HashSet` is not safe to mutate concurrently
+    /// whatever the keys are.
     ///
     /// A `std` mutex, never `parking_lot`: this `World` is shared by the host
-    /// and every loaded artifact, and each of them links its own copy of
-    /// `pill_engine` - and with it its own `parking_lot`, whose table of
-    /// parked threads is per copy. A thread that parked in one copy's table
-    /// was never found by an unlock running another copy's code, so two
-    /// systems from different artifacts contending here deadlocked the frame.
-    /// `std` is one shared library in this build, and on Windows its mutex
-    /// waits on the lock's own address, so a wakeup reaches the waiter
-    /// whichever artifact unlocks.
+    /// and every loaded artifact, each linking its own copy of `pill_engine`
+    /// and with it its own `parking_lot`, whose table of parked threads is per
+    /// copy - an unlock running another copy's code never finds the parked
+    /// thread. `std` is one shared library, and on Windows its mutex waits on
+    /// the lock's own address, so a wakeup reaches the waiter whichever
+    /// artifact unlocks.
     #[cfg(debug_assertions)]
     pub(crate) debug_resource_write_locks: std::sync::Mutex<std::collections::HashSet<ResourceId>>,
 
@@ -545,7 +510,7 @@ pub struct World {
     /// nested colour or vector is editable channel by channel.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
     /// The asset type each `Handle<T>` field of a component references, by
-    /// field name: the registered name of `T` (W-0048). Owned copies, since
+    /// field name: the registered name of `T`. Owned copies, since
     /// the names come from module code; re-recorded by each generation's
     /// registration.
     pub(crate) asset_field_types: HashMap<ComponentId, HashMap<String, String>>,
@@ -737,10 +702,9 @@ impl World {
 
         // Step 4: Push each raw byte payload into the entity's new row and
         // stamp its arrival tick. The push grows the column's ticks with it, so
-        // there is one lookup rather than two; it cannot fail after the pass
-        // above, but it reports rather than panics so a future refactor that
-        // drops the pre-flight check degrades into an error instead of
-        // unwinding.
+        // there is one lookup rather than two; the pass above rules out its
+        // failure, and the error is propagated rather than unwound so a lost
+        // pre-flight check still reports instead of panicking.
         for (id, bytes) in components {
             match archetype.component_storages.get_mut(*id) {
                 Some(storage) => {
@@ -1108,9 +1072,9 @@ impl World {
     /// `attach` fills the columns the destination has and the source does not,
     /// which is exactly the component being added, or nothing for a removal. It
     /// runs before the carried rows move, because that is the only part of the
-    /// migration that can still fail: refusing there costs nothing but the
-    /// entity's place in the destination's list, while refusing afterwards
-    /// would leave rows in two archetypes at once.
+    /// migration that can still fail: a refusal there costs nothing but the
+    /// entity's place in the destination's list, while one afterwards would
+    /// leave rows in two archetypes at once.
     ///
     /// # Errors
     ///
@@ -1167,9 +1131,8 @@ impl World {
         // Step 3: Take the source archetype out of the map for the duration of
         // the move. Moving a row needs `&mut` on both archetypes at once, which
         // the borrow checker cannot express through one `HashMap`; owning one
-        // of them outright says what the previous pair of raw pointers said,
-        // without the aliasing obligation. It goes back in Step 7 unless the
-        // move emptied it.
+        // of them outright states the aliasing rule instead of leaving it to
+        // the caller. It goes back in Step 7 unless the move emptied it.
         let Some(mut old_archetype) = self.archetypes.remove(&old_archetype_id) else {
             return Err(WorldError::ArchetypeMissing {
                 entity,
@@ -1254,8 +1217,7 @@ impl World {
         // Stamp the arrival tick on the component this migration attached.
         // A carried row brought its ticks with it - they are part of the row
         // the destination column took - so a component the source had needs
-        // nothing here, and the two containers that used to be kept in
-        // lockstep are now one.
+        // nothing here.
         let current_tick = Tick::new(self.change_tick);
         for &component_id in &new_archetype.component_types {
             if old_archetype.component_storages.contains(component_id) {

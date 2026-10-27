@@ -3,32 +3,27 @@
 //! # Responsibilities
 //!
 //! - [`UiRenderer`]: owns the render pipeline and the textures the frames
-//!   carried; uploads texture changes and draws a surface's [`DrawList`]s
-//!   into its target.
+//!   carried; uploads texture changes and draws a surface's [`DrawList`]s.
 //! - Applies each list's scale factor, its nested clip rectangles (as scissor
 //!   rectangles) and correct sRGB blending.
 //!
 //! # Design
 //!
-//! The painter uses the renderer module's device, queue and target (plan
-//! decision D8). It keeps no camera, no window and no frame state beyond its
-//! GPU resources; everything per-frame comes in through
-//! [`UiRenderer::render`], once per surface: every list for that surface goes
-//! into one pair of reused buffers, since a buffer can only be written once
-//! per submission (see [`StreamBuffer`]).
+//! The painter uses the renderer module's device, queue and target, and keeps
+//! no camera, no window and no frame state beyond its GPU resources. One call
+//! per surface ([`UiRenderer::render`]) carries every list for it into one
+//! pair of reused buffers, since a buffer can only be written once per
+//! submission (see [`StreamBuffer`]).
 //!
 //! Textures arrive as a versioned set ([`UiRenderer::apply_texture_set`]): the
-//! painter remembers the revision it applied per texture and uploads the
-//! whole image whenever the carried revision differs, so an instance rebuilt
-//! mid-run - and therefore remembering nothing - re-uploads every texture the
-//! set carries instead of drawing with empty textures (W-0028 D3). A draw
-//! naming a texture the painter does not hold is skipped.
+//! painter remembers the revision it applied per texture and uploads the whole
+//! image whenever that revision differs, so an instance rebuilt mid-run
+//! re-uploads every carried texture instead of drawing with empty textures. A
+//! draw naming a texture it does not hold is skipped.
 //!
-//! Colour correctness: `pill_ui_frame` colours are sRGB with straight alpha. The
-//! shader converts vertex colours to linear, the textures are created as
-//! `Rgba8UnormSrgb` (so sampling decodes them), and the caller is expected to
-//! pass an sRGB target format - the hardware then encodes linear to sRGB
-//! exactly once. Blending is the standard straight-alpha
+//! Colour correctness: `pill_ui_frame` colours are straight-alpha sRGB; the
+//! shader decodes vertex colours, and textures are `Rgba8UnormSrgb`. With an
+//! sRGB target the hardware encodes linear to sRGB exactly once. Blending is
 //! `src * src_alpha + dst * (1 - src_alpha)`.
 
 // Standard library
@@ -314,10 +309,10 @@ impl UiRenderer {
     /// Upload every texture in `set` whose carried revision this instance has
     /// not applied, then free the ones it names.
     ///
-    /// This is the reload-safe path (W-0028 D3): a rebuilt instance holds no
-    /// textures, so the first set it sees uploads every texture from the whole
-    /// images the set carries - no back-channel, no cadence. A live instance
-    /// only uploads what changed.
+    /// This is the reload-safe path: a rebuilt instance holds no textures, so
+    /// the first set it sees uploads every texture from the whole images the
+    /// set carries - no back-channel, no cadence. A live instance only uploads
+    /// what changed.
     pub fn apply_texture_set(
         &mut self,
         device: &wgpu::Device,

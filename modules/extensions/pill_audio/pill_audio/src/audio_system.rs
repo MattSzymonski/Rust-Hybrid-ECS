@@ -2,6 +2,7 @@
 //!
 //! # Responsibilities
 //!
+//! - Turns queued [`AudioLoadQueue`] bytes into [`Sound`] assets.
 //! - Places the active listener's ears.
 //! - Carries out each source's pending [`AudioCommand`].
 //! - Follows spatial sources with their emitter, and reclaims finished sinks.
@@ -11,9 +12,6 @@
 //! Takes its state as ordinary system parameters rather than `&mut Engine`,
 //! so the scheduler derives the access pattern from the signature and
 //! serialises this against anything else touching the same resources.
-//!
-//! Reclaiming finished sinks is what makes a fixed pool workable: without it
-//! a sound that ended would hold its sink until the entity was destroyed.
 
 // External crates
 use crate::AudioLoadQueue;
@@ -34,7 +32,8 @@ use crate::sound_type::SoundType;
 
 /// Drives every [`AudioSourceComponent`] once per frame.
 ///
-/// Four things happen, in this order:
+/// Queued sound loads are turned into assets first, then four things happen,
+/// in this order:
 ///
 /// 1. the active listener's ears are placed, so panning reflects this frame;
 /// 2. each source's pending [`AudioCommand`] is carried out;
@@ -44,13 +43,8 @@ use crate::sound_type::SoundType;
 /// Step 4 is what makes a fixed pool workable: without it a sound that ended
 /// would hold its sink until the entity was destroyed.
 ///
-/// Takes its state as ordinary system parameters, so the scheduler derives the
-/// access pattern from the signature and serialises this against anything else
-/// touching the same resources - which is also why the manager and the asset
-/// store arrive separately rather than through the world.
-///
-/// Does nothing when no [`AudioManager`] is installed, which is the headless
-/// case; see [`AudioManager::new`].
+/// Does nothing but drain the load queue when no [`AudioManager`] is
+/// installed, which is the headless case; see [`AudioManager::new`].
 pub fn audio_system(
     mut manager: ResMut<AudioManager>,
     mut assets: ResMut<AssetManager>,
@@ -65,8 +59,8 @@ pub fn audio_system(
         for (name, bytes) in std::mem::take(&mut loads.sounds) {
             if assets.get_by_name::<Sound>(&name).is_none() {
                 let sound = Sound::from_bytes(std::path::Path::new(&name), bytes);
-                // The guard above rules a clash out, so this only fires if two
-                // queued loads claimed one name; report it rather than drop it.
+                // The guard above rules a name clash out, so report rather
+                // than drop a failure the store still reports.
                 assets
                     .add_named(name, sound)
                     .map_err(|error| SystemError::Failure {

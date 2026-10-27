@@ -2,11 +2,14 @@
 //!
 //! # Responsibilities
 //!
-//! - The measured scene body rectangle the frontend places the scene's child window at, and the game view's own rectangle.
-//! - The per-viewport overlay chips (the frame counter and the viewport buttons) and the regions they mark.
+//! - The measured scene body rectangle the frontend places the scene's child
+//!   window at, and the game view's own rectangle.
+//! - The per-viewport overlay chips (the frame counter and the Example
+//!   button) and the regions they mark.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths: a generated patch crate replays this
+//! file's top-level `use` lines, so a `super::`-relative glob would not
+//! resolve there.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -19,11 +22,9 @@ use pill_editor_shell_egui_editor::shell::*;
 pub const SCENE_RECT_OVERSHOOT: f32 = 16.0;
 
 /// A shell update slower than this logs its own `[editor] egui frame` line
-/// in addition to the 210-frame heartbeat. The bar is a whole 60 Hz frame,
-/// not the D32 UI target: a debug build's pass runs several milliseconds, so
-/// a line per pass over the target would be a line per frame, and the log
-/// (and the console's capture rows) would be nothing but this heartbeat. A
-/// pass that eats a whole frame is the one worth its own record.
+/// in addition to the 210-frame heartbeat. The bar is a whole 60 Hz frame: a
+/// debug build's pass runs several milliseconds, so a lower one would log a
+/// line per frame. A pass that eats a whole frame is worth its own record.
 pub const SLOW_UPDATE_MICROS: u64 = 16_000;
 
 /// The scene's frame counter: its box in logical points, and the gap to the
@@ -34,7 +35,7 @@ pub const SCENE_COUNTER_HEIGHT: f32 = 20.0;
 
 pub const SCENE_COUNTER_MARGIN: f32 = 8.0;
 
-/// The example button beside the counter: its width, and the gap between
+/// The Example button beside the counter: its width, and the gap between
 /// the two.
 pub const SCENE_BUTTON_WIDTH: f32 = 72.0;
 
@@ -57,12 +58,12 @@ pub fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
     shell_rect(ui.max_rect().expand(SCENE_RECT_OVERSHOOT))
 }
 
-/// A scene tab's overlay strip, anchored to the viewport's top-right
-/// corner: an example button and the frame counter, both drawn as the
-/// theme's chips. The overlay paints above the scene's child window, so
-/// both sit over the viewport, and both take input, so a click on either
-/// never reaches the project. Both rectangles are recorded as the UI's
-/// own, so a click on them is never read as a scene pick.
+/// A scene tab's overlay strip, anchored to the viewport's top-right corner:
+/// an Example button and the frame counter, both painted from the theme. The
+/// overlay paints above the scene's child window, so both sit over the
+/// viewport, and both take input, so a click on either never reaches the
+/// project. Both rectangles join the frame's overlay regions, so a click on
+/// them is never read as a scene pick.
 pub fn scene_overlay(
     ui: &mut egui::Ui,
     frames_per_second: f32,
@@ -125,7 +126,7 @@ pub fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
     )
 }
 
-/// The side of a scene badge's chip, in points (W-0049 Stage 12).
+/// The side of a scene badge's chip, in points.
 pub const SCENE_BADGE_SIZE: f32 = 16.0;
 
 /// Draw one scene view's entity badges: a chip at each point the executable

@@ -4,7 +4,8 @@
 //!
 //! - Wraps `&mut T` in a [`Mut<T>`] that transparently dereferences to the inner value.
 //! - Bumps the component's `changed` tick on every mutable dereference for
-//!   frame-based change detection by [`Changed`] and [`Added`] filters.
+//!   frame-based change detection by [`Changed`](crate::query::Changed) and
+//!   [`Added`](crate::query::Added) filters.
 //!
 //! # Design
 //!
@@ -24,10 +25,12 @@ use crate::component::{ComponentTicks, Tick};
 ///
 /// `Mut<'a, T>` carries a borrow of both the value and its
 /// [`ComponentTicks`], plus the current world tick (`this_run`). Mutating
-/// through `DerefMut` updates `ticks.changed = this_run` so that future
-/// systems can detect the modification.
+/// through `DerefMut` updates `ticks.changed = this_run`, so a later
+/// [`Changed`](crate::query::Changed) run sees the row. That write needs no
+/// synchronization because the scheduler only ever hands two threads
+/// disjoint rows.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```no_run
 /// # use pill_engine::*;
@@ -41,10 +44,6 @@ use crate::component::{ComponentTicks, Tick};
 ///     }
 /// }
 /// ```
-///
-/// Soundness relies on the scheduler's guarantee that no two threads ever
-/// obtain a `Mut<T>` for the same component row, so the per-row tick update
-/// in `DerefMut` requires no synchronization.
 pub struct Mut<'a, T: ?Sized> {
     /// The underlying component value wrapped by this `Mut`.
     pub(crate) value: &'a mut T,
@@ -55,7 +54,7 @@ pub struct Mut<'a, T: ?Sized> {
 }
 
 impl<'a, T: ?Sized> Mut<'a, T> {
-    /// Build a new `Mut` from its parts.
+    /// Builds a [`Mut`] from its parts.
     #[inline]
     pub fn new(value: &'a mut T, ticks: &'a mut ComponentTicks, this_run: Tick) -> Self {
         Self {
@@ -89,7 +88,7 @@ impl<'a, T: ?Sized> Mut<'a, T> {
         self.this_run
     }
 
-    /// Mutably access the value WITHOUT bumping the change tick.
+    /// Returns mutable access to the value WITHOUT bumping the change tick.
     ///
     /// Useful for read-modify-write paths that want to suppress change
     /// detection (e.g., internal bookkeeping that user systems should not
@@ -99,8 +98,8 @@ impl<'a, T: ?Sized> Mut<'a, T> {
         self.value
     }
 
-    /// Force-mark this row as changed at the current tick, even if the
-    /// underlying value is not actually mutated.
+    /// Marks this row as changed at the current tick, even if the underlying
+    /// value is never mutated.
     #[inline]
     pub fn set_changed(&mut self) {
         self.ticks.changed = self.this_run;
@@ -119,8 +118,8 @@ impl<T: ?Sized> Deref for Mut<'_, T> {
 impl<T: ?Sized> DerefMut for Mut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        // Per-row write - no atomics needed because the query/scheduler
-        // guarantees disjoint access across threads.
+        // Per-row write: no atomics needed, because the query and scheduler
+        // guarantee disjoint access across threads.
         self.ticks.changed = self.this_run;
         self.value
     }
@@ -166,7 +165,8 @@ mod tests {
         assert_eq!(*m, 43);
     }
 
-    /// Verifies that `bypass()` provides raw access without bumping the changed tick.
+    /// Verifies that `bypass_change_detection()` provides raw access without
+    /// bumping the changed tick.
     #[test]
     fn bypass_skips_tick_bump() {
         let mut value = 0_i32;

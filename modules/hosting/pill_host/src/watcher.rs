@@ -43,14 +43,12 @@ use pill_core::{error, info};
 /// File events arriving within this window are coalesced into one reload.
 ///
 /// This is pure latency: it is spent sleeping, on every edit, before any work
-/// starts. At 300 ms it was 40% of a ~700 ms save-to-live, chosen before that
-/// number was ever measured.
-///
-/// It exists because one save produces several notifications - editors write,
-/// rename and touch metadata - and each would otherwise start its own rebuild.
-/// The window only has to outlast that burst, which is a few milliseconds, not
-/// hundreds. Override with `PILL_WATCH_DEBOUNCE_MS` when an editor's save
-/// pattern needs more room.
+/// starts. It exists because one save produces several notifications - editors
+/// write, rename and touch metadata - and each would otherwise start its own
+/// rebuild. The window only has to outlast that burst, which is a few
+/// milliseconds, so it stays far below anything a developer would notice.
+/// Override with `PILL_WATCH_DEBOUNCE_MS` when an editor's save pattern needs
+/// more room.
 const DEFAULT_DEBOUNCE_MILLISECONDS: u64 = 60;
 
 /// Environment variable overriding the debounce window.
@@ -115,9 +113,9 @@ fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     let Ok(canonical_root) = watch_root.canonicalize() else {
         return false;
     };
-    // The deletion events the filter above deliberately accepts used to die
-    // here: `Path::canonicalize` cannot succeed for a removed file, so the
-    // resolver walks to the nearest surviving ancestor instead.
+    // The deletion events the filter above deliberately accepts cannot be
+    // canonicalized at all: `Path::canonicalize` needs every component to
+    // exist, so the resolver walks to the nearest surviving ancestor instead.
     let Some(canonical_path) = canonicalize_through_existing_ancestor(path) else {
         return false;
     };
@@ -422,13 +420,13 @@ pub(crate) fn spawn_source_watcher(
                 ));
             }
             // How long the edit sat before this thread saw it, measured from
-            // the file's own modification time. Reported at INFO, and reported
-            // at all, because a slow save-to-live is dominated by this number
-            // rather than by the patch that follows it - and until now the only
-            // way to know that was to time it from outside the process.
+            // the file's own modification time. Reported at INFO because a
+            // slow save-to-live is dominated by this number rather than by
+            // the patch that follows it, and nothing outside this process can
+            // measure it without timing the whole span.
             //
-            // The debounce above is part of it by construction, so a healthy
-            // reading is a little over DEBOUNCE_DURATION, not zero.
+            // The debounce window above is part of it by construction, so a
+            // healthy reading is a little over that window, not zero.
             let detection_delay_ms = changed_paths
                 .iter()
                 .filter_map(|path| std::fs::metadata(path).ok())

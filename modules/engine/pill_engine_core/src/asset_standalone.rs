@@ -30,8 +30,7 @@
 //! The guid lives in the file's own header, so a standalone file has no
 //! `.meta`, and `.meta` stays a sidecar only. Its type is found by its
 //! extension (`helmet.material`), exactly like a sourced asset's, so the scan,
-//! the watcher and the move-following of the earlier stages treat it with no
-//! special case.
+//! the watcher and the move-following treat it with no special case.
 //!
 //! A document refers to other assets by
 //! [`AssetReference`](crate::asset_reference::AssetReference), resolved when
@@ -148,11 +147,10 @@ impl AssetManager {
     /// Load the standalone file at `path` as a `T`.
     ///
     /// Named by its normalized path and keyed by the guid in its header, under
-    /// the same rules as [`Self::import`]: a path already loaded under that
-    /// guid returns its handle with `already_loaded` set, and nothing is
-    /// decoded; a guid another live `T` has is refused. Nothing is ever
-    /// written: the file is the asset. The outcome's guid is always `Some`: the
-    /// file's header holds it.
+    /// the same rules as [`Self::import`]: a path already loaded under that guid
+    /// returns its handle with `already_loaded` set and decodes nothing; a guid
+    /// another live `T` has is refused. Nothing is ever written: the file is the
+    /// asset, and its header always supplies the guid.
     ///
     /// # Errors
     ///

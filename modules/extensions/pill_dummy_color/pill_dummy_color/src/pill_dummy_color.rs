@@ -1,22 +1,24 @@
-//! Dummy extension used to pad out module-loading tests.
+//! Example extension with no ECS state: a colour value type and a patchable
+//! alpha function.
 //!
 //! # Responsibilities
 //!
-//! - Defines the [`Tint`] struct with two dummy color-blending methods.
-//! - Exposes the [`grayscale`] free function and the hot-patchable
-//!   [`get_color_a`].
-//! - Declares [`Tint`] and [`TestStruct`] for the managed mirror, mirrors
-//!   [`get_color_a`] to C# as `pill_dummy_color.PillDummyColor.GetColorA()`,
-//!   and mirrors `TestStruct::aaa` through a qualified `pill_mirror_method`
-//!   marker - the module's own C#-callable surface, proving the free-function,
-//!   standalone-value-type and mirrored-method codegen paths.
+//! - Defines [`Tint`] with its two blending methods and the [`grayscale`] free
+//!   function.
+//! - Exposes [`get_color_a`], hot-patchable and mirrored to C# as
+//!   `pill_dummy_color.PillDummyColor.GetColorA()`.
+//! - Declares [`Tint`] and [`TestStruct`] as value types and mirrors
+//!   `TestStruct::aaa` through a qualified `pill_mirror_method` marker, so the
+//!   crate covers the free-function, value-type and mirrored-method codegen
+//!   paths.
 //! - Registers through the extension ABI when the host loads it.
 //!
 //! # Design
 //!
 //! The crate carries no ECS state; [`register`] is a no-op that only reports
 //! success, kept as a plain Rust function so the same crate can also be linked
-//! statically into a monolithic build.
+//! statically into a monolithic build. `pill_spline` depends on it, and the
+//! `italian_brainrot` example loads it as its only module.
 
 // External crates
 // `pill_module` and `Engine` must resolve in every build: the attribute is
@@ -230,9 +232,8 @@ mod tests {
             999.0
         }
 
-        // Read rather than hardcode: this function's whole purpose is to have
-        // its value edited, so asserting the literal made the test break every
-        // time someone used it for what it is for.
+        // Read rather than hardcode: the value exists to be edited, so pinning
+        // a literal here would break the test whenever a caller changes it.
         let original = get_color_a();
         assert_eq!(
             managed_get_color_a(),

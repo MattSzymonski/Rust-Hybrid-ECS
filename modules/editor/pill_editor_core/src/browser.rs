@@ -6,6 +6,8 @@
 //! - [`ProjectBrowser`]: the browser's session state - the folder the grid
 //!   lists, the folders the tree shows open, and the tile size the grid
 //!   draws.
+//! - The panel's roots ([`ROOTS`], [`is_root`], [`root_of`]): the project's
+//!   own tree, and every extension's read-only resources beside it.
 //! - The listing math both panes read: [`children`], [`child_folders`],
 //!   [`breadcrumb`], [`parent_folder`], [`file_name`] and [`tile_columns`].
 //! - [`drop_folder_relative`]: where a dropped file lands, validated so a
@@ -17,8 +19,11 @@
 //! and folders ([`AssetListing`]), so both panes derive what they show from
 //! that list: the tree walks its folder rows, the grid keeps the open
 //! folder's direct children, and the breadcrumb cuts the open folder's path.
-//! Nothing here touches egui or the disk, which is what lets the tree, the
-//! grid, the breadcrumb and the scripted channel agree on one state.
+//! The panel's roots are the exception that shapes the rest: a row whose key
+//! *is* a root is never listed as somebody's child, so the extensions' rows
+//! reach the tree only through their own root row. Nothing here touches egui
+//! or the disk, which is what lets the tree, the grid, the breadcrumb and the
+//! scripted channel agree on one state.
 
 // Standard library
 use std::collections::BTreeSet;
@@ -29,10 +34,61 @@ use std::path::PathBuf;
 use pill_core::telemetry::telemetry_target;
 
 // Current crate
-use crate::editor_state::AssetListing;
+use crate::editor_state::{AssetListing, EXTENSIONS_ROOT};
 
-/// The label the root row and the breadcrumb start with.
+/// The label the project's root row and the breadcrumb start with.
 pub const ROOT_LABEL: &str = "Assets";
+
+/// One root of the Assets panel: the key it opens and the label its row
+/// carries.
+///
+/// A root is the panel's own level, not a folder inside another root's tree:
+/// the tree draws both of them at the left edge, and a row whose key *is* a
+/// root is never listed as somebody's child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetRoot {
+    /// The key the root's row opens; empty for the project's own tree.
+    pub key: &'static str,
+    /// The label the root's row and the breadcrumb's first segment carry.
+    pub label: &'static str,
+    /// Whether everything below the root is an extension's read-only
+    /// resource: listed and inspected, never written into.
+    pub read_only: bool,
+}
+
+/// The panel's roots, in the order its tree draws them: the project's own
+/// assets first, every extension's resources beside them.
+pub const ROOTS: [AssetRoot; 2] = [
+    AssetRoot {
+        key: "",
+        label: ROOT_LABEL,
+        read_only: false,
+    },
+    AssetRoot {
+        key: EXTENSIONS_ROOT,
+        label: EXTENSIONS_ROOT,
+        read_only: true,
+    },
+];
+
+/// Whether `key` is one of the panel's roots.
+pub fn is_root(key: &str) -> bool {
+    ROOTS.iter().any(|root| root.key == key)
+}
+
+/// The root `folder` belongs to: the extensions' for everything under
+/// [`EXTENSIONS_ROOT`], the project's tree for anything else.
+pub fn root_of(folder: &str) -> AssetRoot {
+    ROOTS
+        .iter()
+        .copied()
+        .filter(|root| {
+            !root.key.is_empty()
+                && (folder == root.key || folder.starts_with(&format!("{}/", root.key)))
+        })
+        .next_back()
+        .unwrap_or(ROOTS[0])
+}
 
 /// The tile size the grid starts at, in points.
 pub const DEFAULT_TILE_SIZE: f32 = 72.0;
@@ -125,17 +181,21 @@ impl ProjectBrowser {
         if self.folder.is_empty() {
             return false;
         }
-        let exists = assets
-            .iter()
-            .any(|row| row.kind == "folder" && row.path == self.folder);
+        // A root has no row of its own - the panel draws it - so it can never
+        // vanish the way a folder can.
+        let exists = is_root(&self.folder)
+            || assets
+                .iter()
+                .any(|row| row.kind == "folder" && row.key() == self.folder);
         if exists {
             return false;
         }
         let mut fallback = parent_folder(&self.folder).to_string();
         while !fallback.is_empty() {
-            if assets
-                .iter()
-                .any(|row| row.kind == "folder" && row.path == fallback)
+            if is_root(&fallback)
+                || assets
+                    .iter()
+                    .any(|row| row.kind == "folder" && row.key() == fallback)
             {
                 return self.open(&fallback);
             }
@@ -172,10 +232,16 @@ pub fn is_direct_child(path: &str, folder: &str) -> bool {
 
 /// The direct children of `folder`, folders first and each group in
 /// case-insensitive name order - the order both panes list them in.
+///
+/// A root's row is never a child: the panel draws its roots at its own level,
+/// so the project's tree holds the project's content alone.
 pub fn children<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetListing> {
     let mut rows: Vec<&AssetListing> = assets
         .iter()
-        .filter(|row| !row.path.is_empty() && is_direct_child(&row.path, folder))
+        .filter(|row| {
+            let key = row.key();
+            !key.is_empty() && !is_root(&key) && is_direct_child(&key, folder)
+        })
         .collect();
     sort_rows(&mut rows);
     rows
@@ -186,18 +252,32 @@ pub fn children<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetLi
 pub fn child_folders<'a>(assets: &'a [AssetListing], folder: &str) -> Vec<&'a AssetListing> {
     let mut rows: Vec<&AssetListing> = assets
         .iter()
-        .filter(|row| is_folder(row) && is_direct_child(&row.path, folder))
+        .filter(|row| {
+            let key = row.key();
+            is_folder(row) && !is_root(&key) && is_direct_child(&key, folder)
+        })
         .collect();
     sort_rows(&mut rows);
     rows
 }
 
-/// The breadcrumb of `folder`: the root first, then one `(path, label)` per
-/// segment, each path cumulative - so a click can open any ancestor.
+/// The breadcrumb of `folder`: the root it belongs to first, then one
+/// `(path, label)` per segment, each path cumulative - so a click can open
+/// any ancestor.
 pub fn breadcrumb(folder: &str) -> Vec<(String, String)> {
-    let mut segments = vec![(String::new(), ROOT_LABEL.to_string())];
-    let mut cumulative = String::new();
-    for segment in folder.split('/').filter(|segment| !segment.is_empty()) {
+    let root = root_of(folder);
+    let mut segments = vec![(root.key.to_string(), root.label.to_string())];
+    let mut cumulative = root.key.to_string();
+    // The root's own segment is already in place; the rest starts after it.
+    let rest = if root.key.is_empty() {
+        folder
+    } else {
+        folder
+            .strip_prefix(root.key)
+            .unwrap_or(folder)
+            .trim_start_matches('/')
+    };
+    for segment in rest.split('/').filter(|segment| !segment.is_empty()) {
         if !cumulative.is_empty() {
             cumulative.push('/');
         }
@@ -223,8 +303,7 @@ pub fn tile_columns(available_width: f32, cell_width: f32) -> usize {
 /// `res` itself is the asset root - an empty relative path - and everything
 /// under it goes through the same validator every other asset command uses, so
 /// a folder the scripted channel climbed out of (`res/../..`) is refused
-/// instead of joined onto the root: the copy would land outside the project
-/// (W-0107).
+/// instead of joined onto the root: the copy would land outside the project.
 ///
 /// # Errors
 ///
@@ -242,14 +321,11 @@ pub fn drop_folder_relative(folder: &str) -> Result<PathBuf, String> {
 }
 
 /// Folders before files, then case-insensitive by name.
+///
+/// The name comes from the row's key, not from its own path: a module root's
+/// row carries an empty path, so its name only exists in the key.
 fn sort_rows(rows: &mut [&AssetListing]) {
-    rows.sort_by(|left, right| {
-        is_folder(right).cmp(&is_folder(left)).then_with(|| {
-            file_name(&left.path)
-                .to_lowercase()
-                .cmp(&file_name(&right.path).to_lowercase())
-        })
-    });
+    rows.sort_by_cached_key(|row| (!is_folder(row), file_name(&row.key()).to_lowercase()));
 }
 
 #[cfg(test)]
@@ -258,7 +334,9 @@ mod tests {
 
     fn row(path: &str, kind: &str) -> AssetListing {
         AssetListing {
+            root: String::new(),
             path: path.to_string(),
+            read_only: false,
             kind: kind.to_string(),
             standalone: kind == "Material",
             has_meta: false,
@@ -280,6 +358,98 @@ mod tests {
             row("textures/skin.png", "Texture"),
             row("textures/stone.material", "Material"),
         ]
+    }
+
+    /// A row of an extension's read-only resources, at `path` inside `root`.
+    fn module_row(root: &str, path: &str) -> AssetListing {
+        AssetListing {
+            root: root.to_string(),
+            path: path.to_string(),
+            read_only: true,
+            kind: "folder".to_string(),
+            standalone: false,
+            has_meta: false,
+            guid: None,
+        }
+    }
+
+    /// An extension's module and one folder inside it, as the host lists them.
+    fn with_a_module() -> Vec<AssetListing> {
+        let mut assets = listing();
+        assets.push(module_row("pill_master_renderer_data", ""));
+        assets.push(module_row("pill_master_renderer_data", "defaults"));
+        assets
+    }
+
+    /// The panel has two roots, and an extension's resources hang under theirs
+    /// rather than inside the project's tree.
+    #[test]
+    fn the_extensions_root_sits_beside_the_project_tree() {
+        let assets = with_a_module();
+
+        let top: Vec<String> = children(&assets, "").iter().map(|row| row.key()).collect();
+        assert_eq!(top, vec!["models", "shaders", "textures", "config.ini"]);
+        assert!(top.iter().all(|key| !is_root(key)));
+
+        let modules: Vec<String> = children(&assets, EXTENSIONS_ROOT)
+            .iter()
+            .map(|row| row.key())
+            .collect();
+        assert_eq!(modules, vec!["extensions/pill_master_renderer_data"]);
+
+        let inside: Vec<String> = children(&assets, "extensions/pill_master_renderer_data")
+            .iter()
+            .map(|row| row.key())
+            .collect();
+        assert_eq!(
+            inside,
+            vec!["extensions/pill_master_renderer_data/defaults".to_string()]
+        );
+
+        // A browser sitting in a module's tree settles onto the folder it lists.
+        let mut browser = ProjectBrowser::default();
+        assert!(browser.open("extensions/pill_master_renderer_data/defaults"));
+        assert!(!browser.settle(&assets));
+    }
+
+    /// A root has no row of its own, so it never settles away - and a folder
+    /// whose module unloaded lands back on the root it hung under.
+    #[test]
+    fn the_extensions_root_outlives_the_rows_below_it() {
+        let mut browser = ProjectBrowser::default();
+        assert!(browser.open(EXTENSIONS_ROOT));
+        assert!(!browser.settle(&listing()));
+
+        assert!(browser.open("extensions/unloaded/defaults"));
+        assert!(browser.settle(&listing()));
+        assert_eq!(browser.folder, EXTENSIONS_ROOT);
+    }
+
+    /// The breadcrumb starts at the root the folder belongs to, and its first
+    /// segment opens that root.
+    #[test]
+    fn the_breadcrumb_names_the_root_the_folder_belongs_to() {
+        let segments = breadcrumb("extensions/pill_master_renderer_data/defaults");
+        let paths: Vec<&str> = segments.iter().map(|(path, _)| path.as_str()).collect();
+        let labels: Vec<&str> = segments.iter().map(|(_, label)| label.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "extensions",
+                "extensions/pill_master_renderer_data",
+                "extensions/pill_master_renderer_data/defaults",
+            ]
+        );
+        assert_eq!(
+            labels,
+            vec!["extensions", "pill_master_renderer_data", "defaults"]
+        );
+        assert_eq!(
+            breadcrumb(EXTENSIONS_ROOT),
+            vec![(EXTENSIONS_ROOT.to_string(), EXTENSIONS_ROOT.to_string())]
+        );
+        assert_eq!(root_of("models/nested").key, "");
+        assert_eq!(root_of(EXTENSIONS_ROOT).key, EXTENSIONS_ROOT);
     }
 
     #[test]

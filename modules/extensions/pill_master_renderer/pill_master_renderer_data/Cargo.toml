@@ -30,6 +30,9 @@ trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev 
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# The chain's default material is a file this crate parses at runtime
+# (`config/pbr_pipeline`), not a value built in code (W-0136).
+serde_json = "1"
 miette = { version = "7", features = ["derive"] }
 glam = { version = "0.33", features = ["serde", "bytemuck"] }
 bytemuck = { version = "1.4", features = ["derive"] }

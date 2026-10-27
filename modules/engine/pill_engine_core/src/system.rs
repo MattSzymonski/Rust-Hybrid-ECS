@@ -1,68 +1,40 @@
-//! Advanced system parameter infrastructure that allows automatic parameter
-//! resolution for system functions.
+//! System parameter infrastructure: how a plain function becomes a [`System`].
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`SystemParam`] trait that lets function parameters extract
 //!   themselves from the [`World`] (e.g., `Query<T>`, `Commands`, `Res<T>`).
-//! - Provides [`IntoSystem`] to convert plain functions into boxed [`System`] trait objects.
-//! - Implements the [`System`] trait for registered functions, enabling
-//!   the engine to call them generically.
+//! - Provides [`IntoSystem`] to convert plain functions into boxed [`System`]
+//!   trait objects.
+//! - Implements the [`System`] trait for registered functions, enabling the
+//!   engine to call them generically.
 //!
 //! # Design
 //!
-//! System functions are layered into four cooperating traits:
+//! Four cooperating traits: [`SystemParam`] extracts a system's arguments from
+//! the [`World`] and the [`CommandQueue`] and reports its access pattern to the
+//! scheduler; [`SystemParamFunction`] adapts a `FnMut` taking those parameters
+//! into a runnable form; [`IntoSystem`] boxes that function into a [`System`]
+//! the engine stores and invokes generically; and [`SystemOutput`] normalizes
+//! the return value (`()` or `Result<(), SystemError>`).
 //!
-//! - [`SystemParam`] extracts each argument from the [`World`] and
-//!   [`CommandQueue`] at call time and reports its access pattern to the
-//!   scheduler for dependency analysis.
-//! - [`SystemParamFunction`] adapts a plain `FnMut` closure with `SystemParam`
-//!   arguments into a uniform runnable form.
-//! - [`IntoSystem`] boxes that adapted function into a [`System`] trait object
-//!   the engine can store and invoke generically.
-//! - [`SystemOutput`] normalizes the function's return value (`()` or
-//!   `Result<(), SystemError>`) into a single error-reporting result.
+//! # Safety
 //!
-//! The [`System`] trait is the uniform invocation surface the engine drives;
-//! everything else exists to convert user functions into that surface.
+//! [`SystemParam::fetch`] returns a value that is `'static` to the compiler
+//! while it borrows from the world and the command queue. Rust cannot express
+//! "this reference lives exactly as long as this call" without GATs, so the
+//! transmutation is deliberate; it is sound only while the parameter does not
+//! outlive the system call:
 //!
-//! SAFETY: Warning: Lifetime Transmutation
+//! 1. A system parameter must not be stored - no static or global state, and
+//!    nothing the system call outlives.
+//! 2. It must not escape through a closure that outlives the system: a
+//!    background thread, an async task, a callback registered for later.
+//! 3. It must not be returned.
 //!
-//! This module uses `std::mem::transmute` to convert references with actual
-//! lifetimes to `'static` lifetimes. This is a deliberate design choice to
-//! work around Rust's borrowing rules in the context of dynamic system execution.
-//!
-//! This is technically undefined behavior if the reference escapes the system.
-//!
-//! The safety of this pattern relies on these invariants being upheld:
-//!
-//! 1. System parameters must NOT be stored - Parameters like `Query<'static, Q>`
-//!    and `Commands<'static>` must only be used within the system function body.
-//!    Storing them in static variables, global state, or any location that outlives
-//!    the system call is undefined behavior.
-//!
-//! 2. System parameters must NOT escape via closures - Do not capture system
-//!    parameters in closures that outlive the system (e.g., background threads, async
-//!    tasks, or callbacks registered for later execution).
-//!
-//! 3. System parameters must NOT be returned - While the type system prevents
-//!    most cases, do not use unsafe code to extract and return the inner reference.
-//!
-//! ## Why This Pattern?
-//!
-//! Rust's type system cannot express "this reference lives exactly as long as
-//! this function call" without GATs (Generic Associated Types) and complex
-//! lifetime machinery. The `'static` transmutation is a pragmatic solution
-//! used by many ECS frameworks including early versions of Bevy.
-//!
-//! ## Safe Alternatives (Not Yet Implemented)
-//!
-//! - Token type pattern: Pass a lifetime-bound token that proves the borrow
-//!   is still valid, making misuse a compile error.
-//! - GAT-based SystemParam: Use Generic Associated Types to properly model
-//!   the lifetime relationship (requires more complex trait bounds).
-//!
-//! ## Example: Safe Usage
+//! The engine's runner (`IntoSystem::into_system` / `into_hot_system`) is the
+//! one audited caller; a safe call from anywhere else is what the signature
+//! refuses. Violating these invariants is undefined behavior.
 //!
 //! ```no_run
 //! # use pill_engine::*;
@@ -71,20 +43,10 @@
 //! # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
 //! # impl Component for Velocity {}
 //! fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
-//!     for (mut pos, vel) in query.iter_mut() {
-//!         pos.x += vel.x;  // OK - using within system
+//!     for (mut position, velocity) in query.iter_mut() {
+//!         position.x += velocity.x;  // used within the system
 //!     }
-//! }  // query dropped here - lifetime ends safely
-//! ```
-//!
-//! ## Example: UNSAFE Usage (DO NOT DO THIS)
-//!
-//! ```ignore
-//! static mut LEAKED_QUERY: Option<Query<'static, &Position>> = None;
-//!
-//! fn bad_system(query: Query<&Position>) {
-//!     unsafe { LEAKED_QUERY = Some(query); }  // UNDEFINED BEHAVIOR!
-//! }
+//! }  // query dropped here - the borrow ends with the call
 //! ```
 
 // Current crate
@@ -99,7 +61,7 @@ use crate::world::World;
 // System
 // =============================================================================
 
-/// Trait for systems that can be executed by the Engine
+/// Trait for systems the engine can execute.
 ///
 /// Systems are functions that operate on World data. They are executed
 /// every frame and can read/write components, create entities, etc.
@@ -135,9 +97,10 @@ impl SystemOutput for Result<(), SystemError> {
     }
 }
 
-/// Implement System for any FnMut closure with the right signature
+/// Implements [`System`] for any `FnMut` closure with the right signature.
 ///
-/// This allows us to store system closures in a `Vec<Box<dyn System>>`.
+/// This is what lets a registered system be stored as one `RegisteredSystem`
+/// in the engine's registration vector.
 impl<F, Output> System for F
 where
     F: FnMut(&mut World, &mut CommandQueue) -> Output + Send,
@@ -157,10 +120,10 @@ where
 /// This is the core of the flexible system architecture. Types that implement
 /// SystemParam can be used as function parameters in systems.
 ///
-/// SAFETY:
+/// # Safety
 ///
-/// Implementations use lifetime transmutation internally. See module-level docs
-/// for the safety invariants that must be upheld.
+/// Implementations use lifetime transmutation internally. See the module-level
+/// docs for the invariants that must hold.
 ///
 /// The returned parameter must not escape the system function scope.
 pub trait SystemParam: Sized {
@@ -416,7 +379,7 @@ where
     }
 }
 
-// Implement for functions with 1-6 parameters
+// Implement for functions with 1-7 parameters
 impl_system_param_function!(A);
 impl_system_param_function!(A, B);
 impl_system_param_function!(A, B, C);
@@ -448,8 +411,7 @@ pub trait IntoSystem<Input: SystemParam> {
     ///
     /// The slot is initialized here because this is the only place the concrete
     /// `F` and `Input` are known; `name` is the identity a panicking patched
-    /// body is attributed to, so its host can roll that function back
-    /// (Stage 19).
+    /// body is attributed to, so its host can roll that function back.
     #[cfg(feature = "hot_patch")]
     fn into_hot_system(
         self,
@@ -525,11 +487,11 @@ where
             let run: fn(&mut F, Input) -> F::Output =
                 unsafe { std::mem::transmute::<usize, fn(&mut F, Input) -> F::Output>(address) };
 
-            // A patched body can panic (Stage 19, D22): the panic is caught
-            // here, where the failing function is still nameable, and turned
-            // into the system failure the engine already knows how to record
-            // and survive. `panic_into_failure` also counts the streak that
-            // makes the host roll the patch back after three invocations.
+            // A patched body can panic: the panic is caught here, where the
+            // failing function is still nameable, and turned into the system
+            // failure the engine already knows how to record and survive.
+            // `panic_into_failure` also counts the streak that makes the host
+            // roll the patch back after three invocations.
             //
             // `AssertUnwindSafe`: the world and the function are lent to the
             // call and nothing observably inconsistent survives it - the

@@ -55,9 +55,8 @@ compile_error!(
 /// Environment variable that runs the development host in the editor posture,
 /// loading extension editor crates (`<extension>_editor`).
 ///
-/// A development and test switch, standing in for an editor frontend until one
-/// sets the posture itself; unset, this binary never builds or loads an editor
-/// crate.
+/// A development and test switch: it gives this binary the editor host's
+/// extension set. Unset, the binary never builds or loads an editor crate.
 #[cfg(feature = "dev")]
 const EDITOR_POSTURE_ENVIRONMENT_VARIABLE: &str = "PILL_EDITOR_POSTURE";
 

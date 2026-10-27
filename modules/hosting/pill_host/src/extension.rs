@@ -375,7 +375,7 @@ mod slot {
 
         /// Force a full rebuild and reload on the next pass, as if a source
         /// save had arrived: the editor's safe mode retries a shell whose
-        /// generation stopped this way (Stage 22, D33).
+        /// generation stopped this way.
         pub(crate) fn request_reload(&mut self) {
             self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
         }

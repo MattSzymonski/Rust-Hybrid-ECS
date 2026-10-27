@@ -9,12 +9,12 @@
 //!
 //! # Design
 //!
-//! Filters produce (include_mask, exclude_mask) pairs that are checked against
-//! each archetype's component mask at iteration start. `With<T>` adds T to the
-//! include set; `Without<T>` adds T to the exclude set. `Changed<T>` and
-//! `Added<T>` compare per-entity tick values against the calling system's
-//! last-run baseline. `Or` produces multiple pairs - an archetype matches if
-//! any pair passes.
+//! Filters produce `(include, exclude)` component-id pairs that the query
+//! turns into masks; an archetype matches a pair when it holds every include
+//! and none of the excludes. `With<T>` adds T to the include set;
+//! `Without<T>` adds T to the exclude set. `Changed<T>` and `Added<T>` compare
+//! per-entity tick values against the calling system's last-run baseline. `Or`
+//! produces multiple pairs - an archetype matches if any pair passes.
 
 // Current crate
 use crate::archetype::Archetype;
@@ -29,22 +29,21 @@ use super::ptr::SendPtr;
 /// Trait for predicates that decide which entities a query yields beyond
 /// the basic component-set match implied by the [`QueryTarget`].
 ///
-/// Filters operate at two levels:
+/// A filter answers at two levels:
 ///
-/// 1. Archetype-level: [`archetype_filter_pairs`] returns a list of
-///    `(include, exclude)` component-id pairs. An archetype matches the
-///    filter if it satisfies any pair (OR semantics). The default
-///    implementation delegates to [`included_component_ids`] /
-///    [`excluded_component_ids`]; [`Or`] overrides this to produce one
-///    pair per inner filter.
-///
-/// 2. Row-level: [`init_state`] caches per-archetype data (e.g. a
-///    pointer into the column's ticks) and [`matches`] is invoked for each
-///    candidate row. This drives [`Changed`] and [`Added`].
+/// 1. Archetype level: [`archetype_filter_pairs`] returns `(include, exclude)`
+///    component-id pairs, and an archetype matches when it satisfies any
+///    pair. The default builds one pair from [`included_component_ids`] /
+///    [`excluded_component_ids`]; [`Or`] overrides it to produce one pair per
+///    inner filter.
+/// 2. Row level: [`init_state`] caches per-archetype data (a pointer into the
+///    column's ticks) and [`matches`] is consulted for every candidate row.
+///    This drives [`Changed`] and [`Added`].
 ///
 /// The trivial filter `()` matches every row.
 ///
 /// [`QueryTarget`]: super::QueryTarget
+/// [`archetype_filter_pairs`]: QueryFilter::archetype_filter_pairs
 /// [`included_component_ids`]: QueryFilter::included_component_ids
 /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
 /// [`init_state`]: QueryFilter::init_state
@@ -78,10 +77,10 @@ pub trait QueryFilter {
     /// NONE of the `exclude_ids`.
     ///
     /// The default implementation returns a single pair from
-    /// [`included_component_ids`] and [`excluded_component_ids`],
-    /// preserving the original behaviour for simple filters.
-    /// [`Or`] overrides this to return one pair per inner filter,
-    /// giving correct logical-OR semantics at the archetype level.
+    /// [`included_component_ids`] and [`excluded_component_ids`], and no pair
+    /// at all when both are empty (which the query reads as "no archetype
+    /// restriction"). [`Or`] overrides this to return one pair per inner
+    /// filter, giving correct logical-OR semantics at the archetype level.
     ///
     /// [`included_component_ids`]: QueryFilter::included_component_ids
     /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
@@ -226,22 +225,14 @@ impl TickFilterState {
     #[inline]
     unsafe fn ticks_at(&self, index: usize) -> &ComponentTicks {
         debug_assert!(self.is_present(), "ticks_at called on missing component");
-        // SAFETY: `is_present()` returned `true` (enforced by the caller
-        // contract in `/// # Safety` and the `debug_assert!` above), so the
-        // `Option` is `Some` and `unwrap_unchecked` cannot panic. The stored
-        // pointer was created in `new` from a `&[ComponentTicks]` owned by a
-        // column of the archetype, which outlives this state - state lives for
-        // one query iteration during which the archetype is neither mutated nor
-        // deallocated - so dereferencing it yields a valid slice. `index` is a
-        // row index into that archetype, and a column's ticks are grown and
-        // shrunk by the column's own mutators, so they have exactly one row per
-        // component row and `index` is in bounds.
-        // SAFETY: as documented above.
+        // SAFETY: the caller's `# Safety` contract plus the `debug_assert!`
+        // above guarantee the `Option` is `Some`, so `unwrap_unchecked` cannot
+        // panic. The pointer was created in `new` from a `&[ComponentTicks]`
+        // owned by a column of the archetype, and the state lives for exactly
+        // one query iteration, during which the archetype is neither mutated
+        // nor deallocated. A column holds one tick per component row, so
+        // `index` - a row index into that archetype - is in bounds.
         let ticks = unsafe { self.ticks.as_ref().unwrap_unchecked().as_ptr() };
-        // The row-count claim above is what justifies eliding the bounds check.
-        // It is a property of `ComponentColumn` rather than of any caller, but
-        // it is cheap to re-state in debug builds - the release path is
-        // unchanged.
         debug_assert!(
             index < self.tick_count,
             "row {index} is out of bounds for {} component ticks",
@@ -402,10 +393,9 @@ impl_query_filter_tuple!(A, B, C, D);
 /// Disjunction over a tuple of filters: a row matches if at least one
 /// inner filter matches it.
 ///
-/// `Or` correctly implements logical-OR at both the archetype level
-/// (via [`archetype_filter_pairs`]) and the row level (via [`matches`]).
-/// For `Or<(With<A>, With<B>)>`, an archetype containing `A`, `B`, or
-/// both will be included - matching the expected OR semantics.
+/// `Or` implements logical OR at both levels - across archetype pairs (via
+/// [`archetype_filter_pairs`]) and across rows (via [`matches`]) - so an
+/// archetype or row matching any branch is included.
 ///
 /// [`archetype_filter_pairs`]: QueryFilter::archetype_filter_pairs
 /// [`matches`]: QueryFilter::matches
@@ -492,11 +482,11 @@ impl_query_filter_or!(A, B, C, D);
 fn and_filter_pairs(
     all_pairs: &[Vec<(Vec<ComponentId>, Vec<ComponentId>)>],
 ) -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-    // Step 1: Seed the accumulator with a single unrestricted pair so the
+    // Step 1: seed the accumulator with a single unrestricted pair so the
     // fold below starts from a neutral value.
     let mut accumulator: Vec<(Vec<ComponentId>, Vec<ComponentId>)> = vec![(Vec::new(), Vec::new())];
 
-    // Step 2: Fold every conjunct's pairs into the accumulator, merging the
+    // Step 2: fold every conjunct's pairs into the accumulator, merging the
     // include and exclude sets of each combination.
     for inner_pairs in all_pairs {
         if inner_pairs.is_empty() {

@@ -1,4 +1,4 @@
-//! Editor-state recovery (W-0038 Stage 20).
+//! Editor-state recovery.
 //!
 //! # Responsibilities
 //!

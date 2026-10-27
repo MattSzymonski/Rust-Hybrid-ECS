@@ -1,43 +1,29 @@
-//! Query Iteration Benchmarks
-//! ==========================
-//!
-//! Queries are the hottest path in any ECS - every frame, every system spends
-//! nearly all its time inside a query loop. These benchmarks cover every
-//! meaningful iteration variant to build a complete performance profile.
+//! Query iteration benchmarks: one group per iteration variant with a
+//! different cost profile.
 //!
 //! # Responsibilities
 //!
-//! - Owns the criterion benchmark harness for every query iteration variant.
-//! - Covers sequential, filtered, parallel, access-pattern, and cache-pressure
-//!   paths so a regression in any query mode is caught at commit time.
+//! - Owns the criterion harness for every query iteration variant.
+//! - Covers sequential, filtered, parallel, access-pattern and cache-pressure
+//!   paths, so a regression in any query mode shows up in this target.
 //!
 //! # Design
 //!
-//! Each `bench_*` function registers a fresh [`World`] and iterates a typed
-//! [`Query`] inside a criterion closure, isolating the cost of one variant.
-//! Shared worlds come from [`setup_world`] and [`setup_filtered_world`];
-//! filtered worlds tag every 4th entity [`Enemy`] and every 7th entity
-//! [`Frozen`] to exercise realistic `With`/`Without`/`Or` match rates.
+//! Each `bench_*` function builds its world in its criterion closure and
+//! iterates a typed [`Query`] inside `benchmark.iter`, so setup is paid once
+//! per measurement, not per iteration. [`setup_world`] and
+//! [`setup_filtered_world`] supply the shared worlds; the filtered one tags
+//! every 4th entity [`Enemy`] and every 7th [`Frozen`], so `With`/`Without`/`Or`
+//! see non-uniform match rates.
 //!
-//! ## Categories
-//!
-//! Sequential - baseline per-row cost with no parallelism overhead.
-//! Covers unfiltered, mutable (`&mut`), 3-component, and `Entity`-only queries.
-//!
-//! Filters - the added cost of skipping non-matching archetypes and entities.
-//! Covers `With<T>`, `Without<T>`, `Or<(With<A>, With<B>)>`, `Changed<T>`, and
-//! `Added<T>`. Each filter has a different archetype-matching cost profile.
-//!
-//! Parallel - Rayon-based distribution across threads. Covers unfiltered
-//! parallel, filtered parallel (`With<T>`), batch-size scaling (1–1024),
-//! and a sequential-vs-parallel crossover sweep to find the break-even point.
-//!
-//! Access patterns - `get_component()` random access (HashMap lookup per
-//! entity) vs batched iteration, plus query helpers (`entity_count`, `is_empty`,
-//! `first`).
-//!
-//! Cache pressure - 64 B and 256 B components at 10K–2M entities to measure
-//! how component size affects cache-line utilization and memory bandwidth.
+//! - Sequential: unfiltered, `&mut`, three-component and `Entity`-only loops,
+//!   plus the `Changed`/`Added` change-detection filters.
+//! - Parallel: unfiltered, `With`-filtered, batch-size scaling from 1 to 1024,
+//!   and a sequential-vs-parallel crossover sweep.
+//! - Access: `get_component` random access against batched iteration, and the
+//!   `entity_count`/`is_empty`/`first` helpers.
+//! - Cache pressure: 64 B and 256 B components at high entity counts.
+//! - `slice_ceiling`: the same row work over two plain slices, as the floor.
 
 #![allow(dead_code)]
 
@@ -97,23 +83,21 @@ impl Component for Enemy {}
 struct Frozen;
 impl Component for Frozen {}
 
-/// Large component - 64 bytes, spans 2 cache lines per entity.
+/// Large component - 64 bytes, one cache line per row.
 ///
-/// Sized to exercise cache-line utilization when iterating at high entity
-/// counts in the parallel cache-pressure benchmark.
+/// Sized to exercise cache-line utilization at high entity counts in the
+/// parallel cache-pressure benchmark.
 #[derive(Debug, Clone)]
 struct LargeData([[f32; 4]; 4]); // 4×4 matrix = 16 × 4B = 64 B
 impl Component for LargeData {}
 
-/// Massive component - 256 bytes, spans 4 cache lines per entity.
+/// Massive component - 256 bytes, four cache lines per row.
 ///
 /// Sized to stress memory bandwidth and cache-miss rates at extreme entity
 /// counts in the parallel cache-pressure benchmark.
 #[derive(Debug, Clone)]
 struct MassiveData([[f64; 4]; 8]); // 8×4 f64 = 32 × 8B = 256 B
 impl Component for MassiveData {}
-
-// Marks the shared components as trait-accessible for the ECS storage layer.
 
 // =============================================================================
 // Benchmarks
@@ -315,7 +299,6 @@ fn bench_par_batch_size_scaling(criterion: &mut Criterion) {
 /// Finds the crossover point where parallel iteration becomes faster than sequential.
 fn bench_crossover(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_crossover");
-    // Find the entity count where parallel beats sequential
     for &count in &[1_000, 5_000, 10_000, 25_000, 50_000, 100_000] {
         group.bench_with_input(
             BenchmarkId::new("sequential", count),
@@ -387,7 +370,6 @@ fn bench_query_helpers(criterion: &mut Criterion) {
 fn bench_large_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_large_component");
 
-    // 64 B component
     for &count in &[10_000, 50_000] {
         group.bench_with_input(
             BenchmarkId::new("64B_component", count),
@@ -414,7 +396,6 @@ fn bench_large_component(criterion: &mut Criterion) {
         );
     }
 
-    // 256 B component - 4 cache lines per entity, extreme cache pressure
     for &count in &[500_000, 2_000_000] {
         group.bench_with_input(
             BenchmarkId::new("256B_component", count),
@@ -569,7 +550,9 @@ fn bench_entity_only_query(criterion: &mut Criterion) {
 }
 
 /// Random access via `world.get_component()` and `get_component_mut()` on 10K entities.
-/// Measures HashMap lookup + component access cost vs the batched iteration path.
+///
+/// Measures the per-call cost (component registry, entity location and
+/// archetype lookups) against the batched iteration path.
 fn bench_get_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_get_component");
     let count = 10_000;
@@ -658,12 +641,11 @@ fn bench_multi_component(criterion: &mut Criterion) {
 
 /// Bare-loop ceiling: the same element work the query benchmarks do, walked
 /// over two plain slices with no query machinery, no archetype join and no
-/// iterator adapter. This is the shape a span/index loop compiles to in any
-/// language, so it is the fair per-row floor for cross-language iteration
-/// comparisons (the managed side benchmarks the identical shape).
+/// iterator adapter.
 ///
-/// The write half includes a per-row tick store, mirroring what change
-/// tracking adds to a mutable pass.
+/// Gives the per-row floor the query variants are read against. The write half
+/// adds a per-row tick store, mirroring what change tracking adds to a mutable
+/// pass.
 fn bench_slice_ceiling(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("slice_ceiling");
     for &count in &[10_000, 100_000] {

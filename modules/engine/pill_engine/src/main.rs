@@ -1,17 +1,18 @@
-//! Minimal binary demonstrating the ECS library is loaded.
+//! Minimal binary confirming the ECS library loads.
 //!
 //! # Responsibilities
 //!
-//! - Logs version and entity count to confirm the library initialises correctly.
-//! - Lists available examples for users to explore.
+//! - Installs telemetry and constructs an [`Engine`].
+//! - Logs the crate version and the live entity count as an initialisation
+//!   check.
+//! - Points the reader at the example programs.
 //!
 //! # Design
 //!
-//! This binary is the default `pill_engine` package executable. It links the
-//! package's library crate, constructs an [`Engine`], and logs the version
-//! plus the live entity count as a smoke test of library initialisation. All
-//! real workloads live in the example programs; for full examples, use
-//! `cargo run --example <name>`.
+//! This is the `pill_engine` package's binary target. It links the package's
+//! library crate and does nothing beyond bringing the ECS world up, so a
+//! library that fails to initialise fails visibly here. Real workloads live in
+//! the example programs (`cargo run --example <name>`).
 
 // Current crate
 use pill_engine::Engine;
@@ -38,7 +39,7 @@ fn main() {
         engine.world().entity_count(),
     );
 
-    // Print the example programs available for exploration.
+    // Name the example programs the package ships.
     pill_core::info!("Run examples with: cargo run --example <name>");
     pill_core::info!("Available: iterators_stress_test, change_detection_demo,");
     pill_core::info!("           scripting_demo, parallel_systems_demo, resources_demo");

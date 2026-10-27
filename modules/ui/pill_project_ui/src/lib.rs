@@ -2,53 +2,25 @@
 //!
 //! # Responsibilities
 //!
-//! - [`GameUi`]: the resource holding the egui context, the published pointer
-//!   and keyboard claims, and the texture mirror.
+//! - [`GameUi`]: the egui context, the published pointer and keyboard claims,
+//!   and the texture mirror.
 //! - [`GameUi::run`]: one pass - the engine's input in, the frame's draw list
-//!   and textures out, published into the world's
-//!   [`UiFrameSlot`](pill_ui_frame::UiFrameSlot).
-//! - [`install`]: puts the resource into a project's world, registering its
-//!   type first so a reload finds the same one.
-//! - [`install_with_theme`] and [`ThemeInstall`]: the project's code default
-//!   merged with an optional `.theme` override, plus the system that
-//!   re-applies it when the file is reimported (W-0127).
-//! - [`GameUi::theme`] and [`GameUi::apply_theme`]: the tokens the context
-//!   paints with, and the one install entry point.
-//! - [`convert`], [`input`], [`textures`]: the three pieces it composes.
+//!   and textures out, published into the world's [`UiFrameSlot`].
+//! - [`install`] and [`install_with_theme`]: put the resource into a project's
+//!   world with its theme, plus the system that re-applies the theme when the
+//!   override file is reimported.
+//! - [`mod@convert`], [`input`], [`textures`]: the three pieces it composes.
 //!
 //! # Design
 //!
-//! This crate is a shared `dylib` (plan decision D2) so the egui context
-//! outlives a project reload: a rebuilt project finds its fonts, its widget
-//! state and its textures still there. The same reload contract as
-//! `pill_editor_core` binds - nothing module-defined may be stored in the context
-//! - and [`GameUi`] itself lives here, so the type is one across artifacts.
-//!
-//! The frame it produces is neutral (`pill_ui_frame`) and travels through the
-//! draw crate's frame slot (`pill_ui_frame::UiFrameSlot`): the renderer and `pill_renderer_api` never see
-//! egui (D1), and neither side names the other's crate - which is also what
-//! keeps a renderer from having to link this crate, since one link unit cannot
-//! hold two copies of a third-party graph in different formats. A game's own
-//! systems read [`GameUi::wants_pointer`] / [`GameUi::wants_keyboard`] to gate
-//! their input (D4). The context is exposed
-//! for the one thing a facade cannot wrap: a project's UI closure needs
-//! `&mut egui::Ui`.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! // Once, in the project's init:
-//! pill_project_ui::install(engine);
-//!
-//! // In a system, once per frame:
-//! let input = pill_project_ui::InputFrame::capture(world.get_resource::<Input>().unwrap());
-//! let mut ui = world.get_resource_mut::<GameUi>().unwrap();
-//! let mut slot = world.get_resource_mut::<UiFrameSlot>().unwrap();
-//! ui.run(&mut slot, &input, viewport, scale_factor, pill_project_ui::PRIMARY_SURFACE, |ui| {
-//!     ui.heading("Tuning");
-//!     ui.label(format!("fps {fps}"));
-//! });
-//! ```
+//! A shared `dylib`, so the context - its fonts, widget state and textures -
+//! outlives a project reload, and [`GameUi`] lives here, so the type is one
+//! across artifacts; the contract of `pill_editor_core` binds, so nothing
+//! module-defined may be stored in the context. This UI is the one producer
+//! for the world's [`UiFrameSlot`], and the frame it publishes is neutral
+//! (`pill_ui_frame`): neither the renderer nor `pill_renderer_api` sees egui,
+//! and no renderer links this crate. A game gates its own input on
+//! [`GameUi::wants_pointer`] / [`GameUi::wants_keyboard`].
 
 /// The tessellated output to `pill_ui_frame`.
 pub mod convert;
@@ -64,7 +36,7 @@ pub use egui;
 /// without depending on the draw-data crate itself.
 pub use pill_ui_frame::UiFrameSlot;
 /// The UI kit: the theme-to-egui translator, the font installer and the
-/// scoped style variants (W-0127). Re-exported so a project never names the
+/// scoped style variants. Re-exported so a project never names the
 /// rlib directly.
 pub use pill_ui_kit as kit;
 
@@ -80,7 +52,7 @@ use pill_ui_frame::{DrawList, UiDraw, UiFrame};
 // Current crate
 pub use convert::{convert, external_id, straight_color};
 pub use input::{raw_input, InputFrame, InputMemory};
-/// The theme data a project's UI installs (W-0127).
+/// The theme data a project's UI installs.
 pub use pill_ui_theme::{Theme, ThemeOverrides, ThemePathScope};
 use textures::TextureMirror;
 
@@ -125,8 +97,8 @@ pub struct GameUi {
     override_handle: Option<Handle<ThemeOverrides>>,
     /// The override's content version the applied theme was merged from.
     override_version: Option<u64>,
-    /// The three font families' handles, in [`ThemeFonts`] order (body,
-    /// display, monospace).
+    /// The three font families' handles, in [`kit::style::ThemeFonts`] order
+    /// (body, display, monospace).
     font_handles: [Option<Handle<pill_ui_theme::FontAsset>>; 3],
     /// Those handles' content versions when the fonts were installed.
     font_versions: [Option<u64>; 3],
@@ -206,8 +178,8 @@ impl GameUi {
 
     /// Install `theme` on this UI's context.
     ///
-    /// This is the one non-generic install entry point (D11), so no closure
-    /// from a reloadable image ends up in the context's style.
+    /// The theme is plain data, so what reaches the context's style is egui's
+    /// own types and owned font bytes - nothing a reload could invalidate.
     pub fn apply_theme(&mut self, theme: &Theme) {
         self.install_theme(theme);
     }
@@ -374,13 +346,13 @@ impl GameUi {
     }
 
     /// Whether the last pass wants the pointer: a game gates its own pointer
-    /// input on this (D4).
+    /// input on this.
     pub fn wants_pointer(&self) -> bool {
         self.wants_pointer
     }
 
     /// Whether the last pass wants the keyboard: a game gates its own key
-    /// input on this (D4).
+    /// input on this.
     pub fn wants_keyboard(&self) -> bool {
         self.wants_keyboard
     }
@@ -393,7 +365,7 @@ impl GameUi {
 
 /// A project's UI theme: its code default and an optional override file.
 ///
-/// The project builds the base in its own code (the builder, or
+/// The project builds the base in its own code (a [`Theme`] value, or
 /// [`Theme::brutalist`]) and names a `.theme` file below `res`; the file
 /// states only the items it changes.
 #[derive(Clone, Debug)]
@@ -566,7 +538,7 @@ fn resolve_fonts(world: &mut pill_engine_core::World, theme: &Theme) -> Resolved
     resolved
 }
 
-/// Put one family's bytes where [`ThemeFonts`] holds them.
+/// Put one family's bytes where [`kit::style::ThemeFonts`] holds them.
 fn set_font_family(fonts: &mut kit::style::ThemeFonts, index: usize, bytes: Option<Vec<u8>>) {
     match index {
         0 => fonts.body = bytes,

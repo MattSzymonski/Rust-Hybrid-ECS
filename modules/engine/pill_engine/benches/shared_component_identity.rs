@@ -1,38 +1,30 @@
-//! Shared Component Identity Benchmarks
-//! ===================================
-//!
-//! Verifies the claim that resolving a component by a declared identity rather
-//! than by `TypeId` costs nothing in the inner loop, instead of assuming it.
+//! Shared component identity benchmarks: whether resolving a component by its
+//! declared identity instead of by `TypeId` costs anything in the inner loop.
 //!
 //! # Responsibilities
 //!
 //! - Compares query iteration over a shared component against an otherwise
 //!   identical ordinary one, at three entity counts.
 //! - Covers the read (`&T`), write (`&mut T`) and random-access
-//!   (`get_component`) paths, since they resolve the column differently.
+//!   (`get_component`) paths, which resolve the column differently.
 //! - Measures reading a shared component through the *other* binary's copy of
-//!   the type, which is the case the feature exists for.
+//!   the type, the case the shared identity exists for.
 //!
 //! # Design
 //!
-//! `SharedPosition` and `OrdinaryPosition` have identical layouts and differ
-//! only in that the first declares `#[pill(shared)]`. `ForeignPosition` is a
-//! third type declaring the same shared name as `SharedPosition`, standing in
-//! for the copy a second binary would compile - which is how the cross-binary
-//! read path is reachable from a single benchmark binary.
+//! `SharedPosition` and `OrdinaryPosition` have identical layouts; only the
+//! first declares `#[pill(shared)]`. `ForeignPosition` declares the same shared
+//! name, standing in for the copy a second binary would compile - which is how
+//! the cross-binary read path is reachable from a single benchmark binary.
 //!
-//! ## What the numbers should show
-//!
-//! Row access is expected to be *identical*, not merely close: both kinds of
-//! column are the same contiguous `ComponentColumn`, and both are indexed by
-//! `get_unchecked::<T>(row)`, which is a base pointer plus `row * size_of::<T>()`.
-//! Nothing about the declared identity reaches the loop body.
-//!
-//! The only place identity is consulted is once per query, where a shared
-//! component's id comes from hashing its declared name instead of from
-//! `TypeId::of`. Both fold to a constant at compile time, so even that should
-//! not be visible above noise. A gap that scales with entity count would mean
-//! the row path diverged and is the regression this benchmark exists to catch.
+//! Row access should be identical, not merely close: both columns are the same
+//! contiguous `ComponentColumn`, indexed by `get_unchecked::<T>(row)` for reads
+//! and `get_mut_unchecked::<T>(row)` for writes, and nothing about the identity
+//! reaches the loop body. Identity is resolved when a query binds its columns
+//! and on each `get_component` call, where a derived shared identity is a
+//! compile-time constant and `TypeId::of` compiles to the same load. A gap that
+//! scales with entity count means the row path diverged, which is the
+//! regression this target exists to catch.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pill_engine::query::Query;
@@ -83,15 +75,15 @@ struct Velocity {
 // Worlds
 // =============================================================================
 
-/// Entity counts every benchmark sweeps, matching `query_iteration` so the
-/// numbers are comparable against the ordinary query benchmarks.
+/// Entity counts every benchmark sweeps, matching the `query_iteration`
+/// sequential groups so the two targets' numbers are comparable.
 const ENTITY_COUNTS: [usize; 3] = [1_000, 10_000, 100_000];
 
 /// Build a world of `count` entities carrying a shared position and a velocity.
 ///
-/// Both copies of the shared component register, as they would when a project
-/// and a module DLL each run their own `init`, so the column is the bound one
-/// rather than a single-registrant special case.
+/// Both declarations of the shared component register, as they would when a
+/// project and a module DLL each run their own startup, so two Rust types
+/// resolve onto one column instead of each getting its own.
 fn setup_shared_world(count: usize) -> World {
     let mut world = World::new();
     world.register_component::<SharedPosition>();
@@ -134,8 +126,9 @@ fn setup_ordinary_world(count: usize) -> World {
 // Benchmarks
 // =============================================================================
 
-/// Sequential read of `(&Position, &Velocity)` over a shared component against
-/// an ordinary one. The two series should be indistinguishable.
+/// Sequential read of a position and velocity pair, once over a shared
+/// component and once over an ordinary one. The two series should be
+/// indistinguishable.
 fn bench_read_iteration(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("shared_identity_read");
     for &count in &ENTITY_COUNTS {
@@ -183,8 +176,8 @@ fn bench_read_iteration(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Sequential mutable iteration, which additionally writes a change tick per
-/// row through the tick vector the column's id keys.
+/// Sequential mutable iteration, which also marks the changed tick on every
+/// row's entry in the column's tick vector.
 fn bench_write_iteration(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("shared_identity_write");
     for &count in &ENTITY_COUNTS {

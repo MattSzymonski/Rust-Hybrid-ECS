@@ -141,8 +141,8 @@ mod tests {
 
     /// A component with an engine-owned buffer field is checked by size and
     /// alignment: the generator hands managed code three private header words
-    /// there, so no list of public field names describes the struct. Stating a
-    /// signature anyway refused every such mirror at bind time.
+    /// there, so no list of public field names describes the struct. A stated
+    /// signature would refuse every such mirror at bind time.
     #[test]
     fn a_native_buffer_field_leaves_no_field_signature() {
         let fields = [

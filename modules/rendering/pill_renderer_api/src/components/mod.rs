@@ -14,9 +14,10 @@
 //! instance - live in that renderer's data crate, which registers these first
 //! and its own after.
 //!
-//! **The camera pins its shared name.** The `PillComponent` derive would
-//! otherwise build it from `module_path!()`, so moving the type would register
-//! a *different* component and orphan every column a live world holds for it.
+//! **The camera pins its shared name.** The `PillComponent` derive otherwise
+//! builds it from `module_path!()`, so a derived name would register a
+//! *different* component and orphan every column a live world holds for this
+//! one.
 
 mod camera;
 mod viewport;

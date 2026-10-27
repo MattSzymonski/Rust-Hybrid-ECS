@@ -17,20 +17,18 @@
 //!
 //! Waiting for an error scope is asynchronous, and a browser only answers it
 //! once control returns to its event loop, so a frame cannot block on one
-//! there. Blocking capture is therefore a development capability: it is what
-//! lets an edited shader that the driver refuses be reported and skipped
-//! instead of reaching the error handler. Every other build reports such an
-//! error through that handler, which logs it; shipped content has already been
-//! through development, where the capture checked it.
+//! there. Blocking capture is therefore a development capability: it lets an
+//! edited shader the driver refuses be reported and skipped instead of reaching
+//! the error handler, which in every other build logs the refusal.
 //!
-//! A lost device is the one failure that reaches neither path: wgpu answers
-//! every call on it with success, so the loss is only visible to the callback
-//! [`latch_device_loss`] installs, and it has to be carried to the frame path
-//! rather than logged and forgotten.
+//! A lost device reaches neither path: wgpu answers every call on it with
+//! success, so only the callback [`latch_device_loss`] installs sees the loss,
+//! and it has to be carried to the frame path rather than logged and forgotten.
 
 // Standard library
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+// External crates
 pub use pill_renderer_api::error::{ErrorContext, RendererError, Result};
 
 /// The errors a block of GPU work provoked, one per filter class.
@@ -79,8 +77,8 @@ fn latched_loss() -> MutexGuard<'static, Option<String>> {
 /// polls all return success, and no uncaptured error is raised, so nothing in
 /// the frame path can tell that the picture stopped moving. The callback wgpu
 /// fires for the loss is therefore the only witness, and it runs on a driver
-/// thread; the latch carries its answer across to [`device_loss`], which the
-/// next frame reports.
+/// thread; the latch carries its answer to [`device_loss`], which the next
+/// frame reports.
 ///
 /// Installed beside [`report_uncaptured_errors`] when the device is created,
 /// which also clears a loss the previous device of this image recorded.
@@ -157,12 +155,11 @@ pub(crate) fn captured_now<T>(
 /// to its uncaptured-error handler, where the build can capture them.
 ///
 /// wgpu reports a refused pipeline, bind group or texture through that handler,
-/// with no return value to check. Capturing the errors here turns them into a
-/// message the caller can attach to whatever asked for the work - the pass,
-/// the shader, the material - which is the difference between "this frame
-/// failed" and "this pass is not drawn, and here is why". Elsewhere the
-/// block's value is always returned and a refusal is logged by the handler
-/// instead.
+/// with no return value to check. Capturing turns the refusal into a message
+/// the caller can attach to whatever asked for the work, which is the
+/// difference between "this frame failed" and "this pass is not drawn, and here
+/// is why". Where the build cannot capture, the block's value is returned and
+/// the handler logs the refusal.
 ///
 /// # Errors
 ///

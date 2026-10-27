@@ -16,22 +16,19 @@
 //!
 //! # Design
 //!
-//! The document is addressed by the field layer's names (Stage 2), not by the
-//! component types' own serde: a handle field then saves as its guid and an
-//! entity field as its stable id, which is the whole point of the scene
-//! existing (Stages 5 and 7). A component whose own serde writes a handle as a
-//! slot pair cannot be written straight into a file meant for a later run, so
-//! the field layer - which knows what a reference *is* - is the writer.
+//! The document is addressed by the field layer's names, not by the component
+//! types' own serde: a handle field then saves as its guid and an entity field
+//! as its stable id. A component whose own serde writes a handle as a slot pair
+//! cannot be written straight into a file meant for a later run, so the field
+//! layer - which knows what a reference *is* - is the writer.
 //!
-//! A field the field layer can only summarise (a `vec:` container) is not
-//! written; [`SceneSave::skipped_fields`] names each one, so a lossy save says
-//! so rather than passing for a complete one. A field it can locate but not
-//! interpret (a `struct:` with no known layout) is written as its raw bytes,
-//! because a captured opaque payload writes back verbatim into the same
-//! layout. A whole component the field layer cannot reach - no layout, or a
-//! row it cannot read - is left out and named in
-//! [`SceneSave::skipped_components`]: the entity is saved without it, which is
-//! the caller's to report.
+//! A field the field layer can only summarise (a `vec:` container, a `string`)
+//! is not written; [`SceneSave::skipped_fields`] names each one, so a lossy
+//! save says so rather than passing for a complete one. A field it can locate
+//! but not interpret (a `struct:` with no known layout) is written as its raw
+//! bytes, which write back verbatim into the same layout. A whole component it
+//! cannot reach - no layout, or a row it cannot read - is left out and named in
+//! [`SceneSave::skipped_components`], which is the caller's to report.
 //!
 //! Loading is three passes: the components a reference lives in must exist
 //! before the field is written, and an entity reference may name an entity
@@ -104,9 +101,9 @@ impl Scene {
 /// type under, and the type a `Handle<Scene>` field records.
 const SCENE_SHARED_NAME: &str = "pill_engine::scene::Scene";
 
-// Shared across binaries: a project, the host and every extension compile their
-// own copy of the engine, each with its own `TypeId`. The pinned name makes
-// them one asset column; keep it verbatim when moving the type.
+// Shared identity: a type two binaries each compile has one `TypeId` per
+// binary, so the pinned name is what makes them one asset column - and what a
+// saved `Handle<Scene>` field records. Keep it verbatim when moving the type.
 impl Asset for Scene {
     fn shared_name() -> Option<&'static str> {
         Some(SCENE_SHARED_NAME)
@@ -473,8 +470,7 @@ pub fn load_scene(
         }
     }
 
-    // Step 3: the entity references, now that every entity of the document
-    // exists.
+    // Step 3: the entity references, once every entity of the document exists.
     let (_, unresolved) = links.resolve(engine.world_mut());
     report.unresolved_references = unresolved.len();
     report
@@ -605,9 +601,9 @@ fn decoded_field(tag: &'static str, encoded: &serde_json::Value) -> Result<Decod
 
 /// A whole number narrowed to a signed field's own type.
 ///
-/// The arm used to cast (`as i8`), which wraps: a document saying 300 for an
-/// `i8` field loaded as 44, and the world held a number the document never
-/// said. A value that does not fit is refused instead, and the report names it.
+/// A value that does not fit is refused rather than cast: `as i8` would wrap 300
+/// into 44 and leave the world holding a number the document never said. The
+/// report names the refused value.
 fn narrowed_signed<T: TryFrom<i64>>(
     tag: &'static str,
     encoded: &serde_json::Value,
@@ -817,9 +813,9 @@ mod tests {
         ComponentRegistry::registered_name::<Actor>()
     }
 
-    /// AC1 and AC3: a world saves to a `.scene` file with a fresh guid, and
-    /// loading that file into an empty engine brings back the same components
-    /// and references - the asset by guid, the entity by stable id.
+    /// A world saves to a `.scene` file with a fresh guid, and loading that file
+    /// into an empty engine brings back the same components and references -
+    /// the asset by guid, the entity by stable id.
     #[test]
     fn a_scene_round_trips_through_a_file() {
         // Step 1: the world that saves.
@@ -955,9 +951,8 @@ mod tests {
     ///
     /// A heap-backed field is read-only through the field layer - its buffer is
     /// reached through the type's own accessors, not through raw row bytes - so
-    /// the saver must leave one out. It used to write a `string` as JSON while
-    /// the writer refused the same value back, so the file claimed a value no
-    /// load could restore, and `vec:` fields were dropped without a word.
+    /// the saver leaves one out and reports it. Writing a `string` would put a
+    /// value in the file that no load could restore.
     #[test]
     fn a_saved_field_is_one_the_loader_accepts() {
         static LABELED_FIELDS: &[ComponentFieldDescriptor] = &[
@@ -1033,9 +1028,8 @@ mod tests {
     /// and the report says so instead of dropping it.
     ///
     /// The field layer is what writes a scene, so a component without a layout
-    /// has no fields to write. It used to leave the save without a word: the
-    /// document held one component fewer than the world did, `SceneSave` said
-    /// nothing, and gameplay state disappeared from the file silently.
+    /// has no fields to write; keeping quiet about it would put gameplay state
+    /// silently out of the file.
     #[test]
     fn a_component_without_a_layout_is_reported_as_not_written() {
         #[repr(C)]
@@ -1086,8 +1080,8 @@ mod tests {
         );
     }
 
-    /// AC2: a component the world does not know is reported, and the rest of
-    /// the entity still loads.
+    /// A component the world does not know is reported, and the rest of the
+    /// entity still loads.
     #[test]
     fn an_unknown_component_is_reported_and_the_rest_loads() {
         let mut scratch = Scratch::new("unknown");
@@ -1122,9 +1116,8 @@ mod tests {
     /// A document value that does not fit its field's type is refused and
     /// reported, instead of being narrowed into a different number.
     ///
-    /// The integer arms used to cast (`as u8`), so `"amount": 300` wrapped to
-    /// 44 and the world held a number the document never said; the same cast
-    /// turned `1e40` into `inf` for an `f32`.
+    /// Casting would wrap `"amount": 300` to 44 and turn `1e40` into `inf` for
+    /// an `f32`, leaving the world holding numbers the document never said.
     #[test]
     fn a_value_that_does_not_fit_its_field_is_reported() {
         #[repr(C)]

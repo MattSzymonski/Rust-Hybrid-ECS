@@ -19,8 +19,7 @@
 //! no closure created by a reloadable image ends up inside an egui `Style`.
 //! The kit holds no statics: the font signature, the font bytes and the theme
 //! all belong to the caller. Fonts are installed before the style, because a
-//! style that names an unregistered family panics on the next pass
-//! (`research §4.2`).
+//! style that names an unregistered family panics on the next pass.
 
 // Standard library
 use std::hash::{Hash, Hasher};
@@ -112,7 +111,7 @@ pub fn build_style(theme: &Theme, base: &egui::Style) -> egui::Style {
     let visuals = &mut style.visuals;
     visuals.dark_mode = theme.dark_mode;
     // Per-state `fg_stroke` carries the text colours; the override flattens
-    // them (`research §1`).
+    // them.
     visuals.override_text_color = None;
     visuals.panel_fill = color(theme.palette.panel);
     visuals.window_fill = color(theme.palette.panel);

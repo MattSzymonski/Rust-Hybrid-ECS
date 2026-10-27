@@ -1,8 +1,9 @@
-//! Dummy extension used to pad out module-loading tests.
+//! Placeholder extension with no ECS state: a deterministic pseudo-random
+//! generator.
 //!
 //! # Responsibilities
 //!
-//! - Defines the [`LcgRandom`] struct with two dummy pseudo-random methods.
+//! - Defines the [`LcgRandom`] struct with two generator methods.
 //! - Exposes the [`seed_from_u32`] free function.
 //! - Registers through the extension ABI when the host loads it.
 //!
@@ -10,7 +11,8 @@
 //!
 //! The crate carries no ECS state; [`register`] is a no-op that only reports
 //! success, kept as a plain Rust function so the same crate can also be linked
-//! statically into a monolithic build. The generator is a linear congruential
+//! statically into a monolithic build. The module-loading test fixture lists it
+//! so several modules load at once. The generator is a linear congruential
 //! generator: not suitable for real randomness, only for a deterministic dummy
 //! sequence.
 
@@ -33,7 +35,7 @@ pub struct LcgRandom {
 impl LcgRandom {
     /// Advances the generator and returns the next value in its sequence.
     pub fn next_u32(&mut self) -> u32 {
-        // Numeric Recipes LCG constants; fine for a dummy deterministic stream.
+        // Numerical Recipes LCG constants; deterministic, not statistical.
         self.state = self
             .state
             .wrapping_mul(1_664_525)
@@ -41,7 +43,7 @@ impl LcgRandom {
         self.state
     }
 
-    /// Returns the next value mapped into `0.0..1.0`.
+    /// Returns the next value mapped into `0.0..=1.0`.
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u32() as f32) / (u32::MAX as f32)
     }

@@ -6,19 +6,19 @@
 //! - Exercises the shared [`Position`], [`Velocity`], and [`Health`] fixture
 //!   components through sequential and parallel query iteration, including
 //!   tracked batch statistics.
-//! - Verifies change-detection semantics of [`Mut`] and the [`Added`] and
+//! - Verifies change-detection semantics of `Mut<T>` and the [`Added`] and
 //!   [`Changed`] filters.
 //! - Verifies archetype-scoping behaviour of the [`With`], [`Without`], and
 //!   [`Or`] filter combinators.
 //!
 //! # Design
 //!
-//! Every test builds a fresh [`World`] through [`setup_world`] with the three
-//! fixture components registered, populates entities, and asserts on the
-//! results of [`Query`] iteration. Filters are exercised at the archetype
-//! level ([`With`], [`Without`], [`Or`]) and the row level ([`Added`],
-//! [`Changed`]), including nested and mixed combinations that stress the
-//! [`Or`] short-circuiting and duplicate-write detection logic.
+//! Most tests build a fresh [`World`] through [`setup_world`] with the three
+//! fixture components registered; the registration and shared-layout tests
+//! build one directly. Filters are exercised at the archetype level ([`With`],
+//! [`Without`], [`Or`]) and the row level ([`Added`], [`Changed`]), including
+//! nested and mixed combinations that exercise [`Or`] short-circuiting and the
+//! aliasing detection of the target tuples.
 
 // External crates
 use pill_core::rayon;
@@ -31,10 +31,6 @@ use crate::test_fixtures::{setup_world, Health, Position, Velocity};
 use crate::world::World;
 
 // =============================================================================
-// Test Helpers
-// =============================================================================
-
-// =============================================================================
 // Tests
 // =============================================================================
 
@@ -44,7 +40,8 @@ use crate::world::World;
 
 /// A query whose target component is never registered matches nothing and
 /// panics nowhere: the unresolved id is recorded instead of dropped from the
-/// mask, which used to make "not registered" mean "matches everything".
+/// mask, because a dropped id would make "not registered" mean "matches
+/// everything".
 #[test]
 fn query_before_registration_matches_nothing() {
     let mut world = World::new();
@@ -219,9 +216,9 @@ fn test_query_first_empty() {
 /// `first()` agrees with `iter_mut().next()` even with several matching
 /// archetypes.
 ///
-/// Both now walk the same sorted matching-archetype cache; the previous fast
-/// path walked the archetype `HashMap` in its per-instance randomized order,
-/// so `first` could name a different row than every other iterator.
+/// Both walk the same sorted matching-archetype cache, so `first` always names
+/// the row `iter_mut().next()` returns - a randomized archetype order would
+/// let them disagree.
 #[test]
 fn first_agrees_with_iteration_order() {
     let mut world = setup_world();
@@ -259,8 +256,9 @@ fn first_agrees_with_iteration_order() {
 }
 
 /// A filter with a row-level predicate and no archetype scoping produces no
-/// filter pairs, which the fast paths used to read as "accepts everything" -
-/// so a filter rejecting every row still answered from row counts.
+/// filter pairs, which would read as "accepts everything" if the row-level
+/// predicate were skipped: a filter rejecting every row must still answer
+/// nothing from `first`, `is_empty` and `entity_count`.
 #[test]
 fn row_only_filters_are_not_skipped() {
     /// Rejects every row without declaring any component scope.
@@ -382,8 +380,8 @@ fn test_par_iter_with_batch_size() {
     // contiguously across the pool, each thread group's processed count is
     // `batch_size × (its slice count)`: `base` slices each, plus one more for
     // the first `remainder` groups. Ignoring `with_batch_size` changes the
-    // slice lengths (the default spans 256..4096), so these equalities fail
-    // where the old `|| batch_count == 1` escape could not.
+    // slice lengths (the default spans 256..4096), so both equalities catch
+    // it.
     let slices = entity_count / batch_size;
     let base = slices / num_threads;
     let remainder = slices % num_threads;
@@ -665,7 +663,8 @@ fn test_immutable_deref_does_not_bump_changed_tick() {
     assert_eq!(baseline, after_read);
 }
 
-/// Verifies that `bypass()` provides raw access without bumping change-detection ticks.
+/// Verifies that `bypass_change_detection()` provides raw access without
+/// bumping change-detection ticks.
 #[test]
 fn test_bypass_change_detection_does_not_bump_tick() {
     let mut world = setup_world();
@@ -901,10 +900,9 @@ fn test_filter_or_combines_predicates() {
 /// Verifies that `Or<(With<A>, With<B>)>` matches entities with either component.
 #[test]
 fn test_filter_or_with_components_either() {
-    // Regression test for issue 4.8: Or<(With<A>, With<B>)> must match
-    // archetypes containing A *or* B (not just both). The old
-    // implementation incorrectly required both A and B because
-    // included_component_ids was built via union (intersection semantics).
+    // `Or<(With<A>, With<B>)>` must match archetypes containing A *or* B (not
+    // just both): the pairs are `({A},{})` and `({B},{})`, so unioning the
+    // inner includes into one pair would wrongly require both.
     let mut world = setup_world();
     let e_a = world
         .create_entity()
@@ -1090,9 +1088,6 @@ fn test_filter_or_three_way() {
         .build()
         .unwrap();
     let e_hp = world.create_entity().with(Health(10)).build().unwrap();
-    // Entity with none of the three (empty archetype isn't possible, but
-    // we can make one with a different component - no, we don't have a
-    // 4th component. That's fine - the test covers A, B, C archetypes.)
 
     let mut q =
         Query::<(Entity,), Or<(With<Position>, With<Velocity>, With<Health>)>>::new(&mut world);
@@ -1151,11 +1146,12 @@ fn test_filter_or_within_and_tuple() {
     assert_eq!(hits, expected);
 }
 
-/// Verifies that an empty target query with `Or` filter produces correct results.
+/// Verifies that an `Or`-scoped query whose target is only `Entity` yields the
+/// entities its branches match.
 #[test]
 fn test_filter_or_empty_target_with_or() {
-    // Query<(), Or<(With<A>, With<B>)>>: no data fetched, only filter.
-    // Should still correctly scope to matching archetypes.
+    // Query<(Entity,), Or<(With<A>, With<B>)>>: no component data is fetched,
+    // so the `Or` filter alone decides which archetypes match.
     let mut world = setup_world();
     let e_a = world
         .create_entity()
@@ -1169,7 +1165,6 @@ fn test_filter_or_empty_target_with_or() {
         .unwrap();
     let _e_none = world.create_entity().with(Health(10)).build().unwrap();
 
-    // () as QueryTarget - fetches no data, but Entity is available via iter_mut
     let mut q = Query::<(Entity,), Or<(With<Position>, With<Velocity>)>>::new(&mut world);
     let mut hits: Vec<Entity> = q.iter_mut().map(|(e,)| e).collect();
     hits.sort_by_key(|e| e.id());
@@ -1500,7 +1495,7 @@ fn a_stale_shared_reader_is_refused() {
     assert_eq!(values, [(1.0, 2.0)]);
 }
 
-/// A reader declaring no layout keeps today's size-and-alignment check, so it
+/// A reader declaring no layout uses the size-and-alignment check alone, so it
 /// still matches.
 #[test]
 fn a_reader_without_a_declared_layout_falls_back_to_size_and_alignment() {
@@ -1520,9 +1515,9 @@ fn a_stale_reader_is_reported_once() {
     assert_eq!(world.reported_schema_mismatches.len(), 1);
 }
 
-/// A zero batch size cannot reach the slice arithmetic (W-0092).
+/// A zero batch size cannot reach the slice arithmetic.
 ///
-/// `min_len` is a divisor in both executors, so a caller-computed zero used to
+/// `min_len` is a divisor in both executors, so a caller-computed zero would
 /// divide by zero inside `for_each` and take the host down mid-frame. The
 /// setter clamps, so the zero becomes the finest split the executor can make.
 #[test]

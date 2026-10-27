@@ -5,9 +5,9 @@
 //!
 //! - Declare one `#[derive(PillMirror)]` value type with the marker in both
 //!   spellings.
-//! - Pin that both methods reach this artifact's mirror-method registry: the
-//!   macro once matched the bare name only, and a skipped method is invisible
-//!   until the generated C# fails to compile against the missing member.
+//! - Pin that both methods reach this artifact's mirror-method registry. A
+//!   skipped method is invisible until the generated C# fails to compile
+//!   against the missing member, so both spellings are pinned.
 
 use pill_engine::component_registry::mirror_method_descriptors;
 use pill_engine::{pill_mirror_impl, pill_mirror_method, PillMirror};

@@ -43,8 +43,9 @@ pub const BYTES_PER_PIXEL: usize = 2;
 pub fn pack_rgb565(red: f32, green: f32, blue: f32) -> u16 {
     let quantize = |channel: f32, bits: u32| -> u16 {
         let max = ((1u32 << bits) - 1) as f32;
-        // `clamp` maps NaN to the low bound, so a NaN channel renders black
-        // rather than producing an unpredictable bit pattern.
+        // A NaN channel passes `clamp` untouched (NaN compares false both ways)
+        // and the saturating `as u16` cast turns it into 0, so a NaN channel
+        // renders black rather than an unpredictable bit pattern.
         (channel.clamp(0.0, 1.0) * max + 0.5) as u16
     };
     (quantize(red, 5) << 11) | (quantize(green, 6) << 5) | quantize(blue, 5)
@@ -143,8 +144,8 @@ impl Framebuffer {
 
     /// Read one pixel, or `None` when the coordinate is outside the buffer.
     ///
-    /// Used by tests and by callers holding an unchecked coordinate; the
-    /// rasterizer indexes rows directly instead.
+    /// Used by tests; the rasterizer resolves spans through [`Self::span_bounds`]
+    /// and indexes rows directly instead.
     #[inline]
     pub fn pixel(&self, x: u32, y: u32) -> Option<u16> {
         (x < self.width && y < self.height)

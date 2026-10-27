@@ -12,27 +12,24 @@
 //! # Design
 //!
 //! Components are stored in erased columns with no `dyn Any` downcast, so the
-//! only generic way to reach an arbitrary component's value is the field
-//! layout (`name`, `type_tag`, `offset`, `size`, `align`, `element_count`)
-//! that `#[derive(PillComponent)]` / `#[derive(PillMirror)]` register. This
-//! module is the safe wrapper over that data: it resolves a component through
-//! **the entity's own archetype** (never through the registry-wide
-//! name resolver, whose "highest bit" entry is not necessarily the generation
-//! that created the data), validates every value against the layout, and never
-//! hands a raw pointer to the caller.
+//! field layout (`name`, `type_tag`, `offset`, `size`, `align`,
+//! `element_count`) that `#[derive(PillComponent)]` / `#[derive(PillMirror)]`
+//! register is the only generic way to reach an arbitrary component's value.
+//! This module is the safe wrapper over that data: it resolves a component
+//! through **the entity's own archetype**, the one place that names the
+//! generation which created the data (a registry-wide name lookup can see
+//! several registrations under one name), validates every value against the
+//! layout, and never hands a raw pointer to the caller.
 //!
-//! The [`FieldValue`] vocabulary mirrors the derive's closed `type_tag`
-//! vocabulary one-to-one. `struct:` fields (and anything else the engine
-//! cannot interpret) are surfaced as [`FieldValue::Opaque`] on read and are
-//! never edited by value, so an inspector can show them instead of hiding
-//! them; a restore hands the captured bytes back exactly as they were read.
-//!
-//! A nested `struct:` field whose type has a known layout is expanded before it
-//! ever reaches here: the world flattens it into dotted leaf rows when the
-//! component is registered ([`World::register_component_with_layout`]), using
-//! the layouts registered before it, so a nested colour or vector arrives as
-//! the scalars it is made of. The `struct:` tag survives to the decode path
-//! only when no layout was resolvable.
+//! The [`FieldValue`] vocabulary covers the derive's closed `type_tag`
+//! vocabulary. `struct:` fields (and anything else the engine cannot
+//! interpret) are surfaced as [`FieldValue::Opaque`] on read and are never
+//! edited by value, so an inspector can show them instead of hiding them; a
+//! restore hands the captured bytes back exactly as they were read. A nested
+//! `struct:` field whose type has a known layout never gets that far: the
+//! world flattens it into dotted leaf rows at registration
+//! ([`World::register_component_with_layout`]), so the tag survives only when
+//! no layout was resolvable.
 
 // Standard library
 use std::mem::size_of;
@@ -51,17 +48,17 @@ use crate::world::World;
 
 /// One read or edited value in the engine's reflected vocabulary.
 ///
-/// Mirrors the derive's `type_tag` vocabulary 1:1: the scalar primitives the
-/// engine can describe, whole fixed-size arrays, heap-backed containers
-/// (`List` and `Text`, summarized rather than materialized), and an `Opaque`
-/// escape hatch for fields the engine can locate but not interpret (`struct:`
-/// tags whose value type is not resolvable, and any tag outside the
-/// vocabulary). `Opaque` carries the raw bytes so the UI can show them; no
-/// edit can introduce one, but a captured payload whose tag and size match
-/// the field's own descriptor writes back verbatim, which is how a restore
-/// re-creates a destroyed row. `List` and `Text` are read-only through this
-/// path — writes go through the container field's generated accessors, which
-/// reach the live buffer instead of rebuilding the row.
+/// Covers the derive's `type_tag` vocabulary: the scalar primitives the engine
+/// can describe, whole fixed-size arrays, heap-backed containers (`List` and
+/// `Text`, summarized rather than materialized), handle and entity references,
+/// and an `Opaque` escape hatch for fields the engine can locate but not
+/// interpret (`struct:` tags whose value type is not resolvable, and any tag
+/// outside the vocabulary). `Opaque` carries the raw bytes so the UI can show
+/// them; no edit can introduce one, but a captured payload whose tag and size
+/// match the field's own descriptor writes back verbatim, which is how a
+/// restore re-creates a destroyed row. `List` and `Text` are read-only through
+/// this path — writes go through the container field's generated accessors,
+/// which reach the live buffer instead of rebuilding the row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     /// A 32-bit IEEE-754 floating point value.
@@ -127,7 +124,7 @@ pub enum FieldValue {
     /// Writable like a scalar. The pair is the *handle*, so it resolves only
     /// in the world that issued it; what a reference saved for a later run
     /// carries is the entity's [`EntityId`](crate::EntityId), which the writer
-    /// looks up and the loader resolves back to a handle (W-0048 Stage 7).
+    /// looks up and the loader resolves back to a handle.
     Entity {
         /// The referenced entity's slot id.
         id: u64,
@@ -893,14 +890,13 @@ impl World {
     /// A `struct:<path>` field whose type has a known layout - another
     /// component registered with one, or a `#[derive(PillMirror)]` value type -
     /// becomes one row per leaf, named `<field>.<leaf>` with the offsets
-    /// composed, so the editor's generic field API reads and writes a nested
-    /// colour or vector channel by channel. Resolution sees the layouts
-    /// registered so far, so the nested type registers first.
+    /// composed. Resolution sees the layouts registered so far, so the nested
+    /// type registers first.
     ///
-    /// The declared slice is kept beside the flattened view: a generated
-    /// mirror describes declarations, not leaf rows. The common case - nothing
-    /// to expand - borrows the caller's `'static` slice for both; only an
-    /// actual expansion copies into an owned editor layout.
+    /// The declared slice is kept beside the flattened view, because a
+    /// generated mirror describes declarations, not leaf rows. Nothing to
+    /// expand borrows the caller's `'static` slice for both; only an actual
+    /// expansion copies into an owned editor layout.
     pub(crate) fn record_component_field_layout(
         &mut self,
         component_id: ComponentId,
@@ -930,11 +926,11 @@ impl World {
     ///
     /// `prefix` is the dotted path of the struct being flattened ("" at the
     /// top level), `base_offset` is where that struct starts in the component
-    /// row, and `inherited` is the grouping decorators (W-0049: `Color`,
-    /// `Vector`) the enclosing struct fields declared - the editor's row model
-    /// groups leaves by them, so they have to reach the rows the leaves
-    /// produce. A struct cannot contain itself without a heap indirection, and
-    /// heap fields are not `struct:`-tagged, so the recursion terminates.
+    /// row, and `inherited` is the grouping decorators (`Color`, `Vector`) the
+    /// enclosing struct fields declared - the editor's row model groups leaves
+    /// by them, so they have to reach the rows the leaves produce. A struct
+    /// cannot contain itself without a heap indirection, and heap fields are
+    /// not `struct:`-tagged, so the recursion terminates.
     fn expand_fields_into(
         &self,
         fields: &[ComponentFieldDescriptor],
@@ -948,7 +944,7 @@ impl World {
             // An array of structs (`array:struct:<path>`) becomes one dotted
             // row per leaf per element - `points[0].x` - so the editor's generic
             // field API addresses a single control point the same way it
-            // addresses a plain float (W-0038 Stage 15). The element count is
+            // addresses a plain float. The element count is
             // the field's own; a cap keeps a huge array from flooding a layout.
             if let Some(path) = field.type_tag.strip_prefix("array:struct:") {
                 if let Some(nested) = self.resolve_nested_layout(path) {
@@ -1078,7 +1074,7 @@ impl World {
 }
 
 /// The grouping decorators a struct field declares, which its flattened leaves
-/// inherit (W-0049).
+/// inherit.
 ///
 /// `Color` and `Vector` describe the group of leaves a struct expands into, so
 /// they have to travel with the leaves. Every other decorator presents the
@@ -1305,9 +1301,9 @@ impl World {
     /// Resolves the component through the entity's own archetype, validates the
     /// value against the registered field layout, writes it through the column,
     /// and stamps that row's `ComponentTicks::changed` so `Changed<T>` systems
-    /// observe the edit on their next run. This is the difference from
-    /// `get_component_mut` (`world.rs:1224`), which does not stamp. Nothing is
-    /// written when any validation fails.
+    /// observe the edit on their next run. [`Self::get_component_mut`] hands out
+    /// the same column slot without that stamp. Nothing is written when any
+    /// validation fails.
     pub fn write_component_field(
         &mut self,
         entity: Entity,
@@ -1877,8 +1873,7 @@ mod tests {
 
     /// An `array:struct:` field expands into one dotted row per leaf per
     /// element, with the element stride composed from the array's own size, and
-    /// a single element's leaf reads and writes like any scalar field
-    /// (W-0038 Stage 15).
+    /// a single element's leaf reads and writes like any scalar field.
     #[test]
     fn struct_arrays_expand_into_editable_element_rows() {
         let mut world = World::new();

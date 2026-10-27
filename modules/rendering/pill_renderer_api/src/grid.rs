@@ -61,7 +61,7 @@ pub struct FrameGrid {
     pub surfaces: Vec<u32>,
 }
 
-/// Resolve the grid one frame draws from the camera bindings.
+/// Resolves the grid one frame draws from the camera bindings.
 ///
 /// A surface draws the grid when it is bound to a view camera and the grid
 /// is on. The result names every such surface - including the primary one,
@@ -97,11 +97,11 @@ fn view_bound_surfaces(bindings: &BTreeMap<u32, CameraBinding>) -> Vec<u32> {
 }
 
 /// The surfaces an editor's own viewports draw through: every surface bound
-/// to a view camera, whether or not the grid is on (W-0049).
+/// to a view camera, whether or not the grid is on.
 ///
 /// This is the same set [`frame_grid`] draws the grid on, named separately
-/// because the gizmo handles and the selection outlines need the answer even
-/// when the person turned the grid off.
+/// because the editor's gizmo handles and selection outlines need the answer
+/// even when the grid is off.
 pub fn editor_view_surfaces(cameras: &SurfaceCameras) -> Vec<u32> {
     view_bound_surfaces(&cameras.bindings)
 }

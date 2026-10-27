@@ -1,25 +1,21 @@
-//! The OS clipboard bridge (W-0038 Stage 17).
+//! The OS clipboard bridge.
 //!
 //! # Responsibilities
 //!
 //! - [`write`]: put one payload text on the clipboard under the editor's
 //!   registered format and as plain text, so another editor instance (or a
 //!   text editor) can read it.
-//! - [`read`]: the payload text the clipboard carries, preferring the
-//!   registered format and falling back to plain text.
+//! - [`read`]: the text the clipboard carries, preferring the editor's
+//!   payload format and falling back to plain text.
 //!
 //! # Design
 //!
 //! The Win32 half lives here because only this executable names the `windows`
-//! crate (AGENTS.md): a shared dylib must never carry its large `raw-dylib`
-//! import set. The shell queues a [`ClipboardRequest`] and this module carries
-//! it out at the frame boundary, so nothing about the OS clipboard crosses the
-//! reload boundary.
-//!
-//! Both sides open the clipboard for as short a time as possible - one
-//! `OpenClipboard`/`CloseClipboard` pair per call - because an open clipboard
-//! blocks every other process, including the other editor instance a paste is
-//! coming from.
+//! crate: a shared dylib must never carry its large `raw-dylib` import set.
+//! The shell queues a `ClipboardRequest` on its `EditorClipboard` resource and
+//! the runner carries it out here at the frame boundary, so no OS clipboard
+//! handle crosses the reload boundary. Both sides close the clipboard on every
+//! path, because an open clipboard blocks every other process.
 //!
 //! A read is bounded by the block the clipboard reports (`GlobalSize`), never
 //! by the producer's terminator: any process can set the registered format,
@@ -48,8 +44,8 @@ const CF_UNICODETEXT: u32 = 13;
 
 /// The clipboard format id the editor's payloads are registered under.
 ///
-/// Registering is idempotent per name and cheap, and the id is stable for the
-/// life of the process, so it is looked up once and then cached.
+/// Registering is idempotent per name, so every call returns the same id for
+/// the life of the process and nothing needs caching.
 fn payload_format() -> Option<u32> {
     let name: Vec<u16> = FORMAT_NAME
         .encode_utf16()
@@ -64,9 +60,9 @@ fn payload_format() -> Option<u32> {
 
 /// Put `text` on the clipboard, under the editor's format and as plain text.
 ///
-/// Returns an error naming the failed step; a failed write leaves whatever the
-/// clipboard held before in place, because the clipboard is only emptied after
-/// the first allocation succeeds.
+/// Returns an error naming the failed step; once the clipboard is open it is
+/// emptied before the first allocation, so a later failure leaves it empty
+/// rather than holding what it held before.
 pub fn write(text: &str) -> Result<(), String> {
     let format = payload_format().ok_or_else(|| "the payload format was refused".to_string())?;
     let owner = HWND::default();
@@ -87,8 +83,8 @@ fn write_open(text: &str, format: u32) -> Result<(), String> {
     // SAFETY: the clipboard is open (the caller holds it), which is the
     // documented precondition for emptying it.
     unsafe { EmptyClipboard() }.map_err(|error| format!("empty clipboard: {error}"))?;
-    // The registered format first: a reader that understands the payload keeps
-    // its structure, and one that does not falls back to the plain text below.
+    // The registered format first: a reader that understands it gets the
+    // structured payload, one that does not falls back to the plain text below.
     set_one(text, format)?;
     set_one(text, CF_UNICODETEXT)?;
     Ok(())
@@ -97,9 +93,8 @@ fn write_open(text: &str, format: u32) -> Result<(), String> {
 /// Put one UTF-16 copy of `text` on the clipboard under `format`.
 ///
 /// The memory is allocated with `GMEM_MOVEABLE` and handed to the clipboard,
-/// which takes ownership on success; a failed `SetClipboardData` leaves it
-/// ours, and it is freed by dropping the handle back through `GlobalFree` -
-/// leaked instead would be worse than the tiny allocation.
+/// which takes ownership on success; a failed `SetClipboardData` leaves the
+/// block ours, and it is freed with `GlobalFree`.
 fn set_one(text: &str, format: u32) -> Result<(), String> {
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     wide.push(0);
@@ -122,9 +117,8 @@ fn set_one(text: &str, format: u32) -> Result<(), String> {
     unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), target.cast::<u16>(), wide.len()) };
     // SAFETY: the lock was taken above on this handle and is released once.
     let _ = unsafe { GlobalUnlock(HGLOBAL(handle.0)) };
-    // SAFETY: the clipboard is open (the caller holds it) and `handle` is a
-    // moveable block this call no longer uses on success; the clipboard takes
-    // ownership of it.
+    // SAFETY: the clipboard is open (the caller holds it); on success it takes
+    // ownership of `handle`, so this call must not free it afterwards.
     match unsafe { SetClipboardData(format, windows::Win32::Foundation::HANDLE(handle.0)) } {
         Ok(_) => Ok(()),
         Err(error) => {
@@ -138,13 +132,13 @@ fn set_one(text: &str, format: u32) -> Result<(), String> {
 
 /// The text the clipboard carries, preferring the editor's payload format.
 ///
-/// `Ok(None)` means the clipboard held nothing usable; the caller reports it.
+/// `Ok(None)` means the clipboard held nothing usable; the runner reports it
+/// as an empty paste.
 ///
 /// The clipboard is a process-global lock, so `OpenClipboard` can fail simply
-/// because another application (or the suite's own helper) held it for the
-/// moment it was asked: the attempt is retried for a short while before the
-/// failure is reported, and a busy clipboard that never frees is still an
-/// error rather than an empty paste.
+/// because another application held it at that moment: the attempt is retried
+/// a few times before the failure is reported, and a clipboard that never
+/// frees is an error rather than an empty paste.
 pub fn read() -> Result<Option<String>, String> {
     let owner = HWND::default();
     let mut last = String::new();

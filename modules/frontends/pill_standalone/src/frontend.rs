@@ -8,10 +8,9 @@
 //!
 //! # Design
 //!
-//! Both live in the crate that owns the event loop. `FrontendError` used to
-//! live in `pill_core` and later in the host; neither owns a window, and
-//! `pill_core` is the shared dylib every module and hot patch imports, so
-//! keeping `winit` there taxed all of them for a type only this binary ever
+//! Both live in the crate that owns the event loop. `pill_core` is the shared
+//! dylib every module and hot patch imports, so a `winit` type there would make
+//! all of them link the windowing library for an error only this binary
 //! constructs. The runtime composes setup and renderer failures without the
 //! frontend arm (`pill_runtime::RenderingError`); [`RunError`] adds it.
 
@@ -27,8 +26,7 @@ use pill_core_macros::engine_error;
 
 /// Windowed-frontend failures produced by `winit`.
 ///
-/// Raised while creating the event loop or the native standalone window. The
-/// namespace is the one these codes have always had.
+/// Raised while creating the event loop or the native standalone window.
 #[cfg(feature = "rendering")]
 #[engine_error(namespace = host::frontend, runtime = ::pill_core::error)]
 pub enum FrontendError {

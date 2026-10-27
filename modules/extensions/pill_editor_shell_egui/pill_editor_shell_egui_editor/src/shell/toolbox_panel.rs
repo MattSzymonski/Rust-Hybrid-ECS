@@ -2,29 +2,28 @@
 //!
 //! # Responsibilities
 //!
-//! - `toolbox_overlay`: the gizmo's tools, space and snapping as one draggable panel per scene viewport, logging its rectangles once per placement.
+//! - `toolbox_overlay`: the gizmo's tools, space and snapping as one draggable
+//!   panel per scene viewport, with its rectangles logged once per placement.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths: a generated patch crate replays this
+//! file's top-level `use` lines, so a `super::`-relative glob would not
+//! resolve there.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The floating toolbox over one scene viewport (Stage 22): the gizmo's
-/// tools, its space and its snapping as one panel the user drags
-/// anywhere inside the view - the always-visible twin of the viewport
-/// menu's items.
+/// The floating toolbox over one scene viewport: the gizmo's tools, its space
+/// and its snapping as one panel that drags anywhere inside the view - the
+/// always-visible twin of the viewport menu's items.
 ///
-/// The panel floats over the scene's child window (the composition
-/// overlay paints above it), and its rectangle joins the frame's
-/// overlay regions, so a click anywhere on it - a row or the gap
-/// between rows - is the UI's and never becomes a scene pick. The drag
-/// starts on the handle and its result is clamped to the viewport, so
-/// the panel can be parked anywhere inside the view but not lost
-/// outside it. Both rectangles, the panel's and every row's, are
-/// logged once per placement and again after each drag: the suite's
-/// scripted clicks read their targets straight from the log.
+/// The panel floats over the scene's child window and its rectangle joins the
+/// frame's overlay regions, so a click anywhere on it - a row or the gap
+/// between rows - is the UI's and never becomes a scene pick. The drag starts
+/// on the handle and is clamped to the viewport, so the panel can be parked
+/// anywhere inside the view but not lost outside it. The panel's rectangle and
+/// every row's are logged once per placement and again after each drag, which
+/// is where the scripted suite reads its click targets.
 #[pill_hot_fn]
 pub fn toolbox_overlay(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: usize) {
     let viewport = ui.max_rect();

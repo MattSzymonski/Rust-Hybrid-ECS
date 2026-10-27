@@ -1,4 +1,4 @@
-//! Editor panels registered by a module (W-0038 Stage 11).
+//! Editor panels registered by a module.
 //!
 //! # Responsibilities
 //!
@@ -13,28 +13,26 @@
 //!
 //! # Design
 //!
-//! A world resource the frontend inserts and the shell reads each frame. A
+//! A world resource the executable inserts and the shell reads each frame. A
 //! panel's draw function is a plain `fn` pointer into the registering module's
-//! image, so it is only ever called while the liveness marker the module holds
-//! is still alive: `Arc::strong_count` is the answer to "is that image still
-//! mapped", and the registry refuses to hand out a draw function otherwise.
+//! image, handed out only while that source's marker is alive:
+//! `Arc::strong_count` answers "is that image still mapped".
 //!
 //! Registering is per id, not per crate: a module that reloads registers the
-//! same id again, which replaces the entry (new function, new marker, new
-//! epoch) and keeps the slot, so the user's dock layout survives the reload.
-//! A module that unloads and never returns leaves its entry in place with a
-//! dead marker - the tab says so rather than disappearing.
+//! same id again, which replaces the entry in place (new function, new marker,
+//! new epoch) and keeps the slot. A module that unloads and never returns
+//! leaves its entry with a dead marker - the tab says so rather than vanishing.
 
 use std::sync::{Arc, Weak};
 
 use pill_engine::{Entity, Resource};
 
-/// What a module holds to keep its panels alive.
+/// The liveness marker of one registration source.
 ///
-/// One marker per registration source: the registry stores a [`Weak`] to it,
-/// so the moment the module's image goes away the strong count reaches zero
-/// and every panel it registered is known to be dead. A unit struct on
-/// purpose - it carries no state, only a lifetime.
+/// The executable holds the one strong handle, per source, and drops it when
+/// that module unloads; the registry stores a [`Weak`] to it, so a strong
+/// count of zero is what marks every panel the source registered as dead. A
+/// unit struct on purpose - it carries no state, only a lifetime.
 #[derive(Debug, Default)]
 pub struct ModuleLiveness(());
 
@@ -59,9 +57,8 @@ pub enum PanelCommand {
     /// Make this entity the editor's selection.
     SelectEntity(Entity),
     /// Write one component field through the editor's recorded edit path, so
-    /// the change is one undo step (W-0038 Stages 12 and 13). The value is
-    /// text, parsed against the field's current value exactly as the
-    /// Inspector's own rows parse it.
+    /// the change is one undo step. The value is text, parsed against the
+    /// field's current value exactly as the Inspector's own rows parse it.
     SetField {
         /// The entity to edit.
         entity: Entity,
@@ -85,7 +82,7 @@ pub enum PanelCommand {
         /// The new element value, as the Inspector would have typed it.
         value: String,
     },
-    /// Ask the shell to show a window of this panel's (W-0038 Stage 13).
+    /// Ask the shell to show a window of this panel's.
     OpenWindow(PanelWindowRequest),
     /// Close one of this panel's windows.
     CloseWindow(String),
@@ -171,7 +168,7 @@ pub struct PanelContext<'a> {
     /// its own windows, `None` when it is drawing its docked tab.
     pub window: Option<&'a str>,
     /// A window id the editor asked this panel to open - the scripted channel's
-    /// stand-in for clicking the panel's own button (W-0038 Stage 13).
+    /// stand-in for clicking the panel's own button.
     pub requested_window: Option<&'a str>,
     /// The answer a modal window took, once: the panel acts on it and the
     /// shell forgets it.
@@ -198,7 +195,8 @@ pub struct PanelRegistration {
     pub id: String,
     /// The tab's title.
     pub title: String,
-    /// The crate that registered it, for the log and the failure text.
+    /// The crate that registered it: the log names it, and the panel's
+    /// windows are keyed by it.
     pub source: String,
     /// The function that draws the panel's body.
     pub draw: PanelDrawFn,

@@ -11,25 +11,17 @@
 //! **The module ABI is Rust-to-Rust by design.** The host owns the
 //! [`Engine`](crate::Engine) and hands each loaded artifact a pointer to it;
 //! the artifact casts `engine_handle` back to `&mut Engine` and calls the full
-//! typed API. There is no language-neutral plugin ABI here, and none is
-//! planned: a C or Zig module would need a function-pointer vocabulary for
-//! every engine operation, and the engine's surface is generic Rust
+//! typed API. A language-neutral ABI would need a function-pointer vocabulary
+//! for every engine operation, and the engine's surface is generic Rust
 //! (`register_component::<T>`, typed queries) that such a vocabulary cannot
 //! express without a parallel implementation of the whole API.
 //!
-//! An earlier design advertised one: a seven-function C table of which two
-//! entries were documented as unimplemented and the other five were never
-//! called by anything but their own tests. It was removed rather than
-//! completed, because what it cost was not the code but the reader's model -
-//! `EngineApi` looked like a contract to understand and was not one.
-//!
-//! A `#[repr(C)]` struct rather than a bare pointer is still the right shape:
-//! it is what crosses the DLL boundary, and it leaves room to add a field
-//! without changing every entry point's signature. Adding or removing a field
-//! changes a layout every module compiles against, so it is the same class of
-//! coordination as an interop-contract version bump - every module and project
-//! must be rebuilt in lockstep. In development that is automatic, because the
-//! host builds them all from source at startup.
+//! A `#[repr(C)]` struct rather than a bare pointer is what crosses the DLL
+//! boundary, and it leaves room to add a field without changing every entry
+//! point's signature. Adding or removing a field still changes a layout every
+//! module compiles against, so it forces a lockstep rebuild of every module
+//! and project - which development does automatically, since the host builds
+//! them all from source at startup.
 
 // Standard library
 use std::ffi::c_void;

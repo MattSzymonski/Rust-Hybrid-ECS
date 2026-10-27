@@ -2,28 +2,26 @@
 //!
 //! # Responsibilities
 //!
-//! - [`claim_context_once`]: the one decision both the production claim and
-//!   its tests make - whether this generation still has to clear egui's
+//! - [`claim_context_once`]: whether this generation still has to clear egui's
 //!   temporary data.
-//! - [`claim_shell_context`]: the per-generation wrapper around it, called at
-//!   the top of [`run_frame`](crate::shell::run_frame).
+//! - [`claim_shell_context`] and [`claim_popout_contexts`]: the per-generation
+//!   wrappers `run_frame` calls.
 //!
 //! # Design
 //!
 //! The egui `Context` belongs to the frontend, which never unloads, so it
 //! survives a shell reload. egui's `Memory::data` map can still hold values
 //! the previous generation created - a drag payload, a tooltip's state, a
-//! dock's scratch entry - and a value whose type was defined in that
-//! generation carries its drop code and vtable in the image the reload
-//! unmapped. Touching it after the reload is a use-after-unmap.
+//! dock's scratch entry - and a value whose type that generation defined
+//! carries its drop code and vtable in the image the reload unmapped, so
+//! touching it after the reload is a use-after-unmap.
 //!
-//! So the first frame of every generation clears the map and nothing else:
-//! the widget-local state in it (focus, scroll offsets, text-edit state) is
-//! not worth a dangling pointer, and resetting it on a reload is what a user
-//! sees as a fresh panel anyway. Long-lived UI state lives in
+//! The first frame of every generation therefore clears the map: widget-local
+//! state (focus, scroll offsets, text-edit state) is not worth a dangling
+//! pointer. Long-lived UI state lives in
 //! [`EguiShellState`](pill_editor_core::session::EguiShellState), a world
-//! resource defined by the shared model crate, which is what makes it safe to
-//! keep across generations.
+//! resource the shared model crate defines, which is what makes it safe across
+//! generations.
 //!
 //! The "already claimed" flag is a `static` of this crate, and a static lives
 //! in the module's own image: every generation starts unclaimed, and later
@@ -43,10 +41,9 @@ static CONTEXT_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Claim the shared `Context` for this shell generation.
 ///
-/// Returns whether the claim cleared anything, which is `true` once per
-/// generation and `false` on every later frame. `run_frame` calls it before
-/// the egui pass, so no stale value survives into the new generation's
-/// first draw.
+/// Returns whether this call performed the claim: `true` on a generation's
+/// first frame and `false` on every later one. `run_frame` calls it before the
+/// egui pass, so no stale value survives into the new generation's first draw.
 pub fn claim_shell_context(context: &egui::Context) -> bool {
     claim_context_once(&CONTEXT_CLAIMED, context)
 }
@@ -54,8 +51,7 @@ pub fn claim_shell_context(context: &egui::Context) -> bool {
 /// Whether this generation has cleared the popped-out windows' contexts.
 static POPOUTS_CLAIMED: AtomicBool = AtomicBool::new(false);
 
-/// Claim every popped-out tab's context for this shell generation (W-0038
-/// Stage 23).
+/// Claim every popped-out tab's context for this shell generation.
 ///
 /// A popped-out window runs its own context, and that context is exactly as
 /// long-lived as the main one - so the same rule applies to each of them. The
@@ -93,8 +89,8 @@ pub fn claim_popout_contexts(
 
 /// The once-per-generation rule, with its flag passed in.
 ///
-/// Split out so a test can run the rule against its own flag: two tests
-/// sharing one process-wide static would make each other's expectations
+/// The flag is a parameter so a test can run the rule against its own: two
+/// tests sharing one process-wide static would make each other's expectations
 /// depend on the test order.
 pub fn claim_context_once(claimed: &AtomicBool, context: &egui::Context) -> bool {
     if claimed.swap(true, Ordering::AcqRel) {
@@ -181,8 +177,8 @@ mod tests {
         assert_eq!(kept.label, "from the new image");
     }
 
-    /// The claim counts what it dropped, so the log line can say whether a
-    /// reload actually had anything stale to clear.
+    /// A fresh context holds nothing to clear, and the claim still marks the
+    /// generation.
     #[test]
     fn the_claim_reports_how_many_values_it_cleared() {
         let context = egui::Context::default();
