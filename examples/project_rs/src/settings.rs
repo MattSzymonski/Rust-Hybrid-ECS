@@ -3,10 +3,8 @@
 //! # Responsibilities
 //!
 //! - Hold every tuning constant the project's systems read: the physics step,
-//!   gravity, bounce speeds and restitution, and the scene's floor and wall
-//!   extents.
-
-use pill_engine::common_components::Color;
+//!   gravity, bounce speeds and restitution, the scene's floor and wall
+//!   extents, and the two tints the materials take.
 
 /// The step a fresh [`PhysicsState`](crate::PhysicsState) starts with, in
 /// seconds; the per-frame system replaces it with the frame's real delta.
@@ -50,11 +48,11 @@ pub const SPLINE_SAMPLE_COUNT: usize = 21;
 /// Edge length of a sample dot, in pixels.
 pub const SPLINE_SAMPLE_DOT_SIZE: f32 = 6.0;
 
-/// Fill colour of the ball meshes.
-pub const BALL_COLOR: Color = Color::new(1.0, 0.3, 0.3, 1.0);
+/// Fill colour of the ball meshes, as the material parameter's linear RGB.
+pub const BALL_COLOR: [f32; 3] = [1.0, 0.3, 0.3];
 
-/// Fill colour of the sample dots.
-pub const SAMPLE_DOT_COLOR: Color = Color::new(0.25, 0.85, 1.0, 1.0);
+/// Fill colour of the sample dots, as the material parameter's linear RGB.
+pub const SAMPLE_DOT_COLOR: [f32; 3] = [0.25, 0.85, 1.0];
 
 /// How much of the distance to its target the camera closes each frame.
 ///

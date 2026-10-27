@@ -43,14 +43,16 @@ impl AudioLoadQueue {
 mod tests {
     use super::*;
     use crate::{audio_system, AudioListenerComponent, AudioSourceComponent, Sound};
-    use pill_engine::{AssetManager, Engine, Position};
+    use pill_engine::{AssetManager, Engine, TransformComponent};
 
     /// Queued bytes reach the asset store as [`Sound`] assets even with no
     /// audio device installed, which is the headless case.
     #[test]
     fn playback_system_consumes_requests_without_an_audio_device() {
         let mut engine = Engine::new();
-        engine.world_mut().register_component::<Position>();
+        engine
+            .world_mut()
+            .register_component::<TransformComponent>();
         engine
             .world_mut()
             .register_component::<AudioListenerComponent>();

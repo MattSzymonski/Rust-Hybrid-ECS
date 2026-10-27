@@ -215,7 +215,7 @@ pub use abi::publish_mirror_methods;
 /// Integration-style unit tests for the native/C# ECS boundary.
 ///
 /// The fixtures are the shared-ABI components the managed side mirrors
-/// (`Position`, `MeshRendererComponent`, `Color`). They come from `pill_engine`
+/// (`TransformComponent`, `MeshRendererComponent`). They come from `pill_engine`
 /// and the renderer data crate (a dev-dependency), so these run in every
 /// build, headless included.
 #[cfg(test)]

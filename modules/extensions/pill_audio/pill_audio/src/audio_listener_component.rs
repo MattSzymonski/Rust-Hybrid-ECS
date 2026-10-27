@@ -7,9 +7,9 @@
 //!
 //! # Design
 //!
-//! Carries its own `facing_degrees` rather than reading a rotation component,
-//! because this engine's `Position` is 2D and has no orientation. When a 3D
-//! transform arrives, this field is what it replaces.
+//! Carries its own `facing_degrees` rather than reading the transform's
+//! rotation, because the rotation is a quaternion and panning needs one yaw
+//! angle; this field is the listener's own.
 
 // External crates
 use pill_engine::PillComponent;
@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 /// Marks the entity whose position the listener hears from.
 ///
 /// The first enabled listener found wins; there is one pair of ears. An
-/// entity also needs a [`Position`] for the listener to have a location.
+/// entity also needs a [`TransformComponent`](pill_engine::TransformComponent)
+/// for the listener to have a location.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
 #[pill(persistable, shared)]
@@ -31,8 +32,8 @@ pub struct AudioListenerComponent {
     pub enabled: bool,
     /// Direction the listener faces, in degrees counter-clockwise from +X.
     ///
-    /// This engine's `Position` is 2D and carries no orientation, so a
-    /// listener that can turn needs to say so itself.
+    /// The transform's rotation is a quaternion and panning needs a single
+    /// yaw, so a listener that can turn says so itself.
     pub facing_degrees: f32,
 }
 

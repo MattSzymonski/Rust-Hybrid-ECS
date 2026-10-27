@@ -8,8 +8,9 @@
 //! # Design
 //!
 //! A free function rather than part of the system, so the geometry is testable
-//! without an audio device and a 3D transform changes one place. The world is
-//! 2D, so both points are lifted onto z = 0.
+//! without an audio device and a 3D transform changes one place. The listener's
+//! facing is a yaw in the scene's XY plane, so the ears straddle it there and
+//! keep the listener's own height.
 
 // Current crate
 use crate::audio_manager::EAR_SEPARATION;
@@ -20,22 +21,22 @@ use crate::audio_manager::EAR_SEPARATION;
 
 /// Where a listener's ears sit, given where it stands and which way it faces.
 ///
-/// Returns `(left, right)` in the 3D space rodio expects, with the world's 2D
-/// plane laid on z = 0.
-pub fn ear_positions(position: (f32, f32), facing_degrees: f32) -> ([f32; 3], [f32; 3]) {
+/// `translation` is the listener's world position; the returned `(left, right)`
+/// points are what rodio pans against, both at the listener's own height.
+pub fn ear_positions(translation: [f32; 3], facing_degrees: f32) -> ([f32; 3], [f32; 3]) {
     let facing = facing_degrees.to_radians();
     // Ears sit on the axis perpendicular to `facing`: rotating the facing
     // vector by a quarter turn gives the left ear's direction.
     let (sin, cos) = facing.sin_cos();
     let left = [
-        position.0 - sin * EAR_SEPARATION,
-        position.1 + cos * EAR_SEPARATION,
-        0.0,
+        translation[0] - sin * EAR_SEPARATION,
+        translation[1] + cos * EAR_SEPARATION,
+        translation[2],
     ];
     let right = [
-        position.0 + sin * EAR_SEPARATION,
-        position.1 - cos * EAR_SEPARATION,
-        0.0,
+        translation[0] + sin * EAR_SEPARATION,
+        translation[1] - cos * EAR_SEPARATION,
+        translation[2],
     ];
     (left, right)
 }
@@ -56,7 +57,7 @@ mod tests {
     /// convention every other angle is measured against.
     #[test]
     fn ears_straddle_the_facing_direction() {
-        let (left, right) = ear_positions((0.0, 0.0), 0.0);
+        let (left, right) = ear_positions([0.0, 0.0, 0.0], 0.0);
         assert!((left[0] - 0.0).abs() < EPSILON);
         assert!((left[1] - EAR_SEPARATION).abs() < EPSILON);
         assert!((right[0] - 0.0).abs() < EPSILON);
@@ -66,21 +67,29 @@ mod tests {
     /// A quarter turn swaps which world axis the ears lie on.
     #[test]
     fn turning_the_listener_rotates_its_ears() {
-        let (left, right) = ear_positions((0.0, 0.0), 90.0);
+        let (left, right) = ear_positions([0.0, 0.0, 0.0], 90.0);
         assert!((left[0] + EAR_SEPARATION).abs() < EPSILON);
         assert!((left[1] - 0.0).abs() < EPSILON);
         assert!((right[0] - EAR_SEPARATION).abs() < EPSILON);
         assert!((right[1] - 0.0).abs() < EPSILON);
     }
 
-    /// Ears are placed relative to where the listener stands.
+    /// Ears are placed relative to where the listener stands, at its height.
     #[test]
     fn ears_follow_the_listener_position() {
-        let (left, right) = ear_positions((10.0, -5.0), 0.0);
+        let (left, right) = ear_positions([10.0, -5.0, 2.5], 0.0);
         assert!((left[0] - 10.0).abs() < EPSILON);
         assert!((left[1] - (-5.0 + EAR_SEPARATION)).abs() < EPSILON);
         assert!((right[0] - 10.0).abs() < EPSILON);
         assert!((right[1] - (-5.0 - EAR_SEPARATION)).abs() < EPSILON);
+        assert!(
+            (left[2] - 2.5).abs() < EPSILON,
+            "the left ear keeps the height"
+        );
+        assert!(
+            (right[2] - 2.5).abs() < EPSILON,
+            "the right ear keeps the height"
+        );
     }
 
     /// The ears stay one separation either side of the listener at any angle,
@@ -88,7 +97,7 @@ mod tests {
     #[test]
     fn ear_separation_is_preserved_under_rotation() {
         for degrees in [0.0, 37.0, 90.0, 180.0, 271.5] {
-            let (left, right) = ear_positions((3.0, 4.0), degrees);
+            let (left, right) = ear_positions([3.0, 4.0, 0.0], degrees);
             let span = ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2)).sqrt();
             assert!(
                 (span - 2.0 * EAR_SEPARATION).abs() < EPSILON,

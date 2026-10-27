@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn a_subject_is_stale_only_while_its_registered_layout_is_replaced() {
         let mut world = World::new();
-        pill_engine::register_common_components(&mut world);
+        pill_engine::register_transform_component(&mut world);
         let name = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
 
         let current = registered_schemas(&world, std::slice::from_ref(&name));

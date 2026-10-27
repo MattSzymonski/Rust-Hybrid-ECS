@@ -8,7 +8,6 @@
 using System.Runtime.InteropServices;
 
 // The renderer's components the docs below refer to, generated from Rust.
-using pill_engine.common_components;
 using pill_master_renderer.component;
 
 namespace TracyLive;
@@ -46,9 +45,9 @@ public struct PhysicsState
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 /// </summary>
 /// <remarks>
-/// The dot carries the usual <see cref="Position"/> and <see cref="MeshRendererComponent"/>, so
-/// it renders like any other mesh, and the sample system moves it along the
-/// curve as the balls move.
+/// The dot carries a <see cref="TransformComponent"/> and a
+/// <see cref="MeshRendererComponent"/>, so it renders like any other mesh, and
+/// the sample system moves it along the curve as the balls move.
 /// </remarks>
 [StructLayout(LayoutKind.Sequential)]
 public struct SplineSample

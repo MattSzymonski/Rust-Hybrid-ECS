@@ -12,8 +12,8 @@
 //!
 //! # Design
 //!
-//! The shared components (`Position`, `Color`, `MeshRendererComponent` and the
-//! rest) resolve to the Rust types the host links in every posture, so a
+//! The shared components (`TransformComponent`, `MeshRendererComponent` and
+//! the rest) resolve to the Rust types the host links in every posture, so a
 //! headless host binds them exactly as a windowed one does. Every managed
 //! component is addressed by a [`StableComponentId`] hashed from its canonical
 //! full name; [`ComponentBinding`] records whether storage is a concrete Rust

@@ -37,15 +37,13 @@ pub mod sprite;
 
 // The renderer's public surface, so callers name `pill_2d_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
-// `Position` and `Color` are the engine's - every renderer and most
-// projects want the same two, so they are defined once in `pill_engine`
-// rather than copied into each pipeline - and re-exporting them here keeps
-// `register_components` reading as one contract.
+// `Position` and `Color` belong to the pipeline, not to the engine: a sprite's
+// pixel placement and fill are this renderer's own contract, and re-exporting
+// them here keeps `register_components` reading as one call.
 pub use component::{
-    register_components, sprite_instances, RenderViewport, Sprite, SpriteInstance,
+    register_components, sprite_instances, Color, Position, RenderViewport, Sprite, SpriteInstance,
     VirtualResolution,
 };
 pub use error::RendererError;
-pub use pill_engine::common_components::{Color, Position};
 pub use renderer::{Renderer, RendererWindow};
 pub use sprite::SpriteRenderer;

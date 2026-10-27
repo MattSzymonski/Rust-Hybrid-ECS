@@ -30,10 +30,9 @@ use pill_core::error;
 use pill_core::math::Vector3f;
 use pill_core::platform::Instant;
 use pill_engine::*;
-// `Position` is the engine's: it is universal, so a project
-// names them without reaching through whichever renderer happens to draw them.
-// `MeshRendererComponent` is the renderer's own idea of a thing to draw.
-use pill_engine::common_components::Position;
+// `TransformComponent` is the shared placement row, registered by the renderer
+// data crate this project depends on; `MeshRendererComponent` is that
+// renderer's own idea of a thing to draw.
 use pill_master_renderer_data::{
     CameraComponent, DirectionalLightComponent, Material, Mesh, MeshRendererComponent,
     TransformComponent,
@@ -98,10 +97,10 @@ pub struct PhysicsState {
 
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 ///
-/// The dot carries the usual [`Position`] and [`MeshRendererComponent`], so it renders like
-/// any other mesh, and `spline_path_system` moves it along the curve as the
-/// balls move. The host serializes this component across hot-reload
-/// generations, so the layout is pinned with `#[repr(C)]`.
+/// The dot carries a [`TransformComponent`] and a [`MeshRendererComponent`], so
+/// it renders like any other mesh, and `spline_path_system` moves it along the
+/// curve as the balls move. The host serializes this component across
+/// hot-reload generations, so the layout is pinned with `#[repr(C)]`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PillComponent)]
 #[pill(persistable)]
@@ -165,15 +164,11 @@ pub fn init(engine: &mut Engine) -> u32 {
         let ball_materials: [Handle<Material>; BALL_COUNT] = std::array::from_fn(|index| {
             material(
                 &format!("project.ball.{index}"),
-                [BALL_COLOR.r, BALL_COLOR.g, BALL_COLOR.b],
+                BALL_COLOR,
                 index as f32 / BALL_COUNT as f32,
             )
         });
-        let sample_material = material(
-            "project.spline",
-            [SAMPLE_DOT_COLOR.r, SAMPLE_DOT_COLOR.g, SAMPLE_DOT_COLOR.b],
-            0.2,
-        );
+        let sample_material = material("project.spline", SAMPLE_DOT_COLOR, 0.2);
         (mesh, scene_material, ball_materials, sample_material)
     };
     let has_camera = Query::<&CameraComponent>::new(engine.world_mut())
@@ -308,10 +303,6 @@ pub fn init(engine: &mut Engine) -> u32 {
             .world_mut()
             .create_entity()
             .with(physics)
-            .with(Position {
-                x: physics.position_x - physics.radius,
-                y: physics.position_y - physics.radius,
-            })
             .with(TransformComponent {
                 translation: [
                     (physics.position_x - 400.0) / 80.0,
@@ -402,10 +393,6 @@ pub fn init(engine: &mut Engine) -> u32 {
             .world_mut()
             .create_entity()
             .with(SplineSample { t })
-            .with(Position {
-                x: location.x - SPLINE_SAMPLE_DOT_SIZE * 0.5,
-                y: location.y - SPLINE_SAMPLE_DOT_SIZE * 0.5,
-            })
             .with(TransformComponent {
                 translation: [
                     (location.x - 400.0) / 80.0,

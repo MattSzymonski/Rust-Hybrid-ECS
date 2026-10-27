@@ -88,42 +88,6 @@ public partial struct MeshRendererComponent
 
 }
 
-namespace pill_engine.common_components {
-
-using pill_master_renderer.component;
-
-[StructLayout(LayoutKind.Explicit, Size = 8)]
-public partial struct Position
-{
-    [FieldOffset(0)] public float X;
-    [FieldOffset(4)] public float Y;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
-
-
-}
-
-namespace pill_engine.common_components {
-
-using pill_master_renderer.component;
-
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-public partial struct Color
-{
-    [FieldOffset(0)] public float R;
-    [FieldOffset(4)] public float G;
-    [FieldOffset(8)] public float B;
-    [FieldOffset(12)] public float A;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
-
-
-}
-
 namespace pill_master_renderer.component {
 
 [StructLayout(LayoutKind.Explicit, Size = 40)]
