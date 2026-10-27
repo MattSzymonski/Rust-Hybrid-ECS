@@ -7,51 +7,26 @@
 //!
 //! # Design
 //!
-//! A component or any other value the engine copies between artifacts must be
-//! plain data: `#[repr(C)]`, no pointers, no owned allocation. A `String`
-//! breaks that twice over. Its buffer belongs to the allocator of whichever
-//! DLL created it, so a hot reload can leave one library freeing memory
-//! another allocated; and a struct holding one has no meaningful C layout, so
-//! it cannot be mirrored into C# or read across the module boundary.
+//! A value the engine copies between artifacts must be plain data:
+//! `#[repr(C)]`, no pointers, no owned allocation. A `String` breaks that
+//! twice: its buffer belongs to the allocator of whichever DLL created it, so
+//! a hot reload can leave one library freeing memory another allocated, and a
+//! struct holding one has no meaningful C layout, so it cannot be mirrored
+//! into C# or read across the module boundary. Inlining the bytes makes the
+//! value `Copy`, stably laid out, and memcpy-able between archetypes like a
+//! `u32` field; the cost is the length ceiling the type's name states.
 //!
-//! The answer is to inline the bytes. The value is `Copy`, has a stable
-//! `#[repr(C)]` layout, and can be memcpy'd between archetypes exactly as a
-//! `u32` field is. The cost is a ceiling on length, which is why the capacity
-//! is in the type's name rather than hidden: a caller sees what it is choosing.
-//!
-//! ## Truncation rather than refusal
-//!
-//! [`FixedString64::new`] truncates a longer string instead of failing. A name
-//! that does not fit is a content problem, not a reason to stop the frame, and
-//! every call site would otherwise grow an error path it could not usefully
-//! handle. Truncation always lands on a character boundary, so the result is
-//! valid UTF-8 even when the input is cut mid-character - that is what lets
-//! [`FixedString64::as_str`] be infallible.
-//!
-//! ## Serialization
-//!
-//! Serialized as the string it holds, not as its backing array, through
-//! `#[serde(into/from)]`. Two reasons: `serde` implements its traits for
-//! arrays only up to 32 elements, and a snapshot that says `"footstep"` rather
-//! than 64 comma-separated bytes is one a person can read. The padding after
-//! the live bytes carries no meaning and is not worth persisting.
-//!
-//! ## Usage
+//! [`FixedString64::new`] truncates rather than failing, always on a character
+//! boundary, which is what lets [`FixedString64::as_str`] be infallible, and a
+//! longer string from a build with a larger capacity still loads. Serde sees
+//! the string, not the backing array: `serde` implements its traits only up to
+//! 32-element arrays, and `"footstep"` is what a person can read in a snapshot.
 //!
 //! ```
 //! use pill_core::FixedString64;
 //!
 //! let name = FixedString64::new("footstep");
 //! assert_eq!(name.as_str(), "footstep");
-//! assert!(!name.is_empty());
-//!
-//! // Fits in a plain-data struct with no allocation anywhere.
-//! #[repr(C)]
-//! #[derive(Clone, Copy)]
-//! struct AudioSource {
-//!     volume: f32,
-//!     sound: FixedString64,
-//! }
 //! ```
 
 // External crates
@@ -64,8 +39,7 @@ use serde::{Deserialize, Serialize};
 /// Capacity of a [`FixedString64`], in bytes.
 ///
 /// Bytes, not characters: a multi-byte character consumes several. 64 is long
-/// enough for an asset name or a short path and keeps the struct one cache
-/// line with room for a length.
+/// enough for an asset name or a short path and keeps the value cheap to copy.
 pub const FIXED_STRING_64_CAPACITY: usize = 64;
 
 /// A UTF-8 string of up to [`FIXED_STRING_64_CAPACITY`] bytes, stored inline.

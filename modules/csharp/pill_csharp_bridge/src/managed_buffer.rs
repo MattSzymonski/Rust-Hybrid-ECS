@@ -13,22 +13,15 @@
 //! Managed code cannot hand the host an owned buffer, so every payload crosses
 //! in two calls: one reports how many bytes there are, the host allocates, and
 //! the second fills what the host allocated. That protocol is a property of the
-//! boundary rather than of any one payload, so it lives here once and each
-//! caller supplies only what differs - the pair of exported functions and the
-//! upper bound that payload kind accepts.
+//! boundary rather than of any one payload, so each caller supplies only the
+//! pair of exported functions and the upper bound its kind accepts.
 //!
-//! Two things the protocol gets right are easy to get wrong when written out by
-//! hand, which is why they are here and not at the call sites. The length is
-//! checked against a bound **before** anything is allocated, so a corrupt
-//! length is a reported error rather than a multi-gigabyte request. And the
-//! reservation is fallible: `Vec::try_reserve_exact` returns an error where
-//! `vec![0; n]` aborts the process, and aborting is not an acceptable answer to
-//! a number that came from outside.
-//!
-//! Failure is returned rather than reported, because the callers disagree about
-//! what a failure means - one fails a reload with a typed error, one logs and
-//! keeps the manifest it already applied, one falls back to a neutral string -
-//! and that disagreement is legitimate.
+//! The length is checked against a bound **before** anything is allocated, so a
+//! corrupt length is a reported error rather than a multi-gigabyte request, and
+//! the reservation is fallible: `Vec::try_reserve_exact` returns an error where
+//! `vec![0; n]` aborts the process. Failure is returned rather than reported
+//! because the callers disagree about what it means - a typed reload error, a
+//! logged refusal, a neutral string - and that disagreement is legitimate.
 
 // External crates
 use pill_core::error::CSharpError;
@@ -163,9 +156,8 @@ mod tests {
 
     /// A length above the bound is refused before anything is allocated.
     ///
-    /// This is the protection the hand-written copies applied at only some of
-    /// the call sites: an unbounded length reaches `Vec` as an allocation
-    /// request, and an allocation request that large aborts the host.
+    /// An unbounded length would reach `Vec` as an allocation request, and an
+    /// allocation request that large aborts the host.
     #[test]
     fn an_oversized_length_is_refused_without_allocating() {
         let error = fetch_managed_buffer(

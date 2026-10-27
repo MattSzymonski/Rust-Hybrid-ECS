@@ -1,11 +1,11 @@
-//! Host-facing renderer contract retained by `pill_host`.
+//! The renderer contract a frontend drives once per frame.
 //!
 //! # Responsibilities
 //!
-//! - Define [`PillRenderer`], the trait a frontend drives once per frame:
-//!   resize, viewport, frame submission, and asset invalidation.
+//! - Define [`PillRenderer`], the trait a frontend drives: resize, viewport,
+//!   frame submission, surfaces, and asset invalidation.
 //! - Report each frame's result and cost through [`FrameOutcome`],
-//!   [`RenderCapabilities`], and [`RenderMetrics`], so frontends can display
+//!   [`RenderCapabilities`] and [`RenderMetrics`], so frontends can display
 //!   statistics without knowing which backend produced them.
 //! - Name the future a renderer is built through ([`AttachFuture`]), so a
 //!   frontend can await it where it cannot block - in a browser.
@@ -14,12 +14,10 @@
 //!
 //! # Design
 //!
-//! The host stores its renderer as a `Box<dyn PillRenderer>`, so this module
-//! keeps to the values that cross that boundary - [`RenderFrame`],
-//! [`AssetManager`], [`RenderViewport`], and [`RendererError`] - and stays free
-//! of wgpu types. A windowed build implements the trait on its wgpu `Renderer`;
-//! a headless build holds [`HeadlessRenderer`] instead, and the frame loop
-//! cannot tell the difference.
+//! The host holds the renderer as a `Box<dyn PillRenderer>`, so this module
+//! stays free of wgpu types: a windowed build implements the trait on its wgpu
+//! `Renderer`, a headless one swaps in [`HeadlessRenderer`], and the frame
+//! loop cannot tell the difference.
 
 // Standard library
 use std::future::Future;
@@ -51,18 +49,17 @@ pub enum FrameOutcome {
 /// resources - render targets, uploads - do not have to assume desktop
 /// maxima. A renderer with no GPU behind it reports the zero defaults.
 ///
-/// Not `Copy`: `consumed_components` is an owned list. It is owned rather than
-/// `&'static` on purpose - a renderer loaded as a module builds it inside its
-/// own image, and a static slice would point into that image after a reload
-/// unmaps it.
+/// Not `Copy`: `consumed_components` is an owned list, not a `&'static` slice.
+/// A renderer loaded as a module builds it inside its own image, so a static
+/// slice would point into that image after a reload unmaps it.
 #[derive(Debug, Clone, Default)]
 pub struct RenderCapabilities {
     /// Largest supported 2D texture dimension, in texels.
     pub max_texture_size: u32,
     /// Largest single GPU buffer the device accepts, in bytes.
     pub max_buffer_bytes: u64,
-    /// Whether the surface presents high-dynamic-range output. No backend
-    /// reports `true` yet.
+    /// Whether the surface presents high-dynamic-range output. No renderer
+    /// reports `true`.
     pub hdr: bool,
     /// Shared names of the components this renderer reads to build a frame.
     ///
@@ -76,12 +73,13 @@ pub struct RenderCapabilities {
 /// Frame statistics from the most recent [`PillRenderer::render`] call.
 ///
 /// The windowed renderer fills these in as it works, and the host reads them
-/// to report frame diagnostics; a renderer that has not drawn yet leaves
+/// to log the first presented frame; a renderer that has not drawn leaves
 /// every field at zero.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderMetrics {
     /// CPU time spent preparing the frame: syncing assets, rebuilding the
-    /// chain's objects if they moved, and building and sorting the draw queue.
+    /// chain's objects if they moved, and building the draw queue, the
+    /// instance buffer and its upload.
     pub prepare_micros: u64,
     /// CPU time spent submitting the recorded work to the GPU.
     pub submit_micros: u64,
@@ -137,8 +135,7 @@ pub trait PillRenderer {
 
     /// Restricts drawing to a sub-region of the surface.
     ///
-    /// `None` restores full-surface rendering. Embedded frontends use this to
-    /// keep drawing out of the UI regions they overlay.
+    /// `None` restores full-surface rendering.
     fn set_viewport(&mut self, viewport: Option<RenderViewport>);
 
     /// Draws one resolved frame from `assets` and presents it.
@@ -147,17 +144,16 @@ pub trait PillRenderer {
     /// minimized surface or a frame without a camera - which is a normal
     /// outcome, not an error.
     ///
-    /// The store is read rather than copied into the frame: the renderer diffs
-    /// it against what it last uploaded, so only the assets that moved are
-    /// rebuilt, and a frame never carries a duplicate of the project's asset
-    /// data. The borrow lasts the call, so nothing can change under it.
+    /// The store is read, not copied: the renderer diffs it against what it
+    /// last uploaded, and the borrow lasts the call.
     ///
     /// # Errors
     ///
     /// Fails with [`RendererError`] when the GPU work itself fails: a lost or
-    /// out-of-memory surface, a camera handle with no camera behind it, or a
-    /// command buffer wgpu refuses at submission. An asset that will not build
-    /// is not an error - it is reported per pass and skipped.
+    /// out-of-memory surface, a renderer resource the call referenced that is
+    /// not in storage, or a command buffer wgpu refuses at submission. An
+    /// asset that will not build is not an error - it is reported per pass and
+    /// skipped.
     fn render(
         &mut self,
         frame: &RenderFrame,
@@ -172,12 +168,9 @@ pub trait PillRenderer {
     fn invalidate_assets(&mut self);
 
     /// Starts drawing into another surface: a second window or canvas, sized
-    /// `width` by `height` physical pixels.
-    ///
-    /// Every surface shares the renderer's device and caches; each draws
-    /// through the camera the frame resolved for it
-    /// ([`RenderFrame::surface_views`]) and is drawn by [`Self::render`] after
-    /// the primary one. Attaching an id already attached replaces it.
+    /// `width` by `height` physical pixels, drawn after the primary one through
+    /// the camera the frame resolved for it ([`RenderFrame::surface_views`]).
+    /// Attaching an id already attached replaces it.
     ///
     /// The default refuses: a renderer that draws one surface only.
     ///
@@ -217,7 +210,8 @@ pub trait PillRenderer {
     /// nothing.
     fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
 
-    /// Whether a surface may present on the next [`Self::render`].
+    /// Tells the renderer whether `id` may present on the next
+    /// [`Self::render`].
     ///
     /// The frontend paces surfaces the window system paces itself - a Wayland
     /// subsurface, by its frame callbacks - and a surface that may not present
@@ -225,7 +219,8 @@ pub trait PillRenderer {
     /// applies to the primary surface too.
     fn set_surface_ready(&mut self, _id: SurfaceId, _ready: bool) {}
 
-    /// Take the answers to every pick the GPU has finished since the last call.
+    /// Takes the answers to every pick the GPU has finished since the last
+    /// call.
     ///
     /// A pick is answered frames after it was asked, never by stalling the
     /// frame that asked; the frontend writes what this returns into the
@@ -235,12 +230,12 @@ pub trait PillRenderer {
         Vec::new()
     }
 
-    /// Take every preview the GPU has finished since the last call.
+    /// Takes every preview the GPU has finished since the last call.
     ///
     /// A preview is read back frames after it was asked, like a pick, and the
     /// frontend writes what this returns into the world's
     /// [`crate::PreviewResults`]. The default answers nothing: a renderer
-    /// without an off-screen preview target (W-0049 Stage 11).
+    /// without an off-screen preview target.
     fn take_preview_results(&mut self) -> Vec<crate::PreviewImage> {
         Vec::new()
     }

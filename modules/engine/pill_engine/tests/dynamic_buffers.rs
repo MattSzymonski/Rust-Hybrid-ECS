@@ -27,7 +27,7 @@ struct Trail {
     weight: u32,
 }
 
-/// A second component used to force an archetype move.
+/// A second component that forces an archetype move.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PillComponent)]
 #[pill(persistable)]
 struct Marker {

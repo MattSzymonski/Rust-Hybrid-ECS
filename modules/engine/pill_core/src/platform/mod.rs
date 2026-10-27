@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Provide a monotonic clock ([`Instant`]) and the wall-clock time that work
-//!   on native and on the web.
+//! - Provide the monotonic clock ([`Instant`]) and the wall-clock time on
+//!   native and on the web.
 //! - Provide the log outputs: terminal and file on native, the browser
 //!   console on the web.
 //! - Provide the way to run a future: block on native, spawn on the web.

@@ -1,6 +1,5 @@
-//! The scripted channel the editor postures share (W-0004 Stage 30,
-//! W-0029): the page's one entry point for driving the editor without
-//! input events.
+//! The scripted channel: the page's one entry point for driving the editor
+//! without input events.
 //!
 //! # Responsibilities
 //!
@@ -11,10 +10,9 @@
 //!
 //! # Design
 //!
-//! One queue for both editor postures: a build links exactly one runner, so
-//! there is never a second consumer, and the page keeps a single
-//! `editor_command` export whatever the build's frontend. Single-threaded
-//! like every wasm module.
+//! One queue: an editor build links exactly one runner, so there is never a
+//! second consumer, and the page keeps a single `editor_command` export.
+//! Single-threaded like every wasm module.
 
 // Standard library
 use std::cell::RefCell;

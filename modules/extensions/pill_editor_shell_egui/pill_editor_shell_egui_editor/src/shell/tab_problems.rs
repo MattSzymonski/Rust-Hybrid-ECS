@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Draw one row per diagnostic the executable collected from a module build
-//!   or a patch, grouped under the module that reported it (W-0038 Stage 6).
+//!   or a patch, grouped under the module that reported it.
 //! - Turn a row click into an open request for the executable, which knows the
 //!   `code_editor_command` preference and may spawn a process.
 //!
@@ -17,14 +17,14 @@
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 
-/// The Problems tab: the diagnostics grouped by module, newest module first.
+/// The Problems tab: the diagnostics grouped by the module that reported them.
 pub fn problems_tab(ui: &mut egui::Ui, snapshot: &EditorSnapshot, request: &mut Option<usize>) {
     if snapshot.problems.is_empty() {
         ui.weak("No problems");
         return;
     }
-    // The groups keep the order the executable reported them in: a module
-    // that just failed sits where its build finished.
+    // Groups keep the order the executable reported the rows in; a module
+    // that fails again has its old rows dropped and its new ones appended.
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     for (index, row) in snapshot.problems.iter().enumerate() {
         match groups.iter_mut().find(|(module, _)| *module == row.module) {

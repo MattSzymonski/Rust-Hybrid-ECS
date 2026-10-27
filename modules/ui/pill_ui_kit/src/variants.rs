@@ -11,9 +11,8 @@
 //!
 //! A variant mutates the `Ui` it is given and nothing else, so
 //! `ui.scope(|ui| { variants::danger(ui, &theme); ... })` restores the theme's
-//! look when the block ends. `Button::fill` would freeze every state
-//! (`research §6`); changing the scoped `Style` keeps hover and press
-//! behaviour.
+//! look when the block ends. `Button::fill` would freeze every state;
+//! changing the scoped `Style` keeps hover and press behaviour.
 
 // External crates
 use egui::{Color32, Ui};

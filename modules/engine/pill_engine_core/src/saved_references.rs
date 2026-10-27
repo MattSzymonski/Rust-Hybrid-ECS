@@ -5,7 +5,7 @@
 //!
 //! - [`SavedAssetReference`]: the guid that authorizes a reference, a
 //!   non-authoritative path hint beside it, and the sub-asset key the format
-//!   reserves for later (Q1, Q3).
+//!   carries.
 //! - [`saved_reference`]: one field value as the form a saved document holds -
 //!   an asset's guid or an entity's stable id.
 //! - [`restore_asset_reference`]: the guid back to a field value, loading the
@@ -24,16 +24,14 @@
 //! resolves it when it is read.
 //!
 //! The rule is a pair of functions over [`FieldValue`] rather than a serde
-//! context. A context inside the handle's deserializer could not do the job:
-//! it has no [`AssetManager`] to resolve a guid against, and a `Handle` cannot
-//! hold an unresolved guid because it is `#[repr(C)]` and `Copy`. Translating
-//! a field value after it was read keeps both forms honest and lets a loader
-//! resolve every asset and every entity at the point where it can - assets on
-//! demand, entities after the whole document exists.
+//! context, which could not do the job: it has no [`AssetManager`] to resolve a
+//! guid against, and a `Handle` cannot hold an unresolved guid because it is
+//! `#[repr(C)]` and `Copy`. Assets therefore resolve on demand, and entities
+//! once the whole document exists.
 //!
 //! An unresolvable reference is a missing asset, not a broken program: it is
 //! reported once per guid and resolves to [`crate::asset::Handle::INVALID`],
-//! which the renderer already draws with its fallbacks.
+//! which the renderer's caches answer with their defaults.
 
 // Standard library
 use std::collections::HashSet;
@@ -60,16 +58,16 @@ use crate::world::World;
 ///
 /// The guid is what identifies the asset; `path` is a hint kept beside it for
 /// a reader whose database no longer knows the guid (a file copied into
-/// another project keeps working), and `sub_asset` is the key a reference to
-/// part of a file will name once sub-assets exist (Q3) - written only when
-/// set, so a document that never uses one is no larger for it.
+/// another project keeps working). `sub_asset` is the key a reference to part
+/// of a file names - written only when set, so a document that uses none is no
+/// larger for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedAssetReference {
     /// The guid of the referenced asset.
     pub guid: AssetGuid,
     /// The asset's path when the writer knew it, as a non-authoritative hint.
     pub path: Option<String>,
-    /// The sub-asset key inside the file, reserved for later.
+    /// The sub-asset key inside the file; no loader resolves it.
     pub sub_asset: Option<String>,
 }
 
@@ -106,7 +104,7 @@ struct SavedAssetReferenceFields {
     /// The path hint, when the writer knew one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// The reserved sub-asset key, when one is named.
+    /// The sub-asset key, when one is named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sub_asset: Option<String>,
 }
@@ -123,9 +121,8 @@ impl Serialize for SavedAssetReference {
 }
 
 impl<'de> Deserialize<'de> for SavedAssetReference {
-    /// Reads the object form and the bare hex string an older file holds: the
-    /// guid was the whole reference before the path hint and the sub-asset key
-    /// joined it, and those files still have to load.
+    /// Reads the object form and the bare hex string a file that carries no
+    /// hint holds.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         /// Either spelling, told apart by the value's shape.
         #[derive(Deserialize)]
@@ -133,7 +130,7 @@ impl<'de> Deserialize<'de> for SavedAssetReference {
         enum Stored {
             /// The current form.
             Object(SavedAssetReferenceFields),
-            /// The guid alone, as `.material` files wrote it before Q1.
+            /// The guid alone.
             Bare(AssetGuid),
         }
         Ok(match Stored::deserialize(deserializer)? {
@@ -167,10 +164,9 @@ pub enum SavedReference {
 
 impl<'de> Deserialize<'de> for SavedReference {
     /// An object is an asset reference; a string is an entity's id. A bare
-    /// string is never read as an asset here: a document this build writes
-    /// always spells an asset reference as an object, and the guid-only string
-    /// a `.material` file holds is read by [`AssetReference`](crate::AssetReference)
-    /// itself, which is the type that has to keep reading it.
+    /// string is never read as an asset here: this build always spells an asset
+    /// reference as an object, and the guid-only string a `.material` file
+    /// holds is read by [`AssetReference`](crate::AssetReference) itself.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ReferenceVisitor;
         impl<'de> serde::de::Visitor<'de> for ReferenceVisitor {
@@ -253,12 +249,11 @@ pub fn saved_reference(
 /// the asset on demand.
 ///
 /// The guid is tried first, through the project database. A guid nothing knows
-/// falls back to the path hint, which is what keeps a reference working after
-/// its asset was copied into another project that assigned it a different
-/// guid; the fallback is reported once per guid, because it means the two
-/// files are no longer the same identity. A reference that resolves to nothing
-/// is reported once per guid and comes back invalid, so one missing asset does
-/// not fail the document that names it.
+/// falls back to the path hint, which keeps a reference working after its asset
+/// was copied into another project that assigned it a different guid. That
+/// fallback is reported once per guid, as is a reference that resolves to
+/// nothing, which comes back invalid so one missing asset does not fail the
+/// document that names it.
 ///
 /// The caller writes the value: the manager this loads through and the world
 /// the field lives in cannot be borrowed at the same time.
@@ -561,9 +556,9 @@ mod tests {
         AssetGuid::parse(text).expect("the test's guid is 32 hexadecimal digits")
     }
 
-    /// AC1: a component holding a handle and an entity reference round-trips
-    /// through the saved form into a fresh world, where it names the same
-    /// asset and the same entity through new handles.
+    /// A component holding a handle and an entity reference round-trips through
+    /// the saved form into a fresh world, where it names the same asset and the
+    /// same entity through new handles.
     #[test]
     fn references_round_trip_into_a_fresh_world() {
         // Step 1: the first world, with the asset loaded and the fields set
@@ -665,8 +660,8 @@ mod tests {
         assert_eq!(refreshed.target, new_target);
     }
 
-    /// AC2: a guid nothing knows falls back to the path hint, which loads the
-    /// file under the guid its own metadata carries.
+    /// A guid nothing knows falls back to the path hint, which loads the file
+    /// under the guid its own metadata carries.
     #[test]
     fn an_unknown_guid_resolves_by_its_path_hint() {
         let mut scratch = Scratch::new("path-fallback");

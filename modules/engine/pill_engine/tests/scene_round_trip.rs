@@ -5,7 +5,7 @@
 //! - Prove the whole scene path through the API a project uses: the derive's
 //!   field layouts, [`save_scene`], the `.scene` file, and [`load_scene`],
 //!   with an entity reference and a `Handle<Scene>` reference surviving the
-//!   trip (W-0048 Stage 8).
+//!   trip.
 //!
 //! # Design
 //!

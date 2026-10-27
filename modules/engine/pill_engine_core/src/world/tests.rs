@@ -8,10 +8,9 @@
 //!
 //! # Design
 //!
-//! Kept beside the code they exercise rather than inside it: the code half of
-//! this module is split by responsibility, and one test module that can reach
-//! every one of them is what lets a test build a world out of whichever pieces
-//! it needs without re-declaring the fixtures next door already have.
+//! One test module that can reach every one of the world's private pieces, so
+//! a test builds a world out of whichever of them it needs instead of
+//! re-declaring the fixtures.
 
 use super::*;
 use crate::archetype::{FieldSource, LayoutField};
@@ -97,8 +96,7 @@ fn descriptor_components_coexist_and_survive_archetype_migration() {
     assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
 
     // The archetype migrations above are what a reload's remap does to an
-    // entity's row; the stable id is world metadata and rides along (W-0048
-    // Stage 5).
+    // entity's row; the stable id is world metadata and rides along.
     let id = world
         .entity_id(entity)
         .expect("a descriptor-created entity has an id");
@@ -1192,17 +1190,8 @@ fn invalid_descriptor_component_layouts_are_rejected() {
     assert_eq!(world.entity_count(), 0);
 }
 
-/// Tests creating multiple entities with different component combinations.
-///
-/// This test verifies that:
-/// - Entities can be created with various combinations of components
-/// - Each unique component combination creates a separate archetype
-/// - All created entities are properly tracked in the world
-///
-/// Expected results:
-/// - 3 entities should be created in total
-/// - 3 different archetypes should exist (Position+Velocity, Position, Position+Velocity+Health)
-/// - All entity IDs should be present in the entity_locations map
+/// One entity per component combination, one archetype per combination, and
+/// every entity tracked in `entity_locations`.
 #[test]
 fn test_create_entities_with_different_components() {
     let mut world = setup_world();
@@ -1287,19 +1276,8 @@ fn test_create_entities_with_different_components() {
     println!("\nâœ“ All 3 archetypes verified successfully!");
 }
 
-/// Tests adding a new component to an existing entity.
-///
-/// This test verifies that:
-/// - A component can be added to an entity that doesn't already have it
-/// - The entity is migrated to a new archetype with the added component
-/// - Existing components on the entity are preserved during migration
-/// - The entity remains valid and tracked in the world
-/// - The old archetype is automatically cleaned up when it becomes empty
-///
-/// Expected results:
-/// - add_component should return true (success)
-/// - The entity should still exist in entity_locations
-/// - Old archetype should be automatically removed, leaving 1 archetype
+/// Adding a component migrates the entity into the archetype that carries it,
+/// and the archetype it left is removed once it is empty.
 #[test]
 fn test_add_component_to_entity() {
     let mut world = setup_world();
@@ -1333,16 +1311,8 @@ fn test_add_component_to_entity() {
     world.print_archetypes();
 }
 
-/// Tests attempting to add a component to a non-existent entity.
-///
-/// This test verifies that:
-/// - The system handles invalid entity IDs gracefully
-/// - No panic or crash occurs when operating on a fake entity
-/// - The operation correctly returns failure status
-///
-/// Expected results:
-/// - add_component should return false (failure)
-/// - No side effects or modifications to the world state
+/// Adding to a handle the world never handed out reports an error rather than
+/// panicking or touching the world.
 #[test]
 fn test_add_component_to_nonexistent_entity() {
     let mut world = World::new();
@@ -1402,18 +1372,8 @@ fn test_add_component_refuses_unregistered_type() {
     );
 }
 
-/// Tests removing a component from an entity that has multiple components.
-///
-/// This test verifies that:
-/// - A specific component can be removed from an entity
-/// - The entity is migrated to a new archetype without the removed component
-/// - Other components remain intact on the entity
-/// - The entity continues to exist in the world
-///
-/// Expected results:
-/// - remove_component should return true (success)
-/// - The entity should still be tracked in entity_locations
-/// - The entity should be in a different archetype (Position+Health instead of Position+Velocity+Health)
+/// Removing one component leaves the entity and its other components in
+/// place, in an archetype that no longer lists the removed type.
 #[test]
 fn test_remove_component_from_entity() {
     let mut world = setup_world();
@@ -1464,16 +1424,8 @@ fn test_remove_component_from_entity() {
     );
 }
 
-/// Tests attempting to remove a component from a non-existent entity.
-///
-/// This test verifies that:
-/// - The system handles invalid entity IDs gracefully during removal
-/// - No panic occurs when trying to remove from a fake entity
-/// - The operation correctly reports failure
-///
-/// Expected results:
-/// - remove_component should return false (failure)
-/// - No modifications to the world state
+/// Removing from a handle the world never handed out reports an error and
+/// changes nothing.
 #[test]
 fn test_remove_component_from_nonexistent_entity() {
     let mut world = World::new();
@@ -1489,19 +1441,8 @@ fn test_remove_component_from_nonexistent_entity() {
     );
 }
 
-/// Tests removing the last component from an entity, which should destroy it.
-///
-/// This test verifies that:
-/// - When an entity's last component is removed, the entity is automatically destroyed
-/// - No entities with zero components are left in the world
-/// - The entity is properly removed from all tracking structures
-/// - If entity count drops to zero, archetypes are cleaned up
-///
-/// Expected results:
-/// - remove_component should return true (success)
-/// - The entity count should drop to 0
-/// - The entity should no longer exist in entity_locations
-/// - All archetypes should be removed if no entities remain
+/// An entity whose last component is removed is destroyed rather than kept as
+/// an empty row, and the archetype it emptied goes with it.
 #[test]
 fn test_remove_last_component_destroys_entity() {
     let mut world = World::new();
@@ -1529,19 +1470,8 @@ fn test_remove_last_component_destroys_entity() {
     assert!(world.archetypes.is_empty(), "No archetypes should remain");
 }
 
-/// Tests destroying an entity and verifying other entities remain unaffected.
-///
-/// This test verifies that:
-/// - An entity can be completely removed from the world
-/// - Destroying one entity doesn't affect other entities
-/// - The entity is removed from its archetype and all tracking structures
-/// - The total entity count decreases correctly
-///
-/// Expected results:
-/// - destroy should return true (success)
-/// - Entity count should decrease from 2 to 1
-/// - The destroyed entity should no longer exist in entity_locations
-/// - The other entity should remain unaffected
+/// Destroying one entity removes it from every tracking structure and leaves
+/// the others untouched.
 #[test]
 fn test_destroy_entity() {
     let mut world = World::new();
@@ -1572,16 +1502,8 @@ fn test_destroy_entity() {
     assert!(world.entity_locations.contains_key(&entity2));
 }
 
-/// Tests attempting to destroy a non-existent entity.
-///
-/// This test verifies that:
-/// - The system handles invalid entity IDs gracefully during destroy
-/// - No panic or crash occurs when destroying a fake entity
-/// - The operation correctly reports failure
-///
-/// Expected results:
-/// - destroy should return false (failure)
-/// - No changes to the world state
+/// Destroying a handle the world never handed out reports `false` instead of
+/// panicking.
 #[test]
 fn test_destroy_nonexistent_entity() {
     let mut world = World::new();
@@ -1592,17 +1514,8 @@ fn test_destroy_nonexistent_entity() {
     assert!(!result, "Should fail to destroy non-existent entity");
 }
 
-/// Tests that attempting to destroy an already-destroyed entity fails correctly.
-///
-/// This test verifies that:
-/// - Once an entity is destroyed, it cannot be destroyed again
-/// - The system properly tracks which entities exist vs don't exist
-/// - Repeated destroy operations are safely rejected
-///
-/// Expected results:
-/// - First destroy should return true (success)
-/// - Second destroy should return false (entity no longer exists)
-/// - No panic or invalid state from double-destroy attempt
+/// A second destroy of the same handle is refused, so a double destroy cannot
+/// free a slot a later entity owns.
 #[test]
 fn test_destroy_already_destroyed_entity() {
     let mut world = World::new();
@@ -1623,18 +1536,8 @@ fn test_destroy_already_destroyed_entity() {
     assert!(!result2, "Should fail to destroy already-destroyed entity");
 }
 
-/// Tests the cleanup of empty archetypes after entities are destroyed.
-///
-/// This test verifies that:
-/// - When all entities are removed from an archetype, it becomes empty
-/// - The cleanup_empty_archetypes method removes unused archetypes
-/// - Non-empty archetypes and their entities remain unaffected
-/// - Memory is properly reclaimed from empty archetype storage
-///
-/// Expected results:
-/// - Initially 2 archetypes should exist
-/// - After destroying entity1 and cleanup, archetype count should decrease
-/// - entity2 should still exist and be properly tracked
+/// `cleanup_empty_archetypes` drops the archetype an entity left behind and
+/// keeps the one that still holds a row.
 #[test]
 fn test_cleanup_empty_archetypes() {
     let mut world = World::new();
@@ -1668,19 +1571,8 @@ fn test_cleanup_empty_archetypes() {
     assert!(world.entity_locations.contains_key(&entity2));
 }
 
-/// Tests entity migration between archetypes when components are added and removed.
-///
-/// This test verifies that:
-/// - Adding a component moves the entity to a different archetype
-/// - Removing a component moves the entity to yet another archetype
-/// - Each archetype change is properly tracked with different archetype IDs
-/// - Component data is preserved during migrations
-///
-/// Expected results:
-/// - Entity starts in archetype for (Position+Velocity)
-/// - After adding Health, entity moves to archetype for (Position+Velocity+Health)
-/// - After removing Velocity, entity moves to archetype for (Position+Health)
-/// - All three archetype IDs should be different from each other
+/// Each add and each remove moves the entity to another archetype, and no two
+/// steps of the migration land in the same one.
 #[test]
 fn test_entity_archetype_migration() {
     let mut world = setup_world();
@@ -1714,19 +1606,8 @@ fn test_entity_archetype_migration() {
     );
 }
 
-/// Tests that empty archetypes are automatically cleaned up when last entity moves.
-///
-/// This test verifies that:
-/// - When the last entity in an archetype is moved to another archetype, the empty one is removed
-/// - The archetype is removed from both the archetypes map and the lookup table
-/// - No manual cleanup_empty_archetypes() call is needed
-/// - The world remains in a consistent state
-///
-/// Expected results:
-/// - Initially 1 archetype exists (Position+Velocity)
-/// - After adding Health, 2 archetypes exist temporarily
-/// - The old archetype is automatically removed, leaving only 1 archetype
-/// - The entity is correctly tracked in the new archetype
+/// Migrating the last entity out of an archetype removes that archetype
+/// without a `cleanup_empty_archetypes` call.
 #[test]
 fn test_automatic_empty_archetype_cleanup() {
     let mut world = setup_world();
@@ -1768,7 +1649,8 @@ fn test_automatic_empty_archetype_cleanup() {
     println!("âœ“ Empty archetype automatically cleaned up after entity migration");
 }
 
-/// Test that archetype print_info displays component names and entity count
+/// Prints the archetype report and checks the component names and entity count
+/// behind it.
 #[test]
 fn test_archetype_print_info() {
     let mut world = World::new();
@@ -1842,19 +1724,8 @@ fn test_archetype_print_info() {
     println!("âœ“ Component names verified: {:?}", comp_names);
 }
 
-/// Tests entity generation system for safe ID recycling.
-///
-/// This test verifies that:
-/// - Entity IDs are recycled after destruction
-/// - Generations are incremented when IDs are reused
-/// - Stale handles (old generation) cannot access recycled entities
-/// - New entities with recycled IDs work correctly
-///
-/// Expected results:
-/// - Destroyed entity's ID should be reused for new entity
-/// - New entity should have same ID but different generation
-/// - Old handle should be invalid (is_entity_valid returns false)
-/// - Old handle should not access new entity's components
+/// A recycled id carries the next generation, so the stale handle keeps
+/// failing while the handle the world just handed out works.
 #[test]
 fn test_entity_generations() {
     let mut world = World::new();
@@ -1937,12 +1808,8 @@ fn test_entity_generations() {
     println!("âœ“ Entity generation recycling works correctly!");
 }
 
-/// Tests multiple rounds of entity recycling.
-///
-/// This test verifies that:
-/// - Multiple destroy/create cycles correctly increment generations
-/// - The free list works correctly with multiple recycled IDs
-/// - Generations wrap around safely (using wrapping_add)
+/// Repeated destroy/create cycles keep the one id and raise its generation by
+/// one every round.
 #[test]
 fn test_multiple_entity_recycling_rounds() {
     let mut world = World::new();
@@ -1988,9 +1855,8 @@ fn test_multiple_entity_recycling_rounds() {
     println!("âœ“ Multiple recycling rounds work correctly!");
 }
 
-/// Tests that multiple entities can be recycled independently.
-///
-/// This test verifies LIFO (stack) behavior of the free list.
+/// The free list hands ids back last-in-first-out, and a drained list
+/// allocates fresh ids at generation zero.
 #[test]
 fn test_free_list_lifo_order() {
     let mut world = World::new();
@@ -2061,13 +1927,13 @@ fn test_free_list_lifo_order() {
     println!("âœ“ Free list LIFO order works correctly!");
 }
 
-/// A slot whose generation reaches `u32::MAX` is retired instead of
-/// wrapping back to zero (audit 5.14 / 4.1).
+/// A slot whose generation reaches `u32::MAX` is retired instead of wrapped
+/// back to zero.
 ///
-/// Wrapping would resurrect every stale handle from 2^32 recycles ago -
-/// the ABA failure where a handle silently addresses an unrelated entity.
-/// The free list must drop the slot instead, so a stale handle can never
-/// validate against a recycled entity.
+/// Wrapping would resurrect every stale handle from 2^32 recycles ago - the
+/// ABA failure where a handle silently addresses an unrelated entity. The free
+/// list drops the slot instead, so a stale handle can never validate against a
+/// recycled entity.
 #[test]
 fn slot_at_generation_max_is_retired_not_wrapped() {
     let mut world = World::new();
@@ -2116,13 +1982,8 @@ fn slot_at_generation_max_is_retired_not_wrapped() {
     assert!(!world.is_entity_valid(stale), "the stale handle stays dead");
 }
 
-/// Tests entity generations with multiple archetypes and component removal.
-///
-/// This test verifies that:
-/// - Entities in different archetypes have independent generation tracking
-/// - Removing components (which moves entity to new archetype) preserves entity identity
-/// - Destroying entities from different archetypes correctly adds IDs to free list
-/// - Recycled IDs work correctly regardless of which archetype the original was in
+/// Component removal keeps an entity's id and generation, and ids freed from
+/// any archetype recycle into any other.
 #[test]
 fn test_generations_with_multiple_archetypes_and_component_removal() {
     let mut world = setup_world();
@@ -2275,14 +2136,8 @@ fn test_generations_with_multiple_archetypes_and_component_removal() {
     println!("âœ“ Generations with multiple archetypes and component removal work correctly!");
 }
 
-/// Tests that component data is correctly swap-removed when an entity is destroyed.
-///
-/// This test exposes the bug where component data is NOT swap-removed from storage
-/// when an entity is destroyed, causing remaining entities to read stale/wrong data.
-///
-/// Expected behavior
-/// - After destroying entity0, entity2 should still have its original Position (2.0, 2.0)
-/// - Currently, entity2 reads entity0's old Position (0.0, 0.0) - BUG!
+/// Destroying an entity swap-removes its row from every column, so the entity
+/// moved into the freed slot still reads its own component values.
 #[test]
 fn test_component_swap_remove_on_destroy() {
     let mut world = World::new();
@@ -2305,7 +2160,6 @@ fn test_component_swap_remove_on_destroy() {
         .build()
         .unwrap();
 
-    // Verify initial state
     assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
     assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
     assert_eq!(world.get_component::<Position>(entity2).unwrap().x, 2.0);
@@ -2313,14 +2167,9 @@ fn test_component_swap_remove_on_destroy() {
     // Archetype entity list: [entity0, entity1, entity2] (indices 0, 1, 2)
     // Component storage:     [Pos(0,0), Pos(1,1), Pos(2,2)]
 
-    // Destroy entity0 (index 0)
-    // Entity list swap_remove: entity2 moves from index 2 to index 0
-    // Entity list becomes: [entity2, entity1] (entity2 now at index 0)
-    //
-    // BUG: Component storage is NOT updated!
-    // Component storage still: [Pos(0,0), Pos(1,1), Pos(2,2)]
-    //
-    // Now entity2 has index 0, but component at index 0 is Pos(0,0) - WRONG!
+    // Destroy entity0 (index 0). The entity list swap-removes: entity2 moves
+    // from index 2 to index 0. The column has to swap-remove with it, or the
+    // row at index 0 stays entity0's stale Position and entity2 reads it.
     let _ = world.destroy_entity(entity0);
 
     // entity1 should still have its original position (index 1 unchanged)
@@ -2328,8 +2177,7 @@ fn test_component_swap_remove_on_destroy() {
     assert_eq!(pos1.x, 1.0, "entity1 Position.x should be 1.0");
     assert_eq!(pos1.y, 1.0, "entity1 Position.y should be 1.0");
 
-    // entity2 was swapped to index 0 - it should still have Position(2.0, 2.0)
-    // BUG: It actually reads Position(0.0, 0.0) because component storage wasn't swap-removed
+    // entity2 now sits at index 0 and must read the row that followed it.
     let pos2 = world.get_component::<Position>(entity2).unwrap();
 
     println!(
@@ -2338,7 +2186,7 @@ fn test_component_swap_remove_on_destroy() {
     );
     println!("Expected: (2.0, 2.0), Got: ({}, {})", pos2.x, pos2.y);
 
-    // This assertion FAILS because of the unimplemented component swap_remove
+    // The row entity2 reads is its own.
     assert_eq!(
         pos2.x, 2.0,
         "BUG: entity2 should have Position.x = 2.0, but got {} (entity0's old data)",
@@ -2353,18 +2201,9 @@ fn test_component_swap_remove_on_destroy() {
     println!("âœ“ Component swap_remove works correctly!");
 }
 
-/// Tests that component data is properly cleaned up when an entity migrates between archetypes.
-///
-/// When an entity gains or loses a component, it moves to a different archetype.
-/// The old archetype must properly remove the entity's component data using swap_remove.
-/// Otherwise:
-/// 1. Memory leaks occur (orphaned component data)
-/// 2. Other entities in the old archetype may read wrong component data
-///
-/// This test verifies:
-/// - Component data is removed from old archetype during migration
-/// - Other entities in the old archetype still have correct component data
-/// - The swapped entity (if any) correctly maps to its swapped component data
+/// A migration swap-removes the entity's row from the archetype it leaves, so
+/// the entities that stay behind still read their own component data and no
+/// orphaned row is left allocated.
 #[test]
 fn test_component_cleanup_on_archetype_migration() {
     let mut world = setup_world();
@@ -2389,14 +2228,12 @@ fn test_component_cleanup_on_archetype_migration() {
         .build()
         .unwrap();
 
-    // Verify initial state
     assert_eq!(
         world.archetypes.len(),
         1,
         "Should have 1 archetype initially"
     );
 
-    // Verify all entities have correct data
     assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
     assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
     assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
@@ -2404,12 +2241,10 @@ fn test_component_cleanup_on_archetype_migration() {
     assert_eq!(world.get_component::<Position>(entity2).unwrap().x, 2.0);
     assert_eq!(world.get_component::<Velocity>(entity2).unwrap().x, 102.0);
 
-    // Now add Health to entity0 - this moves it to a NEW archetype (Position+Velocity+Health)
-    // The old archetype (Position+Velocity) should swap_remove entity0's data
-    // entity2 should be swapped into index 0
+    // Adding Health moves entity0 to its own archetype; the one it leaves
+    // swap-removes its row and swaps entity2 into the freed index 0.
     world.add_component(entity0, Health(50)).unwrap();
 
-    // Verify entity0 moved to new archetype and has all components
     assert!(world.get_component::<Position>(entity0).is_some());
     assert!(world.get_component::<Velocity>(entity0).is_some());
     assert!(world.get_component::<Health>(entity0).is_some());
@@ -2417,9 +2252,9 @@ fn test_component_cleanup_on_archetype_migration() {
     assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
     assert_eq!(world.get_component::<Health>(entity0).unwrap().0, 50);
 
-    // CRITICAL: entity1 and entity2 should still have correct data in old archetype
-    // If swap_remove wasn't applied to component storage, entity2 (now at index 0)
-    // would incorrectly read entity0's old data!
+    // entity1 and entity2 must still read their own rows: entity2 now sits at
+    // the index entity0 left, so a column that did not swap-remove would hand
+    // it entity0's data.
 
     let pos1 = world.get_component::<Position>(entity1).unwrap();
     let vel1 = world.get_component::<Velocity>(entity1).unwrap();
@@ -2439,7 +2274,6 @@ fn test_component_cleanup_on_archetype_migration() {
         vel2.x
     );
 
-    // Verify archetype count (old one should still exist with entity1, entity2)
     assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes now");
 
     // Now remove Velocity from entity1 - moves to Position-only archetype
@@ -2451,7 +2285,6 @@ fn test_component_cleanup_on_archetype_migration() {
     assert_eq!(pos2.x, 2.0, "entity2 Position.x should still be 2.0");
     assert_eq!(vel2.x, 102.0, "entity2 Velocity.x should still be 102.0");
 
-    // entity1 should only have Position now
     assert!(world.get_component::<Position>(entity1).is_some());
     assert!(world.get_component::<Velocity>(entity1).is_none());
     assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
@@ -2459,10 +2292,10 @@ fn test_component_cleanup_on_archetype_migration() {
     println!("âœ“ Component cleanup on archetype migration works correctly!");
 }
 
-/// Tests that `IteratorTimings` detects duplicate labels within a frame.
+/// Two iterators sharing a label corrupt the per-label splitting hint, so
+/// `IteratorTimings` records the duplicate.
 ///
-/// Two iterators with the same label will corrupt the per-label splitting hint.
-/// This test simulates the logic inside `ParQueryIter::for_each`.
+/// The test replays the bookkeeping `ParQueryIter::for_each` does.
 #[test]
 fn test_per_label_duplicate_detection() {
     let timing = std::sync::Mutex::new(IteratorTimings::new());
@@ -2716,8 +2549,9 @@ fn rehoming_resources_preserves_the_value_and_its_drop() {
 /// The registration log reports what one `init` claimed, which is what
 /// distinguishes a retired owner from a live one.
 ///
-/// `resource_factories` cannot answer that: it accumulates and is never
-/// pruned, so a retired module's entry looks identical to a live one.
+/// `resource_factories` cannot answer that: it records which ids are declared,
+/// not when or by which generation, so a retired module's entry looks identical
+/// to a live one's.
 #[test]
 fn the_registration_log_reports_what_one_generation_claimed() {
     let mut world = World::new();
@@ -3335,10 +3169,9 @@ fn foreign_byte_views_refuse_a_rust_owned_resource() {
 
 /// A zero-sized Rust type is a component like any other.
 ///
-/// This is the tag/marker idiom (`struct Enemy;`), and the unification broke it:
-/// the native registration path fed the descriptor lane's zero-width refusal
-/// into an `.expect`, so declaring a marker aborted the process. No test
-/// covered the case, which is why every gate stayed green through the change.
+/// This is the tag/marker idiom (`struct Enemy;`): a native declaration of zero
+/// width is a filter, and every path that treats it as a row - spawn, migration,
+/// removal, destruction - has to work on a column that allocates nothing.
 #[test]
 fn a_zero_sized_component_lives_a_full_life() {
     #[derive(Clone, Debug, Default)]
@@ -3439,8 +3272,8 @@ fn an_over_aligned_zero_sized_component_is_addressable() {
 ///
 /// The verdict is split, not loosened: a descriptor's width arrives from a
 /// manifest another language wrote, where zero means that declaration is wrong.
-/// Pinned so a later change cannot quietly collapse the two rules back into
-/// one and start accepting a malformed manifest.
+/// Pinned so the two rules stay separate and a malformed manifest keeps being
+/// refused.
 #[test]
 fn a_zero_width_descriptor_component_is_still_refused() {
     let mut world = World::new();
@@ -3617,10 +3450,9 @@ fn a_relayout_drops_the_stored_resource_field_layout() {
     );
 }
 
-/// The stable-id index (W-0048 Stage 5): every created entity gets an id,
-/// the id resolves back to the entity, and destroying the entity drops both
-/// directions - so a stale id names nothing rather than a later occupant of
-/// the recycled slot.
+/// The stable-id index: every created entity gets an id, the id resolves back
+/// to the entity, and destroying the entity drops both directions - so a stale
+/// id names nothing rather than a later occupant of the recycled slot.
 #[test]
 fn a_created_entity_has_an_id_that_dies_with_it() {
     let mut world = World::new();
@@ -3734,11 +3566,12 @@ fn a_component_the_builder_is_given_twice_is_refused() {
     );
 }
 
-/// A tick counter that wrapped is not "nothing changed" (W-0091).
+/// A tick counter that wrapped is not "nothing changed".
 ///
-/// A row written after the counter wrapped carries a small tick, so the plain
-/// `>` comparison `is_newer_than` used to make read it as older than the run
-/// before the wrap and the change was never seen again.
+/// A row written after the counter wrapped carries a small tick, so a plain
+/// `>` comparison would read it as older than the run before the wrap and the
+/// change would never be reported again. `Tick::is_changed` compares across the
+/// wrap instead.
 #[test]
 fn a_wrapped_tick_counter_still_reports_a_change() {
     let mut world = World::new();

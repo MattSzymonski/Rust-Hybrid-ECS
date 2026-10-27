@@ -175,13 +175,13 @@ impl World {
     /// # Shared components
     ///
     /// A component that declares [`Component::shared_name`] resolves to the
-    /// same [`ComponentId`] in every binary that links it, so the second
-    /// binary's registration finds the bit already taken and **binds to the
-    /// existing column** rather than allocating a second one: the registry
-    /// reports `AlreadyPresent`, no new bit is consumed, and entities spawned
-    /// from either binary land in the same archetype. Nothing here special-
-    /// cases that - it falls out of the id being equal - which is why there is
-    /// no window in which two binaries share a column but not a mask bit.
+    /// same [`ComponentId`] in every binary that links it, so a second binary's
+    /// registration finds the bit already taken and **binds to the existing
+    /// column** rather than allocating a second one: the registry reports
+    /// `AlreadyPresent`, no new bit is consumed, and entities spawned from
+    /// either binary land in the same archetype. That falls out of the ids
+    /// being equal, so there is no window in which two binaries share a column
+    /// but not a mask bit.
     pub(crate) fn register_component_inner<T>(
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
@@ -286,11 +286,9 @@ impl World {
         // the reload path already relies on, with `rehome_native_columns`
         // re-pointing live columns at it afterwards.
         let storage_info = if let Some(shared) = T::shared_name() {
-            // A declared identity is what makes two binaries' registrations one
-            // component, and until now it was only visible in the periodic
-            // report - which needs frames, so a host that draws one frame never
-            // showed it. One line per registration puts the same fact in the
-            // startup and reload logs.
+            // One line per registration, so a declared identity shows up in the
+            // startup and reload logs rather than only in the periodic report,
+            // which needs frames.
             info!(
                 target: pill_core::telemetry::telemetry_target::ECS,
                 shared,
@@ -512,8 +510,15 @@ impl World {
 
     /// Register an unmanaged component described by an external language.
     ///
-    /// Re-registering an identical layout and name for the same `stable_id`
-    /// is idempotent and returns the existing [`ComponentId`].
+    /// Re-registering an identical layout and name for the same `stable_id` is
+    /// idempotent and returns the existing [`ComponentId`].
+    ///
+    /// `blittability` is the caller's evidence that every field of the component
+    /// is a blittable value type, and it is required, not optional: the storage
+    /// built from this layout copies rows with `ptr::copy`, frees them without
+    /// running element destructors, and is shared across threads, so no check
+    /// this function could run would make an owning layout safe.
+    /// [`Blittability`] documents what each constructor proves.
     ///
     /// # Errors
     ///
@@ -524,14 +529,6 @@ impl World {
     /// [`WorldError::DescriptorAlreadyRegistered`] when the `stable_id` is
     /// already taken by a different layout or name, and
     /// [`WorldError::ComponentTypeLimitExceeded`] when the registry is full.
-    ///
-    /// `blittability` is the caller's evidence that every field of the
-    /// component is a blittable value type. It is required, not optional:
-    /// the storage built from this layout copies rows with `ptr::copy`, frees
-    /// them without running element destructors, and is shared across threads,
-    /// so there is no check this function could run itself that would make an
-    /// owning layout safe. [`Blittability`] documents what each constructor
-    /// proves.
     pub fn register_component_descriptor(
         &mut self,
         stable_id: u128,
@@ -597,14 +594,12 @@ impl World {
     /// index, and that index is baked into archetype masks and scheduled access
     /// masks - so only the columns' element layout and the recorded size move.
     ///
-    /// `plan` says where each byte of a new row comes from
-    /// ([`FieldPlan::between`] builds one from two field lists). Anything
-    /// it does not cover is left zero. Row order and change ticks are
-    /// preserved, so entity locations stay valid and no system observes a
-    /// spurious `Added`.
-    ///
-    /// The new layout and the plan are checked before the first column is
-    /// touched, so a rejected call leaves the world exactly as it was.
+    /// `plan` says where each byte of a new row comes from ([`FieldPlan::between`]
+    /// builds one from two field lists); anything it does not cover is left zero.
+    /// Row order and change ticks are preserved, so entity locations stay valid
+    /// and no system observes a spurious `Added`. The new layout and the plan are
+    /// checked before the first column is touched, so a rejected call leaves the
+    /// world exactly as it was.
     ///
     /// Returns the number of rows migrated.
     ///
@@ -653,7 +648,7 @@ impl World {
         // Step 1: Verify every column before touching one. The plan and the
         // factory were checked above; what remains is the possibility that a
         // column disagrees with the factory - the desync a partially applied
-        // relayout used to produce - so the whole set is checked first and the
+        // relayout leaves behind - so the whole set is checked first and the
         // report names the column that disagrees.
         let mut targets = Vec::new();
         for (archetype_id, archetype) in &self.archetypes {
@@ -715,11 +710,9 @@ impl World {
     /// removed from the source, so an entity whose only component this is
     /// survives instead of being destroyed when the removal empties it.
     ///
-    /// The source registration is retired once every row has moved: its name
-    /// claim, registry entry and storage factory go, and its bit is released
-    /// when no archetype with live rows still references it. A second remap out
-    /// of the source is therefore impossible, which is what the caller wants:
-    /// the source no longer exists.
+    /// The source registration is then retired: its name claim, registry entry
+    /// and storage factory go, and its bit is released when no archetype with
+    /// live rows still references it.
     ///
     /// Returns the number of rows moved.
     ///
@@ -729,11 +722,11 @@ impl World {
     /// [`WorldError::DescriptorComponentNotRegistered`] when either id is not a
     /// registered descriptor component,
     /// [`WorldError::DescriptorComponentAlreadyPresent`] when the successor
-    /// already carries rows (a fresh registration has none; merging two row
-    /// sets would make the plan's source side wrong for half its input),
-    /// [`WorldError::DescriptorRowInvalid`] when the plan does not fit the two
-    /// layouts, and [`WorldError::DescriptorStorageMissing`] when an archetype
-    /// lists the source without a column.
+    /// already carries rows (merging two row sets would make the plan's source
+    /// side wrong for half its input), [`WorldError::DescriptorRowInvalid`] when
+    /// the plan does not fit the two layouts, and
+    /// [`WorldError::DescriptorStorageMissing`] when an archetype lists the
+    /// source without a column.
     pub fn remap_descriptor_component(
         &mut self,
         old_component_id: ComponentId,
@@ -832,13 +825,12 @@ impl World {
 
     /// Return a raw native component column for language bindings.
     ///
-    /// The native twin of [`Self::descriptor_component_chunk_mut`]: returns the
+    /// The native twin of [`Self::descriptor_component_chunk_mut`]: the
     /// contiguous row buffer of a native (Rust-registered) component as raw
-    /// bytes, so the C# backend can expose components that an extension
-    /// registered without naming their concrete Rust type. Only native
-    /// components are served; descriptor components must use
-    /// [`Self::descriptor_component_chunk_mut`] instead.
-    /// The returned pointer is only valid for the active managed-system
+    /// bytes, so the C# backend can expose components an extension registered
+    /// without naming their concrete Rust type.
+    ///
+    /// The returned pointer is valid only for the active managed-system
     /// invocation and must not be retained beyond it.
     pub fn native_component_chunk_mut(
         &mut self,
@@ -972,12 +964,12 @@ impl World {
     ///
     /// Unlike the persistable resolver, this has no `persist_inserters` filter
     /// to collapse the candidate set, so a name claimed by two registrations
-    /// arrives here with both still visible. It used to break that tie with
-    /// `max_by_key(bit)`, which is not a recency ordering - `allocate_bit`
-    /// reissues bits reclaimed by `remove` before advancing `next_bit`, so the
-    /// highest bit can belong to the older registration. Binding managed code
-    /// to the wrong column that way is silent, so an ambiguous name is now
-    /// reported as [`WorldError::ComponentNameAmbiguous`] instead.
+    /// arrives here with both still visible. The bit index is no recency
+    /// ordering - `allocate_bit` reissues bits reclaimed by `remove` before
+    /// advancing `next_bit`, so the highest bit can belong to the older
+    /// registration - so an ambiguous name is reported as
+    /// [`WorldError::ComponentNameAmbiguous`] rather than binding managed code
+    /// silently to one of the two columns.
     ///
     /// A component declared with a shared identity cannot reach this state:
     /// every binary that links it computes the same [`ComponentId`], so there

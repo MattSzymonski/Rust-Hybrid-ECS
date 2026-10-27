@@ -254,7 +254,8 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
     archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
     min_batch_size: Option<usize>,
     tracked: bool,
-    /// Sum of all queried component sizes - used to clamp the slice size.
+    /// Sum of all queried component sizes - the per-entity byte cost the
+    /// default slice size is derived from.
     total_components_size: usize,
     /// Optional label for Tracy zones - set via `.label("system_name")`.
     label: Option<&'static str>,
@@ -265,12 +266,12 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
 
 // SAFETY: `ParQueryIter` can be moved between threads because
 // `archetype_ranges` holds owned data plus the raw pointers cached in
-// `Q::State` and `F::State`, which point into component storage that remains
-// valid for the query's lifetime (the iterator holds exclusive `World` access,
-// so archetypes and their storage are neither reallocated nor aliased).
-// Parallel execution assigns each thread disjoint entity ranges, and the
-// `Send` bounds below guarantee the pointed-to data can be transferred between
-// threads, so no data race is possible.
+// `Q::State` and `F::State`, which point into component storage that stays
+// valid for the query's lifetime (the iterator holds exclusive `World`
+// access, so archetypes and their storage are neither reallocated nor
+// aliased). Parallel execution assigns each thread a disjoint entity range,
+// and the `Send` bounds below require the pointed-to data to be movable
+// between threads, so no data race is possible.
 //
 // That the *systems* sharing a batch are themselves disjoint is established by
 // `SystemAccess::conflicts_with`, not here; see its contract for the
@@ -362,7 +363,7 @@ where
     /// The batch size is the divisor the executors split work slices with, so
     /// a zero becomes one entity per slice rather than a division by zero: a
     /// batch size computed from a frame's entity count can legitimately come
-    /// out as zero, and that must not end the process mid-frame (W-0092).
+    /// out as zero, and that must not end the process mid-frame.
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.min_batch_size = Some(size.max(1));
         self
@@ -376,7 +377,8 @@ where
 
     /// Execute closure on each entity in parallel.
     ///
-    /// Returns `BatchStats` if `.tracked()` was called, otherwise `()`.
+    /// Returns [`ParForEachResult::Tracked`] when `.tracked()` was called,
+    /// [`ParForEachResult::Untracked`] otherwise.
     pub fn for_each<Func>(self, f: Func) -> ParForEachResult
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
@@ -443,14 +445,14 @@ where
 
     /// Execute the closure on every matching entity (untracked).
     ///
-    /// Uses an adaptive fallback: if the total entity count is below
-    /// `num_threads × 256`, the iteration runs sequentially - avoiding
-    /// Rayon scheduling overhead for tiny workloads (common when many
-    /// small archetypes exist).  Above the threshold, flat work slices
-    /// (default 4096 entities each, matching L1 data cache) are grouped
-    /// into chunks and spawned via [`rayon::scope`], so every thread
-    /// pulls tasks from a shared pool simultaneously
-    /// - no work-stealing cascade, no late-arriving outliers.
+    /// Uses an adaptive fallback: below `num_threads ×
+    /// MINIMUM_SLICE_SIZE` entities the iteration runs sequentially, avoiding
+    /// Rayon scheduling overhead for tiny workloads (common when many small
+    /// archetypes exist). Above it, equal flat work slices - `with_batch_size`
+    /// entities each, or else `default_entities_per_slice`, which
+    /// `ECS_SLICE_SIZE` overrides and which otherwise clamps to 256..4096 - are
+    /// grouped into chunks that [`rayon::scope`] spawns all at once, so every
+    /// thread pulls work from the shared pool.
     fn execute_untracked<Func>(self, f: Func, hint_ns: u64)
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
@@ -476,11 +478,11 @@ where
 
         // Step 3: build flat work slices distributed via rayon::scope.
         //
-        // We pre-build equal-sized entity-range slices, then group them
-        // into num_threads × 2 chunks. Spawning all chunks at once
-        // through rayon::scope lets every thread pull tasks from a shared
-        // pool simultaneously - no work-stealing cascade, no head-start
-        // for the owning thread, and no late-arriving outliers.
+        // Pre-build equal-sized entity-range slices, then group them into
+        // `iterator_work_group_count` contiguous chunks. Spawning all chunks
+        // at once through rayon::scope lets every thread pull tasks from a
+        // shared pool at the same time - no work-stealing cascade, no
+        // head-start for the owning thread, no late-arriving outliers.
         let min_len = self
             .min_batch_size
             .unwrap_or(config::default_entities_per_slice(
@@ -617,11 +619,10 @@ where
     /// [`BatchStats`] about how Rayon distributed the work.
     ///
     /// Same adaptive fallback as [`execute_untracked`]: sequential below
-    /// `num_threads × 256` entities, flat work slices above.
+    /// `num_threads × MINIMUM_SLICE_SIZE` entities, flat work slices above.
     ///
-    /// Tracking adds per-slice atomics (count, min, max) so the caller
-    /// can inspect load distribution.  Each pre-built slice reports
-    /// one stat, giving precise visibility into per-thread assignment.
+    /// Tracking adds per-group atomics (count, min, max) so the caller can
+    /// inspect load distribution; each spawned work group reports one stat.
     ///
     /// [`execute_untracked`]: Self::execute_untracked
     fn execute_tracked<Func>(self, f: Func, hint_ns: u64) -> BatchStats
@@ -698,8 +699,8 @@ where
 
         // Step 3: choose the work-group count from timing feedback when
         // available, then pre-assign contiguous groups so every thread
-        // processes ALL its work back-to-back - no per-chunk queue
-        // contention, no 90µs gaps between chunks on the same thread.
+        // processes all its work back-to-back - no per-chunk queue
+        // contention, no idle gaps between chunks on the same thread.
         // Groups are stored as (start_index, count) ranges into the flat
         // iterator_slices array instead of copying slices with to_vec().
         let iterator_work_group_count =

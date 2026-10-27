@@ -76,29 +76,24 @@ pub trait Component: Send + 'static {
     ///
     /// A component type linked into more than one binary in the same process -
     /// the host, the project, a module DLL - gets a different [`TypeId`] in
-    /// each, because `TypeId` is a hash over the crate name, its `-C metadata`
-    /// disambiguator and the type path, computed per compilation unit.
-    /// Identified by `TypeId`, one type therefore becomes several components
-    /// with several columns, and neither binary can see the other's entities.
+    /// each, because `TypeId` hashes the crate name, its `-C metadata`
+    /// disambiguator and the type path per compilation unit. One type then
+    /// becomes several components with several columns, and neither binary sees
+    /// the other's entities. Declaring a name replaces that identity with one
+    /// derived from the name itself, which every binary computes identically, so
+    /// all of them resolve to one [`ComponentId`], one mask bit and one column.
     ///
-    /// Declaring a name here replaces that identity with one derived from the
-    /// name itself, which every binary computes identically and without any
-    /// coordination. All of them then resolve to one [`ComponentId`], one mask
-    /// bit, and one column.
-    ///
-    /// The name must be unique across the whole process, so it should be
-    /// namespaced - `"pill_spline::Spline"`, not `"Spline"`. It must also be
-    /// stable: it is written down rather than derived from
-    /// [`std::any::type_name`], whose output is explicitly not guaranteed
-    /// stable across compiler versions.
+    /// The name must be unique across the process - `"pill_spline::Spline"`,
+    /// not `"Spline"` - and stable: it is written down rather than derived from
+    /// [`std::any::type_name`], whose output is not guaranteed stable across
+    /// compiler versions.
     ///
     /// Set it through `#[pill(shared)]` on `#[derive(PillComponent)]` rather
     /// than by hand; see [`ComponentId::of`] for what changes once it is set.
     ///
-    /// This is a `where Self: Sized` method rather than an associated
-    /// constant because an associated constant would make `Component` no
-    /// longer dyn-compatible, and the engine's whole storage layer moves
-    /// components as `dyn Component`.
+    /// A `where Self: Sized` method rather than an associated constant, which
+    /// would make `Component` no longer dyn-compatible even though the storage
+    /// layer moves components as `dyn Component`.
     fn shared_name() -> Option<&'static str>
     where
         Self: Sized,
@@ -109,11 +104,10 @@ pub trait Component: Send + 'static {
     /// The stable identity [`Self::shared_name`] hashes to, or `None`.
     ///
     /// Defaulted in terms of `shared_name`, so an implementor only writes the
-    /// name and the two cannot disagree. `#[derive(PillComponent)]` overrides
-    /// it with a compile-time constant: `ComponentId::of` is called once per
-    /// `get_component`, and hashing the name on every one of those is
-    /// measurable - around 20% of that call - where folding it to a constant
-    /// makes it exactly the load `TypeId::of` compiles to.
+    /// name and the two cannot disagree. `#[derive(PillComponent)]` overrides it
+    /// with a compile-time constant: `ComponentId::of` runs on every
+    /// `get_component`, and hashing the name there is measurable, where folding
+    /// it to a constant is the same load `TypeId::of` compiles to.
     ///
     /// Override it only with `shared_component_identity(Self::shared_name())`;
     /// any other value silently splits the component's identity from the name
@@ -137,9 +131,9 @@ pub trait Component: Send + 'static {
     /// the old field offsets.
     ///
     /// `#[derive(PillComponent)]` overrides it from the type's field
-    /// descriptors, the same ones registration hashes. A hand-written impl
-    /// overrides it with `component_schema_hash(Self::FIELD_LAYOUT)`; leaving
-    /// the default keeps the size-and-alignment check only.
+    /// descriptors, the same ones registration hashes; a hand-written impl uses
+    /// `component_schema_hash(Self::FIELD_LAYOUT)`. The default leaves the
+    /// size-and-alignment check only.
     fn declared_schema_hash() -> Option<u64>
     where
         Self: Sized,
@@ -324,9 +318,7 @@ pub const fn shared_component_identity(name: &str) -> u128 {
 /// This is the reasoning [`TypeId`] applies to itself: it too holds 128 bits
 /// and hashes only half of them, because a hash map resolves collisions with
 /// `Eq` - which still compares every bit - so the second 8-byte block buys no
-/// correctness and costs a compression round. Deriving `Hash` here made a
-/// shared component's lookups measurably slower than a native component's,
-/// around 18% of `World::get_component`, which performs two of them per call.
+/// correctness and costs a compression round.
 ///
 /// The variant is mixed in as a salt rather than hashed as a separate value,
 /// so distinguishing the variants stays free.
@@ -511,19 +503,11 @@ pub fn component_schema_hash(fields: &[ComponentFieldDescriptor]) -> u64 {
 
 /// Bitmask for efficiently representing sets of components.
 ///
-/// ## 128 Component Type Limit
-///
-/// Uses a `u128` internally, limiting the ECS to 128 unique component types.
-/// This is a deliberate design tradeoff:
-///
-/// - O(1) archetype matching: Query matching is a simple bitwise AND
-/// - 128 bits = 128 component types: Sufficient for most games
-/// - No heap allocation: Masks are stack-allocated and Copy
-///
-/// If you hit the 128 limit, consider:
-/// 1. Combining related components (e.g., Transform instead of Position + Rotation + Scale)
-/// 2. Using marker components sparingly
-/// 3. Restructuring to use fewer component types with interior variants
+/// A `u128`, which caps the ECS at 128 unique component types - the price of
+/// O(1) archetype matching by bitwise AND and of masks that stay
+/// stack-allocated and `Copy`. Registration reports the ceiling as
+/// [`WorldError::ComponentTypeLimitExceeded`] instead of panicking, and folding
+/// related fields into one component is how a project stays under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ComponentMask(u128);
 
@@ -685,9 +669,8 @@ impl ComponentRegistry {
     /// Returns [`Registration::Created`] with a fresh bit, or
     /// [`Registration::AlreadyPresent`] with the existing one. Idempotent by
     /// design - the reload path re-runs `init`, which re-registers every type -
-    /// but the two cases are distinguishable so a caller that cares can tell
-    /// them apart. [`Self::register_bit`] discards the distinction for callers
-    /// that do not.
+    /// and the two cases stay distinguishable for a caller that cares.
+    /// [`Self::register_bit`] discards the distinction for callers that do not.
     ///
     /// # Errors
     ///
@@ -979,16 +962,13 @@ impl ComponentRegistry {
         None
     }
 
-    /// Get the bit index for a component ID, if registered.
-    /// Forget a previously registered component type.
+    /// Unregister a component type and return its bit to the reclaim pool.
     ///
     /// Called when a reloaded module or project stops registering a type
-    /// entirely and the host drops its orphaned data. Re-registering the same
-    /// `TypeId` later simply allocates a fresh bit index again.
-    ///
-    /// The freed bit is returned to the reclaim pool, so a descriptor manifest
-    /// that retires and introduces types across reloads reuses bits instead of
-    /// walking `next_bit` toward the 128-type ceiling.
+    /// entirely and its orphaned data is dropped. Re-registering the same
+    /// `TypeId` later allocates a fresh bit index again; the reclaimed pool is
+    /// what keeps a descriptor manifest that retires and introduces types
+    /// across reloads from walking `next_bit` toward the 128-type ceiling.
     pub fn remove(&mut self, component_id: &ComponentId) {
         if let Some(bit) = self.id_to_bit.remove(component_id) {
             self.free_bits.push(bit);
@@ -1007,6 +987,7 @@ impl ComponentRegistry {
         self.free_bits.len() + (128 - usize::from(self.next_bit))
     }
 
+    /// Get the bit index for a component ID, if registered.
     pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
         self.id_to_bit.get(component_id).copied()
     }
@@ -1105,7 +1086,6 @@ mod tests {
 
     /// `ComponentRegistry::remove` fully unregisters a type so a later
     /// re-registration works again; the entry is completely gone in between.
-    /// Pins the registry cleanup behind drop-at-detection (audit 3.2).
     #[test]
     fn remove_unregisters_and_reregistration_works() {
         #[derive(Clone, Debug)]
@@ -1147,7 +1127,7 @@ mod tests {
 
     /// Registering the 129th component type reports a typed error instead of
     /// panicking - the ceiling is a configuration outcome, not a programming
-    /// error (audit 4.2).
+    /// error.
     #[test]
     fn the_129th_component_type_errors_instead_of_panicking() {
         // Each tuple is a distinct fake type (distinct names), registered
@@ -1186,7 +1166,7 @@ mod tests {
     }
 
     /// Reclaimed bits keep the registry from walking toward the 128-type
-    /// ceiling during a churn-heavy editing session (audit 4.10).
+    /// ceiling during a churn-heavy editing session.
     #[test]
     fn removed_bits_are_reclaimed_and_reported_as_headroom() {
         let mut registry = ComponentRegistry::new();
@@ -1280,9 +1260,8 @@ mod tests {
             .register_with_layout::<first_copy::SharedProbe>(FIELDS_A)
             .expect("the first declaration is recorded");
 
-        // The old bug: this registration carries no fields, so it used to
-        // overwrite the recorded hash with `None`, after which the check below
-        // took its permissive arm forever.
+        // This registration carries no fields; the recorded hash has to survive
+        // it, or the check below takes its permissive arm forever.
         let _re_registration = registry
             .register::<first_copy::SharedProbe>()
             .expect("re-registration is idempotent");

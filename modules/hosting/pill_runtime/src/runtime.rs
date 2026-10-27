@@ -147,9 +147,9 @@ pub fn set_surface_camera(world: &mut World, id: SurfaceId, binding: Option<Came
 /// Insert the debug-drawing and picking resources into `world`, each only
 /// where it is missing.
 ///
-/// Every build has them (D14): debug drawing on in the development host, and
-/// in a shipping or web build as its project settings say. A system toggles
-/// it at runtime through [`pill_engine::DebugDraw::set_enabled`].
+/// Every build has them: debug drawing on in the development host, and in a
+/// shipping or web build as its project settings say. A system toggles it at
+/// runtime through [`pill_engine::DebugDraw::set_enabled`].
 pub fn insert_debug_resources(world: &mut World, debug_draw_enabled: bool) {
     if !world.has_resource::<pill_engine::DebugDraw>() {
         world.insert_resource(pill_engine::DebugDraw::new(debug_draw_enabled));
@@ -411,8 +411,8 @@ impl PackSource {
 ///
 /// Returns the database to insert as a resource: it holds every packed asset
 /// by guid and by path, so a reference can find and load one that is not
-/// loaded yet (W-0048). Built here because mounting consumes the pack, which
-/// is why this takes the bytes and mounts them in the same step.
+/// loaded yet. Parsing and mounting happen in one step because mounting
+/// consumes the pack.
 ///
 /// # Errors
 ///
@@ -444,7 +444,7 @@ pub fn mount_asset_pack(
     pill_engine::asset_store::mount_pack(pack);
     // From here on the store reads what the pack holds and nothing else: a
     // shipped build must not fall back to a file on the player's machine when
-    // an asset is missing from the bundle (W-0066).
+    // an asset is missing from the bundle.
     pill_engine::asset_store::restrict_to_packs();
     Ok(database)
 }
@@ -518,7 +518,8 @@ pub fn setup_with_asset_database(
         "ECS host starting (statically linked)"
     );
 
-    // Mounted by the caller, before this ran, because it has to precede init.
+    // The database arrives already mounted, because mounting has to precede
+    // every module's and the project's init.
     if let Some(database) = database {
         runtime.engine_mut().world_mut().insert_resource(database);
     }
@@ -629,7 +630,7 @@ mod tests {
 
     /// A project whose pack was fetched gets the database the fetch mounted
     /// inserted before it initializes, so an init that loads an asset finds
-    /// it - the browser path (W-0105).
+    /// it - the browser path.
     #[test]
     fn a_fetched_pack_is_mounted_before_the_project_initializes() {
         let bytes = pack_of(&[("fetched/pack-probe.txt", b"from the pack")]);

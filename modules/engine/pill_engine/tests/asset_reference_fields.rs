@@ -4,7 +4,7 @@
 //!
 //! - Prove the derive's generated registration records each handle field's
 //!   asset type - `T`'s shared name, or its Rust type name without one - so
-//!   the field layer reads the field as a typed asset reference (W-0048).
+//!   the field layer reads the field as a typed asset reference.
 //!
 //! # Design
 //!

@@ -11,54 +11,29 @@
 //!
 //! # Design
 //!
-//! ## Why not a `Vec` field
+//! A `Vec` field cannot cross a reload: its buffer belongs to the allocator of
+//! whichever DLL created it, and that DLL is retired; growth also reallocates
+//! in place, ending any managed view of the old buffer. A block from
+//! [`crate::native_buffer`] outlives the generation that filled it, and a
+//! handle grows by allocating a new block, so a live block never moves.
 //!
-//! A `Vec`'s buffer belongs to the allocator of whichever DLL created it, and
-//! a hot reload retires that DLL. The engine's shared allocation service owns
-//! a `DynamicBuffer`'s block instead, so the block outlives the generation
-//! that filled it and is freed by code that is still mapped. Growth is the
-//! second difference: a `Vec` reallocates in place of its old buffer, which
-//! ends any managed view of it, while a block's address is stable for as long
-//! as a handle to it exists.
+//! `Clone` retains the block - the clone shares it, address and all - so
+//! duplicating a component duplicates the handle and never the elements. A
+//! mutation through one handle copies a shared block first, so two handles
+//! never write through one another; those writes are safe but are not
+//! *observed* by a `&[T]` borrowed from the other handle before that copy,
+//! exactly as with `Cow::to_mut` or `Arc::make_mut`.
 //!
-//! Archetype migration is *not* one of the differences. A row moves bitwise,
-//! so a `Vec` field and a buffer handle both keep their address when the
-//! entity changes archetype.
+//! The contract callers may rely on:
 //!
-//! ## Reference-counted handles, copy-on-write
-//!
-//! `DynamicBuffer` keeps its elements in a block owned by
-//! [`crate::native_buffer`]: memory whose address never changes while the
-//! block is alive, and whose free path is the shared allocation service rather
-//! than whatever code happens to be current. `Clone` *retains* the block - the
-//! clone shares it, address and all - so duplicating a component duplicates
-//! the handle and never the elements. Mutation while a block is shared copies
-//! it first, so two handles never write through one another.
-//!
-//! ## The address-stability contract
-//!
-//! Callers may rely on all of the following; the internals exist to make them
-//! true:
-//!
-//! - **A block's address is stable for as long as any handle to it exists.**
-//!   Growth allocates a new block (and releases the old reference); it never
-//!   relocates a live one, and nothing else moves elements at all.
-//! - **Archetype migration moves the handle, never the block.** A row travels
-//!   bitwise between archetypes, so the handle's bytes move and its reference
-//!   count does not change; a component's elements stay exactly where they
-//!   were across structural changes.
-//! - **Resizing is the one operation that can retire a block**, and it is
-//!   therefore the operation that ends any outstanding element view: take a
-//!   view, use it, drop it before resizing. (Views taken through one handle
-//!   remain valid while shared handles exist, because the block stays alive.)
-//! - **A view never outlives the frame it was taken in.** Handles are
-//!   re-read from the row each frame; nothing caches an element pointer
-//!   across a reload or a frame boundary.
-//!
-//! Element writes through one handle while another exists are safe by
-//! construction - the writer copies first - but they are not *observed* by a
-//! `&[T]` borrowed from the other handle before that copy, exactly as with
-//! `Cow::to_mut` or `Arc::make_mut`.
+//! - a block's address is stable for as long as any handle to it exists;
+//! - an archetype migration moves the handle bitwise and never the block, so a
+//!   component's elements stay where they were across structural changes;
+//! - resizing is the one operation that can retire a block, and therefore the
+//!   one that ends an outstanding element view: take a view, use it, drop it
+//!   before resizing (a view through one handle stays valid while another
+//!   handle shares the block);
+//! - nothing caches an element pointer across a reload or a frame boundary.
 
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
@@ -74,16 +49,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// The handle is `#[repr(C)]` with the words `(ptr, len, cap)` in that order:
 /// the C# mirror reads them directly out of the component row, so managed code
-/// iterates the live elements with zero boundary calls, and the editor reads
-/// the count the same way.
+/// iterates the live elements with zero boundary calls.
 ///
 /// `T: Copy` is a hard requirement, not a convenience: elements are memcpy'd
 /// between blocks and the last release frees the block without running drop
-/// glue, so a type owning anything would leak. Types with a destructor do not
-/// compile into a buffer at all.
-///
-/// See the module documentation for the address-stability contract this type
-/// upholds.
+/// glue, so a type owning anything would leak and does not compile into a
+/// buffer at all.
 #[repr(C)]
 pub struct DynamicBuffer<T: Copy> {
     /// Element area of the block this handle owns a reference to; null while
@@ -154,9 +125,9 @@ impl<T: Copy> DynamicBuffer<T> {
 
     /// Pointer to the first element, for FFI trampolines and mirror views.
     ///
-    /// Null while the buffer is empty; a caller that hands this to managed
-    /// code must pair it with [`Self::len`] and treat a zero length as no
-    /// view.
+    /// Null only when the buffer owns no block (`new`, or `with_capacity(0)`);
+    /// a caller that hands this to managed code must pair it with [`Self::len`]
+    /// and treat a zero length as no view.
     pub fn as_ptr(&self) -> *const T {
         self.ptr
     }
@@ -367,9 +338,10 @@ impl<T: Copy> Default for DynamicBuffer<T> {
 
 /// Cloning a buffer retains its block instead of copying it.
 ///
-/// This is what makes an archetype move copy the handle and not the elements:
-/// both the moved-from and the moved-to component refer to the same block
-/// until one of them writes, at which point that one copies first.
+/// Duplicating a component therefore duplicates the handle and never the
+/// elements; an archetype migration does not even call `Clone`, because a row
+/// travels bitwise. Either way the two handles share one block until one of
+/// them writes, at which point that one copies first.
 impl<T: Copy> Clone for DynamicBuffer<T> {
     fn clone(&self) -> Self {
         if !self.ptr.is_null() {

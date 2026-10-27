@@ -16,8 +16,9 @@
 //! active. Pointers returned in [`ComponentChunk`] remain owned by the active
 //! world's archetype and are only valid for the duration of the managed
 //! invocation. Entity rows arrive in `ComponentChunk::entities`, a const slot,
-//! and only for an archetype a validated term already served in the same
-//! invocation - the entity path cannot be used to probe arbitrary archetypes.
+//! and the archetype-scoped path serves them only for an archetype a validated
+//! term already reached in the same invocation - that path cannot be used to
+//! probe arbitrary archetypes.
 
 // External crates
 use pill_core::telemetry::telemetry_target;
@@ -127,8 +128,7 @@ fn write_entity_chunk(
 /// The binding was built from a layout the live column no longer matches - the
 /// module reloaded with a new schema, or a mirror arrived against a stale one.
 /// A wrong-size chunk would be read as the managed mirror's fields, so the
-/// request fails closed here; this replaces a `debug_assert_eq!` that aborted
-/// debug hosts and vanished entirely in release.
+/// request fails closed here and the mismatch is logged.
 fn module_binding_matches_live_column(
     component_id: ComponentId,
     binding_size: usize,
@@ -239,12 +239,9 @@ fn ffi_get_component_chunk_guarded(
 
 /// Panic-guarded entry point for [`ffi_get_component_chunk_guarded`].
 ///
-/// A panic crossing an `extern "C"` boundary aborts the process. The
-/// managed side already has a per-system error channel built for a
-/// misbehaving system, so an engine assertion reached through this
-/// callback reports `5` - the status this callback already
-/// uses for a call it could not serve - and lets the frame's error path
-/// name the system, rather than killing the host mid-frame.
+/// A panic crossing the `extern "C"` boundary would abort the process; it is
+/// logged and reported as `5` instead, so the frame's error path names the
+/// system and the host keeps running.
 pub(super) extern "C" fn ffi_get_component_chunk(
     key_low: u64,
     key_high: u64,
@@ -383,12 +380,9 @@ fn ffi_get_archetype_chunk_guarded(
 
 /// Panic-guarded entry point for [`ffi_get_archetype_chunk_guarded`].
 ///
-/// A panic crossing an `extern "C"` boundary aborts the process. The
-/// managed side already has a per-system error channel built for a
-/// misbehaving system, so an engine assertion reached through this
-/// callback reports `5` - the status this callback already
-/// uses for a call it could not serve - and lets the frame's error path
-/// name the system, rather than killing the host mid-frame.
+/// A panic crossing the `extern "C"` boundary would abort the process; it is
+/// logged and reported as `5` instead, so the frame's error path names the
+/// system and the host keeps running.
 pub(super) extern "C" fn ffi_get_archetype_chunk(
     archetype_low: u64,
     archetype_high: u64,
@@ -440,12 +434,9 @@ fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -
 
 /// Panic-guarded entry point for [`ffi_get_entity_chunk_guarded`].
 ///
-/// A panic crossing an `extern "C"` boundary aborts the process. The
-/// managed side already has a per-system error channel built for a
-/// misbehaving system, so an engine assertion reached through this
-/// callback reports `5` - the status this callback already
-/// uses for a call it could not serve - and lets the frame's error path
-/// name the system, rather than killing the host mid-frame.
+/// A panic crossing the `extern "C"` boundary would abort the process; it is
+/// logged and reported as `5` instead, so the frame's error path names the
+/// system and the host keeps running.
 pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
     super::context::guard_managed_callback("ffi_get_entity_chunk", 5, || {
         ffi_get_entity_chunk_guarded(chunk_index, output)
@@ -476,12 +467,9 @@ fn ffi_entity_count_guarded(output: *mut u32) -> u8 {
 
 /// Panic-guarded entry point for [`ffi_entity_count_guarded`].
 ///
-/// A panic crossing an `extern "C"` boundary aborts the process. The
-/// managed side already has a per-system error channel built for a
-/// misbehaving system, so an engine assertion reached through this
-/// callback reports `5` - the status this callback already
-/// uses for a call it could not serve - and lets the frame's error path
-/// name the system, rather than killing the host mid-frame.
+/// A panic crossing the `extern "C"` boundary would abort the process; it is
+/// logged and reported as `5` instead, so the frame's error path names the
+/// system and the host keeps running.
 pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
     super::context::guard_managed_callback("ffi_entity_count", 5, || {
         ffi_entity_count_guarded(output)
@@ -495,8 +483,7 @@ pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
 /// scheduled, and `5` a half was missing or the call could not be served.
 ///
 /// Two halves rather than a `u128`: no C ABI in the table carries one, and the
-/// managed side re-assembles the pair into the hex form saved data uses
-/// (W-0048 Stage 5).
+/// managed side re-assembles the pair into the hex form saved data uses.
 fn ffi_entity_stable_id_guarded(entity: *const Entity, low: *mut u64, high: *mut u64) -> u8 {
     if entity.is_null() || low.is_null() || high.is_null() {
         return 5;

@@ -3,45 +3,36 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines [`Input`], the engine-owned input resource, and the plain-data
-//!   vocabulary it is fed with: [`InputEvent`], [`KeyCode`], [`MouseButton`],
-//!   [`Modifiers`], [`GamepadButton`], [`GamepadAxis`], [`PlayerId`].
-//! - Tracks, per frame, what is held and what was pressed or released since the
-//!   previous frame, plus the cursor, mouse motion and scroll accumulated over
-//!   it.
-//! - Queues rumble requests from systems for the frontend that owns the
-//!   gamepads to play.
+//! - Defines [`Input`], the engine-owned resource, and its plain-data
+//!   vocabulary ([`InputEvent`], [`KeyCode`], gamepad and mouse types).
+//! - Tracks, per frame, what is held, what was pressed or released since the
+//!   previous frame, and the cursor, motion and scroll accumulated over it;
+//!   queues rumble requests for the frontend that owns the gamepads.
 //!
 //! # Design
 //!
-//! The engine knows no windowing or gamepad library. A frontend translates its
+//! The engine knows no windowing or gamepad library: a frontend translates its
 //! platform's events (winit, the editor's DOM, gilrs) into [`InputEvent`]s and
-//! queues them between frames through
+//! queues them through
 //! [`Engine::push_input_event`](crate::engine::Engine::push_input_event). The
-//! engine applies the queue at the top of the next frame, right after advancing
-//! [`Time`](crate::time::Time) and for the same reason: the scheduler orders
+//! queue is applied at the top of the next frame, right after advancing
+//! [`Time`](crate::time::Time) and for the same reason - the scheduler orders
 //! systems independently of registration, so an "input system" could run after
-//! its readers. Every system in a frame therefore sees the same input.
+//! its readers - and every system therefore sees the same input. The type lives
+//! in the engine core, the one shared dylib every artifact links, so a project
+//! DLL reads the host's instance through `Res<Input>` across a reload.
 //!
 //! Key codes name physical keys (the W3C `KeyboardEvent.code` vocabulary, as
 //! winit does), not the characters a layout produces: `KeyW` is the key left of
-//! `KeyE` on every layout, which is what movement bindings want. Text entry is
-//! covered separately: [`InputEvent::TextInput`] and [`InputEvent::ImeCommit`]
-//! carry committed characters, and [`InputEvent::ImePreedit`] carries the
-//! composition in progress.
+//! `KeyE` on every layout, which is what movement bindings want. Text arrives
+//! separately, through `InputEvent::TextInput`, `ImeCommit` and `ImePreedit`.
 //!
-//! The resource is defined in `pill_engine`, which every artifact compiles
-//! identically, so a project DLL reads the host's instance through `Res<Input>`
-//! across a reload, exactly like `Time`.
-//!
-//! Frame semantics:
-//! - `*_held`: down at the start of this frame.
-//! - `*_pressed` / `*_released`: changed since the previous frame. A press and
-//!   a release inside one frame report both, so a short tap is never lost.
-//!   Operating-system key repeat does not produce new presses.
-//! - Mouse motion and scroll add up over the frame; the cursor position is the
-//!   latest one. Committed text adds up in the same way; the modifier state
-//!   and the IME composition are the latest reported ones.
+//! Frame semantics: `*_held` is down at the start of the frame; `*_pressed` and
+//! `*_released` changed since the previous one (a press and a release inside
+//! one frame report both, so a short tap is never lost, and operating-system
+//! key repeat produces no new press). Motion, scroll and committed text add up
+//! over the frame; the cursor position, modifier state and IME composition are
+//! the latest reported ones.
 
 // Standard library
 use std::time::Duration;
@@ -401,10 +392,9 @@ pub enum InputEvent {
     },
     /// A held key repeated, as the operating system reports it.
     ///
-    /// A repeat is not a new press: [`Input`] tracks a held key exactly as it
-    /// did without this event. Frontends deliver it so text fields and
-    /// navigation can respond to a held key; a game that ignores it sees no
-    /// change.
+    /// A repeat is not a new press or release: [`Input`] leaves the held and
+    /// edge state alone. Frontends deliver it so text fields and navigation can
+    /// respond to a held key; a game that ignores it sees no change.
     KeyRepeat {
         /// Which key.
         key: KeyCode,

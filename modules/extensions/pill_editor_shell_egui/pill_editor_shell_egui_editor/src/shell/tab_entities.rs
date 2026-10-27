@@ -3,19 +3,20 @@
 //! # Responsibilities
 //!
 //! - `entity_rows`: the rows the tab lists, from the snapshot's entity list.
-//! - `entities_tab`: the rows, each a selection move, over the tab's empty strip's menu.
+//! - `entities_tab`: the rows with their selection and context menus, and the
+//!   empty strip below them.
 //! - `entity_menu_items`: the row menu's create and delete actions.
 //! - `remember_hierarchy_row_rect`: each row's rectangle, logged for the suites.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths: a generated patch crate replays this
+//! file's top-level `use` lines, so a `super::`-relative glob would not
+//! resolve there.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The payload a Hierarchy row hands an entity reference row when dragged
-/// (W-0048 Stage 6).
+/// The payload an Entities row drags onto an Inspector entity-reference field.
 ///
 /// A newtype rather than the bare handle: egui matches a drop by payload
 /// type, and an entity must not be mistaken for the path string an asset tile
@@ -23,9 +24,10 @@ use pill_editor_shell_egui_editor::shell::*;
 #[derive(Clone, Copy, Debug)]
 pub struct DraggedEntity(pub Entity);
 
-/// Record a Hierarchy row's rectangle in the shell's session, returning
-/// nothing: a row logs its rectangle on its first draw and whenever it moves,
-/// so a suite can drag from a row it cannot otherwise locate.
+/// Record an Entities row's rectangle in the shell's session.
+///
+/// The row logs its rectangle on its first draw and whenever it moves, so a
+/// suite can drag from a row it cannot otherwise locate.
 pub fn remember_hierarchy_row_rect(
     session: &mut InspectorSession,
     entity: Entity,
@@ -71,7 +73,7 @@ pub fn entity_rows(snapshot: &EditorSnapshot) -> Vec<(Entity, String)> {
 }
 
 /// The entity menu: New Entity everywhere, Delete Entity for the row under
-/// the pointer. Both edits are recorded, so one undo step reverses them.
+/// the pointer. Both are recorded edits, so an undo reverses either.
 pub fn entity_menu_items(
     ui: &mut egui::Ui,
     entity: Option<Entity>,
@@ -107,9 +109,9 @@ pub fn entity_menu_items(
     }
 }
 
-/// The Entities tab: the world's entities; a click selects one, a right
-/// click selects it and opens its menu - the recorded, undoable create and
-/// delete the native Hierarchy carries as buttons.
+/// The Entities tab: the world's entities; a click selects one and a right
+/// click selects it and opens its menu, whose create and delete are recorded
+/// and undoable.
 #[pill_hot_fn]
 pub fn entities_tab(
     ui: &mut egui::Ui,
@@ -128,14 +130,14 @@ pub fn entities_tab(
         for (entity, label) in entity_rows(snapshot) {
             let selected = selection.contains(entity);
             let response = ui.selectable_label(selected, label);
-            // The reference's selected row: egui fills it with the theme's
-            // `selection` colour, and the accent bar marks its left edge.
+            // The selected row: egui fills it with the theme's `selection`
+            // colour, and the accent bar marks its left edge.
             if selected {
                 style::selected_row_bar(ui, response.rect);
             }
-            // One layer senses the row's press both ways (W-0049): a press
-            // that moves carries the entity for a drop on a reference field
-            // (W-0048 Stage 6), and a press that does not is the row's click.
+            // One layer senses the row's press both ways: a press that moves
+            // carries the entity for a drop on a reference field, and a press
+            // that does not is the row's click.
             let row = ui.interact(
                 response.rect,
                 response.id.with("dragged-entity"),
@@ -147,8 +149,8 @@ pub fn entities_tab(
                 let click = ui.input(|input| click_from_modifiers(&input.modifiers));
                 select_entity_click(selection, entity, click, &rows);
             }
-            // A right click picks the row it opens the menu for, without
-            // disturbing a set the person is about to edit.
+            // A right click resets the selection to the row it opens the
+            // menu for.
             if row.secondary_clicked() {
                 select_entity(selection, entity);
             }

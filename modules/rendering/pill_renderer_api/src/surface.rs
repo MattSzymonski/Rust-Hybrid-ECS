@@ -19,12 +19,12 @@
 //! second kind, which is what keeps it out of the world.
 //!
 //! Presentation pacing belongs to the frontend, because only it knows the
-//! window system: a Wayland subsurface is paced by its own frame callbacks,
-//! and presenting into it before the compositor asks blocks under Mesa's FIFO
-//! mode. The frontend therefore tells the renderer, per surface and per frame,
-//! whether that surface may present now ([`crate::PillRenderer::set_surface_ready`]),
-//! and the renderer skips a surface that may not - one blocked surface never
-//! stalls another or the event loop.
+//! window system: presenting into a Wayland subsurface before the compositor
+//! asks blocks under Mesa's FIFO mode. The frontend therefore tells the
+//! renderer, per surface and per frame, whether that surface may present now
+//! ([`crate::PillRenderer::set_surface_ready`]), and the renderer skips a
+//! surface that may not - one blocked surface never stalls another or the
+//! event loop.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -131,7 +131,7 @@ pub struct SurfaceView {
     pub transform: TransformComponent,
 }
 
-/// Resolve one binding against the world's cameras: `cameras` yields each
+/// Resolves one binding against the world's cameras: `cameras` yields each
 /// camera entity with its camera and transform.
 ///
 /// A [`CameraBinding::View`] resolves to itself; an entity binding resolves to

@@ -11,10 +11,10 @@
 //! # Design
 //!
 //! The renderer never sees a window type, only [`RawWindowData`]: that keeps a
-//! windowing crate out of the renderer, so the standalone host's winit window
-//! and the editor's tao window attach the same way. The handles do not keep
-//! the window alive, so the window is returned with the renderer as an
-//! [`AttachedWindow`], and whoever stores the pair drops the renderer first.
+//! windowing crate out of the renderer, so each frontend attaches its own
+//! window type the same way. The handles do not keep the window alive, so the
+//! window is returned with the renderer as an [`AttachedWindow`], and whoever
+//! stores the pair drops the renderer first.
 
 // Standard library
 use std::any::Any;

@@ -323,7 +323,7 @@ pub fn rendering_system(
         .get_mut()
         .map(|mut requests| std::mem::take(&mut requests.pending))
         .unwrap_or_default();
-    // Previews too (W-0049 Stage 11): the renderer draws at most one per
+    // Previews too: the renderer draws at most one per
     // frame, oldest first.
     frame.preview_requests = preview_requests
         .get_mut()
@@ -379,7 +379,7 @@ pub fn rendering_system(
     // through a world camera never does.
     frame.grid =
         bindings.and_then(|bindings| pill_renderer_api::frame_grid(bindings, bindings.grid));
-    // The editor's views, for the chrome that only belongs on them (W-0049):
+    // The editor's views, for the chrome that only belongs on them:
     // the gizmo handles and the selection outlines. The answer is the
     // view-bound set whether or not the grid is on, so turning the grid off
     // never moves the gizmo onto the game's surface.
@@ -391,9 +391,8 @@ pub fn rendering_system(
     // project installed its own egui UI, and then that UI is what the frame
     // carries - including on a frame it drew nothing in, because a game that
     // owns the UI does not want an empty frame read as "no UI". A world that
-    // never installed a slot carries none (W-0043 retired the `pill_ui`
-    // producer that used to fill the other arm). The choice is stated once, not
-    // per frame.
+    // never installed a slot carries none. The choice is stated once, not per
+    // frame.
     match ui_slot.get_mut() {
         Some(mut slot) => {
             // A rebuilt painter begins with an empty texture map while the
@@ -416,8 +415,8 @@ pub fn rendering_system(
     // The last mesh and material pair resolved, with the draw order it gave
     // (`None` when either handle was dead). Drawables that share a mesh and a
     // material are usually many and adjacent in an archetype, so remembering
-    // one pair skips almost every asset lookup; with 50,000 pills those
-    // lookups were most of this system's time.
+    // one pair skips almost every asset lookup - and those lookups are most of
+    // this system's time once thousands of draws share one pair.
     let mut last_resolved: Option<(Handle<Mesh>, Handle<Material>, Option<u8>)> = None;
     for (entity, transform, renderer) in objects.iter_mut() {
         let rendering_order = match last_resolved {

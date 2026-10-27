@@ -1,4 +1,4 @@
-//! The windows module panels ask the shell for (W-0038 Stage 13).
+//! The windows module panels ask the shell for.
 //!
 //! # Responsibilities
 //!
@@ -15,10 +15,10 @@
 //!
 //! The shell owns the window (position, lifetime, modality) and the panel owns
 //! the content. Windows live in [`PanelWindowSession`], a session resource, so
-//! a shell reload keeps them open; only the owning module's unload closes them,
-//! and the panel's own next draw re-opens what it still wants - which is what
-//! makes "closes on reload, reopens when registered again" fall out of the
-//! ownership rather than needing a rule.
+//! a shell reload keeps them open. A window closes when the user closes it,
+//! when a modal is answered, or when the owning module unloads and its draw
+//! function's image is gone; a panel that wants it back asks again on its next
+//! draw.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -35,8 +35,10 @@ pub struct PanelFeed {
 
 /// Draw every open panel window and publish its rectangle.
 ///
-/// `commands` collects what the windows ask for; the caller applies the window
-/// ones (which need the slot this function knows) and forwards the rest.
+/// `commands` collects what the windows ask for; the caller forwards them to
+/// the executable at the frame boundary. A window command queued from inside
+/// a window has no slot to attribute it to, so only a tab body's own requests
+/// open or close windows.
 pub fn panel_windows(
     context: &egui::Context,
     windows: &mut PanelWindowSession,
@@ -47,8 +49,7 @@ pub fn panel_windows(
     regions: &mut Vec<ShellRect>,
 ) {
     // A window from a module whose panels are gone has nothing to draw with:
-    // the draw function's image is unmapped (Stage 11's rule), so the window
-    // goes with it.
+    // the draw function's image is unmapped, so the window goes with it.
     windows.windows.retain(|window| registry.alive(window.slot));
     if windows.windows.is_empty() {
         return;

@@ -5,9 +5,9 @@
 //! - [`OrbitCamera`]: one scene view's view state - the pivot it orbits, its
 //!   yaw, pitch and distance - and the eye and basis derived from them.
 //! - The four gestures a camera answers - [`OrbitCamera::orbit`],
-//!   [`OrbitCamera::pan`], [`OrbitCamera::dolly`] and [`OrbitCamera::zoom`] -
-//!   each clamped so the view never flips over a pole or collapses onto its
-//!   pivot.
+//!   [`OrbitCamera::pan`], [`OrbitCamera::dolly`] and [`OrbitCamera::zoom`]:
+//!   orbit stops the pitch short of the poles, and dolly and zoom keep the
+//!   distance inside its range.
 //! - [`navigation_binding`]: which gesture a mouse button and the keyboard
 //!   modifiers name under a keymap preset - Blender's by default.
 //!
@@ -17,8 +17,8 @@
 //! surface, and a camera's numbers are testable with no window. The presets
 //! are a table rather than code inside the event handler, so a preset is one
 //! row here and the preferences file only has to name it. A viewport's camera
-//! lives beside its window (the two scene views navigate independently), and
-//! only the *active* viewport's camera receives a gesture.
+//! lives beside its window (the scene views navigate independently), and only
+//! the *active* viewport's camera receives a gesture.
 
 // Current crate
 use crate::commands::KeymapPreset;
@@ -54,8 +54,8 @@ const DEFAULT_DISTANCE: f32 = 16.0;
 /// One scene viewport's orbit camera.
 ///
 /// The camera never enters the world: the scene surface is bound to it as a
-/// view camera, so project systems can neither see nor move it. Both scene
-/// views keep their own, which is what makes navigation "the active
+/// view camera, so project systems can neither see nor move it. Each scene
+/// view keeps its own, which is what makes navigation "the active
 /// viewport's" rather than the editor's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrbitCamera {

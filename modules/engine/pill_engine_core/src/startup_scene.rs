@@ -11,12 +11,12 @@
 //!
 //! # Design
 //!
-//! Order is the whole point of this module. A project's `init` fills its world
-//! up to the counts it expects, so a scene loaded after it would double every
-//! entity; loaded before registration it would find no component types to
-//! attach. The generated entry points therefore drain this request right after
-//! registering the artifact's components, and a shipping build does the same
-//! between its modules and its project.
+//! A project's `init` fills its world up to the counts it expects, so a scene
+//! loaded after it would double every entity; loaded before registration it
+//! would find no component types to attach. The generated entry points
+//! therefore drain this request right after registering the artifact's
+//! components, and a shipping build does the same between its modules and its
+//! project.
 //!
 //! A failure is logged and dropped rather than propagated: a missing or
 //! unreadable scene must not stop a project from starting with its own scene.
@@ -35,7 +35,7 @@ use crate::world::World;
 
 /// A scene the front end asked the engine to load before the project starts.
 ///
-/// Inserted as a world resource, so it survives nothing: the load consumes it.
+/// Inserted as a world resource; the load consumes it.
 pub struct StartupScene {
     /// The scene's path below the project's asset directory, as
     /// `project_settings.yaml` names it.

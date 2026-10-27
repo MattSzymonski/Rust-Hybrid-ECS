@@ -6,7 +6,7 @@
 //!   `pill_engine::mirror` defines - `(args, ret) -> status` - reading each
 //!   argument from its 16-byte slot and writing the result to `ret`.
 //! - Tag every argument and the result for the C# codegen, from the closed
-//!   vocabulary documented on [`lower_parameter`] and [`lower_return`].
+//!   vocabulary `lower_parameter` and `lower_return` accept.
 //! - Emit what a mirrored type needs: the drop trampoline and asset store
 //!   operations of an object, the encodings of an enum or a value type, and
 //!   the shared name of a resource.
@@ -14,14 +14,13 @@
 //! # Design
 //!
 //! The lowering is syntactic, as every proc macro's must be: a parameter is
-//! classified by how it is written. Shapes with one meaning - `&str`,
-//! `impl Into<String>`, `Vec<T>`, `Handle<T>`, a tuple of primitives - are
-//! read here directly. A named type taken by value is read through
-//! `MirrorValue`, which the attribute declaring that type implemented, so a
-//! type nobody mirrored is a compile error at the trampoline rather than a
-//! wrong read at run time. A named type taken by reference crosses as the
-//! address of the value, whichever kind of type it is - an object's box, a
-//! component row, a resource - which is why the codegen, not this macro,
+//! classified by how it is written, and shapes with one meaning - `&str`,
+//! `impl Into<String>`, `Vec<T>`, `Handle<T>`, a tuple of primitives - are read
+//! here directly. A named type taken by value is read through `MirrorValue`,
+//! which the attribute declaring that type implemented, so a type nobody
+//! mirrored is a compile error here rather than a wrong read at run time. A named
+//! type taken by reference crosses as the address of the value - an object's box,
+//! a component row, a resource - which is why the codegen, not this macro,
 //! decides what the C# parameter looks like.
 
 // External crates

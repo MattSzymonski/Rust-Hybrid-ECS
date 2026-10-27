@@ -1,4 +1,4 @@
-//! The editor clipboard's structured payloads (Stage 18, D28).
+//! The editor clipboard's structured payloads.
 //!
 //! # Responsibilities
 //! - One versioned JSON document that names components by type name and
@@ -86,7 +86,7 @@ pub struct SeededComponent {
 }
 
 /// The canonical token of a field value, or `None` for values the payload
-/// does not carry (heap sequences, opaque bytes, struct arrays, and asset or
+/// cannot carry (arrays, heap lists, text, opaque payloads, and asset or
 /// entity references, which address a slot of this process only).
 pub fn format_value(value: &FieldValue) -> Option<String> {
     Some(match value {
@@ -205,8 +205,7 @@ pub fn encode_asset(path: &str) -> String {
     document.to_string()
 }
 
-/// The clipboard commands the Edit menu and the shortcuts name (W-0038
-/// Stage 17).
+/// The clipboard commands the Edit menu and the shortcuts name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClipboardAction {
     /// Put the selection on the clipboard.
@@ -342,21 +341,14 @@ pub struct PastePlan {
     pub note: String,
 }
 
-/// Build the recorded step a paste applies (W-0038 Stage 17).
-///
-/// - An entity payload becomes one `CreateEntity` seeded with the components
-///   the payload carries - the same command the Entities tab's "new entity"
-///   uses, so undo removes the pasted entity.
-/// - A component payload becomes `AddComponent` plus one `SetField` per
-///   carried field, on the selected entity: one step, undone in one.
-/// - A field payload becomes one `SetField` on the selected entity.
-/// - An asset payload moves the selection onto the path (no command: nothing
-///   in the world changed).
+/// Build the recorded step a paste applies: one `CreateEntity` for an entity
+/// payload, `AddComponent` plus `SetField`s for a component, one `SetField`
+/// for a field, and no command for an asset (it only moves the selection).
 ///
 /// A component this build does not register (or cannot add) is skipped and
-/// named in [`PastePlan::skipped`], never silently dropped; a field the live
-/// layout does not carry is skipped the same way, because a paste across two
-/// versions of a component must not write garbage into a reordered image.
+/// named in [`PastePlan::skipped`]; a field the live layout does not carry is
+/// skipped the same way, because a paste across two versions of a component
+/// must not write garbage into a reordered image.
 pub fn paste_plan(
     payload: &Payload,
     selection: &EditorSelection,
@@ -765,7 +757,7 @@ mod tests {
     }
 
     /// Pasting an entity creates one, seeded with what the payload carried, and
-    /// names the components this build does not register (W-0038 Stage 17).
+    /// names the components this build does not register.
     #[test]
     fn an_entity_paste_seeds_a_create_and_names_what_it_skipped() {
         let text = concat!(
@@ -796,7 +788,7 @@ mod tests {
     }
 
     /// A component paste is `AddComponent` plus one `SetField` per field: one
-    /// recorded step, undone in one (W-0038 Stage 17).
+    /// recorded step, undone in one.
     #[test]
     fn a_component_paste_is_one_step() {
         let entity = Entity::from_raw(2, 0);

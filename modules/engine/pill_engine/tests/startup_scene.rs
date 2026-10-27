@@ -6,7 +6,7 @@
 //! - Prove the order: a scene queued before the artifact initializes is in the
 //!   world by the time the project's own `init` body runs, so a project that
 //!   seeds "up to a count" finds the scene's entities instead of adding its
-//!   own over them (W-0048 Stage 9).
+//!   own over them.
 //!
 //! # Design
 //!
@@ -119,7 +119,7 @@ fn the_startup_scene_is_in_the_world_before_init_runs() {
 
     let _ = std::fs::remove_dir_all(Path::new(&root));
 }
-/// A project that queues nothing starts with its own world, as before.
+/// A project that queues nothing initializes against its own world.
 #[test]
 fn a_project_without_a_startup_scene_is_untouched() {
     let mut engine = Engine::new();

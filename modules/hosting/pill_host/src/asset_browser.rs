@@ -4,17 +4,17 @@
 //!
 //! # Responsibilities
 //!
-//! - List the project's `res` directory as a tree ([`list_assets`]): folders
-//!   and files, `.meta` sidecars hidden, each file with its asset type, whether
-//!   it is loaded, and its guid.
-//! - Read an asset's import settings - or a standalone asset's own document -
-//!   as JSON ([`asset_settings`]), and save edited ones back to disk
-//!   ([`save_asset_settings`]).
-//! - Move or rename an asset together with its `.meta` ([`move_asset`]).
-//! - Create a new standalone asset - a material, a render pass - from its
-//!   type's default document ([`create_standalone_asset`]), with every check
-//!   on the name and folder done here rather than in a UI.
-//! - Refuse every path outside `res`.
+//! - List the project's `res` as a tree ([`list_assets`]): folders and files,
+//!   `.meta` sidecars hidden, each file with its asset type, load state and
+//!   guid - then the read-only `res` of every loaded module, naming its root.
+//! - Read and save an asset's import settings, or a standalone asset's own
+//!   document, as JSON ([`asset_settings`], [`save_asset_settings`]), and move
+//!   an asset together with its `.meta` ([`move_asset`]).
+//! - Create a standalone asset from its type's default document
+//!   ([`create_standalone_asset`]), with every check on the name and folder
+//!   done here rather than in a UI.
+//! - Refuse every path outside `res`; a module's resources are listed
+//!   read-only, and the write functions reach only the project's own `res`.
 //!
 //! # Design
 //!
@@ -44,15 +44,21 @@ pub use pill_engine::asset_metadata::{checked_relative, standalone_file_name};
 /// The suffix of a metadata sidecar.
 const METADATA_SUFFIX: &str = ".meta";
 
-/// One row of the `res` tree.
+/// One row of an asset tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetEntry {
-    /// The path relative to `res`, `/`-separated; a folder's has no trailing
-    /// slash.
+    /// The root the entry came from: empty for the project's own `res`, else
+    /// the name of the module whose resources it is.
+    pub root: String,
+    /// Whether the entry is one of a module's resources: listed and shown, but
+    /// never written.
+    pub read_only: bool,
+    /// The path relative to its root, `/`-separated; a folder's has no
+    /// trailing slash.
     pub path: String,
     /// The last component of [`Self::path`].
     pub name: String,
-    /// How many folders deep the entry is (`0` directly in `res`).
+    /// How many folders deep the entry is (`0` directly in the root).
     pub depth: usize,
     /// Whether this is a folder.
     pub is_directory: bool,
@@ -68,13 +74,43 @@ pub struct AssetEntry {
 
 /// Every folder and file under `asset_directory`, depth first, folders before
 /// files and each level sorted by name; `.meta` files and dot-files left out.
+///
+/// The project's tree comes first, then one tree per loaded module's read-only
+/// resources ([`pill_engine::asset_store::module_roots`]), each entry naming
+/// its root so a UI can tell them apart.
 pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
+    let mut entries = Vec::new();
+    append_root(world, "", asset_directory, false, &[], &mut entries);
+    for root in pill_engine::asset_store::module_roots() {
+        append_root(
+            world,
+            &root.module,
+            &root.directory,
+            true,
+            &root.hidden,
+            &mut entries,
+        );
+    }
+    entries
+}
+
+/// Walk one root and push its entries, naming it and whether it is read-only.
+///
+/// `hidden` names the extensions the root leaves out of its tree - a module's
+/// cooked output beside its sources - and never stops the store answering them.
+fn append_root(
+    world: &World,
+    root_label: &str,
+    directory: &Path,
+    read_only: bool,
+    hidden: &[String],
+    entries: &mut Vec<AssetEntry>,
+) {
     let registry = world.get_resource::<ImportRegistry>();
     let assets = world.get_resource::<AssetManager>();
     let database = world.get_resource::<pill_engine::AssetDatabase>();
-    let mut entries = Vec::new();
     visit(
-        asset_directory,
+        directory,
         Path::new(""),
         0,
         &mut |relative, is_directory, depth| {
@@ -84,6 +120,8 @@ pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let mut entry = AssetEntry {
+                root: root_label.to_owned(),
+                read_only,
                 path,
                 name,
                 depth,
@@ -98,22 +136,30 @@ pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
                     .extension()
                     .and_then(|extension| extension.to_str())
                     .unwrap_or_default();
+                // A cooked file beside its source is a build product: the
+                // store reads it by name, the tree does not show it.
+                if hidden
+                    .iter()
+                    .any(|hidden| hidden.eq_ignore_ascii_case(extension))
+                {
+                    return;
+                }
                 if let Some(registry) = registry {
                     entry.type_name = registry.type_for_extension(extension).map(str::to_owned);
                     entry.standalone = registry.is_standalone_extension(extension);
                     entry.loaded =
                         assets.is_some_and(|assets| registry.is_loaded(assets, relative));
                 }
-                // The asset database knows every indexed guid; reading the
-                // header covers a host without one and a file indexed late.
+                // The asset database knows every indexed guid; reading the header
+                // covers a host without one and a file indexed late.
                 entry.guid = database
                     .and_then(|database| database.by_path(&entry.path))
                     .map(|record| record.guid.to_string())
                     .or_else(|| {
                         let header = if entry.standalone {
-                            asset_directory.join(relative)
+                            directory.join(relative)
                         } else {
-                            asset_directory.join(format!("{}{METADATA_SUFFIX}", relative.display()))
+                            directory.join(format!("{}{METADATA_SUFFIX}", relative.display()))
                         };
                         read_guid(&header)
                     });
@@ -121,7 +167,6 @@ pub fn list_assets(world: &World, asset_directory: &Path) -> Vec<AssetEntry> {
             entries.push(entry);
         },
     );
-    entries
 }
 
 /// Walk `root/relative` recursively, calling `visit(relative, is_directory,
@@ -498,6 +543,126 @@ mod tests {
                 extension: "note".to_owned(),
             }]
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A loaded module's resources come after the project's own entries, each
+    /// labelled with its module and marked read-only.
+    #[test]
+    fn a_module_root_is_listed_read_only() {
+        let _mounted = mount_lock();
+        let (world, root) = create_fixture("module-root");
+        let module = std::env::temp_dir().join(format!("pill-module-res-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&module);
+        std::fs::create_dir_all(module.join("overlay")).unwrap();
+        std::fs::write(module.join("overlay/grid.wgsl"), b"grid").unwrap();
+        pill_engine::asset_store::declare_module_root(
+            "pill_test_module",
+            &module,
+            &["overlay/grid.wgsl"],
+        );
+
+        let entries = list_assets(&world, &root);
+
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.root.is_empty())
+                .all(|entry| !entry.read_only),
+            "the project's own assets stay editable"
+        );
+        let module_entries: Vec<&AssetEntry> = entries
+            .iter()
+            .filter(|entry| entry.root == "pill_test_module")
+            .collect();
+        assert!(!module_entries.is_empty(), "the module root is listed");
+        assert!(
+            module_entries.iter().all(|entry| entry.read_only),
+            "every module entry is read-only"
+        );
+        assert!(module_entries
+            .iter()
+            .any(|entry| entry.path == "overlay/grid.wgsl" && !entry.is_directory));
+
+        pill_engine::asset_store::forget_all_module_roots();
+        std::fs::remove_dir_all(&module).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A module contributing two directories lists both under its own name, so
+    /// the panel shows one module row with everything it ships.
+    #[test]
+    fn a_module_with_two_roots_lists_one_tree() {
+        let _mounted = mount_lock();
+        let (world, root) = create_fixture("module-two-roots");
+        let resources =
+            std::env::temp_dir().join(format!("pill-module-res-{}", std::process::id()));
+        let sources = std::env::temp_dir().join(format!("pill-module-src-{}", std::process::id()));
+        for directory in [&resources, &sources] {
+            let _ = std::fs::remove_dir_all(directory);
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(resources.join("default.material"), b"{}").unwrap();
+        std::fs::create_dir_all(sources.join("pipeline")).unwrap();
+        std::fs::write(sources.join("pipeline/fragment.hlsl"), b"//").unwrap();
+
+        pill_engine::asset_store::declare_module_root(
+            "pill_two_roots",
+            &resources,
+            &["default.material"],
+        );
+        pill_engine::asset_store::declare_module_root(
+            "pill_two_roots",
+            &sources,
+            &["pipeline/fragment.hlsl"],
+        );
+
+        let entries = list_assets(&world, &root);
+        let paths: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.root == "pill_two_roots" && !entry.is_directory)
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(paths.contains(&"default.material"), "{paths:?}");
+        assert!(paths.contains(&"pipeline/fragment.hlsl"), "{paths:?}");
+
+        pill_engine::asset_store::forget_all_module_roots();
+        std::fs::remove_dir_all(&resources).unwrap();
+        std::fs::remove_dir_all(&sources).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A root's hidden extensions stay out of the tree - a module's cooked
+    /// output beside its sources - while the store still answers them by name.
+    #[test]
+    fn a_root_keeps_its_hidden_extensions_out_of_the_tree() {
+        let _mounted = mount_lock();
+        let (world, root) = create_fixture("module-hidden");
+        let sources =
+            std::env::temp_dir().join(format!("pill-module-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sources);
+        std::fs::create_dir_all(&sources).unwrap();
+        std::fs::write(sources.join("fragment.hlsl"), b"//").unwrap();
+        std::fs::write(sources.join("fragment.wgsl"), b"//").unwrap();
+
+        pill_engine::asset_store::declare_module_root_hiding(
+            "pill_hidden_module",
+            &sources,
+            &["fragment.hlsl"],
+            &["wgsl"],
+        );
+
+        let entries = list_assets(&world, &root);
+        let paths: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry.root == "pill_hidden_module")
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert!(paths.contains(&"fragment.hlsl"), "{paths:?}");
+        assert!(!paths.contains(&"fragment.wgsl"), "{paths:?}");
+
+        pill_engine::asset_store::forget_all_module_roots();
+        std::fs::remove_dir_all(&sources).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -12,20 +12,16 @@
 //!
 //! # Design
 //!
-//! The shared component names ([`Position`], [`Color`],
-//! [`MeshRendererComponent`] and the renderer's other components) resolve to
-//! the Rust types in `pill_engine` and `pill_renderer_api`, which the host
-//! links in every posture, so a headless host binds them exactly as a windowed
-//! one does. Every managed component is addressed by a [`StableComponentId`]
-//! hashed from its canonical full name, and [`ComponentBinding`] records
-//! whether storage is backed by a concrete Rust type or by a managed layout of
-//! raw bytes.
+//! The shared components (`Position`, `Color`, `MeshRendererComponent` and the
+//! rest) resolve to the Rust types the host links in every posture, so a
+//! headless host binds them exactly as a windowed one does. Every managed
+//! component is addressed by a [`StableComponentId`] hashed from its canonical
+//! full name; [`ComponentBinding`] records whether storage is a concrete Rust
+//! type or a managed layout of raw bytes.
 //!
-//! A reload does not have its own apply loop. It hands the binding table and
-//! the arriving declarations to the one pipeline every manifest kind runs
-//! through, along with the actions that make a component a component: what its
-//! aliases resolve against, which live bindings it may retire, and what
-//! registering, migrating, renaming and retiring managed storage do.
+//! A reload has no apply loop of its own: it hands the binding table and the
+//! arriving declarations to the pipeline every manifest kind runs through,
+//! with what the component kind contributes to it.
 
 // Standard library
 use std::collections::HashMap;
@@ -54,30 +50,15 @@ use super::manifest_apply::{BindingTable, ManifestSubject, RenamePredecessor, Se
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
-/// # The derivation chain, in one place
-///
-/// The representations of one managed component type are spelled out here so
-/// they do not have to be traced across three files:
-///
-/// - **Canonical name**: the C# type's full name with dots
-///   (`pill_spline.Spline`). Everything else derives from it.
-/// - **This identity**: [`stable_component_id`] hashes that name with two
-///   FNV-1a passes over different offsets, using the same mixing function as
-///   `pill_engine::component::component_name_hash`; the managed runtime
-///   recomputes the identical value from the identical name in
-///   `Engine.StableIdOf`, which is what lets two separately compiled sides
-///   agree without exchanging anything.
-/// - **The ABI halves**: `component_key` and `component_key_high` carry the
-///   low and high `u64` halves through the C table, because the C ABI has no
-///   128-bit integer; [`Self::from_halves`] restores the value host-side, and
-///   the managed `StableComponentId` record struct stores the same pair.
-/// - **Rust-side names**: a shared component registered from Rust uses `::`
-///   separators, whose hash is a different value - `ModuleExposedComponent`
-///   carries both spellings, and neither is translated into the other.
-///
-/// The engine-side identities (`ComponentId`, `ColumnIdentity`, the registry
-/// and column layout types, the generated mirror) are documented where they
-/// are defined; none of them crosses a binary boundary.
+/// The name is the C# full name with dots (`pill_spline.Spline`), and
+/// [`stable_component_id`] hashes it with the engine's own mixing function;
+/// the managed runtime recomputes the identical value in `Engine.StableIdOf`,
+/// so two separately compiled sides agree without exchanging anything. The C
+/// ABI has no 128-bit integer, so `component_key`/`component_key_high` carry
+/// the two `u64` halves and [`Self::from_halves`] restores them. A shared
+/// component registered from Rust uses `::` separators and hashes to a
+/// different value: `ModuleExposedComponent` carries both spellings and
+/// neither is translated into the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct StableComponentId(
     /// The 128-bit canonical identity value.
@@ -425,7 +406,7 @@ pub(super) fn register_component_manifest(
             "the column just registered must match the binding just stored"
         );
 
-        // Slice G: give the editor the same field vocabulary
+        // Give the editor the same field vocabulary
         // `#[derive(PillComponent)]` produces, so a C# component shows named,
         // editable fields instead of nothing. Re-registration on assembly
         // swap replaces the layout.
@@ -523,7 +504,7 @@ pub(super) struct ManifestApplyReport {
     pub(super) migrated: Vec<String>,
     /// Managed components the manifest added.
     pub(super) added: Vec<String>,
-    /// Managed components renamed from an earlier declaration, as
+    /// Managed components the manifest renamed through an alias, as
     /// `old name -> new name`.
     pub(super) renamed: Vec<String>,
     /// Managed components whose storage was retired because the manifest
@@ -533,7 +514,7 @@ pub(super) struct ManifestApplyReport {
     pub(super) resources_added: Vec<String>,
     /// Managed resources whose layout changed and whose bytes were migrated.
     pub(super) resources_migrated: Vec<String>,
-    /// Managed resources renamed from an earlier declaration, as
+    /// Managed resources the manifest renamed through an alias, as
     /// `old name -> new name`.
     pub(super) resources_renamed: Vec<String>,
     /// Managed resources whose declaration was retired because the manifest
@@ -543,12 +524,12 @@ pub(super) struct ManifestApplyReport {
 
 /// Apply a swapped assembly's component manifest to the live world.
 ///
-/// The reload counterpart of [`register_component_manifest`]. Where startup may
-/// register what it likes, this one has to *migrate*: a managed component whose
-/// layout changed keeps its entities and its rows, and only the bytes move.
+/// The reload counterpart of [`register_component_manifest`]: where startup may
+/// register what it likes, this one has to *migrate*, so a managed component
+/// whose layout changed keeps its entities and its rows and only the bytes
+/// move. What the kind contributes to that pipeline is [`COMPONENT_SUBJECT`].
 ///
-/// Three cases are refused rather than migrated, each for a reason the caller
-/// cannot talk its way out of:
+/// Three cases are refused rather than migrated:
 ///
 /// - a `Native` or `ModuleNative` binding whose layout or schema changed - the
 ///   Rust side did not change, so the mirror is simply wrong;
@@ -559,13 +540,6 @@ pub(super) struct ManifestApplyReport {
 /// A managed component the manifest stopped naming is not refused: its storage
 /// is retired after everything else has applied, so the dev loop does not
 /// demand a restart for a removed type.
-///
-/// The stages themselves - resolve aliases, collect what vanished, resolve
-/// every entry before mutating anything, apply with a journal, unwind on a
-/// refusal, retire last - are [`super::manifest_apply`]'s, shared with the
-/// resource kind. What is component-specific lives in [`COMPONENT_SUBJECT`]:
-/// the identity, the refusals above, and what registering, migrating, renaming
-/// and retiring a managed column actually do.
 ///
 /// # Errors
 ///
@@ -583,8 +557,8 @@ pub(super) fn apply_component_manifest_on_reload(
     // about the manifest's own shape - an ambiguous alias, an entry that cannot
     // be registered as it stands, a table that already disagrees - is raised
     // here, while the world is still untouched. Applying one kind first and
-    // letting the other refuse later is what used to leave a rejected reload's
-    // resources migrated under the generation that kept running.
+    // letting the other refuse later would leave a rejected reload's resources
+    // migrated under the generation that keeps running.
     let prepared_resources = super::resources::prepare_resource_manifest(engine, &resources)?;
     let previous_components = store.read().clone();
     let prepared_components = super::manifest_apply::prepare_manifest(
@@ -1048,10 +1022,8 @@ fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
     }
 }
 
-/// Register one manifest entry as managed descriptor storage with its layout.
-///
 /// Record the asset type each `Handle<T>` field of a managed component
-/// references, as the derive does for a Rust component (W-0048).
+/// references, as the derive does for a Rust component.
 ///
 /// The manifest names `T` by its Rust type path (what its C# mirror carries);
 /// the world records the type's registered name, found through the asset

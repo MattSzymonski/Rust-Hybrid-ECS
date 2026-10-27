@@ -9,19 +9,15 @@
 //!
 //! # Design
 //!
-//! This is the CPU counterpart of the wgpu backend's shader and render pass,
-//! and it deliberately mirrors that structure: collect instances, resolve the
-//! projection, clear, then draw. What the vertex shader did per-vertex -
-//! scaling a unit quad by `size`, offsetting by `position`, and mapping the
-//! result into the target - is done here once per sprite, in
-//! [`project_span`], because an axis-aligned rectangle needs no per-pixel
-//! interpolation at all.
+//! This is the CPU counterpart of the wgpu backend's shader and render pass.
+//! What that backend's vertex shader does per vertex - scaling a unit quad by
+//! `size`, offsetting by `position`, mapping the result into the target - is
+//! done here once per sprite, in [`project_span`], because an axis-aligned
+//! rectangle needs no per-pixel interpolation at all.
 //!
-//! Sprites are opaque rectangles far more often than not, so the inner loop
-//! splits: a fully opaque sprite becomes a `fill` of packed pixels, and only a
-//! translucent one pays for unpack-blend-repack per pixel. On the class of CPU
-//! this renderer targets that distinction is the difference between a
-//! comfortable frame and a missed one.
+//! Sprites are opaque far more often than not, so the inner loop splits: an
+//! opaque sprite becomes a `fill` of packed pixels, and only a translucent one
+//! pays for unpack-blend-repack per pixel.
 //!
 //! There is no depth buffer and no sorting. Sprites paint in the order the ECS
 //! reports them, which is archetype order - the same order the wgpu backend
@@ -53,9 +49,9 @@ const ALPHA_TRANSPARENT: f32 = 0.0;
 
 /// Alpha at or above which a sprite is treated as fully opaque.
 ///
-/// Above this the blend result is indistinguishable after RGB565 quantization,
-/// so taking the fill path costs nothing visually and saves the per-pixel
-/// unpack and repack.
+/// At or above this the blend result is indistinguishable after RGB565
+/// quantization, so taking the fill path costs nothing visually and saves the
+/// per-pixel unpack and repack.
 const ALPHA_OPAQUE: f32 = 0.998;
 
 // =============================================================================
@@ -70,8 +66,7 @@ const ALPHA_OPAQUE: f32 = 0.998;
 pub struct SpriteRasterizer {
     /// Instances collected from the world, reused across frames.
     ///
-    /// Kept as a field purely to avoid reallocating a vector of a few hundred
-    /// records every frame.
+    /// Kept as a field purely to avoid reallocating the vector every frame.
     instances: Vec<SpriteInstance>,
 }
 

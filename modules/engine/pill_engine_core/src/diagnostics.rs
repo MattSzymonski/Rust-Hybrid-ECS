@@ -10,33 +10,18 @@
 //!
 //! # Design
 //!
-//! Nothing is registered while the engine is built: a project asks for the
-//! report by calling the setter, and only that call registers it. It reads the
-//! whole world under exclusive access - a scheduler barrier every frame - and
-//! prints a multi-line block once per interval, so it is a debugging aid rather
-//! than something every build pays for.
-//!
-//! This runs as a real scheduler system rather than a call inside
-//! `process_frame`, so it appears in the system list, is attributed like any
-//! other system, and can be disabled. It needs to read the whole world -
-//! archetypes, registry, resources - which no [`SystemParam`](crate::SystemParam)
-//! exposes, so it is registered through
+//! Nothing is registered while the engine is built: the setter is the only
+//! call that registers it. It runs as a real scheduler system - listed,
+//! attributed like any other and disableable - registered through
 //! [`register_system_with_access`](crate::Engine::register_system_with_access)
-//! with an access declaration that conflicts with everything. That is what
-//! makes reading the entire world sound: a system that conflicts with every
-//! other is never placed in a parallel batch.
-//!
-//! It is owned by [`SystemOwner::ENGINE`](crate::SystemOwner::ENGINE), which
-//! no reload path clears, so the report keeps running across project and
-//! module reloads.
-//!
-//! ## What it cannot see
-//!
-//! The module **graveyard** - retired DLL images kept mapped while their rows
-//! migrate - belongs to `pill_host`, which `pill_engine` does not depend on.
-//! It is not reachable from here. The engine's own equivalents are reported
-//! instead: recycled entity IDs, and archetypes that are still allocated but
-//! hold no entities.
+//! with an access declaring command use: it reads the whole world, which no
+//! [`SystemParam`](crate::system::SystemParam) exposes, and an access that
+//! conflicts with every other system keeps that read out of a parallel batch.
+//! Its owner, [`SystemOwner::ENGINE`](crate::SystemOwner::ENGINE), is one no
+//! reload path clears, so the report survives project and module reloads. It
+//! cannot report `pill_host`'s reload graveyard - retired images kept mapped
+//! while their rows migrate - so recycled entity IDs and empty archetypes
+//! stand in for it.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -51,9 +36,7 @@ use crate::world::World;
 /// How often the report prints when a project turns it on.
 ///
 /// Wall-clock rather than a frame count: a frame count prints at whatever rate
-/// the project happens to run at, which is every 60 ms on a 1600 fps demo and
-/// every two seconds on a 50 fps one. A duration reads the same everywhere.
-///
+/// the project happens to run at, while a duration reads the same everywhere.
 /// This is the interval [`Engine::set_ecs_diagnostics_interval`] is normally
 /// given; the engine itself registers nothing at it.
 ///
@@ -340,10 +323,8 @@ impl EcsSnapshot {
         );
 
         // Archetypes, largest first. Each one is headed by a sentence rather
-        // than a column of bare numbers: the previous layout printed
-        // `21 entities  756 B  archetype 0x2a` over an unlabelled list, and
-        // nothing on the line said the hex was a component mask, what the
-        // bytes counted, or that the indented names were its columns.
+        // than a column of bare numbers, so the line says what the hex id, the
+        // byte total and the indented names are.
         let _ = writeln!(out, "├{rule}┤");
         if self.archetype_reports.is_empty() {
             row(&mut out, "  no archetypes");

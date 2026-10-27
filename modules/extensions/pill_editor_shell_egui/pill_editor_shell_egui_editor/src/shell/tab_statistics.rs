@@ -3,14 +3,14 @@
 //! # Responsibilities
 //!
 //! - Show the frame rate, the whole shell pass's time, the world's size and
-//!   one row per tab that has been drawn with its smoothed body time
-//!   (W-0038 Stage 7).
+//!   one row per tab drawn since the session began, with its smoothed body
+//!   time.
 //!
 //! # Design
 //!
-//! Every number here is a measurement the shell already took: the pass time
-//! around `run_ui` and the per-tab times around each `TabViewer::ui` body.
-//! The tab only formats them, so reading it never changes what it reports.
+//! Every number here is a measurement the shell already took: the whole
+//! pass's time in `run_frame` and each `TabViewer::ui` body's time. The tab
+//! only formats them; it records nothing.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -67,8 +67,8 @@ pub fn statistics_tab(
 
 /// One label/value pair of the top grid.
 ///
-/// Public because the build script's inventory names every function by its
-/// module path: a private one would not be patchable.
+/// Public so a patched tab body can still call it: a patch crate reaches this
+/// module only through the crate root's re-export.
 pub fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.label(label);
     ui.label(egui::RichText::new(value).monospace());

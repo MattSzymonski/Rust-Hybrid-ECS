@@ -166,7 +166,7 @@ struct MirrorMethodTable {
 ///
 /// The copy callback hands managed code pointers into the table's strings and
 /// the lock is released before those pointers are read, so a republish must not
-/// free the table it replaced (W-0080). The recent ones are kept; a reload that
+/// free the table it replaced. The recent ones are kept; a reload that
 /// has been overtaken more than this many times is long past its read window,
 /// and holding every table a session ever published would grow without bound.
 const RETIRED_TABLES_KEPT: usize = 16;
@@ -239,8 +239,7 @@ extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> 
 /// Function table copied by `csharp_runtime` during managed initialization.
 ///
 /// Every slot maps to one `extern "C"` callback implemented by the query and
-/// deferred-command adapters in this crate. `queue_create` accepts at most
-/// `MAX_COMPONENTS_PER_CREATE` component blobs per call.
+/// deferred-command adapters in this crate.
 ///
 /// The table opens with its own contract version and byte size, which the
 /// managed side checks before it copies a single slot. The host checks the
@@ -248,6 +247,10 @@ extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> 
 /// export; this is the other direction, so a runtime handed a table from a
 /// different contract - or one whose slots changed without a version bump -
 /// refuses it instead of calling through a misread pointer.
+///
+/// A new slot goes at the end, never between existing ones: the managed mirror
+/// struct reproduces this field order, so an inserted slot would misalign every
+/// slot after it.
 #[repr(C)]
 pub(super) struct CsEngineApi {
     /// [`INTEROP_CONTRACT_VERSION`] of the host that built this table.
@@ -289,9 +292,7 @@ pub(super) struct CsEngineApi {
     /// Fill a [`ResourceView`] for one resource the active system declared.
     ///
     /// Arguments are the stable identity's low and high halves, the requested
-    /// mode (`0` read, `1` write) and the output view. Appended last on
-    /// purpose: the managed mirror struct reproduces this field order, so a new
-    /// slot goes at the end rather than between existing ones.
+    /// mode (`0` read, `1` write) and the output view.
     get_resource_view: extern "C" fn(u64, u64, u8, *mut ResourceView) -> u8,
     /// Emit a managed log event through the shared tracing subscriber.
     csharp_log: extern "C" fn(u8, *const u8, u32, *const u8, u32),
@@ -299,12 +300,12 @@ pub(super) struct CsEngineApi {
     csharp_zone_begin: extern "C" fn(*const u8, u32) -> u64,
     csharp_zone_end: extern "C" fn(u64),
     /// Whether a key, by its [`KeyCode`](pill_engine::KeyCode) discriminant,
-    /// is held this frame. Appended at the end.
+    /// is held this frame.
     input_key_held: extern "C" fn(u8) -> u8,
     /// Whether a mouse button, by discriminant, is held this frame.
     input_mouse_button_held: extern "C" fn(u8) -> u8,
     /// Write this frame's mouse motion (physical pixels) to the two outputs;
-    /// `1` when written. Appended at the end.
+    /// `1` when written.
     input_mouse_delta: extern "C" fn(*mut f32, *mut f32) -> u8,
     /// The frame's clamped delta in seconds; `0.0` with no clock.
     time_delta_seconds: extern "C" fn() -> f32,
@@ -314,8 +315,7 @@ pub(super) struct CsEngineApi {
     /// Rayon pool, joining before returning. Status `0` ran every index, `3`
     /// no managed system is scheduled on the calling thread, `4` the call
     /// came from inside a parallel callback, `5` a panic escaped the dispatch.
-    /// `state` is opaque and travels back to `callback` untouched. Appended at
-    /// the end like every earlier slot.
+    /// `state` is opaque and travels back to `callback` untouched.
     parallel_for:
         extern "C" fn(super::parallel::ParallelCallback, *mut std::ffi::c_void, u32) -> u8,
     /// Take the last error (`0`) or the returned string (`1`) a mirrored call
@@ -330,7 +330,6 @@ pub(super) struct CsEngineApi {
     asset_loader_read: extern "C" fn(*const u8, u32, *mut *const u8, *mut u32) -> u8,
     /// Write a live entity's stable id as its low and high halves for
     /// `Engine.TryGetStableId`; `0` wrote it, `1` the entity is not live.
-    /// Appended at the end like every earlier slot.
     entity_stable_id: extern "C" fn(*const Entity, *mut u64, *mut u64) -> u8,
 }
 
@@ -468,8 +467,8 @@ pub(super) struct NativeComponentBlob {
 ///   declared with write access, and must stay within `len * element_size`.
 /// - Entity columns carry their rows in `entities`, a const pointer, and leave
 ///   `data` null; nothing outside the engine may write entity rows.
-/// - `ticks` may be null for read-only columns; entity columns always carry
-///   null ticks.
+/// - `ticks` is null only for entity columns; a component column always carries
+///   one tick per row, whether the system declared read or write access.
 ///
 /// # Layout limits
 ///
@@ -487,9 +486,9 @@ pub(super) struct ComponentChunk {
     pub(super) data: *mut std::ffi::c_void,
     /// Pointer to the first `Entity` of the archetype's entity column.
     ///
-    /// Const, and null for component columns: the read-only contract that used
-    /// to live only in this documentation is now part of the ABI, so an aliasing
-    /// write through an entity column cannot be expressed by accident.
+    /// Const, and null for component columns: the read-only contract is part of
+    /// the ABI, so an aliasing write through an entity column cannot be
+    /// expressed by accident.
     pub(super) entities: *const std::ffi::c_void,
     /// Number of elements stored in the column.
     pub(super) len: u32,
@@ -506,9 +505,8 @@ pub(super) struct ComponentChunk {
     /// compare it before dereferencing, so a chunk kept past its invocation is
     /// a named error rather than a read of storage that has since moved.
     ///
-    /// Free: the field lands in the four bytes of tail padding the struct
-    /// already carried on a 64-bit target, so the layout is unchanged in size
-    /// and alignment.
+    /// The field sits in the struct's trailing padding on a 64-bit target, so
+    /// the size and alignment are the same as without it.
     pub(super) scope_token: u32,
 }
 
@@ -528,13 +526,17 @@ pub(super) struct NativeSystemAccess {
     pub(super) component_key_high: u64,
     /// Access mode: `0` is read-only and `1` is read-write.
     pub(super) mode: u8,
-    /// What the key names: `0` a component, `1` a resource.
+    /// What the key names: `0` a component, `1` a managed resource, `2` a
+    /// Rust-owned resource reached by its shared name.
     ///
-    /// Both are 128-bit name hashes drawn from the same space, so without a
-    /// discriminator a resource read would be authorized by a component entry
-    /// that happened to hash alike, and the scheduler would record a component
-    /// access where a resource access was meant - two systems writing one
-    /// resource would then be free to run together.
+    /// The keys are all 128-bit name hashes drawn from the same space, so
+    /// without a discriminator a resource read would be authorized by a
+    /// component entry that happened to hash alike, and the scheduler would
+    /// record a component access where a resource access was meant - two
+    /// systems writing one resource would then be free to run together. The
+    /// two resource kinds resolve through different tables: a managed resource
+    /// through the manifest's bindings, a native one straight to
+    /// `ResourceId::Shared` of its name.
     pub(super) kind: u8,
 }
 

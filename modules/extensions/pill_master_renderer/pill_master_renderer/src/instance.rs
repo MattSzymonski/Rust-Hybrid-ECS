@@ -14,15 +14,15 @@
 //! # Design
 //!
 //! The matrix is built once per instance on the CPU and the shader only
-//! assembles it. It used to be the other way round: the CPU decomposed the
-//! rotation into Euler angles (three inverse trigonometric calls) and every
-//! vertex rebuilt the matrix from them (six more, and four 4x4 products), so
-//! a mesh drawn 50,000 times paid for the same matrix once per vertex.
+//! assembles it. Building it per vertex instead would make a mesh drawn 50,000
+//! times pay for the same matrix once per vertex, and decomposing the rotation
+//! into Euler angles to carry it that way costs three inverse trigonometric
+//! calls per instance.
 //!
 //! Only the top three rows of the affine matrix are sent; the fourth is always
 //! `0, 0, 0, 1` and the shader supplies it. `#[repr(C)]` over three `[f32; 4]`
-//! rows keeps the layout padding-free, so the offsets the descriptor declares
-//! match the attributes the shader expects.
+//! rows keeps the layout padding-free, so the descriptor's offsets match the
+//! shader's attributes.
 
 // External crates
 use glam::{Quat, Vec3};
@@ -174,8 +174,8 @@ mod tests {
             Quat::from_rotation_y(2.0),
             Quat::from_rotation_z(-1.2),
             Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.3),
-            // Past half a turn: an older encoding lost the winding here, and a
-            // spinning model came back rotated the other way.
+            // Past half a turn: the quaternion's scalar part is negative, so
+            // the matrix must not be rebuilt from a wrapped angle.
             Quat::from_rotation_y(4.5),
         ] {
             let instance = Instance::new(&TransformComponent {

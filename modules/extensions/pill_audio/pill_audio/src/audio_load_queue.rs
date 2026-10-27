@@ -10,9 +10,9 @@
 //!
 //! [`Sound`](crate::Sound) is a shared asset type, so a project that links the
 //! crate can also register a sound itself and take the handle directly - that
-//! is what `examples/project_rs` does with its embedded MP3. The queue stays
-//! for bytes a project hands over at runtime without naming the type: the
-//! module drains it, so the project never has to know when loading happens.
+//! is what `examples/project_rs` does with its embedded MP3. The queue is for
+//! bytes a project hands over at runtime without naming the type: the module
+//! drains it, so the project never has to know when loading happens.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -45,6 +45,8 @@ mod tests {
     use crate::{audio_system, AudioListenerComponent, AudioSourceComponent, Sound};
     use pill_engine::{AssetManager, Engine, Position};
 
+    /// Queued bytes reach the asset store as [`Sound`] assets even with no
+    /// audio device installed, which is the headless case.
     #[test]
     fn playback_system_consumes_requests_without_an_audio_device() {
         let mut engine = Engine::new();

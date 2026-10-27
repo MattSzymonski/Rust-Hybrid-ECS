@@ -184,21 +184,19 @@ impl MaterialBuilder {
 /// A material as written in its `.material` file.
 ///
 /// The asset itself, under the standard asset header (format version, asset
-/// type, guid). Its shader and textures are guids
-/// ([`AssetReference`]), resolved to handles when the file is loaded: a
-/// handle means nothing in the next run, a guid does. A reference that names
-/// no loaded asset resolves to [`Handle::INVALID`], which draws with the
-/// renderer's built-in shader or the slot's default texture.
+/// type, guid). Its shader and textures are guids ([`AssetReference`]), resolved
+/// to handles when the file loads: a handle means nothing in the next run, a
+/// guid does. A reference that names no loaded asset resolves to
+/// [`Handle::INVALID`], which draws with the renderer's built-in shader or the
+/// slot's default texture.
 ///
-/// The default document is what a newly created file holds, and it draws as
-/// it is: the PBR chain's shader (by its fixed guid,
+/// The default document is what a newly created file holds, and it draws as it
+/// is: the PBR chain's shader (by its fixed guid,
 /// [`pbr_pipeline::SHADER_GUID`](crate::config::pbr_pipeline::SHADER_GUID)) at
 /// its neutral parameters, with no maps bound. It names the chain's shader
-/// rather than leaving the shader unset because the chain is every project's
-/// default frame, and its geometry pass draws only the instances that use its
-/// own shader: a material on the renderer's built-in shader would load and
-/// never be drawn there. Maps are `BTreeMap`s for the reason [`Material`]
-/// gives.
+/// because that pass draws only the instances using its own shader, so a
+/// material left on the built-in one would load and never be drawn. Maps are
+/// `BTreeMap`s for the reason [`Material`] gives.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MaterialDocument {
@@ -284,9 +282,10 @@ mod tests {
     #[test]
     fn the_default_document_is_the_pbr_chains_neutral_material() {
         let mut assets = AssetManager::new();
+        crate::declare_crate_roots();
         pbr_pipeline::install(&mut assets).unwrap();
         let shader = assets
-            .handle_by_name::<Shader>(pbr_pipeline::SHADER_NAME)
+            .handle_by_name::<Shader>(pbr_pipeline::SHADER_PATH)
             .unwrap();
 
         let material =

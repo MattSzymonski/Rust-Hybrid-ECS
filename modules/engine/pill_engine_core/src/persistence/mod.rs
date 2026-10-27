@@ -5,26 +5,26 @@
 //! - Stores per-component-type serialize/deserialize/insert function pointers
 //!   registered alongside each persistable component.
 //! - Migrates, in place, only the component types whose schema a reload
-//!   changed, matching old→new components by type name (not `TypeId`), so
-//!   renamed and reshaped components are handled gracefully.
+//!   changed, matching old→new components by type name (not `TypeId`), which is
+//!   what lets a rebuilt image's fresh `TypeId` map back onto the rows the
+//!   previous generation owns.
 //! - Keeps the registration bookkeeping the reload transaction compares across
 //!   the swap: the persistable type manifest, the sequence markers, and the
 //!   forget paths for registrations whose owner is gone.
 //!
 //! # Design
 //!
-//! Selective migration is the one mechanism that runs: the reload transaction
-//! captures each persistable type's metadata before the swap, registers the
-//! arriving generation, and rewrites only the columns whose schema hash moved.
-//! Everything else keeps its bytes, so a reload costs work proportional to
-//! what actually changed rather than to the size of the world.
+//! The reload transaction captures each persistable type's metadata before the
+//! swap, registers the arriving generation, and migrates only the columns whose
+//! schema hash moved. Everything else keeps its bytes, so a reload costs work
+//! proportional to what actually changed rather than to the size of the world.
 //!
-//! Uses **serde_json** (not bincode) because JSON is self-describing:
-//! field names are embedded in the payload, so adding/removing fields does
-//! not break deserialization.  New fields receive `Default::default()`,
-//! removed fields are silently ignored.
+//! The payload is serde_json rather than a binary format because JSON is
+//! self-describing: field names travel with the values, so an added field takes
+//! `Default::default()` and a removed one is ignored.
 //!
-//! Each persistable component type registers three monomorphized functions:
+//! Each persistable component type registers three monomorphized functions,
+//! stored in the [`World`] as plain `fn` pointers:
 //!
 //! | Function        | Signature | Purpose |
 //! |-----------------|-----------|---------|
@@ -32,11 +32,9 @@
 //! | `deserialize`   | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; returns None on schema mismatch |
 //! | `insert_boxed`  | `fn(&mut ComponentColumns, Box<dyn Component>)` | Downcast and push into the archetype's column |
 //!
-//! These functions are monomorphized in the project DLL (where the concrete
-//! types are defined).  They are stored as plain function pointers in the
-//! engine's `World`, so replacing them on reload (via `HashMap::insert`)
-//! does not call any destructors through old vtables — function pointers
-//! are trivially overwritten.
+//! They are monomorphized in the DLL that defines the concrete types, so a
+//! reload replaces them with `HashMap::insert` - no destructor and no vtable
+//! call ever runs through an image that is about to be unmapped.
 //!
 //! During migration: read each row of a changed column through the *retiring*
 //! generation's `serialize`, decode it with the arriving generation's
@@ -74,21 +72,6 @@ mod resources;
 pub use components::*;
 pub use registry::*;
 pub use resources::*;
-
-// =============================================================================
-// World — Additional Fields
-// =============================================================================
-//
-// These fields are added to the `World` struct (see `world.rs`):
-//
-// ```ignore
-// /// Per-component-type serialize fn for reading rows during migration.
-// pub(crate) persist_serializers: HashMap<ComponentId, SerializeComponentFn>,
-// /// Per-type-name deserialize fn for restoring.
-// pub(crate) persist_deserializers: HashMap<String, DeserializeComponentFn>,
-// /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
-// pub(crate) persist_inserters: HashMap<ComponentId, InsertComponentFn>,
-// ```
 
 // =============================================================================
 // Tests
@@ -325,9 +308,9 @@ mod tests {
     }
 
     /// Every native id sharing the forgotten name loses its rows, not just the
-    /// one a name resolver returns: an ambiguous name resolved to nothing at
-    /// all, so the purge used to skip both generations while
-    /// `forget_component_type` removed their registrations anyway.
+    /// one a name resolver returns: an ambiguous name resolves to nothing at
+    /// all, so a single-id purge would leave both generations' rows behind
+    /// while `forget_component_type` removed their registrations.
     #[test]
     fn forget_strips_rows_for_every_id_sharing_the_name() {
         let mut world = World::new();
@@ -477,8 +460,7 @@ mod tests {
 
     /// Re-registering the same persistable type is idempotent across the
     /// persist maps: one serializer/inserter per ComponentId and one
-    /// deserializer/schema hash per name. Pins the invariant the unified
-    /// registration struct (audit 4.2) must preserve.
+    /// deserializer/schema hash per name.
     #[test]
     fn persistable_registration_is_idempotent_across_repeated_calls() {
         let mut world = World::new();
@@ -682,7 +664,7 @@ mod tests {
     }
 
     /// The in-place migration drops old-layout rows through the glue that wrote
-    /// them. The sequence that used to break it: the arriving generation's
+    /// them. The sequence it defends against: the arriving generation's
     /// registration replaces the factory, `rehome_native_columns` stamps the
     /// arriving table onto the still-old column, and only then does the
     /// migration consume that column.
@@ -791,9 +773,9 @@ mod tests {
         );
     }
 
-    /// A name claimed by two registrations is reported as ambiguous rather
-    /// than resolved by the old `max_by_key(bit)` tiebreak, which is not a
-    /// recency ordering and could bind callers to the wrong column.
+    /// A name claimed by two registrations is reported as ambiguous instead of
+    /// being resolved by a bit-index tiebreak: the bit index is not a recency
+    /// ordering, so picking one could bind callers to the wrong column.
     #[test]
     fn a_name_claimed_twice_resolves_to_an_ambiguity_error() {
         let mut world = World::new();
@@ -901,10 +883,9 @@ mod tests {
     /// The persistence name both builds of the settings resource register under.
     const PROBE_SETTINGS_NAME: &str = "probe::Settings";
 
-    /// A registered resource's value survives a snapshot and restore.
-    ///
-    /// Before this existed, `snapshot_resources` did not exist either: a saved
-    /// world came back with every resource missing while looking complete.
+    /// A registered resource's value survives a snapshot and restore: without
+    /// the resource lane a saved world comes back with every resource missing
+    /// while looking complete.
     #[test]
     fn a_persistable_resource_round_trips_through_a_snapshot() {
         let mut world = World::new();

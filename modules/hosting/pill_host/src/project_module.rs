@@ -3,8 +3,9 @@
 //! # Responsibilities
 //!
 //! - Builds and loads the selected backend during startup.
-//! - Reloads native modules without dropping previously mapped libraries.
-//! - Delegates managed reload polling to `csharp_runtime`.
+//! - Reloads native modules without dropping the libraries mapped before them.
+//! - Delegates managed reload polling to the C# bridge's runtime, through
+//!   `crate::csharp`.
 //! - Keeps native component-schema migration beside the DLL swap it protects.
 //!
 //! # Design
@@ -382,8 +383,8 @@ mod loaded {
     /// logs the statuses it understands, but a `CSharpError` returned through
     /// `?` - re-registration refusing an arriving assembly's systems is the one
     /// that matters - reaches the caller as a plain `Err` that both call sites
-    /// used to discard. A project left with no systems and nothing on the
-    /// console is the worst outcome available here, so it is logged loudly.
+    /// would otherwise discard. A project left with no systems and nothing on
+    /// the console is the worst outcome available here, so it is logged loudly.
     fn managed_poll_replaced_assembly(runtime: &mut CSharpProject, engine: &mut Engine) -> bool {
         match runtime.poll_reload(engine) {
             Ok(status) if status == POLL_RELOADED => {
@@ -430,8 +431,8 @@ mod loaded {
     /// of the same edit takes one to three seconds. It cannot answer every
     /// reload - a source file added or removed changes the command line itself -
     /// and it may not exist at all, so both cases fall through to the full
-    /// build that every reload used to run. That build also refreshes the
-    /// capture, which is what makes the reload after it fast again.
+    /// `dotnet build`. That build also refreshes the capture, which is what
+    /// makes the reload after it fast again.
     fn build_csharp_outcome(
         compiler: Option<Arc<FastCompiler>>,
         workspace_root: &Path,
@@ -470,9 +471,8 @@ mod loaded {
     /// belongs to the frame boundary: it runs the in-process compiler, or the
     /// full `dotnet build` fallback when the captured command line cannot
     /// answer the reload, and reports what it produced. Compiling the project
-    /// is the hundreds of milliseconds that used to freeze the frame loop on
-    /// every save; from here the frame keeps rendering and the report is
-    /// collected at a later boundary.
+    /// costs hundreds of milliseconds, so it happens here: the frame keeps
+    /// rendering and the report is collected at a later boundary.
     fn start_csharp_assembly_build(
         project: &mut CSharpProject,
         workspace_root: &Path,
@@ -500,9 +500,8 @@ mod loaded {
                 ManagedReloadStart::Building
             }
             Err(_) => {
-                // Building on this thread blocks the frame the way the in-line
-                // pipeline did, which is the safe direction for a spawn
-                // failure.
+                // Building on this thread blocks the frame, which is the safe
+                // direction for a spawn failure.
                 ManagedReloadStart::Unavailable
             }
         }

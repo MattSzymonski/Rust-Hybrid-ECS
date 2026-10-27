@@ -164,8 +164,7 @@ impl RendererPass {
 
         // Captured rather than left to wgpu's uncaptured-error handler: a
         // pipeline the driver refuses - a shader whose entry points do not
-        // match the pass's kind, say - has to come back as the reason this pass
-        // is not drawn.
+        // match the pass's kind, say - is the reason this pass is not drawn.
         let color_targets: Vec<Option<wgpu::ColorTargetState>> = target_formats
             .iter()
             .map(|format| {
@@ -219,8 +218,7 @@ impl RendererPass {
         } else {
             let size = RendererMaterial::calculate_uniform_size(&renderer_shader.parameter_slots);
             // Not stored: a bind group holds what it references, so the buffer
-            // lives as long as the group that reads it and a second handle here
-            // would only be a way to forget which one is real.
+            // lives as long as the group that reads it.
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("{}_pass_parameters_buffer", pass.name)),
                 size: size as u64,
@@ -233,9 +231,6 @@ impl RendererPass {
                 &renderer_shader.parameter_slots,
                 &pass.parameters,
             )?;
-            // The layout is looked up outside the closure: `?` belongs to this
-            // function, which returns a `Result`, not to a block that only has a
-            // bind group to hand back.
             let layout = renderer_shader
                 .parameters_bind_group_layout
                 .as_ref()

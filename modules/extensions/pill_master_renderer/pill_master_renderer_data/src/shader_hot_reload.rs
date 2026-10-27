@@ -11,12 +11,12 @@
 //!
 //! # Design
 //!
-//! Watching and cooking are the host's: a watcher thread there cooks the
-//! crate's `shaders/` with `pill_assets::cook_shader_tree` - the routine this
-//! crate's build script runs - and hands each re-cooked file to the main thread,
-//! which calls this export from the data module generation that is current at
-//! that moment. The data crate stays free of `notify` and of the cooker, and a
-//! reload of it never leaves a watcher thread running code in a retired image.
+//! Watching and cooking are the host's: a worker thread there cooks the crate's
+//! HLSL sources with `pill_assets::cook_shader_tree` - the routine this crate's
+//! build script runs - and hands each re-cooked file to the main thread, which
+//! calls this export from the data module generation that is current at that
+//! moment. The data crate stays free of `notify` and of the cooker, and a reload
+//! of it never leaves a watcher thread running code in a retired image.
 //!
 //! A shader edit is an asset edit. The renderer's pipelines store their shaders
 //! as `Shader` assets, and the GPU module rebuilds any asset whose content
@@ -38,16 +38,16 @@ use crate::assets::Shader;
 use crate::config::{all_shader_sources, ShaderSourceRecord};
 
 /// What [`pill_render_data_shader_changed`] returns when it could not look at
-/// the assets at all: a null world, a world without an `AssetManager`, or a
-/// path or text that is not UTF-8.
+/// the assets at all: a null world, a world without an `AssetManager`, a null
+/// buffer whose length is not zero, or a path or text that is not UTF-8.
 pub const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
 
 /// Replace one stage's WGSL in every recorded shader asset built from
 /// `relative_path`, and return the names of the assets whose text changed.
 ///
-/// `relative_path` is relative to the crate's `shaders/`, with `/` separators,
-/// as the records spell it. A record whose asset is not in the store - a
-/// pipeline this project never installed - is skipped.
+/// `relative_path` is relative to the crate's `shader_sources/`, with `/`
+/// separators, as the records spell it. A record whose asset is not in the store
+/// - a pipeline this project never installed - is skipped.
 pub fn apply_shader_source<'a>(
     assets: &mut AssetManager,
     relative_path: &str,
@@ -87,7 +87,7 @@ pub fn apply_shader_source<'a>(
 /// Put one re-cooked WGSL file into the shader assets built from it, in
 /// `world`'s `AssetManager`.
 ///
-/// `path` is the cooked file relative to the crate's `shaders/`, with `/`
+/// `path` is the cooked file relative to the crate's `shader_sources/`, with `/`
 /// separators (`pbr_pipeline/shaders/pbr_fragment.wgsl`); `wgsl` is its text.
 /// Returns how many shader assets changed, or [`SHADER_CHANGE_REFUSED`].
 ///

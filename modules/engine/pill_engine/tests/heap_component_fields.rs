@@ -19,8 +19,8 @@ use pill_engine::component_registry::{register_all_components, ComponentFieldDes
 use pill_engine::{ComponentId, PillComponent, World};
 
 /// A descriptor component's registered layout is validated: a descriptor that
-/// reaches past the row or claims a container tag is refused, and the
-/// previously registered layout is left in place.
+/// reaches past the row or claims a container tag is refused, and the accepted
+/// layout stays in place.
 #[test]
 fn an_overflowing_field_layout_is_refused() {
     let mut world = World::new();
@@ -129,7 +129,7 @@ static DERIVE_LAYOUT: &[ComponentFieldDescriptor] = &[
 ];
 
 /// A deliberately altered layout for the same Rust type, standing in for a
-/// build where the declared shape moved; used to force the migration path.
+/// build where the declared shape moved, which forces the migration path.
 static ALTERED_LAYOUT: &[ComponentFieldDescriptor] = &[
     ComponentFieldDescriptor {
         name: "values",

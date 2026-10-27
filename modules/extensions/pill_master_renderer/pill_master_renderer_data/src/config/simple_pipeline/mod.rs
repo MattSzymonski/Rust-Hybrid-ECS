@@ -19,17 +19,17 @@
 //!
 //! # Where the shaders are
 //!
-//! In `shaders/` beside this file, the lit fragment stage. The vertex stage it
-//! pairs with lives in `config/common_shaders/`, because it is not this
-//! pipeline's alone: the renderer's fallback material is built from the same
-//! pair - a material written for the fallback draws here without being rebuilt -
-//! and the PBR geometry pass reuses the vertex stage, since every lit pass in
-//! the crate starts from the same instance layout. Three readers, one copy of
-//! the vertex stage.
+//! The lit fragment stage is in `shader_sources/simple_pipeline/shaders/`. The
+//! vertex stage it pairs with lives in `shader_sources/common_shaders/`, because
+//! it is not this pipeline's alone: the renderer's fallback material is built
+//! from the same pair - a material written for the fallback draws here without
+//! being rebuilt - and the PBR geometry pass reuses the vertex stage, since every
+//! lit pass in the crate starts from the same instance layout. Three readers, one
+//! copy of the vertex stage.
 //!
-//! Each of those directories is a shader cooker root of its own: the rule
-//! matches `<root>/shaders/*.hlsl` one level down and does not walk to a nested
-//! one.
+//! The build script cooks the whole `shader_sources/` tree in one call: every
+//! directory that directly holds `.hlsl` files is a source directory, and every
+//! `include/` in the tree is on every source's include path.
 //!
 //! Nothing here reads a file at runtime: the WGSL is cooked into the crate at
 //! build time and embedded, so the pipeline installs for a project whose assets

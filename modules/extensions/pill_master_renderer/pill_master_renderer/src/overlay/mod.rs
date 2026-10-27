@@ -24,9 +24,6 @@
 //! draw the frame's instances straight from the instance buffer the chain
 //! already uploaded, so a queue position is an instance index in both.
 //!
-//! Every target here is sized to a surface. They are kept per size, so two
-//! surfaces of different sizes do not rebuild them every frame.
-//!
 //! Lines, gizmo triangles and the outline are anti-aliased without
 //! multisampling: each primitive is projected on the processor, widened in
 //! screen space by a pixel of feather, and its fragment shader fades that
@@ -83,8 +80,8 @@ const LINE_FEATHER: f32 = 0.5;
 /// The half width of a gizmo line's quad in the pick buffer, in pixels.
 ///
 /// Wider than the drawn line so the pick covers the band the editor's hover
-/// test accepts as a handle (a fraction of the handle's length, which keeps a
-/// roughly constant screen size). W-0049: a handle presses where it
+/// test accepts as a handle (a radius that follows the handle's length, which
+/// keeps a roughly constant screen size), so a handle presses where it
 /// highlights.
 const PICK_LINE_HALF_WIDTH: f32 = 7.0;
 /// Which side of its line each of a quad's six corners sits on, in order.
@@ -560,7 +557,7 @@ impl Overlay {
             .copied()
             .collect();
         // The editor's chrome - outlines, gizmo handles and their picks -
-        // belongs on the surfaces the frame marks as editor views (W-0049):
+        // belongs on the surfaces the frame marks as editor views:
         // the game's own window draws the game and nothing else. The project's
         // own debug lines are not chrome and draw everywhere.
         let editor_view = frame.editor_views.contains(&input.surface);
@@ -1066,9 +1063,9 @@ type ClipVertex = ([f32; 4], [f32; 3]);
 /// Each quad is the segment widened by the line's half width plus its
 /// feather on each side, with every corner carrying its distance from the
 /// line's centre, so the fragment shader can fade the edge. Widening happens
-/// through the camera's own projection, which keeps a line the same width at
-/// any depth. `gizmos` is the editor-view switch (W-0049): the project's own
-/// debug lines always draw, the gizmo handles only on an editor view.
+/// in screen space after projection, which keeps a line the same width at any
+/// depth. `gizmos` is the editor-view switch: the project's own debug lines
+/// always draw, the gizmo handles only on an editor view.
 fn line_vertices(
     debug: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
@@ -1327,7 +1324,7 @@ fn expand_polygon(polygon: &[ClipVertex], size: (f32, f32), offset: f32) -> Vec<
 }
 
 /// The gizmo lines as the pick buffer draws them: the same quads as the drawn
-/// lines, widened to the band the editor's hover test accepts (W-0049), so
+/// lines, widened to the band the editor's hover test accepts, so
 /// picking covers the handle the pointer highlights.
 fn handle_line_vertices(
     debug: &DebugFrame,
@@ -1491,8 +1488,7 @@ mod tests {
     }
 
     /// A surface that is not an editor view draws the project's own debug
-    /// lines and no editor chrome: no gizmo lines, no gizmo triangles (W-0049,
-    /// which pins the chosen behaviour for a game's `DebugDraw`).
+    /// lines and no editor chrome: no gizmo lines, no gizmo triangles.
     #[test]
     fn a_game_surface_draws_its_debug_lines_without_the_editor_chrome() {
         let mut draw = pill_engine::DebugDraw::new(true);
@@ -1700,9 +1696,9 @@ mod tests {
     }
 
     /// A debug label drawn through the UI painter lands in its linear debug
-    /// colour - the bytes the label shader it replaced wrote into an sRGB
-    /// target - only where its glyph is lit, over its shadow one glyph pixel
-    /// down and right. Skipped on a machine with no adapter at all.
+    /// colour, encoded into the sRGB target, only where its glyph is lit, over
+    /// its shadow one glyph pixel down and right. Skipped on a machine with no
+    /// adapter at all.
     #[test]
     fn labels_draw_through_the_painter_in_their_linear_colour() {
         let Some((device, queue)) = pill_core::platform::futures::block_on(windowless_device())

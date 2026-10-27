@@ -20,18 +20,15 @@
 //! ```
 //!
 //! The first of them reads [`HDR_TARGET`], which the frame's geometry pass
-//! writes. That name is declared here rather than there because this is where
-//! every pass that *consumes* it lives: the geometry pass only writes it.
+//! writes. That name is declared here rather than there because the passes that
+//! consume it live here, and the geometry pass only writes it.
 //!
 //! # Where the shaders are
 //!
-//! In `shaders/` beside this file: the fullscreen vertex stage each pass here
-//! draws through, and the four fragment stages. That directory is a shader
-//! cooker root of its own, because the rule matches `<root>/shaders/*.hlsl` one
-//! level down and does not walk to a nested one - which is why a pipeline that
-//! keeps its stages beside itself costs one line in `build.rs` and nothing else.
-//! None of the five `#include` anything, so unlike the geometry half's root this
-//! one has no `include/` beside it.
+//! In `shader_sources/post_processing/shaders/`: the fullscreen vertex stage each
+//! pass here draws through, and the four fragment stages. None of the five
+//! `#include` anything, so unlike the geometry half's stages these need no
+//! `include/` directory.
 
 // External crates
 use pill_engine::{AssetLoadResult, AssetManager, Handle};
@@ -194,9 +191,7 @@ pub fn install(
         .with_order(2);
     let composite_pass = assets.add_named(COMPOSITE_PASS, composite_pass)?;
 
-    // The two curve constants are solved from the art parameters rather than
-    // authored, so an artist says where mid grey lands and how much highlight has
-    // to fit, and these follow.
+    // Solved from the art parameters, so an artist sets the look and these follow.
     let contrast = 1.6;
     let shoulder = 0.977;
     let (b, c) = lottes_bc(contrast, shoulder, 8.0, 0.18, 0.267);
@@ -281,9 +276,8 @@ fn fullscreen_shader(
 ///
 /// `b` and `c` are solved rather than authored: an artist says where mid grey
 /// should land and how much highlight the display has to fit, and these two
-/// follow. See Tim Lottes, "Advanced Techniques and Optimization of VDR Color
-/// Pipelines", GDC 2016, and `lottes_bc` in the reference renderer, which this
-/// mirrors.
+/// follow. See Tim Lottes' GDC 2016 talk on HDR color pipelines; the fragment
+/// shader's own `lottes` function evaluates the curve these place.
 fn lottes_bc(contrast: f32, shoulder: f32, hdr_max: f32, mid_in: f32, mid_out: f32) -> (f32, f32) {
     let hdr_a = hdr_max.powf(contrast);
     let mid_a = mid_in.powf(contrast);
@@ -297,10 +291,9 @@ fn lottes_bc(contrast: f32, shoulder: f32, hdr_max: f32, mid_in: f32, mid_out: f
 
 /// A 256x256 grain tile, generated rather than shipped.
 ///
-/// The reference samples a tile it commits as an asset. The pattern is value
-/// noise - what matters is that neighbouring texels differ, not that it is
-/// random - so this makes one at install time and the shader gets the same kind
-/// of input without a binary in the repository.
+/// The pattern is value noise - what matters is that neighbouring texels differ,
+/// not that it is random - so this makes one at install time and the shader gets
+/// that input without a binary in the repository.
 fn grain_texture() -> Texture {
     const SIZE: u32 = 256;
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);

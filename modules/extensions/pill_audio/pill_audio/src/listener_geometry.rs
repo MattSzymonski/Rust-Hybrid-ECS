@@ -7,9 +7,9 @@
 //!
 //! # Design
 //!
-//! Split from the system so the geometry is testable without an audio device,
-//! and so the change needed when a 3D transform arrives is confined to one
-//! function. The world is 2D, so both points are lifted onto z = 0.
+//! A free function rather than part of the system, so the geometry is testable
+//! without an audio device and a 3D transform changes one place. The world is
+//! 2D, so both points are lifted onto z = 0.
 
 // Current crate
 use crate::audio_manager::EAR_SEPARATION;
@@ -22,10 +22,6 @@ use crate::audio_manager::EAR_SEPARATION;
 ///
 /// Returns `(left, right)` in the 3D space rodio expects, with the world's 2D
 /// plane laid on z = 0.
-///
-/// Split out from [`audio_system`] so the geometry is testable without an
-/// audio device, and so the change needed when a 3D transform arrives is
-/// confined to one function.
 pub fn ear_positions(position: (f32, f32), facing_degrees: f32) -> ([f32; 3], [f32; 3]) {
     let facing = facing_degrees.to_radians();
     // Ears sit on the axis perpendicular to `facing`: rotating the facing

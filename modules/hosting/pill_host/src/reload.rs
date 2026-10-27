@@ -12,34 +12,19 @@
 //!
 //! # Design
 //!
-//! Extensions and the project ran this sequence as two separate 250-line
-//! functions whose differences were almost entirely log wording. They differ in
-//! exactly three ways, and only those three are expressed here:
-//!
-//! 1. An extension tags its registrations with its [`SystemOwner`], so a
-//!    reload clears only its own systems; the project owns the scheduler
-//!    outright and tags nothing.
-//! 2. Their log wording differs, and not decoratively - the Python suites in
-//!    `devops/tests` tell a project reload from a module reload by matching
-//!    those exact phrases.
-//! 3. Only a module's component names are reported onward, via [`ReloadCommit`],
-//!    for the C# backend to expose; the project has no use for them.
-//!
-//! The first two are carried by [`ReloadSubjectKind`], so a caller states which
-//! kind of subject it is and gets both behaviours together rather than wiring
-//! them up separately.
-//!
-//! One difference was **not** preserved: the project path used to skip the
-//! stranded-factory cleanup that runs when a new generation fails to initialize
-//! after registering component types. That was an inconsistency rather than a
-//! design decision, and unifying gives the project the cleanup too.
+//! The project and every extension run one sequence, and differ in three ways:
+//! an extension tags its registrations with its [`SystemOwner`] while the
+//! project owns the scheduler and tags nothing; their log wording differs, and
+//! not decoratively, because the suites in `devops/tests` tell a project reload
+//! from a module reload by matching those exact phrases; and only a module's
+//! component names are reported onward, for the C# backend to expose.
 //!
 //! **The order of the steps is load-bearing and must not be rearranged.**
 //! `drop_forgotten_components` calls into the retiring image's drop glue, so it
 //! has to run while that image is still mapped. `rehome_native_columns` then
-//! re-points every column's function table at a generation that is still mapped.
-//! Both must happen before the graveyard evicts anything, which is the only
-//! reason a bound of two generations is sound. Reordering them is a
+//! re-points every column's function table at a generation that is still
+//! mapped. Both must happen before the graveyard evicts anything, which is the
+//! only reason a bound of two generations is sound. Reordering them is a
 //! use-after-unmap that surfaces two reloads later, not immediately.
 
 // Standard library
@@ -78,7 +63,7 @@ pub(crate) const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 /// Completion line for a project reload.
 ///
 /// The four constants below are an interface, not prose. `devops/core/
-/// suite_common.py` and `devops/tests/test_hot_reload_suite.py` tell a project
+/// suite_common.py` and the Python suites in `devops/tests` tell a project
 /// reload from a module reload by grepping host output for these exact
 /// phrases, and `devops/tests/test_log_contract.py` fails if either member of
 /// a pair stops appearing verbatim in Rust source. That is why the project and
@@ -99,7 +84,7 @@ const MODULE_FORGOTTEN_TYPES: &str = "component type(s) no longer registered by 
 /// Which kind of subject a reload is running for.
 ///
 /// Carries the two differences that are not about the subject's identity: how
-/// its registrations are scoped, and the exact wording of the two log lines the
+/// its registrations are scoped, and the exact wording of the log lines the
 /// Python suites match on. Both belong together, because a caller that gets one
 /// right and the other wrong produces a reload that behaves correctly and is
 /// reported as the wrong subject.
@@ -170,10 +155,6 @@ impl ReloadSubjectKind {
     }
 }
 
-/// One subject's state, borrowed for the length of a reload.
-///
-/// Built fresh per reload rather than stored: it borrows the caller's library
-/// slot and graveyard mutably, and only for the transaction.
 /// Whether a subject's retired generations are ever unmapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraveyardPolicy {
@@ -185,12 +166,16 @@ pub(crate) enum GraveyardPolicy {
     /// For a subject whose images leave pointers behind that nothing here can
     /// track or release. The renderer module is one: wgpu, the graphics driver
     /// and the `tracing` callsite registry in the shared `pill_core.dll` all
-    /// keep state that points into the image that created it, and a renderer
-    /// whose oldest generation was evicted hung the host's frame loop. The cost
-    /// is one mapped image per reload, which a development session can afford.
+    /// keep state that points into the image that created it, and evicting a
+    /// renderer generation hangs the host's frame loop. The cost is one mapped
+    /// image per reload, which a development session can afford.
     KeepAll,
 }
 
+/// One subject's state, borrowed for the length of a reload.
+///
+/// Built fresh per reload rather than stored: it borrows the caller's library
+/// slot and graveyard mutably, and only for the transaction.
 pub(crate) struct ReloadTransaction<'a> {
     /// Name used in every log line and analytics record.
     pub(crate) subject: &'a str,
@@ -201,7 +186,7 @@ pub(crate) struct ReloadTransaction<'a> {
     pub(crate) owner: SystemOwner,
     /// The generation being retired; still mapped for the whole transaction.
     pub(crate) current: &'a mut NativeLibrary,
-    /// Previously retired generations, still mapped.
+    /// Retired generations that are still mapped.
     pub(crate) old_libraries: &'a mut Vec<NativeLibrary>,
     /// Persistable type names the previous `init` registered.
     pub(crate) registered_type_names: &'a mut Vec<String>,
@@ -481,18 +466,17 @@ pub(crate) enum LoadValidation {
 
 /// Build, load and commit one native generation, for either subject.
 ///
-/// The project and an extension perform the same three steps in the same
-/// order, with the same requirement that a failure anywhere leaves the current
-/// generation running: compile (`build`), load a private copy, then swap
-/// through [`ReloadTransaction`]. Their differences - which build function to
-/// call, whether the ABI check applies, and the exact refusal wording the
-/// Python suites match - are parameters, not a second lifecycle.
+/// Both subjects run the same three steps in the same order, and a failure
+/// anywhere leaves the current generation running: compile (`build`), load a
+/// private copy, then swap through [`ReloadTransaction`]. Their differences -
+/// which build function to call, whether the ABI check applies, the refusal
+/// wording the suites match - are parameters, not a second lifecycle.
 ///
 /// `before_commit` runs once the replacement has built, loaded and passed
-/// validation, immediately before the swap - and not at all when an earlier
-/// step refused it. It is where a subject releases state that must be dropped
-/// while the retiring image is still mapped and that the transaction itself
-/// does not know about: the renderer module detaches its GPU backend there.
+/// validation, immediately before the swap, and not at all when an earlier step
+/// refused it. It is where a subject releases state that must be dropped while
+/// the retiring image is still mapped: the renderer module detaches its GPU
+/// backend there.
 ///
 /// Returns the commit when the swap happened, `None` when anything was
 /// refused.
@@ -594,8 +578,8 @@ impl ReloadTransaction<'_> {
     ///
     /// A retired image is never unmapped at the moment it stops being current:
     /// pointers into it - storage tables, patch stubs, persist metadata - can
-    /// still be live. The eviction log line is what identifies a later fault
-    /// as belonging to an image released here rather than somewhere else.
+    /// still be live. The eviction log line is what identifies a later fault as
+    /// belonging to an image released here rather than somewhere else.
     ///
     /// The `world` argument turns "a bound of two generations is sound" into a
     /// checked claim: a column whose component id has no factory left still
@@ -681,6 +665,9 @@ impl ReloadTransaction<'_> {
     }
 
     /// Run the whole sequence against an already-loaded replacement.
+    ///
+    /// Steps 1 and 2 - compile and load - live in [`build_load_and_commit`];
+    /// the labels below continue from there.
     ///
     /// Returns `None` when the new generation failed to initialize and the
     /// previous one was restored, in which case nothing was swapped and the
@@ -1003,28 +990,28 @@ impl ReloadTransaction<'_> {
         // Returned to the caller rather than stored: only a module
         // reports its component names onward to the C# backend.
 
-        // Step 4b: Re-home every native storage column to the freshly loaded
+        // Step 6: Re-home every native storage column to the freshly loaded
         // generation's function table. Columns created by older generations
         // hold function pointers into their own DLL; refreshing them here (the
         // old DLLs are still mapped) keeps drops and upcasts valid when those
         // DLLs are later evicted from the reload graveyard.
         engine.world_mut().rehome_native_columns();
 
-        // Step 4c: The same treatment for resources. A resource holds a drop
+        // Step 7: The same treatment for resources. A resource holds a drop
         // function belonging to the artifact that inserted it, and nothing
         // clears resources on reload, so without this a retiring generation's
         // image would be evicted while a live resource still pointed its
         // destructor into it.
         engine.world_mut().rehome_resources();
 
-        // Step 4d: And for asset columns. The asset store outlives the reload
+        // Step 8: And for asset columns. The asset store outlives the reload
         // too, and a column's per-type table - drop, upcast, take - is code
         // from whichever artifact declared or first used the type. Re-pointing
         // it here keeps the store usable after that artifact's image leaves
         // the graveyard.
         engine.world_mut().rehome_assets();
 
-        // Step 5: Migrate persistable schemas that changed across the swap.
+        // Step 9: Migrate persistable schemas that changed across the swap.
         // Types are matched by stable name rather than runtime ComponentId,
         // which can differ between generations, so data follows a renamed or
         // reshaped component. Unchanged columns keep their allocations and
@@ -1082,7 +1069,7 @@ impl ReloadTransaction<'_> {
                 );
             }
         }
-        // Step 5a: Migrate reshaped resources. `rehome_resources` above swapped
+        // Step 10: Migrate reshaped resources. `rehome_resources` above swapped
         // each live resource's function table without touching its bytes, so a
         // resource whose fields changed would otherwise be read through the new
         // type over the old value's memory. Matched by persistence name, like
@@ -1105,7 +1092,7 @@ impl ReloadTransaction<'_> {
             migrate_started.elapsed().as_secs_f64() * 1000.0,
         );
 
-        // Step 5b: Prove every surviving native column still owns a mapped
+        // Step 11: Prove every surviving native column still owns a mapped
         // function table before the retiring image can ever be evicted. A
         // column whose id has no factory is the "same name, fresh TypeId" case
         // the name-keyed forgotten-type sweep cannot reach - the name resolves
@@ -1121,7 +1108,7 @@ impl ReloadTransaction<'_> {
             );
         }
 
-        // Step 6: Retire the previous library without unmapping it. Component
+        // Step 12: Retire the previous library without unmapping it. Component
         // operations and persist metadata registered by that generation may
         // still be referenced by engine-owned pointers.
         let previous_library = std::mem::replace(&mut *self.current, new_library);

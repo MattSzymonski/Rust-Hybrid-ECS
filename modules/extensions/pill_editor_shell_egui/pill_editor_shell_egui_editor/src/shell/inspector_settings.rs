@@ -6,10 +6,10 @@
 //!   settings as a recursive row walk.
 //! - `settings_commit`: the recorded command one committed settings value
 //!   queues.
-//! - The two shapes a material document needs rows of their own for (W-0049
-//!   Stage 8): a colour parameter (`parameters.<slot>.Color`, an array of
-//!   numbers) drawn as a picker, and a texture slot (`textures.<slot>`, a
-//!   guid) drawn as a type-filtered picker with a drop target.
+//! - The two shapes a material document needs rows of their own for: a colour
+//!   parameter (`parameters.<slot>.Color`, an array of numbers) drawn as a
+//!   picker, and a texture slot (`textures.<slot>`, a guid) drawn as a
+//!   type-filtered picker with a drop target.
 //!
 //! # Design
 //!
@@ -19,8 +19,7 @@
 //! asset's **guid**, which is what the file holds: each listing row carries
 //! its own guid for exactly this.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -31,7 +30,11 @@ use pill_editor_shell_egui_editor::shell::*;
 pub const TEXTURE_TYPE_SUFFIX: &str = "Texture";
 
 /// The settings document's rows: objects and arrays nest their children,
-/// every scalar leaf edits.
+/// every scalar leaf edits - unless `read_only`, when every row reads a module
+/// resource that nothing may write.
+///
+/// `texture_slots` are the slots the asset's shader declares: each gets a row,
+/// whether or not the document binds it yet.
 #[allow(clippy::too_many_arguments)]
 pub fn asset_settings_rows(
     ui: &mut egui::Ui,
@@ -41,6 +44,8 @@ pub fn asset_settings_rows(
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
+    read_only: bool,
+    texture_slots: &[String],
 ) {
     match settings {
         JsonValue::Object(entries) => {
@@ -51,6 +56,30 @@ pub fn asset_settings_rows(
                     settings,
                     value,
                     key.clone(),
+                    assets,
+                    pending,
+                    session,
+                    overlay_regions,
+                    read_only,
+                );
+            }
+            if read_only {
+                return;
+            }
+            // A slot the shader declares but the document does not bind is
+            // exactly the one a person wants to fill: without a row there is
+            // no way to pick a texture for it.
+            let bound = entries.get("textures");
+            for slot in texture_slots {
+                if bound.is_some_and(|textures| textures.get(slot.as_str()).is_some()) {
+                    continue;
+                }
+                texture_slot_row(
+                    ui,
+                    asset_path,
+                    settings,
+                    &format!("textures.{slot}"),
+                    &None,
                     assets,
                     pending,
                     session,
@@ -67,7 +96,7 @@ pub fn asset_settings_rows(
 /// One settings row: a leaf gets the widget its JSON kind asks for (its
 /// commit carries the whole patched document), a container nests - except the
 /// two shapes that get a control of their own, a texture slot and a colour
-/// parameter (W-0049 Stage 8).
+/// parameter.
 #[allow(clippy::too_many_arguments)]
 pub fn asset_settings_row(
     ui: &mut egui::Ui,
@@ -79,7 +108,50 @@ pub fn asset_settings_row(
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
+    read_only: bool,
 ) {
+    // A module's resource is shown exactly as it is: containers keep their
+    // shape and every leaf reads, with no picker to repoint it.
+    if read_only {
+        match value {
+            JsonValue::Object(entries) => {
+                ui.label(egui::RichText::new(key.as_str()).color(style::text_muted()));
+                ui.indent(key.as_str(), |ui| {
+                    for (child_key, child) in entries {
+                        asset_settings_row(
+                            ui,
+                            asset_path,
+                            root,
+                            child,
+                            format!("{key}.{child_key}"),
+                            assets,
+                            pending,
+                            session,
+                            overlay_regions,
+                            true,
+                        );
+                    }
+                });
+            }
+            other => read_only_row(ui, &key, &other.to_string()),
+        }
+        return;
+    }
+    if key == "shader" || key == "shader.guid" {
+        let reference = reference_guid(value);
+        shader_row(
+            ui,
+            asset_path,
+            root,
+            "shader",
+            &reference,
+            assets,
+            pending,
+            session,
+            overlay_regions,
+        );
+        return;
+    }
     if let Some(reference) = texture_slot_value(&key, value) {
         texture_slot_row(
             ui,
@@ -113,6 +185,7 @@ pub fn asset_settings_row(
                         pending,
                         session,
                         overlay_regions,
+                        false,
                     );
                 }
             });
@@ -131,6 +204,7 @@ pub fn asset_settings_row(
                         pending,
                         session,
                         overlay_regions,
+                        false,
                     );
                 }
             });
@@ -288,7 +362,7 @@ pub fn colour_parameter_row(
 
 /// One texture slot: the referenced texture's name (or its guid, when the
 /// listing no longer holds it), a clear button, a drop target and a
-/// type-filtered picker that opens under the row (W-0049 Stage 8).
+/// type-filtered picker that opens under the row.
 ///
 /// Every choice writes the chosen asset's guid, which is what the file holds.
 #[allow(clippy::too_many_arguments)]
@@ -428,17 +502,150 @@ pub fn texture_candidates(assets: &[AssetListing]) -> Vec<&AssetListing> {
         .collect()
 }
 
-/// The guid a dropped asset path writes: the listing row's own, or `None`
-/// when the path names no asset that carries one.
+/// The last segment of a shader asset's registered type name.
+pub const SHADER_TYPE_SUFFIX: &str = "Shader";
+
+/// The guid a settings reference holds, in either spelling: the value itself
+/// when the document writes a bare guid, or the object form's `guid`.
+pub fn reference_guid(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(guid) => Some(guid.clone()),
+        JsonValue::Object(entries) => entries
+            .get("guid")
+            .and_then(|guid| guid.as_str())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The listing rows a shader reference's picker offers, in listing order.
+pub fn shader_candidates(assets: &[AssetListing]) -> Vec<&AssetListing> {
+    assets
+        .iter()
+        .filter(|row| {
+            row.kind
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| name == SHADER_TYPE_SUFFIX)
+        })
+        .collect()
+}
+
+/// One shader reference: the shader's path (or its guid when the listing no
+/// longer holds it), a clear button, a drop target and a picker over the
+/// shaders the listing names.
+///
+/// Every choice writes the reference's object form, which is what a saved
+/// `.material` holds.
+#[allow(clippy::too_many_arguments)]
+pub fn shader_row(
+    ui: &mut egui::Ui,
+    asset_path: &str,
+    root: &JsonValue,
+    key: &str,
+    reference: &Option<String>,
+    assets: &[AssetListing],
+    pending: &mut PendingEditorCommands,
+    session: &mut InspectorSession,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
+    let shader_path = reference
+        .as_deref()
+        .and_then(|guid| assets.iter().find(|row| row.guid.as_deref() == Some(guid)))
+        .map(|row| row.path.clone());
+    let text = match (&shader_path, reference) {
+        (Some(path), _) => path.clone(),
+        (None, Some(guid)) => format!("{}…", guid.chars().take(8).collect::<String>()),
+        (None, None) => "(none)".to_string(),
+    };
+    let mut chosen: Option<Option<String>> = None;
+    let mut button_rect = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("shader").color(style::text_muted()));
+        let response = ui.add_sized(
+            egui::vec2(
+                (ui.available_width() - inspector_fields::ASSET_ROW_CLEAR_WIDTH).max(60.0),
+                18.0,
+            ),
+            egui::Button::new(icons::rich(icons::Icon::Code, &text)).truncate(),
+        );
+        if let Some(dropped) = response.dnd_release_payload::<String>() {
+            chosen = assets
+                .iter()
+                .find(|row| row.key() == *dropped)
+                .and_then(|row| row.guid.clone())
+                .map(Some);
+        }
+        if response.clicked() {
+            session.settings_picker = Some(key.to_string());
+            session.settings_search.clear();
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                slot = key,
+                "[editor] settings shader picker"
+            );
+        }
+        button_rect = Some(response.rect);
+        if ui
+            .add_enabled(reference.is_some(), egui::Button::new("x").small())
+            .on_hover_text("Clear the shader")
+            .clicked()
+        {
+            chosen = Some(None);
+        }
+    });
+
+    if session.settings_picker.as_deref() == Some(key) {
+        if let Some(rect) = button_rect {
+            let picker_id =
+                egui::Id::new(("pill_editor_shell_egui.shader_picker", key.to_string()));
+            floating_popup(
+                ui,
+                picker_id,
+                rect,
+                rect.width().max(180.0),
+                overlay_regions,
+                &mut |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(inspector_fields::ASSET_PICKER_HEIGHT)
+                        .show(ui, |ui| {
+                            for candidate in shader_candidates(assets) {
+                                let current =
+                                    shader_path.as_deref() == Some(candidate.path.as_str());
+                                if ui.selectable_label(current, &candidate.path).clicked() {
+                                    chosen = candidate.guid.clone().map(Some);
+                                }
+                            }
+                        });
+                },
+            );
+        }
+    }
+
+    if let Some(reference) = chosen {
+        session.settings_picker = None;
+        let value = match reference {
+            Some(guid) => serde_json::json!({ "guid": guid }),
+            None => JsonValue::Null,
+        };
+        settings_commit(pending, asset_path, root, key, value);
+    }
+}
+
+/// The guid a dropped asset writes: the listing row's own, or `None` when the
+/// path names no asset that carries one.
+///
+/// The dropped payload is the row's key, so a module row is found the same way
+/// a project one is.
 pub fn texture_guid_for(assets: &[AssetListing], path: &str) -> Option<String> {
     assets
         .iter()
-        .find(|row| row.path == path)
+        .find(|row| row.key() == path)
         .and_then(|row| row.guid.clone())
 }
 
 /// Queue the recorded edit that puts `value` at `key` in the settings; the
-/// command carries the whole patched document, the native contract.
+/// command carries the whole patched document.
 pub fn settings_commit(
     pending: &mut PendingEditorCommands,
     asset_path: &str,
@@ -465,4 +672,69 @@ pub fn settings_commit(
         label,
         Some(inspector::settings_coalesce_key(asset_path, key)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(path: &str, kind: &str, guid: Option<&str>) -> AssetListing {
+        AssetListing {
+            root: String::new(),
+            path: path.to_string(),
+            read_only: false,
+            kind: kind.to_string(),
+            standalone: true,
+            has_meta: guid.is_some(),
+            guid: guid.map(str::to_owned),
+        }
+    }
+
+    /// A reference reads both spellings the documents use: the object form this
+    /// build writes, and the bare guid every older file holds.
+    #[test]
+    fn a_reference_reads_both_spellings() {
+        assert_eq!(
+            reference_guid(&serde_json::json!({ "guid": "abc" })).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            reference_guid(&serde_json::json!("abc")).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(reference_guid(&serde_json::Value::Null), None);
+    }
+
+    /// A shader reference's picker offers shaders, and a texture slot's picker
+    /// offers textures: neither lists the other's rows.
+    #[test]
+    fn the_pickers_offer_their_own_kind() {
+        let assets = vec![
+            row(
+                "materials/a.material",
+                "pill_master_renderer::assets::Material",
+                Some("m"),
+            ),
+            row(
+                "shaders/pbr.hlsl",
+                "pill_master_renderer::assets::Shader",
+                Some("s"),
+            ),
+            row(
+                "textures/rock.png",
+                "pill_master_renderer::assets::Texture",
+                Some("t"),
+            ),
+        ];
+        let shaders: Vec<&str> = shader_candidates(&assets)
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(shaders, vec!["shaders/pbr.hlsl"]);
+        let textures: Vec<&str> = texture_candidates(&assets)
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(textures, vec!["textures/rock.png"]);
+    }
 }

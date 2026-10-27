@@ -8,9 +8,8 @@
 //! # Design
 //!
 //! Not a component and not an asset: a plain value the renderer holds, so it
-//! carries no ECS derives and is registered with nothing. It lives under
-//! `components/` because that is where the renderer's scene-facing types are
-//! gathered, and because it never belonged to the asset or GPU layers either.
+//! carries no ECS derives and is registered with nothing. It sits under
+//! `components/` with the contract's other scene-facing types.
 
 /// A rectangle of the target a frame draws into.
 ///

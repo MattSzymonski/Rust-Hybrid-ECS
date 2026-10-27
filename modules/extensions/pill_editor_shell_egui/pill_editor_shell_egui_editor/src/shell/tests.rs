@@ -2,13 +2,12 @@
 //!
 //! # Responsibilities
 //!
-//! - The menus', the toolbox's and the inspector's model-level tests.
+//! - The tab bodies, the asset listing's icons, the addable list and the
+//!   shared selection's moves.
 //!
 //! # Design
 //!
-//! Split out of the shell's root file (W-0037 Stage 3) with its bodies
-//! unchanged. The block was inline (`mod tests { ... }`) and is now the file
-//! itself; `use super::*;` still reaches the shell's items.
+//! A child module of the shell, so `use super::*;` reaches the shell's items.
 
 // Current crate
 
@@ -130,7 +129,7 @@ fn the_tab_bodies_draw_without_panicking() {
 }
 
 /// The Add list the popup and the component menu share omits every component
-/// the entity already carries, whether it is addable or not (W-0049 Stage 9).
+/// the entity already carries, whether it is addable or not.
 #[test]
 fn the_addable_list_omits_the_components_the_entity_carries() {
     let mut engine = Engine::new();
@@ -179,28 +178,36 @@ fn the_browser_draws_its_tree_path_and_tiles() {
     let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
     snapshot.assets = vec![
         AssetListing {
+            root: String::new(),
             path: "models".to_string(),
+            read_only: false,
             kind: "folder".to_string(),
             standalone: false,
             has_meta: false,
             guid: None,
         },
         AssetListing {
+            root: String::new(),
             path: "models/nested".to_string(),
+            read_only: false,
             kind: "folder".to_string(),
             standalone: false,
             has_meta: false,
             guid: None,
         },
         AssetListing {
+            root: String::new(),
             path: "models/cube.obj".to_string(),
+            read_only: false,
             kind: "pill_master_renderer::assets::Mesh".to_string(),
             standalone: false,
             has_meta: true,
             guid: None,
         },
         AssetListing {
+            root: String::new(),
             path: "shaders/code.wgsl".to_string(),
+            read_only: false,
             kind: "file".to_string(),
             standalone: false,
             has_meta: false,
@@ -270,7 +277,9 @@ fn the_browser_draws_its_tree_path_and_tiles() {
 #[test]
 fn tiles_pick_an_icon_from_the_kind_and_the_extension() {
     let row = |path: &str, kind: &str| AssetListing {
+        root: String::new(),
         path: path.to_string(),
+        read_only: false,
         kind: kind.to_string(),
         standalone: false,
         has_meta: false,
@@ -349,7 +358,7 @@ fn run_pass_with(
 }
 
 /// Dragging an asset tile from the grid onto its Inspector asset row queues
-/// the reference edit, through egui's drag-and-drop payload (W-0048).
+/// the reference edit, through egui's drag-and-drop payload.
 #[test]
 fn a_dropped_asset_tile_queues_the_reference_edit() {
     const MESH_TYPE: &str = "pill_master_renderer::assets::Mesh";
@@ -409,7 +418,9 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     let engine = Engine::new();
     let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
     snapshot.assets = vec![AssetListing {
+        root: String::new(),
         path: "cube.obj".to_string(),
+        read_only: false,
         kind: MESH_TYPE.to_string(),
         standalone: false,
         has_meta: true,
@@ -524,9 +535,8 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     );
 }
 
-/// A wheel event over a scroll area scrolls it; the bridge and the dock both
-/// pass wheel deltas through untouched (W-0048: the Inspector is scrolled by
-/// wheeling over it).
+/// A click on an entity row moves the shared selection; a second click on the
+/// selected row is not a change.
 #[test]
 fn a_row_click_moves_the_shared_selection() {
     let mut engine = Engine::new();
@@ -607,7 +617,9 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     selection.select_only(entity);
     selection.asset = Some("textures/rock.png".to_string());
     snapshot.asset_detail = Some(pill_editor_core::editor_state::AssetDetail {
+        root: String::new(),
         path: "textures/rock.png".to_string(),
+        read_only: false,
         kind: "pill_master_renderer::assets::Texture".to_string(),
         standalone: false,
         settings: Some(serde_json::json!({
@@ -616,6 +628,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
             "flip_v": false,
             "waves": [{ "amplitude": 1.0 }],
         })),
+        texture_slots: Vec::new(),
     });
     let mut pending = PendingEditorCommands::default();
     let context = egui::Context::default();

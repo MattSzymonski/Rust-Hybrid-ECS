@@ -1,16 +1,16 @@
-//! The editor's menu bar: the strip above the dock, its six titles and the
-//! mark on its left.
+//! The editor's menu bar: the strip above the dock, its titles, the mark on
+//! its left and the entries each menu carries.
 //!
 //! # Responsibilities
 //!
 //! - The bar's vocabulary: the menu titles in their order, and the metrics
 //!   the shell and the tests share (bar height, the mark's size and inset,
-//!   title padding).
+//!   the gap before the first title).
 //! - The mark's rectangle inside a bar of a given height - the geometry the
 //!   shell positions the texture with.
-//! - The menu model itself (what each menu contains and which editor action
-//!   an item runs) is [`crate::menubar`]'s job; this module only says what
-//!   the bar looks like.
+//! - The menus' contents as plain data: one row per registered command whose
+//!   menu path names the menu, and the action a click asks for
+//!   ([`MenuAction`]).
 //!
 //! Nothing here draws: the shell walks [`Menu::ALL`] and egui lays the
 //! buttons out, so the bar follows the theme and the font metrics.
@@ -44,15 +44,16 @@ pub const MENU_TITLE_COUNT: usize = Menu::ALL.len();
 /// One menu title: the strip's entry, in the order it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Menu {
-    /// Project-level entries: assets and quitting the editor.
+    /// The scene document's rows, the asset actions and quitting the editor.
     File,
-    /// History and selection edits.
+    /// History, the clipboard, entity deletion and the Preferences tab.
     Edit,
-    /// New entities and assets.
+    /// A new entity.
     Create,
-    /// The gizmo, the space, snapping and the scene grid.
+    /// The gizmo's tool, space and snapping, the scene grid and the
+    /// simulation controls.
     View,
-    /// The dock's tabs.
+    /// The dock's tabs and one more scene view.
     Window,
     /// The About window.
     Help,
@@ -113,7 +114,7 @@ pub struct MenuView<'a> {
     /// The shared selection the enablement rules read.
     pub selection: &'a EditorSelection,
     /// The registered commands in registration order: a row exists because
-    /// one of these names this menu (W-0038 Stage 2).
+    /// one of these names this menu.
     pub commands: &'a [CommandView],
 }
 
@@ -161,14 +162,13 @@ pub enum MenuAction {
     Redo,
     /// Bring a dock tab to the front.
     ActivateTab(EditorTab),
-    /// Dock one more scene view, with its own camera and toolbox (W-0038
-    /// Stage 21).
+    /// Dock one more scene view, with its own camera and toolbox.
     NewSceneView,
     /// Open the About window.
     About,
     /// Quit the editor.
     Quit,
-    /// Copy, cut or paste (W-0038 Stage 17): the shell queues the request the
+    /// Copy, cut or paste: the shell queues the request the
     /// executable's OS clipboard bridge carries out.
     Clipboard(crate::clipboard::ClipboardAction),
 }
@@ -178,8 +178,8 @@ pub enum MenuAction {
 ///
 /// Nothing here is hard-coded per menu. A command that stops being registered
 /// loses its row, a renamed command renames its row, and the rules between
-/// groups are the specs marked [`crate::commands::CommandSpec::separator`]
-/// (W-0038 Stage 2).
+/// groups are the specs marked with
+/// [`crate::commands::CommandSpec::separator`].
 pub fn entries(menu: Menu, view: &MenuView<'_>) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for command in view.commands {
@@ -229,8 +229,8 @@ fn scene_selection(selection: &EditorSelection) -> Option<String> {
 /// editor to do.
 ///
 /// The label is the command's title, except where the row carries the current
-/// state (the gizmo's space). A command with no action in this editor yet is a
-/// disabled row: the registry can register ahead of the code that runs it.
+/// state (the gizmo's space). An id that names neither an action here nor a
+/// dock tab is a disabled row.
 fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
     let state = ToolboxState {
         gizmo: view.snapshot.gizmo,
@@ -266,7 +266,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
                 commands: vec![step],
             }
         }
-        // The clipboard rows (W-0038 Stage 17): Copy and Cut need a selection
+        // The clipboard rows: Copy and Cut need a selection
         // with something to carry, Paste is always offered - whether the
         // clipboard holds a payload is the executable's answer, and a refusal
         // there is a toast rather than a greyed row nobody can explain.
@@ -280,7 +280,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
             MenuAction::Clipboard(action)
         }
         "editor.paste" => MenuAction::Clipboard(crate::clipboard::ClipboardAction::Paste),
-        // The scene document's rows (W-0048 Stage 9). Open acts on the scene
+        // The scene document's rows. Open acts on the scene
         // selected in the Assets tab, so it greys out until one is; Save needs
         // an open scene file, and Save As always has somewhere to write.
         "editor.scene_new" => MenuAction::Queue {
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(rect.min.y, 0.0);
     }
 
-    /// The frame's view over a fresh engine, with the registry's commands.
+    /// The frame's view over one snapshot, selection and command list.
     fn view_over<'a>(
         snapshot: &'a EditorSnapshot,
         selection: &'a EditorSelection,
@@ -489,8 +489,8 @@ mod tests {
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let entries = entries(Menu::File, &view_over(&snapshot, &selection, &commands));
-        // The scene document's rows lead the menu (W-0048 Stage 9), then the
-        // asset actions, then quitting.
+        // Two rules split the rows: New/Open/Save, then Save As with the
+        // asset rows, then Quit.
         assert_eq!(
             labels(&entries),
             vec![
@@ -503,9 +503,9 @@ mod tests {
                 "Quit Editor",
             ]
         );
-        // Only the sidecar write needs a selection, and nothing is selected.
+        // The empty selection is what greys the sidecar write out.
         assert!(!actions(&entries)[5].1);
-        // One rule after the scene rows and one above Quit Editor.
+        // One rule before Save Scene As and one above Quit Editor.
         assert_eq!(separators(&entries), 2);
         assert!(matches!(entries[3], MenuEntry::Separator));
         assert!(matches!(entries[7], MenuEntry::Separator));
@@ -534,9 +534,9 @@ mod tests {
         assert!(!rows[1].1, "no redo history yet");
         assert!(!rows[5].1, "nothing selected to delete");
         assert!(rows[6].1, "the preferences tab always opens");
-        // Copy and cut need something to carry; paste is always offered, because
-        // whether the clipboard holds a payload is the executable's answer
-        // (W-0038 Stage 17).
+        // Copy and cut need something to carry; paste is always offered,
+        // because whether the clipboard holds a payload is the executable's
+        // answer.
         assert_eq!((rows[2].1, rows[3].1), (false, false));
         assert!(rows[4].1, "paste is offered with nothing selected");
 
@@ -635,7 +635,7 @@ mod tests {
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let menu = entries(Menu::Window, &view_over(&snapshot, &selection, &commands));
-        // The new-view row comes first (W-0038 Stage 21), then one row per
+        // The new-view row comes first, then one row per
         // tab in strip order.
         let mut expected: Vec<String> = vec!["New Scene View".to_string()];
         expected.extend(EditorTab::ALL.iter().map(|tab| tab.title()));
@@ -703,8 +703,7 @@ mod tests {
         assert_eq!(labels(&menu)[0], "Step Back");
     }
 
-    /// A snapshot over a fresh engine, cloned for the entries that take a
-    /// view of it.
+    /// A snapshot over a fresh engine, which the entry tests take views of.
     fn snapshot_fixture() -> EditorSnapshot {
         let engine = pill_engine::Engine::new();
         EditorSnapshot::capture_list(&engine, 0, &[], Vec::new())

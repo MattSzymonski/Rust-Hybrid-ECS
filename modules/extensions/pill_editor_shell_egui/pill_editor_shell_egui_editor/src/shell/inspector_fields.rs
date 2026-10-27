@@ -1,18 +1,19 @@
-//! The Inspector's field rows: the decorators, the row model and the
+//! The Inspector's field rows: the decorators a component declares and the
+//! control each row draws.
 //!
 //! # Responsibilities
 //!
-//! - `inspector_field_row`: the decorators a component declares (`[Header]`, `[Space]`, `[Tooltip]`, `[Range]`, `[Min]`, the multi-line boxes, `[HideInInspector]`) applied to one field's row.
+//! - `inspector_field_row`: one component field's row, with the decorators a component declares (`[Header]`, `[Space]`, `[Tooltip]`, `[Range]`, `[Min]`, the multi-line boxes, `[HideInInspector]`) applied to it.
 //! - `inspector_row` and `is_scalar_field`: which control a field gets.
-//! - `inspector_asset_row`: an asset reference field's row - the named asset,
-//!   its type's picker, clear, and a drop target for the Assets tab (W-0048).
+//! - `inspector_asset_row` and `inspector_entity_row`: a reference row - the
+//!   named target, its picker, its clear button and a drop target for an
+//!   asset or entity dragged out of another tab.
 //! - `remember_inspector_row` and `field_widget_name`: the once-per-row logging the suite asserts on.
-//! - `remember_asset_row_text` and `remember_asset_row_rect`: an asset row's
-//!   current text (logged per change) and its rectangle (logged per placement),
-//!   which the editor suite waits on.
+//! - `remember_asset_row_text`, `remember_asset_row_rect` and the entity row's
+//!   twins: a row's current text (logged per change) and its rectangle (logged
+//!   per placement), which the editor suite waits on.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -328,7 +329,7 @@ pub fn inspector_field_row(
                 );
             }
             // The same row a `[f32; 3]` field draws, assembled from leaves
-            // that live in fields of their own (W-0049).
+            // that live in fields of their own.
             ui.horizontal_wrapped(|ui| {
                 let label = ui.add_sized(
                     egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
@@ -465,7 +466,7 @@ pub struct AssetRowInput<'a> {
     pub assets: &'a [AssetListing],
 }
 
-/// One asset reference row (W-0048): a button naming the referenced asset,
+/// One asset reference row: a button naming the referenced asset,
 /// which opens a picker of every asset of the field's type, a clear button,
 /// and a drop target that takes an asset dragged from the Assets tab.
 ///
@@ -487,11 +488,10 @@ pub fn inspector_asset_row(
         .flatten()
         .unwrap_or(AssetReferenceLabel::Missing);
     let text = label.text().to_owned();
-    // One line per row and text: the row reports the asset it draws the first
-    // time it appears and whenever that asset changes, so a suite can wait for
-    // a pick to show up - and for the previous asset to show up again after an
-    // undo. The entity is part of the key: two entities holding one asset are
-    // still two rows.
+    // One line per row and text: the row reports the asset it draws on its
+    // first draw and on every change, so a suite can wait for a pick to show
+    // up - and for the previous asset to show up again after an undo. The
+    // entity is part of the key: two entities holding one asset are two rows.
     let key = format!("{}.{type_name}.{}", input.entity, input.field);
     if remember_asset_row_text(session, &key, &text) {
         pill_core::info!(
@@ -562,7 +562,7 @@ pub fn inspector_asset_row(
 
     // The picker opens under its row: a search box, then the field's
     // candidates, with `None` first. It floats over the rows below and claims
-    // its rectangle, so a click in it is the picker's (W-0049 Stage 8).
+    // its rectangle, so a click in it is the picker's.
     if session.asset_picker.as_deref() == Some(key.as_str()) {
         if let Some((rect, _)) = button_rect {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
@@ -644,7 +644,7 @@ pub struct EntityRowInput<'a> {
     pub scene: &'a [EntityListEntry],
 }
 
-/// One entity reference row (W-0048 Stage 6): a button naming the referenced
+/// One entity reference row: a button naming the referenced
 /// entity, which opens a picker over the scene, a target button that arms a
 /// scene click, a clear button, and a drop target that takes an entity dragged
 /// from the Entities tab.
@@ -929,8 +929,8 @@ pub fn remember_asset_row_rect(
     );
 }
 
-/// The current values of a grouped row's leaves, in the row's own order
-/// (W-0049): a leaf inside an array value reads its element.
+/// The current values of a grouped row's leaves, in the row's own order: a
+/// leaf inside an array value reads its element.
 pub fn leaf_values(component: &ComponentView, leaves: &[inspector::RowLeaf]) -> Vec<FieldValue> {
     leaves
         .iter()
@@ -964,8 +964,7 @@ pub fn color_channels(values: &[FieldValue]) -> Option<[f32; 4]> {
     Some(channels)
 }
 
-/// The label a row draws, marked when the selection disagrees on its value
-/// (W-0038 Stage 16).
+/// The label a row draws, marked when the selection disagrees on its value.
 pub fn row_label(
     field: &str,
     details: &[EntityDetail],
@@ -981,7 +980,7 @@ pub fn row_label(
 }
 
 /// Queue one field edit for **every** selected entity the component exists on,
-/// as one recorded step (W-0038 Stage 16).
+/// as one recorded step.
 ///
 /// `targets` is [`super::tab_inspector::inspector_targets`]'s answer: the
 /// primary first, then the other selected entities carrying the component. One
@@ -1050,7 +1049,8 @@ pub fn row_is_mixed(
 }
 
 /// Note one Inspector row's signature, answering whether it is new, so a
-/// panel that redraws every frame does not flood the log with the same row.///
+/// panel that redraws every frame does not flood the log with the same row.
+///
 /// The signature is built here from the component, the row's kind and its
 /// distinguishing parts, so no call site joins a `|`-string by hand.
 pub fn remember_inspector_row(

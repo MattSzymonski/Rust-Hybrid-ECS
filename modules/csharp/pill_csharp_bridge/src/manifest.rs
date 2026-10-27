@@ -43,12 +43,10 @@ const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
 /// One accepted leaf type's whole meaning to the host.
 ///
-/// The managed manifest vocabulary is read by four separate checks -
-/// blittability, natural alignment, the engine type tag and default-literal
-/// parsing - and each one used to carry its own copy of the type names. This
-/// table is the one copy: a type is accepted exactly when it has a row here,
-/// and every check reads its answer from that same row, so the four can no
-/// longer disagree about what a type means.
+/// The manifest vocabulary is read by four separate checks - blittability,
+/// natural alignment, the engine type tag and default-literal parsing - and all
+/// four read their answer from this table: a type is accepted exactly when it
+/// has a row here, so the checks cannot disagree about what a type means.
 struct BlittableLeaf {
     /// Canonical managed type name as the manifest writes it.
     type_name: &'static str,
@@ -90,11 +88,6 @@ enum DefaultLiteral {
 /// with `ptr::copy` and the buffer is freed without running any destructor, so
 /// every field must be a blittable value with no ownership, no interior
 /// pointer, and nothing to release.
-///
-/// Before this vocabulary existed the only check on a field's type was that
-/// its name was non-empty, so a manifest declaring a managed reference passed
-/// validation and the resulting column was shared across threads on a promise
-/// nothing verified.
 ///
 /// A nested value type is a shape, not a leaf: it has no row here, and
 /// validation recurses into its own fields instead of looking it up.
@@ -187,7 +180,7 @@ const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
         tag: Some("u16"),
         default_literal: DefaultLiteral::Unsigned16,
     },
-    // A reference to another entity (W-0048 Stage 6): the runtime's `Entity`
+    // A reference to another entity: the runtime's `Entity`
     // handle, which is the Rust handle's mirror - a `u64` slot id and a `u32`
     // generation. Eight-byte aligned because of the `u64`, and with no
     // default: an unset reference is the world's null handle.
@@ -203,7 +196,7 @@ const BLITTABLE_LEAVES: &[BlittableLeaf] = &[
 const STRUCT_TYPE: &str = "struct";
 
 /// The prefix of a `Handle<T>` field's type: `handle:` and the Rust type path
-/// of `T`, as the C# mirror of `T` carries it (W-0048).
+/// of `T`, as the C# mirror of `T` carries it.
 const HANDLE_PREFIX: &str = "handle:";
 
 /// A handle's size and alignment: two `u32`s, `index` then `generation`.
@@ -259,20 +252,18 @@ pub(super) struct ManagedComponentManifest {
     pub(super) shared: bool,
     /// What the entry declares: a component, or a resource.
     ///
-    /// Defaulted so a manifest written before resources existed still parses as
-    /// a list of components; the managed side always writes the tag now, and
-    /// the default is what keeps an older generation's payload readable during
-    /// a reload that straddles the change.
+    /// Defaulted so a payload that omits the tag parses as a list of
+    /// components: an older generation's manifest stays readable during a
+    /// reload that straddles the change.
     #[serde(default)]
     pub(super) kind: ManifestEntryKind,
-    /// Names this entry's type used to be declared under.
+    /// The names of live registrations this entry renames onto itself.
     ///
     /// A rename is expressed here rather than as a new entry: the host resolves
     /// each alias to the registration that answered to it and moves that
     /// registration's rows onto this entry, so the rename reads as a
     /// migration instead of a retirement plus an add. Defaulted for the same
-    /// reason `kind` is - a manifest written before aliases existed still
-    /// parses.
+    /// reason `kind` is.
     #[serde(default)]
     pub(super) aliases: Vec<String>,
     /// Top-level field descriptions of the component layout.
@@ -311,8 +302,7 @@ pub(super) struct ManagedFieldManifest {
     pub(super) default: Option<String>,
     /// Presentation decorators the field declares, in declaration order.
     ///
-    /// Defaulted so a manifest written before decorators existed still parses
-    /// during a reload that straddles the change.
+    /// Defaulted so a payload that omits them parses as an undecorated field.
     #[serde(default)]
     pub(super) decorations: Vec<ManagedFieldDecorator>,
     /// Nested field descriptions when this field is a struct.
@@ -708,11 +698,10 @@ pub(super) fn plan_tag(type_tag: &str) -> &str {
 /// in an artifact's static data. A manifest-declared component has no statics
 /// to borrow from, so its strings have to be given the same lifetime by hand.
 ///
-/// Doing that with a bare `Box::leak` per registration is what this replaces:
-/// the C# project re-registers its components on every reload, so the leak grew
-/// with reload count rather than with the number of distinct names. Interning
-/// bounds it by the project's type set, which is the intended cost - a name a
-/// component keeps across a hundred reloads is stored once.
+/// A bare `Box::leak` per registration would grow with the reload count, since
+/// the C# project re-registers its components on every reload. Interning bounds
+/// the cost by the project's type set: a name a component keeps across a
+/// hundred reloads is stored once.
 static INTERNED_FIELD_STRINGS: std::sync::Mutex<Option<HashSet<&'static str>>> =
     std::sync::Mutex::new(None);
 
@@ -806,10 +795,9 @@ pub(super) fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> S
 
 /// Parse a managed manifest and check every entry against its own identity.
 ///
-/// Split out of `register_component_manifest` so the reload path validates
-/// exactly what the startup path validates. Every check here is a property of
-/// the manifest alone - identity, uniqueness, and the shape of each layout - so
-/// both callers can run it before either touches the world.
+/// Every check here is a property of the manifest alone - identity, uniqueness,
+/// and the shape of each layout - so startup and reload both run it before
+/// either touches the world, and so both validate exactly the same thing.
 pub(super) fn parse_and_validate_manifest(
     bytes: &[u8],
 ) -> Result<Vec<ManagedComponentManifest>, CSharpError> {

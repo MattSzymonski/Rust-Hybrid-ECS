@@ -1,34 +1,27 @@
-//! `change_detection_demo` — a runnable example demonstrating Pill's
-//! change-detection filters (`Changed<T>`, `Added<T>`, `With<T>`,
-//! `Without<T>`) on top of the parameterized `Query<Data, Filter>` API.
+//! A runnable example of Pill's change-detection filters (`Changed<T>`,
+//! `Added<T>`, `With<T>`, `Without<T>`) on top of the parameterized
+//! `Query<Data, Filter>` API.
 //!
-//! Each frame three systems run:
-//! - `movement_system` mutates `Position` for entities that have a
-//!   non-zero `Velocity`. The mutation goes through `Mut<Position>`,
-//!   which bumps the per-row `changed` tick automatically.
-//! - `react_to_movement_system` uses `Query<(Entity, &Position),
-//!   Changed<Position>>` and only sees entities whose position was
-//!   actually mutated since this system last ran.
-//! - `react_to_new_health_system` uses `Query<(Entity,),
-//!   Added<Health>>` to react when Health appears on an entity for the
-//!   first time. Commands add Health to entity 0 on frame 3.
+//! Each frame five systems run. `movement_system` writes `Position` through
+//! `Mut<Position>` on even frames, which bumps the per-row `changed` tick
+//! whether or not the value moved; `react_to_movement_system` observes those
+//! rows through `Changed<Position>`, and `react_to_new_health_system` observes
+//! a `Health` added through deferred `Commands` on the following frame.
 //!
 //! # Responsibilities
 //!
-//! - Defines the `Position`, `Velocity`, `Health`, and `Player`
-//!   components plus the `FrameCounter` and `TargetEntity` resources.
-//! - Registers five systems that exercise the `Changed<T>`, `Added<T>`,
-//!   `With<T>`, and `Without<T>` change-detection filters.
+//! - Defines the `Position`, `Velocity`, `Health`, and `Player` components plus
+//!   the `FrameCounter` and `TargetEntity` resources.
+//! - Registers five systems that exercise the four change-detection filters.
 //! - Runs five deterministic frames and prints the reactive output so the
-//!   demo's behaviour can be verified from the log.
+//!   demo's behaviour can be checked from the log.
 //!
 //! # Design
 //!
-//! The demo runs the engine sequentially (`set_parallel_execution(false)`)
-//! so the printed log is deterministic. `driver_system` runs first: it
-//! advances the frame counter and queues a `Health` attachment through
-//! deferred `Commands`, so `Added<Health>` picks the new component up on
-//! the following frame.
+//! The engine runs sequentially (`set_parallel_execution(false)`) so the
+//! printed log is deterministic, and `driver_system` runs first: it advances
+//! the frame counter and queues the `Health` attachment, so `Added<Health>`
+//! picks it up on the following frame.
 
 // External crates
 use pill_engine::{
@@ -58,8 +51,8 @@ impl Component for Position {}
 
 /// 2D velocity component describing per-frame movement.
 ///
-/// Only entities with a non-zero `Velocity` are moved by `movement_system`,
-/// so stationary entities never trigger `Changed<Position>`.
+/// Every entity carrying it is matched by `movement_system`, which adds the
+/// velocity to `Position` on even frames.
 #[derive(Debug, Clone)]
 struct Velocity {
     /// Horizontal velocity applied on each moved frame.
@@ -94,10 +87,6 @@ struct Player;
 impl Component for Player {}
 
 // ============================================================================
-// Trait-object registration
-// ============================================================================
-
-// ============================================================================
 // FrameCounter
 // ============================================================================
 
@@ -119,8 +108,11 @@ impl Resource for TargetEntity {}
 // Systems
 // ============================================================================
 
-/// Mutates Position only on even frames so reactive systems can see the
+/// Writes Position only on even frames so reactive systems can see the
 /// difference between "changed" and "unchanged" frames.
+///
+/// The loop writes through `Mut` unconditionally, so a zero `Velocity` still
+/// marks the row as changed - the filter reports "written", not "moved".
 fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Velocity)>) {
     // Step 1: read the current frame and skip odd frames entirely so the
     // reactive systems observe a genuine "unchanged" frame.
@@ -136,8 +128,8 @@ fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Ve
     }
 }
 
-/// Reacts only to entities whose Position was mutated since this system
-/// last ran. Combines a row-level filter (`Changed<Position>`) with an
+/// Reacts only to entities whose Position was written through since this
+/// system last ran. Combines a row-level filter (`Changed<Position>`) with an
 /// archetype-level filter (`With<Player>`) to scope the result.
 // The full query type is spelled out on purpose: combining a row filter with
 // an archetype filter is exactly what this example exists to show, and hiding
@@ -239,7 +231,7 @@ fn main() {
     let _player_b = world
         .create_entity()
         .with(Position { x: 10.0, y: 10.0 })
-        .with(Velocity { x: 0.0, y: 0.0 }) // never moves -> never "changes"
+        .with(Velocity { x: 0.0, y: 0.0 }) // zero velocity: still written through
         .with(Player)
         .build()
         .unwrap();

@@ -5,16 +5,17 @@
 //! - [`World::load_asset`]: the one call a project makes to get a typed handle
 //!   for a file under `res`, with its guid recorded so references can save.
 //! - [`Engine::load_scene_file`]: a `.scene` file instantiated into the world
-//!   from code, the same load the editor's Open and the startup scene use.
+//!   from code, through the same [`load_scene`] pass the editor's Open and the
+//!   startup scene run.
 //!
 //! # Design
 //!
-//! Assets are named by path (Q6 in the item's plan): a project writes
-//! `"models/helmet.obj"` and gets a `Handle<Mesh>`, instead of decoding the
-//! bytes itself and inventing a name for the result. The path is resolved
-//! through the mounted asset directory, the type through the file's extension,
-//! and the guid is written to the file's `.meta` when it has none - so the
-//! handle a game holds is the same identity a scene reference saves.
+//! Assets are named by path: a project writes `"models/helmet.obj"` and gets a
+//! `Handle<Mesh>`, instead of decoding the bytes itself and inventing a name for
+//! the result. The path is resolved through the mounted asset directory, the
+//! type through the file's extension, and the guid is written to the file's
+//! `.meta` when it has none - so the handle a game holds is the same identity a
+//! scene reference saves.
 
 // Standard library
 use std::path::Path;

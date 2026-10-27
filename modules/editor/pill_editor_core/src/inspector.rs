@@ -3,17 +3,15 @@
 //!
 //! # Responsibilities
 //!
-//! - The `SetField`/`SetArrayElement` builders and their history labels (the
-//!   native editor's spellings), so the shell's widgets and the scripted
-//!   channel queue identical edits.
-//! - [`parse_field_value`]: text into a value's own kind, the native
-//!   inspector's parsing rule - used by the scripted channel and any text
-//!   field.
+//! - The `SetField`/`SetArrayElement` builders and their history labels, so
+//!   the shell's widgets and the scripted channel queue identical edits.
+//! - [`parse_field_value`]: text into a value's own kind - used by the
+//!   scripted channel and any text field.
 //! - [`element_field`]: one element of an array value.
 //! - The section model the tab draws: [`component_label`],
 //!   [`component_icon`], [`widget_for`] and [`rows`] - what each component
 //!   section holds and which widget each row asks for.
-//! - Asset reference rows (W-0048): the [`EditorCommand::SetFieldAsset`]
+//! - Asset reference rows: the [`EditorCommand::SetFieldAsset`]
 //!   builders ([`asset_edit`], [`selection_asset_edit`]) and the assets a
 //!   row's picker offers ([`asset_candidates`]).
 //! - Asset settings as editable data: key paths (`a.b[0]`), leaf reads and
@@ -55,10 +53,11 @@ pub fn component_label(type_name: &str) -> &str {
 /// The duotone icon a component section's header draws, from its type name.
 ///
 /// The engine's components carry no icon metadata, so the mark follows the
-/// name's words: a transform points in all directions, a mesh or collider is
-/// a cube (the collider an outlined one), a sprite or texture is an image, a
-/// material a sphere, a light a power switch, a camera a monitor, a script or
-/// behaviour a code mark, and anything else the property sliders.
+/// name's words: a transform points in all directions, a mesh is a cube (a
+/// collider an outlined one), a sprite or texture is an image, a material a
+/// sphere, a light a power switch, a camera a monitor, audio a play mark, a
+/// script, behaviour or system a code mark, physics outward arrows, and
+/// anything else the property sliders.
 pub fn component_icon(type_name: &str) -> Icon {
     let lower = type_name.to_lowercase();
     if lower.contains("transform") {
@@ -90,7 +89,7 @@ pub fn component_icon(type_name: &str) -> Icon {
     }
 }
 
-/// The duotone icon a scene badge draws for an entity (W-0049 Stage 12): the
+/// The duotone icon a scene badge draws for an entity: the
 /// camera mark for something that can see, the light mark for something that
 /// shines, and nothing for everything else - which draws as a plain circle.
 ///
@@ -226,7 +225,7 @@ pub fn widget_for_decorated(value: &FieldValue, decorators: &[FieldDecorator]) -
 /// How many side-by-side elements a vector row holds at most: X, Y, Z, W.
 pub const VECTOR_AXES_MAX: usize = 4;
 
-/// The channel suffixes a colour row reads, in order (W-0049).
+/// The channel suffixes a colour row reads, in order.
 pub const COLOR_CHANNELS: [&str; 4] = ["r", "g", "b", "a"];
 
 /// The axis suffixes a grouped vector row reads, in order.
@@ -306,7 +305,7 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
-    /// A reference to another entity (W-0048 Stage 6): the referenced
+    /// A reference to another entity: the referenced
     /// entity's Hierarchy label, a picker over the scene's entities, a
     /// viewport pick, a clear button and a drop target for the Entities tab.
     Entity {
@@ -317,7 +316,7 @@ pub enum FieldRow {
         /// Text the field's `[Tooltip]` declared, shown on hover of the label.
         tooltip: Option<String>,
     },
-    /// A colour (W-0049): one swatch whose popup holds the picker. Its leaves
+    /// A colour: one swatch whose popup holds the picker. Its leaves
     /// are the channels, whether they are one array field's elements or one
     /// scalar field each.
     Color {
@@ -330,7 +329,7 @@ pub enum FieldRow {
     },
     /// A vector assembled from consecutive leaves that share a dotted prefix
     /// and a `#[pill(vector)]` decorator: one row of X/Y/Z side-by-side
-    /// numeric fields, as a `[f32; 3]` field already draws (W-0049).
+    /// numeric fields, as a `[f32; 3]` field already draws.
     VectorGroup {
         /// The axes the row writes, in X/Y/Z[/W] order.
         leaves: Vec<RowLeaf>,
@@ -355,8 +354,8 @@ pub enum FieldRow {
 /// The rows a component section draws, in field order.
 ///
 /// A scalar array of two to four elements becomes one vector row (Unity draws
-/// a `Vector3` as three fields on one line); anything longer stays one row per
-/// element, drawn by the caller from the array's own value.
+/// a `Vector3` as three fields on one line); anything longer draws as one
+/// read-only row.
 ///
 /// Decorators are applied here so the shell only draws what the model asks
 /// for: `[HideInInspector]` drops the field together with its header and gap,
@@ -400,9 +399,9 @@ pub fn rows(component: &ComponentView) -> Vec<FieldRow> {
             }
         }
         // A run of scalar leaves sharing a dotted prefix and a grouping
-        // decorator draws as one row: a colour's channels or a vector's axes
-        // (W-0049). The run decides the row, so a nested struct the world
-        // flattened at registration reads as the value it is.
+        // decorator draws as one row: a colour's channels or a vector's axes.
+        // The run decides the row, so a nested struct the world flattened at
+        // registration reads as the value it is.
         if let Some((row, consumed)) = grouped_row(component, index, tooltip.clone()) {
             rows.push(row);
             index += consumed;
@@ -625,8 +624,8 @@ pub fn axis_color(index: usize) -> Color32 {
     }
 }
 
-/// The recorded component attach, under the native label (`add {short}`):
-/// the Component menu's picker and the scripted channel share it.
+/// The recorded component attach, labelled `add {short}`: the Component
+/// menu's picker and the scripted channel share it.
 pub fn component_add(entity: Entity, component: &str) -> (EditorCommand, String) {
     (
         EditorCommand::AddComponent {
@@ -637,7 +636,7 @@ pub fn component_add(entity: Entity, component: &str) -> (EditorCommand, String)
     )
 }
 
-/// The recorded component detach, under the native label (`remove {short}`).
+/// The recorded component detach, labelled `remove {short}`.
 pub fn component_remove(entity: Entity, component: &str) -> (EditorCommand, String) {
     (
         EditorCommand::RemoveComponent {
@@ -648,7 +647,7 @@ pub fn component_remove(entity: Entity, component: &str) -> (EditorCommand, Stri
     )
 }
 
-/// The recorded whole-field edit: `SetField` under the native label.
+/// The recorded whole-field edit: `SetField` labelled `set {short}.{field}`.
 pub fn field_edit(
     entity: Entity,
     component: &str,
@@ -805,8 +804,8 @@ pub fn parse_entity_reference(text: &str) -> Result<Option<Entity>, String> {
     Ok(Some(Entity::from_raw(id, generation)))
 }
 
-/// The recorded array-element edit: `SetArrayElement` under the native
-/// label (`set Component[index].field`).
+/// The recorded array-element edit: `SetArrayElement` labelled
+/// `set {short}[{index}].{field}`.
 pub fn element_edit(
     entity: Entity,
     component: &str,
@@ -832,12 +831,12 @@ pub fn element_edit(
 }
 
 /// The continuous-edit key one inspector widget's commits share, so a drag
-/// or a typing run merges into one undo step - the native widget id.
+/// or a typing run merges into one undo step.
 pub fn field_coalesce_key(entity: Entity, component: &str, field: &str) -> String {
     format!("inspector.{entity}.{component}.{field}")
 }
 
-/// The selected entities one component's edit reaches (W-0038 Stage 16): the
+/// The selected entities one component's edit reaches: the
 /// primary first, then every other selected entity whose detail carries the
 /// component.
 ///
@@ -896,7 +895,7 @@ pub fn element_field(value: &FieldValue, index: usize) -> Option<FieldValue> {
     elements.get(index).cloned()
 }
 
-/// One recorded batch writing every leaf of a grouped row (W-0049): the colour
+/// One recorded batch writing every leaf of a grouped row: the colour
 /// or vector a row draws, across the whole selection, as one undo step.
 ///
 /// `values` holds one value per leaf, in the row's own order. The label and the
@@ -958,9 +957,9 @@ pub fn parse_field_value(text: &str, current: &FieldValue) -> Result<FieldValue,
     Ok(parsed)
 }
 
-/// One field value in the text form the Inspector's widgets show and commit
-/// (W-0038 Stage 12): what a module panel displays and what it writes back
-/// through `PanelCommand::SetField`.
+/// One field value in the text form the Inspector's widgets show and commit:
+/// what a module panel displays and what it writes back through
+/// `PanelCommand::SetField`.
 pub fn value_text(value: &FieldValue) -> String {
     match value {
         FieldValue::F32(value) => format!("{value}"),
@@ -1170,7 +1169,7 @@ mod tests {
     }
 
     /// A multi-selection edits the entities that carry the component, and skips
-    /// the ones that do not (W-0038 Stage 16).
+    /// the ones that do not.
     #[test]
     fn selection_targets_skip_entities_without_the_component() {
         let primary = Entity::from_raw(1, 0);
@@ -1819,7 +1818,7 @@ mod tests {
     }
 
     /// An asset value becomes an asset row carrying the field's asset type,
-    /// not a read-only row (W-0048).
+    /// not a read-only row.
     #[test]
     fn an_asset_value_is_an_asset_row() {
         let view = component(
@@ -1846,7 +1845,9 @@ mod tests {
     #[test]
     fn asset_candidates_are_the_files_of_the_fields_type() {
         let listing = |path: &str, kind: &str| AssetListing {
+            root: String::new(),
             path: path.to_owned(),
+            read_only: false,
             kind: kind.to_owned(),
             standalone: false,
             has_meta: true,
@@ -1866,8 +1867,7 @@ mod tests {
         assert!(asset_candidates(&assets, None).is_empty());
     }
 
-    /// An entity value becomes an entity row, not a read-only one (W-0048
-    /// Stage 6).
+    /// An entity value becomes an entity row, not a read-only one.
     #[test]
     fn an_entity_value_is_an_entity_row() {
         let view = component(

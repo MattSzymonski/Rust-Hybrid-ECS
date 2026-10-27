@@ -8,18 +8,18 @@
 //!
 //! # Design
 //!
-//! Hand-reconstructing `--extern` and `-L native` was the hot-patch prototype's
-//! most brittle part: it hardcoded one rlib metadata hash and three registry
-//! paths, so it broke on any dependency change and could not run on another
-//! machine. Cargo already knows the right answer, so this asks it rather than
-//! guessing, and a patch therefore links exactly the artifacts the running
-//! module linked - which is what keeps type layout AND `TypeId` identical
-//! across the boundary.
+//! Reconstructing `--extern` and `-L native` by hand is the most brittle part
+//! of a patch pipeline: it has to name one rlib metadata hash and every
+//! registry path, so it breaks on any dependency change and cannot run on
+//! another machine. Cargo already knows the right answer, so this asks it
+//! rather than guessing, and a patch therefore links exactly the artifacts the
+//! running module linked - which is what keeps type layout AND `TypeId`
+//! identical across the boundary.
 //!
 //! ```ignore
-//! let line = CargoRustcLine::capture(&workspace, "project", &lib_rs)?;
+//! let line = CargoRustcLine::capture(&workspace, "project", &lib_rs, &build_command)?;
 //! let output = line
-//!     .replay(&patch_source, &patch_dll, "pill_hotpatch_7", &[project_rlib])
+//!     .replay(&patch_source, &patch_dll, "pill_hotpatch_7", &[project_rlib], None)
 //!     .output()?;
 //! ```
 
@@ -32,8 +32,6 @@ use std::time::Duration;
 // Flag classification
 // =============================================================================
 
-/// Flags whose value is a SEPARATE following token (`-C` `opt-level=0`), so the
-/// parser must consume two tokens to keep pairs together.
 /// Identifies how a cached compiler line was tokenized.
 ///
 /// Bump this whenever [`tokenize`] changes, so caches written by the previous
@@ -52,6 +50,8 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the capture checks whether its cargo has finished.
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Flags whose value is a SEPARATE following token (`-C` `opt-level=0`), so the
+/// parser must consume two tokens to keep pairs together.
 const TWO_TOKEN_FLAGS: &[&str] = &[
     "-C",
     "-L",
@@ -74,9 +74,9 @@ const TWO_TOKEN_FLAGS: &[&str] = &[
 ///
 /// - `metadata` / `extra-filename` belong to the original crate's identity and
 ///   would collide with it.
-/// - `incremental` measured SLOWER for a single-file patch (551 ms vs 465 ms):
-///   the whole crate is one codegen unit and changes on every patch, so the
-///   cache never hits and only costs bookkeeping.
+/// - `incremental` is slower for a single-file patch: the whole crate is one
+///   codegen unit and changes on every patch, so the cache never hits and only
+///   costs bookkeeping.
 const DROPPED_CODEGEN_VALUES: &[&str] = &["metadata=", "extra-filename=", "incremental="];
 
 /// Whole flags dropped on replay, with their value token when they have one.
@@ -110,17 +110,15 @@ pub struct CargoRustcLine {
 /// Where a package's captured flags are cached between processes.
 ///
 /// Inside the workspace's private build tree, not the system temporary
-/// directory: two checkouts of this repository share `/tmp`, and a cache
-/// written by one was replayed by the other as if it described its own
-/// dependency graph - the same metadata and `TypeId` drift the rest of this
-/// subsystem goes to great lengths to prevent. Keying the path on the
+/// directory: checkouts of this repository share `/tmp`, and a cache at a
+/// shared path would be replayed by the wrong dependency graph - the metadata
+/// and `TypeId` drift the rest of this subsystem prevents. Keying on the
 /// workspace root makes a foreign cache unreachable rather than merely
 /// detectable.
 ///
-/// Shared by the two writers so they cannot disagree: the fast-patch pipeline,
-/// which captures on demand, and [`crate::build_runner::run_build_command`],
-/// which harvests the same line for free out of a build it was going to run
-/// anyway.
+/// Shared by the two writers: the fast-patch pipeline, which captures on
+/// demand, and [`crate::build_runner::run_build_command`], which harvests the
+/// same line out of a build it runs anyway.
 pub(crate) fn flags_cache_path(workspace_root: &Path, package: &str) -> PathBuf {
     workspace_root
         .join(crate::config::MODULE_BUILD_TARGET_DIRECTORY)
@@ -164,21 +162,16 @@ impl CargoRustcLine {
 
     /// Ask cargo for the `rustc` line it uses to build `package`'s library.
     ///
-    /// Cargo only prints the invocation when it actually compiles, so an
-    /// up-to-date crate produces nothing. In that case `crate_root` has its
-    /// modification time bumped (contents untouched, so version control is
-    /// unaffected) and the build is retried once.
+    /// Cargo prints an invocation only when it compiles, so an up-to-date
+    /// crate root is touched and the build retried once. `build_command` MUST
+    /// be the host's own command for this crate, feature flags included: a
+    /// bare `cargo build -p <package>` line links a differently-configured
+    /// `pill_engine`, giving every patch `TypeId` a different value.
     ///
     /// # Errors
     ///
-    /// Returns a message when cargo cannot be run, when the build fails, or
-    /// when no invocation for `package` appears even after forcing a rebuild.
-    /// `build_command` MUST be the host's own command for this crate, feature
-    /// flags included. Capturing a bare `cargo build -p <package>` instead
-    /// yields a line that links a differently-configured `pill_engine`, and a
-    /// different feature set means different crate metadata - so every
-    /// `TypeId` in the patch would differ from the running world's and the
-    /// patched code would find no components and no resources.
+    /// Returns a message when cargo cannot run, the build fails, or no
+    /// invocation for `package` appears after forcing a rebuild.
     pub fn capture(
         workspace_dir: &Path,
         package: &str,
@@ -348,9 +341,9 @@ impl CargoRustcLine {
     /// `staged_dependencies`, when given, redirects every `--extern` that names
     /// a shared per-crate slot to the copy staged there. Those slots are
     /// overwritten in place by any build of the same crate name, feature set
-    /// included, so linking them directly is what made a patch fail with
-    /// `error[E0463]` after an unrelated `cargo build`. Hash-qualified paths are
-    /// left alone: they already name one exact configuration.
+    /// included, so linking them directly makes a patch fail with `error[E0463]`
+    /// after an unrelated `cargo build`. Hash-qualified paths are left alone:
+    /// they already name one exact configuration.
     pub fn replay_args(
         &self,
         input: &Path,
@@ -432,20 +425,17 @@ impl CargoRustcLine {
 
         // No PDB for the patch.
         //
-        // Measured, not guessed: this is 22% of the compile. Linking is 75% of a
-        // patch's wall time - a body that references nothing links in 90 ms
-        // against 360 ms for a real one - because the linker reads the whole
-        // engine closure, 21 MB of `pill_engine` and 12 MB of `pill_core`, to
-        // emit one function. Most of that bulk is debug info, and building a PDB
-        // from it costs 80 ms and writes 18 MB per patch. `-C debuginfo=0` does
-        // NOT avoid it: the debug info lives in the inputs, not in the patch, so
-        // only telling the linker to skip the PDB entirely helps.
+        // Linking dominates a patch's wall time because the linker reads the
+        // whole engine closure - tens of megabytes of `pill_engine` and
+        // `pill_core` - to emit one function, and most of that bulk is debug
+        // info that building a PDB then writes back to disk on every save.
+        // `-C debuginfo=0` does NOT avoid it: the debug info lives in the
+        // inputs, not in the patch, so only telling the linker to skip the PDB
+        // entirely helps.
         //
-        // The trade is real and deliberate: patched code has no debugger
-        // symbols. A patch is generated code that exists for a few seconds, and
-        // a prologue-patched function already defeats breakpoints set on it -
-        // so the symbols were of little use, while the 80 ms is paid on every
-        // save.
+        // The trade is deliberate: patched code has no debugger symbols. A
+        // patch is generated code that exists for a few seconds, and a
+        // prologue-patched function already defeats breakpoints set on it.
         //
         // MSVC-only because `/DEBUG:NONE` is a link.exe/lld-link flag. Other
         // targets keep whatever cargo recorded.
@@ -498,7 +488,7 @@ impl CargoRustcLine {
         std::fs::write(path, text)
     }
 
-    /// Reload a previously saved line.
+    /// Reload a line saved by [`Self::save`].
     ///
     /// Returns `None` when the cache is absent, when any input that could change
     /// the flags is newer than it, or when `build_command` differs from the one
@@ -545,29 +535,18 @@ impl CargoRustcLine {
 // Free functions
 // =============================================================================
 
-/// Linker the patch is built with, given the one cargo recorded.
+/// Linker the patch is built with, given the one cargo recorded. Returns the
+/// value unchanged for every `-C` other than `linker=`, and for a `linker=`
+/// that already names an LLD.
 ///
-/// Returns the value unchanged for every `-C` other than `linker=`, and for a
-/// `linker=` that already names an LLD.
+/// The workspace asks for `rust-lld` (`modules/.cargo/config.toml`), but the
+/// editor launcher forces `link.exe` for the whole dx session, whose linker
+/// proxy cannot run LLD. The patch is not linked by dx - the host runs `rustc`
+/// itself - so that captured flag does not apply.
 ///
-/// **Why the patch overrides the linker at all.** The workspace asks for
-/// `rust-lld` (`modules/.cargo/config.toml`), but the editor launcher has to
-/// force `link.exe` for the whole dx session, because dx drives the link
-/// through its own linker proxy and that proxy cannot run LLD. The patch is not
-/// linked by dx: the host runs `rustc` itself, so nothing forces `link.exe`
-/// here beyond the flag having been captured from a build that did run under
-/// the launcher.
-///
-/// **What it is worth.** Measured on the same patch and the same inputs, LLD
-/// links this closure in ~236 ms against link.exe's ~950 ms - the single
-/// largest difference between the editor's patch time and the standalone
-/// host's, and about 55 % of the editor's whole per-patch cost.
-///
-/// **Why it is safe.** The linker choice affects only the ephemeral patch
-/// image. Both linkers consume the same object files and import libraries and
-/// both accept the `/DEBUG:NONE` the replay appends; the patch never links
-/// anything the module did not, and a linker that failed would refuse the patch
-/// and fall back to a module reload rather than produce a wrong one.
+/// The choice affects only the ephemeral patch image: both linkers consume the
+/// same objects and import libraries, and a linker that failed would refuse
+/// the patch rather than produce a wrong one.
 fn patch_linker_value(value: &str) -> String {
     let Some(linker) = value.strip_prefix("linker=") else {
         return value.to_string();
@@ -593,18 +572,15 @@ const PATCH_LINKER: &str = "rust-lld";
 
 /// Point one `--extern name=path` at the artifact a patch can actually use.
 ///
-/// Two rewrites happen here. First, a metadata-only entry (`.rmeta`) is
-/// retargeted at the sibling `.rlib` cargo writes beside it: a patch is
-/// linked, and rustc refuses to link against metadata alone, while cargo's
-/// recorded line can name the `.rmeta` for a dependency whose rlib exists all
-/// the same. Missing sibling: the entry stays as it was.
+/// First, a metadata-only entry (`.rmeta`) is retargeted at the sibling `.rlib`
+/// beside it: a patch is linked, and rustc refuses to link against metadata
+/// alone. Missing sibling: the entry stays as it was.
 ///
 /// Second, a shared per-crate slot is redirected to its staged copy. Only a
 /// `.rlib` whose filename carries no `-<16 hex digits>` metadata suffix counts
 /// as shared. Everything else is returned unchanged, including entries this
-/// cannot parse: linking the original path is what happened before staging
-/// existed, so an unrecognized entry degrades to the old behaviour rather than
-/// to a broken command line.
+/// cannot parse: an unparseable entry is linked from its original path, which
+/// degrades to no redirect rather than to a broken command line.
 fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
     let Some((name, path)) = entry.split_once('=') else {
         return entry.to_string();
@@ -659,11 +635,13 @@ fn extract_backticked(line: &str) -> Option<String> {
     Some(line[start..end].to_string())
 }
 
-/// Split a command line into tokens, honouring cargo's single-quote grouping.
+/// Split a command line into tokens, honouring cargo's quote grouping.
 ///
 /// Cargo quotes any argument containing a space or a backslash, which on
-/// Windows means most paths. Quotes are grouping only - there is no escape
-/// sequence inside them, and paths cannot contain a single quote.
+/// Windows means most paths. Single quotes are grouping only - cargo escapes
+/// nothing inside them, and paths cannot contain a single quote. Double quotes
+/// carry backslash escapes, which cargo uses for a value that itself contains a
+/// double quote.
 fn tokenize(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -671,10 +649,10 @@ fn tokenize(command: &str) -> Vec<String> {
     // single quotes for most arguments but switches to double quotes with
     // backslash escapes when the value itself contains a double quote - which
     // `--check-cfg 'cfg(feature, values("rendering"))'` does. Treating only
-    // single quotes as grouping split that one argument in half and handed
-    // rustc `values(\"rendering\"))"` as a second input filename, so every
-    // patch of a crate with features failed with "multiple input filenames
-    // provided" and fell back to a full reload.
+    // single quotes as grouping splits that one argument in half, and rustc
+    // then reads the tail as a second input filename - "multiple input
+    // filenames provided" - so every patch of a crate with features falls back
+    // to a full reload.
     let mut opened_by: Option<char> = None;
     let mut escaped = false;
     let mut has_content = false;
@@ -788,11 +766,9 @@ mod tests {
     /// escapes the inner ones - which `--check-cfg` does for any crate that has
     /// features.
     ///
-    /// This is the bug that made the project crate unpatchable. Treating only
-    /// single quotes as grouping split the argument in half, and rustc received
-    /// the tail as a second input filename: "multiple input filenames provided".
-    /// Every project edit fell back to a full reload, with the real cause buried
-    /// in a message that never mentioned quoting.
+    /// Only single-quote grouping splits the argument in half, and rustc then
+    /// reads the tail as a second input filename: "multiple input filenames
+    /// provided", with no mention of quoting in the message.
     #[test]
     fn tokenizer_handles_double_quoted_arguments_with_escapes() {
         let tokens =
@@ -854,8 +830,8 @@ mod tests {
             "the wrapper token is dropped in favour of the real rustc"
         );
 
-        // No token names rustc: fall back to the first token, which preserves
-        // the pre-wrapper behaviour rather than guessing.
+        // No token names rustc: fall back to the first token, which is what a
+        // plain invocation already gives rather than a guess.
         let unrelated = tokenize(r"--crate-name project --edition=2021");
         assert_eq!(compiler_token_index(&unrelated), 0);
     }
@@ -864,9 +840,9 @@ mod tests {
     ///
     /// Cargo quotes an argument that contains whitespace or a backslash. It
     /// usually reaches for single quotes, but switches to double quotes with
-    /// backslash escapes for some values - both spellings were observed in this
-    /// workspace for `--check-cfg`, from the same cargo. The tokenizer has to
-    /// read both, so the round-trip below drives both.
+    /// backslash escapes for some values - cargo emits both spellings for
+    /// `--check-cfg`. The tokenizer has to read both, so the round-trip below
+    /// drives both.
     fn quote_like_cargo(argument: &str, double: bool) -> String {
         if double {
             format!(
@@ -881,12 +857,11 @@ mod tests {
     /// Every argument shape this command line actually carries must survive a
     /// quote-then-tokenize round trip, in both quoting styles.
     ///
-    /// This is the general form of the bug that made every crate with features
-    /// unpatchable: one argument was split in two, rustc took the tail as a
-    /// second input filename, and the patch failed with a message that never
-    /// mentioned quoting. A single hand-written case would not have caught it,
-    /// because the broken shape only appears for `--check-cfg` on a crate that
-    /// has features - so the shapes are enumerated instead.
+    /// A single mis-grouped argument is enough to break a patch: rustc takes the
+    /// tail as a second input filename, and the failure never mentions quoting.
+    /// A single hand-written case would not catch it, because the broken shape
+    /// only appears for `--check-cfg` on a crate that has features - so the
+    /// shapes are enumerated instead.
     #[test]
     fn every_argument_shape_survives_a_quoting_round_trip() {
         let arguments = [
@@ -954,7 +929,7 @@ mod tests {
             13,
             "a fragment would show up as an extra token: {tokens:#?}"
         );
-        // The value that used to be split in half.
+        // The value a single-quote-only tokenizer would split in half.
         assert!(
             tokens.contains(&r#"cfg(feature, values("rendering"))"#.to_string()),
             "the check-cfg value must be one token: {tokens:#?}"
@@ -982,10 +957,9 @@ mod tests {
 
     /// The cache is rejected when it was written by a different tokenizer.
     ///
-    /// Without this the parser fix would not have reached anyone: the cache key
-    /// is the manifests, the lockfile and the build command, and fixing a parser
-    /// changes none of them, so every existing cache would replay the tokens the
-    /// old parser produced.
+    /// The cache key is the manifests, the lockfile and the build command, and
+    /// a parser fix changes none of them - so without the version marker an
+    /// existing cache would replay the tokens the old parser produced.
     #[test]
     fn a_cache_from_a_different_tokenizer_is_rejected() {
         let directory = ScratchDirectory::new("flags_cache_version");
@@ -1048,8 +1022,8 @@ mod tests {
     }
 
     /// Only a shared slot with a staged copy is redirected. Everything else is
-    /// returned unchanged, so an unrecognized entry degrades to the behaviour
-    /// that existed before staging rather than to a broken command line.
+    /// returned unchanged, so an unparseable entry is linked from its original
+    /// path rather than producing a broken command line.
     #[test]
     fn only_staged_shared_slots_are_redirected() {
         let staged = ScratchDirectory::new("staged_externs_test");
@@ -1193,9 +1167,9 @@ mod tests {
     ///
     /// The editor launcher forces `link.exe` on the whole dx session because
     /// dx's linker proxy cannot drive LLD, and that flag is captured with the
-    /// rest of the command. Replaying it costs ~290 ms of extra link time per
-    /// patch (measured on the same inputs) for a linker choice that only ever
-    /// affects the ephemeral patch image.
+    /// rest of the command. Replaying it costs the linker difference on every
+    /// patch, for a linker choice that only ever affects the ephemeral patch
+    /// image.
     #[test]
     fn the_patch_links_with_lld_even_when_cargo_recorded_link_exe() {
         assert_eq!(patch_linker_value("linker=link.exe"), "linker=rust-lld");
@@ -1300,10 +1274,10 @@ mod tests {
 
     /// Two checkouts must not share one flags cache.
     ///
-    /// The path used to be `temp_dir()/pill_hotpatch_<package>.flags`, which
-    /// named the same file for every clone of this repository on the machine.
-    /// Scoping it to the workspace root is what makes a replay always describe
-    /// the dependency graph the running module was built against.
+    /// A cache in the system temporary directory would name the same file for
+    /// every clone of this repository on the machine. Scoping it to the
+    /// workspace root is what makes a replay always describe the dependency
+    /// graph the running module was built against.
     #[test]
     fn flags_cache_path_is_workspace_scoped() {
         let first = flags_cache_path(Path::new("C:/work/one"), "project");
@@ -1334,7 +1308,7 @@ mod tests {
         parsed().save(&cache, &command).expect("save");
         // Everything below is written after the cache; dating the cache into
         // the past makes each of them provably newer without pausing between
-        // the writes (SA-0069).
+        // the writes.
         date_file(
             &cache,
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
@@ -1363,9 +1337,9 @@ mod tests {
     /// A touch must never put back bytes it read before a save landed.
     ///
     /// The touch exists to bump the crate root's modification time so cargo
-    /// rebuilds it, and rewriting the bytes it just read was how it did that -
-    /// which reverts any save that lands between the read and the write, so the
-    /// next reload compiles source the person has already replaced.
+    /// rebuilds it. Rewriting the bytes it reads would revert any save that
+    /// lands between the read and the write, so the next reload would compile
+    /// source the person has already replaced.
     ///
     /// A save replaces the file atomically while the touch runs, so the crate
     /// root holds either version cleanly. Reading a large one takes long enough
@@ -1414,10 +1388,10 @@ mod tests {
     /// A capture whose cargo never returns must give up on its own deadline.
     ///
     /// The capture runs on the frame thread, so a cargo blocked on another
-    /// build's package lock froze the editor for as long as that build took -
-    /// with no deadline, no cancellation and no way for the person to see why.
-    /// The command here never finishes on its own, which is what a lock wait
-    /// looks like from the host's side.
+    /// build's package lock would freeze the editor for as long as that build
+    /// takes - with no deadline, no cancellation and no way for the person to
+    /// see why. The command here never finishes on its own, which is what a
+    /// lock wait looks like from the host's side.
     #[test]
     fn a_capture_that_never_returns_is_given_up_on_its_deadline() {
         // A script rather than an inline command: the capture appends `-v` to

@@ -33,8 +33,6 @@ pub use renderer_camera::RendererCamera;
 
 // The handles name slots in the renderer's own maps, so they are plumbing
 // rather than interface: reachable anywhere in the crate, exported nowhere.
-// They were private when they lived in one `resource_handles` module, and
-// defining them here does not make them part of the crate's surface.
 pub(crate) use renderer_camera::RendererCameraHandle;
 pub(crate) use renderer_material::RendererMaterialHandle;
 pub(crate) use renderer_mesh::RendererMeshHandle;

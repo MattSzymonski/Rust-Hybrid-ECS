@@ -1,41 +1,32 @@
-//! Shared core definitions of the Pill engine.
+//! Shared core definitions of the Pill engine: the one library every DLL links.
 //!
 //! # Responsibilities
 //!
 //! - Own the semantic error system used by every workspace crate.
-//! - Keep the `PillStyle` string-styling vocabulary for terminal output.
-//! - Own the telemetry foundation: static targets, developer log macros,
-//!   the terminal formatter, and the subscriber builder.
-//! - Own the platform layer ([`platform`]): the clock, log output and
-//!   futures, the only code that differs between native and the web.
+//! - Own the telemetry foundation: static targets, developer log macros, the
+//!   terminal formatter, the subscriber builder and the metrics recorder.
+//! - Own the platform layer ([`platform`]): clock, log output and futures, the
+//!   only code that differs between native and the web.
 //! - Own the Tracy profiling API (`profile_scope!` and friends) with its
 //!   feature gating and no-op fallbacks.
-//! - Re-export the `tracing`, `metrics`, and profiling macros so users import
-//!   everything from a single flat namespace: `pill_core`.
+//! - Own the state that must exist once per process: the Rayon pool, the
+//!   native buffer allocation service and the per-thread run ticks.
+//! - Provide the plain-data and helper types the artifacts share: inline
+//!   strings, native-backed buffers, slot maps, `PillStyle`, colour palettes,
+//!   math aliases and small utilities.
+//! - Re-export the `tracing` and `metrics` macros, so every telemetry entry
+//!   point imports from a single flat namespace: `pill_core`.
 //!
 //! # Design
 //!
+//! The crate is both a `dylib` and an `rlib`: every DLL links the one shared
+//! copy, so process-global state has a single instance across the boundary,
+//! while a monolithic release build can still embed it.
+//!
 //! The error system lives in [`error`]: subsystem enums declared with
-//! `#[engine_error]` compose transparently into [`error::HostError`], and
-//! the diagnostics runtime renders one semantic message definition in
-//! either plain or styled form. Crates import these types from here instead
-//! of defining their own error-handling infrastructure.
-//!
-//! The telemetry system lives in [`telemetry`] and [`metrics`]: `tracing`
-//! carries events and spans through three lanes (`engine::dev`, `engine::*`,
-//! `profile::*`), and the `metrics` recorder keeps repeated numerical state.
-//!
-//! # Single Flat Namespace
-//!
-//! All telemetry entry-points re-export at the crate root, so there is exactly
-//! one way to import each macro and no ambiguity with `tracing::*`:
-//!
-//! ```ignore
-//! use pill_core::{debug, info, warn, error, trace, trace_span}; // permanent logging
-//! use pill_core::{log, dev_warn, dev_error};                     // scratch debugging
-//! use pill_core::{gauge, histogram, counter};                    // metrics
-//! use pill_core::profile_scope;                                  // profiling
-//! ```
+//! `#[engine_error]` compose transparently into [`error::HostError`], and the
+//! renderers turn one semantic message definition into plain or styled output.
+//! The telemetry system lives in [`telemetry`] and [`metrics`].
 
 // =============================================================================
 // Modules

@@ -5,8 +5,7 @@
 //! - `scalar_edit_decorated`: one field's control, decorated and committed through the core's helper.
 //! - The numeric editors (`scalar_edit`, `integer_slider`, `integer_drag`, `ascending`), the read-only row and the value formatters the component menu and the settings rows use.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -83,7 +82,7 @@ pub fn ascending(min: f32, max: f32) -> (f32, f32) {
 /// One whole number seen through `f64`, with the way back into its own
 /// `FieldValue`, so the slider and the drag value are written once rather
 /// than once per kind. Each kind carries its own bounds: a `[Range]` wider
-/// than the kind clamps to the kind's limit, as it always did.
+/// than the kind clamps to the kind's limit.
 ///
 /// Public like every item here: the build script's inventory names it at the
 /// crate root, and a patch crate reaches it through the shell's re-exports.
@@ -239,9 +238,8 @@ pub fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> 
             .changed()
             .then_some(FieldValue::F64(edited))
         }
-        // Every whole-number kind: one drag value, the same for each. A kind
-        // without a numeric editor answers `None`, so the caller paints it
-        // read-only.
+        // Every whole-number kind shares one drag value here; a kind without
+        // a numeric editor answers `None`.
         other => {
             let number = Number::of(other)?;
             let mut edited = number.current;

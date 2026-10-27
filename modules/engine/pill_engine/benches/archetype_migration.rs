@@ -1,25 +1,27 @@
 //! Archetype migration benchmarks for adding and removing components.
 //!
-//! Every time a component is added to or removed from an entity, the ECS must
-//! move that entity to a different archetype - cloning all existing components
-//! into the destination storage and updating internal lookup tables.
+//! Adding a component to an entity, or removing one, moves that entity to a
+//! different archetype: every component it already has is copied into the
+//! destination storage and the lookup tables are updated.
 //!
 //! # Responsibilities
 //!
 //! - Single add/remove: the baseline cost of a one-step archetype transition.
-//! - Multi add/remove: three consecutive migrations per entity, stressing
-//!   the clone+move loop and Vec reallocation.
-//! - Archetype explosion: entities with unique subsets of optional components
-//!   create many distinct archetypes, stressing HashMap lookups and storage
-//!   fragmentation.
+//! - Multi add/remove: three consecutive migrations per entity, stressing the
+//!   move loop and column reallocation.
+//! - Archetype explosion: four optional components combined per entity, so the
+//!   world holds up to sixteen archetypes, stressing archetype lookup and
+//!   storage fragmentation.
 //!
 //! # Design
 //!
-//! All benchmarks use `iter_batched` so setup (entity spawning, pre-adding
-//! components for removal tests) is excluded from the measured time. The
-//! fixture components ([`Position`], [`Velocity`], [`Health`], [`Armor`],
-//! [`Mana`], [`Stamina`]) are cheap `Clone` structs so the measured work is
-//! dominated by archetype migration itself, not component construction.
+//! The add, remove and despawn benchmarks use `iter_batched`, so setup (entity
+//! spawning, pre-adding components for the removal cases) is excluded from the
+//! measured time. The archetype-explosion benchmark creates its entities inside
+//! the measurement, because that is its workload. The fixture components
+//! ([`Position`], [`Velocity`], [`Health`], [`Armor`], [`Mana`], [`Stamina`])
+//! are cheap `Clone` structs, so the measured work is dominated by archetype
+//! migration rather than component construction.
 
 #![allow(dead_code)]
 
@@ -83,9 +85,6 @@ impl Component for Mana {}
 #[derive(Debug, Clone)]
 struct Stamina(f32);
 impl Component for Stamina {}
-
-// Registers every fixture type with the trait-object type map so the
-// benchmarked [`World`] can store them behind `dyn Component`.
 
 // =============================================================================
 // Benchmarks
@@ -202,7 +201,7 @@ fn bench_add_multi_component(criterion: &mut Criterion) {
                     || setup_world(count),
                     |(mut world, handles)| {
                         for entity in handles {
-                            // Add 3 components → entity migrates through 3 archetypes
+                            // Three adds: the entity migrates through three archetypes.
                             black_box(world.add_component(entity, Health(100.0)).is_ok());
                             black_box(world.add_component(entity, Armor(50.0)).is_ok());
                             black_box(world.add_component(entity, Mana(200.0)).is_ok());
@@ -252,12 +251,13 @@ fn bench_remove_multi_component(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Creates entities where each one has a unique subset of 4 optional tag components,
-/// producing many distinct archetypes to stress archetype lookup and storage overhead.
+/// Creates entities carrying a different subset of four optional components,
+/// filling the world with up to sixteen archetypes to stress archetype lookup
+/// and storage overhead.
 fn bench_archetype_explosion(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("archetype_explosion");
-    // Each entity gets a unique combination of optional tag components,
-    // creating up to `entity_count` distinct archetypes.
+    // Four optional components give 2^4 = 16 archetypes at most, so the index
+    // pattern decides which subset each entity lands in.
     for &count in &[100, 1_000] {
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
@@ -277,8 +277,6 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
                             y: 0.0,
                         });
 
-                        // Each entity gets a subset of optional components,
-                        // creating many distinct archetypes.
                         if i % 2 == 0 {
                             builder = builder.with(Health(100.0));
                         }
@@ -308,12 +306,11 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
 
 /// Measures LIFO despawn: destroying entities in the reverse of creation order.
 ///
-/// This is the pattern projectile/particle systems produce - the most recently
-/// spawned entity dies first - so every `swap_remove` removes the last row and
-/// the `index != last` guard in `ComponentColumn::swap_remove` (and the native
-/// column path) skips the redundant self-copy. The guard was added to fix the
-/// wasted `memmove` reported by audit 5.9; this benchmark pins the despawn
-/// path so a regression in it stays visible.
+/// This is the pattern projectile and particle systems produce - the most
+/// recently spawned entity dies first - so every removal takes the last row and
+/// the `index != last` guard in `ComponentColumn::swap_remove` and
+/// `swap_remove_discard` skips the redundant self-copy. Pinning this path keeps
+/// a regression in that guard visible.
 fn bench_lifo_despawn(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_lifo_despawn");
     for &count in &[1_000, 10_000] {

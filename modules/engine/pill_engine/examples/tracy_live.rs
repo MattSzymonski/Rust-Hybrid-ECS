@@ -3,15 +3,16 @@
 //! # Responsibilities
 //!
 //! - Installs the Pill telemetry stack with the Tracy layer enabled.
-//! - Registers eight component types and seven systems with mixed component sizes.
-//! - Spawns 30 000 entities and drives the engine frame loop at a 30 FPS cap.
+//! - Registers eight component types and six systems with mixed component sizes.
+//! - Spawns 30 000 entities and drives the engine frame loop uncapped, so the
+//!   profiler sees the workload's natural frame times.
 //! - Reports live FPS and entity counts to the console every two seconds.
 //!
 //! # Design
 //!
 //! The demo keeps a fixed, self-contained workload so frame times, zone
 //! counts, and thread distribution stay comparable across runs. Heavy
-//! per-entity work (trig, sqrt, and cache-line scattering reads) keeps
+//! per-entity work (sqrt, division, and cache-line-scattering reads) keeps
 //! wake-up latency negligible and stresses parallel distribution.
 //!
 //! Usage:
@@ -22,11 +23,9 @@
 //!
 //! Press Ctrl+C to stop.
 //!
-//! Reconnecting: after killing and restarting this program, Tracy auto-reconnects.
-//! If it doesn't pick up, click the "Connect" button in Tracy GUI again - sometimes
-//! the GUI stops listening after an abrupt disconnect.
-
-// Standard library
+//! Reconnecting: after a restart Tracy usually reconnects on its own. If it does
+//! not, click "Connect" again - the GUI can stop listening after an abrupt
+//! disconnect.
 
 // External crates
 use pill_core::platform::Instant;
@@ -38,7 +37,7 @@ use pill_engine::*;
 
 /// Two-dimensional position of an entity in world space.
 ///
-/// Updated each frame by `movement_system` and read by `render_system`.
+/// Updated each frame by `movement_system`.
 #[derive(Debug, Clone)]
 struct Position {
     /// Horizontal coordinate in world units.
@@ -54,7 +53,7 @@ impl Component for Position {}
 
 /// Two-dimensional velocity of an entity in world units per frame.
 ///
-/// Consumed by `movement_system` and updated by `gravity_system`.
+/// Consumed by `movement_system` and updated by `physics_system`.
 #[derive(Debug, Clone)]
 struct Velocity {
     /// Horizontal speed in world units per frame.
@@ -70,8 +69,8 @@ impl Component for Velocity {}
 
 /// Current hit points of an entity.
 ///
-/// Decayed each frame by `health_decay_system`, damaged by
-/// `health_decay_system`, and destroyed by `cleanup_system` at zero.
+/// Regenerated each frame by `health_decay_system` and destroyed by
+/// `cleanup_system` at or below zero.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
@@ -132,9 +131,6 @@ impl Component for RenderData {}
 struct PhysicsData([[f32; 4]; 8]);
 impl Component for PhysicsData {}
 
-// Registers all eight component types with the trait-type map so the ECS can
-// type-erase them behind the `Component` trait object.
-
 // =============================================================================
 // Systems
 // =============================================================================
@@ -147,11 +143,10 @@ fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
     }
 }
 
-/// Slowly regenerates health towards a zero floor for every entity.
+/// Slowly raises every entity's health, floored at zero.
 ///
 /// Uses a labelled, tracked parallel iterator so Tracy reports per-label
-/// timings; the deliberately light work keeps the label group meaningful
-/// after the first frame.
+/// timings.
 fn health_decay_system(mut query: Query<&mut Health>) {
     let _zone = crate::profile_scope!("health_decay_systXxxxxxm");
 
@@ -169,7 +164,8 @@ fn health_decay_system(mut query: Query<&mut Health>) {
 /// The pre-pass adds CPU work to stress the scheduler's automatic parallelism
 /// hint; the second pass performs the actual cleanup through deferred commands.
 fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
-    // Heavy parallel pre-pass - auto-hinted from system EMA, uses full pool.
+    // Step 1: a heavy parallel pre-pass, so the splitting hint measured from
+    // system EMA has real work to spread across the pool.
     query
         .par_iter_mut()
         .label("cleanup_system")
@@ -180,7 +176,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
             core::hint::black_box(acc);
         });
 
-    // Actual cleanup - destroy entities at or below zero health.
+    // Step 2: destroy entities at or below zero health.
     for (entity, health) in query.iter_mut() {
         if health.0 <= 0.0 {
             commands.destroy_entity(entity);
@@ -188,7 +184,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
     }
 }
 
-/// Heavy per-entity work - trig, sqrt, mul - designed to stress
+/// Heavy per-entity work - sqrt, division, clamp - designed to stress
 /// parallel distribution and make wake-up latency negligible.
 /// Writes to its own `GravityForce` component so it can run in
 /// parallel with `movement` and `health_decay`.
@@ -218,7 +214,8 @@ fn render_system(mut query: Query<(&RenderData, &mut Health)>) {
         .label("render_system")
         .tracked()
         .for_each(|(render, mut health)| {
-            // Touch every 8th f64 in the 256 B struct to simulate scattering reads
+            // Touch four f64s spread across the 256 B struct to simulate
+            // scattering reads.
             let acc = render.0[0][0] + render.0[2][1] + render.0[4][2] + render.0[6][3];
             health.0 = (health.0 + acc as f32 * 0.001).clamp(0.0, 200.0);
         });
@@ -299,7 +296,7 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Step 3: Build the engine, register every component type, and install
-    // the seven systems that make up the demo workload.
+    // the six systems that make up the demo workload.
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
@@ -319,8 +316,8 @@ fn main() {
     engine.register_system("physics", physics_system);
     engine.register_system("cleanup", cleanup_system);
 
-    // Set 30 FPS cap using the engine's built-in limiter
-    // engine.set_fps_limit(200.0);
+    // No frame cap is set, so the loop runs as fast as the machine allows. The
+    // limiter's Tracy zone is off to keep the timeline readable.
     engine.trace_frame_wait = false;
 
     // Step 4: Spawn the initial 30 000 entity population with mixed component

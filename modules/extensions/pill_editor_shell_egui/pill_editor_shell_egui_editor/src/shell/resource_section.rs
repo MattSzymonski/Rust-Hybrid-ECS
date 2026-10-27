@@ -1,4 +1,4 @@
-//! The Inspector's resource section (W-0038 Stage 14).
+//! The Inspector's resource section.
 //!
 //! # Responsibilities
 //!
@@ -44,8 +44,8 @@ pub fn resource_section(
                         queue_edit(pending, view, field, FieldValue::F32(number));
                     }
                 }
-                // An enum field travels as its discriminant; the row shows the
-                // number rather than offering a picker nobody asked for.
+                // An enum field travels as its discriminant, so the row shows
+                // the number.
                 other => {
                     ui.monospace(inspector::value_text(other));
                 }

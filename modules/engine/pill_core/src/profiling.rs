@@ -1,83 +1,46 @@
-//! Tracy profiler abstraction layer with compile-time feature gating.
+//! Tracy profiling: zones, plots and messages behind compile-time feature
+//! gating.
 //!
 //! # Responsibilities
 //!
-//! - Provides macros (`profile_scope!`, `profile_frame_mark!`, etc.) that
-//!   emit Tracy zones, plots, and messages when profiling features are active.
-//! - Computes parallel-utilisation metrics for frame analysis.
-//! - Silently no-ops all instrumentation when no profiling feature is enabled.
+//! - Provide the macros instrumentation calls: `profile_scope!`,
+//!   `profile_frame_mark!`, `profile_plot!` and the rest.
+//! - Compute the parallel-utilisation metrics of a frame.
+//! - Compile every entry point away to a no-op when no profiling feature is
+//!   enabled.
 //!
 //! # Design
 //!
-//! | Capability                | `profiling` | `profiling-minimal` | (none) |
-//! |---------------------------|-----------|-------------------|--------|
-//! | CPU zones                 | +         | +                 | -      |
-//! | Zone text/details         | +         | -                 | -      |
-//! | Native Tracy plots        | +         | -                 | -      |
-//! | Messages (white)          | +         | -                 | -      |
-//! | Warnings (orange)         | +         | -                 | -      |
-//! | Errors (red)              | +         | -                 | -      |
-//! | Thread naming             | +         | -                 | -      |
-//! | Frame marks               | +         | +                 | -      |
-//! | Secondary frames          | +         | +                 | -      |
-//! | Non-continuous frames     | +         | +                 | -      |
-//! | Call stack sampling       | +         | +                 | -      |
-//! | Context switch profiling    | +         | -                 | -      |
-//! | System info (CPU freq)    | +         | -                 | -      |
-//! | On-demand collection      | +         | +                 | -      |
-//! | Code transfer (asm)       | +         | -                 | -      |
-//! | Allocation tracking       | +         | -                 | -      |
+//! | Capability                                   | `profiling` | `profiling-minimal` |
+//! |----------------------------------------------|-------------|---------------------|
+//! | CPU zones, frame marks, secondary frames     | +           | +                   |
+//! | Call stack sampling, on-demand collection    | +           | +                   |
+//! | Zone text, native plots, messages, threads   | +           | -                   |
+//! | Context switches, system info, code transfer | +           | -                   |
 //!
-//! # Setup
-//!
-//! Call `profile_init!()` once at the start of `main()` to activate Tracy.
-//! Without it, all instrumentation silently no-ops even with the feature on.
-//!
-//! # Usage
-//!
-//! ```ignore
-//! // Static name (zero-allocation, preferred):
-//! let _zone = profile_scope!("movement");
-//!
-//! // Frame boundary:
-//! profile_frame_mark!();
-//!
-//! // Secondary (named) frame for subsystems:
-//! profile_secondary_frame_mark!("scripts");
-//!
-//! // Plot (identifier name → native Tracy graph):
-//! profile_plot!(entity_count, world.entity_count() as f64);
-//!
-//! // Message / warn / error (warn=orange, error=red):
-//! profile_message!("archetype created: {:?}", id);
-//! profile_warn!("duplicate iterator label: {}", label);
-//! profile_error!("command execution failed: {:?}", err);
-//!
-//! // Thread naming:
-//! profile_thread!("worker_pool");
-//!
-//! // Non-continuous frame (one-shot operations):
-//! let _setup = profile_non_continuous_frame!("engine_init");
-//!
-//! // Plot configuration (one-time setup):
-//! profile_plot_config!(entity_count, PlotConfiguration::default()
-//!     .format(PlotFormat::Number));
-//! ```
+//! `profile_init!()` must run once at startup to start the Tracy client;
+//! without it every call no-ops even with a feature on. With no profiling
+//! feature at all, every entry point is a no-op stub the compiler drops.
 
 // =============================================================================
 // Profiling Targets
 // =============================================================================
 
-/// Tracing target of coarse profiling spans (`profile::coarse`).
+/// The `tracing` target the coarse profiling lane is filtered under
+/// (`profile::coarse`).
 ///
-/// Coarse spans (frame, ECS, render, passes) are always routed to Tracy when
-/// profiling is enabled; they are never affected by terminal log verbosity.
+/// With the `tracy` feature, [`TelemetryBuilder::with_tracy`] installs a layer
+/// that enables this target at `TRACE`, independently of terminal verbosity,
+/// and a zone asks that filter whether the profiler wants it.
+///
+/// [`TelemetryBuilder::with_tracy`]: crate::telemetry::TelemetryBuilder::with_tracy
 pub const PROFILE_COARSE_TARGET: &str = crate::telemetry::telemetry_target::PROFILE_COARSE;
 
-/// Tracing target of fine investigative spans (`profile::fine`).
+/// The `tracing` target the fine investigative lane is filtered under
+/// (`profile::fine`).
 ///
-/// Fine spans are feature-gated behind `profiling-fine` and normally stay
-/// disabled because they perturb timing measurements.
+/// Enabled only when the telemetry builder was asked for fine profiling: those
+/// zones perturb timing measurements, so they stay off by default.
 pub const PROFILE_FINE_TARGET: &str = crate::telemetry::telemetry_target::PROFILE_FINE;
 
 // ============================================================================
@@ -156,10 +119,11 @@ mod enabled {
     /// Whether a zone on the fine (`profile::fine`) or coarse
     /// (`profile::coarse`) lane would reach a connected profiler.
     ///
-    /// The lane filter is the telemetry stack's `tracing` filter, so the
-    /// lanes are switched on and off exactly as before. Checked before a
-    /// dynamic name is formatted, so a run without a profiler attached
-    /// allocates nothing.
+    /// The lanes are switched through the telemetry stack's `tracing` filter:
+    /// the builder's Tracy layer turns `profile::coarse`, and fine profiling
+    /// `profile::fine`, on at `TRACE`, independently of terminal verbosity.
+    /// Checked before a dynamic name is formatted, so a run without a profiler
+    /// attached allocates nothing.
     #[inline(never)]
     fn lane_wanted(fine: bool) -> bool {
         if !Client::is_running() || !Client::is_connected() {
@@ -175,11 +139,10 @@ mod enabled {
     /// RAII guard for a CPU zone. Created by `profile_scope!` and
     /// `profile_scope_fine!`; the zone closes when the guard drops.
     ///
-    /// The zone is opened through the Tracy client directly rather than as a
-    /// `tracing` span. `tracing-tracy` names a zone when its span is entered,
-    /// from the span's static name and the fields recorded so far, so a name
-    /// or text recorded afterwards never reached Tracy: every dynamic zone
-    /// showed up as "profile", and no zone carried its text.
+    /// The zone is opened through the Tracy client directly, not as a
+    /// `tracing` span: a span is named when it is entered, from its static name
+    /// and the fields recorded so far, so a dynamic name or text recorded
+    /// afterwards could never reach Tracy.
     #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone {
         // `None` when the lane is off or no profiler is connected.
@@ -555,7 +518,7 @@ pub mod profiling_extras {
     }
 
     /// Set the display name of the current thread.
-    /// Uses the safe `Client::set_thread_name` API instead of unsafe FFI.
+    /// Goes through the safe `Client::set_thread_name` API.
     #[inline]
     pub fn set_thread_name(name: &str) {
         if Client::is_running() {
@@ -739,21 +702,12 @@ pub use profiling_extras as extras;
 // Free Functions
 // =============================================================================
 
-/// Compute thread-utilization percentage for a single frame.
+/// Computes the thread-utilization percentage of a single frame.
 ///
-/// # Formula
-///
-/// ```text
-/// utilization = Σ(system_durations_ns) / (frame_wall_time_ns × thread_count) × 100
-/// ```
-///
-/// # Interpretation
-///
-/// | Value | Meaning |
-/// |-------|---------|
-/// | 100%  | Every thread was busy for the entire frame (perfect packing) |
-/// | 50%   | Half the available CPU-time was idle |
-/// | <100% | Batch serialization, imbalanced systems, or dispatch overhead |
+/// The utilization is the total of `system_durations_ns` divided by the
+/// frame's full thread capacity (`frame_wall_time_ns` times `thread_count`),
+/// as a percentage: 100% means every thread was busy for the entire frame,
+/// below that some CPU-time went idle.
 ///
 /// This is a lower-bound estimate because each system's wall-clock
 /// duration already includes internal Rayon parallelism - a system that
@@ -786,25 +740,14 @@ pub fn compute_parallel_utilization(
     (total_work as f64 / capacity as f64) * 100.0
 }
 
-/// Compute batch-packing efficiency: how evenly systems within each
-/// parallel batch balance each other.
+/// Computes batch-packing efficiency: how evenly the systems of each parallel
+/// batch balance each other.
 ///
-/// # Formula
-///
-/// For each batch: `batch_score = Σ(durations) / (max_duration × batch_size)`.
-/// The frame-level score is a total-work-weighted average across batches.
-///
-/// # Interpretation
-///
-/// | Value | Meaning |
-/// |-------|---------|
-/// | 100%  | Every system in every batch has identical duration |
-/// | <100% | Some systems finish early while others in the same batch keep running |
-///
-/// A low packing score means the scheduler is grouping systems with
-/// very different execution times.  The idle threads from the shorter
-/// systems cannot be used by the longer one because Rayon work-stealing
-/// is intra-system, not inter-system.
+/// Per batch the score is the batch's total duration over its longest system's
+/// duration times the batch size; the frame score is a total-work-weighted
+/// average of those. 100% means every system of every batch takes the same
+/// time. Below that, the shorter systems' threads go idle while the longest
+/// one runs, because Rayon work-stealing is intra-system, not inter-system.
 ///
 /// # Examples
 ///
@@ -852,14 +795,10 @@ pub fn compute_batch_packing_efficiency(
     (total_actual as f64 / total_ideal as f64) * 100.0
 }
 
-/// Compute and emit parallel-utilization Tracy plots for the current frame.
+/// Computes the frame's parallel-utilization and batch-packing percentages and
+/// emits them as native Tracy plots.
 ///
-/// This is the single entry-point called from the engine's frame processing.
-/// It collects the necessary inputs, computes both utilization and
-/// batch-packing percentages, and emits them as native Tracy plot points.
-///
-/// Only compiled when the `profiling` feature is active - `profiling-minimal`
-/// does not include native Tracy plots.
+/// Compiled only under `profiling`: `profiling-minimal` has no native plots.
 ///
 /// # Examples
 ///
@@ -915,18 +854,14 @@ macro_rules! profile_init {
 /// Active under both `profiling` and `profiling-minimal`. Zone text/details
 /// (the `[...]` form) only emit under `profiling`.
 ///
-/// The zone is a `tracing` span routed to Tracy through `TracyLayer` when the
-/// application installs it with the `profile::coarse` target enabled.
+/// The zone opens through the Tracy client directly, on the lane the telemetry
+/// builder enables for `profile::coarse`. A dynamic name is formatted only when
+/// the profiler is connected and wants the zone.
 ///
 /// ```ignore
-/// // Static name (zero-allocation, preferred):
-/// let _zone = profile_scope!("movement");
-///
-/// // With details (only active under `profiling`, no-op under `profiling-minimal`):
-/// let _zone = profile_scope!("movement", [("entities: {}", count)]);
-///
-/// // Dynamic name (use sparingly - allocates):
-/// let _zone = profile_scope!("system: {}", name);
+/// let _zone = profile_scope!("movement");                        // static name
+/// let _zone = profile_scope!("movement", [("entities: {}", n)]); // with details
+/// let _zone = profile_scope!("system: {}", name);                // dynamic name
 /// ```
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 #[macro_export]

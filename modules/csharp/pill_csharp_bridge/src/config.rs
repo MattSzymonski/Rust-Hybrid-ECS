@@ -36,12 +36,12 @@ pub struct CSharpModuleConfig {
 impl CSharpModuleConfig {
     /// Describe a managed project by its assembly names and output directories.
     ///
-    /// A reloading build gets this from
-    /// `pill_host`'s `ProjectModuleConfig::from_environment`, which reads the project's
-    /// `.csproj`. A shipping build has no project path to read, so its frontend
-    /// states the same four values directly - which is also why this type needs
-    /// a constructor at all: it is `#[non_exhaustive]`, so it cannot be built
-    /// with a struct expression from another crate.
+    /// A reloading build gets this from `pill_host`'s
+    /// `ProjectModuleConfig::from_environment`, which reads the project's
+    /// `.csproj`; a shipping build has no project path to read, so its frontend
+    /// states the same four values directly. The constructor exists because the
+    /// type is `#[non_exhaustive]`, so another crate cannot build it with a
+    /// struct expression.
     ///
     /// The two subdirectories are relative to the root the caller supplies with
     /// them, not to any fixed location.

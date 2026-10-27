@@ -202,11 +202,11 @@ static TELEMETRY_HANDLES: OnceLock<TelemetryHandles> = OnceLock::new();
 /// Install the engine telemetry stack and return its reload handles.
 ///
 /// The terminal lane uses the default engine filter. When `directory` is
-/// supplied, a rolling file lane is added with the same engine filter but
-/// developer scratch logs (`engine::dev`) disabled; both lanes are
-/// live-reloadable through the returned handles. When the `profiling`
-/// feature is active, `profile::*` spans are routed to Tracy through an
-/// independent filter.
+/// supplied, a rolling file lane is added with the engine's filter minus the
+/// developer scratch logs (`engine::dev`) and with the rendering target at
+/// `debug`; both lanes are live-reloadable through the returned handles. When
+/// the `profiling` feature is active, `profile::*` spans are routed to Tracy
+/// through an independent filter.
 ///
 /// # Errors
 ///
@@ -232,17 +232,17 @@ pub fn init_telemetry_with_capture(
 ) -> Result<TelemetryHandles, TelemetryError> {
     let mut builder = TelemetryBuilder::new().with_logging_config(terminal_defaults());
 
-    // Step 0: install the console's capture lane when one was supplied.
+    // Step 1: install the console's capture lane when one was supplied.
     if let Some(buffer) = capture {
         builder = builder.with_capture(buffer);
     }
 
-    // Step 1: Add a rolling file lane when a log directory is supplied.
+    // Step 2: Add a rolling file lane when a log directory is supplied.
     if let Some(directory) = file_log_directory {
         builder = builder.with_file_output(file_defaults(), directory);
     }
 
-    // Step 2: Route profiling spans to Tracy when the feature is active.
+    // Step 3: Route profiling spans to Tracy when the feature is active.
     #[cfg(feature = "profiling")]
     {
         builder = builder.with_tracy(true);
@@ -252,11 +252,11 @@ pub fn init_telemetry_with_capture(
         }
     }
 
-    // Step 3: Build and initialize the subscriber stack.
+    // Step 4: Build and initialize the subscriber stack.
     let handles = builder.init()?;
     let _ = TELEMETRY_HANDLES.set(handles.clone());
 
-    // Step 4: Install the shared metrics recorder when the feature is on.
+    // Step 5: Install the shared metrics recorder when the feature is on.
     #[cfg(feature = "metrics")]
     {
         // The recorder is process-wide, so the engine and host share one

@@ -22,9 +22,8 @@
 //!
 //! The functions here are plain library code. The `#[no_mangle]` symbols come
 //! from `__pill_renderer_entry_points!`, which the renderer's wrapper crate
-//! expands. The library itself cannot carry them unmangled: every renderer
-//! declares the same two names, and this crate is linked into the host's
-//! dependency graph.
+//! expands, because every renderer declares the same two names and this crate
+//! is linked into the host's dependency graph.
 
 // Standard library
 use std::ffi::c_void;
@@ -40,9 +39,9 @@ use crate::renderer::Renderer;
 /// Build a renderer on the window `window` describes.
 ///
 /// Returns a `Box<Box<dyn PillRenderer>>` as a raw pointer, to be driven by
-/// the host and released with [`pill_renderer_detach`], or null when the
-/// window data is missing or the renderer could not be created; the reason is
-/// logged here.
+/// the host and released with [`detach_backend`] (which the exported
+/// `pill_renderer_detach` forwards to), or null when the window data is
+/// missing or the renderer could not be created; the reason is logged here.
 ///
 /// # Safety
 ///
@@ -101,7 +100,7 @@ pub unsafe extern "C" fn detach_backend(backend: *mut c_void) {
         return;
     }
     // SAFETY: by this function's contract the pointer came from
-    // `Box::into_raw` in `pill_renderer_attach` and is released exactly once.
+    // `Box::into_raw` in `attach_to_window` and is released exactly once.
     let backend = unsafe { Box::from_raw(backend.cast::<Box<dyn PillRenderer>>()) };
     if catch_unwind(AssertUnwindSafe(|| drop(backend))).is_err() {
         pill_core::error!(

@@ -13,11 +13,9 @@
 //! # Design
 //!
 //! Everything crossing is plain data: no handles, no device objects, no
-//! callbacks - the rule the retired `pill_editor_api` stated for the old
-//! editor, kept for this one. The shell's input events travel in this resource as
-//! owned [`InputEvent`]s, so the UI reads the events of its own windows and
-//! never the game's (W-0038 Stage 1).
-
+//! callbacks. The shell's input events travel in this resource as owned
+//! [`InputEvent`]s, so the UI reads the events of its own windows and never
+//! the game's.
 // External crates
 use egui::epaint::ClippedPrimitive;
 use egui::{Context, CursorIcon, FullOutput, OutputCommand, TexturesDelta};
@@ -50,18 +48,18 @@ pub struct EguiShellInput {
     ///
     /// egui's button events name their own position, and a frame can carry a
     /// release with no move before it: this seeds the bridge with the place
-    /// the pointer was last seen (W-0038 Stage 1).
+    /// the pointer was last seen.
     pub cursor: Option<Vector2f>,
     /// The OS clipboard's text, carried when the frame's events include a paste
-    /// chord (W-0038 Stage 17).
+    /// chord.
     ///
     /// egui pastes text only from an [`egui::Event::Paste`], and only the
     /// frontend can read the OS clipboard, so it reads it once per paste chord
     /// and the bridge appends the event: without this a focused text field
     /// would ignore Ctrl+V.
     pub paste_text: Option<String>,
-    /// The entities the executable projected into this frame's scene views
-    /// (W-0049 Stage 12), one entry per entity and view.
+    /// The entities the executable projected into this frame's scene views,
+    /// one entry per entity and view.
     ///
     /// The executable owns the views' cameras and the renderer's projection,
     /// so it is the side that can say where an entity lands on screen; the
@@ -69,7 +67,7 @@ pub struct EguiShellInput {
     pub badges: Vec<ShellBadge>,
 }
 
-/// One entity's badge in one scene view (W-0049 Stage 12).
+/// One entity's badge in one scene view.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShellBadge {
     /// Which scene view the badge belongs to.
@@ -84,7 +82,7 @@ pub struct ShellBadge {
 
 /// How many badges one scene view draws: enough for a scene's population to
 /// read at a glance, few enough that the overlay never turns into a wall of
-/// chips (W-0049 Stage 12).
+/// chips.
 pub const BADGES_PER_VIEW_MAX: usize = 48;
 
 impl Resource for EguiShellInput {}
@@ -105,7 +103,7 @@ impl Default for EguiShellInput {
     }
 }
 
-/// One input record per popped-out tab's window (W-0038 Stage 23).
+/// One input record per popped-out tab's window.
 ///
 /// A popped-out window's events must not reach the main window's pass - its
 /// coordinates are its own client area's - so the frontend keeps them apart
@@ -120,8 +118,8 @@ pub struct EguiPopoutInputs {
 impl Resource for EguiPopoutInputs {}
 
 /// How many scene viewports a layout opens with: the two the default dock
-/// carries. The shell may report more - a view the person added (W-0038
-/// Stage 21) - and the frontend opens one for each it does.
+/// carries. The shell may report more - a view the person added - and the
+/// frontend opens one for each it does.
 pub const DEFAULT_SCENE_VIEWS: usize = 2;
 
 /// The most scene views one editor opens: each view is a child window and a
@@ -184,7 +182,7 @@ pub struct EguiShellFrame {
     pub ime_allowed: bool,
     /// Where the IME candidate window should appear, logical points.
     pub ime_rect: Option<ShellRect>,
-    /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
+    /// The asset path a tile drag handed to the OS: the
     /// frontend starts an OLE drag with it, so a file can be dragged into
     /// Explorer.
     pub drag_out: Option<String>,
@@ -194,9 +192,9 @@ pub struct EguiShellFrame {
     pub quit_requested: bool,
     /// When egui asked for the next pass: `Some(Duration::ZERO)` draws again
     /// at once, `None` means no pass was requested. The frontend's redraw
-    /// cadence honours it (W-0038 Stage 9).
+    /// cadence honours it.
     pub repaint_after: Option<Duration>,
-    /// One frame per tab popped out into its own OS window (W-0038 Stage 23):
+    /// One frame per tab popped out into its own OS window:
     /// the shell runs a pass of its own context for each, and the frontend
     /// paints it into that tab's window. A tab that appears here has its
     /// window created; one that disappears is closed.
@@ -204,7 +202,6 @@ pub struct EguiShellFrame {
 }
 
 /// One popped-out tab's frame: which tab it draws, and the pass's output.
-///
 pub struct PopoutFrame {
     /// The tab's wire name, which is also its window's identity.
     pub tab: String,
@@ -284,9 +281,9 @@ pub fn frame_from_output(context: &Context, output: FullOutput) -> EguiShellFram
         game_rect: None,
         // Same for the overlay chips: the shell records them as it draws.
         overlay_regions: Vec::new(),
-        // The engine reports IME composition in its input events; the
-        // candidate window follows the text field egui focuses, which the
-        // frontend reads off the frame's focus state for now.
+        // The engine reports IME composition in its input events; this frame
+        // allows IME exactly while egui wants the keyboard, since the
+        // candidate window follows the text field that has focus.
         ime_allowed: wants_keyboard,
         ime_rect: None,
         // Only the shell asks for a drag out; it records the path itself.

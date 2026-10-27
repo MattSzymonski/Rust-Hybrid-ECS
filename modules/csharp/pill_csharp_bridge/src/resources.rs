@@ -13,28 +13,20 @@
 //! # Design
 //!
 //! A managed resource is blittable bytes with a declared name, which is exactly
-//! what [`World::register_foreign_resource`] already accepts - so nothing new
-//! is invented here. The manifest carries resources in the same array as
-//! components, distinguished by a `kind` tag, so one transfer and one
-//! transaction cover both.
+//! what [`World::register_foreign_resource`] already accepts. The manifest
+//! carries resources in the same array as components, distinguished by a `kind`
+//! tag, so one transfer and one transaction cover both.
 //!
 //! The binding table is a process-wide `RwLock` rather than a per-invocation
-//! pointer, unlike [`ComponentBindings`](super::components::ComponentBindings).
-//! That is not a shortcut: a resource table is genuinely process-wide - there
-//! is one value per world, not one per archetype - and the mirror-method table
-//! next door is published the same way for the same reason. It also keeps the
-//! scope struct, and every installer that fills it, unchanged.
+//! pointer, unlike [`ComponentBindings`](super::components::ComponentBindings):
+//! a resource table is genuinely process-wide - there is one value per world,
+//! not one per archetype - and the lock keeps the scope struct, and every
+//! installer that fills it, unchanged.
 //!
-//! Under `cargo test` the table is thread-local instead: cargo runs tests on
-//! parallel threads in one process, and since every manifest apply publishes
-//! the table whole, a component-only manifest in one test would otherwise
-//! wipe a resource test's bindings mid-flight. See `RESOURCE_BINDINGS`.
-//!
-//! A reload does not have its own apply loop either. The rename/retire/rollback
-//! protocol is the components' protocol, run from one place; what is
-//! resource-specific is that a resource owns no column, so its migration moves
-//! a stored value rather than rewriting a column - and that the move cannot be
-//! reversed, which the subject says by journalling no undo for it.
+//! The reload protocol is the components' protocol, run from one place; a
+//! resource owns no column, so its migration moves a stored value rather than
+//! rewriting a column - and the move cannot be reversed, which the subject says
+//! by journalling no undo for it.
 
 // Standard library
 use std::collections::HashMap;
@@ -117,13 +109,11 @@ pub(super) type ResourceBindings = HashMap<StableComponentId, ResourceBinding>;
 /// so registration, reload and the `Res<T>` callback must all see the same
 /// bindings.
 ///
-/// Under `cargo test` it is thread-local instead. Every manifest apply
-/// publishes the table whole - an arriving generation's manifest is the
-/// complete list of what it declares - and cargo runs tests on parallel
-/// threads in one process, so a component-only manifest in one test would
-/// otherwise wipe a resource test's bindings mid-flight. A test registers,
-/// acts and asserts on one thread, so a per-thread table gives each test
-/// exactly what a host gives the process: a table nothing else writes.
+/// Under `cargo test` it is thread-local: every manifest apply publishes the
+/// table whole, and cargo runs tests on parallel threads in one process, so a
+/// component-only manifest in one test would otherwise wipe a resource test's
+/// bindings mid-flight. A test registers, acts and asserts on one thread, so a
+/// per-thread table gives each test what a host gives the process.
 #[cfg(not(test))]
 static RESOURCE_BINDINGS: OnceLock<RwLock<ResourceBindings>> = OnceLock::new();
 
@@ -180,15 +170,13 @@ fn publish_bindings(bindings: ResourceBindings) {
 
 /// Register every resource the managed manifest declares.
 ///
-/// Called with the resource entries a manifest parse separated out, at the
-/// point the component entries are registered, so one generation's whole
-/// declaration lands in one transaction.
+/// Called with the entries a manifest parse separated out, so one generation's
+/// whole declaration lands in one transaction.
 ///
 /// Each resource is registered twice on purpose: once as a foreign resource, so
 /// the scheduler and managed code can reach it, and once as persistable, so it
-/// appears in a snapshot. A managed resource is the case persistence was least
-/// able to reach before - there is no Rust type to derive anything from - and
-/// its bytes are exactly what a snapshot can carry.
+/// appears in a snapshot - there is no Rust type to derive persistence from,
+/// and the resource's bytes are exactly what a snapshot can carry.
 ///
 /// # Errors
 ///
@@ -233,38 +221,6 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
     })
 }
 
-/// Resolve and apply a reloaded generation's resource declarations, one kind
-/// on its own.
-///
-/// Five outcomes per resource, decided by the shared pipeline from the arriving
-/// declaration and the binding the previous generation left behind:
-///
-/// - **unchanged** - the schema hash matches, so the stored bytes are still
-///   valid under the arriving struct and nothing is touched, which is what
-///   keeps a resource's value across an ordinary reload;
-/// - **added** - no binding yet, so it registers exactly as at startup;
-/// - **reshaped** - the schema hash moved, so the stored bytes migrate field by
-///   field into the new layout, matched by name;
-/// - **renamed** - an alias claims a binding still in the table, so the value
-///   and the claims move onto the successor and the predecessor is dropped;
-/// - **retired** - the manifest stopped naming it and no alias claimed it, so
-///   its value and binding go.
-///
-/// The ordering that makes those safe - aliases first, retirement last - is the
-/// pipeline's, and it is the same ordering managed components run through.
-///
-/// A failure part-way through is handled differently from the component path,
-/// which unwinds an undo journal: a relayout moves bytes into a narrower shape,
-/// so reversing it would invent the bytes it dropped. Instead the binding table
-/// is published on every exit, so it never describes a layout the engine no
-/// longer holds, and the failure is logged as one that needs a host restart.
-///
-/// # Errors
-///
-/// Returns a [`CSharpError`] when an alias is malformed or claims more than one
-/// predecessor, and when the engine refuses a registration, a relayout or a
-/// remap.
-///
 /// Resolve this manifest's resource entries without touching the engine.
 ///
 /// A caller that has both kinds in hand resolves resources *and* components
@@ -273,7 +229,10 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
 ///
 /// # Errors
 ///
-/// The alias and addability refusals, all of which happen before any mutation.
+/// Every refusal the resolution can raise: an alias that names nothing
+/// unambiguously, more than one predecessor claimed for one entry, an alias
+/// declared by an entry the table already holds, and a declaration that cannot
+/// be registered as it stands. All of them happen before any mutation.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn prepare_resource_manifest<'declaration>(
     engine: &Engine,
@@ -292,10 +251,16 @@ pub(super) fn prepare_resource_manifest<'declaration>(
 
 /// Apply what [`prepare_resource_manifest`] resolved and publish the table.
 ///
-/// The table is published on every exit, the failing one included. A reshape
-/// that already ran cannot be undone - reversing it would invent the bytes it
-/// dropped - so the pipeline leaves it applied, and publishing is what keeps
-/// the table describing the layout the engine actually holds.
+/// Per resource the pipeline decides one of five outcomes from the arriving
+/// declaration and the previous binding: unchanged (the schema hash matches, so
+/// the stored bytes stay), added, reshaped (the bytes migrate field by field,
+/// matched by name), renamed through an alias, or retired - aliases first,
+/// retirement last.
+///
+/// The table is published on every exit, the failing one included: a reshape
+/// that already ran cannot be undone, so leaving it applied and publishing is
+/// what keeps the table describing the layout the engine holds, and a failure
+/// is logged as one that needs a host restart.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn execute_resource_manifest(
     engine: &mut Engine,
@@ -554,20 +519,13 @@ fn register_one(
     Ok(resource_id)
 }
 
-/// Move one resource's stored bytes from the layout it has to the one the
-/// arriving manifest declares.
-///
-/// Fields are matched by name, so a field that moved follows its name, a field
-/// the new shape adds starts zeroed rather than reading whatever was next in
-/// memory, and a field the new shape dropped is left behind. Exactly the rule a
-/// reshaped managed component's rows follow, because it is the same plan.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 /// Build the byte plan from one resource shape to another, with declared
 /// defaults applied to the fields the diff leaves empty.
 ///
 /// Shared by a reshape and a rename because the two differ only in which id
 /// the plan runs against; `set_default` is a no-op on a copied field, which is
 /// what keeps a changed default from masking a carried value.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 fn resource_field_plan(
     previous: &[ResourceFieldLayout],
     arriving: &[ResourceFieldLayout],
@@ -585,6 +543,13 @@ fn resource_field_plan(
     plan
 }
 
+/// Move one resource's stored bytes from the layout it has to the one the
+/// arriving manifest declares.
+///
+/// Fields are matched by name, so a field that moved follows its name, a field
+/// the new shape adds starts zeroed rather than reading whatever was next in
+/// memory, and a field the new shape dropped is left behind - the rule a
+/// reshaped managed component's rows follow, because it is the same plan.
 fn relayout_one(
     engine: &mut Engine,
     existing: &ResourceBinding,
@@ -713,8 +678,8 @@ pub(super) struct ManagedResourceDeclaration {
     pub(super) align: usize,
     /// Hash of the managed field schema.
     pub(super) schema_hash: u64,
-    /// Names this resource used to be declared under; a rename migrates the
-    /// stored value instead of refusing the manifest.
+    /// The names of live registrations this resource renames onto itself; a
+    /// rename migrates the stored value instead of refusing the manifest.
     pub(super) aliases: Vec<String>,
     /// The declared field layout, used to plan a reload's byte migration.
     pub(super) fields: Vec<ResourceFieldLayout>,

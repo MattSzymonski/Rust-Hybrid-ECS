@@ -1,38 +1,23 @@
-//! Entity Lifecycle Benchmarks
-//! ============================
+//! Entity creation and destruction benchmarks.
 //!
-//! Entity creation and destruction are the most fundamental ECS operations -
-//! every spawned enemy, bullet, or particle pays these costs. These benchmarks
-//! isolate the allocation paths that live outside the hot query loop.
+//! Every spawned enemy, bullet or particle pays these costs, and they sit
+//! outside the hot query loop, so this target isolates the allocation paths.
 //!
 //! # Responsibilities
 //!
 //! - Benchmarks entity creation with and without pre-allocation.
-//! - Benchmarks entity destruction, covering HashMap removal and free-list
-//!   push.
-//! - Benchmarks free-list ID recycling through a create-destroy-recreate
-//!   cycle.
-//! - Benchmarks wide-archetype spawning with many components per entity.
+//! - Benchmarks entity destruction, covering entity-location removal,
+//!   free-list push and empty-archetype cleanup.
+//! - Benchmarks free-list ID recycling through a create-destroy-recreate cycle.
+//! - Benchmarks wide-archetype spawning with six components per entity.
 //!
 //! # Design
 //!
-//! Each benchmark registers the shared [`Transform`], [`Velocity`], and
-//! [`Health`] components on a fresh [`World`] so every measurement starts from
-//! an empty state. The destroy and reuse-cycle benches use Criterion's
-//! `iter_batched` harness to keep setup outside the measured section.
-//!
-//! What each benchmark isolates:
-//!
-//! - Create: fresh `World`, no pre-allocation - raw allocation + HashMap
-//!   insertion + Vec growth.
-//! - Create (reserved): calls `world.reserve_entities(count)` first to
-//!   pre-allocate internal structures, showing how much overhead is avoidable.
-//! - Destroy: tears down single-component entities one at a time, measuring
-//!   HashMap removal, free-list push, and empty-archetype cleanup.
-//! - Reuse cycle: create → destroy → create again, exercising the free-list
-//!   ID recycling path vs allocating brand-new IDs.
-//! - Many components: 6 components per entity in a single wide archetype,
-//!   measuring the added cost of building large-component entities.
+//! Each benchmark registers the components it uses on a fresh [`World`], so
+//! every measurement starts from an empty state. The destroy and reuse-cycle
+//! benchmarks use Criterion's `iter_batched` harness to keep setup outside the
+//! measured section; the create benchmarks spawn inside the measurement,
+//! because spawning is the workload.
 
 #![allow(dead_code)]
 
@@ -77,8 +62,6 @@ impl Component for Velocity {}
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
-
-// Marks the shared components as trait-accessible for the ECS storage layer.
 
 // =============================================================================
 // Benchmarks
@@ -271,7 +254,7 @@ fn bench_reuse_cycle(criterion: &mut Criterion) {
 fn bench_create_many_components(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create_many_components");
 
-    // Define additional components locally
+    // Components used only by the wide-archetype benchmark.
     #[derive(Debug, Clone)]
     struct Armor(f32);
     impl Component for Armor {}

@@ -5,46 +5,46 @@
 //! - Parse an asset pack ([`AssetPack`]): the files of a project's `res`
 //!   directory in one blob, written at build time by `pill_assets`.
 //! - Keep the mount points an [`AssetLoader::Path`](crate::AssetLoader::Path)
-//!   resolves through: packs ([`mount_pack`]) and the project's asset
-//!   directory ([`mount_directory`]).
+//!   resolves through - packs ([`mount_pack`]) and the project's asset directory
+//!   ([`mount_directory`]) - and the read-only directories extension modules
+//!   contribute ([`declare_module_root`]), which resolve by name like the
+//!   project's and are never written ([`is_module_asset`]).
 //! - Read a path's bytes from the first mount that has it ([`read`]).
 //! - Write a file beside an asset that lives on the filesystem
-//!   ([`write_beside`]), which is how a development build records an asset's
-//!   metadata, and write a new file that must not exist yet ([`write_new`]),
-//!   which is how a tool creates a standalone asset. Packs are never written.
+//!   ([`write_beside`]) - how a development build records an asset's metadata -
+//!   or a new file that must not exist yet ([`write_new`]). Packs are never
+//!   written.
 //!
 //! # Design
 //!
-//! Loading code names a path relative to the project's `res` directory and
-//! never the target it runs on; what differs per target is only what is
-//! mounted:
+//! Loading code names a path relative to the project's `res` directory and never
+//! the target it runs on; what differs per target is only what is mounted:
 //!
-//! - **development:** nothing but the filesystem - the project's asset
-//!   directory, then the working directory's `res`, `$PROJECT_PATH/res` and
+//! - **development:** the filesystem - the project's asset directory, every
+//!   module root, then the working directory, its `res`, `$PROJECT_PATH/res` and
 //!   the executable's `res`;
 //! - **native shipping:** the pack the shipping bundle embeds, mounted by the
 //!   runtime before any module initializes;
 //! - **web:** a pack the frontend fetched, mounted the same way.
 //!
-//! Packs are searched before the filesystem, newest mount first: a shipped
-//! game reads the assets it was built with, not whatever happens to sit at a
-//! development path on the machine it runs on.
-//!
-//! The store is a process-wide static of this crate. In a development host
-//! each loaded image has its own copy, which is harmless there: only the
-//! filesystem is mounted, and every copy reads the same files.
+//! Packs are searched before the filesystem, newest mount first: a shipped game
+//! reads the assets it was built with, not whatever sits at a development path
+//! on the machine it runs on. The store is a process-wide static of this crate,
+//! and `pill_engine_core` is a shared `dylib` - one copy per process - so the
+//! host, every module and every project resolve a path against one set of
+//! mounts.
 //!
 //! # Pack format (version 1)
 //!
 //! Little-endian throughout. `PILLPACK`, a `u32` version, a `u32` entry count,
 //! then per entry a `u32` path length, the path (UTF-8, `/`-separated,
-//! relative), and a `u64` offset and `u64` length of its bytes counted from the
-//! start of the pack. The bytes follow the index. `pill_assets::write_asset_pack`
-//! is the writer; the two change together.
+//! relative), and a `u64` offset and `u64` length counted from the start of the
+//! pack. The bytes follow the index. `pill_assets::write_asset_pack` is the
+//! writer; the two change together.
 
 // Standard library
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -209,11 +209,13 @@ impl<'bytes> PackReader<'bytes> {
 // Mount points
 // =============================================================================
 
-/// What is mounted: packs, newest first, and the project's asset directory.
+/// What is mounted: packs, newest first, the project's asset directory, and
+/// the directories extension modules contribute.
 #[derive(Default)]
 struct Mounts {
     packs: Vec<Arc<AssetPack>>,
     directory: Option<PathBuf>,
+    roots: Vec<ModuleAssetRoot>,
 }
 
 /// The process-wide mounts of this image.
@@ -250,21 +252,238 @@ pub fn mounted_directory() -> Option<PathBuf> {
         .filter(|directory| !directory.as_os_str().is_empty())
 }
 
+// =============================================================================
+// Module asset roots
+// =============================================================================
+
+/// A read-only directory an extension module contributes to the store.
+///
+/// The module declares it with the files it cannot run without: the
+/// declaration asserts both, so a build that loses a default resource stops
+/// with the module and the path in the message instead of loading a blank
+/// texture three systems later. Nothing writes into a root - the editor shows
+/// it read-only - because a module's resources ship with the module.
+///
+/// One module may contribute several of these (its `res`, the sources it is
+/// configured from, the images it ships); the editor merges them into one row
+/// tree under the module's name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleAssetRoot {
+    /// The module that declared the root, as the host names it.
+    pub module: String,
+    /// The directory the module's resources live in.
+    pub directory: PathBuf,
+    /// The files below `directory` the module cannot run without.
+    pub files: Vec<String>,
+    /// File extensions, lowercase and without the dot, that the listing leaves
+    /// out: the cooked output beside a module's sources is a build product, not
+    /// content, and the store still answers it by name.
+    pub hidden: Vec<String>,
+}
+
+/// Declare `directory` as one of `module`'s read-only asset roots.
+///
+/// Loading code names a module resource by a path relative to one of these
+/// roots, exactly as it names a project asset relative to `res`. A module
+/// registers once per generation, so declaring the same root again is what a
+/// reload does and changes nothing.
+///
+/// # Panics
+///
+/// Panics when `directory` is not a directory, when one of `required_files`
+/// is not a file below it, or when the same directory is declared twice with
+/// different required files: each is a packaging mistake, and each names the
+/// module and the path.
+pub fn declare_module_root(module: &str, directory: impl Into<PathBuf>, required_files: &[&str]) {
+    declare_module_root_hiding(module, directory, required_files, &[]);
+}
+
+/// [`declare_module_root`], with file extensions the listing leaves out.
+///
+/// A directory whose sources are cooked into a file beside them says so here:
+/// the cooked file stays readable through the store - a shader's stages are
+/// read by path - while the editor's tree shows the sources the person authors.
+pub fn declare_module_root_hiding(
+    module: &str,
+    directory: impl Into<PathBuf>,
+    required_files: &[&str],
+    hidden_extensions: &[&str],
+) {
+    let root = ModuleAssetRoot {
+        module: module.to_owned(),
+        directory: directory.into(),
+        files: required_files
+            .iter()
+            .map(|file| (*file).to_owned())
+            .collect(),
+        hidden: hidden_extensions
+            .iter()
+            .map(|extension| extension.to_ascii_lowercase())
+            .collect(),
+    };
+    assert_module_root_complete(&root);
+    let mut mounts = mounts()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(declared) = mounts
+        .roots
+        .iter_mut()
+        .find(|declared| declared.module == root.module && declared.directory == root.directory)
+    {
+        assert!(
+            *declared == root,
+            "module '{}' declared its root '{}' twice, and the two disagree about its files",
+            root.module,
+            declared.directory.display()
+        );
+        return;
+    }
+    mounts.roots.push(root);
+}
+
+/// Assert every declared module root still holds its resources.
+///
+/// A module declares its roots while its init runs, and the host runs that
+/// inside `catch_unwind`: this re-checks them outside it, so a file that went
+/// missing stops the process with the module and the path in the message. Two
+/// roots of one module that list the same relative path are refused here too:
+/// the editor would show one file twice, under two keys.
+///
+/// # Panics
+///
+/// Panics when a declared directory or required file is missing, or when two
+/// of a module's roots claim one path.
+pub fn verify_module_roots() {
+    let roots = module_roots();
+    assert_roots_do_not_overlap(&roots);
+    for root in &roots {
+        assert_module_root_complete(root);
+    }
+}
+
+/// Panic when two roots of one module list the same relative path.
+fn assert_roots_do_not_overlap(roots: &[ModuleAssetRoot]) {
+    let mut claimed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for root in roots {
+        let paths = claimed.entry(root.module.as_str()).or_default();
+        for file in relative_files(&root.directory) {
+            assert!(
+                paths.insert(file.clone()),
+                "module '{}' claims '{file}' from two of its roots",
+                root.module
+            );
+        }
+    }
+}
+
+/// Every file below `directory`, relative and `/`-separated.
+fn relative_files(directory: &Path) -> Vec<String> {
+    fn walk(directory: &Path, prefix: &Path, files: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = prefix.join(entry.file_name());
+            if path.is_dir() {
+                walk(&path, &relative, files);
+            } else {
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(directory, Path::new(""), &mut files);
+    files
+}
+
+/// Panic unless `root`'s directory and files are all there.
+fn assert_module_root_complete(root: &ModuleAssetRoot) {
+    assert!(
+        root.directory.is_dir(),
+        "module '{}' declares its asset root at '{}', which is not a directory",
+        root.module,
+        root.directory.display()
+    );
+    for file in &root.files {
+        let path = root.directory.join(file);
+        assert!(
+            path.is_file(),
+            "module '{}' requires its resource '{file}', which is missing at '{}'",
+            root.module,
+            path.display()
+        );
+    }
+}
+
+/// The roots modules have declared, in declaration order.
+pub fn module_roots() -> Vec<ModuleAssetRoot> {
+    mounts()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .roots
+        .clone()
+}
+
+/// Forget every root `module` declared: a host unloaded the module, so its
+/// resources stop resolving and stop being listed.
+pub fn forget_module_root(module: &str) {
+    mounts()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .roots
+        .retain(|root| root.module != module);
+}
+
+/// Forget every declared root.
+///
+/// A host calls this before it mounts the modules of a fresh manifest, so a
+/// root from a previous set cannot answer a path; the store's tests call it
+/// so one test does not decide the others.
+pub fn forget_all_module_roots() {
+    mounts()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .roots
+        .clear();
+}
+
+/// Whether `path` is one of a module's resources: an absolute path inside a
+/// declared root, or a relative one that only a root has.
+///
+/// The project's directory answers first, exactly as [`resolve_file`] orders
+/// it, so a project file that happens to share a module resource's path is the
+/// project's and stays writable. The editor asks this before it writes
+/// anything, so a module's resources are never an authoring target.
+pub fn is_module_asset(path: &Path) -> bool {
+    if path.is_absolute() {
+        return module_roots()
+            .iter()
+            .any(|root| path.starts_with(&root.directory));
+    }
+    if mounted_directory().is_some_and(|directory| directory.join(path).is_file()) {
+        return false;
+    }
+    module_roots()
+        .iter()
+        .any(|root| root.directory.join(path).is_file())
+}
+
 /// Read the bytes of the asset at `path` from the first mount that has it.
 ///
-/// An absolute path is read from the filesystem as is. A relative one is
-/// looked up in every pack, then below the project's asset directory, then
-/// the development fallbacks: `res` in the working directory, in
-/// `$PROJECT_PATH`, and beside the executable.
+/// An absolute path is read from the filesystem as is. A relative one is looked
+/// up in every pack, then below the project's asset directory, then in each
+/// module root, then the development fallbacks: the working directory itself,
+/// its `res`, `$PROJECT_PATH/res` and the executable's `res`.
 ///
-/// Once [`restrict_to_packs`] has been called - a shipped build, right after
-/// it mounts the pack it was built with - only the packs and a deliberately
-/// mounted directory are read, so a pack miss is a missing asset rather than a
-/// file the machine happens to have.
+/// Once [`restrict_to_packs`] has been called - a shipped build, right after it
+/// mounts the pack it was built with - only the packs and a deliberately mounted
+/// directory are read, so a pack miss is a missing asset rather than a file the
+/// machine happens to have.
 ///
 /// # Errors
 ///
-/// Returns [`AssetLoadError::PathNotFound`] when no mount has the path, or
+/// [`AssetLoadError::PathNotFound`] when no mount has the path, or
 /// [`AssetLoadError::Read`] when the file was found but could not be read.
 pub fn read(path: &Path) -> AssetLoadResult<Vec<u8>> {
     // Packs first: a shipped game reads what it was built with.
@@ -304,8 +523,8 @@ pub(crate) fn pack_key(path: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Find `path` on the filesystem: as is when absolute, else below the
-/// mounted directory and the development fallbacks.
+/// Find `path` on the filesystem: as is when absolute, else below the mounted
+/// directory, each module root and the development fallbacks.
 ///
 /// The fallbacks are off once [`restrict_to_packs`] has been called - a
 /// shipped build reads what it was built with - while an absolute path and a
@@ -317,6 +536,11 @@ fn resolve_file(path: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(directory) = mounted_directory() {
         candidates.push(directory.join(path));
+    }
+    // Then every module's own resources, in declaration order: a default an
+    // extension ships lives beside the module, not in the project.
+    for root in module_roots() {
+        candidates.push(root.directory.join(path));
     }
     if !packs_only() {
         candidates.push(path.to_owned());
@@ -381,8 +605,7 @@ pub fn locate_file(path: &Path) -> Option<PathBuf> {
 /// The bytes go to a temporary sibling first and are linked into place only
 /// when complete, so a crash or a second writer never leaves a half-written
 /// file. An existing file is never replaced, even one that appears while this
-/// runs: it may hold a person's edits. A filesystem without hard links takes
-/// the same write through a rename.
+/// runs: it may hold a person's edits.
 ///
 /// # Errors
 ///
@@ -422,9 +645,7 @@ pub fn write_beside(
 ///
 /// The bytes go to a temporary sibling first and are linked into place only
 /// when complete, so a crash never leaves a half-written file, and an existing
-/// file - even one that appears while this runs - is never replaced. A
-/// filesystem without hard links takes the same write through a rename, so a
-/// project on a removable or network drive can still create assets. Missing
+/// file - even one that appears while this runs - is never replaced. Missing
 /// parent directories are not created: the caller names a folder that exists.
 ///
 /// # Errors
@@ -533,9 +754,192 @@ pub(crate) fn mounted_directory_test_lock() -> std::sync::MutexGuard<'static, ()
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Serializes tests that declare module roots: the registry is process-wide.
+#[cfg(test)]
+pub(crate) fn module_roots_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Drop every declared module root, so one test does not decide the others.
+#[cfg(test)]
+pub(crate) fn clear_module_roots() {
+    forget_all_module_roots();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh scratch directory named after `label`.
+    fn scratch(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("pill-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    /// A module root answers a module resource by name, and the store calls
+    /// that path read-only.
+    #[test]
+    fn a_module_root_answers_a_relative_path() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let directory = scratch("module-root");
+        std::fs::create_dir_all(directory.join("overlay")).unwrap();
+        std::fs::write(directory.join("overlay/grid.wgsl"), b"grid").unwrap();
+
+        declare_module_root("pill_test_module", &directory, &["overlay/grid.wgsl"]);
+
+        assert_eq!(read(Path::new("overlay/grid.wgsl")).unwrap(), b"grid");
+        assert!(is_module_asset(Path::new("overlay/grid.wgsl")));
+        assert!(is_module_asset(&directory.join("overlay/grid.wgsl")));
+        assert!(!is_module_asset(Path::new("overlay/missing.wgsl")));
+        let roots = module_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].module, "pill_test_module");
+        assert_eq!(roots[0].files, vec!["overlay/grid.wgsl"]);
+
+        clear_module_roots();
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A declaration names the module and the file it cannot find.
+    #[test]
+    fn a_missing_resource_stops_the_declaration() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let directory = scratch("module-root-missing-file");
+
+        let panic = std::panic::catch_unwind(|| {
+            declare_module_root("pill_test_module", &directory, &["overlay/grid.wgsl"]);
+        });
+        let message = panic_message(panic);
+        assert!(message.contains("pill_test_module"), "{message}");
+        assert!(message.contains("overlay/grid.wgsl"), "{message}");
+        assert!(
+            module_roots().is_empty(),
+            "the refused root is not recorded"
+        );
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A directory that is not there is named too.
+    #[test]
+    fn a_missing_directory_stops_the_declaration() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let directory = scratch("module-root-missing-directory").join("gone");
+
+        let panic =
+            std::panic::catch_unwind(|| declare_module_root("pill_test_module", &directory, &[]));
+        let message = panic_message(panic);
+        assert!(message.contains("is not a directory"), "{message}");
+        assert!(message.contains("pill_test_module"), "{message}");
+    }
+
+    /// A module registers once per generation, so the same declaration twice
+    /// is a reload; the same directory with a different file list is a
+    /// mistake.
+    #[test]
+    fn declaring_the_same_root_again_changes_nothing() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let directory = scratch("module-root-twice");
+        std::fs::write(directory.join("grid.wgsl"), b"grid").unwrap();
+        declare_module_root("pill_test_module", &directory, &["grid.wgsl"]);
+        declare_module_root("pill_test_module", &directory, &["grid.wgsl"]);
+        assert_eq!(module_roots().len(), 1, "the reload kept one root");
+
+        let panic = std::panic::catch_unwind(|| {
+            declare_module_root("pill_test_module", &directory, &[]);
+        });
+        let message = panic_message(panic);
+        assert!(message.contains("disagree"), "{message}");
+        assert_eq!(module_roots().len(), 1);
+
+        clear_module_roots();
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A module may contribute several directories, and each answers its own
+    /// relative paths.
+    #[test]
+    fn a_module_may_declare_a_second_root() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let resources = scratch("module-root-res");
+        let sources = scratch("module-root-sources");
+        std::fs::write(resources.join("default.material"), b"{{}}").unwrap();
+        std::fs::write(sources.join("fragment.hlsl"), b"//").unwrap();
+
+        declare_module_root("pill_test_module", &resources, &["default.material"]);
+        declare_module_root("pill_test_module", &sources, &["fragment.hlsl"]);
+
+        assert_eq!(module_roots().len(), 2, "both directories are the module's");
+        assert_eq!(read(Path::new("default.material")).unwrap(), b"{{}}");
+        assert_eq!(read(Path::new("fragment.hlsl")).unwrap(), b"//");
+
+        clear_module_roots();
+        std::fs::remove_dir_all(&resources).unwrap();
+        std::fs::remove_dir_all(&sources).unwrap();
+    }
+
+    /// Two roots of one module that list one path would show it twice, so the
+    /// verification refuses them by name.
+    #[test]
+    fn two_roots_of_one_module_may_not_claim_one_path() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let first = scratch("module-root-overlap-first");
+        let second = scratch("module-root-overlap-second");
+        std::fs::write(first.join("shared.wgsl"), b"a").unwrap();
+        std::fs::write(second.join("shared.wgsl"), b"b").unwrap();
+        declare_module_root("pill_test_module", &first, &[]);
+        declare_module_root("pill_test_module", &second, &[]);
+
+        let panic = std::panic::catch_unwind(verify_module_roots);
+        let message = panic_message(panic);
+        assert!(message.contains("shared.wgsl"), "{message}");
+        assert!(message.contains("pill_test_module"), "{message}");
+
+        clear_module_roots();
+        std::fs::remove_dir_all(&first).unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+    }
+
+    /// A resource deleted after the declaration stops the host's verification.
+    #[test]
+    fn a_vanished_resource_fails_the_verification() {
+        let _guard = module_roots_test_lock();
+        clear_module_roots();
+        let directory = scratch("module-root-vanished");
+        std::fs::write(directory.join("grid.wgsl"), b"grid").unwrap();
+        declare_module_root("pill_test_module", &directory, &["grid.wgsl"]);
+        std::fs::remove_file(directory.join("grid.wgsl")).unwrap();
+
+        let panic = std::panic::catch_unwind(verify_module_roots);
+        let message = panic_message(panic);
+        assert!(message.contains("grid.wgsl"), "{message}");
+
+        clear_module_roots();
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The message a caught panic carried.
+    fn panic_message(panic: std::thread::Result<()>) -> String {
+        let payload = panic.expect_err("the call was expected to panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_default()
+    }
 
     #[test]
     fn write_new_writes_once_and_never_replaces() {
@@ -558,8 +962,8 @@ mod tests {
     }
 
     /// A filesystem with no hard links - exFAT, FAT, some network shares -
-    /// refuses the link every writer tries first, and a create used to surface
-    /// that refusal instead of writing the file (W-0096).
+    /// refuses the link every writer tries first, so a create has to fall back
+    /// to the rename rather than surface that refusal.
     fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

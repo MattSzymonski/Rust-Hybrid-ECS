@@ -13,19 +13,13 @@
 //!
 //! # Design
 //!
-//! The data a project draws with - assets, components, the default pipelines
-//! and their WGSL, the frame, the backend trait - lives in `pill_renderer_api`,
-//! which carries no wgpu and is re-exported here. This crate is the only one
-//! that links wgpu, which is what will let it be loaded and reloaded as a
-//! module while the host and projects link only the data.
-//!
-//! Transferred from the original `pill_renderer` crate. The GPU resource,
-//! shader, material, mesh, camera, drawer, and surface code remains in the
-//! original module structure.
-//!
-//! The host still links this crate directly under its `rendering` feature;
-//! making it a reloadable module is the remaining work of
-//! `.construction_site/plans/renderer_hot_reload.md`.
+//! The data a renderer draws with - assets, components, the default pipelines
+//! and their WGSL - lives in `pill_master_renderer_data`; the contract between
+//! host and renderer - the frame, the backend trait, the camera - lives in
+//! `pill_renderer_api`. Neither carries wgpu, and both are re-exported here.
+//! This crate is the only renderer crate that links wgpu, which is what lets a
+//! development host load and reload it as a module while everything around it
+//! compiles against data.
 
 // The contract lives in `pill_renderer_api` and this renderer's data in
 // `pill_master_renderer_data`; neither carries wgpu. Their modules are
@@ -111,16 +105,16 @@ pub use resources::RenderingManager;
 /// The module's entry point: registers the post-update `rendering` system
 /// that fills the frame, once, and returns zero.
 ///
-/// Registers no data. The host registers `pill_renderer_api` - components,
-/// asset types, resources, the default pipeline - before anything loads, in
-/// every posture; registering it again from here would re-point the asset
-/// types' tables at this image, the one that reloads most often.
-///
 /// The system is registered under whatever scope the caller opened: a host
 /// loading this module scopes it to the module's own owner, so a reload clears
 /// exactly this system and the next generation registers its own. The
-/// generated `host_module_pill_master_renderer` wrapper carries this as
-/// `pill_module_init` by expanding `__pill_module_entry_points!`.
+/// generated `host_module_*` wrapper carries this as `pill_module_init` by
+/// expanding `__pill_module_entry_points!`.
+///
+/// Registers no data: the host registers `pill_renderer_api` - components,
+/// asset types, resources, the default pipeline - before anything loads, and
+/// doing it here would re-point the asset types' tables at this image, the one
+/// that reloads most often.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     if engine.is_system_enabled("rendering").is_none() {
@@ -137,8 +131,8 @@ pub fn register(engine: &mut Engine) -> u32 {
 /// the same renderer through the blocking `pill_renderer_attach` export
 /// instead.
 ///
-/// The future fails with a [`RendererError`] when surface, adapter or device
-/// creation fails.
+/// The future fails with a [`RendererError`] when creating the renderer fails:
+/// surface, adapter or device creation, or one of the objects built after them.
 ///
 /// # Safety
 ///

@@ -7,14 +7,14 @@
 //!
 //! # Design
 //!
-//! Lives here rather than in `pill_engine` because every variant wraps a
-//! `wgpu` error type, and `pill_engine` is compiled into every loaded module
-//! and every hot patch - one wgpu type reachable from it would put the whole
-//! graphics stack into all of them.
+//! Lives here rather than in `pill_engine` because most variants wrap a `wgpu`
+//! error type, and `pill_engine` is compiled into every loaded module and every
+//! hot patch - one wgpu type reachable from it would put the whole graphics
+//! stack into all of them.
 //!
-//! The `engine::renderer` namespace is deliberately unchanged from when this
-//! enum lived in the engine, so the diagnostic codes users may already have
-//! seen keep meaning the same thing.
+//! The diagnostic codes are namespaced `engine::renderer`, for example
+//! `engine::renderer::no_texture_formats`, which is what a log line or an
+//! editor shows a user.
 
 // External crates
 use pill_core_macros::engine_error;
@@ -85,8 +85,8 @@ mod tests {
 
     /// Renderer unit variants produce their diagnostic code.
     ///
-    /// The code is derived from the namespace and the variant name, so moving
-    /// this enum out of `pill_engine` must not change what a user sees.
+    /// The code is derived from the namespace and the variant name, so the
+    /// variant alone decides the suffix a user sees.
     #[test]
     fn renderer_error_code_derives_from_namespace_and_variant() {
         assert_eq!(

@@ -6,15 +6,15 @@
 //! - Log that hot reloading of a project is starting, with the numbered list
 //!   of modules the host is about to build, as one multi-line entry
 //!   ([`announce_plan`]).
-//! - Log `[n/m] Building of <module> started` when one of those builds begins
-//!   ([`announce_build`]), once per module.
+//! - Log `[n/m] ------------- Building of <module> started` when one of those
+//!   builds begins ([`announce_build`]), once per module.
 //!
 //! # Design
 //!
 //! The plan is process-wide because its builds start in different places: the
 //! extensions and the project in `setup`, the renderer's GPU module only when a
 //! window opens. A build of a module that is not (or no longer) in the plan -
-//! every reload - is not announced here, and its caller logs it as before.
+//! every reload - is not announced here; its caller logs it.
 
 // Standard library
 use std::sync::Mutex;

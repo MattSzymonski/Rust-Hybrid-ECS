@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Draw the filter row - the level buttons, the channel switch and the
-//!   search field - and the rows the filters leave (W-0038 Stage 5).
+//!   search field - and the rows the filters leave.
 //! - Edit the filters in the shared session; the executable applies them to
 //!   the history on the next frame, so the tab never touches the world.
 //! - Say how much history the view is holding back.

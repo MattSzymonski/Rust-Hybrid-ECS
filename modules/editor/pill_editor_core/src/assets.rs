@@ -8,23 +8,20 @@
 //! - The open, submit and cancel helpers every entry point shares - the
 //!   toolbar buttons, the dialog windows and the scripted channel - so each
 //!   action takes one path and logs one token set.
-//! - The immediate toolbar actions: [`queue_delete`],
-//!   [`queue_write_meta`] and [`queue_move`], each a recorded
-//!   [`EditorCommand`] batch.
+//! - The immediate toolbar actions: [`queue_delete`], [`queue_write_meta`] and
+//!   [`queue_move`], each a recorded [`EditorCommand`] batch.
 //! - [`reveal_target`]: the absolute path a "show in the file manager"
-//!   request opens, refused when it would leave the asset directory
-//!   (W-0049 Stage 10).
+//!   request opens, refused when it would leave the asset directory.
 //!
 //! # Design
 //!
 //! The dialogs are egui windows drawn by the shell; the file work is
 //! [`EditorCommand`](crate::EditorCommand)'s asset commands, applied by the
-//! executable at the frame boundary and recorded in the history - the exact
-//! contract the Assets tab follows. Nothing here touches the engine:
-//! the batches land in [`PendingEditorCommands`] and the executable's drain
-//! does the rest. A reveal is the one exception: nothing in the world changes,
-//! so the shell queues it beside the batches and the executable opens the
-//! folder.
+//! executable at the frame boundary and recorded in the history. Nothing here
+//! touches the engine: the batches land in [`PendingEditorCommands`] and the
+//! executable's drain does the rest. A reveal is the one exception: nothing in
+//! the world changes, so the shell queues it beside the batches and the
+//! executable opens the folder.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -70,8 +67,27 @@ pub fn selected_row<'a>(
     selection: &EditorSelection,
     assets: &'a [AssetListing],
 ) -> Option<&'a AssetListing> {
-    let path = selection.asset.as_deref()?;
-    assets.iter().find(|row| row.path == path)
+    let key = selection.asset.as_deref()?;
+    assets.iter().find(|row| row.key() == key)
+}
+
+/// Whether `key` names an extension's resource tree - the extensions root
+/// itself, one module's root row, or anything below them.
+///
+/// An extension's resources are listed and inspected, never written: the
+/// toolbar, the grid's strip and the row menus ask this before they offer a
+/// mutation. Everything under the root is read-only whatever rows the listing
+/// happens to hold, so a module that just loaded or unloaded cannot open a
+/// window where a write would be offered.
+pub fn is_read_only_key(assets: &[AssetListing], key: &str) -> bool {
+    if crate::browser::root_of(key).read_only {
+        return true;
+    }
+    assets
+        .iter()
+        .filter(|row| row.read_only)
+        .map(AssetListing::key)
+        .any(|read_only_key| read_only_key == key || key.starts_with(&format!("{read_only_key}/")))
 }
 
 /// Open the create dialog: the target folder follows the selection (the
@@ -85,16 +101,27 @@ pub fn open_create(
 ) {
     let folder = match assets
         .iter()
-        .find(|row| Some(row.path.as_str()) == selection.asset.as_deref())
+        .find(|row| Some(row.key().as_str()) == selection.asset.as_deref())
     {
-        Some(row) if row.kind == "folder" => row.path.clone(),
-        Some(row) => row
-            .path
-            .rsplit_once('/')
-            .map(|(parent, _)| parent.to_string())
-            .unwrap_or_default(),
+        Some(row) if row.kind == "folder" => row.key(),
+        Some(row) => {
+            let key = row.key();
+            key.rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default()
+        }
         None => String::new(),
     };
+    // Nothing is created inside a module's resources: the dialog would offer a
+    // file the drain refuses.
+    if is_read_only_key(assets, &folder) {
+        pill_core::warn!(
+            target: telemetry_target::ECS,
+            folder,
+            "[editor] create refused: a module's resources are read-only"
+        );
+        return;
+    }
     let type_name = types
         .first()
         .map(|info| info.type_name.clone())
@@ -345,7 +372,15 @@ pub fn delete_selection(
         );
         return false;
     };
-    queue_delete(pending, &row.path);
+    if row.read_only {
+        pill_core::warn!(
+            target: telemetry_target::ECS,
+            path = row.key().as_str(),
+            "[editor] delete refused: a module's resources are read-only"
+        );
+        return false;
+    }
+    queue_delete(pending, &row.key());
     true
 }
 
@@ -365,7 +400,15 @@ pub fn write_meta_selection(
         );
         return false;
     };
-    queue_write_meta(pending, &row.path);
+    if row.read_only {
+        pill_core::warn!(
+            target: telemetry_target::ECS,
+            path = row.key().as_str(),
+            "[editor] meta refused: a module's resources are read-only"
+        );
+        return false;
+    }
+    queue_write_meta(pending, &row.key());
     true
 }
 
@@ -381,14 +424,12 @@ pub fn drop_destination(from: &str, folder: &str) -> Option<String> {
     (to != from).then_some(to)
 }
 
-/// The absolute path a reveal opens, for a project-relative asset path
-/// (W-0049 Stage 10).
+/// The absolute path a reveal opens, for a project-relative asset path.
 ///
 /// The empty path is the asset root itself - the Assets panel's open folder at
 /// the top - and a nested path is joined below it. A path that climbs out of
 /// the root, or one that names nothing on disk, is refused with a message
-/// rather than opened: the panel's rows are the only callers, and a stale row
-/// must not make the OS open something else.
+/// rather than opened, so a stale row never makes the OS open something else.
 ///
 /// # Errors
 ///
@@ -427,6 +468,7 @@ fn close(dialog: &mut Option<AssetDialog>, kind: &str) {
 mod tests {
     use super::*;
     use crate::editor_state::EditorSelection;
+    use crate::editor_state::EXTENSIONS_ROOT;
 
     /// A scratch folder of this test's own, with one file in it.
     fn scratch_folder(label: &str) -> PathBuf {
@@ -471,12 +513,85 @@ mod tests {
 
     fn listing(path: &str, kind: &str, standalone: bool, has_meta: bool) -> AssetListing {
         AssetListing {
+            root: String::new(),
             path: path.to_string(),
+            read_only: false,
             kind: kind.to_string(),
             standalone,
             has_meta,
             guid: None,
         }
+    }
+
+    /// A row of a module's read-only resource tree.
+    fn module_row(root: &str, path: &str, kind: &str) -> AssetListing {
+        AssetListing {
+            root: root.to_string(),
+            path: path.to_string(),
+            read_only: true,
+            kind: kind.to_string(),
+            standalone: kind == "pill_master_renderer::Material",
+            has_meta: kind == "pill_master_renderer::Material",
+            guid: None,
+        }
+    }
+
+    /// A module's resource tree is recognised by the extensions root and every
+    /// key below it; a project key never is.
+    #[test]
+    fn a_module_tree_is_read_only() {
+        let rows = vec![
+            module_row("pill_master_renderer_data", "", "folder"),
+            module_row("pill_master_renderer_data", "defaults", "folder"),
+            module_row(
+                "pill_master_renderer_data",
+                "defaults/pill.pbr.material",
+                "pill_master_renderer::Material",
+            ),
+            listing("textures/rock.png", "Texture", false, true),
+            listing("pill_master_renderer_data", "folder", false, false),
+        ];
+        assert!(is_read_only_key(&rows, EXTENSIONS_ROOT));
+        assert!(is_read_only_key(
+            &rows,
+            "extensions/pill_master_renderer_data"
+        ));
+        assert!(is_read_only_key(
+            &rows,
+            "extensions/pill_master_renderer_data/defaults"
+        ));
+        assert!(is_read_only_key(
+            &rows,
+            "extensions/pill_master_renderer_data/defaults/pill.pbr.material"
+        ));
+        // A project folder of the same name is its own key, not the module's.
+        assert!(!is_read_only_key(&rows, "textures/rock.png"));
+        assert!(!is_read_only_key(&rows, "textures"));
+        assert!(!is_read_only_key(&rows, "pill_master_renderer_data"));
+    }
+
+    /// A module's resource is found by its key, and neither the toolbar's
+    /// delete nor its meta write queues anything for it.
+    #[test]
+    fn a_module_resource_is_never_written() {
+        let rows = vec![module_row(
+            "pill_master_renderer_data",
+            "defaults/pill.pbr.material",
+            "pill_master_renderer::Material",
+        )];
+        let mut selection = EditorSelection::default();
+        selection.asset =
+            Some("extensions/pill_master_renderer_data/defaults/pill.pbr.material".to_string());
+        assert!(selected_row(&selection, &rows).is_some(), "found by key");
+
+        let mut pending = PendingEditorCommands::default();
+        assert!(!delete_selection(&mut pending, &selection, &rows));
+        assert!(
+            pending.batches.is_empty(),
+            "a refused delete queues nothing"
+        );
+        assert!(!write_meta_selection(&mut pending, &selection, &rows));
+        assert!(pending.batches.is_empty());
     }
 
     fn types() -> Vec<StandaloneTypeInfo> {

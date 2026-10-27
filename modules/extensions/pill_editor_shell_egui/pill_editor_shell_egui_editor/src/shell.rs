@@ -6,11 +6,9 @@
 //!   frame the executable draws, including the scene rectangle the frontend
 //!   places the scene's child window at.
 //! - The tab bodies ([`entities_tab`], [`systems_tab`], [`inspector_tab`],
-//!   [`assets_tab`], [`preferences_tab`], all `#[pill_hot_fn]` so a body
-//!   edit patches live) and their row builders.
-//!   The scene and game tabs draw nothing: their bodies stay holes in the
-//!   UI so the scene and game child windows, which sit under the overlay,
-//!   show through.
+//!   [`assets_tab`], [`preferences_tab`], all `#[pill_hot_fn]` so a body edit
+//!   patches live). The scene and game tabs draw nothing: their bodies stay
+//!   holes so the child windows under the overlay show through.
 //!
 //! # Design
 //!
@@ -21,11 +19,11 @@
 //!
 //! # Patchability
 //!
-//! A generated patch crate holds one function body and reaches this module
-//! only through the crate root's re-export, so every item an edited body can
-//! name - a sibling function, a constant, a type - is `pub` here. A body that
-//! calls a helper by bare name is therefore fine; a body that names a private
-//! item fails to compile as a patch and the host reloads the module instead.
+//! A patch crate holds one function body and reaches this module only through
+//! the crate root's re-export, so every item an edited body can name is `pub`
+//! here - and every module is, because the build script's function inventory
+//! names each addressable function by its module path. A body that names a
+//! private item fails to compile as a patch, and the host reloads.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -34,47 +32,28 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 pub mod prelude;
 
 /// The [`claim`] module: the generation's claim on the shared egui context.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod claim;
 
 pub use claim::claim_context_once;
 pub use claim::claim_popout_contexts;
 pub use claim::claim_shell_context;
 
-/// The Systems tab: pause/step and the recorded system toggles.
-///
-/// Public like every tab module: the build script's function inventory
-/// names each addressable function by its module path, so the module a
-/// patchable function lives in cannot be private.
+/// The [`tab_systems`] module: the Systems tab's pause and step controls and
+/// its recorded system toggles.
 pub mod tab_systems;
 
 pub use tab_systems::systems_tab;
 
 /// The [`toasts`] module: the host's notices drawn as a short-lived stack.
-///
-/// Public like every tab module: the build script's function inventory
-/// names each addressable function by its module path, so the module cannot
-/// be private.
 pub mod toasts;
 
-/// The [`menubar`] module: the menu bar: the rows' menus and the actions they run.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`bar`] module: the menu bar's rows and the actions they run.
 pub mod bar;
 
 pub use bar::about_window;
 pub use bar::menu_bar;
 
-/// The [`palette`] module: the searchable command popup (W-0038 Stage 3).
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`palette`] module: the searchable command popup.
 pub mod palette;
 
 pub use bar::menu_body;
@@ -82,62 +61,34 @@ pub use bar::run_menu_action;
 pub use bar::MENU_TITLE_GAP;
 pub use palette::palette_window;
 
-/// The [`tab_console`] module: the Console tab's filters and rows (W-0038
-/// Stage 5).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// The [`tab_console`] module: the Console tab's filters and rows.
 pub mod tab_console;
 
 pub use tab_console::console_tab;
 
-/// The [`tab_problems`] module: build errors and warnings, grouped by module
-/// (W-0038 Stage 6).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// The [`tab_problems`] module: build errors and warnings, grouped by module.
 pub mod tab_problems;
 
 pub use tab_problems::problems_tab;
 
-/// The [`tab_statistics`] module: frame, pass and per-tab timings (W-0038
-/// Stage 7).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// The [`tab_statistics`] module: frame, pass and per-tab timings.
 pub mod tab_statistics;
 
 pub use tab_statistics::statistics_tab;
 
 /// The [`tab_demo`] module: the shell module's own editor panel, the reference
-/// a module's panel is written against (W-0038 Stage 11).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// a module's panel is written against.
 pub mod tab_demo;
 
 pub use tab_demo::demo_panel;
 
 /// The [`panel_windows`] module: the windows and modals module panels ask the
-/// shell for (W-0038 Stage 13).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// shell for.
 pub mod panel_windows;
 
 pub use panel_windows::{panel_windows, PanelFeed};
 
-/// The [`spline_tool`] module: the Spline Tool panel and its re-seed modal
-/// (W-0038 Stages 12 and 13).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// The [`spline_tool`] module: the Spline Tool panel and its re-seed modal.
 pub mod spline_tool;
 
 pub use spline_tool::{
@@ -146,20 +97,12 @@ pub use spline_tool::{
 };
 
 /// The [`resource_section`] module: the Inspector's rows for one editable
-/// world resource (W-0038 Stage 14).
-///
-/// Public like every tab module: the build script's function inventory names
-/// each addressable function by its module path, so the module cannot be
-/// private.
+/// world resource.
 pub mod resource_section;
 
 pub use resource_section::{queue_edit as queue_resource_edit, resource_section};
 
 /// The [`views`] module: the scene and game viewports: their geometry and overlay chips.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod views;
 
 pub use views::frame_counter_rect;
@@ -175,11 +118,8 @@ pub use views::SCENE_COUNTER_WIDTH;
 pub use views::SCENE_RECT_OVERSHOOT;
 pub use views::SLOW_UPDATE_MICROS;
 
-/// The [`chrome`] module: the chrome both tabs share: icons, selection moves and logged rects.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`chrome`] module: the chrome the tabs share: icons, selection moves,
+/// context menus and the rectangles the frame reports as the UI's.
 pub mod chrome;
 
 pub use chrome::apply_tab_redock;
@@ -202,29 +142,17 @@ pub use chrome::SPACE_ROWS;
 pub use chrome::TOOL_ROWS;
 
 /// The [`menus`] module: the context menus the tabs open.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod menus;
 
 pub use menus::component_menu_items;
 pub use menus::scene_context_menu;
 
-/// The [`toolbox`] module: the floating toolbox over a scene viewport.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`toolbox_panel`] module: the floating toolbox over a scene viewport.
 pub mod toolbox_panel;
 
 pub use toolbox_panel::toolbox_overlay;
 
 /// The [`tab_entities`] module: the entities tab: the entity rows and their menu.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod tab_entities;
 
 pub use tab_entities::entities_tab;
@@ -234,19 +162,11 @@ pub use tab_entities::remember_hierarchy_row_rect;
 pub use tab_entities::DraggedEntity;
 
 /// The [`tab_preferences`] module: the preferences tab: the editor-wide rows and the project's gizmo state.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod tab_preferences;
 
 pub use tab_preferences::preferences_tab;
 
 /// The [`tab_inspector`] module: the inspector tab: the selection's components and their rows.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod tab_inspector;
 
 pub use tab_inspector::addable_components;
@@ -258,11 +178,8 @@ pub use tab_inspector::inspector_tab;
 pub use tab_inspector::INSPECTOR_LABEL_WIDTH;
 pub use tab_inspector::INSPECTOR_VECTOR_FIELD_WIDTH;
 
-/// The [`inspector_fields`] module: the inspector's field rows: the decorators, the row model and the.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`inspector_fields`] module: the inspector's field rows: the decorators
+/// a component declares, the row model and the control each row draws.
 pub mod inspector_fields;
 
 pub use inspector_fields::field_widget_name;
@@ -276,10 +193,6 @@ pub use inspector_fields::remember_inspector_row;
 pub use inspector_fields::EntityRowInput;
 
 /// The [`inspector_widgets`] module: the inspector's field controls.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod inspector_widgets;
 
 pub use inspector_widgets::ascending;
@@ -292,10 +205,6 @@ pub use inspector_widgets::scalar_edit_decorated;
 pub use inspector_widgets::Number;
 
 /// The [`inspector_settings`] module: the inspector's asset import settings.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod inspector_settings;
 
 pub use inspector_settings::asset_settings_row;
@@ -303,10 +212,6 @@ pub use inspector_settings::asset_settings_rows;
 pub use inspector_settings::settings_commit;
 
 /// The [`tab_assets`] module: the assets tab: the folder tree and the open folder's grid.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod tab_assets;
 
 pub use tab_assets::assets_grid;
@@ -322,10 +227,6 @@ pub use tab_assets::ASSETS_TREE_WIDTH;
 pub use tab_assets::ASSETS_TREE_WIDTH_RANGE;
 
 /// The [`assets_tiles`] module: the assets tab's tiles, their menu and the asset dialog.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
 pub mod assets_tiles;
 
 pub use assets_tiles::asset_dialog_window;
@@ -343,11 +244,8 @@ pub use assets_tiles::ASSETS_TILE_LABEL_HEIGHT;
 pub use assets_tiles::ASSETS_TILE_LABEL_ROWS;
 pub use toasts::{draw_toasts, push_notices};
 
-/// The [`tests`] module: the shell's unit tests.
-///
-/// Public like every tab module: the build script's function
-/// inventory names each addressable function by its
-/// module path, so the module cannot be private.
+/// The [`tests`] module: the shell's unit tests; the parent compiles it into
+/// the test build only.
 #[cfg(test)]
 pub mod tests;
 
@@ -355,13 +253,9 @@ pub mod tests;
 // Constants
 // =============================================================================
 
-// Public like every item a patched body may name: a patch crate sees this
-// module through the crate root's re-export, and a private constant would
-// fail its compile (`error[E0425]`) after which the host reloads.
-
-/// One shell frame: the shell's own events become egui input, the dock runs,
-/// and the output becomes the executable's frame. The asset dialog, when one
-/// is open, is drawn over the dock.
+/// One shell frame: the boundary input becomes egui input, the dock runs, and
+/// the output becomes the executable's frame. The asset dialog, when one is
+/// open, is drawn over the dock.
 // The executable hands the pass its world borrows; there is no smaller shape
 // that does not mean building a struct per frame.
 #[allow(clippy::too_many_arguments)]
@@ -381,9 +275,9 @@ pub fn run_frame(
     state.frame_index = state.frame_index.wrapping_add(1);
     let frame_index = state.frame_index;
     // The executable resolves the theme's layers and publishes the merge on
-    // the snapshot (W-0127 Stage 6); the shell installs it whenever the
-    // generation moves, on the main context and every popped-out one, so a
-    // preference or project edit restyles the editor without a restart.
+    // the snapshot; the shell installs it whenever the generation moves, on
+    // the main context and every popped-out one, so a preference or project
+    // edit restyles the editor without a restart.
     if state.applied_theme_generation != snapshot.theme_generation {
         state.applied_theme_generation = snapshot.theme_generation;
         pill_editor_core::style::apply_theme(
@@ -404,8 +298,8 @@ pub fn run_frame(
         }
     }
     // The saved layout's module tabs name panel slots from the run that wrote
-    // them; the ids it carried are what maps them to today's slots (Stage 11).
-    // Once per session: a shell reload must not undo a dock the user moved.
+    // them; the registry's ids are what map them to today's slots. Once per
+    // session: a shell reload must not undo a dock the user moved.
     if !state.panels_remapped {
         let ids: Vec<String> = panels
             .entries()
@@ -418,10 +312,10 @@ pub fn run_frame(
     // The host's notices become toasts before the dock draws, so a reload that
     // happened this frame is on screen in this frame.
     push_notices(state, notices);
-    // The row heartbeat: the editor suite reads it to prove both tabs see
-    // the project's data, that the frame counter - and with it the session
-    // resource - survives a reload or patch, and which entity the
-    // Inspector's detail tier describes.
+    // The row heartbeat: the editor suite reads it to prove the shell sees the
+    // project's data, that the frame counter - and with it the session
+    // resource - survives a reload or patch, and which entity the Inspector's
+    // detail tier describes.
     if frame_index.is_multiple_of(210) {
         let detail_entity = snapshot
             .detail
@@ -448,8 +342,8 @@ pub fn run_frame(
     claim_shell_context(&state.context);
     // The UI heartbeat: one full shell update (input conversion, the egui
     // dock and its tabs, the frame conversion) in microseconds. The shell
-    // benchmark measures the D32 UI-redraw case from it; the GPU overlay
-    // draw is outside it, as presentation is vsync-bound.
+    // benchmark reads the UI-redraw case from it; the GPU overlay draw is
+    // outside it, as presentation is vsync-bound.
     let ui_started = pill_core::platform::Instant::now();
     let raw_input = pill_editor_core::input::raw_input(shell_input);
     // The brand mark is uploaded once per session: the context owns the
@@ -459,18 +353,18 @@ pub fn run_frame(
     // asset dialog are separate fields, borrowed apart so the dock's layout
     // borrow and the dialog's state borrow coexist.
     let context = state.context.clone();
-    // What the module panels read this pass (Stages 12 and 13): only built when
-    // a panel is registered, so a build with none costs nothing.
+    // What the module panels read this pass: only built when a panel is
+    // registered, so a build with none costs nothing.
     let panel_feed = panel_feed(snapshot, panels);
-    // The answer the last pass's modal took, for exactly one pass.
+    // The panels see this frame's rate, the same number the scene chips show.
     let mut panel_feed = panel_feed;
     panel_feed.frames_per_second = shell_input.frames_per_second;
     // A window the scripted channel asked for: the panel itself decides what
     // that id means. Kept until the pinged panel is drawn - a request must not
     // be dropped by a frame where that tab was not on screen.
     let panel_window_ping = state.panel_window_ping.clone();
-    // A tile drag that left the windows hands its path to the executable
-    // (W-0038 Stage 19), through the frame the frontend drains.
+    // A tile drag that left the windows hands its path to the executable,
+    // through the frame the frontend drains.
     let mut drag_out: Option<String> = None;
     let panel_answer =
         state
@@ -504,7 +398,7 @@ pub fn run_frame(
         ..
     } = state;
     // The grid reports what it drew, so the executable asks for previews of
-    // what is on screen only (W-0049 Stage 11).
+    // what is on screen only.
     preview_visible.clear();
     // Named through the package path, not as a file-local item: a hot patch
     // compiles this body in a crate of its own, where only the package's
@@ -589,9 +483,8 @@ pub fn run_frame(
             menubar,
             &mut viewer,
         );
-        // The windows the module panels asked for (Stage 13): applied here so
-        // one a panel opens this frame is drawn in this frame, then drawn by
-        // the panel that owns them.
+        // The windows the module panels asked for, applied before the windows
+        // pass draws them, so one opened this frame is on screen this frame.
         for (slot, request) in viewer.panel_window_requests.drain(..) {
             let source = panels
                 .get(slot)
@@ -635,10 +528,9 @@ pub fn run_frame(
     shell_frame.game_rect = viewer.game_rect.take();
     shell_frame.overlay_regions = std::mem::take(&mut viewer.overlay_regions);
     shell_frame.quit_requested = std::mem::take(&mut menubar.quit_requested);
-    // One more pass per popped-out tab (W-0038 Stage 23): each runs its own
-    // context, so its window has its own widget state, its own input record
-    // and its own frame. The dock no longer holds these tabs, so nothing draws
-    // them twice.
+    // One more pass per popped-out tab: each runs its own context, so its
+    // window has its own widget state, its own input record and its own frame.
+    // These tabs are not in the dock tree, so nothing draws them twice.
     // A tab that came back to the dock takes its context with it: a context
     // nothing draws into would be cleared on every generation's first frame
     // and kept for the life of the session otherwise.
@@ -647,7 +539,7 @@ pub fn run_frame(
     shell_frame.popout_frames =
         run_popout_passes(dock, popout_contexts, popout_inputs, &mut viewer);
     // A tab menu's pop-out request lands here for the same reason a re-dock
-    // does: the dock is borrowed while it draws (W-0038 Stage 23).
+    // does: the dock is borrowed while it draws.
     if let Some(tab) = viewer.tab_popout.take() {
         if dock.pop_out(tab) {
             pill_core::info!(
@@ -662,9 +554,9 @@ pub fn run_frame(
     if let Some(surface) = viewer.tab_redock.take() {
         pill_editor_shell_egui_editor::shell::apply_tab_redock(dock.state_mut(), surface);
     }
-    // The Window menu's "New Scene View" (W-0038 Stage 21): docked here for
-    // the same reason, and activated through the executable's own path so the
-    // new tab is at the front of its group the moment it appears.
+    // The Window menu's "New Scene View", docked here for the same reason and
+    // activated through the executable's own path, so the new tab is at the
+    // front of its group the moment it appears.
     if std::mem::take(&mut menubar.new_scene_view) {
         let tab = dock.next_scene_view();
         if dock.contains(tab) {
@@ -688,7 +580,7 @@ pub fn run_frame(
         }
     }
     // The answer has been read by the pass that needed it; the next one must
-    // not act on it again (W-0038 Stage 13).
+    // not act on it again.
     if panel_answer.is_some() {
         windows.answer = None;
     }
@@ -697,8 +589,8 @@ pub fn run_frame(
         *window_ping = None;
     }
     // A panel that crossed its budget this frame gets its toast once, named
-    // after the tab so the user can find the panel it belongs to (Stage 11).
-    // After the viewer's last use: its copy of the budget is what drew.
+    // after the tab so the user can find the panel it belongs to. After the
+    // viewer's last use: the viewer holds the budget mutably while it draws.
     for entry in &mut panel_budget.entries {
         if !entry.warned || entry.toasted {
             continue;
@@ -713,18 +605,19 @@ pub fn run_frame(
         toasts.push_local(NoticeLevel::Warning, text, frame_index);
     }
     *frame = shell_frame;
-    // The tile drag's path travels in the frame the executable drains (W-0038
-    // Stage 19): the shell cannot start an OLE drag itself.
+    // The tile drag's path travels in the frame the executable drains: the
+    // shell cannot start an OLE drag itself.
     frame.drag_out = drag_out;
     let ui_micros = ui_started.elapsed().as_micros() as u64;
-    // The Statistics tab's top row: the pass this frame actually took
-    // (W-0038 Stage 7). Recorded before the frame's own logging so the tab and
-    // the log line below never disagree.
+    // The Statistics tab's top row: the pass this frame actually took,
+    // recorded before the frame's own logging so the tab and the log line
+    // below never disagree.
     stats.record_shell(ui_micros);
     stats.frames_per_second = shell_input.frames_per_second;
-    // The periodic heartbeat, plus any update that runs past the D32 UI
-    // budget: the suites prove the counter advances, and the benchmark gets
-    // samples even when 210 frames take longer than its measurement window.
+    // The periodic heartbeat, plus any update that runs past
+    // `SLOW_UPDATE_MICROS`: the suites prove the counter advances, and the
+    // benchmark gets samples even when 210 frames take longer than its
+    // measurement window.
     if frame_index.is_multiple_of(210) || ui_micros >= SLOW_UPDATE_MICROS {
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ECS,
@@ -739,7 +632,7 @@ pub fn run_frame(
 // The tab viewer and the tabs
 // =============================================================================
 
-/// Run one egui pass per popped-out tab (W-0038 Stage 23).
+/// Run one egui pass per popped-out tab.
 ///
 /// Each popped-out window has its own context, so it draws independently of
 /// the dock pass that ran a moment earlier in the main window: same data, same
@@ -778,7 +671,7 @@ pub fn run_popout_passes(
         viewer.scene_rects = vec![None; dock.scene_view_count()];
         let output = context.run_ui(raw_input, |ui| {
             // The window has no dock around it, so it draws the one dock
-            // affordance it needs: the way back (W-0038 Stage 23).
+            // affordance it needs: the way back.
             let mut send_back = false;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(tab.title()).strong());
@@ -821,7 +714,7 @@ pub fn run_popout_passes(
     frames
 }
 
-/// What module panels read this pass (W-0038 Stages 12 and 13).
+/// What module panels read this pass.
 ///
 /// Built only when a panel is registered: the rows are a copy of the snapshot
 /// the tabs already read, and an editor with no module panels should not pay
@@ -875,7 +768,7 @@ pub fn panel_feed(snapshot: &EditorSnapshot, panels: &PanelRegistry) -> PanelFee
 pub struct EditorTabViewer<'a> {
     /// The engine data the tabs read.
     pub snapshot: &'a EditorSnapshot,
-    /// The shared selection the Entities tab writes.
+    /// The shared selection the tabs read and write.
     pub selection: &'a mut EditorSelection,
     /// The asset dialog that is open, if one is; the Assets tab and the
     /// dialog window both read and write it.
@@ -896,7 +789,7 @@ pub struct EditorTabViewer<'a> {
     /// The scene viewports' body rectangles this pass, in logical points,
     /// one slot per view index; the frontend places each viewport's child
     /// window at its slot. Sized from the dock before the pass, so a view
-    /// the person added has its slot already (W-0038 Stage 21).
+    /// the person added has its slot already.
     pub scene_rects: Vec<Option<ShellRect>>,
     /// The game viewport's body rectangle this pass, in logical points; the
     /// frontend places the primary surface's child window at it.
@@ -909,20 +802,19 @@ pub struct EditorTabViewer<'a> {
     /// The surface a tab menu asked to re-dock, drained by `run_frame`
     /// after the dock finishes drawing.
     pub tab_redock: Option<SurfaceIndex>,
-    /// The tab a tab menu asked to pop out into its own window (W-0038 Stage
-    /// 23), drained by `run_frame` after the dock finishes drawing for the
-    /// same reason.
+    /// The tab a tab menu asked to pop out into its own window, drained by
+    /// `run_frame` after the dock finishes drawing for the same reason.
     pub tab_popout: Option<EditorTab>,
-    /// The Console tab's filters (W-0038 Stage 5); the executable applies them
+    /// The Console tab's filters; the executable applies them
     /// to the history on its next frame.
     pub console_filters: &'a mut ConsoleFilterSettings,
-    /// The Problems row a click asked to open (W-0038 Stage 6); the executable
+    /// The Problems row a click asked to open; the executable
     /// drains it and launches the configured code editor.
     pub problem_open: &'a mut Option<usize>,
-    /// The timings the Statistics tab reads (W-0038 Stage 7): the shell writes
+    /// The timings the Statistics tab reads: the shell writes
     /// them around each tab body, the tab only formats them.
     pub stats: &'a mut StatisticsSession,
-    /// The panels the loaded modules registered (W-0038 Stage 11): a module
+    /// The panels the loaded modules registered: a module
     /// tab's title, body and liveness all come from here.
     pub panels: &'a PanelRegistry,
     /// Every module panel's build time, written around each panel body and
@@ -931,34 +823,33 @@ pub struct EditorTabViewer<'a> {
     /// The commands the module panels asked for this pass, applied by the
     /// executable at the frame boundary.
     pub panel_commands: &'a mut Vec<PanelCommand>,
-    /// The world's entities, as module panels see them (W-0038 Stage 12).
+    /// The world's entities, as module panels see them.
     pub panel_entities: &'a [PanelEntityRow],
     /// The selected entity's components, as module panels see them.
     pub panel_detail: Option<&'a PanelEntityDetail>,
-    /// The answer a modal window took, for the pass that follows it
-    /// (W-0038 Stage 13).
+    /// The answer a modal window took, for the pass that follows it.
     pub panel_answer: Option<&'a pill_editor_core::panels::PanelAnswer>,
     /// The windows the panels asked to open or close this pass, with the slot
     /// that asked: applied after the dock, before the windows draw.
     pub panel_window_requests: &'a mut Vec<(u16, PanelCommand)>,
     /// The slot a scripted window request named, and the window id it wants
-    /// that panel to open (W-0038 Stage 13).
+    /// that panel to open.
     pub panel_window_ping: Option<(u16, &'a str)>,
     /// Whether the pinged panel drew this pass, so the request is spent.
     pub panel_window_ping_used: bool,
-    /// The shell's side of the OS clipboard (W-0038 Stage 17): the request
+    /// The shell's side of the OS clipboard: the request
     /// the executable carries out, and the text it read back.
     pub clipboard: &'a mut pill_editor_core::clipboard::EditorClipboard,
-    /// The asset path a tile drag handed to the OS (W-0038 Stage 19): the
+    /// The asset path a tile drag handed to the OS: the
     /// executable starts an OLE drag with it.
     pub drag_out: &'a mut Option<String>,
-    /// The rendered asset previews, by path (W-0049 Stage 11).
+    /// The rendered asset previews, by path.
     pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
     /// The tiles the grid drew this frame, which the executable turns into
     /// preview requests.
     pub preview_visible: &'a mut Vec<String>,
     /// The entity badges the executable projected into this frame's scene
-    /// views (W-0049 Stage 12).
+    /// views.
     pub badges: &'a [ShellBadge],
 }
 
@@ -972,7 +863,7 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         // A module panel's title is the registry's: it changes when the module
-        // unloads, and it carries the over-budget badge (Stage 11).
+        // unloads, and it carries the over-budget badge.
         if let Some(slot) = tab.module_slot() {
             let title = self.panels.tab_title(slot);
             let label = if self.panel_budget.is_slow(slot) {
@@ -987,7 +878,7 @@ impl TabViewer for EditorTabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         // Every tab body is timed, because the Statistics tab's whole point is
-        // that its rows are measurements rather than estimates (Stage 7).
+        // that its rows are measurements rather than estimates.
         let started = pill_core::platform::Instant::now();
         let tab = *tab;
         match tab {
@@ -1049,7 +940,7 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Module(slot) => {
                 // The panel belongs to a module: its draw function is called
                 // only while that module's liveness marker is alive, and the
-                // tab says so when it is not (Stage 11).
+                // tab says so when it is not.
                 match self.panels.draw_of(slot) {
                     Some(draw) => {
                         let requested_window = self
@@ -1118,8 +1009,8 @@ impl TabViewer for EditorTabViewer<'_> {
     /// and Close; a floating window's tab gets Redock, which brings the
     /// surface's tabs back into the dock.
     fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, path: NodePath) {
-        // Popping a tab out is offered wherever a tab is, docked or floating
-        // (W-0038 Stage 23). The window carries the way back.
+        // Popping a tab out is offered wherever a tab is, docked or floating;
+        // the window carries the way back.
         if ui
             .add(icons::IconButton::new(
                 icons::Icon::ArrowSquareOut,

@@ -6,8 +6,8 @@
 //!   [`Shader`], [`Material`], [`RenderPass`], [`RenderingPipeline`] -
 //!   re-exported flat so a game names them without the submodule they sit in.
 //! - Carry each type's builder and binding declarations: [`MaterialBuilder`],
-//!   [`ShaderBuilder`], the parameter and texture slot types, and the
-//!   `pub(crate)` helpers that key slot lists by the names they carry.
+//!   [`ShaderBuilder`], the parameter and texture slot types, and the helpers
+//!   that key slot lists by the names they carry.
 //! - Register every type behind `dyn Asset`, so the world's `AssetManager`
 //!   stores them many per type like any other asset.
 //! - Provide [`asset_key`], packing a handle's index and generation into the
@@ -17,9 +17,9 @@
 //!
 //! Each type here is data plus declaration: a game builds it, the
 //! `AssetManager` owns it, and the renderer reads it while resolving a frame,
-//! with the GPU side - caches, pipelines, bind groups - living under
-//! [`crate::resources`] and [`crate::renderer`]. [`asset_key`] packs a
-//! handle's generation above its index, so one `u64` tells a cache which
+//! with the GPU side - caches, pipelines, bind groups - living in the GPU
+//! module (`pill_master_renderer`), which links this crate. [`asset_key`] packs
+//! a handle's generation above its index, so one `u64` tells a cache which
 //! asset and which version of it a resource was built for.
 
 mod material;
@@ -33,17 +33,19 @@ pub use material::{Material, MaterialBuilder, MaterialDocument, MaterialTexture}
 pub use mesh::{Mesh, MeshImportSettings, MeshVertex};
 pub use render_pass::RenderPass;
 pub use render_pass::RenderPassDocument;
-// Defined by the renderer contract (`pill_renderer_api::frame`), which a
-// resolved pass is written in too; re-exported so `assets::` paths keep working.
+// The pass vocabulary belongs to the renderer contract
+// (`pill_renderer_api::frame`), where a resolved pass is written too;
+// re-exported so `assets::` reaches it beside the types that carry it.
 pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 pub use rendering_pipeline::RenderingPipeline;
 pub use shader::{parameter_slots_by_name, texture_slots_by_name};
 pub use shader::{
-    Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
+    Shader, ShaderBuilder, ShaderImportSettings, ShaderParameterDeclaration, ShaderParameterSlot,
+    ShaderParameterType, ShaderTextureDeclaration, ShaderTextureSlot,
 };
 pub use texture::{
-    cube_face_direction, equirect_uv, project_equirect_to_cubemap, Texture, TextureImportSettings,
-    TextureType,
+    cube_face_direction, equirect_uv, load_shipped_texture, project_equirect_to_cubemap, Texture,
+    TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE, DEFAULT_NORMAL_TEXTURE,
 };
 
 use pill_engine::{Asset, Handle};

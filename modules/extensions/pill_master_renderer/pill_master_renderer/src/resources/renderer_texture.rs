@@ -57,19 +57,15 @@ impl RendererTexture {
 
     /// Creates a texture, view, and sampler from decoded texels.
     ///
-    /// This is how project images become GPU resources: the bytes are
-    /// uploaded at construction, so a failure is reported against the asset
-    /// being loaded. `name` labels the texture and the errors that mention it.
-    /// The bytes are laid out as the texture asset's are for `texture_type`:
-    /// RGBA8 for colour and normal maps, RGBA half floats for an environment,
-    /// and a cubemap's six faces one after another.
+    /// The bytes are laid out as the texture asset's are for `texture_type`,
+    /// and `name` labels the texture and the errors that mention it.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::RendererError::Other`] naming the asset when
-    /// `rgba` does not carry the bytes the size and type call for, when
-    /// `texture_type` is [`TextureType::Depth`] rather than an image, or when
-    /// the driver refuses the texture, the upload, or the sampler.
+    /// Returns [`crate::error::RendererError::Other`] naming the asset when the
+    /// bytes do not match the size and type, when `texture_type` is
+    /// [`TextureType::Depth`], or when the driver refuses the texture, the
+    /// upload, or the sampler.
     pub fn new_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -104,7 +100,6 @@ impl RendererTexture {
             depth_or_array_layers: layers,
         };
 
-        // Specify texture format
         let format = match texture_type {
             TextureType::Color => wgpu::TextureFormat::Rgba8UnormSrgb,
             TextureType::Normal => wgpu::TextureFormat::Rgba8Unorm,
@@ -141,7 +136,6 @@ impl RendererTexture {
         })
         .map_err(|detail| texture_failure(name, "creation", detail))?;
 
-        // Write data to texture
         capturing_validation(device, || {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -295,7 +289,6 @@ impl RendererTexture {
         surface_configuration: &wgpu::SurfaceConfiguration,
         label: &str,
     ) -> Result<Self> {
-        // Get size
         let size = wgpu::Extent3d {
             // Depth texture needs to be the same size as window
             width: surface_configuration.width,
@@ -303,7 +296,6 @@ impl RendererTexture {
             depth_or_array_layers: 1,
         };
 
-        // Create texture
         let texture = capturing_validation(device, || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -321,7 +313,6 @@ impl RendererTexture {
             detail: format!("depth texture `{label}`: {detail}"),
         })?;
 
-        // Create texture view
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A read sampler, not a comparison one: the pass path binds depth under

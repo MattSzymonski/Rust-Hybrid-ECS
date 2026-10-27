@@ -3,17 +3,12 @@
 //!
 //! # Responsibilities
 //!
-//! - Keep the GPU caches level with each frame's asset store, one asset
-//!   type at a time, rebuilding only what moved ([`Renderer`] and its
-//!   per-type sync helpers).
-//! - Keep the GPU caches level with each frame's asset store, one asset
-//!   type at a time, rebuilding only what moved ([`Renderer`] and its
-//!   per-type sync helpers).
-//! - Hold the chain's GPU objects in a `ScriptableRenderingPipeline`: ask it to
-//!   rebuild them when the frame says they moved, and to plan each frame's
-//!   passes.
-//! - Submit the frame through [`State`]: one command encoder, one wgpu render
-//!   pass per planned pass, then the present.
+//! - Keep the GPU caches level with the asset store, one asset type at a time,
+//!   rebuilding only what moved ([`Renderer`] and its per-type sync helpers).
+//! - Hold the chain's GPU objects in a `ScriptableRenderingPipeline`: rebuild
+//!   them when the frame says they moved, and plan each frame's passes.
+//! - Submit through [`State`]: one command encoder, one wgpu render pass per
+//!   planned pass, then the present.
 //! - Draw into several surfaces from one device: the primary one the renderer
 //!   was built on, and every one attached since ([`ExtraTarget`]), each through
 //!   its own camera.
@@ -25,15 +20,12 @@
 //! The renderer is the two halves a frame needs: an asset store made level with
 //! the GPU, and a chain made into passes. Both are gated on something cheap -
 //! the store's revision, the chain's generation - so an unchanged frame costs
-//! two comparisons and no rebuilds. Creation failures are reported and skipped
-//! rather than fatal: a shader, texture, or target that would not build is
-//! named in the log while the rest of the revision still reaches the GPU.
+//! two comparisons and no rebuilds; creation failures are named and skipped.
 //!
 //! An extra surface owns what is sized to it - its swapchain, depth buffer,
-//! offscreen targets and the pass objects bound to those targets - and its
-//! camera's uniform buffer. Rendering it swaps those into [`State`], records
-//! the frame with the same code the primary surface uses, and swaps them back;
-//! the device, the asset caches and the frame's queue are shared.
+//! offscreen targets, their pass objects and its camera's uniform buffer. It is
+//! swapped into [`State`] for its own frame and back out; the device, the asset
+//! caches and the queue are shared.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -105,9 +97,10 @@ pub(crate) const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg
 /// The master renderer: the asset caches, the frame's chain, and the submission
 /// behind the [`PillRenderer`] contract.
 ///
-/// One renderer owns one window's surface and everything drawn to it: the GPU
-/// state, the resources manager that keeps the store level with the GPU, and the
-/// chain that turns a frame into passes.
+/// One renderer owns the surface of the window it was built on, every surface
+/// attached since, and everything drawn to them: the GPU state, the resources
+/// manager that keeps the store level with the GPU, and the chain that turns a
+/// frame into passes.
 pub struct Renderer {
     /// The wgpu device, surface, and frame state this renderer drives.
     pub state: State,
@@ -381,7 +374,7 @@ impl PillRenderer for Renderer {
         if drawn_surfaces.is_empty() {
             // Nothing drew, so no preview can be drawn either - but every
             // request the frame took is answered, or the caller waits for a
-            // preview that will never come (W-0074).
+            // preview that will never come.
             for request in &frame.preview_requests {
                 self.state.preview.refuse(request.id);
             }
@@ -416,7 +409,7 @@ impl PillRenderer for Renderer {
         drop(instances_zone);
         // Once for the whole frame, before any surface draws: every geometry
         // pass of every surface reads this one buffer, so a frame that draws N
-        // surfaces copies the instance bytes once rather than N times (W-0077).
+        // surfaces copies the instance bytes once rather than N times.
         let upload_zone = pill_core::profile_scope!("renderer: upload instances");
         self.state.mesh_drawer.upload_instances(
             &self.state.device,
@@ -475,7 +468,7 @@ impl PillRenderer for Renderer {
             }
         }
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
-        // One asset preview, when an editor asked for one (W-0049 Stage 11):
+        // One asset preview, when an editor asked for one:
         // its own encoder and submission, after the frame's surfaces, so it
         // never delays a presented frame.
         record_preview(self, frame, assets_manager);
@@ -644,21 +637,18 @@ impl PillRenderer for Renderer {
 }
 
 /// Draw one asset preview, when the frame asked for one and the last one has
-/// been handed over (W-0049 Stage 11).
+/// been handed over.
 ///
-/// A texture is drawn from the GPU texture the asset sync already uploaded; a
-/// material is a sphere in the first colour parameter the material declares. A
-/// mesh has no preview yet - it needs the mesh pipeline's vertex layout, depth
-/// and a camera - so its request is refused, which leaves the tile's type icon
-/// in place.
+/// A texture is drawn from the GPU texture the asset sync already uploaded, a
+/// material as a sphere in the first colour parameter it declares, and a mesh
+/// from its own file through the preview's mesh pipeline.
 ///
 /// Every request the frame took is answered: the first is drawn when the
 /// renderer is free, and anything not drawn is refused, because a caller that
-/// waits for an answer that never comes stops asking (W-0074).
+/// waits for an answer that never comes stops asking.
 ///
-/// Its own encoder and submission, after the frame's surfaces: a preview never
-/// delays a presented frame, and the readback is mapped once this submission
-/// is in.
+/// Its own encoder and submission, after the frame's surfaces, so a preview
+/// never delays a presented frame.
 fn record_preview(renderer: &mut Renderer, frame: &RenderFrame, assets_manager: &AssetManager) {
     let mut drawable = renderer.state.preview.ready();
     for request in &frame.preview_requests {
@@ -815,11 +805,11 @@ pub struct State {
     /// Debug drawing, outlines and picking, drawn over every surface's chain.
     pub(crate) overlay: Overlay,
     /// The asset preview path: one small off-screen render per request, read
-    /// back between frames (W-0049 Stage 11).
+    /// back between frames.
     pub(crate) preview: crate::preview::PreviewRenderer,
     /// The UI painter: the game's UI and the debug labels, over every
-    /// surface's overlay. Its pipeline is tied to the surface's colour format
-    /// (Stage 12), and the debug font is registered in it from the start.
+    /// surface's overlay. Its pipeline is tied to the surface's colour format,
+    /// and the debug font is registered in it from the start.
     pub(crate) ui_renderer: UiRenderer,
     /// UI frames since the UI pass last logged what it drew, so the log
     /// stays readable while the end-to-end suites still see the token.
@@ -895,8 +885,8 @@ impl State {
     ///
     /// Only committed once the surface accepted the new size, so a refusal
     /// leaves the old, consistent surface and depth pair in place instead of a
-    /// configuration that disagrees with the swapchain. What used to be an
-    /// `expect` here killed the host on a resize it could not honour.
+    /// configuration that disagrees with the swapchain; the caller reports the
+    /// refusal instead of the host dying on a resize it cannot honour.
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
         self.surface.resize(&self.device, width, height)?;
         self.depth_texture = RendererTexture::new_depth_texture(
@@ -943,7 +933,7 @@ impl State {
         }
         // Observable proof for the runtime suites, sampled like the GPU
         // profiler's report so the log stays readable. It counts the game's
-        // lists only, as it did before the labels joined them.
+        // lists only; the debug labels are not part of the count.
         let draws = lists.len() - 1;
         let vertices: usize = lists[1..].iter().map(|(list, _)| list.vertices.len()).sum();
         self.frames_since_ui_report += 1;
@@ -1310,8 +1300,8 @@ impl State {
             },
         );
         drop(overlay_zone);
-        // The debug labels and the game's UI, over the chain's picture
-        // (Stage 12), through the [`ui`](crate::ui) painter.
+        // The debug labels and the game's UI, over the chain's picture,
+        // through the [`ui`](crate::ui) painter.
         self.record_ui(
             surface_id,
             &mut encoder,
@@ -1479,8 +1469,8 @@ mod tests {
         );
 
         // A rectangle that would leave the target is pulled back inside it: wgpu
-        // rejects a scissor that hangs over the edge, which is what made the
-        // first version of this clip panic instead of drawing.
+        // rejects a scissor that hangs over the edge, which fails the frame's
+        // submission instead of clipping the draw.
         let clipped =
             viewport_in_target(RenderViewport::new(900, 600, 300, 200), 1280, 800, 640, 400);
         assert!(clipped.x + clipped.width <= 640, "{clipped:?}");
@@ -1503,9 +1493,9 @@ mod tests {
         ));
     }
 
-    /// The instance buffer is uploaded once per frame, not once per surface
-    /// (W-0077): `State::render` runs for the primary surface and again for
-    /// every extra one, all with the same queue.
+    /// The instance buffer is uploaded once per frame, not once per surface:
+    /// `State::render` runs for the primary surface and again for every extra
+    /// one, all with the same queue.
     ///
     /// The upload needs a device, so this reads the frame path instead: one
     /// upload call, in `Renderer::render`, and no instance slice threaded into

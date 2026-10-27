@@ -1,7 +1,8 @@
 //! Stress test for the ECS archetype-based iteration and collision performance.
 //!
-//! Runs a 10,000 entity simulation in which entities move toward a single
-//! obstacle carrying five box colliders, reporting collision checks per second.
+//! Runs a 10,000 entity simulation in which entities travel outward from a
+//! ring while one obstacle carries five box colliders, reporting collision
+//! checks per second.
 //!
 //! # Responsibilities
 //!
@@ -180,8 +181,6 @@ struct Obstacle;
 
 impl Component for Obstacle {}
 
-// Make all components accessible via the Component trait for TraitTypeMap
-
 // =============================================================================
 // Systems
 // =============================================================================
@@ -200,7 +199,8 @@ fn collision_and_movement_system(
         return;
     };
 
-    // Parallel version with batch tracking - shows how work is distributed
+    // Parallel pass with an explicit batch size and batch tracking, so the
+    // printed statistics say how the work was spread.
     {
         let stats = moving_query
             .par_iter_mut()
@@ -225,7 +225,7 @@ fn collision_and_movement_system(
                 }
             });
 
-        // Use static counter to only print once per 100 frames
+        // Print the batch statistics once, on the first frame.
         static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
         let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
         if frame == 0 {

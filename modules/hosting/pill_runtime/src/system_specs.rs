@@ -10,8 +10,9 @@
 //! This lives in the runtime, which links only into executables, rather
 //! than in the engine core: `sysinfo` reaches the system through the
 //! `windows` crate, which declares its functions as `raw-dylib` imports of
-//! about seventy system DLLs. In the shared `pill_engine_core.dll` that made
-//! every hot patch generate an import library for each of them at link time.
+//! about seventy system DLLs. In the shared `pill_engine_core.dll` that would
+//! make every hot patch generate an import library for each of them at link
+//! time.
 
 // External crates
 use pill_core::info;
@@ -19,8 +20,7 @@ use pill_core::telemetry::log_block;
 
 /// Report a summary of detected system hardware through the telemetry stack.
 ///
-/// Includes CPU, core/thread count, RAM, swap, disks, OS, and uptime.
-/// GPU detection requires a rendering backend.
+/// Includes CPU, core/thread count, RAM, swap, disks, OS and uptime.
 ///
 /// Emitted under `telemetry_target::SYSTEM` as one multi-line event, so the
 /// report can be filtered or redirected like any other engine output and keeps
@@ -35,8 +35,8 @@ pub(crate) fn print_system_specs() {
     //
     // Targeted refresh, never `System::new_all()`: the report reads memory and
     // CPU figures only, while `new_all` also enumerates every process on the
-    // machine - measured ~300 ms on a busy Windows session, paid in the middle
-    // of start-up for information nothing here consumes.
+    // machine - paid in the middle of start-up for information nothing here
+    // consumes.
     let system = System::new_with_specifics(
         RefreshKind::nothing()
             .with_memory(MemoryRefreshKind::everything())
@@ -136,7 +136,7 @@ fn disk_info_lines(disks: &sysinfo::Disks) -> Vec<String> {
 /// Format a duration in seconds as a compact `Nd Nh Nm` human-readable string.
 ///
 /// Omits the days component when it is zero and returns `"unknown"` for a
-/// zero-second input, matching `sysinfo`'s behaviour on unsupported systems.
+/// zero-second input, which is what a platform without an uptime reports.
 fn format_uptime(seconds: u64) -> String {
     if seconds == 0 {
         return "unknown".to_string();

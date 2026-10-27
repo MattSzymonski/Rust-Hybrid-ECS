@@ -9,22 +9,16 @@
 //! # Design
 //!
 //! [`Time`] is inserted by [`Engine::new`](crate::engine::Engine::new) and
-//! advanced by the engine itself at the top of every frame, before any system
-//! runs. Systems only ever read it through `Res<Time>`.
+//! advanced at the top of every frame, before any system runs; systems only
+//! ever read it through `Res<Time>`.
 //!
-//! It is advanced directly by `process_frame` rather than by a registered
-//! system, and that is deliberate. A registered "time system" would only be
-//! ordered ahead of its readers if every project registered it first: the
-//! scheduler batches in registration order - see
-//! [`build_execution_graph`](crate::scheduler::SystemScheduler::build_execution_graph) -
-//! so a project that registers a time-updating system late would hand its
-//! earlier systems values a frame stale. Advancing the clock outside the system
-//! set is the only way to guarantee every system in a frame sees the same,
-//! current time.
-//!
-//! Durations are reported both as `f32` seconds, which is what gameplay
-//! integration wants, and as whole milliseconds, which is what a HUD or a log
-//! line wants without re-deriving it at each call site.
+//! `process_frame` advances it rather than a registered system, deliberately.
+//! A "time system" would only be ordered ahead of its readers if every project
+//! registered it first: the scheduler batches in registration order (see
+//! [`build_execution_graph`](crate::scheduler::SystemScheduler::build_execution_graph)),
+//! so a project that registers one late hands its earlier systems values a
+//! frame stale. Advancing outside the system set is the only way to guarantee
+//! every system in a frame sees the same current time.
 
 // Standard library
 use std::time::Duration;
@@ -64,8 +58,8 @@ const MAXIMUM_DELTA_SECONDS: f32 = 0.1;
 /// }
 /// ```
 ///
-/// Every value describes the frame currently being processed, and stays fixed
-/// for its whole duration, so two systems in one frame always agree.
+/// Every value describes the frame being processed and stays fixed for its
+/// duration, so two systems in one frame always agree.
 pub struct Time {
     /// When the clock started, i.e. when the engine was created.
     startup: Instant,
@@ -141,10 +135,8 @@ impl Time {
 
     /// Milliseconds elapsed since the project started.
     ///
-    /// `u128` because a millisecond count from a long-running session outgrows
-    /// `u64` only after ~584 million years, but `Duration::as_millis` returns
-    /// `u128` and narrowing it here would be a silent truncation in the one
-    /// place a session could be long.
+    /// `u128`, as [`Duration::as_millis`] produces; narrowing here would be a
+    /// silent truncation.
     pub fn elapsed_milliseconds(&self) -> u128 {
         self.elapsed.as_millis()
     }

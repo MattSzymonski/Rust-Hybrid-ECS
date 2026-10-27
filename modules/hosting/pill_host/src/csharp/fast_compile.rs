@@ -8,23 +8,19 @@
 //!
 //! # Design
 //!
-//! A `dotnet build` of a one-file gameplay edit costs about three seconds cold
-//! and one second warm, while the C# compilation inside it costs around
-//! thirty-five milliseconds. Everything else is process start, MSBuild
-//! evaluation, a restore pass and a walk of the project reference graph - work
-//! that recomputes an answer which has not changed since the host started. This
+//! A `dotnet build` of a one-file gameplay edit costs seconds, while the C#
+//! compilation inside it costs tens of milliseconds. The rest is process start,
+//! MSBuild evaluation, a restore pass and a walk of the project reference graph,
+//! recomputing an answer that has not changed since the host started. This
 //! module skips all of it: the project's startup build reports the exact `csc`
 //! invocation it used, and a reload replays that invocation through Roslyn
-//! inside the host process.
+//! inside the host process. Replaying the capture is what makes the fast path
+//! faithful - references, defines, language version, analyzers and source list
+//! are MSBuild's own.
 //!
-//! Replaying a captured command line rather than reconstructing one is what
-//! makes the fast path faithful. The references, preprocessor defines, language
-//! version, analyzers and source list are MSBuild's own; nothing here decides
-//! what a gameplay project compiles against.
-//!
-//! The capture does go stale in exactly one way that matters: adding or removing
-//! a source file changes the list MSBuild computed. That case is detected here
-//! and sent back through a full build, which refreshes the capture for the next
+//! The capture goes stale in exactly one way that matters: adding or removing a
+//! source file changes the list MSBuild computed. That case is detected here and
+//! sent back through a full build, which refreshes the capture for the next
 //! reload.
 
 // Standard library
@@ -69,8 +65,7 @@ const COMPILE_STATUS_FAILED: i32 = 1;
 ///
 /// A failing build reports kilobytes; the cap is generous enough that no real
 /// diagnostic set reaches it, and it is here so a compiler reporting a corrupt
-/// length cannot drive the host into an allocation it dies on. This site had no
-/// bound at all before the two-call protocol became shared.
+/// length cannot drive the host into an allocation it dies on.
 const MAX_DIAGNOSTICS_BYTES: u32 = 4 * 1024 * 1024;
 
 // =============================================================================
@@ -243,7 +238,7 @@ impl FastCompiler {
     /// Ask the compiler to populate its caches on a background thread.
     ///
     /// Best effort: a warmup that cannot be resolved or cannot start only means
-    /// the first reload pays what every reload used to.
+    /// the first reload pays the full Roslyn startup cost.
     fn start_warmup(&self, runtime: &DotnetRuntimeContext, assembly: &Path) {
         let Ok(warmup) =
             runtime.get_unmanaged_fn::<WarmupFn>(assembly, COMPILER_INTEROP_TYPE, "Warmup")

@@ -10,14 +10,13 @@
 //!
 //! # Design
 //!
-//! The revision is the reload rule (W-0028 D3). A painter keeps
-//! `texture -> revision` for what it has applied and uploads whenever the
-//! carried revision is not the applied one, so a painter that was rebuilt -
-//! and therefore remembers nothing - uploads everything the set carries. That
-//! only works if every entry can *rebuild* its texture, so an entry always
-//! carries the whole image: the producer pays one full-image copy per changed
-//! texture per frame, and nothing is replayed from history, so no
-//! back-channel and no cadence is involved.
+//! The revision is the reload rule: a painter keeps `texture -> revision` for
+//! what it has applied and uploads whenever the carried revision is not the
+//! applied one, so a painter that was rebuilt - and therefore remembers
+//! nothing - uploads everything the set carries. That only works if every
+//! entry can *rebuild* its texture, so an entry always carries the whole
+//! image: one full-image copy per changed texture per frame, with nothing
+//! replayed from history, so no back-channel and no cadence is involved.
 //!
 //! Every buffer is an [`Arc`] allocated by the producing side's own code and
 //! handed over as plain data: a project reload may drop the producer while a

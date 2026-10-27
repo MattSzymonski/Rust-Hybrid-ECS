@@ -148,16 +148,15 @@ impl Entity {
 /// Stable 128-bit identity of one entity, for references that outlive a run.
 ///
 /// An [`Entity`] is a slot and a generation: cheap, and meaningless to a world
-/// that did not issue it. An `EntityId` is the identity data meant for a later
-/// run carries instead - a scene file, a spawn table, a saved selection - so a
+/// that did not issue it. An `EntityId` is what data meant for a later run
+/// carries instead - a scene file, a spawn table, a saved selection - so a
 /// reference finds its entity again after the world is rebuilt and the slots
 /// are handed out in a different order.
 ///
-/// The id is random, not derived from the slot: an id derived from the slot
-/// would name whoever took that slot next, and a stale reference would then
-/// address the wrong entity instead of nothing. It is assigned when the entity
-/// is created, unless the creator supplies one (a scene load does), and it is
-/// indexable both ways by the world that holds it.
+/// The id is random, not derived from the slot: a slot-derived id would name
+/// whoever took that slot next, and a stale reference would then address the
+/// wrong entity instead of nothing. It is assigned when the entity is created,
+/// unless the creator supplies one, and the world indexes it both ways.
 ///
 /// # Examples
 ///
@@ -195,7 +194,7 @@ impl EntityId {
     /// # Errors
     ///
     /// Returns the `getrandom` error when the platform has no usable random
-    /// source; the world then mints one from a counter and warns once.
+    /// source; the world then derives ids from a counter and logs the failure.
     pub fn random() -> Result<Self, getrandom::Error> {
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes)?;

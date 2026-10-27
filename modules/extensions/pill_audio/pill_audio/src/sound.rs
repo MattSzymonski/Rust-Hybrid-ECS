@@ -45,10 +45,8 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// One loaded audio file, held as its undecoded bytes.
 ///
 /// Stored in the [`AssetManager`](pill_engine::AssetManager) and addressed by
-/// `Handle<Sound>`. The bytes are kept encoded and decoded afresh for each
-/// playback: a decoder is a one-shot cursor, so two entities playing one sound
-/// need two of them, and holding PCM instead would cost roughly an order of
-/// magnitude more memory per sound.
+/// `Handle<Sound>`; the bytes are decoded afresh for each playback, so two
+/// entities can play one sound at once.
 ///
 /// # Examples
 ///
@@ -61,13 +59,11 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// # }
 /// ```
 ///
-/// `Debug` prints the path and the byte count rather than the bytes: a sound
-/// is megabytes of samples, and a default derive would dump all of them into
-/// a log line.
+/// `Debug` prints the path and the byte count rather than the bytes.
 ///
 /// Mirrored to C# as `pill_audio.Sound`: a managed project imports one with
 /// `assets.Import<Sound>(path, ...)` and builds one with `Sound.Load` or
-/// `Sound.FromBytes`, exactly as a Rust project would.
+/// `Sound.FromBytes`.
 #[pill_engine::pill_mirror_object(asset, import)]
 pub struct Sound {
     /// Path the bytes were read from, kept for diagnostics and reloading.
@@ -268,12 +264,11 @@ pub(crate) fn validate_format(path: &std::path::Path) -> Result<(), AssetPathErr
     }
 }
 
-/// `Arc<[u8]>` that reads as a byte slice, so a decoder can borrow the sound's
-/// bytes instead of copying them.
+/// `Arc<[u8]>` exposed as a byte slice, so a decoder reads the sound's shared
+/// bytes instead of a copy.
 ///
-/// `std::io::Cursor` needs its inner value to be `AsRef<[u8]>`, and the blanket
-/// impls do not cover `Arc<[u8]>`. Wrapping is cheaper than the alternative the
-/// old engine used, which copied the whole buffer per playback.
+/// Building a decoder clones the `Arc` - a refcount bump regardless of file
+/// size - and the cursor then reads through the shared buffer.
 pub struct ArcBytes(std::sync::Arc<[u8]>);
 
 impl AsRef<[u8]> for ArcBytes {
@@ -461,9 +456,8 @@ mod tests {
         assert_eq!(assets.len::<Sound>(), 1);
     }
 
-    /// Unloading a sound leaves a source's handle resolving to nothing, which
-    /// is what replaces the old engine's `destroy` hook that reached into
-    /// every component.
+    /// Unloading a sound leaves a source's handle resolving to nothing, so no
+    /// component has to clear itself.
     #[test]
     fn unloading_a_sound_leaves_its_handle_unresolvable() {
         let mut assets = AssetManager::new();

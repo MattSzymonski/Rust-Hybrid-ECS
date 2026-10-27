@@ -77,9 +77,8 @@ impl World {
     ///
     /// Every such caller already has a safe answer for an unresolved name -
     /// skip the row, omit the manifest entry, drop nothing - so reporting the
-    /// ambiguity and taking that path is strictly better than the previous
-    /// `max_by_key(bit)` tiebreak, which silently picked one of the candidates
-    /// and could bind rows to the wrong column.
+    /// ambiguity and taking that path is strictly better than a tiebreak that
+    /// silently picks one candidate and binds rows to the wrong column.
     pub(super) fn resolve_component_id_by_name_logged(
         &self,
         type_name: &str,
@@ -463,12 +462,6 @@ pub type RestoreResourceFn = fn(world: &mut World, bytes: &[u8]) -> bool;
 // Per-Type Monomorphized Functions
 // =============================================================================
 
-//
-// These generic functions are monomorphized once per concrete component type
-// inside the project DLL.  They are stored as plain `fn` pointers in the engine's
-// HashMaps, so replacing them on hot-reload simply overwrites the pointer —
-// no destructors, no vtable calls, no DLL-unload issues.
-
 /// Deep-merge two JSON values: `base` provides defaults, `override_json`
 /// provides the actual data.  Fields present in `override_json` take
 /// precedence; fields only in `base` are kept as defaults.
@@ -559,8 +552,7 @@ where
     // Step 3: Fold in the declared field layout. Tags carry the container
     // kinds (`vec:f32`, `string`), offsets distinguish a reordered or padded
     // shape, and the element count separates a fixed array from a resized one.
-    // A layout-less registration contributes nothing here, keeping its hash
-    // exactly what earlier builds produced.
+    // A layout-less registration contributes nothing here.
     for field in fields {
         field.name.hash(&mut hasher);
         field.type_tag.hash(&mut hasher);

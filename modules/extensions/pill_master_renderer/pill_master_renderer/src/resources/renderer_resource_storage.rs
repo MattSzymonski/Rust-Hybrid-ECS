@@ -1,4 +1,4 @@
-//! GPU-side storage for the transferred renderer's resources.
+//! GPU-side storage for every resource the renderer holds.
 //!
 //! # Responsibilities
 //!
@@ -78,10 +78,10 @@ impl RendererResourceStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::error::RendererError::Other`] naming the stand-in
-    /// (`default_color` or `default_normal`) when the driver refuses its
-    /// texture, upload, or sampler. Everything else the constructor touches
-    /// only records work and cannot fail.
+    /// Returns [`crate::error::RendererError::Other`] naming the stand-in when
+    /// the driver refuses its texture, upload, or sampler: `default_color`,
+    /// `default_normal`, `default_equirect` or `default_cubemap`. Everything
+    /// else the constructor touches only records work and cannot fail.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self> {
         let mut storage = RendererResourceStorage {
             shaders: SlotMap::<RendererShaderHandle, RendererShader>::with_capacity_and_key(
@@ -140,50 +140,84 @@ impl RendererResourceStorage {
     /// binds nothing: white for colour slots, the flat normal map for normal
     /// slots, black for equirect and cubemap slots.
     ///
+    /// The colour and normal stand-ins are files the data module ships, read
+    /// through its store; one that cannot be read falls back to the single
+    /// texel built here, because a window without a colour texture is worse
+    /// than a white one.
+    ///
     /// Fails only when the driver refuses one of the textures.
     fn install_default_textures(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<()> {
-        self.default_color_texture = self.textures.insert(RendererTexture::new_texture(
+        self.default_color_texture = self.textures.insert(Self::stand_in(
             device,
             queue,
-            Some("default_color"),
-            &[255, 255, 255, 255],
-            1,
-            1,
+            "default_color",
+            Some(pill_master_renderer_data::DEFAULT_COLOR_TEXTURE),
             TextureType::Color,
+            &[255, 255, 255, 255],
         )?);
-        self.default_normal_texture = self.textures.insert(RendererTexture::new_texture(
+        self.default_normal_texture = self.textures.insert(Self::stand_in(
             device,
             queue,
-            Some("default_normal"),
-            &[128, 128, 255, 255],
-            1,
-            1,
+            "default_normal",
+            Some(pill_master_renderer_data::DEFAULT_NORMAL_TEXTURE),
             TextureType::Normal,
+            &[128, 128, 255, 255],
         )?);
         // Half-float zeros are zero bytes: one black texel, and six of them for
-        // the cube's faces.
-        self.default_equirect_texture = self.textures.insert(RendererTexture::new_texture(
+        // the cube's faces. Neither has a file form an importer reads, so the
+        // two environment stand-ins stay texels built here.
+        self.default_equirect_texture = self.textures.insert(Self::stand_in(
             device,
             queue,
-            Some("default_equirect"),
-            &[0; 8],
-            1,
-            1,
+            "default_equirect",
+            None,
             TextureType::Equirect,
+            &[0; 8],
         )?);
-        self.default_cubemap_texture = self.textures.insert(RendererTexture::new_texture(
+        self.default_cubemap_texture = self.textures.insert(Self::stand_in(
             device,
             queue,
-            Some("default_cubemap"),
-            &[0; 48],
-            1,
-            1,
+            "default_cubemap",
+            None,
             TextureType::Cubemap,
+            &[0; 48],
         )?);
         Ok(())
+    }
+
+    /// One stand-in: the file the module ships when `path` names one it can
+    /// read, else a single texel of `texel`.
+    fn stand_in(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: &str,
+        path: Option<&str>,
+        texture_type: TextureType,
+        texel: &[u8],
+    ) -> Result<RendererTexture> {
+        if let Some(path) = path {
+            match pill_master_renderer_data::load_shipped_texture(path, texture_type) {
+                Ok(texture) => {
+                    return RendererTexture::new_texture(
+                        device,
+                        queue,
+                        Some(name),
+                        &texture.rgba,
+                        texture.width,
+                        texture.height,
+                        texture.texture_type,
+                    );
+                }
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "stand-in texture `{path}` is not readable; using the built-in texel: {error}"
+                ),
+            }
+        }
+        RendererTexture::new_texture(device, queue, Some(name), texel, 1, 1, texture_type)
     }
 }

@@ -113,9 +113,9 @@ pub(super) struct Atlas {
 
 /// The texture the label list samples the font from.
 ///
-/// Reserved out of the game UI's external range: `pill_project_ui` numbers
-/// egui's managed textures `1 << 63 | id`, and egui never reaches the id that
-/// would make this one.
+/// Reserved at the top of the UI's id space: `pill_project_ui` maps egui's
+/// managed textures to `1 << 63 | id` and its user textures below that
+/// ceiling, so only the largest managed id could collide with this one.
 pub(crate) const FONT_TEXTURE: TextureId = TextureId(u64::MAX);
 
 /// The atlas's width and height in texels: every glyph's cell, in rows of

@@ -41,10 +41,6 @@ use crate::world::{set_per_thread_last_run_tick, set_per_thread_this_run_tick, W
 // RegisteredSystem
 // =============================================================================
 
-/// Wrapper pairing a registered system with its runtime bookkeeping.
-///
-/// Holds the system's name, boxed instance, enabled state, and the per-frame
-/// timing data that feeds adaptive parallelism and profiling.
 /// Identifies which loaded module registered a system.
 ///
 /// A hot reload replaces one module's code while the rest of the process keeps
@@ -67,8 +63,7 @@ impl SystemOwner {
     /// function pointer lives in `pill_engine_core.dll`, which is never
     /// unloaded, so there is nothing to retire.
     ///
-    /// `u64::MAX` so it cannot collide with [`Self::PROJECT`] or any
-    /// [`Self::extension`]; reaching it that way would need 2^64 modules.
+    /// `u64::MAX`, which no [`Self::extension`] index reaches.
     pub const ENGINE: Self = Self(u64::MAX);
 
     /// Owner of the extension loaded at `index`.
@@ -80,6 +75,10 @@ impl SystemOwner {
     }
 }
 
+/// One registered system with its runtime bookkeeping.
+///
+/// Holds the system's name, boxed instance, enabled state, and the per-frame
+/// timing data that feeds adaptive parallelism and profiling.
 struct RegisteredSystem {
     /// Run after deferred commands, including while paused.
     post_update: bool,
@@ -181,9 +180,9 @@ pub struct Engine {
     /// while paused, then pauses again. Set by
     /// [`Engine::request_single_step`].
     single_step_pending: bool,
-    /// If true, `process_frame` returns an error immediately when any
-    /// deferred command fails.  When false (default), errors are logged
-    /// to stderr and execution continues.
+    /// If true, `process_frame` returns every deferred-command failure it
+    /// collected. When false (default), failures are logged and the frame
+    /// reports success.
     pub should_exit_on_error: bool,
     /// Optional frame rate limit. When set, `process_frame` sleeps the
     /// remaining budget after completing the frame's work.
@@ -702,14 +701,11 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`HotPatchError::UnknownSystem`] when no hot-patchable system is
-    /// registered under `name`, [`HotPatchError::SignatureMismatch`] when the
-    /// signature moved, and [`HotPatchError::NullAddress`] for a null
-    /// replacement. In every case the running implementation stays in place.
-    ///
-    /// [`HotPatchError::UnknownSystem`]: crate::hot_patch::HotPatchError::UnknownSystem
-    /// [`HotPatchError::SignatureMismatch`]: crate::hot_patch::HotPatchError::SignatureMismatch
-    /// [`HotPatchError::NullAddress`]: crate::hot_patch::HotPatchError::NullAddress
+    /// Returns [`HotPatchError`](crate::hot_patch::HotPatchError) when no
+    /// hot-patchable system is registered under `name` (`UnknownSystem`), when
+    /// the signature moved (`SignatureMismatch`), or for a null replacement
+    /// (`NullAddress`). In every case the running implementation stays in
+    /// place.
     pub fn hot_patch(
         &mut self,
         name: &str,
@@ -778,9 +774,8 @@ impl Engine {
     /// Attributes every system registered from now on to `owner`.
     ///
     /// The host wraps a module's initialization in this call and
-    /// [`Self::end_module_registration`], so module code registers systems
-    /// exactly as it always has while the engine still records which module
-    /// each system came from.
+    /// [`Self::end_module_registration`], so module code registers systems by
+    /// name while the engine records which module each system came from.
     pub fn begin_module_registration(&mut self, owner: SystemOwner) {
         self.active_owner = owner;
     }
@@ -876,12 +871,11 @@ impl Engine {
 
     /// Removes all registered systems, clearing the scheduler state.
     ///
-    /// This is used during hot-reload: the old project DLL's system function
-    /// pointers become invalid after unloading, so all systems must be
-    /// dropped and re-registered from the newly loaded DLL.
+    /// Their dispatch slots are retired with them, so nothing can be patched
+    /// into a system that no longer runs.
     ///
     /// Component registrations, entities, and resources are **not** cleared —
-    /// only systems are affected. The world state persists across reloads.
+    /// only systems are affected. The world state persists.
     pub fn clear_systems(&mut self) {
         self.systems.clear();
         // Every system is gone, so no dispatch slot may remain patchable.
@@ -1184,8 +1178,9 @@ impl Engine {
     // Internal: Sequential Execution
     // -------------------------------------------------------------------------
 
-    /// Runs systems sequentially, used when parallel execution is disabled or
-    /// when only one system is registered.
+    /// Runs systems sequentially: when parallel execution is disabled, when
+    /// only one system is registered, and for the post-update phase, which
+    /// always follows the command flush on the calling thread.
     fn run_systems_sequential(&mut self, post_update: bool) {
         let _zone = crate::profile_scope!(
             "systems sequential",
@@ -1347,10 +1342,11 @@ impl Engine {
                 // inlines away at any optimisation level.
                 //
                 // `addr_of_mut!` is used instead of `&mut ... as *mut T` because
-                // it preserves pointer provenance - the compiler can still track
-                // which allocation the pointer was derived from, enabling better
-                // alias analysis and compatibility with strict-provenance
-                // hardware (CHERI, Arm MTE).
+                // it never forms a reference first: a `&mut` to memory the
+                // workers are about to write through would assert the exclusive
+                // access this function cannot uphold. Deriving the pointer
+                // directly also keeps its provenance tied to the allocation,
+                // which strict-provenance targets (CHERI, Arm MTE) rely on.
                 let world_ptr =
                     crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.world));
                 let queue_ptr =
@@ -1569,7 +1565,7 @@ mod tests {
 
     /// A panicking system is contained: it becomes a recorded failure, the
     /// frame survives, and three consecutive panics queue one fault report for
-    /// the host to roll the function back with (Stage 19, D22).
+    /// the host to roll the function back with.
     ///
     /// Hot-patch only: containment lives in the dispatch slot a patched system
     /// calls through, and without the feature there is no patch to roll back.
@@ -1946,9 +1942,9 @@ mod tests {
     fn system_snapshots_report_owners_and_toggle_by_index() {
         let mut engine = Engine::new();
         // This test is about project and module ownership and indexes the
-        // snapshot list directly. The ECS report is opt-in, so nothing is
-        // registered here today; the call keeps the indices meaning what they
-        // would if a project turned it on first.
+        // snapshot list directly. The ECS report is opt-in and nothing here
+        // turns it on; the call keeps the indices meaning what they would if a
+        // project did so first.
         engine.set_ecs_diagnostics_interval(None);
         engine.register_system("duplicate", || {});
         engine.begin_module_registration(SystemOwner::extension(0));
@@ -1977,7 +1973,7 @@ mod tests {
     }
 
     /// The ECS report is opt-in: a fresh engine registers nothing and the
-    /// setter is the one call that registers it (W-0094).
+    /// setter is the one call that registers it.
     ///
     /// The docs on `Engine::new`, the setter and the `diagnostics` module all
     /// promise this shape, so the test fails if either side drifts: registering

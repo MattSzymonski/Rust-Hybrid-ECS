@@ -1,8 +1,8 @@
-//! Dummy extension used to pad out module-loading tests.
+//! Placeholder extension with no ECS state.
 //!
 //! # Responsibilities
 //!
-//! - Defines the [`Adder`] struct with two dummy arithmetic methods.
+//! - Defines the [`Adder`] struct with two arithmetic methods.
 //! - Exposes the [`double`] free function.
 //! - Registers through the extension ABI when the host loads it.
 //!
@@ -10,7 +10,8 @@
 //!
 //! The crate carries no ECS state; [`register`] is a no-op that only reports
 //! success, kept as a plain Rust function so the same crate can also be linked
-//! statically into a monolithic build.
+//! statically into a monolithic build. The module-loading test fixture lists it
+//! so several modules load at once.
 
 // External crates
 // `pill_module` and `Engine` must resolve in every build: the attribute is

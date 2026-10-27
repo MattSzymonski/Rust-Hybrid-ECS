@@ -9,9 +9,8 @@
 //!
 //! # Design
 //!
-//! A resource, because there is exactly one audio device. The old engine
-//! called this a "global component"; this engine has no such concept, and a
-//! singleton is a resource.
+//! A resource, because there is exactly one audio device and the stream must
+//! outlive every sink playing through it.
 //!
 //! Sinks are pooled rather than created on demand: creating one allocates a
 //! mixer channel, and doing that while a frame is being assembled is work on
@@ -93,8 +92,8 @@ impl AudioManager {
     ///
     /// Returns `None` when no audio device is available - a headless CI
     /// runner, a container, a machine with audio disabled. That is an ordinary
-    /// condition rather than an error: [`register`] simply does not install
-    /// the resource, and [`audio_system`] does nothing without it.
+    /// condition rather than an error: [`crate::register`] then installs no
+    /// manager, and [`crate::audio_system`] only drains queued sound loads.
     pub fn new(ambient_count: usize, spatial_count: usize) -> Option<Self> {
         let (stream, stream_handle) = rodio::OutputStream::try_default().ok()?;
 
@@ -175,7 +174,7 @@ impl AudioManager {
         free.push(sink);
     }
 
-    /// Whether the sink is still draining audio.
+    /// Whether the sink has audio queued and is not paused.
     pub fn is_playing(&self, sound_type: SoundType, sink: u32) -> bool {
         match sound_type {
             SoundType::Ambient => self
@@ -204,6 +203,9 @@ impl AudioManager {
     }
 
     /// Queue `sound` on `sink` and begin playing at `volume`.
+    ///
+    /// Returns `false`, leaving the sink untouched, when the bytes cannot be
+    /// decoded or `sink` names no sink of that kind.
     pub(crate) fn start(
         &self,
         sound_type: SoundType,

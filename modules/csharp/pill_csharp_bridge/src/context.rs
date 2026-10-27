@@ -150,9 +150,9 @@ impl ActiveSystemGuard {
     ///
     /// Returns `None` when a scope is already installed on this thread. That is
     /// a managed-side programming error - a C# system re-entering the host -
-    /// and it used to be an `assert!`. Panicking here unwinds through the .NET
-    /// frames that called in, which is undefined behaviour at the FFI boundary,
-    /// so the condition is reported instead of raised.
+    /// and it must not panic: unwinding through the .NET frames that called in
+    /// is undefined behaviour at the FFI boundary, so the condition is reported
+    /// instead of raised.
     ///
     /// The nested-invocation check is the only fallible step and it runs before
     /// any mutation, so a rejection leaves no stale state behind.
@@ -261,19 +261,14 @@ impl Drop for ActiveSystemGuard {
 ///
 /// Since Rust 1.81 a panic crossing an `extern "C"` boundary aborts the process
 /// rather than being undefined, so this converts a loud process kill into the
-/// refusal the callback already knows how to report. The managed side then
-/// fails the running system through the existing per-system error channel,
-/// which is what that channel was built for.
-///
-/// The panic payload is logged here because the status code alone cannot carry
-/// it: a caller seeing `5` learns the call failed, not that an engine assertion
-/// fired inside it.
+/// refusal the callback can report, and the managed side then fails the running
+/// system through its per-system error channel. The payload is logged here
+/// because the status code alone cannot carry it.
 ///
 /// `AssertUnwindSafe` is required because these callbacks take raw pointers,
-/// which are never `UnwindSafe`. The assertion is sound for the reason the
-/// boundary exists: a failed callback leaves the frame's work incomplete, and
-/// the deferred command queue and the invocation scope are both torn down as a
-/// unit when the system that owns them reports failure.
+/// which are never `UnwindSafe`. The assertion is sound because a failed
+/// callback leaves the frame's work incomplete, and the deferred command queue
+/// and the invocation scope are both torn down when the system reports failure.
 pub(super) fn guard_managed_callback(
     callback: &'static str,
     failure_status: u8,

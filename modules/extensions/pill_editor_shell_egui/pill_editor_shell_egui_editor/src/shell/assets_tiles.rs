@@ -6,31 +6,32 @@
 //! - `asset_menu_items`: the tile's context menu.
 //! - `asset_dialog_window`: the create and rename dialogs.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Assets tab's grid tiles: the gap around each tile, the band under its
-/// icon for the name, the icon's inset, and the corner radius of the
-/// selected and hovered washes, in points.
+/// The horizontal padding inside a tile's cell, in points.
 pub const ASSETS_TILE_GAP: f32 = 8.0;
 
+/// The band under a tile's icon that holds its name, in points.
 pub const ASSETS_TILE_LABEL_HEIGHT: f32 = 26.0;
 
+/// The gap between a tile's icon and its name, in points.
 pub const ASSETS_TILE_LABEL_GAP: f32 = 2.0;
 
+/// The inset between a tile's cell edge and its icon, in points.
 pub const ASSETS_TILE_ICON_INSET: f32 = 6.0;
 
+/// The corner radius of a selected or hovered tile's wash, in points.
 pub const ASSETS_TILE_CORNER_RADIUS: f32 = 4.0;
 
 /// The rows a tile's name may wrap to before it elides, like Unity's two.
 pub const ASSETS_TILE_LABEL_ROWS: usize = 2;
 
 /// The side of the type icon a finished preview keeps in its bottom-left
-/// corner, in points (W-0049 Stage 11).
+/// corner, in points.
 pub const ASSETS_TILE_BADGE_SIZE: f32 = 14.0;
 
 /// The handles a grid tile writes through: the selection a click moves, the
@@ -46,10 +47,10 @@ pub struct AssetTileWrites<'a> {
     pub pending: &'a mut PendingEditorCommands,
     /// The regions an open menu marks so a click inside is never a scene pick.
     pub overlay_regions: &'a mut Vec<ShellRect>,
-    /// The asset path a drag handed to the OS (W-0038 Stage 19): the shell
+    /// The asset path a drag handed to the OS: the shell
     /// reports it, the executable starts the OLE drag.
     pub drag_out: &'a mut Option<String>,
-    /// The rendered previews, by path (W-0049 Stage 11): a tile draws the one
+    /// The rendered previews, by path: a tile draws the one
     /// it finds and keeps its icon otherwise.
     pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
     /// The tiles drawn this frame, which the executable turns into preview
@@ -96,9 +97,10 @@ pub fn asset_tile(
     writes: &mut AssetTileWrites<'_>,
 ) {
     let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click_and_drag());
-    remember_tile_rect(browser, &row.path, rect);
+    let key = row.key();
+    remember_tile_rect(browser, &key, rect);
     let visuals = ui.visuals().clone();
-    let selected = writes.selection.asset.as_deref() == Some(row.path.as_str());
+    let selected = writes.selection.asset.as_deref() == Some(key.as_str());
     if selected || response.hovered() {
         let fill = if selected {
             visuals.selection.bg_fill
@@ -123,7 +125,7 @@ pub fn asset_tile(
     };
     // A finished preview takes the tile's picture area; the type icon stays in
     // the picture's bottom-left corner, so a person still reads what the file
-    // is (W-0049 Stage 11). Until one exists the icon alone stands.
+    // is. Until one exists the icon alone stands.
     let preview = writes.previews.get(&row.path);
     writes.preview_visible.push(row.path.clone());
     match preview {
@@ -147,7 +149,7 @@ pub fn asset_tile(
     }
     let font = egui::TextStyle::Small.resolve(ui.style());
     let job = tile_name_job(
-        browser::file_name(&row.path),
+        browser::file_name(&key),
         &font,
         visuals.text_color(),
         cell.x - ASSETS_TILE_GAP,
@@ -160,10 +162,10 @@ pub fn asset_tile(
     ui.painter()
         .galley(label_origin, label, visuals.text_color());
     if response.clicked() {
-        select_asset(writes.selection, &row.path);
+        select_asset(writes.selection, &key);
     }
     if response.double_clicked() && browser::is_folder(row) {
-        browser.open(&row.path);
+        browser.open(&key);
     }
     // A scene tile opens on the second click, the way a document does
     // everywhere else; the command is the File menu's, so both reach one
@@ -178,7 +180,7 @@ pub fn asset_tile(
         writes.pending.push(vec![command]);
     }
     if response.secondary_clicked() {
-        select_asset(writes.selection, &row.path);
+        select_asset(writes.selection, &key);
     }
     context_menu("assets", &response, writes.overlay_regions, &mut |ui| {
         asset_menu_items(
@@ -191,16 +193,23 @@ pub fn asset_tile(
         )
     });
     // Folders are drop targets (a tile lands inside one) and every tile is a
-    // drag source, so a file moves by dragging it onto a folder.
+    // drag source, so a file moves by dragging it onto a folder. A module's
+    // folder takes nothing: nothing may be written into it.
     if browser::is_folder(row) {
         if let Some(dragged) = response.dnd_release_payload::<String>() {
-            if let Some(to) = assets::drop_destination(&dragged, &row.path) {
-                assets::queue_move(writes.pending, &dragged, &to);
+            if !row.read_only {
+                if let Some(to) = assets::drop_destination(&dragged, &key) {
+                    assets::queue_move(writes.pending, &dragged, &to);
+                }
             }
         }
     }
-    response.dnd_set_drag_payload(row.path.clone());
-    // A file dragged past the window edge is the OS's (W-0038 Stage 19): the
+    // A module's resource is not a drag source either: the payload names a
+    // key no command may act on.
+    if !row.read_only {
+        response.dnd_set_drag_payload(key.clone());
+    }
+    // A file dragged past the window edge is the OS's: the
     // tile reports the path once, and the executable starts an OLE drag with
     // it. The pointer's release never arrives once it leaves the windows, so
     // "button still down, no pointer position" is what a drag out looks like.
@@ -216,7 +225,7 @@ pub fn asset_tile(
             );
         }
     }
-    response.on_hover_text(row.path.as_str());
+    response.on_hover_text(key.as_str());
 }
 
 /// The icon a row's tile draws: folders, the project's asset types by their
@@ -294,15 +303,15 @@ pub fn asset_menu_items(
         );
         ui.close();
     }
-    // The row's own file or folder in the platform's file manager (W-0049
-    // Stage 10): the shell queues the project-relative path and the
-    // executable opens it.
-    if ui
-        .add(icons::IconButton::new(
-            icons::Icon::FolderOpen,
-            "Open in File Explorer",
-        ))
-        .clicked()
+    // The row's own file or folder in the platform's file manager: the shell
+    // queues the project-relative path and the executable opens it.
+    if !row.read_only
+        && ui
+            .add(icons::IconButton::new(
+                icons::Icon::FolderOpen,
+                "Open in File Explorer",
+            ))
+            .clicked()
     {
         pending.reveal(row.path.clone());
         pill_core::info!(
@@ -313,6 +322,11 @@ pub fn asset_menu_items(
         ui.close();
     }
     if row.kind == "folder" {
+        return;
+    }
+    // A module's resources are shown, never written: no rename, no meta, no
+    // delete.
+    if row.read_only {
         return;
     }
     if ui
@@ -355,7 +369,7 @@ pub fn asset_menu_items(
 /// Public because [`run_frame`]'s generated hot patch calls it through the
 /// package path.
 ///
-/// Its rectangle joins the frame's overlay regions while it is open (W-0049):
+/// Its rectangle joins the frame's overlay regions while it is open:
 /// a click on a dialog button or in its name field is the dialog's, never a
 /// scene pick behind it.
 pub fn asset_dialog_window(

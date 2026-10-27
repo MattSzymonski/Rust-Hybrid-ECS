@@ -20,9 +20,8 @@ use pill_engine::pill_hot_fn;
 use pill_editor_shell_egui_editor::shell::*;
 
 /// The Systems tab: the engine's pause and single-step controls in a header
-/// row, then one row per registered system - its name and owner, and a
-/// state button (`on`/`off`) that queues the recorded, undoable toggle the
-/// native panel records.
+/// row, then one row per registered system - its name and owner, and a state
+/// button (`on`/`off`) that queues the recorded, undoable system toggle.
 #[pill_hot_fn]
 pub fn systems_tab(
     ui: &mut egui::Ui,

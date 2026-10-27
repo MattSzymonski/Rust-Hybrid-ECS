@@ -66,9 +66,9 @@ use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 /// Everything the frame-step loop needs, assembled once during startup.
 ///
-/// An editor-only module whose tolerated first load failed (Stage 22, D33):
-/// kept with the owner tag and watcher counter its first load would have had,
-/// so [`DevHost::retry_extension`] can build and load it later without
+/// An editor-only module whose tolerated first load failed: kept with the
+/// owner tag and watcher counter its first load would have had, so
+/// [`DevHost::retry_extension`] can build and load it later without
 /// restarting the host.
 struct PendingModule {
     config: crate::config::ExtensionConfig,
@@ -99,8 +99,8 @@ pub struct DevHost {
     loaded_project: LoadedProject,
     /// Extensions, each with its own watcher and reload transaction.
     extensions: Vec<ExtensionSlot>,
-    /// Tolerated editor-only modules whose first load failed (D33): no slot
-    /// and no watcher; [`DevHost::retry_extension`] is their only way in.
+    /// Tolerated editor-only modules whose first load failed: no slot and no
+    /// watcher; [`DevHost::retry_extension`] is their only way in.
     pending_modules: Vec<PendingModule>,
     /// Counter bumped by the project watcher on every relevant source save.
     ///
@@ -158,8 +158,8 @@ pub struct DevHost {
     ///
     /// Every reload step defers while this is `Some`: a reload rebuilds the
     /// rlibs the build links against, and a second attempt would race the
-    /// first for the same pending edit. The compile no longer freezes the
-    /// frame loop, which is the reason it runs there at all.
+    /// first for the same pending edit. The compile runs off the frame loop,
+    /// which is the reason the thread exists.
     #[cfg(feature = "hot_patch")]
     patch_attempt: Option<InFlightPatch>,
     /// Every patch library loaded in this process, newest last.
@@ -210,17 +210,15 @@ impl DevHost {
     ///
     /// `generation` is one-based in the order patches were applied; zero
     /// restores the code the running artifact was built with. This is a pointer
-    /// store per artifact - nothing is rebuilt, reloaded or unloaded, which is
-    /// what dispatching through a slot buys over rewriting a function prologue.
-    ///
-    /// Call it between frames. It is safe from a frontend because it borrows
-    /// the host mutably, and the frame loop cannot be running concurrently.
+    /// store per artifact - nothing is rebuilt, reloaded or unloaded - which is
+    /// what a dispatch slot buys over rewriting a function prologue. Call it
+    /// between frames: it borrows the host mutably.
     ///
     /// # Errors
     ///
     /// Returns a message when no session has patched `function`, when the
-    /// generation does not exist, or when an artifact refuses the address. On
-    /// any error the currently running implementation is left in place.
+    /// generation does not exist, or when an artifact refuses the address; on
+    /// any error the running implementation is left in place.
     #[cfg(feature = "hot_patch")]
     pub fn rollback_patch(&mut self, function: &str, generation: u32) -> Result<(), String> {
         let DevHost {
@@ -292,9 +290,9 @@ impl DevHost {
             .collect()
     }
 
-    /// Whether any watcher's work waits for a frame boundary (Stage 23,
-    /// D32): the editor's sleeping heartbeat takes a frame when one does,
-    /// so an edit reaches a paused, idle editor without user input.
+    /// Whether any watcher's work waits for a frame boundary: the editor's
+    /// sleeping heartbeat takes a frame when one does, so an edit reaches a
+    /// paused, idle editor without user input.
     pub fn source_work_pending(&self) -> bool {
         #[cfg(feature = "hot_patch")]
         if self.patch_attempt.is_some() {
@@ -312,12 +310,11 @@ impl DevHost {
     }
 
     /// Rebuild and load a module the host may have skipped, or force a
-    /// rebuild of a loaded one (Stage 22, D33).
+    /// rebuild of a loaded one.
     ///
     /// For a tolerated editor-only module whose first load failed, runs that
     /// load again and starts its watcher on success. For a loaded module,
-    /// asks its reload path to rebuild as if its sources were saved - the
-    /// way the editor's safe mode retries a shell whose generation stopped.
+    /// asks its reload path to rebuild as if its sources were saved.
     ///
     /// # Errors
     ///
@@ -598,10 +595,9 @@ pub struct RenderingHost {
     /// rows through the old field offsets. While paused, the renderer's owner
     /// is disabled and `render` is skipped; the window keeps its last frame.
     paused: Option<PauseReason>,
-    /// Whether the frontend last reported the scene quiet (Stage 23, D32):
-    /// with the project also paused, a reload-free boundary and no renderer
-    /// change, the frame skips the render and the surfaces keep their last
-    /// image.
+    /// Whether the frontend last reported the scene quiet: with the project
+    /// also paused, a reload-free boundary and no renderer change, the frame
+    /// skips the render and the surfaces keep their last image.
     scene_quiet: bool,
     /// Whether the last frame drew the surfaces; the frontend clears its
     /// scene-changed flag on the frames this is true.
@@ -728,11 +724,9 @@ impl RenderingHost {
     /// still mapped. Until the attach below, the host draws nothing. After the
     /// commit, the slot's current library is the new generation, or the old
     /// one when the new `init` failed and the transaction rolled back; both
-    /// are attached the same way. A build or load that failed never reaches
-    /// the hook, and the backend is left as it was.
-    ///
-    /// A backend that fails to attach leaves the window undrawn and is
-    /// retried on the next source change; the reason is logged.
+    /// are attached the same way, and a failed build or load leaves the
+    /// backend as it was. A failed attach leaves the window undrawn and is
+    /// retried on the next source change.
     fn reload_renderer_if_changed(&mut self) -> RendererStep {
         let RenderingHost {
             host,
@@ -992,10 +986,10 @@ impl RenderingHost {
         self.display.set_viewport(viewport);
     }
 
-    /// Tell the host the frontend has nothing for the scene surfaces to draw
-    /// (Stage 23, D32): with the project also paused and nothing reloading,
-    /// the next frame skips the render and the surfaces keep their last
-    /// image. The frontend clears the hint on anything that changes them.
+    /// Tell the host the frontend has nothing for the scene surfaces to draw:
+    /// with the project also paused and nothing reloading, the next frame
+    /// skips the render and the surfaces keep their last image. The frontend
+    /// clears the hint on anything that changes them.
     pub fn set_scene_quiet(&mut self, quiet: bool) {
         self.scene_quiet = quiet;
     }
@@ -1048,13 +1042,13 @@ impl RenderingHost {
             self.scene_drawn = false;
             return Ok(report);
         }
-        // Step 4: an idle editor draws nothing (Stage 23, D32). When the
-        // frontend reports its scene quiet, the project's systems are paused
-        // and nothing this boundary touched the renderer, the surfaces keep
-        // their last presented image: with the world not advancing, the
-        // image cannot be stale. Anything that can change the picture -
-        // input, commands, reloads, a renderer rebuild, re-cooked shaders -
-        // clears the frontend's flag or is checked here.
+        // Step 5: an idle editor draws nothing. When the frontend reports its
+        // scene quiet, the project's systems are paused and nothing this
+        // boundary touched the renderer, the surfaces keep their last presented
+        // image: with the world not advancing, the image cannot be stale.
+        // Anything that can change the picture - input, commands, reloads, a
+        // renderer rebuild, re-cooked shaders - clears the frontend's flag or
+        // is checked here.
         if self.scene_quiet
             && self.host.runtime.engine().systems_paused()
             && reloaded_extensions.is_empty()
@@ -1074,7 +1068,7 @@ impl RenderingHost {
         self.display.render(self.host.runtime.engine().world())?;
         self.display
             .deliver_pick_results(self.host.runtime.engine_mut().world_mut());
-        // Previews too (W-0049 Stage 11): the renderer reads one back between
+        // Previews too: the renderer reads one back between
         // frames, and the editor's tiles pick the pixels up next frame.
         self.display
             .deliver_preview_results(self.host.runtime.engine_mut().world_mut());
@@ -1329,9 +1323,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     //
     // The staging directory holds loaded module copies, the engine dylibs
     // staged beside them, and the hot-patch scratch images - none of it any
-    // build's to keep. It used to be swept only for a native project backend,
-    // so a C# host (whose extensions still stage native copies) never swept at
-    // all and the directory grew with every run.
+    // build's to keep. A C# host stages native copies for its extensions too,
+    // so the sweep cannot depend on the project's backend.
     cleanup_temporary_files(&workspace_root);
 
     // Step 3: Construct the engine and its stable API table.
@@ -1346,8 +1339,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     if let Some(startup_scene) = host_config.startup_scene.as_deref() {
         pill_engine::queue_startup_scene(runtime.engine_mut().world_mut(), startup_scene);
     }
-    // Debug drawing is always on in the development host (D14); the
-    // settings' `debug_draw:` key is what a shipping build starts with.
+    // Debug drawing is always on in the development host; the settings'
+    // `debug_draw:` key is what a shipping build starts with.
     pill_runtime::insert_debug_resources(runtime.engine_mut().world_mut(), true);
     let engine_api = EngineApi::new(runtime.engine_mut());
 
@@ -1407,7 +1400,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // One patch session per LOADED extension, index-aligned with
     // `extensions` (the frame's fast path walks the two together); a module
     // whose first load failed - or waits for a retry - has none until it
-    // loads (Stage 22, D33).
+    // loads.
     #[cfg(feature = "hot_patch")]
     let mut module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = Vec::new();
     for (index, module_config) in host_config.extensions.iter().enumerate() {
@@ -1423,7 +1416,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         ) {
             Ok(slot) => slot,
             Err(error) => {
-                // An editor-only module the embedder asked to tolerate (D33):
+                // An editor-only module the embedder asked to tolerate:
                 // report the failure the way a failed reload does and carry
                 // on; the editor's safe mode owns what happens next, and
                 // `DevHost::retry_extension` can build it again later.
@@ -1471,6 +1464,11 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
             &module_config.build_command,
         ));
     }
+    // Every extension has declared the read-only roots it ships by now; check
+    // them outside the module-init `catch_unwind`, so a resource that went
+    // missing stops the host with the module and the path in the message
+    // instead of leaving a scene that quietly draws nothing.
+    pill_engine::asset_store::verify_module_roots();
     // Step 5: Build and load the project module, then start its source watcher.
     // Extensions load first, so the C# backend can be handed every
     // native component the modules exposed to managed code: each module's
@@ -1530,7 +1528,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
 
     // Step 5b: Import the project's source assets when its settings ask for
-    // it, now that every module has registered its imported asset types.
+    // it, once every module has registered its imported asset types.
     if host_config.assets.scan_on_start {
         if let Some(asset_directory) = &host_config.asset_directory {
             scan_project_assets(runtime.engine_mut(), asset_directory);
@@ -1538,7 +1536,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     }
 
     // Step 5c: Index every asset of the project by guid and by path, loaded
-    // or not, so a reference can find and load one (W-0048). After the module
+    // or not, so a reference can find and load one. After the module
     // and project registrations, which say which extensions are standalone.
     if let Some(asset_directory) = &host_config.asset_directory {
         index_project_assets(runtime.engine_mut(), asset_directory);
@@ -1804,7 +1802,7 @@ fn attach_backend(
 /// engine renderer to a supplied native window.
 ///
 /// Frontends that must finish project setup (building and loading the project
-/// module) before any window exists — for example the standalone runner — call
+/// module) before any window exists - for example the standalone runner - call
 /// [`setup`] first and this function once a window is available, so a slow
 /// first build never shows a blank surface.
 ///
@@ -1847,16 +1845,13 @@ where
 ///
 /// A prologue patch overwrote bytes inside a loaded artifact. When that artifact
 /// is replaced, the recorded addresses point into an image the graveyard will
-/// unmap, and writing saved bytes back to one is not a rollback - it is a write
-/// into retired, possibly re-used memory.
+/// unmap, and writing saved bytes back to one is a write into retired, possibly
+/// re-used memory rather than a rollback.
 ///
 /// Every session is cleared, not only the one whose artifact reloaded: patches
 /// fan out across every loaded artifact, so a module's records include addresses
 /// inside the project image and cannot be cleared selectively. A partial restore
-/// would leave two copies of one function disagreeing, which is worse than none.
-///
-/// Idempotent, so calling it once after several reloads is the same as calling
-/// it after each.
+/// would leave two copies of one function disagreeing. Idempotent.
 #[cfg(feature = "hot_patch")]
 fn forget_prologue_records(host: &mut DevHost) {
     if let Some(session) = host.hot_patch.as_mut() {
@@ -1984,22 +1979,17 @@ fn start_patch_build(
 ///
 /// Activation happens here rather than on the worker because a dispatch slot
 /// write belongs to the thread that owns the frame boundary; the worker only
-/// compiled and mapped the image. While the build is still running nothing is
-/// consumed - the pending generation stays pending, so the reload the frame
-/// loop would otherwise perform still owes it.
+/// compiled and mapped the image. While the build runs nothing is consumed, so
+/// the pending generation keeps the reload the frame loop owes it.
 ///
-/// Returns `true` when this frame must not start another attempt: a build
-/// that came back without installing its patch leaves the edit for the reload
-/// path below, exactly the order the in-line pipeline had. Without that, a
-/// patch that cannot compile is retried forever and the reload that would
-/// deliver the edit never runs. A collected success returns `false`, because a
-/// save that arrived while the build ran is a fresh edit the fast path may
-/// handle immediately.
+/// Returns `true` when this frame must not start another attempt: a build that
+/// came back without installing its patch leaves the edit for the reload path
+/// below, and without that a patch that cannot compile is retried forever. A
+/// collected success returns `false`, because a save that arrived while the
+/// build ran is a fresh edit the fast path may handle immediately.
 ///
-/// The second element is when the collected transaction began - the attempt's
-/// own start. The build runs between frames, so the frame that reports it
-/// cannot measure the analytics total from its own beginning; `run_reload_steps`
-/// spans its total back to this instant. `None` when nothing was collected.
+/// The second element is the attempt's own start, so this frame's analytics
+/// total can span the build; `None` when nothing was collected.
 #[cfg(feature = "hot_patch")]
 fn advance_patch_attempt(host: &mut DevHost) -> (bool, Option<Instant>) {
     let Some(mut in_flight) = host.patch_attempt.take() else {
@@ -2110,8 +2100,7 @@ fn patch_attempt_in_flight(_host: &DevHost) -> bool {
 /// project's embedded copy is redirected too.
 ///
 /// Anything patching refuses falls straight through to the full rebuild the
-/// frame loop performs next, so the worst case is the behaviour that existed
-/// before the fast path.
+/// frame loop performs next, so the worst case is that rebuild.
 ///
 /// A no-op without the `hot_patch` feature, so the frame loop reads the same in
 /// both configurations rather than carrying a `cfg` of its own.
@@ -2234,17 +2223,15 @@ fn try_project_fast_path(_host: &mut DevHost, _may_start: bool) {}
 /// Re-sync the patch baselines of every subject a reload has just rebuilt.
 ///
 /// `classify` decides "body-only" by diffing the file against a snapshot of
-/// what is currently running, and that snapshot only advances when a patch
-/// succeeds. A reload advances what is running without touching it, so an edit
-/// the fast path refused stays in the diff forever: the next edit is compared
-/// against a baseline that is now two edits stale, reports a change outside a
-/// hot function body, and is refused for a change the reload already absorbed.
-/// One unpatchable edit would otherwise turn patching off for the rest of the
-/// run, which reads as "live patching stopped working".
+/// what is running, and that snapshot only advances when a patch succeeds. A
+/// reload advances what is running without touching it, so an edit the fast
+/// path refused stays in the diff forever: the next edit is compared against a
+/// baseline two edits stale, reports a change outside a hot function body, and
+/// is refused - which reads as "live patching stopped working".
 ///
-/// Called after the reload rather than before it, so a save that lands during
-/// the build is not folded into the baseline: that save has advanced the
-/// generation counter, the next frame observes it, and it gets its own reload.
+/// Called after the reload, so a save that lands during the build is not folded
+/// into the baseline: it has advanced the generation counter, and the next
+/// frame gives it its own reload.
 #[cfg(feature = "hot_patch")]
 fn resync_patch_baselines(host: &mut DevHost, project: bool, modules: &[usize]) {
     if project {
@@ -2340,7 +2327,7 @@ fn module_mirror_ownership(
 /// touches the boundary - telling the managed loader the assembly settled,
 /// polling it for the swap, and the bookkeeping a replaced image invalidates -
 /// happens here. A worker that stopped without a report falls back to
-/// building on the frame thread, the way every reload used to run.
+/// building on the frame thread.
 fn advance_managed_build(host: &mut DevHost) {
     match host.loaded_project.collect_managed_build() {
         BuildCollection::Pending => {}
@@ -2362,11 +2349,10 @@ fn advance_managed_build(host: &mut DevHost) {
 
 /// Finish a managed reload whose assembly build reported.
 ///
-/// Mirrors what the in-line reload did after its compile: report the compile,
-/// collapse the loader's debounce, poll for the swap, and run the bookkeeping
-/// a replaced image invalidates. A failed compile keeps the running assembly,
-/// abandons the armed timing, and still refreshes the editor revision - the
-/// in-line pipeline did the same.
+/// Reports the compile, collapses the loader's debounce, polls for the swap,
+/// and runs the bookkeeping a replaced image invalidates. A failed compile
+/// keeps the running assembly, abandons the armed timing, and still refreshes
+/// the editor revision.
 fn finish_managed_build(host: &mut DevHost, report: BuildReport) {
     let mut replaced = false;
     match report.outcome {
@@ -2491,7 +2477,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // pending edit. Rendering and systems continue; the build is collected on
     // a later frame. A build that came back without installing its patch also
     // blocks new attempts for this frame, so the reload below gets to deliver
-    // the edit - the order the in-line pipeline had.
+    // the edit.
     let (failed_attempt, collected_patch_started) = advance_patch_attempt(host);
     if let Some(started) = collected_patch_started {
         // The collected build ran while earlier frames kept rendering; the
@@ -2519,7 +2505,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // Step 2: Honour a rollback request, at the same frame boundary the
     // patch installs use - the prologue route rewrites live code, so this is a
     // requirement rather than a convenience. A function whose patched body has
-    // been panicking rolls itself back at the same boundary (Stage 19, D22).
+    // been panicking rolls itself back at the same boundary.
     process_rollback_request(host);
     process_patch_faults(host);
 
@@ -2743,7 +2729,7 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
         // frame keeps rendering while Roslyn runs; the build is collected at a
         // later boundary, which is where its poll and bookkeeping happen. A
         // native project - or a worker thread that could not start - reloads
-        // right here, the way every reload used to run.
+        // right here.
         let start = host.loaded_project.start_managed_reload(
             &host.workspace_root,
             &host.module_config,
@@ -2827,9 +2813,9 @@ fn run_reload_steps(host: &mut DevHost) -> Vec<String> {
     // the project normally does in Step 5 of this same boundary.
     suspend_stale_subjects(host);
 
-    // Print the analytics line for every reload completed this frame (extensions
-    //  from Step 0, the project from Step 1), plus one aggregate total.
-    // The events were recorded with their build/stage/load/init/migrate
+    // Print the analytics line for every reload completed this frame
+    // (extensions from Step 1, the project from Step 5), plus one aggregate
+    // total. The events were recorded with their build/stage/load/init/migrate
     // breakdowns already populated, so this is a pure drain-and-print.
     analytics::print_reload_events(reload_started);
     reloaded_extensions
@@ -3172,11 +3158,10 @@ fn apply_asset_changes(host: &mut DevHost) {
 pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) -> Option<FrameReport> {
     let DevHost { runtime, .. } = host;
     runtime.run_frame_with(frame_start, |_| {
-        // The per-frame native update hooks the loader once offered ran here.
-        // Nothing in the workspace generates that optional export: a project
-        // and every extension run entirely through their registered scheduler
-        // systems, so this phase has nothing of its own left to do. The
-        // closure stays as the seam a future per-frame hook would use.
+        // No per-frame native hook exists: a project and every extension run
+        // entirely through their registered scheduler systems, so this phase
+        // has nothing of its own to do. The closure stays as the seam a future
+        // per-frame hook would use.
     })
 }
 
@@ -3187,14 +3172,11 @@ pub(crate) fn run_frame_phase(host: &mut DevHost, frame_start: Instant) -> Optio
 /// process that is already running, and rather than a console command because
 /// the standalone host has no input loop and its stdout is routinely redirected.
 ///
-/// One line, either:
-///
-/// - `list` - print every generation this session has installed
-/// - `<function>@<generation>` - reinstall that generation
-/// - `<function>@previous` - step back one from whatever is running
-/// - `<function>@0` - the code the artifact was built with
-///
-/// It is deleted as soon as it is read, so a request is honoured exactly once.
+/// One line, either `list` (print every generation this session installed),
+/// `<function>@<generation>` (reinstall that generation), `<function>@previous`
+/// (step back one from whatever is running), or `<function>@0` (the code the
+/// artifact was built with). It is deleted as soon as it is read, so a request
+/// is honoured exactly once.
 #[cfg(feature = "hot_patch")]
 const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
 
@@ -3304,13 +3286,13 @@ fn previous_patch_generation(host: &DevHost, function: &str) -> Option<u32> {
         .map(|newest| newest.saturating_sub(1))
 }
 
-/// Roll back a function whose patched body kept panicking (Stage 19, D22).
+/// Roll back a function whose patched body kept panicking.
 ///
 /// The engine's dispatch slot counts consecutive panicking invocations and
 /// queues one report when a function crosses the threshold; the rollback
 /// itself belongs here, at the frame boundary, where no system is executing -
 /// the same requirement the prologue route imposes on the requested rollback.
-/// Rolling back to the previous generation is what the plan asks for, and a
+/// Rolling back to the previous generation keeps the last working code, and a
 /// function that was patched only once rolls back to generation zero, which is
 /// the code the running artifact was built with. Nothing retries the rejected
 /// patch: the edit's signal was consumed when it was applied, so the function
@@ -3427,8 +3409,7 @@ fn patch_targets<'a>(
 /// Report one patch attempt, and say whether it fully handled the change.
 ///
 /// `true` means the edit is live and the pending reload has nothing left to do.
-/// Every other outcome falls through to the normal rebuild, so the worst case
-/// is exactly the behaviour that existed before the fast path.
+/// Every other outcome falls through to the normal rebuild.
 #[cfg(feature = "hot_patch")]
 fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
     match outcome {

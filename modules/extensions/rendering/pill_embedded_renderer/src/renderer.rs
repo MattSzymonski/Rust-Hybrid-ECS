@@ -20,15 +20,8 @@
 //! display.draw(renderer.frame_rgb565())?;
 //! ```
 //!
-//! That split is deliberate. A renderer that owned the driver could only be
-//! built for the machine wired to the panel; this one compiles and unit-tests
-//! on any host, which is what makes the rasterizer testable at all.
-//!
-//! The shape mirrors the wgpu backend - `new`, `resize`, `set_viewport`,
-//! `set_virtual_resolution`, `render` - so a frontend can drive either without
-//! knowing which it holds. The differences are that construction takes
-//! dimensions rather than a window handle, and that presentation is the
-//! caller's job rather than a swapchain's.
+//! Keeping the driver out is what lets this crate compile and unit-test on any
+//! host rather than only on the machine wired to a panel.
 
 // External crates
 use pill_engine::engine::Engine;
@@ -108,6 +101,15 @@ impl Renderer {
     /// Infallible: there is no device to lose and no frame to acquire, so
     /// unlike the wgpu backend there is nothing to report. The result is
     /// retrieved with [`Self::frame_rgb565`].
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let mut renderer = Renderer::new(240, 280);
+    /// renderer.set_virtual_resolution(Some(VirtualResolution::new(800.0, 600.0)));
+    /// renderer.render(host.engine_mut());
+    /// display.draw(renderer.frame_rgb565())?;
+    /// ```
     pub fn render(&mut self, engine: &mut Engine) {
         let (width, height) = (self.framebuffer.width(), self.framebuffer.height());
         let viewport = self
@@ -228,8 +230,8 @@ mod tests {
 
         let frame = renderer.frame_rgb565();
         assert_eq!(frame.len(), 16 * 8 * 2);
-        // Every pixel carries the same background colour, so every even byte
-        // matches the first one.
+        // Every pixel carries the same background colour, so every two-byte
+        // pixel matches the first one.
         assert!(frame.chunks_exact(2).all(|pixel| pixel == &frame[0..2]));
     }
 }

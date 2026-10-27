@@ -2,13 +2,12 @@
 //!
 //! # Responsibilities
 //!
-//! - Show that every `#[pill(...)]` field decorator the Inspector understands
-//!   round-trips from the derive's compile-time layout, in declaration order.
+//! - Show that the field decorators a component or value type declares
+//!   round-trip from the derive's compile-time layout, in declaration order.
 //! - Show that an undecorated field keeps an empty decorator slice, so the
 //!   common case costs nothing.
 //! - Show that a decorated field of a nested value type keeps its decorations
-//!   on its dotted rows after registration, which is what lets the Inspector
-//!   style a nested colour channel.
+//!   on its dotted rows after registration.
 
 use pill_engine::component_registry::{
     register_all_components, ComponentFieldDescriptor, FieldDecorator,
@@ -20,9 +19,9 @@ use pill_engine::{ComponentId, PillComponent, PillMirror, World};
 #[repr(C)]
 #[derive(Debug, Clone, Default, PillComponent)]
 struct DecoratedProbe {
-    /// No decorators: the row draws exactly as it did before this feature.
+    /// No decorators: the row carries an empty decorator slice.
     plain: f32,
-    /// Verified through the decorator set below.
+    /// Dropped from the Inspector; the value is still stored and copied.
     #[pill(hide_in_inspector)]
     hidden: usize,
     /// A header and a gap on the same field, in the order declared.

@@ -136,11 +136,12 @@ impl World {
         }
 
         // Step 1: Refuse a name collision before the registration happens.
-        // This guard used to run *after* `register_component_inner`, which its
-        // `return` then left half-applied: a fresh bit, a name entry, a
-        // storage factory pointing into the image about to be discarded and a
-        // registration-log entry all survived, so the name resolved to two
-        // ids and every retry consumed one bit toward the 128-type ceiling.
+        // Running the guard after `register_component_inner` would let its
+        // `return` leave the registration half-applied: a fresh bit, a name
+        // entry, a storage factory pointing into the image about to be
+        // discarded and a registration-log entry all surviving, so the name
+        // resolves to two ids and every retry consumes one bit toward the
+        // 128-type ceiling.
         if let Some((existing_id, live_rows)) =
             self.live_component_with_name(&type_name, component_id)
         {
@@ -220,11 +221,11 @@ impl World {
         // reload migrates its rows once `init` returns.
         self.register_component_inner_superseding::<T>(fields, superseding);
 
-        // Step 3: Purge stale persist entries left over from previous
-        // registrations of the same type name.  This handles the case where
-        // a component struct is changed and then changed back — the compiler
-        // may assign the same TypeId, but old entries from intermediate
-        // shapes still pollute the persist maps.
+        // Step 3: Purge persist entries left over from earlier registrations
+        // of the same type name, so a name never resolves to two columns.
+        // Re-registering a type that was changed and then changed back can also
+        // reuse its `TypeId`, and entries recorded for the intermediate shapes
+        // must go with the generation that registered them.
         //
         // Eviction is what makes name resolution unambiguous later, so it must
         // only ever remove a *superseded* generation. A same-name entry whose

@@ -16,26 +16,21 @@
 //! zero-cost typed reference that can be stored and passed around without
 //! borrowing the [`World`].
 //!
-//! ## Usage
+//! # Examples
 //!
 //! ```no_run
 //! # use pill_engine::*;
-//! // Define a resource
+//! # let mut world = World::new();
 //! #[derive(Debug)]
 //! struct ProjectTime { delta: f32, elapsed: f32 }
 //! impl Resource for ProjectTime {}
-//!
-//! // Insert into world
-//! # let mut world = World::new();
 //! world.insert_resource(ProjectTime { delta: 0.016, elapsed: 0.0 });
 //!
-//! // Get a handle (cheap, copyable)
+//! // A handle is cheap and copyable.
 //! let handle = ResHandle::<ProjectTime>::new();
-//!
-//! // Use handle to access the resource later
 //! let time = handle.get(&world).unwrap();
 //!
-//! // Use in systems via Res/ResMut
+//! // Systems take the same resource through Res/ResMut.
 //! fn my_system(time: Res<ProjectTime>) {
 //!     println!("Elapsed: {}", time.get().unwrap().elapsed);
 //! }
@@ -60,10 +55,9 @@ use crate::world::World;
 
 /// Resource marker trait - resources are singleton data stored in the World.
 ///
-/// Unlike components, resources are not attached to entities. They represent
-/// global/shared state such as time, input, configuration, etc.
-///
-/// Resources must be Send + Sync to support parallel system access.
+/// Unlike components, resources are not attached to entities; they hold global
+/// state such as time, input or configuration, and must be `Send + Sync` to
+/// support parallel system access.
 ///
 /// # Examples
 ///
@@ -91,10 +85,9 @@ pub trait Resource: Send + Sync + 'static {
     /// The name must be unique across the whole process, so it should be
     /// namespaced - `"pill_spline::SplineSettings"`, not `"Settings"`.
     ///
-    /// Most resources do not need this. A type defined in `pill_engine`, or in
-    /// any crate every artifact compiles identically, already agrees on its
-    /// `TypeId` everywhere - which is why `Time` and `AssetManager` work
-    /// across the boundary untouched.
+    /// Most resources do not need this: a type every artifact compiles
+    /// identically already agrees on its `TypeId` everywhere, which is why
+    /// `Time` and `AssetManager` cross the boundary untouched.
     fn shared_name() -> Option<&'static str>
     where
         Self: Sized,
@@ -206,14 +199,9 @@ const SHARED_RESOURCE_HASH_SALT: u64 = 0xd6e8_feb8_6659_fd93;
 
 /// A lightweight, typed handle to a resource in the World.
 ///
-/// `ResHandle<T>` is a zero-cost abstraction that stores the resource's type
-/// information. Handles are `Copy`, `Clone`, `Send`, and `Sync`, making them
-/// easy to store and pass around without borrowing the World.
-///
-/// Use handles when you need to:
-/// - Store a reference to a resource type for later access
-/// - Pass resource type information between systems or phases
-/// - Defer resource access to a later point
+/// `ResHandle<T>` is a zero-cost abstraction carrying only the resource's type:
+/// handles are `Copy`, `Clone`, `Send` and `Sync`, so one can be stored or passed
+/// to another phase and resolved later without borrowing the [`World`].
 ///
 /// # Examples
 /// ```no_run
@@ -306,10 +294,6 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 }
 
 // =============================================================================
-// Tests
-// =============================================================================
-
-// =============================================================================
 // ErasedResource
 // =============================================================================
 
@@ -318,19 +302,17 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 ///
 /// Function pointers rather than a vtable, for the same reason
 /// [`ColumnOps`](crate::archetype::ColumnOps) is on the component side: a
-/// `Box<dyn Any>` carries its destructor in a vtable that lives in the image
-/// of whichever artifact created the value, and resources outlive the module
-/// that inserted them - nothing clears them on reload. A table that is plain
-/// data can be replaced when the code it points at is about to be unmapped.
+/// `Box<dyn Any>` carries its destructor in a vtable that lives in the image of
+/// whichever artifact created the value, and resources outlive the module that
+/// inserted them - nothing clears them on reload. A table that is plain data can
+/// be replaced when the code it points at is about to be unmapped.
 ///
-/// Only a drop is needed. Unlike a component column, a resource is never
-/// upcast to a trait object, so there are no `up_ref`/`up_mut`/`take_boxed`
+/// One table answers every question about a registration: the drop, a value's
+/// size and alignment (which a box needs for its own allocation), and, for a
+/// declaration from another language, the schema hash its manifest carried.
+/// Only a drop is needed - unlike a component column, a resource is never upcast
+/// to a trait object, so there are no `up_ref`/`up_mut`/`take_boxed`
 /// counterparts.
-///
-/// The layout fields moved here so one table answers every question about a
-/// registration: a value's size and alignment (which a box needs for its own
-/// allocation) and, for a declaration from another language, the schema hash
-/// its manifest carried.
 #[derive(Clone, Copy)]
 pub struct ErasedResourceOps {
     /// Drop the initialized value at `ptr`.
@@ -406,12 +388,10 @@ unsafe fn drop_nothing(_ptr: *mut u8) {}
 
 /// One resource value, stored without a trait object.
 ///
-/// Replaces `Box<dyn Any + Send + Sync>`. Two reasons, and the second is what
-/// makes it necessary rather than tidy:
+/// A `Box<dyn Any + Send + Sync>` cannot serve, for two reasons:
 ///
 /// 1. `Any::downcast_ref` compares [`TypeId`], which differs between artifacts
-///    that compiled the same type with different inputs, so a resource
-///    inserted by one could not be read by another.
+///    that compiled the same type with different inputs.
 /// 2. A `Box<dyn Any>`'s vtable - including its destructor - lives in the image
 ///    of the artifact that created the value. Resources are never cleared on
 ///    reload, so retiring a module that owned one leaves a destructor pointing
@@ -646,15 +626,12 @@ impl ErasedResource {
     /// `World::rehome_resources`.
     ///
     /// The table has to agree with the box's own ownership; a disagreement
-    /// would install a drop the value never had. Debug builds assert it, and
-    /// `World::rehome_resources` skips the case in release builds.
+    /// would install a drop the value never had, so the swap is refused and
+    /// reported rather than applied.
     pub fn refresh_ops(&mut self, ops: ErasedResourceOps) {
-        // A table that disagrees with the box's ownership would install a drop
-        // the value never had, or none where one is needed. `rehome_resources`
-        // already filters this case out, so reaching it means a caller got it
-        // wrong - refuse the swap and say so rather than corrupting the box.
-        // Keeping the existing table is the safe half of the disagreement: the
-        // value is still released by whatever produced it.
+        // Keeping the existing table is the safe half of a disagreement: the
+        // value is still released by whatever produced it. `rehome_resources`
+        // filters this case out, so reaching it means a caller got it wrong.
         if ops.foreign != self.type_id.is_none() {
             error!(
                 target: pill_core::telemetry::telemetry_target::ECS,
@@ -674,16 +651,13 @@ impl ErasedResource {
 
     /// Whether the stored value can be read as a `T`.
     ///
-    /// An ordinary resource demands the exact `TypeId` it was stored under,
-    /// which is the strict default. A shared one cannot: the whole point is
-    /// that another artifact reaches it, and that artifact's `TypeId` for the
-    /// same type differs. It compares layout instead, which still rejects an
-    /// outright wrong `T` while accepting the other artifact's copy of the
-    /// right one.
+    /// An ordinary resource demands the exact `TypeId` it was stored under. A
+    /// shared one cannot: another artifact's `TypeId` for the same type differs,
+    /// so it compares layout instead, which still rejects an outright wrong `T`.
     ///
     /// Layout alone is weaker than `TypeId` - `{f32, f32}` and `{u32, u32}`
-    /// agree on size and alignment - which is why a shared resource's name is
-    /// guarded at registration (see `World::register_resource`).
+    /// agree on size and alignment - which is why a shared resource's name and
+    /// shape are guarded at registration (see `World::register_resource`).
     pub fn holds<T: Resource>(&self) -> bool {
         if self.shared_identity {
             self.size == std::mem::size_of::<T>() && self.align == std::mem::align_of::<T>()

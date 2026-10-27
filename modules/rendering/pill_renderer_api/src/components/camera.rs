@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 /// from becoming NaNs in the matrix.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
-// Pinned to the name this type carried before it moved into `components/`. A
-// derived name follows `module_path!()`, so re-deriving it would register a
-// different component and orphan every column a live world holds for this one.
+// Pinned rather than derived: the derive follows `module_path!()`, so a
+// derived name would register a different component and orphan every column a
+// live world holds for this one.
 #[pill(
     shared = "pill_master_renderer::component::CameraComponent",
     persistable

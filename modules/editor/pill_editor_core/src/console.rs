@@ -1,4 +1,4 @@
-//! The Console tab's history and filters (W-0038 Stage 5).
+//! The Console tab's history and filters.
 //!
 //! # Responsibilities
 //!
@@ -37,7 +37,7 @@ pub enum ConsoleChannel {
 }
 
 impl ConsoleChannel {
-    /// The wire name the log and the scripted channel use.
+    /// The channel's name in the tab's status row and in the log.
     pub fn name(self) -> &'static str {
         match self {
             ConsoleChannel::Engine => "engine",
@@ -47,10 +47,10 @@ impl ConsoleChannel {
 
     /// The channel a target belongs to.
     ///
-    /// The engine, host and editor crates log under a crate path whose first
-    /// segment names them (`engine::ecs`, `pill_host::loader`,
-    /// `pill_editor_core::...`); a project's own logs carry the
-    /// project's, so anything else is the game's.
+    /// The engine, the host, the editor and the renderers log under a crate
+    /// path whose first segment names them (`engine::ecs`,
+    /// `pill_host::loader`, `pill_editor_core::...`); a project's own logs
+    /// carry the project's, so anything else is the game's.
     pub fn of_target(target: &str) -> Self {
         let engine_roots = ["engine", "host", "editor", "pill_core", "render"];
         let head = target.split("::").next().unwrap_or(target);
@@ -143,8 +143,7 @@ pub const CONSOLE_VIEW_ROWS: usize = 200;
 /// What the Console tab draws: the filters in force and the rows they leave.
 ///
 /// A copy, like the menus' command rows: the shell's tab reads the frame's
-/// snapshot and never the world, and the newest [`CONSOLE_VIEW_ROWS`] rows are
-/// what fits on screen anyway.
+/// snapshot and never the world.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConsoleView {
     /// The lowest level shown.
@@ -161,7 +160,7 @@ pub struct ConsoleView {
     pub lines: Vec<ConsoleLine>,
 }
 
-/// The filters the Console tab edits (W-0038 Stage 5).
+/// The filters the Console tab edits.
 ///
 /// They live in the shell's session, not in [`ConsoleState`]: the tab draws
 /// from the frame's snapshot and cannot reach the world, so it edits this

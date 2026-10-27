@@ -1,4 +1,4 @@
-//! Asset previews on the editor's side (W-0049 Stage 11): the preference that
+//! Asset previews on the editor's side: the preference that
 //! turns them on, and the tiles whose previews are worth queueing.
 //!
 //! # Responsibilities
@@ -7,15 +7,12 @@
 //!   flips in the Preferences tab.
 //! - [`preview_asset`]: which renderer preview a listing row asks for, from its
 //!   asset type, its file and its guid.
-//! - [`PreviewQueue`]: the paths the Assets grid drew this frame, so the
-//!   executable asks only for tiles on screen.
+//! - [`PreviewQueue`]: the tile paths one grid pass drew, in draw order.
 //!
 //! # Design
 //!
 //! Nothing here renders: the renderer draws the preview and the executable
 //! keeps the resulting image, so this module only decides *what* to ask for.
-//! The queue is the grid's own answer to "what is visible", written while the
-//! tiles are drawn and read once by the frame that builds the requests.
 
 // Standard library
 use std::path::Path;
@@ -71,11 +68,10 @@ pub fn preview_asset_for<'a>(
         .and_then(|row| preview_asset(row, root))
 }
 
-/// The paths whose tiles the Assets grid drew this frame.
+/// The tile paths one pass of the Assets grid drew, in draw order.
 ///
-/// The grid clears it at the start of a pass and pushes every tile it draws,
-/// so scrolling costs preview work only for what is visible. The executable
-/// reads it once per frame and takes the first path it has no image for.
+/// [`PreviewQueue::clear`] starts a pass and [`PreviewQueue::push`] records a
+/// drawn tile, so a reader can ask for previews only for what is visible.
 #[derive(Default)]
 pub struct PreviewQueue {
     /// The visible tiles' paths, in draw order.
@@ -85,7 +81,7 @@ pub struct PreviewQueue {
 impl pill_engine::Resource for PreviewQueue {}
 
 impl PreviewQueue {
-    /// Start a new frame's list of visible tiles.
+    /// Start a new pass's list of visible tiles.
     pub fn clear(&mut self) {
         self.paths.clear();
     }
@@ -102,7 +98,9 @@ mod tests {
 
     fn row(path: &str, kind: &str, guid: Option<&str>) -> AssetListing {
         AssetListing {
+            root: String::new(),
             path: path.to_string(),
+            read_only: false,
             kind: kind.to_string(),
             standalone: false,
             has_meta: guid.is_some(),

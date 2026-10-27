@@ -38,8 +38,8 @@ pub struct EguiShellState {
     pub dock: EditorDock,
     /// Completed egui passes; the shell's log cadence reads it.
     pub frame_index: u64,
-    /// The executable's theme generation this session last installed
-    /// (W-0127 Stage 6). The executable resolves the layers and publishes the
+    /// The executable's theme generation this session last installed. The
+    /// executable resolves the layers and publishes the
     /// merged theme on the snapshot; the shell installs it when this moves, so
     /// a reloaded shell picks up the theme already in force.
     pub applied_theme_generation: u64,
@@ -58,13 +58,13 @@ pub struct EguiShellState {
     /// The brand mark's texture, uploaded on the first frame and kept for the
     /// session: the context owns it, so a shell reload reuses it.
     pub mark: Option<TextureHandle>,
-    /// The rendered asset previews, by project-relative path (W-0049
-    /// Stage 11): pixels the executable read back from the renderer and
+    /// The rendered asset previews, by project-relative path: pixels the
+    /// executable read back from the renderer and
     /// uploaded once, kept in memory so a tile redraws without another
     /// request.
     pub previews: BTreeMap<String, TextureHandle>,
     /// The tiles the renderer answered with no pixels, by project-relative
-    /// path (W-0074): an undecodable file or a frame that drew nothing is
+    /// path: an undecodable file or a frame that drew nothing is
     /// answered with a refusal, so the tile keeps its type icon and the grid
     /// asks for the next one instead of waiting on this one forever.
     pub preview_refused: BTreeSet<String>,
@@ -76,33 +76,31 @@ pub struct EguiShellState {
     pub menubar: MenubarSession,
     /// The Inspector's collapsed component sections and its logged geometry.
     pub inspector: InspectorSession,
-    /// The toasts the host's notices put on screen (W-0038 Stage 4).
+    /// The toasts the host's notices put on screen.
     pub toasts: ToastSession,
-    /// The command palette's open state and query (W-0038 Stage 3).
+    /// The command palette's open state and query.
     pub palette: PaletteState,
-    /// The Console tab's filters (W-0038 Stage 5): the tab edits these, and
+    /// The Console tab's filters: the tab edits these, and
     /// the executable applies them to the history on the next frame.
     pub console_filters: crate::console::ConsoleFilterSettings,
-    /// The Problems row a click asked to open, drained by the executable
-    /// (W-0038 Stage 6).
+    /// The Problems row a click asked to open, drained by the executable.
     pub problem_open: Option<usize>,
-    /// The per-tab and whole-pass timings the Statistics tab shows
-    /// (W-0038 Stage 7).
+    /// The per-tab and whole-pass timings the Statistics tab shows.
     pub stats: StatisticsSession,
     /// Every module panel's build time, and which of them overshoots the
-    /// budget (W-0038 Stage 11).
+    /// budget.
     pub panel_budget: PanelBudget,
     /// Whether this session already mapped the saved layout's module tabs
     /// from the panel ids it carried to the slots the registry assigns today.
     /// Once per session, not once per shell generation: a reload must not
     /// undo a dock the user rearranged.
     pub panels_remapped: bool,
-    /// The windows the module panels asked for (W-0038 Stage 13).
+    /// The windows the module panels asked for.
     pub panel_windows: PanelWindowSession,
     /// A window the scripted channel asked a panel to open: the panel's slot
-    /// and the window id it should choose (W-0038 Stage 13).
+    /// and the window id it should choose.
     pub panel_window_ping: Option<(u16, String)>,
-    /// One egui context per popped-out tab (W-0038 Stage 23). A popped-out
+    /// One egui context per popped-out tab. A popped-out
     /// window runs its own pass, so it owns its own context - the main one is
     /// running the dock in the same frame. The map lives in the session for
     /// the same reason the main context does: a shell reload must find each
@@ -143,7 +141,7 @@ pub struct PanelWindowAnswer {
     pub accepted: bool,
 }
 
-/// The windows the module panels asked for (W-0038 Stage 13).
+/// The windows the module panels asked for.
 ///
 /// Session-scoped like the dock: a shell reload keeps every window open, and
 /// only the owning module's unload closes its windows - which is exactly why
@@ -216,7 +214,7 @@ pub struct TabTiming {
     pub passes: u64,
 }
 
-/// The timings the Statistics tab reads (W-0038 Stage 7).
+/// The timings the Statistics tab reads.
 ///
 /// Written by the shell's own pass, read by the tab: the measurement is the
 /// shell's, so the tab cannot inflate what it reports by drawing itself.
@@ -276,7 +274,7 @@ fn smoothing(current: f64, sample: f64, weight: f64) -> f64 {
     }
 }
 
-/// The command palette's session state (W-0038 Stage 3).
+/// The command palette's session state.
 ///
 /// Owned strings, not callbacks: the palette outlives a shell reload, and a
 /// reload must not leave a closure from the old image behind.
@@ -295,17 +293,16 @@ pub struct PaletteState {
     pub logged_query: Option<String>,
 }
 
-/// The floating viewport toolbox's session state (Stage 22): a drag parks
+/// The floating viewport toolbox's session state: a drag parks
 /// one scene view's toolbox, and the log reports a placement once.
 ///
 /// Session-scoped, like the dock's floating tabs' positions: a restart
-/// starts every toolbox at its default corner. Persisting the origins into
-/// the layout document is follow-up work.
+/// starts every toolbox at its default corner.
 pub struct ToolboxSession {
     /// Per-scene-view panel origins in logical points; `None` until a drag
     /// parks that view's toolbox, so the default anchor keeps following the
     /// viewport until the user moves it. One slot per view index, however
-    /// many views the person opened (W-0038 Stage 21).
+    /// many views the person opened.
     pub origins: Vec<Option<Pos2>>,
     /// Per-scene-view panel rectangles whose rows the log already reported,
     /// so the rect lines appear once per placement and once per drag.
@@ -365,9 +362,9 @@ pub struct MenubarSession {
     pub history_requests: Vec<HistoryRequest>,
     /// The dock tab the Window menu asked for, drained by the executable.
     pub pending_tab: Option<EditorTab>,
-    /// Whether the Window menu asked for one more scene view (W-0038 Stage
-    /// 21); the shell docks it after the pass, because the dock is borrowed
-    /// by the `DockArea` while the menu draws.
+    /// Whether the Window menu asked for one more scene view; the shell docks
+    /// it after the pass, because the dock is borrowed by the `DockArea` while
+    /// the menu draws.
     pub new_scene_view: bool,
     /// Whether the About window is open.
     pub about_open: bool,
@@ -487,10 +484,10 @@ pub struct PanelTiming {
     pub toasted: bool,
 }
 
-/// Every module panel's build time (W-0038 Stage 11).
+/// Every module panel's build time.
 ///
-/// Written by the shell's own pass and read by the tab that draws the narm
-/// and by the suite: the measurement belongs to whoever timed the call, and
+/// Written by the shell's own pass; the dock's tab title and the executable's
+/// panels dump read it. The measurement belongs to whoever timed the call, so
 /// a panel cannot inflate its own row by drawing it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelBudget {
@@ -577,7 +574,7 @@ pub struct InspectorSession {
     /// the row memories below, because the rows on screen are that entity's.
     pub subject: Option<pill_engine::Entity>,
     /// Each asset reference row's last logged rectangle, keyed by
-    /// `entity.component.field` (W-0048): what a suite drops an asset onto.
+    /// `entity.component.field`: what a suite drops an asset onto.
     /// Only a row on screen keeps an entry; see the shell's
     /// `remember_asset_row_rect`.
     pub asset_row_rects: Vec<(String, Rect)>,
@@ -589,7 +586,7 @@ pub struct InspectorSession {
     /// The open asset picker's search text.
     pub asset_search: String,
     /// Each entity reference row's last logged rectangle, keyed by
-    /// `entity.component.field` (W-0048 Stage 6): what a suite drags an
+    /// `entity.component.field`: what a suite drags an
     /// entity onto.
     pub entity_row_rects: Vec<(String, Rect)>,
     /// Each entity reference row's last logged text, keyed the same way: the
@@ -600,17 +597,17 @@ pub struct InspectorSession {
     /// The open entity picker's search text.
     pub entity_search: String,
     /// The settings-document key (`textures.albedo`) whose picker is open, if
-    /// one is (W-0049 Stage 8).
+    /// one is.
     pub settings_picker: Option<String>,
     /// The open settings picker's search text.
     pub settings_search: String,
     /// Each Hierarchy row's last logged rectangle, keyed by the entity's
-    /// display (W-0048 Stage 6): what a suite drags onto an entity reference
+    /// display: what a suite drags onto an entity reference
     /// row. The Entities tab shares this session, since the cache is the same
     /// "geometry the log already reported" concern.
     pub hierarchy_row_rects: Vec<(String, Rect)>,
-    /// Each scene badge's last logged rectangle, keyed by `view:entity`
-    /// (W-0049 Stage 12): what a suite clicks to select through a badge.
+    /// Each scene badge's last logged rectangle, keyed by `view:entity`:
+    /// what a suite clicks to select through a badge.
     pub badge_rects: Vec<(String, Rect)>,
 }
 

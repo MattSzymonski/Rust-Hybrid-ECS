@@ -8,9 +8,9 @@
 //! # Design
 //!
 //! Shared and persistable, and edited live through the editor's field layout.
-//! Nothing reads it yet, so it is carried as scene contract only - see the
-//! type's own note. The shared name is pinned rather than derived from the
-//! module path; see [`crate::components`].
+//! No shipped pass reads it - their light rigs are baked into the shaders - so
+//! it is carried as scene contract only. The shared name is pinned rather than
+//! derived from the module path; see [`crate::components`].
 
 // External crates
 use pill_engine::{PillComponent, World};
@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 /// A directional light, described by the colour it emits and its strength.
 ///
 /// Projects declare one to light the scene, and the editor edits its fields
-/// live through the shared layout. The shipped passes do not read it yet -
-/// their light rigs are baked into the shaders - so today it travels the
-/// scene contract and nothing more.
+/// live through the shared layout. The shipped passes do not read it - their
+/// light rigs are baked into the shaders - so it travels the scene contract and
+/// nothing more.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
-// Pinned to the name this type carried before it moved into `components/`. A
-// derived name follows `module_path!()`, so re-deriving it would register a
-// different component and orphan every column a live world holds for this one.
+// Pinned so the identity does not follow the module path. A derived name
+// follows `module_path!()`, so re-deriving it would register a different
+// component and orphan every column a live world holds for this one.
 #[pill(
     shared = "pill_master_renderer::component::DirectionalLightComponent",
     persistable

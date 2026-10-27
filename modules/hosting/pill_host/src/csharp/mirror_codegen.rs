@@ -20,10 +20,8 @@
 //! The runtime owns every pointer, so the generated code is safe C# and the
 //! reloadable project assembly still needs no `AllowUnsafeBlocks`; one
 //! function-pointer type covers every trampoline, so NativeAOT needs nothing
-//! generated per signature either.
-//!
-//! The encodings each `Push*`/`Result*` call writes are the contract with
-//! `pill_engine::mirror` on the Rust side.
+//! generated per signature either. The encodings each `Push*`/`Result*` call
+//! writes are the contract with `pill_engine::mirror` on the Rust side.
 
 // Standard library
 use std::collections::BTreeMap;

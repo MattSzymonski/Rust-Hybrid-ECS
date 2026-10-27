@@ -4,9 +4,6 @@
 //! copies rows with `ptr::copy`, frees them without running element
 //! destructors, and is `Send + Sync` on the strength of the `Blittability` its
 //! layout carries.
-//! These tests pin the shapes the engine must refuse, and pin that the refusal
-//! is a typed error rather than a debug-only assertion or a panic deep inside
-//! the first growth.
 //!
 //! # Responsibilities
 //!
@@ -38,9 +35,8 @@ fn degenerate_layouts_are_typed_errors() {
     ));
 
     // The fields are public, so a column can be handed a layout the
-    // constructor would have refused. It validates again, in every build
-    // profile: a debug-only assertion used to leave release builds accepting
-    // these until the first push ran off the end of the buffer.
+    // constructor would have refused. It validates again in every build
+    // profile, so a release build cannot accept these either.
     let zero_sized = ColumnLayout {
         size: 0,
         align: 4,

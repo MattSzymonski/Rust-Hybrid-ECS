@@ -3,9 +3,8 @@
 //! # Responsibilities
 //!
 //! - Render one requested asset into a 128x128 RGBA8 target and copy it to a
-//!   readback buffer ([`PreviewRenderer::record`] for a texture or material,
-//!   [`PreviewRenderer::record_mesh`] for a mesh), at most one request per
-//!   frame.
+//!   readback buffer ([`PreviewRenderer::record`],
+//!   [`PreviewRenderer::record_mesh`]), at most one request per frame.
 //! - Map that buffer after the frame that wrote it was submitted
 //!   ([`PreviewRenderer::after_submit`]), and hand the pixels back once the
 //!   GPU finished ([`PreviewRenderer::collect`]).
@@ -23,8 +22,7 @@
 //! seen from a three-quarter angle occludes itself. The target and both
 //! pipelines are built once and reused; the readback is a mapped buffer polled
 //! without waiting, the shape the pick buffer already uses. Nothing is written
-//! to disk: the pixels cross to the editor as data (W-0049 Stage 11).
-
+//! to disk: the pixels cross to the editor as data.
 // Standard library
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -41,8 +39,7 @@ pub const PREVIEW_SIZE: u32 = 128;
 /// Bytes one preview's pixels take: RGBA8, tightly packed.
 const PREVIEW_BYTES: u64 = (PREVIEW_SIZE as u64) * (PREVIEW_SIZE as u64) * 4;
 
-/// How many GPU bytes the decoded texture files a preview drew may hold
-/// (W-0076).
+/// How many GPU bytes the decoded texture files a preview drew may hold.
 ///
 /// The cache exists so scrolling back to a tile costs no decode; it is not a
 /// residency list, so it is bounded rather than grown for the session. A 4K
@@ -144,7 +141,7 @@ pub(super) struct PreviewRenderer {
     /// was decoded from.
     sources: HashMap<String, (Option<SystemTime>, wgpu::TextureView)>,
     /// The order the sources were last used in, oldest first, with the GPU
-    /// bytes each holds: what the budget is enforced over (W-0076).
+    /// bytes each holds: what the budget is enforced over.
     source_order: VecDeque<(String, u64)>,
     /// The GPU bytes `sources` holds.
     source_bytes: u64,
@@ -422,9 +419,9 @@ impl PreviewRenderer {
         if let Some((cached, view)) = self.sources.get(path) {
             if *cached == modified {
                 let view = view.clone();
-                // Reused entries move to the front of the eviction queue: the
-                // budget drops what a person scrolled past, not what they are
-                // looking at.
+                // Reused entries move to the newest end of the eviction queue:
+                // the budget drops what a person scrolled past, not what they
+                // are looking at.
                 self.touch_source(path);
                 return Some((view, self.sampler.clone()));
             }
@@ -853,12 +850,12 @@ fn framing(vertices: &[crate::assets::MeshVertex]) -> Option<[[f32; 4]; 4]> {
     Some((projection * view).to_cols_array_2d())
 }
 
-/// The paths a cache must drop to fit `budget`, oldest first, and the bytes it
-/// holds afterwards.
+/// The paths a cache must drop to fit `budget`, oldest first, with `total`
+/// reduced by the bytes each carried.
 ///
 /// The newest entry is never dropped, even when it alone is over the budget: a
 /// source bigger than the whole cache still previews, it just leaves nothing
-/// else resident (W-0076).
+/// else resident.
 fn trim_to_budget(
     order: &mut VecDeque<(String, u64)>,
     total: &mut u64,
@@ -942,8 +939,8 @@ mod tests {
         assert!(framing(&[vertex([f32::NAN, 0.0, 0.0]), vertex([1.0, 1.0, 1.0])]).is_some());
     }
 
-    /// A megabyte of 4K texture is 64 MB, so browsing a folder of them must not
-    /// keep every one resident (W-0076).
+    /// A 4K texture is 64 MB, so browsing a folder of them must not keep every
+    /// one resident.
     #[test]
     fn browsing_many_textures_keeps_the_cache_under_its_budget() {
         let texture_bytes = 4096 * 4096 * 4;

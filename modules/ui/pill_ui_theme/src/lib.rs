@@ -3,8 +3,7 @@
 //! # Responsibilities
 //!
 //! - [`theme`]: the complete base [`Theme`], the neutral [`Theme::fallback`]
-//!   and the research document's [`Theme::brutalist`] recipe, plus the one pure
-//!   merge.
+//!   and the [`Theme::brutalist`] recipe, plus the one pure merge.
 //! - [`overrides`]: [`ThemeOverrides`], the sparse document a `.theme` file
 //!   holds, and its JSON reader (bare body or standalone document).
 //! - [`asset`]: the `.theme` standalone asset type.
@@ -14,18 +13,14 @@
 //!
 //! # Design
 //!
-//! This crate is a shared `dylib` (W-0127), like the other cross-artifact type
-//! crates: a project, `pill_project_ui`, the reloadable editor shell and
-//! `pill_editor_core` all name the same `Theme`, `ThemeOverrides` and
-//! `FontAsset` types, so one asset column and one world resource serve them
-//! all. It is egui-free on purpose: the translator from tokens to egui's
-//! `Style` lives in `pill_ui_kit`, compiled into each UI's own link unit, so no
-//! egui value ever crosses this crate's boundary (one link unit cannot hold two
-//! copies of egui in different formats).
+//! This crate is a shared `dylib`: a project, `pill_project_ui`, the editor shell
+//! and `pill_editor_core` share the `Theme`, `ThemeOverrides` and `FontAsset`
+//! types, one asset column and one world resource. It is egui-free: the
+//! translator lives in `pill_ui_kit`, compiled into each UI's link unit, so no
+//! egui value crosses this boundary (two copies cannot share a link unit).
 //!
-//! A theme is always complete here. A `.theme` file carries **only overrides**
-//! (the items it changes), and merging never falls back to an egui default, so
-//! an absent item cannot change by accident.
+//! A theme is always complete: a `.theme` file carries **only overrides**, and
+//! merging never falls back to an egui default, so an absent item cannot change.
 
 /// The `.theme` standalone asset.
 pub mod asset;

@@ -8,8 +8,7 @@
 //! - Build one pass object per pass of the chain, and remember the reason for
 //!   each pass it could not build.
 //! - Plan each frame - which draws each pass takes, which pass opens each
-//!   target - and name a pass that cannot be recorded once, rather than once
-//!   per frame.
+//!   target - and name a pass that cannot be recorded once, not once per frame.
 //! - Write the chain to the log once per change.
 //!
 //! # Design
@@ -17,15 +16,12 @@
 //! The chain is read every frame but its GPU objects are not rebuilt every
 //! frame: an unchanged frame costs one tuple comparison, and the signature
 //! strings are only built once the chain generation, the resource epoch, or the
-//! surface size moved. Creation failures are reported and skipped rather than
-//! fatal - a shader, texture, or target that would not build is named in the log
-//! while the rest of the chain still reaches the GPU.
+//! surface size moved.
 //!
-//! The chain is a script. A game writes it as a [`RenderingPipeline`] of
-//! [`RenderPass`]es; this is what that declaration becomes once the device has
-//! seen it. Nothing here owns a window, a frame loop, or an asset cache - what
-//! it needs of those arrives in a [`ChainContext`], and what it produces is
-//! either a pass object or the reason there is none.
+//! The chain is a script: a game writes it as a [`RenderingPipeline`] of
+//! [`RenderPass`]es, and this is what that declaration becomes once the device
+//! has seen it. A [`ChainContext`] carries what the chain needs of the renderer;
+//! the output is a pass object or the reason there is none.
 //!
 //! [`RenderingPipeline`]: crate::RenderingPipeline
 //! [`RenderPass`]: crate::RenderPass
@@ -140,10 +136,9 @@ impl PassPlan<'_> {
 ///
 /// The chain names its shaders and textures by asset key and the renderer caches
 /// their GPU objects by the same key, so it is handed the caches rather than a
-/// way to look them up. Bundled because the split is what the borrow checker
-/// enforces - the pipeline is mutated while all of this is borrowed - and
-/// because a chain that has to be handed four things separately at every call
-/// site is a chain that is not really a unit yet.
+/// way to look them up. Bundled because the borrow split demands it - the
+/// pipeline is mutated while all of this is borrowed - and because four separate
+/// arguments at every call site would stop the chain reading as one unit.
 pub(crate) struct ChainContext<'a> {
     /// The device, caches, and surface-sized targets the passes are built from.
     pub(crate) state: &'a mut State,
@@ -518,8 +513,8 @@ fn build_pass(
     if let Some(reason) = shaderless_target_refusal(pass) {
         return PassSlot::Unsupported(reason);
     }
-    // A geometry pass with no shader of its own draws through each material's
-    // pipeline, and that is the only path that needs no object.
+    // A geometry pass with no shader of its own is the only kind that needs no
+    // object built here: it draws through each material's pipeline.
     let Some(shader_key) = pass.shader else {
         return match pass.kind {
             PassKind::Geometry => PassSlot::Unshaded,
@@ -598,14 +593,6 @@ fn build_pass(
     }
 }
 
-/// A signature of everything a chain's GPU objects depend on.
-///
-/// The chain is read every frame but its pipelines are not rebuilt every frame:
-/// this is what decides whether they have to be. It covers the chain's content,
-/// including pass parameters and the textures a pass names - both iterated in
-/// slot order so a `HashMap`'s arbitrary order cannot make an unchanged chain
-/// look new - plus the resource epoch, which moves whenever a shader or texture
-/// the bind groups reference was recreated.
 /// The whole queue as one range, or none when the queue is empty.
 fn whole_queue(render_queue: &[RenderQueueItem]) -> Vec<Range<u32>> {
     if render_queue.is_empty() {
@@ -635,6 +622,14 @@ fn shader_ranges(render_queue: &[RenderQueueItem], shader_index: u8) -> Vec<Rang
     ranges
 }
 
+/// A signature of everything a chain's GPU objects depend on.
+///
+/// The chain is read every frame but its pipelines are not rebuilt every frame:
+/// this is what decides whether they have to be. It covers the chain's content,
+/// including pass parameters and the textures a pass names - both iterated in
+/// slot order so a `HashMap`'s arbitrary order cannot make an unchanged chain
+/// look new - plus the resource epoch, which moves whenever a shader or texture
+/// the bind groups reference was recreated.
 fn chain_signature(chain: &[ResolvedPass], resource_epoch: u64) -> String {
     let mut signature = format!("e{resource_epoch}");
     for pass in chain {

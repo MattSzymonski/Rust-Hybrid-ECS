@@ -4,7 +4,7 @@
 //!
 //! - [`Theme`]: every value a UI's style needs, as plain owned data.
 //! - [`Theme::fallback`] and [`Theme::brutalist`]: the neutral dark base and
-//!   the research document's brutalist recipe.
+//!   the brutalist recipe.
 //! - [`Theme::merged_with`]: the one place a sparse override document becomes a
 //!   complete theme.
 //! - The token types the document and the UI kit share ([`Rgba`], [`Stroke`],
@@ -411,7 +411,7 @@ impl Default for WidgetStates {
 }
 
 impl WidgetStates {
-    /// The brutalist recipe's five states (`research §3`).
+    /// The brutalist recipe's five states.
     fn brutalist() -> Self {
         let line = Rgba::rgb(70, 60, 64);
         let radius = 0;
@@ -543,7 +543,7 @@ impl Default for Palette {
 }
 
 impl Palette {
-    /// The brutalist recipe's colours (`research §3`).
+    /// The brutalist recipe's colours.
     fn brutalist() -> Self {
         Self {
             frame: Rgba::rgb(20, 17, 18),
@@ -621,11 +621,10 @@ impl Theme {
         }
     }
 
-    /// The research document's brutalist recipe, as a code default.
+    /// The brutalist recipe, as a code default.
     ///
     /// Square corners, hard offset shadows (blur 0), a pink accent, light text
-    /// on near-black surfaces, and the recipe's spacing and text table
-    /// (`research §3`).
+    /// on near-black surfaces, and the recipe's spacing and text table.
     pub fn brutalist() -> Self {
         let mut text_styles = BTreeMap::new();
         text_styles.insert(

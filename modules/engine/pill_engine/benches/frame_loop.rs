@@ -1,35 +1,26 @@
 //! Integration benchmark for the ECS frame loop.
 //!
-//! Measures `engine.process_frame()` wall-clock time, exercising every ECS
-//! subsystem together: system registration, scheduler graph build + batch
-//! dispatch, query iteration (sequential and parallel), change detection,
-//! and command execution.
+//! Measures `engine.process_frame()` wall-clock time with every subsystem in
+//! the same frame: scheduler graph build and batch dispatch, query iteration
+//! (sequential and parallel), change tracking and the deferred command flush.
 //!
 //! # Responsibilities
 //!
-//! - Benchmarks the full frame loop across six workload profiles, from
-//!   trivial to maximum stress.
-//! - Sweeps each profile over multiple entity counts.
-//! - Provides a `_sequential` baseline (parallel execution disabled) per
-//!   profile to measure the speedup from parallelism.
+//! - Benchmarks the frame loop across six workload profiles, from frame
+//!   overhead alone to every system and component, at several entity counts.
+//! - Pairs every run with a `_sequential` baseline (parallel execution
+//!   disabled), so the speedup from parallelism is the ratio of the two series.
 //!
 //! # Design
 //!
-//! Six workload profiles span the spectrum from trivial to maximum stress,
-//! each selecting a different combination of systems and components:
-//!
-//! | Profile | Systems | Components/entity | Stress point |
-//! |---------|---------|-------------------|--------------|
-//! | `standard` | 3 light | ~40 B | Baseline frame overhead |
-//! | `large_cache` | 4 (std + render) | ~300 B | 256 B component cache pressure |
-//! | `light` | 3 tracy_live | ~40 B | Mixed seq/par with conditional logic |
-//! | `heavy_compute` | 2 heavy | ~80 B | sqrt/div/cbrt per entity |
-//! | `large_components` | 2 cache-heavy | ~420 B | 256 B + 128 B reads per entity |
-//! | `full` | 7 tracy_live | ~460 B | All systems, all components, `With<Enemy>` filter |
-//!
-//! Every profile runs at multiple entity counts and includes a `_sequential`
-//! baseline (parallel execution disabled) to measure the speedup from
-//! parallelism.
+//! | Profile | Systems | Components | Stress point |
+//! |---------|---------|------------|--------------|
+//! | `standard` | movement, health_decay, reporting | Position, Velocity, Health | Frame overhead |
+//! | `large_cache` | movement, health_decay, reporting, render | Position, Velocity, Health, RenderData (256 B), PhysicsData (128 B) | Cache-line pressure |
+//! | `light` | movement, health_decay, collision | Position, Velocity, Health | Sequential and parallel systems, one with a branch |
+//! | `heavy_compute` | gravity, cleanup | Position, Velocity, Health, Mass, GravityForce | sqrt/div/cbrt per entity |
+//! | `large_components` | render, physics | Position, Velocity, Health, RenderData, PhysicsData | 256 B + 128 B rows per entity |
+//! | `full` | all eight, `enemy_ai` included | every component, `Enemy` on every fourth entity | Everything at once |
 //!
 //! Run with:
 //! ```text
@@ -37,8 +28,6 @@
 //! ```
 
 #![allow(dead_code)]
-
-// Standard library
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
@@ -106,22 +95,21 @@ impl Component for PhysicsData {}
 /// Workload profile selecting which systems and components a benchmark run
 /// exercises.
 ///
-/// Each variant maps to one row of the module header table; component sizes
-/// and stress points differ so the frame loop is exercised across a spectrum
-/// from trivial to maximum stress.
+/// Each variant maps to one row of the module header table, so the profiles
+/// span the range from frame overhead alone to full component pressure.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Profile {
-    /// Original frame_loop: 3 light systems, small components
+    /// Movement, health decay and reporting over small components.
     Standard,
-    /// Standard + 256 B RenderData cache pressure
+    /// `Standard` plus a 256 B `RenderData` read.
     LargeCache,
-    /// tracy_live light: movement, health_decay, collision
+    /// Movement, health decay and collision damage on small components.
     Light,
-    /// tracy_live heavy: gravity, cleanup
+    /// Gravity and cleanup, both compute-heavy.
     HeavyCompute,
-    /// tracy_live cache: render + physics (256 B + 128 B)
+    /// Render and physics reads over 256 B and 128 B components.
     LargeComponents,
-    /// tracy_live full: all 7 systems with all components
+    /// Every system and component, with a `With<Enemy>` filter.
     Full,
 }
 
@@ -139,7 +127,7 @@ fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
     }
 }
 
-/// Slowly decays every entity's health toward zero, clamped at zero.
+/// Adds a fixed step to every entity's health each frame, clamped at zero.
 ///
 /// Exercises the parallel iterator over a single component.
 fn health_decay_system(mut query: Query<&mut Health>) {
@@ -173,7 +161,8 @@ fn enemy_ai_system(mut query: Query<(&mut Position, &mut Velocity), With<Enemy>>
 
 /// Integrates a gravity force scaled by mass using expensive math.
 ///
-/// Heavy-compute workload: sqrt/div/cbrt per entity on the parallel iterator.
+/// Heavy-compute workload: sqrt and division per entity on the parallel
+/// iterator.
 fn gravity_system(mut query: Query<(&mut GravityForce, &Mass)>) {
     query.par_iter_mut().for_each(|(mut force, mass)| {
         let distance_squared = force.x * force.x + force.y.sqrt() * force.y + 0.01;
@@ -240,7 +229,7 @@ fn reporting_system(mut query: Query<(&Position, &Health)>) {
 // Free Functions
 // =============================================================================
 
-/// Linear congruential generator producing a pseudo-random value in `[0, 1)`
+/// Linear congruential generator producing a pseudo-random value in `[0, 1]`
 /// alongside the next generator state.
 ///
 /// Fills entity components with deterministic pseudo-random data so benchmark
@@ -369,9 +358,11 @@ fn build_engine(entity_count: usize, profile: Profile, parallel: bool) -> Engine
     engine
 }
 
-/// Runs `engine.process_frame()` across 6 workload profiles (standard → full tracy_live),
-/// each at multiple entity counts with both parallel and sequential execution.
-/// Measures end-to-end frame cost - the ultimate integration metric for all ECS subsystems.
+/// Runs `engine.process_frame()` for every profile at its entity counts, once
+/// parallel and once sequential.
+///
+/// Measures end-to-end frame cost, the integration metric over all ECS
+/// subsystems.
 fn bench_frame_loop(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("frame_loop");
 

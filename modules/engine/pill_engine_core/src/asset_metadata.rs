@@ -6,26 +6,18 @@
 //!   source's normalized path with `.meta` appended.
 //! - Define what an asset type needs to be loaded through its metadata
 //!   ([`ImportedAsset`]): import settings and a decoder that takes them.
-//! - Load an asset through its metadata file ([`AssetManager::import`]): read
-//!   the guid and settings when the file exists, decode the source, and write
-//!   the file when it is missing and the policy asks for it.
-//! - Decode a loaded asset again in place ([`AssetManager::reimport`]), after
-//!   its source or its metadata file changed.
-//! - Write a missing metadata file for a source without decoding it
-//!   ([`AssetManager::ensure_metadata`]), so a tool can keep every source
-//!   paired with one.
-//! - Follow a source moved with its metadata file
-//!   ([`AssetManager::follow_move`]): the loaded asset takes the new name and
-//!   keeps its handle and guid.
+//! - Own the import pipeline on [`AssetManager`]: [`AssetManager::import`],
+//!   [`AssetManager::reimport`], [`AssetManager::ensure_metadata`] and
+//!   [`AssetManager::follow_move`].
 //!
 //! # Design
 //!
 //! A source file in a project's `res` directory (`textures/helmet.jpg`) can
-//! carry a metadata file beside it (`textures/helmet.jpg.meta`) holding what
-//! the source does not say for itself - the asset's stable guid and its import
-//! settings, never the decoded payload. The extension is kept rather than
-//! replaced, so `helmet.png` and `helmet.obj` never share one. A `.meta` file
-//! is only ever such a sidecar; it is never an asset of its own.
+//! carry a metadata file beside it holding what the source does not say for
+//! itself - the asset's stable guid and its import settings, never the decoded
+//! payload. The extension is kept rather than replaced, so `helmet.png` and
+//! `helmet.obj` never share one, and a `.meta` file is never an asset of its
+//! own.
 //!
 //! The file is JSON with a small header the engine owns and the settings the
 //! asset type owns:
@@ -40,18 +32,16 @@
 //! ```
 //!
 //! An asset loaded this way is named by its normalized path relative to `res`
-//! and keyed by the guid in its metadata. One path is one asset: importing a
-//! path that is already loaded returns the handle it already has, which is
-//! exactly what a project reload re-running its loading code needs. A guid
-//! claimed by a second path (a source copied together with its `.meta`) is
-//! refused rather than silently moved, because the store would otherwise
-//! rebind it.
+//! and keyed by the guid in its metadata. One path is one asset, which is what
+//! a project reload re-running its loading code needs; a guid claimed by a
+//! second path (a source copied together with its `.meta`) is refused rather
+//! than silently moved, because the store would otherwise rebind it.
 //!
 //! Nothing here stores a function pointer: [`AssetManager::import`] is generic,
-//! so each call is compiled into the binary that makes it, and a reload has
-//! nothing new to re-point. Code that does not know an asset's type goes
-//! through [`ImportRegistry`](crate::asset_import_registry::ImportRegistry),
-//! which does store them and handles the reload hazard that brings.
+//! so each call is compiled into the binary that makes it and a reload has
+//! nothing to re-point. Code that does not know an asset's type goes through
+//! [`ImportRegistry`](crate::asset_import_registry::ImportRegistry), which does
+//! store them and handles the reload hazard that brings.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -532,13 +522,12 @@ impl AssetManager {
     /// Load the source asset at `request.path` through its metadata file.
     ///
     /// The asset is named by its normalized path and keyed by the guid in its
-    /// metadata. When the metadata file exists (packed or on disk), its guid
-    /// and settings are used; when it does not, the request's initial
-    /// settings and a new random guid are, and with
+    /// metadata: an existing file's guid and settings win, otherwise the
+    /// request's initial settings and a new random guid are used, and with
     /// [`MetadataPolicy::CreateIfMissing`] the file is written beside the
-    /// source - after the source decoded, so a broken source never leaves a
-    /// metadata file behind. A file that exists is never overwritten, even
-    /// when it cannot be read.
+    /// source - after the source decoded, so a broken source never leaves one
+    /// behind. An existing file is never overwritten, even when it cannot be
+    /// read.
     ///
     /// Importing a path that is already loaded returns its existing handle
     /// with [`ImportOutcome::already_loaded`] set, and reads nothing.
@@ -714,19 +703,15 @@ impl AssetManager {
     /// version moves, so whatever holds the handle sees the new value and a
     /// renderer re-uploads only this asset. The settings come from the
     /// metadata file, or are the type's defaults when there is none. Nothing
-    /// is written.
-    ///
-    /// A path that is not loaded is imported instead, with
-    /// [`MetadataPolicy::ReadIfPresent`]; the outcome's `replaced` is then
-    /// `false`.
+    /// is written. A path that is not loaded is imported instead, with
+    /// [`MetadataPolicy::ReadIfPresent`], and `replaced` is `false`.
     ///
     /// # Errors
     ///
-    /// The errors of [`Self::import`]. In particular a metadata file whose
-    /// guid no longer matches the loaded asset is
-    /// [`AssetImportError::PathBoundToOtherGuid`]. On every error the loaded
-    /// value is left exactly as it was: a source that fails to decode never
-    /// empties its slot.
+    /// The errors of [`Self::import`]. A metadata file whose guid no longer
+    /// matches the loaded asset is [`AssetImportError::PathBoundToOtherGuid`].
+    /// On every error the loaded value is left exactly as it was: a source
+    /// that fails to decode never empties its slot.
     pub fn reimport<T: ImportedAsset>(
         &mut self,
         path: &Path,
@@ -802,11 +787,11 @@ impl AssetManager {
     /// return the guid written; `None` when the file already exists or the
     /// source is not on a writable filesystem (a packed asset).
     ///
-    /// Nothing is decoded or loaded: the file gets `T`'s default settings and
-    /// a guid. When `T` is already loaded under `path`'s name - its `.meta`
-    /// was deleted while it ran - the loaded asset's own guid is written, so
-    /// the running asset and its file keep agreeing. Otherwise a new random
-    /// guid is drawn. An existing file is never touched.
+    /// Nothing is decoded: a source nothing has loaded gets `T`'s default
+    /// settings, one already loaded under `path`'s name the settings it was
+    /// decoded with, so a `.meta` deleted while it ran comes back describing
+    /// the same value. A loaded asset keeps its own guid and anything else
+    /// gets a new random one. An existing file is never touched.
     ///
     /// # Errors
     ///

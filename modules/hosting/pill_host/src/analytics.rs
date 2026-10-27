@@ -19,9 +19,9 @@
 //! modules (`build_runner`, `native_library`, `extension`,
 //! `project_module`) and no single one owns the whole transaction. Records are
 //! keyed by module name, which is unique across the project and extensions.
-//!  The collector is deliberately best-effort: a missing DLL, a PE
-//! that cannot be parsed, or an absent cargo-timings report degrades the
-//! report to `-` instead of failing the build.
+//! The collector is deliberately best-effort: a missing DLL, a PE image that
+//! cannot be parsed, or an absent cargo-timings report degrades the report to
+//! `-` instead of failing the build.
 
 // Standard library
 use std::collections::HashMap;
@@ -46,11 +46,9 @@ use serde_json::Value;
 /// is where the reports land: every build the host spawns runs with
 /// `CARGO_TARGET_DIR` pointing at
 /// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], and cargo writes the
-/// report under whichever target directory it was given. A hardcoded
-/// `target/cargo-timings` found only reports left by ordinary `cargo build`
-/// runs, so the per-crate rebuild breakdown was stale - or, on a clean
-/// checkout, missing entirely - and the `crates rebuilt by cargo:` line
-/// silently disappeared from every reload's analytics.
+/// report under whichever target directory it was given. A named
+/// `target/cargo-timings` would find only the reports of the developer's own
+/// `cargo build` runs.
 ///
 /// Cargo does NOT insert the target triple here, so this stays the same under
 /// the dioxus CLI's `--target` builds; only the artifact directories move.
@@ -66,10 +64,8 @@ fn cargo_timings_directory() -> String {
 ///
 /// Derived from the same private build tree as [`cargo_timings_directory`]:
 /// every build the host spawns runs with `CARGO_TARGET_DIR` pointing at
-/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], so a hardcoded
-/// `target/debug/.fingerprint` only ever found fingerprints left by the
-/// developer's own `cargo build`. The `deps=` detail was therefore empty for
-/// exactly the builds it describes.
+/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], so the fingerprints of
+/// the builds this report describes are the ones under it.
 fn cargo_fingerprint_directory() -> String {
     format!(
         "{}/.fingerprint",
@@ -768,8 +764,8 @@ struct PatchFallback {
     count: u64,
 }
 
-/// Process-wide analytics state, guarded because the build watchdog polls
-/// child memory from the main frame thread.
+/// Process-wide analytics state, guarded because builds record from worker
+/// threads while the frame loop prints the reports.
 struct Analytics {
     started: Instant,
     modules: Vec<ModuleAnalytics>,
@@ -1808,8 +1804,6 @@ const CONCURRENCY_DATA = [
 ];
 </script></body></html>"#;
 
-    /// Build a throwaway workspace whose `target/cargo-timings` holds the
-    /// fixture, and return the workspace root.
     /// The two slot routes promise something the prologue route cannot, and the
     /// benchmark harness keys off exactly this.
     ///
@@ -1817,7 +1811,7 @@ const CONCURRENCY_DATA = [
     /// dispatcher runs the new code. The prologue route overwrites a live
     /// function's first bytes: a caller that inlined the body still runs the old
     /// one, and the twelve-byte write is not atomic. Reporting both as `patch`
-    /// is what made a benchmark average a guarantee with an approximation.
+    /// would make a benchmark average a guarantee with an approximation.
     #[test]
     fn only_the_slot_routes_are_provable() {
         assert!(PatchRoute::EngineSlot.is_provable());
@@ -1873,6 +1867,8 @@ const CONCURRENCY_DATA = [
         assert_eq!(event.kind.label(), "reload");
     }
 
+    /// Build a throwaway workspace whose `target/cargo-timings` holds the
+    /// fixture, and return the workspace root.
     fn fixture_workspace() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1930,12 +1926,12 @@ const CONCURRENCY_DATA = [
     ///
     /// Two states are skipped rather than asserted on, because neither says
     /// anything about the parser. The workspace may never have produced a report
-    /// (a fresh checkout), and - the case that used to fail this test - the
-    /// newest report may come from a build where nothing needed recompiling. An
-    /// up-to-date build still writes a full report, but every unit in it has
-    /// `"duration": 0`, and the parser deliberately keeps only units that
-    /// actually ran. Asserting on a non-empty result therefore made this test
-    /// depend on what the developer happened to build last.
+    /// (a fresh checkout), and the newest report may come from a build where
+    /// nothing needed recompiling: an up-to-date build still writes a full
+    /// report, but every unit in it has `"duration": 0`, and the parser
+    /// deliberately keeps only units that actually ran. Asserting on a
+    /// non-empty result would make this test depend on what the developer
+    /// happened to build last.
     #[test]
     fn parses_real_workspace_timings_when_present() {
         // Two levels up from `hosting/pill_host`, same as the host's own
@@ -2010,10 +2006,10 @@ const CONCURRENCY_DATA = [
 
     /// A truncated optional header must degrade the report, not panic.
     ///
-    /// The guard used to trust the file's own `SizeOfOptionalHeader`, so a
-    /// header declaring 40 bytes passed it and the `SizeOfImage` read at
-    /// offset 56 indexed past the buffer. Both files below panic on the old
-    /// code; the guard now refuses them before anything is read.
+    /// The guard requires the optional header to declare at least the 60 fixed
+    /// bytes the parse reads - the deepest is `SizeOfImage` at offset 56 - so a
+    /// header declaring less is refused before any field is read, instead of
+    /// being trusted and indexing past the buffer.
     #[test]
     fn a_truncated_optional_header_degrades_to_none() {
         // 132 bytes: enough for the COFF header and 40 optional-header bytes

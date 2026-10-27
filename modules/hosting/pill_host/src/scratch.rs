@@ -7,16 +7,14 @@
 //!   processes - a second checkout, a second agent - never share a path, and
 //!   remove it on drop, which a failing test still reaches.
 //! - Date a file explicitly, for tests whose subject is "this file is newer
-//!   than that one": they used to sleep between the two writes, resting on
-//!   filesystem timestamp resolution and the wall clock (SA-0069).
+//!   than that one", so the comparison rests on the date rather than on
+//!   filesystem timestamp resolution and the wall clock.
 //!
 //! # Design
 //!
-//! Test fixtures used to pick their own names and clean up in a trailing
-//! `remove_dir_all` that a failing test never reaches; the fixed names
-//! collided outright when two runs met. One guard for the crate means one
-//! scheme; `Drop` rather than a trailing call means cleanup cannot be
-//! forgotten.
+//! One guard for the crate means one naming scheme, and cleanup in `Drop`
+//! rather than in a trailing call, so a failing test - which never reaches the
+//! end of its body - still removes its directory.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -69,7 +67,7 @@ impl Deref for ScratchDirectory {
     type Target = Path;
 
     /// The directory, so `root.join("x")` and `&root` at a `&Path` parameter
-    /// read exactly as they did when the test owned a bare `PathBuf`.
+    /// both work on the guard directly.
     fn deref(&self) -> &Path {
         &self.path
     }
@@ -84,19 +82,18 @@ impl AsRef<Path> for ScratchDirectory {
 
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
-        // A directory the test already removed (or never made droppable on
-        // another platform) is fine; cleanup is best-effort by design.
+        // A directory the test already removed is fine; cleanup is
+        // best-effort by design.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
 /// Set a file's modification time, so a later write is provably newer.
 ///
-/// A test that needs "this file is newer than that one" used to sleep between
-/// the two writes; dating one side explicitly makes the comparison true by
-/// construction, needs no wall-clock distance and costs no test time. Files
-/// only: Windows cannot open a directory to set its time, so a fixture whose
-/// walk compares directory times must stay flat.
+/// Dating one side explicitly makes a "this file is newer than that one"
+/// comparison true by construction, with no wall-clock distance to wait out.
+/// Files only: Windows cannot open a directory to set its time, so a fixture
+/// whose walk compares directory times must stay flat.
 pub(crate) fn date_file(path: &Path, modified: SystemTime) {
     let file = std::fs::File::options()
         .write(true)

@@ -2,28 +2,30 @@
 //!
 //! # Responsibilities
 //!
-//! - Generate `generated/<module>_Components.g.cs` inside each extension
-//!   that exposes components to managed code, from the module's real
-//!   registered layout (name, size, alignment).
+//! - Generate `generated/<module>_Components.g.cs` inside each extension that
+//!   exposes a managed surface - its components, its mirrored value types and
+//!   its mirrored free functions - from that surface's real registered
+//!   descriptors (name, size, alignment, field layout).
 //! - Keep the declaration with the module: nothing is hand-written in the
 //!   C# project, and the generated file's content derives entirely from what
 //!   the Rust module itself registered.
 //!
 //! # Design
 //!
-//! The generated struct is a raw ABI blob: `[StructLayout(LayoutKind.Sequential,
-//! Size = N)]` plus a private alignment-driving pad field (C# struct alignment
-//! is driven by fields, so the pad makes the managed alignment match the
-//! module's registered layout). The `Raw` span property exposes the live bytes
-//! in safe code, so typed C# can read/write the component through
-//! `MemoryMarshal`. The host validates the generated struct's size/alignment
-//! against the module binding when the managed manifest is registered, so a
-//! generator bug cannot silently produce a mismatched mirror.
+//! Each component is mirrored by a struct over its registered layout: an
+//! opaque `[StructLayout(LayoutKind.Sequential, Size = N)]` blob with an
+//! alignment-driving pad field when no field layout is known, and an explicit
+//! `LayoutKind.Explicit` struct with one field per descriptor when it is (C#
+//! struct alignment is driven by fields, so the pad makes the managed
+//! alignment match the module's). The `Raw` span property exposes the live
+//! bytes in safe code. The host validates the generated struct's size and
+//! alignment against the module binding when the managed manifest is
+//! registered, so a generator bug cannot silently produce a mismatched mirror.
 //!
-//! The file is regenerated on every host startup. A committed copy is kept as
-//! a bootstrap so standalone C# builds (IDE, `dotnet build`, the C# runtime
-//! regression tests) compile without a prior host run; the host overwrites it
-//! with identical content, so a matching module leaves the tree clean.
+//! The file is regenerated on every host startup. A committed copy serves as a
+//! bootstrap so standalone C# builds (IDE, `dotnet build`, the C# runtime
+//! regression tests) compile without a prior host run; identical content is
+//! left untouched, so a matching module keeps the tree clean.
 
 // Standard library
 use std::path::Path;
@@ -107,10 +109,8 @@ pub(crate) fn generate_module_components_csharp(
 
 /// Generate `generated/<module_name>_Components.g.cs` inside `crate_root`.
 ///
-/// The engine of [`generate_module_components_csharp`], for a crate that is not
-/// an extension: the host's own renderer data (`pill_renderer_api`) exposes its
-/// components exactly as an extension does, but lives beside `pill_engine`
-/// rather than in an extension folder under `extensions/`.
+/// The engine of [`generate_module_components_csharp`], taking the directory
+/// that holds the module's `generated/` folder directly.
 ///
 /// # Errors
 ///
@@ -253,7 +253,7 @@ pub(crate) fn generate_components_csharp(
 
     // Each nested definition goes to the namespace the pre-pass chose for it;
     // an opaque stand-in (a type no descriptor declares) goes beside the
-    // components, as before.
+    // components that use it.
     let default_namespace = default_value_namespace(module_name, exposed);
     let nested_namespaces: Vec<String> = nested_definitions
         .iter()
@@ -379,9 +379,9 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
 ///
 /// `size`/`align` come from the Rust type; alignment above 8 is rejected
 /// because no C# primitive can drive it. `struct:` fields are resolved against
-/// the module's `PillMirror` inventory (recursively), falling back to an
-/// opaque blob of the field's size when a type is not declared. Nested
-/// definitions are appended to `emitted` in dependency order.
+/// the module's registered `#[derive(PillMirror)]` types (recursively),
+/// falling back to an opaque blob of the field's size when a type is not
+/// declared. Nested definitions are appended to `emitted` in dependency order.
 ///
 /// `owner_type_name` is the component's Rust type name when this struct
 /// mirrors a component row — which is what enables the heap-field accessor
@@ -500,7 +500,7 @@ fn emit_typed_struct(
             cs.to_string()
         } else if base_tag == "entity" && element_size == std::mem::size_of::<pill_engine::Entity>()
         {
-            // A reference to another entity (W-0048 Stage 6). The runtime's own
+            // A reference to another entity. The runtime's own
             // handle type is the mirror of the Rust one - same `(id, generation)`
             // layout - so the field is typed rather than left an opaque blob.
             "Entity".to_string()
@@ -638,11 +638,12 @@ fn emit_typed_struct(
 
 /// Emit (once) the typed C# struct for a `struct:<path>` field tag.
 ///
-/// Resolves the path against the module's `PillMirror` inventory; when the
-/// type is declared, its own field layout is emitted recursively. When it is
-/// not (an enum, a plain struct that never derived `PillMirror`, a foreign
-/// type), an opaque blob of the field's element size/alignment is emitted so
-/// the mirror still compiles and stays size-correct.
+/// Resolves the path against the module's registered `#[derive(PillMirror)]`
+/// types; when the type is declared, its own field layout is emitted
+/// recursively. When it is not (an enum, a plain struct that never derived
+/// `PillMirror`, a foreign type), an opaque blob of the field's element
+/// size/alignment is emitted so the mirror still compiles and stays
+/// size-correct.
 fn emit_nested_struct(
     qualified: &str,
     size: usize,
@@ -979,9 +980,7 @@ fn value_type_namespaces(
 /// once to the live row with `Bind(ref row)`. A C# struct is copied on
 /// assignment, so a mutator on the value type would reallocate through the
 /// copy and leave the live row pointing at the freed block; on the row-ref
-/// type that call does not compile, and the handle itself copies as a
-/// pointer. The bind check runs once per handle, because every member of the
-/// handle addresses the same row in the same invocation.
+/// type that call does not compile, and the handle itself copies as a pointer.
 ///
 /// Every span is a lease, not ownership: resizing or replacing the container
 /// invalidates it, exactly as a `&mut Vec` would in Rust.
@@ -2724,8 +2723,8 @@ mod tests {
         assert!(content.contains(
             "global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);"
         ));
-        // The member path is raw function pointers now: no delegate types and
-        // no marshalling layer, and the bind check costs one int compare.
+        // The member path is raw function pointers: no delegate types and no
+        // marshalling layer, and the bind check costs one int compare.
         assert!(!content.contains("UnmanagedFunctionPointer"));
         assert!(!content.contains("Resolve<"));
         assert!(content.contains("internal static void EnsureAccessorsBound()"));
@@ -2871,11 +2870,10 @@ mod tests {
     /// Header-mutating members exist only on the row-ref handle, and the
     /// handle binds to a live row with `Bind(ref ...)`.
     ///
-    /// A value-type mutator reallocates through whatever struct the caller
-    /// holds: `var copy = row.Write<Trail>(); copy.ResizePoints(8);` resized
-    /// the real container and stored the new header into the copy, leaving
-    /// the live row pointing at the freed block. Copying the handle copies a
-    /// pointer, and the copying call form stops compiling.
+    /// A value-type mutator would reallocate through whatever struct the
+    /// caller holds - `var copy = row.Write<Trail>(); copy.ResizePoints(8);` -
+    /// leaving the live row pointing at the freed block. Copying the handle
+    /// copies a pointer, and the copying call form stops compiling.
     #[test]
     fn heap_mutators_require_a_row_ref() {
         let workspace = temp_workspace("heap_row_ref", "pill_spline");

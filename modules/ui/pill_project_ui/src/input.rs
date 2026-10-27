@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - [`InputFrame`]: one frame of engine input, owned, so a system can capture
-//!   it before borrowing the UI resource mutably.
+//!   it before the UI resource's mutable borrow.
 //! - [`raw_input`]: that frame as egui's [`RawInput`], against the viewport the
 //!   UI draws into.
 //! - [`map_key`], [`pointer_button`] and [`modifiers`]: the pure conversions it
@@ -16,20 +16,11 @@
 //! The engine reports input as a *snapshot* (what is held, what went down or
 //! up this frame, the accumulated text and scroll), not as an event list, so
 //! the bridge derives egui's events from the snapshot's edges and remembers
-//! the previous value of the two that only exist as "the current state".
-//!
-//! Order matters to egui: modifiers change before the keys they apply to, and
-//! the pointer moves before a button press that names its position, so events
-//! are emitted in that order rather than the snapshot's field order.
-//!
-//! The editor's equivalent (`pill_editor_core::input`) is the shape this mirrors,
-//! deliberately not a dependency: that crate carries `egui_dock` and the
-//! editor's boundary types, and a game build must not link the docking crate
-//! (plan decision D2).
-//!
-//! [`InputFrame`] exists because the resource borrows do not overlap: a system
-//! holds `&Input` and `&mut GameUi` from the same world at once, so the input
-//! is captured first and the borrow released.
+//! the two values that only exist as "the current state". Order matters to
+//! egui: modifiers change before the keys they apply to, and the pointer moves
+//! before a button press that names its position. The editor's equivalent
+//! (`pill_editor_core::input`) mirrors this shape without a dependency, since
+//! its crate carries `egui_dock`, which a game build must not link.
 
 // External crates
 use egui::{Event, ImeEvent, Modifiers, MouseWheelUnit, Pos2, RawInput, Rect, Vec2};
@@ -258,7 +249,8 @@ pub fn raw_input(
             Vec2::new(viewport.x, viewport.y),
         )),
         time: Some(time),
-        // A game window only reports input while it is focused.
+        // The bridge is fed by the game's own window; the engine releases held
+        // input when that window loses focus, so egui sees no stale presses.
         focused: true,
         events,
         ..Default::default()
@@ -292,9 +284,9 @@ pub fn modifiers(engine: EngineModifiers) -> Modifiers {
 
 /// Map an engine key code onto egui's.
 ///
-/// The mapping covers the letters, digits, function keys, arrows and the
-/// editing keys a game UI uses; anything else is dropped rather than guessed
-/// at.
+/// The mapping covers the letters, digits, punctuation, function keys, arrows
+/// and the editing keys a game UI uses; anything else is dropped rather than
+/// guessed at.
 pub fn map_key(key: KeyCode) -> Option<egui::Key> {
     use egui::Key;
     Some(match key {

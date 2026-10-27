@@ -3,10 +3,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Watch the project's asset directory recursively, and debounce edits like
-//!   source edits.
-//! - Map each edited file to the source asset it concerns: a source is
-//!   itself, a metadata file (`a.png.meta`) is its source (`a.png`).
+//! - Watch the project's asset directory recursively, debounce edits like
+//!   source edits, and map each edited file to the source asset it concerns:
+//!   a source is itself, a metadata file (`a.png.meta`) is its source.
 //! - Queue each change as an [`AssetChange`] for the main thread, which
 //!   imports or reimports it through the world's
 //!   [`ImportRegistry`](pill_engine::ImportRegistry).
@@ -17,12 +16,10 @@
 //! so a reload can swap any image at any time without a thread running inside
 //! the one being retired. The main thread applies the queue at the frame
 //! boundary, after the reloads, through the registrations current at that
-//! moment - the same split the shader watcher uses.
-//!
-//! The watcher reports paths, not decisions. Whether a path is an asset at
-//! all (its extension has a registered type), whether it is loaded, and what
-//! to do about a deleted source are the main thread's to decide, where the
-//! registry and the asset store are.
+//! moment - the same split the shader watcher uses. The watcher reports paths,
+//! not decisions: whether a path is an asset at all, whether it is loaded, and
+//! what to do about a deleted source are the main thread's to decide, where
+//! the registry and the asset store are.
 //!
 //! Dot-files are ignored: a metadata write goes through a temporary sibling
 //! named `.<file>.<pid>-<n>.tmp`, and the file it produces is what counts.
@@ -87,10 +84,10 @@ impl AssetWatcher {
             return Ok(None);
         }
 
-        // Step 1: Queue the receiver and spawn the shared watcher worker with
-        // the asset acceptance: every relevant event, rename sides included
-        // (a rename arrives as a remove of the old name and a create of the
-        // new one, which is all this stage needs).
+        // Queue the receiver and spawn the shared watcher worker with the
+        // asset acceptance: every relevant event, rename sides included (a
+        // rename arrives as a remove of the old name and a create of the new
+        // one, and the classification below reads both).
         let (change_sender, changes) = channel::<AssetChange>();
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

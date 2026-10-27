@@ -6,7 +6,7 @@
 //!   order the pipeline's vertex step reads them, plus a 32-bit index list.
 //! - Build meshes three ways: from buffers the game already holds, from the
 //!   built-in triangle used as a stand-in, and by decoding a Wavefront OBJ
-//!   buffer handed over by the managed asset bridge.
+//!   buffer.
 //! - Derive tangent space after an OBJ decode. A file carries positions, UVs
 //!   and normals, so the tangents and bitangents the shaders read are
 //!   accumulated from the mesh's triangles and normalized here.
@@ -116,11 +116,9 @@ impl Mesh {
 
     /// Decodes a Wavefront OBJ buffer into an indexed, tangent-space mesh.
     ///
-    /// The managed (C#) asset-loading bridge is the only other caller today:
-    /// a managed project has no way to build a [`MeshVertex`] buffer itself,
-    /// so it hands the host raw file bytes and gets a mesh back. This is the
-    /// same decode `italian_brainrot`'s Rust project used to do for itself
-    /// before that project moved to the shared bridge.
+    /// A managed (C#) project has no way to build a [`MeshVertex`] buffer
+    /// itself, so the bridge hands the host raw file bytes and gets a mesh
+    /// back; the renderer's asset preview decodes a file through here too.
     ///
     /// # Errors
     ///
@@ -285,8 +283,8 @@ impl Asset for Mesh {
 
 /// How to decode a model file into a mesh: what its `.meta` file holds.
 ///
-/// The defaults are the choices [`Mesh::from_obj_bytes`] always made, so a
-/// mesh imported without a metadata file decodes exactly as before. Every
+/// The defaults flip V and derive tangents, which is what an import with no
+/// metadata file uses, and what [`Mesh::from_obj_bytes`] decodes with. Every
 /// field is part of the metadata file format; `#[serde(default)]` lets a file
 /// written before a field existed still load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,8 +347,8 @@ f 1/1 2/2 3/3\n";
         assert!(Mesh::from_obj_bytes("empty", b"").is_err());
     }
 
-    /// The default settings are the old fixed behaviour, so an import with no
-    /// metadata file gives the same mesh `from_obj_bytes` always did.
+    /// An import with no metadata file decodes through the default settings,
+    /// which is what `from_obj_bytes` uses.
     #[test]
     fn importing_with_default_settings_matches_from_obj_bytes() {
         let decoded = Mesh::from_obj_bytes("t", TRIANGLE_OBJ.as_bytes()).unwrap();

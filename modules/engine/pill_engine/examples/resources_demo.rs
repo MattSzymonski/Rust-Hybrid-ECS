@@ -53,8 +53,6 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
-// Required for component storage
-
 // ============================================================================
 // Resources
 // ============================================================================
@@ -91,7 +89,7 @@ fn time_system(mut time: ResMut<ProjectTime>) {
 
 /// Apply velocity to position for every entity.
 ///
-/// - `Query<&mut Position, &Velocity>` ⇒ writes Position, reads Velocity.
+/// - `Query<(&mut Position, &Velocity)>` ⇒ writes Position, reads Velocity.
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
     for (mut pos, vel) in query.iter_mut() {
         pos.x += vel.vx;
@@ -115,7 +113,7 @@ fn scoring_system(mut query: Query<&Position>, mut score: ResMut<Score>) {
 /// Print current project stats.
 ///
 /// - `Query<(Entity, &Position)>` ⇒ reads Position (and entity id).
-/// - `Res<ProjectTime>`              ⇒ reads ProjectTime.
+/// - `Res<ProjectTime>`           ⇒ reads ProjectTime.
 /// - `Res<Score>`                 ⇒ reads Score.
 fn display_system(
     mut query: Query<(Entity, &Position)>,

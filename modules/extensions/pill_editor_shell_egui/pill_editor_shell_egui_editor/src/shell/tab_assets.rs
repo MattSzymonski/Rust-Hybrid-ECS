@@ -6,8 +6,7 @@
 //! - `assets_tree` and `folder_tree_rows`: the folder rows, their carets and the drag targets.
 //! - The path bar, the zoom bar and `assets_grid`.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -44,17 +43,21 @@ pub fn assets_tab(
     // lists a path the listing no longer holds.
     browser.settle(&snapshot.assets);
     let selected_row = assets::selected_row(writes.selection, &snapshot.assets);
-    let selected_is_file = selected_row.is_some_and(|row| row.kind != "folder");
-    let missing_meta =
-        selected_row.is_some_and(|row| row.kind != "folder" && !row.standalone && !row.has_meta);
+    let selected_is_file = selected_row.is_some_and(|row| row.kind != "folder" && !row.read_only);
+    let missing_meta = selected_row.is_some_and(|row| {
+        row.kind != "folder" && !row.standalone && !row.has_meta && !row.read_only
+    });
+    // Nothing is created inside a module's resources.
+    let folder_is_read_only = assets::is_read_only_key(&snapshot.assets, &browser.folder);
     // The toolbar: creating opens the dialog; the rest act on the selected
-    // entry and queue recorded file commands. The buttons only appear when
-    // they can act, like the native panel's. The tab's own title already
-    // names the panel, so a second heading would only cost the grid room.
+    // entry and queue recorded file commands. A button only appears when it
+    // can act. The tab's own title already names the panel, so a second
+    // heading would only cost the grid room.
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
-            .clicked()
+        if !folder_is_read_only
+            && ui
+                .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
+                .clicked()
         {
             assets::open_create(
                 writes.dialog,
@@ -112,11 +115,13 @@ pub fn assets_tab(
     });
 }
 
-/// The Assets tab's folder tree: the project's asset root, then every folder
-/// under it at its own indent, with the open folder's row highlighted. A
-/// row click opens that folder in the grid and selects it (the create
-/// dialog's destination follows the selection); the caret opens and closes
-/// its children; a dropped tile moves its file into the row's folder.
+/// The Assets tab's folder tree: the panel's two roots - the project's
+/// assets and the extensions' read-only resources - then every folder under
+/// each at its own indent, with the open folder's row highlighted. A row
+/// click opens that folder in the grid and selects it (the create dialog's
+/// destination follows the selection); the caret opens and closes its
+/// children; a dropped tile moves its file into the row's folder, and the
+/// extensions side takes no drops at all.
 pub fn assets_tree(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
@@ -127,20 +132,38 @@ pub fn assets_tree(
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            let root = ui.selectable_label(
-                browser.folder.is_empty(),
-                icons::rich(icons::Icon::Folder, browser::ROOT_LABEL),
-            );
-            if root.clicked() {
-                browser.open("");
-            }
-            if let Some(dragged) = root.dnd_release_payload::<String>() {
-                if let Some(to) = assets::drop_destination(&dragged, "") {
-                    assets::queue_move(pending, &dragged, &to);
+            for root in browser::ROOTS {
+                // The panel's own level: the project's tree, and every
+                // extension's resources beside it rather than inside it.
+                let root_row = ui.selectable_label(
+                    browser.folder == root.key,
+                    icons::rich(icons::Icon::Folder, root.label),
+                );
+                if root_row.clicked() {
+                    browser.open(root.key);
                 }
+                if let Some(dragged) = root_row.dnd_release_payload::<String>() {
+                    if !root.read_only {
+                        if let Some(to) = assets::drop_destination(&dragged, root.key) {
+                            assets::queue_move(pending, &dragged, &to);
+                        }
+                    }
+                }
+                root_row.on_hover_text(if root.read_only {
+                    "The extensions' resources: listed and inspected, never written"
+                } else {
+                    "The project's asset root"
+                });
+                folder_tree_rows(
+                    ui,
+                    &snapshot.assets,
+                    browser,
+                    selection,
+                    pending,
+                    root.key,
+                    1,
+                );
             }
-            root.on_hover_text("The project's asset root");
-            folder_tree_rows(ui, &snapshot.assets, browser, selection, pending, "", 1);
         });
 }
 
@@ -156,7 +179,9 @@ pub fn folder_tree_rows(
     depth: usize,
 ) {
     for folder in browser::child_folders(assets, parent) {
-        let path = folder.path.as_str();
+        let key = folder.key();
+        let path = key.as_str();
+        let read_only = folder.read_only;
         let expanded = browser.is_expanded(path);
         let has_children = !browser::child_folders(assets, path).is_empty();
         let mut toggle = false;
@@ -186,8 +211,12 @@ pub fn folder_tree_rows(
             if label.clicked() {
                 open = true;
             }
+            // A module's resource tree takes no drops: nothing may be written
+            // into it.
             if let Some(dragged) = label.dnd_release_payload::<String>() {
-                dropped = Some(dragged);
+                if !read_only {
+                    dropped = Some(dragged);
+                }
             }
             label.on_hover_text(path);
         });
@@ -296,9 +325,9 @@ pub fn assets_grid(
                     );
                     ui.close();
                 }
-                // The open folder itself in the platform's file manager
-                // (W-0049 Stage 10): the empty area has no row to reveal, so
-                // it reveals the folder the grid is showing.
+                // The open folder itself in the platform's file manager: the
+                // empty area has no file row to reveal, so it reveals the
+                // folder the grid is showing.
                 if ui
                     .add(icons::IconButton::new(
                         icons::Icon::FolderOpen,

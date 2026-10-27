@@ -4,7 +4,7 @@
 //! # Responsibilities
 //!
 //! - [`system_row_label`]: the `name (owner)` text with its `[ambiguous]`
-//!   marker, the spelling the native Systems panel uses.
+//!   marker, the spelling the Systems tab shows.
 //! - [`system_state_label`] and [`system_toggle`]: the `on`/`off` button
 //!   text and the recorded `SetSystemEnabled` edit it queues, with the
 //!   history label `system {index} on|off`.

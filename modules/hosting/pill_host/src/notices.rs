@@ -1,4 +1,4 @@
-//! Host activity notes for an attached editor frontend (Stage 19).
+//! Host activity notes for an attached editor frontend.
 //!
 //! # Responsibilities
 //!
@@ -118,10 +118,9 @@ mod tests {
     /// Serializes the two tests that share the process-global queue.
     ///
     /// `cargo test` runs them on parallel threads, so without this the
-    /// capacity test's 260 pushes land between the order test's two pushes
-    /// and its drain, failing both. nextest gives every test its own process
-    /// and never sees it, which is how the race survived until a plain
-    /// `cargo test -p pill_host` ran.
+    /// capacity test's pushes land between the order test's two pushes and
+    /// its drain, failing both. nextest gives every test its own process and
+    /// never sees the race.
     static QUEUE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// The queue hands notices back in order and empties on take.

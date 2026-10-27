@@ -306,8 +306,7 @@ impl MeshDrawer {
     /// # Errors
     ///
     /// Never returns an error: every step is a wgpu call that reports nothing
-    /// to check, and `Ok(())` is the only value produced. The `Result` keeps
-    /// the call site uniform with the frame path's other fallible steps.
+    /// to check; the `Result` keeps the call site uniform with the frame path.
     #[allow(clippy::too_many_arguments)]
     pub fn record_draw_commands(
         &mut self,
@@ -368,8 +367,8 @@ impl MeshDrawer {
                 // The key packs every handle the draw binds, so an item whose
                 // key equals the one before it needs nothing rebound: it only
                 // extends the current draw. The queue is sorted by key, so
-                // that is nearly every item, and unpacking the key and
-                // rebuilding three handles for each was most of this loop.
+                // that is nearly every item, and the key is unpacked only
+                // where the bound state actually changes.
                 if previous_key == Some(render_queue_item.key) {
                     current_drawing_context.accumulate_instance();
                     continue;
@@ -424,7 +423,6 @@ impl MeshDrawer {
                     );
                 }
 
-                // Add new instance
                 current_drawing_context.accumulate_instance();
             }
         }

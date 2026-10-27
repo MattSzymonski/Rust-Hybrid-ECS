@@ -1,8 +1,7 @@
 //! Editor-owned state and commands over the engine.
 //!
-//! This module is the only place in `pill_editor` that talks to the engine's
-//! world and systems. It depends on `pill_engine` directly; `pill_host` only
-//! hands the engine over through `RenderingHost::engine()/engine_mut()`.
+//! It depends on `pill_engine` directly; `pill_host` only hands the engine
+//! over through `RenderingHost::engine()/engine_mut()`.
 //!
 //! # Responsibilities
 //!
@@ -13,9 +12,8 @@
 //!
 //! - **Reads** are tiered snapshots ([`EditorSnapshot`]) rebuilt from a live
 //!   `&Engine` at the frame boundary. Nothing is cached between refreshes
-//!   except `Entity` handles and the window layout, so hot reload can never
-//!   leave stale metadata behind: components are addressed by name and
-//!   re-resolved per capture.
+//!   except `Entity` handles, so hot reload can never leave stale metadata
+//!   behind: components are addressed by name and re-resolved per capture.
 //! - **Mutations** are queued [`EditorCommand`]s flushed in one batch at the
 //!   frame boundary, before the frame runs. Every engine call this dispatches
 //!   is all-or-nothing; failures are returned as `(index, message)` pairs for
@@ -65,11 +63,11 @@ pub struct ComponentView {
     /// One current value per field, parallel to `fields`.
     pub values: Vec<FieldValue>,
     /// What each asset reference field names, parallel to `values`: `None`
-    /// for a field that is not an asset reference (W-0048). Resolved when
+    /// for a field that is not an asset reference. Resolved when
     /// the view is captured, since the shell sees no asset store.
     pub asset_labels: Vec<Option<AssetReferenceLabel>>,
     /// What each entity reference field names, parallel to `values`: `None`
-    /// for a field that is not an entity reference (W-0048 Stage 6). Resolved
+    /// for a field that is not an entity reference. Resolved
     /// when the view is captured, for the same reason.
     pub entity_labels: Vec<Option<EntityReferenceLabel>>,
 }
@@ -179,7 +177,7 @@ pub struct EntityPickTarget {
     pub field: String,
 }
 
-/// The world resource carrying an armed entity pick (W-0048 Stage 6).
+/// The world resource carrying an armed entity pick.
 ///
 /// The Inspector row arms it through [`EditorCommand::ArmEntityPick`] and the
 /// executable that answers scene picks reads it: the shell draws rows and has
@@ -210,10 +208,10 @@ pub struct EntityDetail {
     pub components: Vec<ComponentView>,
 }
 
-/// How many selected entities the snapshot captures a detail for (W-0038
-/// Stage 16). A selection past this size still edits the primary and the
-/// entities it has details for; the cap keeps a Ctrl+A over a large scene from
-/// rebuilding hundreds of component views every frame.
+/// How many selected entities the snapshot captures a detail for. A
+/// selection past this size still edits the primary and the entities it has
+/// details for; the cap keeps a Ctrl+A over a large scene from rebuilding
+/// hundreds of component views every frame.
 pub const SELECTED_DETAILS_MAX: usize = 64;
 
 /// One row of the Systems tab.
@@ -234,27 +232,57 @@ pub struct SystemSummary {
     pub name_is_ambiguous: bool,
 }
 
+/// The Assets panel's second root: the folder every extension's read-only
+/// resources hang under, beside the project's own tree rather than inside it.
+pub const EXTENSIONS_ROOT: &str = "extensions";
+
 /// One row of the Assets panel: a file or folder the browser knows about.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetListing {
-    /// Project-relative path, forward slashes.
+    /// The root the row came from: empty for the project's own `res`, else the
+    /// name of the module whose read-only resources it is. A root's
+    /// own row has an empty [`Self::path`].
+    pub root: String,
+    /// The path within its root, forward slashes.
     pub path: String,
+    /// Whether the row is one of a module's resources: listed and inspected,
+    /// never written.
+    pub read_only: bool,
     /// A short kind label: the asset type, `file`, or `folder`.
     pub kind: String,
     /// Whether the entry is a standalone asset (it holds its own header).
     pub standalone: bool,
     /// Whether a `.meta` sidecar - or a standalone header - carries a guid;
-    /// a sourced file without one can get a written sidecar (Stage 25).
+    /// a sourced file without one can get a written sidecar.
     pub has_meta: bool,
     /// The asset's guid when the file names one, in its sidecar or its own
-    /// header (W-0049): what a settings document's reference writes, and the
-    /// key that names the asset behind such a reference.
+    /// header: what a settings document's reference writes, and the key that
+    /// names the asset behind such a reference.
     pub guid: Option<String>,
 }
 
-/// One standalone asset type a new file can be created for (Stage 25): a
-/// row of the create dialog, straight from the loaded modules'
-/// registrations.
+impl AssetListing {
+    /// The row as the tree and the grid name it: [`Self::path`] inside the
+    /// project, `extensions/root/path` inside an extension's resources (the
+    /// root alone for the root's own row).
+    ///
+    /// Project rows keep their plain path, so a selection, a command and a
+    /// scripted verb name a project asset by the path it carries. The
+    /// extension rows hang under [`EXTENSIONS_ROOT`], which is a root of the
+    /// panel in its own right, never a folder inside the project's tree.
+    pub fn key(&self) -> String {
+        if self.root.is_empty() {
+            self.path.clone()
+        } else if self.path.is_empty() {
+            format!("{EXTENSIONS_ROOT}/{}", self.root)
+        } else {
+            format!("{EXTENSIONS_ROOT}/{}/{}", self.root, self.path)
+        }
+    }
+}
+
+/// One standalone asset type a new file can be created for: a row of the
+/// create dialog, straight from the loaded modules' registrations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StandaloneTypeInfo {
     /// The registered type name, written to the file's `asset_type`.
@@ -265,12 +293,18 @@ pub struct StandaloneTypeInfo {
     pub extension: String,
 }
 
-/// The selected asset's detail for the Inspector (Stage 17): its row data
+/// The selected asset's detail for the Inspector: its row data
 /// and the import settings document the editable rows build on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetDetail {
-    /// Project-relative path, forward slashes.
+    /// The root the asset came from: empty for the project, else the module
+    /// whose read-only resources it is.
+    pub root: String,
+    /// The path within its root, forward slashes.
     pub path: String,
+    /// Whether the asset is one of a module's resources: shown, never edited -
+    /// every one of its rows is read-only.
+    pub read_only: bool,
     /// A short kind label: the asset type, `file`, or `folder`.
     pub kind: String,
     /// Whether the entry is a standalone asset (its own document).
@@ -278,9 +312,26 @@ pub struct AssetDetail {
     /// The import settings document (a standalone asset's body, or the
     /// sidecar's `settings`); `None` for folders and unknown extensions.
     pub settings: Option<serde_json::Value>,
+    /// The texture slots a material's shader declares, in declaration order:
+    /// every one gets a row, whether or not the document binds it yet.
+    pub texture_slots: Vec<String>,
 }
 
-/// What a click on an entity row means (W-0038 Stage 16).
+impl AssetDetail {
+    /// The asset as the tree, the grid and the selection name it; see
+    /// [`AssetListing::key`].
+    pub fn key(&self) -> String {
+        if self.root.is_empty() {
+            self.path.clone()
+        } else if self.path.is_empty() {
+            format!("{EXTENSIONS_ROOT}/{}", self.root)
+        } else {
+            format!("{EXTENSIONS_ROOT}/{}/{}", self.root, self.path)
+        }
+    }
+}
+
+/// What a click on an entity row means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionClick {
     /// Replace the selection with the clicked entity.
@@ -298,7 +349,7 @@ pub enum SelectionClick {
 /// Inspector follows whichever slot holds - a resource selection is exclusive
 /// with the other two.
 ///
-/// The entity slot is a **set** (W-0038 Stage 16): the last entity in it is the
+/// The entity slot is a **set**: the last entity in it is the
 /// primary, which is what the gizmo acts on, what the scene outlines most
 /// brightly and what the Inspector edits first. Ctrl extends the set, Shift
 /// extends it over the Entities list's range, and a plain click replaces it.
@@ -309,9 +360,9 @@ pub struct EditorSelection {
     entities: Vec<Entity>,
     /// The selected asset's project-relative path, when one is.
     pub asset: Option<String>,
-    /// The selected world resource's stable name, when one is (W-0038
-    /// Stage 14). A resource selection is exclusive with the other two: the
-    /// Inspector shows one thing at a time.
+    /// The selected world resource's stable name, when one is. A resource
+    /// selection is exclusive with the other two: the Inspector shows one
+    /// thing at a time.
     pub resource: Option<String>,
 }
 
@@ -408,8 +459,8 @@ impl pill_engine::Resource for EditorSelection {}
 
 /// The complete per-refresh view the editor renders.
 ///
-/// Owned by [`EditorContext`](crate::EditorContext) and handed out by clone;
-/// every dock and pop-out window polls its own copy, like `Stats` does.
+/// Captured from a live engine each frame and published as a world resource;
+/// the shell and the executable's dumps read the captured copy.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EditorSnapshot {
     /// Host reload/rollback/patch counter at capture time.
@@ -418,11 +469,10 @@ pub struct EditorSnapshot {
     pub entities: Vec<EntityListEntry>,
     /// Detail of the selected entity, if the selection is still alive.
     pub detail: Option<EntityDetail>,
-    /// The detail of every selected entity, in selection order (W-0038
-    /// Stage 16). The Inspector draws the primary's rows and reads this to
-    /// find which other selected entities a component edit can reach, and
-    /// which rows the selection disagrees on. Bounded by
-    /// [`SELECTED_DETAILS_MAX`].
+    /// The detail of every selected entity, in selection order. The Inspector
+    /// draws the primary's rows and reads this to find which other selected
+    /// entities a component edit can reach, and which rows the selection
+    /// disagrees on. Bounded by [`SELECTED_DETAILS_MAX`].
     pub selected_details: Vec<EntityDetail>,
     /// Registered systems with owner labels.
     pub systems: Vec<SystemSummary>,
@@ -431,10 +481,10 @@ pub struct EditorSnapshot {
     pub components: Vec<RegisteredComponent>,
     /// The asset browser's rows (the Assets panel).
     pub assets: Vec<AssetListing>,
-    /// The live standalone asset types (Stage 25): what a create dialog may
+    /// The live standalone asset types: what a create dialog may
     /// offer.
     pub standalone_types: Vec<StandaloneTypeInfo>,
-    /// The selected asset's detail (Stage 17): the Inspector's asset
+    /// The selected asset's detail: the Inspector's asset
     /// section.
     pub asset_detail: Option<AssetDetail>,
     /// Whether the engine's system phase is paused.
@@ -442,13 +492,13 @@ pub struct EditorSnapshot {
     /// The gizmo tool's settings (mode, space, snapping); the Scene tab's
     /// context menu checks its items against them.
     pub gizmo: crate::gizmo::GizmoSettings,
-    /// Whether the scene grid is on (Stage 23); the toolbox's grid row and
+    /// Whether the scene grid is on; the toolbox's grid row and
     /// the Scene tab's menu check it against the renderer's switch.
     pub grid_enabled: bool,
     /// The preferences file's values and the current project's remembered
-    /// entry (Stage 20); the Preferences tab's rows read them.
+    /// entry; the Preferences tab's rows read them.
     pub preferences: crate::preferences::PreferencesView,
-    /// The theme the editor's UI paints with (W-0127 Stage 6): the code
+    /// The theme the editor's UI paints with: the code
     /// default merged with the user's and the project's layers.
     pub theme: pill_ui_theme::Theme,
     /// How many themes the executable has resolved. The shell installs
@@ -457,7 +507,7 @@ pub struct EditorSnapshot {
     /// The layers [`Self::theme`] was merged from, in apply order; the code
     /// default is always first.
     pub theme_layers: Vec<crate::style::ThemeLayerInfo>,
-    /// The font bytes the theme's layers resolved (W-0127 Stage 7), installed
+    /// The font bytes the theme's layers resolved, installed
     /// with the theme.
     pub theme_fonts: crate::kit::style::ThemeFonts,
     /// How many steps the undo history holds; the menu bar's Undo row greys
@@ -466,26 +516,24 @@ pub struct EditorSnapshot {
     /// How many steps the redo history holds.
     pub redo_depth: usize,
     /// What the title bar shows for the open scene: the file name, or
-    /// `untitled`, with a trailing `*` while it has unsaved edits (W-0048
-    /// Stage 9).
+    /// `untitled`, with a trailing `*` while it has unsaved edits.
     pub scene_title: String,
     /// Whether a scene file is open; Save greys out when nothing is.
     pub scene_open: bool,
     /// Where Save As writes by default: the open scene's path, or
     /// `scenes/untitled.scene` for a world that was never saved.
     pub scene_save_path: String,
-    /// Every registered command in registration order (W-0038 Stage 2): the
+    /// Every registered command in registration order: the
     /// menu bar draws a row per command whose menu path names the menu, and
     /// a spec that is not here has no row.
     pub commands: Vec<crate::commands::CommandView>,
-    /// The Console tab's filters and newest rows (W-0038 Stage 5).
+    /// The Console tab's filters and newest rows.
     pub console: crate::console::ConsoleView,
-    /// Build errors and warnings, grouped by the module that reported them
-    /// (W-0038 Stage 6).
+    /// Build errors and warnings, grouped by the module that reported them.
     pub problems: Vec<crate::notices::ProblemRow>,
     /// Command failures from the last apply batch, newest first.
     pub errors: Vec<String>,
-    /// The editable world resources and their field values (W-0038 Stage 14).
+    /// The editable world resources and their field values.
     pub resources: Vec<ResourceView>,
 }
 
@@ -544,7 +592,7 @@ impl EditorSnapshot {
                 .unwrap_or(false),
             preferences: crate::preferences::PreferencesView::default(),
             // The code default until the executable resolves its layers
-            // (W-0127 Stage 6): every postures' first frame paints the editor
+            //: every postures' first frame paints the editor
             // look rather than the crate's neutral fallback.
             theme: crate::style::default_theme(),
             theme_generation: 1,
@@ -625,9 +673,8 @@ impl EditorSnapshot {
     /// each with owned label strings. A 200k-entity world spends real time
     /// here in debug builds. The editor captures it every frame, because the
     /// rows must follow a system that spawns, despawns or re-composes an
-    /// entity; caching it needs a change signal the world does not expose yet
-    /// (W-0089's follow-up: `entity_count` alone misses a spawn and a despawn
-    /// in the same frame).
+    /// entity; caching it needs a change signal the world does not expose:
+    /// `entity_count` alone misses a spawn and a despawn in the same frame.
     pub fn capture_entities(engine: &Engine) -> Vec<EntityListEntry> {
         engine
             .world()
@@ -782,7 +829,7 @@ pub struct RegisteredComponent {
     /// Registered type name (the stable cross-reload key).
     pub type_name: String,
     /// True when some generation of this type has a non-empty field layout,
-    /// so the editor can zero-initialise an image of it (the §2.2 rule).
+    /// so the editor can zero-initialise an image of it.
     pub addable: bool,
 }
 
@@ -873,8 +920,7 @@ pub enum EditorCommand {
         value: FieldValue,
     },
     /// Point an asset reference field at the asset `reference` names - a path
-    /// relative to `res` or a 32-digit guid - or clear it with `None`
-    /// (W-0048).
+    /// relative to `res` or a 32-digit guid - or clear it with `None`.
     ///
     /// Resolved at the frame boundary, where the asset is loaded first when
     /// it is not loaded yet; it then writes like a [`Self::SetField`], whose
@@ -889,8 +935,8 @@ pub enum EditorCommand {
         /// The asset's path or guid, or `None` to clear the reference.
         reference: Option<String>,
     },
-    /// Point an entity reference field at `reference`, or clear it with `None`
-    /// (W-0048 Stage 6).
+    /// Point an entity reference field at `reference`, or clear it with
+    /// `None`.
     ///
     /// The handle is checked against the world when the batch is applied, so a
     /// reference to an entity that has gone by then is refused rather than
@@ -906,8 +952,7 @@ pub enum EditorCommand {
         /// The entity to reference, or `None` to clear the reference.
         reference: Option<Entity>,
     },
-    /// Wait for the next scene click to name an entity reference field
-    /// (W-0048 Stage 6).
+    /// Wait for the next scene click to name an entity reference field.
     ///
     /// The row's target button arms it and the scene click answers it; neither
     /// is an edit, so nothing is recorded until the click names an entity.
@@ -944,7 +989,7 @@ pub enum EditorCommand {
         /// Desired pause state.
         paused: bool,
     },
-    /// Choose what the transform gizmo edits (Stage 20): the tool's mode,
+    /// Choose what the transform gizmo edits: the tool's mode,
     /// its space, or whether dragging snaps. Absent fields keep their value.
     SetGizmoTool {
         /// The mode to select.
@@ -954,7 +999,7 @@ pub enum EditorCommand {
         /// The snapping toggle's new state.
         snap: Option<bool>,
     },
-    /// Turn the scene grid on or off (Stage 23): the infinite ground the
+    /// Turn the scene grid on or off: the infinite ground the
     /// editor's view-bound surfaces draw.
     SetGrid {
         /// The grid's new state.
@@ -963,7 +1008,7 @@ pub enum EditorCommand {
     /// Run exactly one system phase on the next frame, then pause again.
     StepOnce,
     /// Copy files from outside the project into the assets directory (a
-    /// drag-and-drop import, Stage 18). Undo removes the copies; a file of
+    /// drag-and-drop import). Undo removes the copies; a file of
     /// the same name is overwritten.
     ImportFiles {
         /// Absolute source paths, as the OS reported them.
@@ -981,8 +1026,8 @@ pub enum EditorCommand {
         /// Where the copies live (the redo's destination).
         destination: String,
     },
-    /// Create a standalone asset of `type_name` called `name` in `folder`
-    /// (Stage 25), both relative to the asset directory.
+    /// Create a standalone asset of `type_name` called `name` in `folder`,
+    /// both relative to the asset directory.
     ///
     /// The file is the type's default document with a fresh guid, written so
     /// an existing file is never replaced, then imported at once; its
@@ -998,7 +1043,7 @@ pub enum EditorCommand {
         name: String,
     },
     /// Delete the asset file at `path`, relative to the asset directory,
-    /// together with its `.meta` sidecar (Stage 25).
+    /// together with its `.meta` sidecar.
     ///
     /// The apply captures both files' bytes before deleting them; the
     /// inverse is the restore that puts them back, the sidecar's guid
@@ -1007,7 +1052,7 @@ pub enum EditorCommand {
         /// The asset's path relative to the asset directory.
         path: String,
     },
-    /// Restore the asset files a delete captured (Stage 25): the file's
+    /// Restore the asset files a delete captured: the file's
     /// bytes, and the sidecar's when it had one. The inverse is the delete,
     /// so the pair round-trips; like the other restore commands this is
     /// never a recorded edit of its own.
@@ -1020,7 +1065,7 @@ pub enum EditorCommand {
         meta: Option<Vec<u8>>,
     },
     /// Move or rename the asset at `from` to `to`, both relative to the
-    /// asset directory (Stage 25).
+    /// asset directory.
     ///
     /// The `.meta` sidecar travels with the file and the asset watcher
     /// follows the move, so the loaded asset keeps its handle and guid; the
@@ -1031,8 +1076,8 @@ pub enum EditorCommand {
         /// Where it goes, relative to the asset directory.
         to: String,
     },
-    /// Write the `.meta` sidecar the sourced asset at `path` is missing
-    /// (Stage 25), with the type's defaults and a fresh guid. A no-op - and
+    /// Write the `.meta` sidecar the sourced asset at `path` is missing, with
+    /// the type's defaults and a fresh guid. A no-op - and
     /// so nothing recorded - where a sidecar exists; the inverse deletes
     /// the written sidecar.
     WriteAssetMeta {
@@ -1040,7 +1085,7 @@ pub enum EditorCommand {
         path: String,
     },
     /// Replace the import settings of the asset at `path` - or a standalone
-    /// asset's own document - with `settings` (Stage 25). The inverse
+    /// asset's own document - with `settings`. The inverse
     /// carries the previous value, which the apply reads before writing.
     SetAssetSettings {
         /// The asset's path relative to the asset directory.
@@ -1048,10 +1093,11 @@ pub enum EditorCommand {
         /// The new settings (or document) body.
         settings: serde_json::Value,
     },
-    /// Set one field of one editor-editable resource (Stage 25).
+    /// Set one field of one editor-editable resource.
     ///
     /// The engine keeps no resource reflection, so the resources this can
-    /// name are curated in [`crate::gizmo`], field by field; the inverse
+    /// name are curated in [`crate::resources::EDITABLE_RESOURCES`] and read
+    /// and written field by field through [`crate::gizmo`]; the inverse
     /// carries the previous value.
     SetResourceField {
         /// The resource's stable name (its type path).
@@ -1061,7 +1107,7 @@ pub enum EditorCommand {
         /// The new value.
         value: FieldValue,
     },
-    /// Set the shared selection (Stage 25). Consecutive selection changes
+    /// Set the shared selection. Consecutive selection changes
     /// merge into one history step through a coalesce key; the inverse
     /// carries the previous pair, so undo goes back one selection at a
     /// time.
@@ -1072,7 +1118,7 @@ pub enum EditorCommand {
         /// The selected asset's path, when one is.
         asset: Option<String>,
     },
-    /// Select one world resource for the Inspector (W-0038 Stage 14).
+    /// Select one world resource for the Inspector.
     ///
     /// Its own command rather than a third field of [`EditorCommand::SetSelection`]:
     /// selecting a resource clears the entity and asset slots, and an undo of
@@ -1094,7 +1140,7 @@ pub enum EditorCommand {
         /// The resource slot to restore.
         resource: Option<String>,
     },
-    /// Write preferences file values (Stage 20): one `(key, text)` pair per
+    /// Write preferences file values: one `(key, text)` pair per
     /// edited row, applied as a read-modify-write of the preferences
     /// document so keys other writers own survive. A pair whose text is
     /// blank writes nothing; the file's live reader applies the values
@@ -1103,8 +1149,7 @@ pub enum EditorCommand {
         /// `(key, value)` pairs; keys are the file's own, dots nest.
         values: Vec<(String, String)>,
     },
-    /// Start an empty scene: every entity goes, no file is open (W-0048
-    /// Stage 9).
+    /// Start an empty scene: every entity goes, no file is open.
     ///
     /// A document action, not an edit: it is not recorded, and the history it
     /// would otherwise fill names entities this world no longer has.
@@ -1157,6 +1202,27 @@ fn asset_authoring_root() -> Result<PathBuf, String> {
     pill_engine::asset_store::mounted_directory().ok_or("no asset directory is mounted".to_owned())
 }
 
+/// Refuse `relative` when it names one of a module's resources.
+///
+/// A module's resources are listed and inspected, never written: the
+/// check sits in every mutation arm, so the widget, the context menu and the
+/// scripted channel all hit it. The [`EXTENSIONS_ROOT`] itself is refused too:
+/// no asset of the project's lives there, so a command carrying a key that
+/// deep is a bug rather than an edit.
+fn refuse_module_resource(command: &EditorCommand, relative: &Path) -> Result<(), String> {
+    let grouped = relative
+        .components()
+        .next()
+        .is_some_and(|first| first.as_os_str() == EXTENSIONS_ROOT);
+    if grouped || pill_engine::asset_store::is_module_asset(relative) {
+        return Err(format!(
+            "{command:?}: `{}` is a module's resource and cannot be modified",
+            asset_slash(relative)
+        ));
+    }
+    Ok(())
+}
+
 /// `path` as a `/`-separated string, the form asset commands carry.
 fn asset_slash(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -1204,8 +1270,8 @@ impl EditorCommand {
     /// Whether this command is an undoable edit.
     ///
     /// Engine controls (pause, step) and the restore commands themselves are
-    /// not edits: they never enter the history. A system toggle is an edit -
-    /// it is persisted project state - so it records.
+    /// not edits: they never enter the history. A system toggle is an edit,
+    /// so it records.
     pub fn recordable(&self) -> bool {
         matches!(
             self,
@@ -1368,17 +1434,16 @@ impl EditorCommand {
 
     /// Apply a batch and compute the inverse of every edit it performed.
     ///
-    /// This is the single application path: the plain [`Self::apply`] only
-    /// discards the recording. A command is only recorded when it succeeded
-    /// and produced an inverse, so an undo can never half-restore a batch;
-    /// [`RecordedApply::fully_invertible`] reports whether that held.
+    /// This is the single application path: [`Self::apply`] only discards
+    /// the recording. A command is recorded only when it succeeded and
+    /// produced an inverse, which [`RecordedApply::fully_invertible`] reports.
     ///
     /// The batch runs against its own copy because a restore assigns a fresh
     /// handle mid-batch: every command behind it - and every inverse already
-    /// collected - follows the entity to the new handle, exactly like the
-    /// history entries do. Without that, a delete recorded as `destroy, clear
-    /// the selection` would undo its clear before the restore exists and the
-    /// selection would come back pointing at nothing.
+    /// collected - follows the entity, exactly like the history entries do.
+    /// Without that, a delete recorded as `destroy, clear the selection`
+    /// would undo its clear before the restore exists and the selection would
+    /// come back pointing at nothing.
     pub fn apply_recorded(engine: &mut Engine, commands: &[EditorCommand]) -> RecordedApply {
         let mut outcome = RecordedApply {
             fully_invertible: true,
@@ -1898,6 +1963,7 @@ impl EditorCommand {
                 let file_name = pill_engine::asset_metadata::standalone_file_name(name, &extension)
                     .map_err(|message| format!("{command:?}: {message}"))?;
                 let relative = relative_folder.join(&file_name);
+                refuse_module_resource(command, &relative)?;
                 let destination = root.join(&relative);
                 if destination.exists() {
                     return Err(format!(
@@ -1952,6 +2018,7 @@ impl EditorCommand {
                 let root = asset_authoring_root()?;
                 let relative = pill_engine::asset_metadata::checked_relative(path)
                     .map_err(|message| format!("{command:?}: {message}"))?;
+                refuse_module_resource(command, &relative)?;
                 let file = root.join(&relative);
                 let bytes = std::fs::read(&file)
                     .map_err(|error| format!("{command:?}: cannot read `{path}`: {error}"))?;
@@ -1986,7 +2053,7 @@ impl EditorCommand {
                 }
                 // The file is gone, so the asset it held must go with it: a
                 // re-created path would otherwise collide with the loaded
-                // value on the guid the create writes (W-0122).
+                // value on the guid the create writes.
                 if let Some(registry) = engine
                     .world()
                     .get_resource::<pill_engine::ImportRegistry>()
@@ -2010,6 +2077,7 @@ impl EditorCommand {
                 let root = asset_authoring_root()?;
                 let relative = pill_engine::asset_metadata::checked_relative(path)
                     .map_err(|message| format!("{command:?}: {message}"))?;
+                refuse_module_resource(command, &relative)?;
                 write_asset_bytes(&root.join(&relative), bytes)
                     .map_err(|message| format!("{command:?}: {message}"))?;
                 if let Some(meta_relative) =
@@ -2037,6 +2105,8 @@ impl EditorCommand {
                     .map_err(|message| format!("{command:?}: {message}"))?;
                 let to_relative = pill_engine::asset_metadata::checked_relative(to)
                     .map_err(|message| format!("{command:?}: {message}"))?;
+                refuse_module_resource(command, &from_relative)?;
+                refuse_module_resource(command, &to_relative)?;
                 let destination = root.join(&to_relative);
                 if let Some(parent) = destination.parent() {
                     std::fs::create_dir_all(parent)
@@ -2060,6 +2130,7 @@ impl EditorCommand {
                 let root = asset_authoring_root()?;
                 let relative = pill_engine::asset_metadata::checked_relative(path)
                     .map_err(|message| format!("{command:?}: {message}"))?;
+                refuse_module_resource(command, &relative)?;
                 let Some(meta_relative) = pill_engine::asset_metadata::metadata_path_for(&relative)
                 else {
                     return Err(format!("{command:?}: `{path}` cannot have a sidecar"));
@@ -2107,6 +2178,7 @@ impl EditorCommand {
                 let root = asset_authoring_root()?;
                 let relative = pill_engine::asset_metadata::checked_relative(path)
                     .map_err(|message| format!("{command:?}: {message}"))?;
+                refuse_module_resource(command, &relative)?;
                 let registry = engine
                     .world()
                     .get_resource::<pill_engine::ImportRegistry>()
@@ -2212,10 +2284,7 @@ impl EditorCommand {
                     world.insert_resource(EditorSelection::default());
                 }
                 // A selection that names an entity the world no longer
-                // carries drops that entity (Stage 28: a recovered selection
-                // from before a crash is checked here exactly like one the
-                // history trapped across a destroy); the asset half still
-                // applies.
+                // carries drops that entity; the asset half still applies.
                 let mut taken = Vec::with_capacity(entities.len());
                 for entity in entities {
                     if world.is_entity_valid(*entity) {
@@ -2514,7 +2583,7 @@ mod tests {
     use super::*;
 
     /// A click replaces the selection, Ctrl adds to it, and Shift covers the
-    /// rows between the anchor and the clicked row (W-0038 Stage 16).
+    /// rows between the anchor and the clicked row.
     #[test]
     fn selection_clicks_reset_add_and_range() {
         let rows: Vec<Entity> = (1..=4).map(|id| Entity::from_raw(id, 0)).collect();
@@ -2744,13 +2813,6 @@ mod tests {
 
     /// The editor's generic field write reaches a component's registered
     /// field layout - the path the Inspector uses to edit values live.
-    ///
-    /// The copied version of this test wrote through the renderer's real
-    /// `DirectionalLightComponent`; that pin needs the renderer data in this
-    /// crate's test graph, which at the time dragged the `pill_ui` stack in
-    /// beside the editor's egui library and rustc refused the mixed formats (W-0017
-    /// Stage 5; `pill_ui` retired in W-0043). Follow-up: re-pin against the
-    /// renderer's real component once its data can join this test graph.
     #[test]
     fn set_field_updates_a_registered_layout() {
         let mut engine = demo_engine();
@@ -3257,7 +3319,7 @@ mod tests {
         assert_eq!(strength, FieldValue::F32(6.5));
     }
 
-    /// A note file as an asset, for the asset reference tests (W-0048).
+    /// A note file as an asset, for the asset reference tests.
     #[derive(Debug)]
     struct Note;
     impl pill_engine::asset::Asset for Note {}
@@ -3477,7 +3539,7 @@ mod tests {
     }
 
     /// A component holding a reference to another entity, as the derive lays
-    /// one out (W-0048 Stage 6).
+    /// one out.
     #[repr(C)]
     #[derive(Debug, Clone, Copy, Default)]
     struct TargetHolder {
@@ -3551,7 +3613,7 @@ mod tests {
 
     /// Arming a row records the field a scene press names, and the request the
     /// runner takes is what the press turns into one recorded step - the same
-    /// `entity_edit` the row's own picker and drop queue (W-0048 Stage 6).
+    /// `entity_edit` the row's own picker and drop queue.
     #[test]
     fn an_armed_row_answers_the_scene_press_with_one_recorded_step() {
         let (mut engine, holder, first, second) = holder_engine();
@@ -3669,7 +3731,7 @@ mod tests {
     }
 
     /// A standalone type that refuses every document, so a create writes its
-    /// file and then fails to import it (W-0088).
+    /// file and then fails to import it.
     #[derive(Debug)]
     struct Refused;
     impl pill_engine::asset::Asset for Refused {}
@@ -3700,8 +3762,7 @@ mod tests {
     struct RefusedDocument {}
 
     /// A create whose import refuses the file it just wrote leaves no file,
-    /// and a delete that cannot remove the sidecar puts the asset back
-    /// (W-0088).
+    /// and a delete that cannot remove the sidecar puts the asset back.
     #[test]
     fn a_failed_create_or_delete_leaves_the_directory_as_it_found_it() {
         let _mount = asset_mount_lock();
@@ -3788,7 +3849,7 @@ mod tests {
     /// A created asset that an undo deleted comes back when the step is
     /// redone: the delete unloads the asset with its file, so the redo's
     /// create can import the fresh file instead of colliding on a guid the
-    /// store still holds (W-0122).
+    /// store still holds.
     #[test]
     fn a_redone_create_writes_the_file_again() {
         let _mount = asset_mount_lock();

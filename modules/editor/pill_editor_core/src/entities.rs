@@ -3,11 +3,10 @@
 //!
 //! # Responsibilities
 //!
-//! - [`entity_create`]: one empty entity, under the native Hierarchy's
-//!   `new entity` label.
+//! - [`entity_create`]: one empty entity, under the `new entity` label.
 //! - [`entity_delete`]: the destroy with the selection clear as ONE recorded
-//!   step, under the native `delete entity` label, so undo restores the
-//!   entity and the selection that pointed at it.
+//!   step, under the `delete entity` label, so undo restores the entity and
+//!   the selection that pointed at it.
 //!
 //! # Design
 //!

@@ -62,7 +62,10 @@ python devops/ci_cd/verify.py --quick           # the CI gate's inner loop
 
 `test_coding_standards.py` lints every `.rs` file against the Pill comment and
 layout rules, and `test_examples.py` builds each example in release and reports
-artifact sizes. Formatting, clippy and the cargo test lanes are `verify.py`
+artifact sizes. The lint's eighth check refuses work-item ids, stage numbers,
+plan decisions and construction-site paths in `modules/` comments, with no
+allowance: a reintroduced reference fails the check. Formatting, clippy and the
+cargo test lanes are `verify.py`
 steps; those two lanes run through `cargo-nextest` (`modules/.config/nextest.toml`)
 when it is installed and through `cargo test` when it is not, and always run
 the doctests with `cargo test --doc`. See `tests/README.md` for what each suite
@@ -74,6 +77,11 @@ test drives it. `tools/wasm_size_report.py` explains a web build's size: the
 shipped module's sections, its gzip size, the embedded asset pack, and (with
 `twiggy` on PATH) the code by crate - engine, project, standard library and
 third-party families - from the binary wasm-opt has not stripped yet.
+`tools/comment_audit.py` ranks the Rust sources by comment debt for a cleanup
+pass: process references (work-item ids, stage numbers, plan decisions),
+history wording, overlong doc blocks and TODO markers, weighted by the file's
+public surface. It prints the ranking and writes a JSON or Markdown report on
+request; `--self-test` checks the analyzers after a heuristic change.
 
 ### Styling a project or the editor
 

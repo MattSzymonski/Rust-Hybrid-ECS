@@ -49,8 +49,9 @@ use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget
 pub struct RenderPass {
     /// Label used in logs, profiling and error messages.
     pub name: String,
-    /// Shader the pass draws with. [`Handle::INVALID`] selects the renderer's
-    /// built-in pass shader.
+    /// Shader the pass draws with. [`Handle::INVALID`] leaves a geometry pass
+    /// drawing through each instance's own material pipeline; a fullscreen or
+    /// skybox pass without one is not drawn.
     pub shader: Handle<Shader>,
     /// Material the pass draws with: its shader, parameters and textures, under
     /// whatever this pass sets itself. [`Handle::INVALID`] names none.
@@ -91,7 +92,10 @@ pub struct RenderPass {
     /// The first pass to name a target decides its size, because the target
     /// belongs to the chain rather than to any one pass. A pass at half size is
     /// how the expensive, blurry steps - ambient occlusion, depth of field, a
-    /// bloom level - cost a quarter of the pixels.
+    /// bloom level - cost a quarter of the pixels. Only a fullscreen pass can be
+    /// scaled: a pass's attachments must all be one size, and a geometry or
+    /// skybox pass pairs its colour target with the surface's depth buffer, so
+    /// the renderer does not draw such a pass at a scale.
     pub target_scale: u32,
     /// Whether the pass blends its output over what the target already holds.
     pub blend: bool,
@@ -108,7 +112,8 @@ pub struct RenderPass {
 }
 
 impl RenderPass {
-    /// A surface-writing geometry pass with the built-in shader and no inputs.
+    /// A surface-writing geometry pass with no shader of its own, so it draws
+    /// through each instance's material pipeline.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -219,9 +224,9 @@ impl RenderPass {
 /// The asset itself, under the standard asset header. Its shader and textures
 /// are guids ([`AssetReference`]) resolved when the file loads; everything
 /// else is the [`RenderPass`] field of the same name. The default document is
-/// [`RenderPass::new`]'s pass - a geometry pass onto the surface with the
-/// built-in shader - which the renderer runs as it is, so a newly created file
-/// is valid before anyone edits it.
+/// [`RenderPass::new`]'s pass - a geometry pass onto the surface with no shader
+/// of its own - which the renderer runs as it is, so a newly created file is
+/// valid before anyone edits it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderPassDocument {
@@ -339,7 +344,7 @@ mod tests {
     use super::*;
 
     /// A new `.render_pass` file's document builds `RenderPass::new`'s pass:
-    /// a geometry pass onto the surface with the built-in shader.
+    /// a geometry pass onto the surface with no shader of its own.
     #[test]
     fn the_default_document_is_the_minimal_pass() {
         let assets = AssetManager::new();

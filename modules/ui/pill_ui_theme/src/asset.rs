@@ -25,8 +25,8 @@ use pill_engine_core::{Asset, AssetLoadResult, AssetManager, StandaloneAsset};
 
 use crate::overrides::ThemeOverrides;
 
-/// The pinned shared name of [`ThemeOverrides`]; see the comment on its `Asset`
-/// implementation.
+/// The pinned shared name of [`ThemeOverrides`], used by its `Asset`
+/// implementation to keep one asset column across binaries.
 pub const THEME_SHARED_NAME: &str = "pill_ui_theme::ThemeOverrides";
 
 impl Asset for ThemeOverrides {

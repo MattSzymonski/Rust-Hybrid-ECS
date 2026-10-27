@@ -12,19 +12,18 @@
 //! # Design
 //!
 //! Only the types live here; the system that fills them from the world is the
-//! renderer module's. The frame crosses the artifact boundary - whatever fills
-//! it, the renderer module reads it - so what it carries is plain data: asset
-//! keys instead of handles, the camera copied out rather than borrowed. The
-//! assets behind those keys are read from the world's `AssetManager` at render
-//! time, so the frame never copies the asset store.
+//! renderer module's. The frame crosses the artifact boundary, so what it
+//! carries is plain data: asset keys instead of handles, the camera copied out
+//! rather than borrowed. The assets behind those keys are read from the
+//! world's `AssetManager` at render time, so the frame never copies the store.
 //!
 //! **This module is renderer contract.** `PillRenderer::render` takes a
 //! [`RenderFrame`], so everything the frame names must be available to every
 //! renderer and to the host, whichever renderer's data crate a project uses.
-//! It therefore depends on nothing in `assets/`, `config/` or the rendering
-//! manager: the pass and parameter types it needs are defined here, and the
-//! asset types that use them import them from here. The camera is contract for
-//! the same reason; the transform is the engine's.
+//! It therefore depends on nothing in the renderer's own data crate: the pass
+//! and parameter types it needs are defined here, and the asset types that use
+//! them import them from here. The camera is contract for the same reason; the
+//! transform is the engine's.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -119,12 +118,6 @@ pub struct RenderInstance {
 
 /// One pass of the chain the renderer runs, with every handle resolved.
 ///
-/// The renderer only ever sees a [`RenderFrame`], and the manager holding the
-/// pipeline is a resource of the world, so the chain crosses into the frame as
-/// plain values: `shader` is the asset key the renderer finds its GPU shader
-/// by, and `None` leaves the choice to the instances, each drawing with the
-/// shader its own material names.
-///
 /// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
 /// allocate: it points at a static inside the binary that created it. This
 /// value lives in the world and outlives that binary - a project or module
@@ -134,6 +127,8 @@ pub struct RenderInstance {
 pub struct ResolvedPass {
     /// Label used in logs, profiling and error messages.
     pub name: String,
+    /// Asset key of the shader the pass draws with; `None` draws each instance
+    /// with the shader its own material names.
     pub shader: Option<u64>,
     /// What the pass draws.
     pub kind: PassKind,
@@ -187,11 +182,8 @@ impl ResolvedPass {
 /// One frame's renderer input: the instances, the pass chain, the camera, and
 /// the clock, extracted from the world and handed to the renderer.
 ///
-/// Everything here crosses as plain owned values, because the frame is what a
-/// project's copy of this crate hands the host's renderer: asset keys instead
-/// of handles, the camera copied out rather than borrowed. The assets behind
-/// those keys are read from the world's `AssetManager` at render time, so the
-/// frame stays small however large the project's assets are.
+/// Everything crosses as plain owned values, so a frame outlives the artifact
+/// that filled it.
 #[derive(Clone, Debug)]
 pub struct RenderFrame {
     /// Every drawable the world offered this update, in traversal order.
@@ -243,17 +235,14 @@ pub struct RenderFrame {
     /// The surfaces this frame marks as editor views, ascending.
     ///
     /// A surface bound to a view camera is an editor's own viewport: it draws
-    /// the grid, and the editor's chrome - the transform gizmo and the
-    /// selection outlines - belongs on it. A surface drawn through a world
-    /// camera is a game's window and never carries that chrome, so a project
-    /// that binds its viewport as a view also keeps its own pixels free of the
-    /// editor's furniture (W-0049). Empty means no editor is looking at this
-    /// frame.
+    /// the grid and carries the editor's chrome - the transform gizmo and the
+    /// selection outlines. A surface drawn through a world camera is a game's
+    /// window and never gets that chrome. Empty means no editor is looking.
     pub editor_views: Vec<u32>,
     /// The picks asked for since the last frame; the renderer answers them
     /// through [`crate::PillRenderer::take_pick_results`].
     pub pick_requests: Vec<crate::PickRequest>,
-    /// The previews asked for since the last frame (W-0049 Stage 11); the
+    /// The previews asked for since the last frame; the
     /// renderer draws at most one per frame and answers them through
     /// [`crate::PillRenderer::take_preview_results`].
     pub preview_requests: Vec<crate::PreviewRequest>,
@@ -262,7 +251,7 @@ pub struct RenderFrame {
     pub sequence: u64,
     /// The UI to draw over the frame: the draw lists a game's or tool's UI
     /// pass built this update, per surface, and the textures they sample.
-    /// Empty means no UI (Stage 12).
+    /// Empty means no UI.
     pub ui: pill_ui_frame::UiFrame,
 }
 

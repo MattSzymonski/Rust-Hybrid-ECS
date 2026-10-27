@@ -1,14 +1,13 @@
-//! The chrome both tabs share: icons, selection moves and logged rects.
+//! The chrome the shell's tabs share: icons, selection moves and logged rects.
 //!
 //! # Responsibilities
 //!
 //! - `tab_icon`: the icon a dock tab draws beside its title.
-//! - The selection moves both tabs and the menus make, each logging the token a suite watches for.
+//! - The selection moves the tabs and the menus make, each logging the token a suite watches for.
 //! - The redock action, the empty-area helper and the context-menu logging and region marking every menu goes through.
-//! - The once-per-rect logging the inspector's and the toolbox's rows use.
+//! - The once-per-rect logging the inspector's sections and the viewport badges use.
 //!
-//! Bodies unchanged from the shell's root file (W-0037 Stage 3); the globs
-//! below are absolute paths, so a patch crate resolves them too.
+//! The globs below are absolute paths, so a patch crate resolves them too.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -52,7 +51,7 @@ pub fn gizmo_space_label(space: GizmoSpace) -> &'static str {
     }
 }
 
-/// What a click on an entity row means (W-0038 Stage 16).
+/// What a click on an entity row means.
 pub use pill_editor_core::editor_state::SelectionClick;
 
 /// The meaning of a click made with these modifiers.
@@ -166,7 +165,7 @@ pub fn log_context_menu(area: &str) {
     );
 }
 
-/// Claim one floating surface's rectangle for the UI (W-0049).
+/// Claim one floating surface's rectangle for the UI.
 ///
 /// Every surface the shell draws outside the tab viewer - the create and
 /// rename dialog, the About window, a picker popup under a field, a menu -
@@ -187,26 +186,21 @@ pub fn claim_pointer(rect: egui::Rect, regions: &mut Vec<ShellRect>) {
 /// the scene viewport), and a click inside it must never reach the scene
 /// behind it.
 ///
-/// Public beside [`context_menu`], which calls it: the dock's tab menu marks
-/// its own rectangle through the `TabViewer` hook.
+/// Public like every helper the shell re-exports, so a patch crate reaches it
+/// through the package path.
 pub fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut Vec<ShellRect>) {
     if let Some(menu) = opened {
         claim_pointer(menu.response.rect, regions);
     }
 }
 
-/// Open a floating popup under an anchor rectangle, and claim its area
-/// (W-0049 Stage 8).
+/// Open a floating popup under an anchor rectangle, and claim its area.
 ///
 /// A picker draws in a foreground `Area` anchored under the field it belongs
 /// to, so it floats over the rows below instead of pushing them down, and
 /// its rectangle joins the frame's overlay regions, so a click inside it never
-/// becomes a scene pick.
-///
-/// # Errors
-///
-/// Nothing: the popup is pure UI. It returns the area's response, so the
-/// caller can tell whether a press landed outside it.
+/// becomes a scene pick. The area's response is returned, so the caller can
+/// tell whether a press landed outside it.
 pub fn floating_popup(
     ui: &egui::Ui,
     id: egui::Id,

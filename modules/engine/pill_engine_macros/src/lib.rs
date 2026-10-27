@@ -1,47 +1,31 @@
-//! Procedural macros that remove the error-prone registration and FFI
+//! Procedural macros that remove the hand-written registration and FFI
 //! boilerplate from extension and project crates.
 //!
 //! # Responsibilities
 //!
-//! - [`derive(PillComponent)`] turns one component type into everything the
-//!   engine needs to know about it: the [`Component`] impl and a descriptor
-//!   submitted into this artifact's compile-time registry. Persistable components (those marked
-//!   `#[pill(persistable)]`) are additionally registered for schema migration,
-//!   and they drive the aggregate project schema fingerprint — no hand-written
-//!   registration list or fingerprint hash to keep in sync.
-//! - [`derive(PillLayout)`] emits just the compile-time field layout for a
-//!   type that registers itself explicitly and must not auto-register (engine
-//!   types, host-linked extensions): `offset_of!`/`size_of!`/`align_of!`
-//!   descriptors with no `Component` impl, no accessors and no inventory
-//!   submission.
-//! - [`pill_value_type!`] declares a foreign value type - one whose definition
-//!   lives in another crate, so no derive can reach it - for the managed
-//!   mirror: the same descriptors `#[derive(PillMirror)]` would submit, with
-//!   every offset taken from the compiler.
-//! - [`attribute(PillModule)`] wraps an extension's `register` function
-//!   and generates the `pill_module_*` C-ABI exports (version, name, init) with
-//!   the panic guard and engine-pointer reconstruction that every module
-//!   otherwise hand-writes.
-//! - [`attribute(PillProject)`] does the same for the project ABI
-//!   (`pill_module_init`, `pill_module_abi_version`,
-//!   `project_schema_fingerprint`).
-//! - The mirror attributes (`#[pill_mirror_impl]`, `#[pill_mirror_fn]`,
-//!   `#[pill_mirror_object]`, `#[pill_mirror_resource]`, and
-//!   `#[derive(PillMirror)]`) make Rust functions and types callable from C#
-//!   through one C-ABI trampoline shape; the lowering lives in `mirror`.
+//! - [`PillComponent`] / [`PillLayout`]: one component's `Component` impl plus
+//!   a descriptor submitted into this artifact's registry - persistable ones
+//!   also register for schema migration and feed the project schema
+//!   fingerprint - or the field layout alone for a type that registers itself
+//!   and must not auto-register (engine types, host-linked extensions).
+//! - [`pill_value_type!`]: the layout of a foreign value type, with offsets
+//!   taken from the compiler.
+//! - [`pill_module`] / [`pill_project`]: the loadable-artifact exports
+//!   (`pill_module_init`, `pill_module_abi_version`, the descriptor copies, the
+//!   project's schema fingerprint) behind the panic guard and engine-pointer
+//!   reconstruction every artifact otherwise hand-writes.
+//! - The mirror attributes ([`pill_mirror_impl`], [`pill_mirror_fn`],
+//!   [`pill_mirror_object`], [`pill_mirror_resource`], [`PillMirror`]): Rust
+//!   functions and types callable from C# through one C-ABI trampoline shape.
 //!
 //! # Design
 //!
-//! The generated code references the engine through fully-qualified paths
-//! (`::pill_engine::...`, `::trait_type_map::...`) so the macros never need to
-//! know which crate a consumer is. Component collection uses the [`inventory`]
-//! crate, which builds a registry per linked artifact: each hot-reload
-//! generation DLL ends up with its own registry containing exactly the
-//! components its own sources declared, so re-registering a stale generation's
-//! types is impossible by construction.
-//!
-//! [`Component`]: ::pill_engine::Component
-//! [`inventory`]: https://docs.rs/inventory
+//! Generated code names the engine through fully-qualified `::pill_engine::`
+//! paths, so no macro needs to know its consumer's crate. Components are
+//! collected with the `inventory` crate, which builds a registry per linked
+//! artifact: each hot-reload generation DLL holds exactly the components its
+//! own sources declared, so a stale generation's types cannot be re-registered.
+//! The mirror lowering lives in `mirror`.
 
 extern crate proc_macro;
 
@@ -59,67 +43,42 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 
 /// Turns a component type into its engine registration.
 ///
-/// Generates:
-/// - `impl Component for T`
-/// - a descriptor submitted into this artifact's compile-time registry
+/// Generates `impl Component for T` plus a descriptor submitted into this
+/// artifact's compile-time registry, and the field layout that the schema hash
+/// and the C# mirror codegen read.
 ///
-/// Supported helper attributes:
-/// - `#[pill(persistable)]` - the component is schema-migrated across reloads
-///   (requires `Serialize + DeserializeOwned + Default`, matching
-///   [`World::register_persistable_component`]).
-/// - `#[pill(shared)]` - the component keeps one identity across every binary
-///   that links it, instead of a separate one per binary. Use it for a type
-///   more than one artifact names directly: without it each binary gets its
-///   own `TypeId`, hence its own column, and neither can see the other's
-///   entities. The identity is derived from `module_path!()::TypeName`;
-///   `#[pill(shared = "some::other::Name")]` overrides that when a type has
-///   moved between modules and the old identity must be kept. The name must be
-///   unique process-wide, so it should stay namespaced.
+/// Type-level helpers (`#[pill(...)]`):
+/// - `persistable` - schema-migrated across reloads; requires
+///   `Serialize + DeserializeOwned + Default`, as
+///   [`World::register_persistable_component_with_layout`] does.
+/// - `shared`, `shared = "crate::Name"` - one identity across every binary that
+///   links the type, instead of one `TypeId` and column per binary with neither
+///   able to see the other's entities. The identity is `module_path!()::TypeName`
+///   unless pinned, and must be unique process-wide.
 ///
-/// Supported field decorators (`#[pill(...)]` on a field, Unity's vocabulary;
-/// several per field either comma-separated in one attribute or as one
-/// attribute each):
-/// - `#[pill(hide_in_inspector)]` - the Inspector does not draw the field;
-///   it is still stored, serialized and copied;
-/// - `#[pill(header("Text"))]` - a separator line with the text above the field;
-/// - `#[pill(space(10.0))]` - a vertical gap above the field;
-/// - `#[pill(tooltip("Text"))]` - the text on hover of the field's label;
-/// - `#[pill(range(0.0, 100.0))]` - a slider over the range (an integer field
-///   slides in whole steps);
-/// - `#[pill(text_area)]`, `#[pill(text_area(3, 10))]` - a multi-line text box
-///   for a `String` field;
-/// - `#[pill(multiline(5))]` - a fixed-height multi-line text box;
-/// - `#[pill(min(0.0))]` - a drag value that never goes below the minimum;
-/// - `#[pill(color)]` - the field is a colour: an array of three or four
-///   numbers draws as one colour row with a popup picker, and a struct field
-///   whose leaves are named `r`, `g`, `b`[, `a`] draws as one too;
-/// - `#[pill(vector)]` - consecutive scalar leaves sharing a dotted prefix
-///   draw as one vector row (X/Y/Z/W) instead of one row each.
+/// Field decorators (`#[pill(...)]` on a field, Unity's vocabulary; several per
+/// field, comma-separated or one attribute each). Presentation only: storage,
+/// persistence, the schema fingerprint and the generated C# mirror are unchanged.
+/// - `hide_in_inspector` (not drawn, still stored); `header("Text")` and
+///   `space(10.0)` (a separator line with text, a vertical gap);
+/// - `tooltip("Text")`; `min(0.0)` (a drag value with that floor);
+/// - `range(0.0, 100.0)` (a slider, in whole steps for an integer field);
+/// - `text_area`, `text_area(3, 10)`, `multiline(5)` (multi-line text boxes);
+/// - `color` (an array of three or four numbers, or a struct of `r`, `g`, `b`[,
+///   `a`] leaves, draws as one colour row with a picker); `vector` (consecutive
+///   scalar leaves sharing a dotted prefix draw as one X/Y/Z/W row).
 ///
-/// Decorators are presentation only: they change nothing about storage,
-/// persistence, the schema fingerprint or the generated C# mirror.
+/// Field types: a primitive, a fixed-size array or a `#[derive(PillMirror)]`
+/// struct mirrors as a typed C# field. `String`, `Vec<E>` and `Vec<String>` are
+/// Rust-owned containers mirrored as accessor members that call derive-generated
+/// C-ABI trampolines, so managed code reads and writes the live container in
+/// place (`Vec` resizes through `E: Default + Clone`; `Vec<String>` elements are
+/// individually allocated, so each gets its own accessor). `DynamicBuffer<E>`
+/// lives in engine-owned native memory, so the mirror reads its `(ptr, len, cap)`
+/// handle straight out of the row and only resizing calls native code; `E` must
+/// be `Copy`, because the buffer runs no element drop glue.
 ///
-/// Supported field types:
-/// - blittable values — primitives, fixed-size arrays, `#[derive(PillMirror)]`
-///   structs — become typed C# fields on the generated mirror;
-/// - `String` and `Vec<E>` (with `E` a primitive or a `#[derive(PillMirror)]`
-///   struct) are Rust-owned container fields. They mirror as accessor members
-///   (a span over the live buffer, a count, a resize; get/set for text) that
-///   call derive-generated C-ABI trampolines, so managed code reads and writes
-///   the real container in place. Resizing a `Vec` field needs `E: Default +
-///   Clone`, which the supported element types all satisfy;
-/// - `Vec<String>` is supported too, through per-element accessors: its
-///   elements are separately allocated, so managed code gets `Count`, `GetX`,
-///   `SetX`, `PushX` and `ResizeX` (one boundary call per element) instead of
-///   a span;
-/// - `DynamicBuffer<E>` is the engine-owned container: its elements live in
-///   native memory with a stable address, the mirror reads the `(ptr, len,
-///   cap)` handle straight out of the row (iterating costs zero calls), and
-///   only resizing - which retires the block - calls native code. `E` must be
-///   a primitive or a `#[derive(PillMirror)]` struct, and `Copy`, because the
-///   buffer never runs element drop glue.
-///
-/// [`World::register_persistable_component`]: ::pill_engine::World::register_persistable_component
+/// [`World::register_persistable_component_with_layout`]: ::pill_engine::World::register_persistable_component_with_layout
 #[proc_macro_derive(PillComponent, attributes(pill))]
 pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -203,7 +162,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         };
 
     // Each `Handle<T>` field's asset type, recorded at registration so the
-    // field layer knows what the field references (W-0048). Recorded by the
+    // field layer knows what the field references. Recorded by the
     // generated function, in this artifact, from `T`'s own shared name.
     let asset_field_records = match handle_field_records(&input, ident) {
         Ok(records) => records,
@@ -349,19 +308,18 @@ fn handle_type_argument(ty: &syn::Type) -> Option<&syn::Type> {
 // #[derive(PillLayout)]
 // =============================================================================
 
-/// Emits a type's compile-time field layout without any of the component
+/// Emits a type's compile-time field layout without the component
 /// registration machinery.
 ///
-/// Generates the same descriptor list as [`derive(PillComponent)`] - built
-/// with `offset_of!`/`size_of!`/`align_of!` and the same tag vocabulary - as
-/// an inherent `FIELD_LAYOUT` const plus a [`ComponentLayout`] impl. Use it
-/// for a type that registers itself explicitly: an engine type, a host-linked
-/// extension, anything that must not submit an inventory registration into
-/// every artifact that links it.
+/// Generates [`PillComponent`]'s descriptor list - `offset_of!`, `size_of` and
+/// `align_of` over the same tag vocabulary - as an inherent `FIELD_LAYOUT` const
+/// plus a [`ComponentLayout`] impl, for a type that registers itself
+/// explicitly: an engine type, a host-linked extension, anything that must not
+/// submit an inventory registration into every artifact that links it.
 ///
-/// Nested struct fields are tagged `struct:<path>` and flattened into dotted
-/// leaf rows by the world at registration, provided the nested type's own
-/// layout is registered first.
+/// Nested struct fields are tagged `struct:<path>`; the world flattens them into
+/// dotted leaf rows at registration, provided the nested type's own layout is
+/// registered first.
 ///
 /// [`ComponentLayout`]: ::pill_engine::component_registry::ComponentLayout
 #[proc_macro_derive(PillLayout, attributes(pill))]
@@ -551,7 +509,7 @@ fn add_field_decorator(
         });
         return Ok(());
     }
-    // The two grouping decorators take no argument (W-0049).
+    // The two grouping decorators take no argument.
     if path.is_ident("color") || path.is_ident("vector") {
         decorators.push(if path.is_ident("color") {
             quote! { ::pill_engine::component_registry::FieldDecorator::Color }
@@ -1329,7 +1287,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                 // A field holding another entity's handle. Tagged on its own
                 // rather than as a `struct:` so the field layer reads and
                 // writes it as a reference the editor can pick, instead of an
-                // opaque pair of numbers (W-0048 Stage 6).
+                // opaque pair of numbers.
                 "Entity" => Ok("entity".to_string()),
                 // An asset handle keeps the asset it names, so the C# mirror
                 // can type the field as `Handle<Mesh>` rather than an opaque
@@ -1452,17 +1410,15 @@ fn is_primitive_tag(tag: &str) -> bool {
 // #[derive(PillMirror)]
 // =============================================================================
 
-/// Turns a plain (non-component) value type, or a fieldless enum, into a
-/// typed C# mirror.
+/// Turns a plain (non-component) value type, or a fieldless enum, into a typed
+/// C# mirror.
 ///
-/// On a named-field struct, generates a [`PillValueTypeDescriptor`] submitted
-/// into this artifact's compile-time inventory, so the host's C# codegen can
-/// resolve `struct:<path>` field tags to typed nested structs, plus the
-/// encodings that let mirrored functions take and return the type by value.
-///
-/// On a fieldless enum with an integer `#[repr]`, generates a C# `enum` with
-/// the same values, which mirrored functions take and return as the
-/// discriminant. Generic types are rejected.
+/// A named-field struct gets a [`PillValueTypeDescriptor`] submitted into this
+/// artifact's inventory, so the host's C# codegen resolves `struct:<path>` field
+/// tags to typed nested structs, plus the encodings that let mirrored functions
+/// take and return it by value. A fieldless enum with an integer `#[repr]`
+/// becomes a C# `enum` whose values mirrored functions pass as the discriminant.
+/// Generic types are rejected.
 ///
 /// [`PillValueTypeDescriptor`]: ::pill_engine::component_registry::PillValueTypeDescriptor
 #[proc_macro_derive(PillMirror, attributes(pill))]
@@ -1524,22 +1480,21 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 
 /// Declares the layout of a foreign value type for the managed mirror.
 ///
-/// `#[derive(PillMirror)]` reads the type definition, so a type this crate
-/// does not define (`glam::Vec3`, say) cannot carry it. This macro takes the
-/// same declaration a derive would read - the type path and its `field: type`
-/// list - and emits the same
+/// `#[derive(PillMirror)]` reads the type definition, so a type this crate does
+/// not define (`glam::Vec3`, say) cannot carry it. This macro takes the same
+/// declaration a derive would read - the type path and its `field: type` list -
+/// and emits the same
 /// [`PillValueTypeDescriptor`](::pill_engine::component_registry::PillValueTypeDescriptor)
-/// into the calling artifact's registry, so managed code gets typed members
-/// for the fields instead of an opaque byte blob.
+/// into the calling artifact's registry, so managed code gets typed members for
+/// the fields instead of an opaque byte blob.
 ///
-/// Write the path exactly as the component field is written: the field tag is
+/// Spell the path exactly as the component field is written: the field tag is
 /// the path as spelled at the field site (`Vector3f` for a `[Vector3f; 16]`
-/// field), and the host resolves descriptors by exact name. The declared
-/// fields must cover the type byte-for-byte - a generated assertion fails the
-/// build if the type gains, loses, or repacks a field.
-///
-/// The declaration belongs to the artifact whose mirror needs it: a type
-/// declared in one module is not visible to another module's registry.
+/// field), and the host resolves descriptors by exact name. A generated
+/// assertion fails the build when the last declared field does not end the type,
+/// so a field added behind the declaration cannot go unseen. The declaration
+/// belongs to the artifact whose mirror needs it; another module's registry does
+/// not see it.
 #[proc_macro]
 pub fn pill_value_type(input: TokenStream) -> TokenStream {
     let declaration = parse_macro_input!(input as ValueTypeDeclaration);
@@ -1657,24 +1612,19 @@ impl syn::parse::Parse for ValueTypeDeclaration {
 // #[pill_mirror_impl] / #[pill_mirror_method]
 // =============================================================================
 
-/// Mirrors selected functions of an `impl` block to C#.
+/// Mirrors selected functions of an inherent `impl` block to C#.
 ///
-/// Applied to an inherent `impl` block; the functions inside it marked with
-/// `#[pill_mirror_method]` become members of the type's C# mirror:
+/// Every function inside it marked with `#[pill_mirror_method]` becomes a member
+/// of the type's C# mirror: `&self` / `&mut self` methods become instance members
+/// reaching the live value through its address - a component row, a
+/// `#[derive(PillMirror)]` value, a `#[pill_mirror_object]`'s box, or, on a
+/// `#[pill_mirror_resource]`, extension methods on `Res<T>` / `ResMut<T>`; `self`
+/// methods consume an object (a builder's `with_*` and `build`); functions with no
+/// receiver become static members (`Shader::new`).
 ///
-/// - `&self` / `&mut self` methods become instance members. On a
-///   `#[derive(PillMirror)]` value type or a component row the call reaches the
-///   live value through its address, so a `&mut self` method writes through to
-///   it; on a `#[pill_mirror_object]` it reaches the boxed object; on a
-///   `#[pill_mirror_resource]` it becomes an extension method on `Res<T>` /
-///   `ResMut<T>`.
-/// - `self` methods consume an object (a builder's `with_*` and `build`).
-/// - Functions with no receiver become static members (`Shader::new`).
-///
-/// The marker's path may be written fully qualified
-/// (`#[pill_engine::pill_mirror_method]`); only its last segment is matched.
-/// The `impl` block must live in the module that declares the type, so the
-/// qualified name the methods are filed under is the type's own.
+/// The marker's path may be written fully qualified; only its last segment is
+/// matched. The `impl` block must live in the module that declares the type,
+/// because the qualified name the methods are filed under is derived there.
 ///
 /// ```ignore
 /// #[pill_mirror_object(asset)]
@@ -1689,16 +1639,15 @@ impl syn::parse::Parse for ValueTypeDeclaration {
 /// }
 /// ```
 ///
-/// For every marked function the macro emits, next to the `impl` block, a
-/// C-ABI trampoline of the one shape `pill_engine::mirror` defines and a
-/// [`PillMethodDescriptor`] carrying its address and the type tags of its
-/// arguments and result, which is everything the host's C# codegen reads.
-/// Arguments and results may be primitives, strings, slices and `Vec`s,
-/// `impl Into<String>` and `impl IntoIterator`, `Handle<T>`, `AssetLoader`,
-/// `Option<T>`, tuples and arrays of primitives, and the mirrored types
-/// themselves - by value or by reference. A `Result<T, E>` with `E: Display`
-/// fails the managed call with `E`'s message. Anything else is a compile
-/// error naming the parameter.
+/// For every marked function the macro emits, next to the `impl` block, a C-ABI
+/// trampoline of the one shape `pill_engine::mirror` defines and a
+/// [`PillMethodDescriptor`] carrying its address and the tags of its arguments
+/// and result - everything the host's C# codegen reads. Arguments and results may
+/// be primitives, strings, slices and `Vec`s, `impl Into<String>` and
+/// `impl IntoIterator`, `Handle<T>`, `AssetLoader`, `Option<T>`, tuples and arrays
+/// of primitives, and mirrored types themselves by value or by reference. A
+/// `Result<T, E>` with `E: Display` fails the managed call with `E`'s message;
+/// anything else is a compile error naming the parameter.
 ///
 /// [`PillMethodDescriptor`]: ::pill_engine::component_registry::PillMethodDescriptor
 #[proc_macro_attribute]
@@ -1729,15 +1678,14 @@ pub fn pill_mirror_method(_attribute: TokenStream, item: TokenStream) -> TokenSt
 /// The free-function counterpart of [`pill_mirror_impl`]:
 /// `pill_dummy_color::get_color_a` becomes
 /// `pill_dummy_color.PillDummyColor.GetColorA()` - the class is the last path
-/// segment PascalCased, declared in the namespace of the preceding segments.
-/// The argument and result vocabulary is [`pill_mirror_impl`]'s, so a free
-/// function may take a resource (`assets: &mut AssetManager` becomes a
-/// `ResMut<AssetManager>` parameter) as well as plain values.
+/// segment PascalCased, in the namespace of the preceding segments. The argument
+/// and result vocabulary is [`pill_mirror_impl`]'s, so a free function may take a
+/// resource (`assets: &mut AssetManager` becomes a `ResMut<AssetManager>`
+/// parameter) as well as plain values.
 ///
-/// Combine it with [`pill_hot_fn`] by listing this attribute first: it then
-/// captures the original signature (the contract C# compiled against) while
-/// the body stays hot-patchable, so a patch replaces the code a managed call
-/// executes.
+/// List it before [`pill_hot_fn`]: it then captures the original signature (the
+/// contract C# compiled against) while the body stays hot-patchable, so a patch
+/// replaces the code a managed call executes.
 ///
 /// ```ignore
 /// #[pill_mirror_fn]
@@ -1765,17 +1713,14 @@ pub fn pill_mirror_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream
 /// description with a `String` in it. Functions that return the type hand C# a
 /// new object; functions that take it by value move it out of the C# object,
 /// which is unusable afterwards; `&self`/`&mut self` methods borrow it.
-/// Disposing the C# object (or letting the garbage collector finalize it)
-/// drops the Rust value.
+/// Disposing the C# object (or letting the garbage collector finalize it) drops
+/// the Rust value, so the type must be `Send`.
 ///
 /// Flags:
 /// - `asset` - the type is an `Asset`: C# can add it to the world's
 ///   `AssetManager`, remove it and look it up (`assets.AddNamed(name, mesh)`).
 /// - `import` - also an `ImportedAsset`: `assets.Import<Mesh>(path, ...)`.
 /// - `standalone` - also a `StandaloneAsset`: `assets.ImportStandalone<Material>(path)`.
-///
-/// The type must be `Send`, because the garbage collector may drop it from
-/// its finalizer thread.
 #[proc_macro_attribute]
 pub fn pill_mirror_object(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as syn::Item);
@@ -1810,8 +1755,7 @@ pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenS
 ///
 /// The function itself is emitted unchanged; the macro only adds a descriptor
 /// carrying its fully-qualified path, its dispatch address and its signature
-/// identity, submitted into this artifact's compile-time registry. Nothing has
-/// to be listed by hand, exactly as with `#[derive(PillComponent)]`.
+/// identity, submitted into this artifact's compile-time registry.
 ///
 /// ```ignore
 /// #[pill_hot]
@@ -1823,18 +1767,15 @@ pub fn pill_mirror_resource(attribute: TokenStream, item: TokenStream) -> TokenS
 /// ```
 ///
 /// The name the host patches by is `module_path!() + "::" + fn name`, matching
-/// how `PillComponent` derives its type name.
+/// how `PillComponent` derives its type name. The address and signature are
+/// resolved through the function value, not its syntax: a function-item type
+/// satisfies exactly one arity of `SystemParamFunction`, so the parameter tuple
+/// is inferred instead of being rebuilt from tokens.
 ///
-/// The address and signature are computed through the function VALUE rather
-/// than from its syntax: a concrete function-item type satisfies exactly one
-/// arity of `SystemParamFunction`, so the parameter tuple is inferred. Rebuilding
-/// that tuple from tokens would mean stripping patterns like `mut query` and
-/// guessing elided lifetimes.
-/// Supported argument:
-/// - `#[pill_hot(name = "project::movement_system")]` — override the derived
-///   qualified name. A generated patch library is its own crate, so
-///   `module_path!()` there would report the patch's name rather than the
-///   original's; the host passes the name it is patching so the two agree.
+/// `#[pill_hot(name = "project::movement_system")]` overrides the derived name. A
+/// generated patch library is its own crate, so `module_path!()` there would
+/// report the patch's name rather than the original's; the host passes the name
+/// it is patching so the two agree.
 #[proc_macro_attribute]
 pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -1960,10 +1901,9 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
 /// Makes an ordinary function hot-patchable.
 ///
 /// Use this for a plain `pub fn`; use `#[pill_hot]` for an ECS system. The two
-/// differ because a system already has an indirection - the engine holds its
-/// boxed closure and can swap what it calls - while an ordinary function is
-/// called directly by its callers, so the indirection has to live inside the
-/// function itself.
+/// differ because a system already has an indirection - the engine holds its boxed
+/// closure and can swap what it calls - while an ordinary function is called
+/// directly, so the indirection has to live inside the function itself.
 ///
 /// ```ignore
 /// #[pill_hot_fn]
@@ -1976,11 +1916,10 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
 /// a slot, so every caller - including ones in other crates that linked this one
 /// statically - goes through the redirect.
 ///
-/// An inherent method is supported as well, and takes a different shape: its
-/// body cannot be renamed because it uses `self`, so it is emitted in place and
-/// the dispatcher sits in front of it. A method parameter must therefore be a
-/// plain binding, because that is the name the dispatcher forwards by -
-/// destructure the value inside the body instead.
+/// An inherent method takes a different shape: its body cannot be renamed
+/// because it uses `self`, so it is emitted in place and the dispatcher sits in
+/// front of it. A method parameter must therefore be a plain binding, because
+/// that is the name the dispatcher forwards by.
 ///
 /// # A crate linked into several artifacts
 ///
@@ -2254,8 +2193,7 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
 
-                // One acquire load from a hot cache line, then a call. Measured
-                // at under 0.2 ns against a direct call - below the noise floor.
+                // One acquire load from a hot cache line, then a call.
                 let installed = #slot_ident.installed();
                 if installed != 0 {
                     // SAFETY: the slot holds an address accepted by
@@ -2277,10 +2215,9 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Emits the hot-patch resolver export on its own.
 ///
-/// `#[pill_project]` and `#[pill_module]` already include it, so this exists for
-/// artifacts that carry hot functions but neither entry point — in particular
-/// the small patch libraries the host generates, which contain one edited
-/// function and nothing else.
+/// `#[pill_project]` and `#[pill_module]` already include it; this exists for an
+/// artifact that carries hot functions but neither entry point - in particular
+/// the patch libraries the host generates.
 ///
 /// Takes an optional export name, defaulting to `pill_hot_resolve`:
 ///
@@ -2321,8 +2258,8 @@ fn hot_patch_resolver_export(
     let address_name = format_ident!("{}_address", export_name);
     let coverage_name = format_ident!("{}_extent_coverage", export_name);
     quote! {
-        /// SPIKE: report the address of ANY function in this artifact, by
-        /// qualified path, from the build-script-generated inventory.
+        /// Reports the address of any function in this artifact by qualified
+        /// path, from the build-script-generated inventory.
         ///
         /// Unlike the slot exports this needs no annotation on the function -
         /// discovery is mechanical - which is what makes prologue patching
@@ -2548,17 +2485,15 @@ fn hot_patch_resolver_export(
 
 /// Emit the `pill_module_init` entry point every loadable artifact exports.
 ///
-/// One body for both attributes. A project and an extension are the same
-/// DLL contract: they export the same symbols, are loaded the same way, reload
-/// through the same transaction and retire into the same graveyard. What used
-/// to distinguish them was a symbol prefix, which is a difference in a string
-/// rather than in a contract, so the entry point is written once here and each
-/// attribute supplies only the `#[cfg]` gate its artifact needs.
+/// One body for both attributes. A project and an extension are the same DLL
+/// contract: they export the same symbols, are loaded the same way, reload
+/// through the same transaction and retire into the same graveyard, so the entry
+/// point is written once here and each attribute supplies only the `#[cfg]` gate
+/// its artifact needs.
 ///
 /// `gate` is empty in both emissions: a project is always built as its own
-/// artifact, and a module's entry points are emitted by the wrapper macro
-/// (where `init_fn` is the path `$crate::register`), so the one body serves
-/// both.
+/// artifact, and a module's entry points are emitted by the wrapper macro (where
+/// `init_fn` is the path `$crate::register`).
 fn module_init_export(
     gate: &proc_macro2::TokenStream,
     init_fn: &proc_macro2::TokenStream,
@@ -2633,27 +2568,23 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 // #[pill_module]
 // =============================================================================
 
-/// Wraps an extension's `register` function and generates the
-/// `pill_module_*` C-ABI exports.
+/// Wraps an extension's `register` function and generates the `pill_module_*`
+/// C-ABI exports. The annotated function must have the signature
+/// `fn(engine: &mut Engine) -> u32`.
 ///
-/// The annotated function must have the signature
-/// `fn(engine: &mut Engine) -> u32`. The macro:
+/// Before calling it the macro auto-registers every component declared with
+/// `#[derive(PillComponent)]` in this artifact. It also derives the module name
+/// from `CARGO_PKG_NAME` (null-terminated), reads the ABI version from
+/// `::pill_engine::module_abi::MODULE_ABI_VERSION` so module and host can never
+/// drift, and wraps the whole init in `catch_unwind`, so a panic becomes a
+/// non-zero status and the host rolls back instead of unwinding across the C ABI.
 ///
-/// - auto-registers every component declared with `#[derive(PillComponent)]`
-///   in this artifact before calling the wrapped function;
-/// - derives the module name from `CARGO_PKG_NAME` (null-terminated) instead
-///   of a hand-written constant;
-/// - reads the ABI version from `::pill_engine::module_abi::MODULE_ABI_VERSION`
-///   so the module and host can never drift;
-/// - wraps the whole init in `catch_unwind` so a panic becomes a non-zero
-///   status and the host rolls back instead of unwinding across the C ABI.
-///
-/// The `#[no_mangle]` exports come from `__pill_module_entry_points!`, the
-/// macro this attribute emits: the loadable artifact is the generated
-/// `host_module_<name>` wrapper crate, which compiles this one as a plain
-/// library and expands the macro, so a crate linked into several artifacts
-/// never defines a symbol more than once. The wrapped function itself is
-/// always compiled, since a statically linked build calls it directly.
+/// The `#[no_mangle]` exports come from `__pill_module_entry_points!`, the macro
+/// this attribute emits: the loadable artifact is the generated
+/// `host_module_<name>` wrapper crate, which compiles this one as a plain library
+/// and expands the macro, so a crate linked into several artifacts never defines
+/// a symbol more than once. The wrapped function itself is always compiled, since
+/// a statically linked build calls it directly.
 #[proc_macro_attribute]
 pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -2839,22 +2770,20 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 // #[pill_project]
 // =============================================================================
 
-/// Wraps a project's `init` function and generates the loadable-artifact
-/// exports (`pill_module_init`, `pill_module_abi_version`) plus the
-/// project-only `project_schema_fingerprint`.
+/// Wraps a project's `init` function and generates the loadable-artifact exports
+/// (`pill_module_init`, `pill_module_abi_version`) plus the project-only
+/// `project_schema_fingerprint`.
 ///
 /// The annotated function must have the signature
 /// `fn(engine: &mut Engine) -> u32`. The macro auto-registers every component
-/// declared with `#[derive(PillComponent)]` in this artifact before calling
-/// the wrapped function, and generates the schema fingerprint from the same
-/// registry, so adding a component can never leave the fingerprint stale.
+/// declared with `#[derive(PillComponent)]` in this artifact before calling the
+/// wrapped function, and generates the schema fingerprint from the same registry,
+/// so adding a component cannot leave the fingerprint stale.
 ///
-/// The entry points are the same ones [`macro@pill_module`] emits, because a
-/// project and an extension are one DLL contract: the host loads both the
-/// same way, reloads both through the same transaction, and used to tell them
-/// apart only by a symbol prefix. What remains project-specific is the schema
-/// fingerprint, which a module has no equivalent of, and the ungated exports -
-/// a project is always built as its own artifact.
+/// The entry points are [`pill_module`]'s, because a project and an extension are
+/// one DLL contract loaded and reloaded the same way. What is project-specific is
+/// the schema fingerprint and the ungated exports: a project is always built as
+/// its own artifact, so there is no second definition to collide with.
 #[proc_macro_attribute]
 pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);

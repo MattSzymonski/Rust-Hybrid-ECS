@@ -11,24 +11,19 @@
 //!
 //! The executable owns the window, the GPU device and the input; this crate
 //! owns the dock and the egui pass, and the two exchange plain data
-//! ([`EguiShellInput`] and [`EguiShellFrame`], defined in `pill_editor_core`,
-//! the shared `dylib` both link). Input events transit through the engine's
-//! `Input` resource, and the shell converts them itself.
+//! ([`EguiShellInput`], [`EguiShellFrame`]) in the `pill_editor_core` dylib
+//! both link. The shell turns that input into egui's own raw input.
 //!
 //! This file is the crate's hot file: the patch machinery compiles
 //! [`egui_shell_update`] into a crate of its own, replaying this file's
-//! top-level `use` lines there. Everything the system calls is therefore
-//! `pub` in [`shell`] and named through the package
-//! (`use pill_editor_shell_egui_editor::shell::...`), never as a file-local
-//! item - the same constraint a project's hot file follows, for the same
-//! reason.
+//! top-level `use` lines there, so everything the system calls is `pub` in
+//! [`shell`] and named through the package path, never as a file-local item.
 //!
-//! An edit in `shell.rs` is patched the same way, and its generated crate
-//! adds only `use pill_editor_shell_egui_editor::*;` on top of that file's own
-//! `use` lines. That glob reaches this module's items, so the shell's public
-//! items are re-exported below: without the re-export a tab body's call to a
-//! sibling by bare name does not resolve, the patch fails to compile, and the
-//! host silently falls back to reloading the module.
+//! An edit in `shell.rs` is patched the same way: its crate adds only
+//! `use pill_editor_shell_egui_editor::*;` on top of that file's `use` lines.
+//! That glob reaches this module's items, so the shell's public items are
+//! re-exported below; without the re-export a tab body's bare-name call to a
+//! sibling does not resolve and the patch falls back to a reload.
 
 // The crate's own name, so the package paths below resolve inside this
 // crate too; the generated patch crate sees the same `use` lines.
@@ -58,7 +53,7 @@ include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 // below names it bare.
 pub use pill_editor_shell_egui_editor::shell::*;
 
-/// The shell's UI work: the dock, the two tabs and the frame build.
+/// The shell's UI work: the dock, the tab bodies and the frame build.
 pub mod shell;
 
 // =============================================================================
@@ -77,8 +72,9 @@ pub mod shell;
 pub fn register(engine: &mut Engine) -> u32 {
     let world = engine.world_mut();
     // Step 1: the command resources the assets actions queue into (the
-    // registry, the inbox, the pending batches and the history), shared
-    // with the executable and re-claimed so a reload keeps them.
+    // registry, the inbox, the pending batches, the history and the scene
+    // session), shared with the executable and re-claimed so a reload keeps
+    // them.
     ensure_command_resources(world);
     // Step 2: the session (the egui context and the dock), built on first
     // load only. Its type lives in `pill_editor_core`, so a reload of
@@ -96,7 +92,7 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EguiShellFrame>().is_none() {
         world.insert_resource(EguiShellFrame::default());
     }
-    // The popped-out windows' input, one record per tab (W-0038 Stage 23):
+    // The popped-out windows' input, one record per tab:
     // the frontend fills it, the shell reads it when it runs that tab's pass.
     world.register_resource::<EguiPopoutInputs>();
     if world.get_resource::<EguiPopoutInputs>().is_none() {
@@ -114,19 +110,17 @@ pub fn register(engine: &mut Engine) -> u32 {
     if world.get_resource::<EditorSelection>().is_none() {
         world.insert_resource(EditorSelection::default());
     }
-    // Step 4b: the host's notices, which the executable rewrites whenever a
-    // reload, a patch or a failure lands (W-0038 Stages 4 and 6). Its type is
-    // shared, so the shell reads what the arriving generation wrote.
+    // The host's notices, which the executable rewrites whenever a reload, a
+    // patch or a failure lands. Its type is shared, so the shell reads what
+    // the arriving generation wrote.
     world.register_resource::<EditorNotices>();
     if world.get_resource::<EditorNotices>().is_none() {
         world.insert_resource(EditorNotices::default());
     }
-    // Step 5: the per-frame system that runs the dock. Post-update, like the
-    // renderer's frame build: it keeps running while the engine is paused.
-    // Step 6: this module's own editor panel (W-0038 Stage 11). The request is
-    // queued rather than registered: the executable binds it to the liveness
-    // marker that dies with this module's image, which is what keeps a stale
-    // draw function from ever being called.
+    // Step 5: this module's own editor panels. The requests are queued rather
+    // than registered: the executable binds each to the liveness marker that
+    // dies with this module's image, which is what keeps a stale draw function
+    // from ever being called.
     world.register_resource::<PanelRegistrations>();
     if world.get_resource::<PanelRegistrations>().is_none() {
         world.insert_resource(PanelRegistrations::default());
@@ -145,6 +139,8 @@ pub fn register(engine: &mut Engine) -> u32 {
             draw: shell::spline_tool_panel,
         });
     }
+    // Step 6: the per-frame system that runs the dock. Post-update, like the
+    // renderer's frame build: it keeps running while the engine is paused.
     engine.register_post_update_system("egui_shell", egui_shell_update);
     // NOTE: asserted on by the egui editor's end-to-end suite.
     pill_core::info!(
@@ -171,8 +167,8 @@ pub fn egui_shell_update(
         ResMut<EguiShellState>,
         ResMut<EguiShellInput>,
         ResMut<EguiShellFrame>,
-        // The nested tuples keep this system within the engine's six-parameter
-        // tuple arity.
+        // The nested tuples keep this system within the engine's supported
+        // system-parameter arity.
         (
             Res<EditorSnapshot>,
             ResMut<EditorSelection>,
@@ -180,14 +176,14 @@ pub fn egui_shell_update(
         ),
         (
             ResMut<PendingEditorCommands>,
-            // The panels the loaded modules registered (W-0038 Stage 11) and
+            // The panels the loaded modules registered and
             // the commands they asked for this pass.
             Res<PanelRegistry>,
             ResMut<PanelCommands>,
-            // The shell's side of the OS clipboard (W-0038 Stage 17).
+            // The shell's side of the OS clipboard.
             ResMut<pill_editor_core::clipboard::EditorClipboard>,
         ),
-        // Each popped-out window's input (W-0038 Stage 23).
+        // Each popped-out window's input.
         Res<EguiPopoutInputs>,
     ),
 ) {

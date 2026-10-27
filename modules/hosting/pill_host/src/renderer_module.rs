@@ -4,12 +4,10 @@
 //! # Responsibilities
 //!
 //! - Build, load, initialize and reload the renderer module like any extension,
-//!   under an owner of its own ([`RendererModule`]), and keep trying when a
-//!   load fails: a renderer that does not build yet leaves the window blank
-//!   until the next edit fixes it, instead of ending the host.
-//! - Attach it to a window through its `pill_renderer_attach` export, and
-//!   wrap the backend that returns in [`ModuleRenderer`], which the frame loop
-//!   drives as an ordinary `dyn PillRenderer`.
+//!   under an owner of its own ([`RendererModule`]), keeping the host running
+//!   when a load fails: the window stays blank until the next edit.
+//! - Attach it to a window through its `pill_renderer_attach` export, and wrap
+//!   the backend that returns in [`ModuleRenderer`].
 //!
 //! # Design
 //!
@@ -18,19 +16,18 @@
 //! [`ModuleRenderer`] calls through it and, when dropped, hands it back to the
 //! module's `pill_renderer_detach`, so the renderer is freed by the image that
 //! allocated it while that image is still mapped. A `ModuleRenderer` must
-//! therefore be dropped before the module's slot - `RenderingHost` declares
-//! its fields in that order.
+//! therefore be dropped before the module's slot - `RenderingHost` declares its
+//! fields in that order.
 //!
 //! The module is kept out of the host's extension list: that list reloads its
 //! members on a source change, and a renderer reload has to detach the backend
 //! first. `RenderingHost` reloads it instead, detaching through the reload's
 //! `before_commit` hook and attaching whichever generation is current after.
 //!
-//! A failed load never costs the scene. The module first loads when the window
-//! opens - after the project filled the world - so it loads under
-//! [`FirstLoadFailure::ClearSystemsOnly`]: a refused generation clears its own
-//! systems, stays mapped, and must have registered no data. Its watcher starts
-//! before the first load, so the load that failed is simply tried again.
+//! A failed load never costs the scene: the module first loads when the window
+//! opens, after the project filled the world, so it loads under
+//! [`FirstLoadFailure::ClearSystemsOnly`] - a refused generation clears its own
+//! systems, stays mapped, and must have registered no data.
 
 // Standard library
 use std::ffi::c_void;
@@ -212,7 +209,7 @@ impl RendererModule {
         }
     }
 
-    /// Build, load and initialize the first generation from the sources as of
+    /// Build, load and initialize the first generation from the sources at
     /// `generation`; `true` when it loaded.
     fn try_first_load(
         &mut self,
@@ -237,7 +234,7 @@ impl RendererModule {
             Ok(mut slot) => {
                 // A renderer image leaves state behind - wgpu's, the driver's,
                 // `tracing` callsites - that nothing can release, and evicting
-                // one hung the frame loop. Every generation stays mapped.
+                // one hangs the frame loop. Every generation stays mapped.
                 slot.keep_every_generation();
                 // The sources this generation was built from are handled; a
                 // save after this point is the next reload.

@@ -8,10 +8,9 @@
 //!   as a normal map, as depth that only a shader declares, or as an
 //!   environment - an equirectangular panorama or a cubemap - for a skybox.
 //! - Build textures by decoding an image file ([`Texture::new`]), from an RGBA8
-//!   buffer the caller already holds ([`Texture::from_rgba`]), and from linear
-//!   float texels ([`Texture::from_rgba_f32`]).
-//! - Project an equirectangular panorama onto the six faces of a cubemap, with
-//!   the same direction convention the skybox shaders sample by.
+//!   buffer ([`Texture::from_rgba`]), and from linear float texels
+//!   ([`Texture::from_rgba_f32`]), projecting a panorama onto a cubemap's six
+//!   faces with the direction convention the skybox shaders sample by.
 //! - Load through a metadata file ([`ImportedAsset`]): the
 //!   [`TextureImportSettings`] in `<image>.meta` say how to read the texels.
 //!
@@ -19,16 +18,13 @@
 //!
 //! A texture here is plain data with no GPU state: the renderer keeps the
 //! texture, view and sampler beside it and rebuilds them when the asset's
-//! version moves. The [`TextureType`] travels with the texels for the same
-//! reason the texels travel at all - the bytes alone do not say how to read
-//! them, so the type decides their layout, the format the renderer uploads as,
-//! and how a shader may sample the result.
+//! version moves. [`TextureType`] travels with the texels because the bytes
+//! alone do not say how to read them - the type decides the layout, the format
+//! the renderer uploads as, and how a shader may sample the result.
 //!
-//! Environment textures are high dynamic range: a sky's sun is many times
-//! brighter than its clouds, and clamping it to one byte per channel would
-//! flatten it. They are kept as half floats, the widest format every backend
-//! can filter, and a cubemap is projected from a panorama once, at import,
-//! rather than every frame.
+//! An environment texture is high dynamic range, so it is stored as half
+//! floats - the widest format every backend can filter - and a cubemap is
+//! projected from its panorama once, at import, rather than every frame.
 
 // Standard library
 use std::f32::consts::PI;
@@ -254,8 +250,7 @@ impl Texture {
     ///
     /// An [`TextureType::Equirect`] texture keeps the panorama as it is; a
     /// [`TextureType::Cubemap`] is projected from it, with faces a quarter of the
-    /// panorama's width - the size at which a face and the panorama hold the
-    /// same detail around the horizon.
+    /// panorama's width.
     ///
     /// # Errors
     ///
@@ -468,6 +463,30 @@ impl ImportedAsset for Texture {
     }
 }
 
+/// The file the renderer's colour stand-in is read from: one white texel, for a
+/// slot that binds nothing.
+pub const DEFAULT_COLOR_TEXTURE: &str = "textures/default_color.png";
+
+/// The file the renderer's normal stand-in is read from: one texel of
+/// `(128, 128, 255)`, the flat normal.
+pub const DEFAULT_NORMAL_TEXTURE: &str = "textures/default_normal.png";
+
+/// Decode a texture the module ships, read from `path` under its `res` root.
+///
+/// The renderer's stand-in textures are content like the default material: a
+/// file the module declares. It is read here because this crate's store is the
+/// one that knows the module's roots; a caller that cannot use the result - a
+/// build without the file, an image that will not decode - falls back to the
+/// texel it builds in code.
+///
+/// # Errors
+///
+/// Fails when the file does not resolve through the store, or does not decode.
+pub fn load_shipped_texture(path: &str, texture_type: TextureType) -> AssetLoadResult<Texture> {
+    let bytes = pill_engine::asset_store::read(std::path::Path::new(path))?;
+    Texture::decode(path.to_owned(), texture_type, &bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +648,21 @@ mod tests {
         // the declared size, so only the shape is wrong.
         let bytes = vec![0; 2 * 8 * 6];
         assert!(Texture::from_rgba("sky", TextureType::Cubemap, bytes, 2, 1).is_err());
+    }
+
+    /// The stand-ins the module ships are files that decode, so a renderer that
+    /// reads them shows white and a flat normal rather than falling back to the
+    /// texels it builds in code.
+    #[test]
+    fn the_shipped_stand_in_textures_decode() {
+        crate::declare_crate_roots();
+        let colour = load_shipped_texture(DEFAULT_COLOR_TEXTURE, TextureType::Color)
+            .expect("the colour stand-in is shipped");
+        assert_eq!((colour.width, colour.height), (1, 1));
+        assert_eq!(colour.rgba, [255, 255, 255, 255]);
+
+        let normal = load_shipped_texture(DEFAULT_NORMAL_TEXTURE, TextureType::Normal)
+            .expect("the normal stand-in is shipped");
+        assert_eq!(normal.rgba, [128, 128, 255, 255]);
     }
 }

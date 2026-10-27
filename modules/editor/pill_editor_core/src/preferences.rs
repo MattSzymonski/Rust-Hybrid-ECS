@@ -1,11 +1,10 @@
-//! The Preferences tab's shared vocabulary (Stage 20): the preferences
+//! The Preferences tab's shared vocabulary: the preferences
 //! file's editable keys, value parsing and the document helpers.
 //!
 //! # Responsibilities
 //!
 //! - [`PREFERENCE_FIELDS`]: the editable rows (file key, label, blank-file
-//!   fallback), the one list the tab's widgets and the scripted channel
-//!   both walk.
+//!   fallback) the Preferences tab draws, in row order.
 //! - [`PreferencesView`]: the file's current values as display strings,
 //!   plus the project key and its remembered gizmo entry - the snapshot
 //!   tier the tab seeds its buffers from.
@@ -19,9 +18,9 @@
 //! alone: every write is a read-modify-write, so keys other writers leave
 //! behind - the executable's per-project gizmo entry - survive a save. Rows
 //! carry the text the user typed; [`parse_value`] turns a row's text into
-//! JSON the way the native panel does - bare JSON first, so a number or a
-//! boolean round-trips, anything else the string it looks like. A blank row
-//! writes nothing, so blank keeps whatever the consumer's own default is.
+//! JSON - bare JSON first, so a number or a boolean round-trips, anything
+//! else the string it looks like. A blank row writes nothing, so blank keeps
+//! whatever the consumer's own default is.
 
 // Standard library
 use std::collections::BTreeMap;
@@ -106,8 +105,8 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 11] = [
 ];
 
 /// The preference key the editor's user theme layer is named under: a
-/// `.theme`/`.json` file, absolute or relative to the state directory
-/// (W-0127 Stage 6).
+/// `.theme`/`.json` file, absolute or relative to the editor's state
+/// directory.
 pub const THEME_PREFERENCE_KEY: &str = "theme";
 
 /// The keymap preset the file selects, or the default (Blender) when the
@@ -127,7 +126,7 @@ pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
 }
 
 /// The gizmo handle's hit radius the file asks for, as a multiplier on the
-/// handle length (W-0049).
+/// handle length.
 ///
 /// The hover test and the press both read this one number, so a handle that
 /// highlights under the pointer is a handle a press grabs. A missing, blank
@@ -274,7 +273,7 @@ pub fn set_key(document: &mut Map<String, Value>, key: &str, value: Value) -> Re
 /// A missing file is an empty document - the first save creates it - but a file
 /// that exists and cannot be read or parsed is an error. Folding it into an
 /// empty document would let the next save write a file holding only the keys it
-/// set, erasing every unrelated preference (W-0090).
+/// set, erasing every unrelated preference.
 ///
 /// # Errors
 ///
@@ -325,8 +324,8 @@ pub fn write_document(directory: &Path, document: &Map<String, Value>) -> Result
 mod tests {
     use super::*;
 
-    /// A scratch directory of this test's own, next to the sibling tests'
-    /// convention.
+    /// A scratch directory of this test's own under the system temp
+    /// directory, named so parallel runs do not collide.
     fn scratch_directory(label: &str) -> std::path::PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "ecs-preferences-{label}-{}-{}",
@@ -464,7 +463,7 @@ mod tests {
     fn a_corrupt_document_is_refused_rather_than_read_as_empty() {
         // Folding "not JSON" into an empty document would let the next save
         // erase every key the file held, including the ones this write never
-        // touched (W-0090).
+        // touched.
         let directory = scratch_directory("corrupt");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(PREFERENCES_FILE);
@@ -493,7 +492,7 @@ mod tests {
     #[test]
     fn a_document_that_is_not_an_object_is_refused() {
         // A file holding `[1, 2]` parses as JSON but is not a document, so a
-        // save that modified it would have nowhere to put a key (W-0090).
+        // save that modified it would have nowhere to put a key.
         let error = parse_document("[1, 2]").expect_err("a list is not a document");
         assert!(
             error.contains("not a JSON object"),

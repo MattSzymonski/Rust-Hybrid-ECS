@@ -4,9 +4,9 @@
 //!
 //! - Install the engine report handler and the shared telemetry stack.
 //! - Own the `winit` event loop, the main window, and the editor's own GPU
-//!   device that draws the editor's UI (D8, D19).
+//!   device that draws the editor's UI.
 //! - Host the project and its extensions, including the reloadable editor
-//!   shell module, through `pill_host` (D15).
+//!   shell module, through `pill_host`.
 //! - Convert the final error into one styled miette report at the single
 //!   reporting boundary.
 //!
@@ -14,8 +14,8 @@
 //!
 //! The executable is the part of the editor that cannot change while it
 //! runs: the platform layer, the loop, and the UI presentation. Everything
-//! that should reload - panels, commands, panels' state - lives in the shell
-//! module this binary hosts. Changes to this binary require a restart;
+//! that should reload - panels, their commands and their state - lives in the
+//! shell module this binary hosts. Changes to this binary require a restart;
 //! changes to the shell module hot-patch or reload.
 
 // Standard library
@@ -28,9 +28,10 @@ use pill_core::error::{engine_report, install_engine_report_handler};
 // Current crate
 use crate::frontend::EditorError;
 
-/// The editor's errors, with their stable diagnostic codes.
+/// The OS clipboard bridge the runner drives for copy, cut and paste.
 mod clipboard;
 mod drag_out;
+/// The editor's errors, with their stable diagnostic codes.
 mod frontend;
 /// The composition overlay over the editor window: a DirectComposition
 /// visual on Windows, its wgpu surface, and the egui-wgpu draw path.

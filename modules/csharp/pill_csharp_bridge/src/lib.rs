@@ -11,19 +11,18 @@
 //!
 //! # Design
 //!
-//! `pill_csharp_runtime` is the managed half of the same boundary, and the
-//! two change together: [`INTEROP_CONTRACT_VERSION`] is checked from both
-//! sides when the runtime starts. [`csharp_runtime`] owns the low-level .NET
-//! hosting boundary. The remaining modules separate ABI layout, component
-//! registration, scheduled invocation scope, queries, commands, and backend
-//! lifecycle; [`CSharpRuntime`] is the entry point.
+//! `pill_csharp_runtime` is the managed half of this boundary, and the two
+//! change together: [`INTEROP_CONTRACT_VERSION`] is checked from both sides
+//! when the runtime starts. [`csharp_runtime`] owns the low-level .NET hosting
+//! boundary; the remaining modules split ABI layout, registration, invocation
+//! scope, queries, commands and backend lifecycle; [`CSharpRuntime`] is the
+//! entry point.
 //!
 //! Development tooling - mirror generation and the in-process Roslyn
-//! compiler - lives in `pill_host`, which builds on what is exported here.
-//! Nothing in this crate reads project settings, builds or watches anything.
-//! A shipped C# project reaches the runtime as a [`CSharpBackend`], which
-//! implements `pill_runtime::ProjectBackend`: the bridge depends on the
-//! runtime, never the other way round.
+//! compiler - lives in `pill_host`. This crate reads no project settings,
+//! builds nothing and watches nothing. A shipped C# project reaches the
+//! runtime as a [`CSharpBackend`] implementing `pill_runtime::ProjectBackend`:
+//! the bridge depends on the runtime, never the other way round.
 
 /// C-compatible data structures and callback table shared with the managed runtime.
 mod abi;
@@ -123,9 +122,10 @@ pub struct ResolvedMirrorMethod {
     pub crate_name: String,
     /// How the function takes its owner: `""`, `"ref"`, `"mut"` or `"value"`.
     pub receiver: String,
-    /// What the owning type is, when the declaring attribute knew it:
-    /// `"object"`, `"enum"`, `"resource"`, `"module"`, or empty for a method
-    /// whose type the codegen resolves from the type rows.
+    /// What the owning type is, when the declaring attribute knew it: `"value"`
+    /// for a `#[derive(PillMirror)]` value type or a component row, `"object"`,
+    /// `"enum"`, `"resource"`, `"module"` for a free function, or empty for a
+    /// method whose type the codegen resolves from the type rows.
     pub owner_kind: String,
 }
 

@@ -1,11 +1,10 @@
 //! The editor's command registry: named actions, their menus and their
-//! rebindable shortcuts (Stage 14, D27/D31).
+//! rebindable shortcuts.
 //!
 //! # Responsibilities
 //!
-//! - Model a command ([`CommandSpec`]: id, title, menu path, per-preset
-//!   shortcuts, global flag) and the registry that owns every registration
-//!   ([`CommandRegistry`]), grouped by the module that registered it.
+//! - Model a command ([`CommandSpec`]) and the registry that owns every
+//!   registration ([`CommandRegistry`]), grouped by the registering module.
 //! - Resolve effective shortcuts from the active keymap preset plus the
 //!   keybindings file's overrides, and report conflicts by command name.
 //! - Parse and format a chord as the `ctrl+shift+p` text both files use
@@ -42,9 +41,9 @@ use crate::layout::EditorTab;
 
 /// The key vocabulary command bindings use.
 ///
-/// Deliberately small: every key a preset or a user binding names in this
-/// stage, converted to the engine's [`pill_engine::KeyCode`] in one place so
-/// the two lists cannot drift silently.
+/// Deliberately small: every key a preset or a user binding names, converted
+/// to the engine's [`pill_engine::KeyCode`] in one place so the two lists
+/// cannot drift silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyName {
@@ -364,7 +363,7 @@ const LETTERS: [KeyName; 26] = [
 // Presets
 // =============================================================================
 
-/// The keymap presets the editor ships (D27).
+/// The keymap presets the editor ships.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeymapPreset {
@@ -405,7 +404,7 @@ pub struct CommandSpec {
     /// Menu path (`["View", "Pause Simulation"]`); empty means palette-only.
     pub menu_path: Vec<String>,
     /// The default binding per preset; a preset that is absent leaves the
-    /// command unbound in it, as the plan requires.
+    /// command unbound in it.
     pub shortcuts: BTreeMap<KeymapPreset, Vec<Chord>>,
     /// Whether the shortcut wins while a text field has focus (a global
     /// binding); everything else yields to the focused field.
@@ -493,7 +492,8 @@ impl CommandRegistry {
         self.owners.insert(owner.to_string(), commands);
     }
 
-    /// Every command, built-ins first, then owners in registration order.
+    /// Every command, owners in key order; the built-ins ride under owner
+    /// `editor`.
     pub fn commands(&self) -> impl Iterator<Item = &CommandSpec> {
         self.owners.values().flatten()
     }
@@ -553,7 +553,7 @@ impl CommandRegistry {
 
     /// Whether a chord fires for `key` with `modifiers`, and which command.
     ///
-    /// The first command in registration order wins when two share a chord;
+    /// The first command in the registry's order wins when two share a chord;
     /// [`Self::conflicts`] is what reports the collision.
     pub fn resolve(
         &self,
@@ -581,8 +581,8 @@ impl CommandRegistry {
             .collect()
     }
 
-    /// The commands as plain data, in registration order: what the frame's
-    /// snapshot carries so menus (and, later, the palette) build rows without
+    /// The commands as plain data, in the registry's order: what the frame's
+    /// snapshot carries so the menus and the palette build rows without
     /// touching the world.
     pub fn views(&self) -> Vec<CommandView> {
         self.commands()
@@ -633,7 +633,7 @@ pub fn menu_tree(registry: &CommandRegistry) -> BTreeMap<String, Vec<&CommandSpe
 /// This table is what the menu bar draws: a row exists because a command
 /// registers a menu path, its label is the command's title, and the rules
 /// between groups are the specs marked [`CommandSpec::separator`]. Removing
-/// a spec here removes its row (W-0038 Stage 2).
+/// a spec here removes its row.
 fn builtin_commands() -> Vec<CommandSpec> {
     use KeymapPreset::{Blender, Godot, Unity, Unreal};
     let mut commands = vec![
@@ -649,12 +649,12 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "alt+r")
             .bind(Godot, "ctrl+alt+r")
             .bind(Unreal, "alt+r"),
-        // The pop-out pair (Stage 29): the tab in the active tabset moves
+        // The pop-out pair: the tab in the active tabset moves
         // into its own window, and every floating tab comes home.
         CommandSpec::new("editor.popout_tab", "Pop Out Panel").menu(&["Layout", "Pop Out Panel"]),
         CommandSpec::new("editor.redock_tab", "Redock Popped Panels")
             .menu(&["Layout", "Redock Popped Panels"]),
-        // A second scene view (Stage 29): another scene tab, another
+        // A second scene view: another scene tab, another
         // surface, its own editor camera.
         CommandSpec::new("editor.scene_view_new", "New Scene View")
             .menu(&["Layout", "New Scene View"]),
@@ -680,7 +680,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .global(),
         // The clipboard commands stay un-global on purpose: while a widget
         // holds the focus (a text field), ctrl+c/x/v belong to the field's
-        // own Edit handling (Stage 18).
+        // own Edit handling.
         CommandSpec::new("editor.copy", "Copy")
             .menu(&["Edit", "Copy"])
             .bind(Blender, "ctrl+c")
@@ -699,7 +699,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "ctrl+v")
             .bind(Godot, "ctrl+v")
             .bind(Unreal, "ctrl+v"),
-        // The transform tools (Stage 20): the chords are the ones Unity and
+        // The transform tools: the chords are the ones Unity and
         // Unreal already use, and Blender's own grab/rotate/scale keys. The
         // titles are the toolbox's row labels - the View menu, the panel and
         // the palette show one name per command.
@@ -751,10 +751,9 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .bind(Unity, "f10")
             .bind(Godot, "f6")
             .bind(Unreal, "f10"),
-        // The Hierarchy's entity actions (Stage 34, parity with the Dioxus
-        // editor's New/Delete entity buttons): creation makes one empty
-        // entity, deletion clears the selection in the same step. No
-        // chords: the menu, the palette and the panel's toolbar carry them.
+        // The Hierarchy's entity actions: creation makes one empty entity,
+        // deletion clears the selection in the same step. No chords: the
+        // menu, the palette and the panel's toolbar carry them.
         CommandSpec::new("editor.entity_create", "New Entity").menu(&["Create", "New Entity"]),
         CommandSpec::new("editor.entity_delete", "Delete Entity")
             .menu(&["Edit", "Delete Entity"])
@@ -762,7 +761,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         CommandSpec::new("editor.preferences_open", "Preferences...")
             .menu(&["Edit", "Preferences..."])
             .separator(),
-        // The scene document's rows (W-0048 Stage 9), at the head of File:
+        // The scene document's rows, at the head of File:
         // what the editor opens and writes. Save As carries no chord for the
         // same reason the other rows do not - the menu and the palette carry
         // it - and Open acts on the scene selected in the Assets tab.
@@ -782,7 +781,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         CommandSpec::new("editor.scene_save_as", "Save Scene As")
             .menu(&["File", "Save Scene As"])
             .separator(),
-        // The Assets dialogs' buttons (Stage 25). They are registered like
+        // The Assets dialogs' buttons. They are registered like
         // any other command - the button row runs them by id - with no menu
         // entry of their own: they answer through the dialog they were
         // pressed on, and invoked without one they warn and do nothing.
@@ -797,8 +796,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .separator(),
         // Help's one row.
         CommandSpec::new("editor.about", "About Pill Editor").menu(&["Help", "About Pill Editor"]),
-        // One more scene view, ahead of the Window menu's tab rows (W-0038
-        // Stage 21): no chord, because the menu and the palette carry it.
+        // One more scene view, ahead of the Window menu's tab rows: no chord,
+        // because the menu and the palette carry it.
         CommandSpec::new("editor.scene_new_view", "New Scene View")
             .menu(&["Window", "New Scene View"])
             .separator(),
@@ -834,27 +833,28 @@ pub struct KeybindingsFile {
     pub overrides: BTreeMap<String, Vec<String>>,
 }
 
-/// The preferences file (D31): everything the editor lets a user persist
-/// that is not the layout or the bindings.
+/// The preferences file: everything the editor lets a user persist that is
+/// not the layout or the bindings.
 ///
-/// The keymap preset lives in the keybindings file instead (the plan's
-/// acceptance reads it there); this file holds the preferences the later
-/// stages consume, parsed here so one reader owns the file.
+/// The keymap preset lives in the keybindings file instead; this file holds
+/// the rest, parsed here so one reader owns it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EditorPreferences {
-    /// The UI theme name, when a stylesheet selects one.
+    /// The user theme layer's file, absolute or relative to the state
+    /// directory.
     #[serde(default)]
     pub theme: Option<String>,
     /// Transform snapping steps, in world units and degrees.
     #[serde(default)]
     pub snapping_steps: Option<SnappingSteps>,
-    /// The gizmo tool's persisted state (Stage 20).
+    /// The gizmo tool's persisted state.
     #[serde(default)]
     pub gizmo: Option<GizmoPreferences>,
     /// The command that opens the user's code editor.
     #[serde(default)]
     pub code_editor_command: Option<String>,
-    /// Autosave interval for the editor state, in seconds.
+    /// Autosave interval for the editor state, in seconds, as the file
+    /// stores it.
     #[serde(default)]
     pub autosave_interval_seconds: Option<f64>,
     /// Maximum undo steps kept (absent uses the history default, 500).
@@ -865,14 +865,14 @@ pub struct EditorPreferences {
     pub history_memory_budget_mb: Option<usize>,
 }
 
-/// Snapping steps for a later stage's transforms.
+/// Snapping steps the gizmo's drags use.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SnappingSteps {
     /// Translation step in world units.
     pub translation: f32,
     /// Rotation step in degrees.
     pub rotation_degrees: f32,
-    /// Scale step, as a factor increment (Stage 20).
+    /// Scale step, as a factor increment.
     #[serde(default = "default_scale_step")]
     pub scale: f32,
 }
@@ -882,12 +882,11 @@ fn default_scale_step() -> f32 {
     0.1
 }
 
-/// The gizmo tool's persisted state (Stage 20).
+/// The gizmo tool's persisted state.
 ///
 /// The top-level fields are the defaults; `projects` remembers a choice per
-/// project - the plan's "per project" snapping decision - keyed by the
-/// project directory's name, so moving between projects brings each one's
-/// tool back.
+/// project, keyed by the project directory's name, so moving between
+/// projects brings each one's tool back.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GizmoPreferences {
     /// The last active mode, when one was chosen.
@@ -918,24 +917,24 @@ pub struct GizmoProjectPreferences {
     pub snap: Option<bool>,
 }
 
-/// The preferences file's name, next to the layout file (D31).
+/// The preferences file's name, next to the layout file.
 ///
 /// Declared here rather than in an editor frontend: the executable reads the
 /// file at startup and the shell writes it, and both link this crate.
 pub const PREFERENCES_FILE: &str = "preferences.json";
 
-/// The keybindings file's name, next to the layout file (D31).
+/// The keybindings file's name, next to the layout file.
 ///
 /// The executable watches it and applies every change through
 /// [`CommandRegistry::apply_file`]; the preset and the overrides it holds
 /// are what menus, shortcuts and the palette dispatch from.
 pub const KEYBINDINGS_FILE: &str = "keybindings.json";
 
-/// The gizmo settings a project starts a session with (Stage 20).
+/// The gizmo settings a project starts a session with.
 ///
 /// Resolution order: the project's own remembered entry, then the file's
 /// last-used values, then the defaults; the snapping steps are the file's,
-/// one set for every project (D31). A missing or unreadable file is the
+/// one set for every project. A missing or unreadable file is the
 /// defaults, never an error: the tool has to work before anyone edits
 /// preferences.
 pub fn read_gizmo_settings(
@@ -978,7 +977,7 @@ pub fn read_gizmo_settings(
     settings
 }
 
-/// Remember one project's gizmo choices in the preferences file (Stage 20).
+/// Remember one project's gizmo choices in the preferences file.
 ///
 /// Read-modify-write, so every other key survives; the top-level fields are
 /// the last-used values a shell toggles against, and the per-project entry
@@ -1050,13 +1049,13 @@ impl pill_engine::Resource for CommandInbox {}
 ///
 /// The shell has no `Engine`, so its handlers queue [`EditorCommand`]s; the
 /// executable applies the batch at the frame boundary
-/// ([`EditorCommand::apply`]), exactly the contract the plan states.
+/// ([`EditorCommand::apply`]).
 #[derive(Clone, Debug, Default)]
 pub struct PendingEditorCommands {
     /// The queued batches, drained by the executable.
     pub batches: Vec<PendingCommandBatch>,
     /// Asset paths the shell asked the executable to show in the platform's
-    /// file manager, in request order (W-0049 Stage 10).
+    /// file manager, in request order.
     ///
     /// Not commands: showing a file changes nothing in the world and has
     /// nothing to undo, and the shell cannot reach the asset root - only the
@@ -1082,7 +1081,7 @@ impl PendingEditorCommands {
     ///
     /// Marked with the walk's direction, because the step is popped before its
     /// commands run: a replay that fails puts the cursor back rather than
-    /// leaving the log claiming a step that never happened (W-0090).
+    /// leaving the log claiming a step that never happened.
     pub fn push_replay(&mut self, commands: Vec<EditorCommand>, direction: HistoryDirection) {
         self.batches.push(PendingCommandBatch {
             commands,
@@ -1136,7 +1135,7 @@ pub struct PendingCommandBatch {
     pub label: String,
     /// Continuous-edit key, when recorded.
     pub coalesce_key: Option<String>,
-    /// The history walk this batch replays, when it is one (W-0090).
+    /// The history walk this batch replays, when it is one.
     pub replay: Option<HistoryDirection>,
 }
 

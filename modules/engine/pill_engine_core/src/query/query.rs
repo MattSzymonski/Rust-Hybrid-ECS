@@ -29,12 +29,8 @@ use super::FilteredArchetypeRange;
 
 /// Query for iterating over entities matching a component pattern.
 ///
-/// The query is parameterized by two type arguments:
-///
-/// - `Q: QueryTarget` - the data fetched per row (e.g.
-///   `(Entity, &Transform, &mut Velocity)`).
-/// - `F: QueryFilter` - an optional row predicate (default `()`, accepts
-///   everything).
+/// `Q` is the data fetched per row (e.g. `(Entity, &Transform, &mut Velocity)`)
+/// and `F` an optional row predicate (default `()`, accepts everything).
 ///
 /// # Examples
 /// ```no_run
@@ -74,17 +70,17 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// for a given `F`.  For simple filters this is a single pair; only
     /// [`Or`] filters produce multiple pairs.
     filter_pairs: Vec<(ComponentMask, ComponentMask)>,
-    /// First target id the registry could not resolve, if any.
+    /// The first target id the registry could not resolve, if any.
     ///
-    /// An unresolved target cannot be fetched, so the query matches no
-    /// archetype at all. Dropping the bit from the mask instead - what this
-    /// used to do - made the mask *less* restrictive: an unregistered
-    /// component matched archetypes that cannot serve it, and iteration then
-    /// panicked inside the column lookup.
+    /// Such a target cannot be fetched, so the query matches no archetype at
+    /// all. Dropping the bit from the mask instead would make the mask *less*
+    /// restrictive: an unregistered component would match archetypes that
+    /// cannot serve it, and iteration would then panic inside the column
+    /// lookup.
     unresolved_target: Option<ComponentId>,
     /// A shared component this query's binary declares with a different field
     /// layout than the one registered now (see
-    /// [`World::find_stale_shared_reader`]).
+    /// `World::find_stale_shared_reader`).
     ///
     /// Reading it would apply the old field offsets to the new rows, so the
     /// query matches nothing, exactly like an unresolved target. The world logs
@@ -93,7 +89,7 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// Whether every filter pair carried an unresolved id on its include
     /// side. No archetype can satisfy such a pair, so when all of them are
     /// like that the query matches nothing - `With<T>` for an unregistered
-    /// `T` used to match everything instead.
+    /// `T` would otherwise match everything.
     filters_unsatisfiable: bool,
     /// Sum of all queried component sizes in bytes - cached for slice clamping.
     total_components_size: usize,
@@ -144,7 +140,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             ]
         );
 
-        // Step 1b: Refuse an aliasing target here, at construction. System
+        // Step 2: Refuse an aliasing target here, at construction. System
         // registration checks the same predicate, but a query built directly -
         // by user code or generated code calling `Query::new` - never passes
         // through registration, and an aliasing target is undefined behavior
@@ -158,20 +154,20 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             );
         }
 
-        // Step 2: Build the target and filter masks from the component registry.
+        // Step 3: Build the target and filter masks from the component registry.
         // A target id the registry cannot resolve is *recorded*, not skipped:
-        // skipping narrowed the mask and turned "not registered" into "matches
-        // everything", which panics when iteration reaches a column that is
-        // not there.
+        // skipping would drop the requirement and let archetypes that cannot
+        // serve the target match, which panics once iteration reaches a column
+        // that is not there.
         let (target_mask, unresolved_target) = match Self::build_target_mask(world) {
             Ok(mask) => (mask, None),
             Err(component_id) => (ComponentMask::empty(), Some(component_id)),
         };
         let (filter_pairs, filters_unsatisfiable) = Self::build_filter_mask_pairs(world);
 
-        // Step 2b: Refuse a stale reader of a shared component: the binary
-        // running this query was built against a field layout the registry no
-        // longer holds. Checked once here per query, not per row.
+        // Step 4: Refuse a stale reader of a shared component: the binary
+        // running this query was built against a field layout the registry does
+        // not hold. Checked once here per query, not per row.
         let declared_shared = Q::declared_shared_schemas();
         let stale_shared_component = if declared_shared.is_empty() {
             None
@@ -179,7 +175,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             world.find_stale_shared_reader(&declared_shared, std::any::type_name::<Q>())
         };
 
-        // Step 3: Sum the sizes of every fetched component type, clamped to
+        // Step 5: Sum the sizes of every fetched component type, clamped to
         // a minimum of 8 bytes. `default_entities_per_slice` divides by this
         // value, so the clamp both avoids division by zero and keeps the
         // per-slice byte volume bounded.
@@ -189,7 +185,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .sum::<usize>()
             .max(8);
 
-        // Step 4: Assemble the query with empty caches; the first iterator
+        // Step 6: Assemble the query with empty caches; the first iterator
         // creation populates them.
         Self {
             world,
@@ -280,22 +276,11 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
 
     /// Returns `true` if `archetype` matches this query's requirements.
     ///
-    /// The check has two layers:
-    ///
-    /// 1. Target mask (hard AND): the archetype must contain every
-    ///    component the query fetches (e.g. `&Position` + `&mut Velocity`).
-    ///
-    /// 2. Filter pairs (OR across pairs, AND within each pair):
-    ///    - 0 pairs (e.g. no filter, or `()`): any archetype with the
-    ///      target components matches.
-    ///    - 1 pair (e.g. `With<A>`, `Without<B>`, `Changed<A>`):
-    ///      the archetype must have all `include` components AND none of
-    ///      the `exclude` components. This is the simple case - just like
-    ///      the old `(include_mask, exclude_mask)` model.
-    ///    - 2+ pairs (only [`Or`] filters): the archetype matches if
-    ///      any pair matches. For `Or<(With<A>, With<B>)>` the pairs
-    ///      are `({A},{})` and `({B},{})`, so archetypes with A, B, or
-    ///      both are included.
+    /// The target mask is a hard AND: the archetype must hold every component
+    /// the query fetches. A filter pair requires all of its include bits and
+    /// none of its exclude bits, and pairs are OR-ed - 2+ of them come only
+    /// from [`Or`], whose `Or<(With<A>, With<B>)>` becomes `({A},{})` and
+    /// `({B},{})`.
     fn archetype_matches(
         archetype: &Archetype,
         target_mask: &ComponentMask,
@@ -310,7 +295,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             0 => true,
 
             // Fast path: the common case. One include+exclude pair.
-            // Conceptually identical to the old `(include, exclude)` model.
             1 => {
                 let (included_mask, excluded_mask) = &filter_pairs[0];
                 archetype.matches_mask(included_mask)
@@ -334,7 +318,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// haven't changed since the last call.
     #[inline]
     fn matching_archetype_ids(&mut self) -> &[ArchetypeId] {
-        // Step 0: An unresolved target or an unsatisfiable filter means the
+        // Step 1: An unresolved target or an unsatisfiable filter means the
         // answer is the empty set no matter what the world holds; returning
         // here also keeps a stale cache from ever being refreshed into it.
         if self.unresolved_target.is_some()
@@ -344,10 +328,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             return &[];
         }
 
-        // Step 1: Serve the cached list whenever the world's archetype
+        // Step 2: Serve the cached list whenever the world's archetype
         // generation is unchanged since the last cache fill.
         if self.cached_generation != self.world.archetype_generation {
-            // Step 2: Rescan every archetype, keeping only those that match
+            // Step 3: Rescan every archetype, keeping only those that match
             // this query's target mask and filter pairs.
             let _zone = crate::profile_scope!(
                 "find matching archetypes",
@@ -379,7 +363,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
                 matching.len(),
             );
 
-            // Step 3: Refresh the cache and the generation it was built from.
+            // Step 4: Refresh the cache and the generation it was built from.
             self.cached_matches = matching;
             self.cached_generation = self.world.archetype_generation;
         }
@@ -391,21 +375,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Each call bumps the world's change tick and captures the current
     /// system last-run tick, so change-detection filters (e.g.
     /// [`Changed`](crate::query::Changed)) compare against a fresh baseline.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use pill_engine::*;
-    /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
-    /// # impl Component for Position {}
-    /// # let mut world = World::new();
-    /// # world.register_component::<Position>();
-    /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
-    /// let mut query = Query::<&Position>::new(&mut world);
-    /// for position in query.iter_mut() {
-    ///     println!("position at ({}, {})", position.x, position.y);
-    /// }
-    /// ```
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
         // Step 1: Measure iterator construction with a Tracy profile scope.
@@ -464,28 +433,13 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// archetype cache directly without building an iterator, in the same
     /// order [`iter_mut`](Self::iter_mut) uses. For filtered queries it falls
     /// back to [`iter_mut`](Self::iter_mut) and takes the first row.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use pill_engine::*;
-    /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
-    /// # impl Component for Position {}
-    /// # let mut world = World::new();
-    /// # world.register_component::<Position>();
-    /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
-    /// let mut query = Query::<&Position>::new(&mut world);
-    /// if let Some(position) = query.first() {
-    ///     println!("first position x = {}", position.x);
-    /// }
-    /// ```
     #[inline]
     pub fn first(&mut self) -> Option<Q::Item<'_>> {
         // Fast path: a filter that accepts every row - grab the first entity
         // from the first non-empty matching archetype, walking the same
         // sorted cache `iter_mut` uses. Walking the archetype `HashMap`
-        // directly (what this used to do) reads a per-instance randomized
-        // order, so `first` could disagree with `iter_mut().next()`.
+        // directly would read a per-instance randomized order, so `first`
+        // could disagree with `iter_mut().next()`.
         if F::ACCEPTS_ALL {
             let this_run = self.world.increment_change_tick();
             // The same snapshot-and-walk `iter_mut` uses, so `first` cannot
@@ -503,18 +457,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// For unfiltered queries this is O(archetypes) - it inspects archetype
     /// entity counts directly. For filtered queries it evaluates the first
     /// matching row through the iterator.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use pill_engine::*;
-    /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
-    /// # impl Component for Position {}
-    /// # let mut world = World::new();
-    /// # world.register_component::<Position>();
-    /// let mut query = Query::<&Position>::new(&mut world);
-    /// assert!(query.is_empty());
-    /// ```
     #[inline]
     pub fn is_empty(&mut self) -> bool {
         // Fast path: a filter that accepts every row - check the matching
@@ -534,19 +476,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// archetype entity counts directly without iterating rows. For
     /// filtered queries (e.g. `Changed<T>`), it falls back to O(n)
     /// row-by-row counting since each row must be tested individually.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use pill_engine::*;
-    /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
-    /// # impl Component for Position {}
-    /// # let mut world = World::new();
-    /// # world.register_component::<Position>();
-    /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
-    /// let mut query = Query::<&Position>::new(&mut world);
-    /// assert_eq!(query.entity_count(), 1);
-    /// ```
     #[inline]
     pub fn entity_count(&mut self) -> usize {
         // Fast path: a filter that accepts every row - sum the matching

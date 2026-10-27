@@ -18,30 +18,28 @@
 //!
 //! # Design
 //!
-//! [`AssetManager::import`] is generic, so the type is fixed where it is
-//! called. A caller holding only `textures/a.png` needs the step from an
-//! extension to a type, which is what [`World::register_imported_asset`]
-//! records: each registration stores function pointers to the import
-//! functions monomorphized for that type, in the binary that registered it.
+//! [`AssetManager::import`] is generic, so the type is fixed where it is called.
+//! A caller holding only `textures/a.png` needs the step from an extension to a
+//! type, which is what [`World::register_imported_asset`] records: each
+//! registration stores function pointers monomorphized for that type, in the
+//! binary that registered it.
 //!
-//! Those pointers are the reload hazard `AGENTS.md` warns about. They point
-//! into the registering DLL, and that image is unmapped some time after a
-//! reload retires it. The registry does not track subjects itself. Instead,
-//! each registration's liveness rides on a marker resource the registering
-//! generation inserts:
+//! Those pointers are code from the registering DLL, which is unmapped some time
+//! after a reload retires it, so each registration's liveness rides on a marker
+//! resource the registering generation inserts:
 //!
 //! - A reload's `init` registers again, which records fresh pointers into the
 //!   new image and replaces the marker.
-//! - A generation that stops registering a type, or a subject that is
-//!   unloaded, loses its claim on the marker. The host drops unclaimed
-//!   resources while the image is still mapped, which ends the registration:
-//!   an entry only holds a weak reference to the marker's token.
+//! - A generation that stops registering a type, or a subject that is unloaded,
+//!   loses its claim on the marker. The host drops unclaimed resources while the
+//!   image is still mapped, which ends the registration: an entry holds only a
+//!   weak reference to the marker's token.
 //!
 //! Several binaries can register one type: a project calls
-//! `pill_master_renderer_data::register` in its own `init`, and so does the
-//! data crate's own module. Each keeps its own registration, and the newest
-//! live one is used, so a project that stops registering a type falls back to
-//! the module's registration instead of losing the type.
+//! `pill_master_renderer_data::register` in its own `init`, and so does the data
+//! crate's own module. Each keeps its own registration and the newest live one is
+//! used, so a project that stops registering a type falls back to the module's
+//! registration instead of losing the type.
 //!
 //! [`World::register_imported_asset`]: crate::World::register_imported_asset
 
@@ -771,7 +769,7 @@ impl ImportRegistry {
     ///
     /// The game-code shape of loading an asset by name, recorded with its
     /// guid the way any import is: `world.load_asset::<Mesh>("models/x.obj")`
-    /// wraps it (W-0048 Stage 10).
+    /// wraps it.
     ///
     /// # Errors
     ///
@@ -797,7 +795,8 @@ impl ImportRegistry {
     }
 
     /// Decode `path` again in place as the type its extension maps to; see
-    /// [`AssetManager::reimport`].    ///
+    /// [`AssetManager::reimport`].
+    ///
     /// # Errors
     ///
     /// As [`Self::import`].
@@ -862,7 +861,7 @@ impl ImportRegistry {
 
     /// Drop the asset loaded under `path`'s name, if any: what a delete calls
     /// once the file is gone, so re-creating the path does not collide with the
-    /// old asset on its guid (W-0122). `false` for a path nothing has loaded.
+    /// old asset on its guid. `false` for a path nothing has loaded.
     pub fn remove_loaded(&self, assets: &mut AssetManager, path: &Path) -> bool {
         self.functions_for_path(path)
             .is_ok_and(|functions| (functions.remove_loaded)(assets, path))
@@ -936,13 +935,13 @@ impl ImportRegistry {
     /// Import every source file under `root` whose extension a registered
     /// type imports.
     ///
-    /// `root` is the directory asset paths are relative to - a project's
-    /// `res` - and each file is imported by its path relative to it, exactly
-    /// as loading code names it. Metadata files are skipped (they are read
-    /// with their source), as are dot-files such as the temporary files a
-    /// metadata write leaves for an instant. A file of an unknown extension is
-    /// not an error: the extension is reported once in the result, however
-    /// many files carry it.
+    /// `root` is the directory asset paths are relative to - a project's `res` -
+    /// and each file is imported by its path relative to it, exactly as loading
+    /// code names it. Metadata files are skipped (they are read with their
+    /// source), as are dot-files such as the temporary files a metadata write
+    /// leaves for an instant. A file of an unknown extension is not an error:
+    /// the extension is reported once in the result, however many files carry
+    /// it.
     ///
     /// A second scan of the same directory decodes and writes nothing: every
     /// path is already loaded, and every file it would write exists.

@@ -2,7 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Load the saved dock, refusing documents this build cannot read.
+//! - Load the saved dock, falling back to the default for a document this
+//!   build cannot read.
 //! - Write without destroying the previous file when a save goes wrong.
 //! - Own [`layout_directory`], where the editor's state files live.
 
@@ -20,63 +21,26 @@ use crate::error::LayoutPersistenceError;
 
 /// The schema of the dock-layout document this build writes and accepts.
 ///
-/// v2 adds the Scene and Assets tabs and the side/bottom default layout, so
-/// documents written by the two-tab build are rejected and replaced by the
-/// new default.
+/// Any change to the tab set, or to what the document carries beside the dock
+/// tree, bumps it: `EditorTab` is serialized into the document, and the tab
+/// payloads plus the panel-id and pop-out lists are what a reader has to
+/// understand.
 ///
-/// v3 adds the second viewport tab (the scene view later numbered 1), so
-/// documents written before it are rejected and replaced by the new default.
-///
-/// v4 adds the Inspector tab (`EditorTab::Inspector`) and its slot in the
-/// default layout, so previous documents are rejected and replaced too.
-///
-/// v5 adds the Preferences tab (`EditorTab::Preferences`), tabbed with the
-/// Systems list, so previous documents are rejected and replaced too.
-///
-/// v6 adds the Game tab (`EditorTab::Game`), tabbed with the scene
-/// viewports, so previous documents are rejected and replaced too.
-///
-/// v7 moves the dock itself: `egui_dock` 0.21 replaced the node model that
-/// 0.17 wrote (positional nodes became a node arena, leaves carry a viewport
-/// rect and a scroll offset, and the document carries the window
-/// translations), so a v6 document has no meaning here and is replaced by
-/// the default layout with one log line.
-///
-/// v8 adds the Console tab (W-0038 Stage 5). A v7 document is *migrated*, not
-/// replaced: the tab is appended to the leaf that holds Assets and the
-/// document is stamped v8, so an existing layout survives the upgrade.
-///
-/// v9 adds the Problems tab (W-0038 Stage 6), appended to the leaf that holds
-/// Console by the same migration rule.
-///
-/// v10 adds the Statistics tab (W-0038 Stage 7), appended to the leaf that
-/// holds Problems.
-///
-/// v11 adds module panels (W-0038 Stage 11): the document carries the panel id
-/// each module tab's slot named, so the tab finds its panel again however the
-/// modules register in the next run. Nothing is appended, so a v10 document is
-/// accepted and stamped - its tabs are all built-in ones.
-///
-/// v12 opens the scene views (W-0038 Stage 21): `EditorTab::Scene` carries the
-/// view's index, so a layout may hold any number of them. Nothing is
-/// appended, so a v11 document is accepted and stamped - its `Scene` and
-/// `SecondScene` tabs read as views 0 and 1.
-///
-/// v13 adds pop-out windows (W-0038 Stage 23): the document names the tabs
-/// that live in their own OS windows, so a restart puts them back there.
-/// Nothing is appended, so a v12 document is accepted and stamped.
+/// A document `migrate` has a rule for is upgraded in place and stamped; any
+/// other - older than the oldest rule, or newer than this build - is replaced
+/// by the default layout with one log line.
 pub const LAYOUT_SCHEMA_VERSION: u32 = 13;
 
 /// The application directory inside the per-user state directory.
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
 
-/// The dock document's file name, beside the retired `pill_ui` editor's layout file.
+/// The dock document's file name in the layout directory.
 const LAYOUT_FILE: &str = "editor_egui_layout.json";
 
 /// Failures the dock model reports.
 ///
-/// Persistence wraps these in [`LayoutPersistenceError`]; the type stays
-/// here because the shared error surface names it (`editor::layout`).
+/// [`LayoutPersistenceError`] carries this type as its validation source; it
+/// stays here because the shared error surface names it (`editor::layout`).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
     /// The saved document was written by a newer layout schema.
@@ -90,13 +54,14 @@ pub fn load_or_default() -> EditorDock {
 }
 
 /// Load the dock document at `path`, falling back to the default on any
-/// invalid document.
+/// document this build cannot read.
 ///
-/// The fallback is the same for every reason - a missing file, a document
-/// from an older or newer schema, a document that does not parse - so the
-/// editor always opens. Each reason is logged once, at info, as
-/// `[editor] layout reset`: a suite tells a reset from a restored layout
-/// without reading the reason, and a person reads the reason.
+/// An older document [`migrate`] has a rule for is upgraded and written back
+/// first. The default is the answer for every remaining reason - a missing
+/// file, an unreadable schema, a document that does not parse - so the editor
+/// always opens. A reset is logged once, at info, as `[editor] layout reset`:
+/// a suite tells a reset from a restored layout without reading the reason,
+/// and a person reads the reason.
 fn load_from_path(path: &Path) -> EditorDock {
     // A missing file is the normal first-run state and stays silent.
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -140,9 +105,10 @@ fn load_from_path(path: &Path) -> EditorDock {
 /// Upgrade an older document in place, returning the version it came from;
 /// `None` when this build has no rule for that version.
 ///
-/// One entry per version bump: the tab that stage added, and the tab it is
-/// appended beside. A document several versions old gets every missing tab in
-/// one pass, chained in strip order, and nothing the user arranged moves.
+/// Each chain entry names the newest schema that still lacks a tab, the anchor
+/// it is appended beside and the tab itself. A document several versions old
+/// gets every missing tab in one pass, chained in strip order, and nothing the
+/// user arranged moves.
 fn migrate(dock: &mut EditorDock) -> Option<u32> {
     const CHAIN: [(u32, super::EditorTab, super::EditorTab); 3] = [
         (7, super::EditorTab::Assets, super::EditorTab::Console),
@@ -265,8 +231,8 @@ pub fn layout_directory() -> PathBuf {
 /// The temp directory is the last resort for an environment with neither.
 ///
 /// A browser has no environment and no filesystem; `std::env` panics there,
-/// so the web posture reports the working directory and every file read or
-/// write fails gracefully into the default dock instead.
+/// so the web posture answers a fixed relative directory and every load fails
+/// into the default dock.
 #[cfg(not(target_arch = "wasm32"))]
 fn editor_state_directory() -> PathBuf {
     if cfg!(windows) {
@@ -296,8 +262,8 @@ mod tests {
     use super::*;
     use crate::layout::EditorTab;
 
-    /// The default layout as `egui_dock` 0.17 wrote it: a real v6 document
-    /// from the dock this upgrade replaced, not a hand-written sketch.
+    /// A layout document in `egui_dock` 0.17's node model: a real v6
+    /// document, not a hand-written sketch.
     const V6_LAYOUT: &str = include_str!("fixtures/layout_v6.json");
 
     /// A directory of this test's own under the temp directory.
@@ -309,9 +275,9 @@ mod tests {
 
     #[test]
     fn a_stored_v6_document_is_replaced_by_the_default_layout() {
-        // 0.21's node model is not 0.17's. Whether the document cannot be read
-        // at all or parses and then fails the schema check, it must never be
-        // mistaken for this build's own file.
+        // The node models differ. Whether the document cannot be read at all
+        // or parses and then fails the schema check, it must never be mistaken
+        // for this build's own file.
         if let Ok(dock) = serde_json::from_str::<EditorDock>(V6_LAYOUT) {
             assert_eq!(dock.schema_version(), 6);
             assert!(!dock.is_current());

@@ -13,8 +13,9 @@
 //! [`EngineParameters::update`] rewrites the whole buffer, so the CPU-side
 //! copy and the GPU copy stay in step without anyone tracking dirty fields.
 //! The fog pair leads the block because the HLSL `EngineParams` in
-//! `include/common.hlsl` declares it at those offsets; the frame size and time
-//! follow as the engine side's extension, which no shipped shader reads yet.
+//! `shader_sources/common_shaders/include/common.hlsl` declares it at those
+//! offsets; the frame size and time follow as the engine side's extension,
+//! which no shipped shader reads.
 
 // External crates
 use wgpu::util::DeviceExt;
@@ -27,15 +28,13 @@ use crate::error::Result;
 /// Fog and the frame's size and time are frame state rather than pass state,
 /// so every pass reads the same buffer instead of carrying copies that could
 /// disagree within one frame.
-// The fog pair must match the HLSL `EngineParams` in `include/common.hlsl`
-// (std140, and that is all it declares so far):
-//   vec3  fog_color;       // offset 0  (12 bytes)
-//   float fog_density;     // offset 12 (4 bytes)
-// The frame size and time are the engine side's extension, laid out after the
-// pair; no shipped HLSL or WGSL declares them yet.
-//   vec4  frame_size;      // offset 16; xy = pixels, zw = its reciprocal
-//   vec4  time;            // offset 32; x = seconds, y = delta, z = frame
-//   // struct total: 48 bytes
+///
+/// The first 16 bytes must match the HLSL `EngineParams` in
+/// `shader_sources/common_shaders/include/common.hlsl`, which declares the
+/// fog pair and nothing after it. The tail is the engine side's own
+/// extension, which no shipped shader declares: `frame_size` at offset 16
+/// (xy = pixels, zw = their reciprocal) and `time` at offset 32 (x = seconds,
+/// y = delta, z = frame). The struct totals 48 bytes.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EngineParametersData {
@@ -46,9 +45,8 @@ pub struct EngineParametersData {
     /// The surface size in pixels, and its reciprocal.
     ///
     /// For a pass that samples the frame at a texel offset. No shipped shader
-    /// reads it yet, so it waits for the pass that will: taking the size from
-    /// the buffer keeps it current across a resize without the game handing it
-    /// through pass parameters.
+    /// reads it yet. Taken from the buffer rather than a pass parameter, so a
+    /// resize cannot leave it stale.
     pub frame_size: [f32; 4],
     /// x = seconds since the first frame, y = this frame's duration, z = the
     /// frame's sequence number. w is unused.
@@ -128,19 +126,17 @@ pub struct EngineParameters {
 
 impl EngineParameters {
     /// Creates the uniform buffer and its bindings that carry the engine
-    /// parameters to every shader.
+    /// parameters to every shader, with the values zeroed.
     ///
-    /// The values start zeroed, and the layout declares a single uniform
-    /// buffer at binding 0 that both the vertex and fragment stages can read.
     /// A pipeline that reads engine parameters must be built against
-    /// [`bind_group_layout`](EngineParameters::bind_group_layout), since that
-    /// is what makes this one group bindable by every pass.
+    /// [`bind_group_layout`](EngineParameters::bind_group_layout), which is
+    /// what makes this one group bindable by every pass.
     ///
     /// # Errors
     ///
-    /// None of its own: creating a buffer, a layout, and a bind group only
-    /// records work, and wgpu reports a rejected descriptor through the
-    /// device's error handler rather than through this return value.
+    /// Never returns an error: creating a buffer, a layout, and a bind group
+    /// only records work, and wgpu reports a rejected descriptor through the
+    /// device's error handler.
     pub fn new(device: &wgpu::Device) -> Result<Self> {
         let parameters_data = EngineParametersData::new();
 
@@ -151,15 +147,14 @@ impl EngineParameters {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        // Define engine bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("engine_parameters_bind_group_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0, // (set = X, binding = 0)
+                binding: 0, // (set = 0, binding = 0)
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false, // Specifies if this buffer will be changing size or not
+                    has_dynamic_offset: false,
                     min_binding_size: None,
                 },
                 count: None,
@@ -169,7 +164,7 @@ impl EngineParameters {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
-                binding: 0, // (set = X, binding = 0)
+                binding: 0,
                 resource: parameters_uniform_buffer.as_entire_binding(),
             }],
             label: Some("engine_parameters_bind_group"),

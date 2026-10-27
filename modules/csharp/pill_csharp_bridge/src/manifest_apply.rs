@@ -2,47 +2,34 @@
 //!
 //! # Responsibilities
 //!
-//! - Resolves each arriving declaration against the live binding table:
+//! - Resolve each arriving declaration against the live binding table:
 //!   settled, added, renamed through an alias, or reshaped.
-//! - Applies the resolution in the one order the reload protocol allows, and
-//!   journals an undo per applied entry so a later refusal unwinds.
-//! - Retires the entries the manifest stopped naming, last, after nothing that
-//!   could fail is left to run.
+//! - Apply them in the order the reload protocol allows, journaling an undo per
+//!   applied entry so a later refusal unwinds, and retire the entries the
+//!   manifest stopped naming last.
 //!
 //! # Design
 //!
-//! A managed manifest carries more than one kind of entry - components today,
-//! resources beside them, script components later - and every kind needs the
-//! same six stages in the same order. Only four things genuinely differ: how an
-//! entry is identified, what registering one does, what reshaping one does, and
-//! what retiring one does. Those arrive as a [`ManifestSubject`], a plain
-//! struct of function pointers in the style of `ColumnOps` and
-//! `StorageFactory`; everything else lives here, once.
-//!
-//! ## The ordering is the protocol
+//! Every manifest kind needs the same stages in the same order, and what a kind
+//! contributes arrives as a [`ManifestSubject`], a plain struct of function
+//! pointers in the style of `ColumnOps` and `StorageFactory`; everything else
+//! lives here, once.
 //!
 //! - **Aliases resolve before vanished entries are collected**, so an entry
 //!   whose alias reaches a still-live predecessor turns that predecessor from a
 //!   disappearance into a rename.
 //! - **Every entry is resolved before any of it is applied**, so the refusals
 //!   validation cannot foresee leave the world and the table as they were.
-//! - **Retirement runs last**, because it drops bytes and cannot be undone, so
-//!   nothing that could fail may run after it.
+//! - **Retirement runs last**, because it drops bytes and cannot be undone.
 //!
 //! ## What rollback can and cannot promise
 //!
-//! The table is all-or-nothing by construction: the pipeline works on a copy
-//! and the caller publishes whatever comes back. Engine state is as
-//! all-or-nothing as the subject's actions allow, and that is where the kinds
-//! genuinely part company. A component's reshape is a column relayout whose
-//! inverse plan puts the rows back, so it journals an undo and a refusal
-//! restores everything. A resource's reshape moves its stored bytes into a
-//! possibly narrower shape, and reversing that would have to invent the bytes
-//! it dropped - so it journals no undo, and the pipeline leaves that entry
-//! applied with its new binding in the table. Leaving it is the point: the
-//! table must never describe a layout the engine no longer holds, or the view
-//! callback's size check is reading one shape through another. Undo what can be
-//! undone, leave what cannot, and keep the table describing the engine.
+//! The table is all-or-nothing: the pipeline works on a copy and the caller
+//! publishes whatever comes back. A component's reshape journals an undo whose
+//! inverse plan puts the rows back; a resource's reshape cannot, because
+//! reversing it would have to invent the bytes it dropped - so it stays applied
+//! with its new binding, since the table must keep describing the layout the
+//! engine holds, which the view callback's size check depends on.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -129,7 +116,7 @@ pub(super) struct ManifestSubject<Declaration, Binding, Undo> {
     pub(super) identity: fn(&Declaration) -> StableComponentId,
     /// The declared name, for reports and refusals.
     pub(super) name: fn(&Declaration) -> &str,
-    /// The names this declaration says it used to be known by.
+    /// The names of live registrations this declaration renames onto itself.
     pub(super) aliases: fn(&Declaration) -> &[String],
     /// The name a live binding was registered under, for the retirement report.
     pub(super) binding_name: fn(&Engine, &Binding) -> String,
@@ -171,7 +158,8 @@ pub(super) struct ManifestOutcome {
     pub(super) added: Vec<String>,
     /// Entries whose layout changed and whose stored data was migrated.
     pub(super) migrated: Vec<String>,
-    /// Entries renamed from an earlier declaration, as `old name -> new name`.
+    /// Entries the manifest renamed through an alias, shown as
+    /// `old name -> new name`.
     pub(super) renamed: Vec<String>,
     /// Entries retired because the manifest stopped naming them.
     pub(super) retired: Vec<String>,
@@ -272,7 +260,7 @@ where
     })
 }
 
-/// The mutating half of [`apply_manifest`]: apply what [`prepare_manifest`]
+/// The mutating half of the pipeline: apply what [`prepare_manifest`]
 /// resolved, unwind on a refusal, and retire last.
 pub(super) fn execute_manifest<Declaration, Binding, Undo>(
     subject: &ManifestSubject<Declaration, Binding, Undo>,
@@ -311,8 +299,8 @@ where
         }
     }
 
-    // Step 5: Retire the declarations the manifest stopped naming, now that
-    // every add and migration has applied. Nothing may fail after this.
+    // Step 5: Retire the declarations the manifest stopped naming, once every
+    // add and migration has applied. Nothing may fail after this.
     if !vanished.is_empty() {
         let retired: Vec<Binding> = vanished
             .iter()

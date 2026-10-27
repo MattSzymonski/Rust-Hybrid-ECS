@@ -17,8 +17,10 @@
 //! resolves it once loaded.
 //!
 //! An unresolved reference is a missing asset, not a broken program: it
-//! resolves to [`Handle::INVALID`], which the renderer already draws with its
-//! fallbacks. It is logged once per guid rather than once per frame.
+//! resolves to [`Handle::INVALID`], which the renderer's caches answer with
+//! their default material, shader or texture - an instance whose mesh never
+//! uploaded is not drawn. It is logged once per guid rather than once per
+//! frame.
 
 // Standard library
 use std::collections::HashSet;
@@ -155,9 +157,9 @@ impl<T: Asset> std::fmt::Debug for AssetReference<T> {
 }
 
 impl<T: Asset> serde::Serialize for AssetReference<T> {
-    /// The saved form of a reference (Q1): `{"guid": "<32 hex>"}`, or `null`
-    /// when unset. A reference holds no path, so the hint is left out; a
-    /// writer that has the asset manager adds it through
+    /// The saved form of a reference: `{"guid": "<32 hex>"}`, or `null` when
+    /// unset. A reference holds no path, so the hint is left out; a writer that
+    /// has the asset manager adds it through
     /// [`SavedAssetReference::with_path`](crate::SavedAssetReference::with_path).
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.guid {
@@ -171,7 +173,7 @@ impl<T: Asset> serde::Serialize for AssetReference<T> {
 
 impl<'de, T: Asset> serde::Deserialize<'de> for AssetReference<T> {
     /// Reads both spellings: the object form this build writes and the bare
-    /// 32-hex guid every material and render pass written before Q1 holds.
+    /// 32-hex guid an older material or render pass file holds.
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self {
             guid: Option::<crate::saved_references::SavedAssetReference>::deserialize(
@@ -205,8 +207,7 @@ mod tests {
         assert_eq!(read, reference);
     }
 
-    /// AC3: the bare hex a `.material` file written before Q1 holds still
-    /// loads as the same reference.
+    /// The bare hex a `.material` file holds loads as the same reference.
     #[test]
     fn a_reference_reads_the_bare_guid_older_files_hold() {
         let read: AssetReference<Picture> = serde_json::from_str(&format!("\"{GUID}\"")).unwrap();

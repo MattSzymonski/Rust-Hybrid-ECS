@@ -8,8 +8,7 @@
 //!
 //! The macro walks the fields through a synthetic struct and takes every
 //! offset from the compiler, so a path spelled across segments has to work the
-//! same as an imported name - and two declarations whose paths share a
-//! trailing segment have to coexist, which pins the generated item naming.
+//! same as an imported name.
 
 mod probe {
     /// A `repr(C)` stand-in for a foreign vector type.

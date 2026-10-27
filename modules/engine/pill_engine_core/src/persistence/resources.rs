@@ -12,8 +12,9 @@
 //!
 //! A resource is a singleton, so unlike components there is no entity to group
 //! by and the snapshot is a flat, name-sorted list. Sorting by name makes a
-//! snapshot reproducible, which matters because the reload transaction
-//! compares snapshots across two generations of the same project.
+//! snapshot reproducible: hash-map order is not, and a snapshot that differs
+//! between two identical runs cannot be diffed, compared, or used as a test
+//! fixture.
 
 use super::*;
 
@@ -23,10 +24,9 @@ use super::*;
 
 /// Captured resource values at a point in time.
 ///
-/// Keyed by name for the reason every persistence payload is: an entry names
-/// its resource by the string both generations
-/// write down, never by an id, because an id is a `TypeId` in one process and a
-/// name hash in another while the name is what a save file can carry.
+/// Keyed by name, like every persistence payload: a [`ResourceId::Native`] is a
+/// `TypeId`, which no other process and no later build of this one reproduces,
+/// while the name is what a save file can carry.
 ///
 /// Flat rather than nested: a resource is a singleton, so there is no entity to
 /// group by.
@@ -86,19 +86,16 @@ pub struct PersistResourceManifestEntry {
 // World — Persistable Resource Registration
 // =============================================================================
 //
-// The resource half of the same contract. A resource is a singleton, so there
-// is no archetype to walk and no per-entity fan-out: a snapshot is one payload
-// per registered resource, keyed by the name both generations agree on.
+// A resource is a singleton, so there is no archetype to walk and no per-entity
+// fan-out: a snapshot is one payload per registered resource, keyed by the name
+// both generations agree on.
 //
-// Two things make this worth having beyond "save files should include the
-// resources". First, a world written to disk without its resources loses the
-// project's whole global state - the score, the level index, the settings -
-// while looking like a complete save. Second, `rehome_resources` refreshes a
-// live resource's function table across a reload but never touches its bytes,
-// so a resource whose shape changed is reinterpreted under the new type unless
-// something migrates it. `migrate_changed_persistable_resources` is that
-// something, and it is the resource twin of the component migration the reload
-// transaction already runs.
+// Migration is what makes this safe rather than merely convenient.
+// `rehome_resources` refreshes a live resource's function table across a reload
+// but never touches its bytes, so a resource whose shape changed would be
+// reinterpreted under the new type unless something migrates it.
+// `migrate_changed_persistable_resources` is that something, and it is the
+// resource twin of the component migration the reload transaction runs.
 
 impl World {
     /// Register a resource that survives snapshot, restore and reload.
@@ -110,9 +107,9 @@ impl World {
     /// same site.
     ///
     /// Registration is what opts a resource in. A resource registered with
-    /// [`Self::register_resource`] alone keeps behaving exactly as before and
-    /// simply never appears in a snapshot - the same relationship
-    /// `register_component` has with `register_persistable_component`.
+    /// [`Self::register_resource`] alone never appears in a snapshot - the same
+    /// relationship `register_component` has with
+    /// `register_persistable_component`.
     ///
     /// `T` must implement `Serialize + DeserializeOwned + Default` for the same
     /// reason a persistable component must: JSON is what crosses the gap

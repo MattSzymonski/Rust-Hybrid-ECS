@@ -1,4 +1,4 @@
-//! Redraw cadence (W-0038 Stage 9): when the editor owes a frame.
+//! Redraw cadence: when the editor owes a frame.
 //!
 //! # Responsibilities
 //!
@@ -53,8 +53,8 @@ pub struct FrameDemand {
     pub snapshot: bool,
     /// The window's size or scale changed.
     pub resized: bool,
-    /// Something is moving: the engine is not paused, a camera navigation or
-    /// a scripted drag is in flight, or a toast is counting down.
+    /// Something is moving: the engine is not paused, or a camera navigation
+    /// or scripted drag is in flight.
     pub animating: bool,
     /// egui asked for a repaint at its own pace.
     pub repaint_requested: bool,
