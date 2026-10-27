@@ -208,7 +208,7 @@ pub use asset_metadata::{
 pub use asset_reference::AssetReference;
 pub use asset_standalone::{render_standalone, StandaloneAsset};
 pub use commands::{CommandError, Commands};
-pub use common_components::{register_common_components, Color, Position, TransformComponent};
+pub use common_components::{register_transform_component, TransformComponent};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
 pub use debug_draw::{

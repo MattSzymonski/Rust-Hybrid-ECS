@@ -10,7 +10,6 @@
 
 use crate::settings::*;
 use crate::{PhysicsState, SimulationTime};
-use pill_engine::common_components::Position;
 use pill_engine::*;
 use pill_master_renderer_data::TransformComponent;
 
@@ -67,7 +66,7 @@ pub fn simulate_ball(state: &mut PhysicsState) {
 #[pill_hot]
 pub(crate) fn physics_system(
     mut time: ResMut<SimulationTime>,
-    mut query: Query<(&mut PhysicsState, &mut Position, &mut TransformComponent)>,
+    mut query: Query<(&mut PhysicsState, &mut TransformComponent)>,
 ) -> Result<(), SystemError> {
     let Some(time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
@@ -76,14 +75,12 @@ pub(crate) fn physics_system(
     };
 
     let delta_seconds = time.delta_seconds;
-    for (mut physics, mut position, mut transform) in query.iter_mut() {
+    for (mut physics, mut transform) in query.iter_mut() {
         physics.delta_time = delta_seconds;
         simulate_ball(&mut physics);
 
-        // Physics coordinates describe the centre of the ball; the mesh
-        // renderer expects the top-left corner of the quad.
-        position.x = physics.position_x - physics.radius;
-        position.y = physics.position_y - physics.radius;
+        // Physics coordinates are the ball's centre in the project's
+        // 800x600 pixel space; the transform places the mesh from them.
         transform.translation = [
             (physics.position_x - 400.0) / 80.0,
             (300.0 - physics.position_y) / 80.0,

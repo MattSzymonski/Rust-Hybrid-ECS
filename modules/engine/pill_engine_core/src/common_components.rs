@@ -2,29 +2,28 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines [`Position`] and [`Color`], the two components every renderer and
-//!   most projects name, with the byte layout they share across binaries.
 //! - Defines [`TransformComponent`], an entity's placement in the scene, which
 //!   rendering, physics, audio and gameplay all read.
-//! - Publishes their editor field layouts and the one call that registers them
-//!   ([`register_common_components`]), so a world that uses them exposes their
+//! - Publishes its editor field layout and the one call that registers it
+//!   ([`register_transform_component`]), so a world that uses it exposes its
 //!   fields to the inspector.
 //!
 //! # Design
 //!
-//! These are universal rather than renderer-specific: a position is where a
-//! thing is, a colour is what shade it is, and neither names a GPU concept.
-//! Renderer-specific mesh, camera and material contracts live in the rendering
-//! extension; these gameplay data types stay usable without it.
+//! The transform is universal rather than renderer-specific: where a thing is
+//! belongs to the scene, not to a GPU. Renderer-specific mesh, camera and
+//! material contracts live in the rendering extension, and a renderer that
+//! wants a component of its own - a pixel position for a sprite, say - defines
+//! it beside the code that draws it.
 //!
-//! The byte layout is a shared ABI. Another language binds these rows by the
-//! name they register under and the `repr(C)` size it verifies, because a
-//! `TypeId` is computed per compilation unit. [`TransformComponent`] also
-//! declares a shared name, so every binary that registers it resolves to one
-//! column. All three are declared by hand rather than with
-//! `#[derive(PillComponent)]`, whose inventory entry would make every artifact
-//! linking the engine register the component - and fold it into its
-//! persistable-schema fingerprint - whether it used it or not.
+//! The byte layout is a shared ABI. Another language binds this row by the
+//! name it registers under and the `repr(C)` size it verifies, because a
+//! `TypeId` is computed per compilation unit. [`TransformComponent`] declares a
+//! shared name, so every binary that registers it resolves to one column. It is
+//! declared by hand rather than with `#[derive(PillComponent)]`, whose inventory
+//! entry would make every artifact linking the engine register the component -
+//! and fold it into its persistable-schema fingerprint - whether it used it or
+//! not.
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -39,63 +38,6 @@ use pill_engine_macros::PillLayout;
 // =============================================================================
 // Components
 // =============================================================================
-
-/// World-space position of an entity's draw origin, in pixels.
-///
-/// Plain `repr(C)` float pairs, so its byte layout is what another language
-/// binds against rather than a `TypeId`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PillLayout)]
-pub struct Position {
-    /// Horizontal pixel coordinate of the draw origin.
-    pub x: f32,
-    /// Vertical pixel coordinate of the draw origin.
-    pub y: f32,
-}
-impl Component for Position {}
-
-/// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
-///
-/// `#[repr(C)]` with normalized float channels so the byte layout is shared
-/// with the C# runtime as part of the component ABI.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, PillLayout)]
-pub struct Color {
-    /// Red channel.
-    #[pill(color)]
-    pub r: f32,
-    /// Green channel.
-    #[pill(color)]
-    pub g: f32,
-    /// Blue channel.
-    #[pill(color)]
-    pub b: f32,
-    /// Alpha channel.
-    #[pill(color)]
-    pub a: f32,
-}
-impl Component for Color {}
-
-impl Color {
-    /// Opaque white, and what [`Default`] returns for a colour.
-    pub const WHITE: Color = Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
-    };
-
-    /// Construct a color from its red, green, blue, and alpha channels.
-    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Self::WHITE
-    }
-}
 
 /// The shared name [`TransformComponent`] registers under.
 ///
@@ -180,20 +122,16 @@ pub fn rotation_or_identity(rotation: [f32; 4]) -> [f32; 4] {
 // Registration
 // =============================================================================
 
-/// Register [`Position`], [`Color`] and [`TransformComponent`] with their
-/// editor layouts.
+/// Register [`TransformComponent`] with its editor layout.
 ///
-/// [`TransformComponent`] is registered as persistable, so its values are
-/// migrated across reloads. Idempotent, so a hot reload re-running `init` is
-/// safe, and every type arrives in the inspector field-editable rather than as
-/// an opaque blob: the layouts come from `#[derive(PillLayout)]` on each
-/// struct.
+/// The transform is registered as persistable, so its values are migrated
+/// across reloads. Idempotent, so a hot reload re-running `init` is safe, and
+/// the type arrives in the inspector field-editable rather than as an opaque
+/// blob: the layout comes from `#[derive(PillLayout)]`.
 ///
 /// A renderer calls this from its registration entry point before adding
 /// whatever it draws with.
-pub fn register_common_components(world: &mut World) {
-    world.register_component_with_layout::<Position>(Position::FIELD_LAYOUT);
-    world.register_component_with_layout::<Color>(Color::FIELD_LAYOUT);
+pub fn register_transform_component(world: &mut World) {
     world.register_persistable_component_with_layout::<TransformComponent>(
         TransformComponent::FIELD_LAYOUT,
     );
@@ -207,72 +145,30 @@ pub fn register_common_components(world: &mut World) {
 mod tests {
     use super::*;
 
-    /// The declared layouts describe the structs they claim to.
-    ///
-    /// The generated layouts cover each struct byte-for-byte, with the tags
-    /// and alignment the inspector relies on.
-    #[test]
-    fn the_field_layouts_match_their_structs() {
-        assert_eq!(
-            Position::FIELD_LAYOUT.len(),
-            2,
-            "a position has two coordinates"
-        );
-        assert_eq!(
-            std::mem::size_of::<Position>(),
-            Position::FIELD_LAYOUT
-                .iter()
-                .map(|field| field.size)
-                .sum::<usize>(),
-            "the layout covers every byte of Position"
-        );
-
-        assert_eq!(Color::FIELD_LAYOUT.len(), 4, "a colour has four channels");
-        assert_eq!(
-            std::mem::size_of::<Color>(),
-            Color::FIELD_LAYOUT
-                .iter()
-                .map(|field| field.size)
-                .sum::<usize>(),
-            "the layout covers every byte of Color"
-        );
-
-        for (index, field) in Position::FIELD_LAYOUT
-            .iter()
-            .chain(Color::FIELD_LAYOUT)
-            .enumerate()
-        {
-            assert_eq!(field.type_tag, "f32", "field {index} is a float channel");
-            assert_eq!(field.align, 4, "field {index} is four-byte aligned");
-        }
-    }
-
-    /// Registration attaches the layouts, so the inspector sees fields rather
+    /// Registration attaches the layout, so the inspector sees fields rather
     /// than an opaque blob.
     #[test]
-    fn registration_attaches_the_field_layouts() {
+    fn registration_attaches_the_field_layout() {
         let mut world = World::new();
-        register_common_components(&mut world);
+        register_transform_component(&mut world);
 
-        let position = crate::component::ComponentId::of::<Position>();
-        let color = crate::component::ComponentId::of::<Color>();
+        let transform = crate::component::ComponentId::of::<TransformComponent>();
         assert_eq!(
-            world.component_field_layout(position).map(<[_]>::len),
-            Some(2)
+            world.component_field_layout(transform).map(<[_]>::len),
+            Some(3)
         );
-        assert_eq!(world.component_field_layout(color).map(<[_]>::len), Some(4));
     }
 
     /// Registering twice is what a hot reload does, and it must not fail.
     #[test]
     fn registration_is_idempotent() {
         let mut world = World::new();
-        register_common_components(&mut world);
-        register_common_components(&mut world);
+        register_transform_component(&mut world);
+        register_transform_component(&mut world);
 
         assert!(
             world.take_registration_error().is_none(),
-            "re-registering the same types is what every reload does"
+            "re-registering the same type is what every reload does"
         );
     }
 
@@ -292,12 +188,12 @@ mod tests {
         );
     }
 
-    /// A world registering only the common components has the transform, with
+    /// A world registering only the engine's component has the transform, with
     /// its three described fields and a persistence entry.
     #[test]
     fn registration_includes_a_persistable_transform() {
         let mut world = World::new();
-        register_common_components(&mut world);
+        register_transform_component(&mut world);
 
         let transform = crate::component::ComponentId::of::<TransformComponent>();
         assert_eq!(
@@ -340,13 +236,5 @@ mod tests {
         assert_eq!(transform.translation, [0.0; 3]);
         assert_eq!(transform.rotation, [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(transform.scale, [1.0; 3]);
-    }
-
-    /// White is the default, because a mesh with no colour set should be
-    /// visible rather than invisible.
-    #[test]
-    fn a_default_colour_is_opaque_white() {
-        assert_eq!(Color::default(), Color::WHITE);
-        assert_eq!(Color::WHITE, Color::new(1.0, 1.0, 1.0, 1.0));
     }
 }

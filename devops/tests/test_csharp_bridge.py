@@ -501,8 +501,8 @@ SYSTEM_EXTRA_LATCH_EDIT = (
     "public static class SplinePathSystem\n{\n    // Written by devops/tests/test_csharp_bridge.py while the suite runs:\n    // reports the migrated field default once per assembly.\n#pragma warning disable PILL0301\n    private static bool extraLogged;\n#pragma warning restore PILL0301\n\n    [EcsSystem]",
 )
 SYSTEM_EXTRA_PRINT_EDIT = (
-    "                ref var sample = ref sampleRow.SplineSample;\n                ref var position = ref sampleRow.Position;",
-    "                ref var sample = ref sampleRow.SplineSample;\n                if (!extraLogged)\n                {\n                    extraLogged = true;\n                    Console.WriteLine($\"[project_cs] sample extra={sample.Extra}\");\n                }\n                ref var position = ref sampleRow.Position;",
+    "                ref var sample = ref sampleRow.SplineSample;",
+    "                ref var sample = ref sampleRow.SplineSample;\n                if (!extraLogged)\n                {\n                    extraLogged = true;\n                    Console.WriteLine($\"[project_cs] sample extra={sample.Extra}\");\n                }",
 )
 
 # `7.5f` through `"R"` formatting; anything else means the added field was

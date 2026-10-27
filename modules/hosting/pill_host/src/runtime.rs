@@ -3536,30 +3536,26 @@ mod tests {
 
     const PAUSED: Option<PauseReason> = Some(PauseReason::StaleRendererAfterDataLayoutChange);
 
-    /// A world holding one entity with each of the engine's common components
-    /// (the shared transform, the plain position), and the names they are
-    /// registered under.
-    fn world_with_common_components() -> (pill_engine::World, String, String) {
+    /// A world holding one entity with the engine's transform, and the name it
+    /// is registered under.
+    fn world_with_common_components() -> (pill_engine::World, String) {
         let mut world = pill_engine::World::new();
-        pill_engine::register_common_components(&mut world);
+        pill_engine::register_transform_component(&mut world);
         world
             .create_entity()
             .with(pill_engine::TransformComponent::default())
-            .with(pill_engine::Position::default())
             .build()
             .expect("registered components");
         let transform = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
-        let position =
-            pill_engine::component::ComponentRegistry::registered_name::<pill_engine::Position>();
-        (world, transform, position)
+        (world, transform)
     }
 
     /// A shared component with entities that the renderer does not consume is
     /// reported once, with its entity count; a plain one never is.
     #[test]
     fn an_ignored_shared_component_is_reported_once() {
-        let (world, transform, position) = world_with_common_components();
-        let registered = vec![transform.clone(), position, transform.clone()];
+        let (world, transform) = world_with_common_components();
+        let registered = vec![transform.clone(), transform.clone()];
 
         assert_eq!(
             unsupported_render_components(&world, &registered, &[]),
@@ -3570,7 +3566,7 @@ mod tests {
     /// A consumed component, or one no entity carries, is not reported.
     #[test]
     fn consumed_or_unused_components_are_not_reported() {
-        let (world, transform, _) = world_with_common_components();
+        let (world, transform) = world_with_common_components();
 
         assert!(unsupported_render_components(
             &world,
@@ -3579,7 +3575,7 @@ mod tests {
         )
         .is_empty());
         let mut empty = pill_engine::World::new();
-        pill_engine::register_common_components(&mut empty);
+        pill_engine::register_transform_component(&mut empty);
         let transform = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
         assert!(unsupported_render_components(&empty, &[transform], &[]).is_empty());
     }

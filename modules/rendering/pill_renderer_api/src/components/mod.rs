@@ -29,11 +29,11 @@ pub use viewport::RenderViewport;
 use pill_engine::World;
 
 /// Registers the contract's components with the world, field layouts included:
-/// the engine's common components (the transform among them) and the camera.
+/// the engine's transform and the camera.
 ///
 /// A renderer's data crate calls this before registering its own components.
 pub fn register_contract_components(world: &mut World) {
-    pill_engine::common_components::register_common_components(world);
+    pill_engine::common_components::register_transform_component(world);
     camera::register(world);
 }
 

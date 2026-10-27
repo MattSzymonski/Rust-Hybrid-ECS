@@ -26,13 +26,16 @@
 //! by [`audio_system`]. The component stays `#[repr(C)]` plain data, which is
 //! what lets it survive a hot reload and be read from C#.
 //!
-//! ## Spatial audio and the 2D world
+//! ## Spatial audio
 //!
-//! `Position` is 2D while rodio's spatial sink wants a 3D point, so a
-//! [`Position`] is lifted to `(x, y, 0.0)`, and [`AudioListenerComponent`]
-//! carries its own `facing_degrees` rather than reading a rotation component
-//! this engine does not have. [`ear_positions`] is the one conversion between
-//! the two spaces.
+//! A spatial sink wants a 3D point, and the transform's
+//! [`translation`](pill_engine::TransformComponent::translation) is exactly
+//! that: an emitter follows its entity's translation and the listener's ears
+//! are placed around it.
+//! [`AudioListenerComponent`] still carries its own `facing_degrees` rather
+//! than reading the transform's quaternion, and [`ear_positions`] is the one
+//! conversion between a listener's placement and the two points rodio pans
+//! against.
 
 // The build script scans this crate and emits one address entry per function
 // into `function_inventory.rs`; the `include!` is what makes every function

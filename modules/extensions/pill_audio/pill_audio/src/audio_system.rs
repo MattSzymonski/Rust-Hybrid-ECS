@@ -15,7 +15,7 @@
 
 // External crates
 use crate::AudioLoadQueue;
-use pill_engine::{AssetManager, Position, Query, ResMut, SystemError};
+use pill_engine::{AssetManager, Query, ResMut, SystemError, TransformComponent};
 
 // Current crate
 use crate::audio_command::AudioCommand;
@@ -49,8 +49,8 @@ pub fn audio_system(
     mut manager: ResMut<AudioManager>,
     mut assets: ResMut<AssetManager>,
     mut loads: ResMut<AudioLoadQueue>,
-    mut listeners: Query<(&AudioListenerComponent, &Position)>,
-    mut sources: Query<(&mut AudioSourceComponent, &Position)>,
+    mut listeners: Query<(&AudioListenerComponent, &TransformComponent)>,
+    mut sources: Query<(&mut AudioSourceComponent, &TransformComponent)>,
 ) -> Result<(), SystemError> {
     let Some(mut assets) = assets.get_mut() else {
         return Ok(());
@@ -72,10 +72,10 @@ pub fn audio_system(
     // Step 1: find the active listener. One pair of ears, so the first enabled
     // listener wins and the rest are ignored.
     let mut ears = None;
-    for (listener, position) in listeners.iter_mut() {
+    for (listener, transform) in listeners.iter_mut() {
         if listener.enabled {
             ears = Some(ear_positions(
-                (position.x, position.y),
+                transform.translation,
                 listener.facing_degrees,
             ));
             break;
@@ -92,7 +92,7 @@ pub fn audio_system(
         manager.set_ears(left, right);
     }
 
-    for (mut source, position) in sources.iter_mut() {
+    for (mut source, transform) in sources.iter_mut() {
         // `play_on_awake` is a one-shot: clearing it here means a reload,
         // which re-runs registration but keeps components, does not restart
         // every sound in the world.
@@ -149,7 +149,7 @@ pub fn audio_system(
         // Step 3: follow the entity with the emitter.
         if source.has_sink() && source.is_playing {
             if sound_type == SoundType::Spatial {
-                manager.set_emitter(source.sink, [position.x, position.y, 0.0]);
+                manager.set_emitter(source.sink, transform.translation);
             }
             manager.set_volume(sound_type, source.sink, source.volume);
         }

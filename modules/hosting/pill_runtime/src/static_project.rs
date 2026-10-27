@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn an_external_backend_gets_the_module_components_and_returns_its_guard() {
         fn registers_common_components(engine: &mut Engine) -> u32 {
-            pill_engine::register_common_components(engine.world_mut());
+            pill_engine::register_transform_component(engine.world_mut());
             0
         }
         static MODULES: &[StaticModule] = &[StaticModule {

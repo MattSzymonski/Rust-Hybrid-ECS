@@ -1960,10 +1960,10 @@ mod tests {
     fn a_nested_type_lives_in_the_namespace_of_its_first_user() {
         let workspace = temp_workspace("namespaces", "pill_spline");
         let first = exposed_typed(
-            "pill_engine.common_components.Position",
-            8,
+            "pill_engine.common_components.TransformComponent",
+            40,
             4,
-            vec![field("x", "f32", 0, 4, 4), field("y", "f32", 4, 4, 4)],
+            vec![field("translation", "f32", 0, 12, 4)],
         );
         let second = exposed_typed(
             "pill_master_renderer.component.Path",

@@ -32,7 +32,6 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 
 // The renderer's components, generated from their Rust registration.
-using pill_engine.common_components;
 using pill_master_renderer.component;
 
 using static TracyLive.ProjectConstants;
@@ -73,13 +72,6 @@ internal static class ProjectConstants
 
     /// <summary>Edge length of a sample dot, in pixels.</summary>
     internal const float SplineSampleDotSize = 6.0f;
-
-    /// <summary>Fill colour of the ball meshes.</summary>
-    internal static readonly Color BallColor = new() { R = 1.0f, G = 0.3f, B = 0.3f, A = 1.0f };
-
-    /// <summary>Fill colour of the sample dots.</summary>
-    internal static readonly Color SampleDotColor =
-        new() { R = 0.25f, G = 0.85f, B = 1.0f, A = 1.0f };
 }
 
 // =============================================================================
@@ -182,7 +174,7 @@ public static class BallPhysicsSystem
     [EcsSystem]
     public static void Run(
         ResMut<SimulationTime> time,
-        Query<Write<PhysicsState>, Write<Position>, Write<TransformComponent>> query)
+        Query<Write<PhysicsState>, Write<TransformComponent>> query)
     {
         ref SimulationTime simulation = ref time.Value;
         SimulationClock.Stamp(ref simulation);
@@ -191,16 +183,14 @@ public static class BallPhysicsSystem
         foreach (var row in query.Rows())
         {
             ref var physics = ref row.PhysicsState;
-            ref var position = ref row.Position;
             ref var transform = ref row.TransformComponent;
 
             physics.DeltaTime = deltaSeconds;
             Simulate(ref physics);
 
-            // Physics coordinates describe the centre of the ball; the mesh
-            // renderer expects the top-left corner of the quad.
-            position.X = physics.PositionX - physics.Radius;
-            position.Y = physics.PositionY - physics.Radius;
+            // Physics coordinates are the ball's centre in the project's
+            // 800x600 pixel space; the scene places the mesh from them, and
+            // the renderer draws its quad from the entity's transform.
             transform = TransformComponent.At((physics.PositionX - 400.0f) / 80.0f, (300.0f - physics.PositionY) / 80.0f, 0.0f, physics.Radius / 80.0f);
         }
     }
@@ -263,7 +253,7 @@ public static class SplinePathSystem
     public static void Run(
         Query<Read<PhysicsState>> balls,
         Query<Write<Spline>> splines,
-        Query<Write<SplineSample>, Write<Position>, Write<TransformComponent>> samples)
+        Query<Write<SplineSample>, Write<TransformComponent>> samples)
     {
         // Step 1: collect the ball centres in the order the control points
         // take. Iteration walks the ball archetype row by row and the balls
@@ -305,14 +295,11 @@ public static class SplinePathSystem
             foreach (var sampleRow in samples.Rows())
             {
                 ref var sample = ref sampleRow.SplineSample;
-                ref var position = ref sampleRow.Position;
                 float x = spline.GetLocationX(sample.T);
                 float y = spline.GetLocationY(sample.T);
 
                 // Samples are curve points and the dot is centred on them;
-                // meshs draw from the top-left corner of their quad.
-                position.X = x - SplineSampleDotSize * 0.5f;
-                position.Y = y - SplineSampleDotSize * 0.5f;
+                // the transform places the mesh's quad from that centre.
                 sampleRow.TransformComponent = TransformComponent.At((x - 400.0f) / 80.0f, (300.0f - y) / 80.0f, 0.0f, SplineSampleDotSize / 160.0f);
             }
         }
@@ -368,11 +355,6 @@ public static class BallSpawnSystem
             PhysicsState ball = WorldSetup.BallSpawnState(index);
             commands.CreateEntity()
                 .With(ball)
-                .With(new Position
-                {
-                    X = ball.PositionX - ball.Radius,
-                    Y = ball.PositionY - ball.Radius,
-                })
                 .With(TransformComponent.At((ball.PositionX - 400.0f) / 80.0f, (300.0f - ball.PositionY) / 80.0f, 0.0f, ball.Radius / 80.0f))
                 .With(MeshRendererComponent.None)
                 .Build();
@@ -434,11 +416,6 @@ public static class SplineSampleSpawnSystem
             float y = seed.GetLocationY(t);
             commands.CreateEntity()
                 .With(new SplineSample { T = t })
-                .With(new Position
-                {
-                    X = x - SplineSampleDotSize * 0.5f,
-                    Y = y - SplineSampleDotSize * 0.5f,
-                })
                 .With(TransformComponent.At((x - 400.0f) / 80.0f, (300.0f - y) / 80.0f, 0.0f, SplineSampleDotSize / 160.0f))
                 .With(MeshRendererComponent.None)
                 .Build();

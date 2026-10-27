@@ -12,7 +12,6 @@ using System.Runtime.InteropServices;
 using TracyLive;
 using TracyLive.Loader;
 // The renderer's components, generated from their Rust registration.
-using pill_engine.common_components;
 using pill_master_renderer.component;
 
 namespace TracyLive.Tests;
@@ -744,11 +743,11 @@ internal static class Program
                 // and its `MeshVertex` value type, and the spline extension's
                 // `Spline`, `Vector3f` and `OmoMO`. Only loaded modules are
                 // mirrored, so `pill_dummy_color`'s value types are absent.
-                Equal(components.Length, 13, "unexpected manifest component count: " +
+                Equal(components.Length, 11, "unexpected manifest component count: " +
                     string.Join(" | ", components.Select(component =>
                         component.GetProperty("full_name").GetString())));
-                var position = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "pill_engine.common_components.Position");
+                var transform = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "pill_master_renderer.component.TransformComponent");
                 var renderable = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "pill_master_renderer.component.MeshRendererComponent");
                 var physics = components.Single(component =>
@@ -760,8 +759,8 @@ internal static class Program
                 // Generated mirrors bind by their generated identity, exactly as
                 // an extension's do; the shared-schema path is for hand-written
                 // `[EcsSharedComponent]` mirrors, which the renderer no longer has.
-                Assert(!position.GetProperty("shared").GetBoolean(),
-                    "generated Position mirror must bind by identity, not as a shared schema");
+                Assert(!transform.GetProperty("shared").GetBoolean(),
+                    "generated TransformComponent mirror must bind by identity, not as a shared schema");
                 Assert(!renderable.GetProperty("shared").GetBoolean(),
                     "generated MeshRendererComponent mirror must bind by identity, not as a shared schema");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
@@ -839,28 +838,24 @@ internal static class Program
                     "a handle is a leaf, not a nested struct");
             });
 
-            Test("ball physics declares PhysicsState, Position, and TransformComponent writes", () =>
+            Test("ball physics declares PhysicsState and TransformComponent writes", () =>
             {
                 var method = typeof(BallPhysicsSystem).GetMethod(nameof(BallPhysicsSystem.Run))
                     ?? throw new InvalidOperationException("BallPhysicsSystem.Run is missing");
                 var system = ProjectHost.CreateSystem(method);
                 var componentAccesses = system.Accesses.Where(access => access.Kind == 0).ToArray();
 
-                Equal(system.Accesses.Count(access => access.Kind == 0), 3, "unexpected ball access count");
+                Equal(system.Accesses.Count(access => access.Kind == 0), 2, "unexpected ball access count");
                 Assert(system.Accesses.All(access => access.Mode == 1),
                     "ball physics accesses must all be writable");
                 Equal(componentAccesses[0].ComponentKey, Engine.ComponentKey(typeof(PhysicsState)),
                     "wrong PhysicsState key");
                 Equal(componentAccesses[0].ComponentKeyHigh,
                     Engine.ComponentKeyHigh(typeof(PhysicsState)), "wrong PhysicsState high key");
-                Equal(componentAccesses[1].ComponentKey, Engine.ComponentKey(typeof(Position)),
-                    "wrong Position key");
+                Equal(componentAccesses[1].ComponentKey, Engine.ComponentKey(typeof(TransformComponent)),
+                    "wrong TransformComponent key");
                 Equal(componentAccesses[1].ComponentKeyHigh,
-                    Engine.ComponentKeyHigh(typeof(Position)), "wrong Position high key");
-                Equal(componentAccesses[2].ComponentKey, Engine.ComponentKey(typeof(TransformComponent)),
-                    "wrong MeshRendererComponent key");
-                Equal(componentAccesses[2].ComponentKeyHigh,
-                    Engine.ComponentKeyHigh(typeof(TransformComponent)), "wrong MeshRendererComponent high key");
+                    Engine.ComponentKeyHigh(typeof(TransformComponent)), "wrong TransformComponent high key");
             });
 
             Test("managed Commands parameter is reflected into system metadata", () =>
@@ -929,8 +924,8 @@ internal static class Program
                 // what a fresh project build does.
                 ProjectHost.CreateSystem(method).Run();
                 Equal(MockNativeWorld.QueuedCreates, 5, "spawn create count mismatch");
-                Equal(MockNativeWorld.LastCreateComponentCount, 4,
-                    "each ball must contain PhysicsState, Position, and MeshRendererComponent");
+                Equal(MockNativeWorld.LastCreateComponentCount, 3,
+                    "each ball must contain PhysicsState, TransformComponent and MeshRendererComponent");
                 Equal(MockNativeWorld.NextEntityId, 5UL, "spawn did not reserve unique entities");
             });
 
@@ -984,11 +979,10 @@ internal static class Program
                 Equal(Marshal.OffsetOf<PhysicsState>(nameof(PhysicsState.Active)).ToInt32(), 24,
                     "PhysicsState.Active offset mismatch");
 
-                Equal(Marshal.SizeOf<Position>(), 8, "Position size mismatch");
-                Equal(Marshal.SizeOf<Color>(), 16, "Color size mismatch");
                 Equal(Marshal.SizeOf<MeshRendererComponent>(), 16, "MeshRendererComponent size mismatch");
                 Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.Material)).ToInt32(), 8,
                     "MeshRendererComponent.Material offset mismatch");
+                Equal(Marshal.SizeOf<TransformComponent>(), 40, "TransformComponent size mismatch");
             });
 
             Test("padded sequential layouts agree with Marshal", () =>
@@ -1902,12 +1896,12 @@ internal static class Program
 
             Test("component keys are stable and type-specific", () =>
             {
-                Equal(Engine.ComponentKey(typeof(Position)),
-                    Engine.ComponentKey(typeof(Position)), "Position key is unstable");
+                Equal(Engine.ComponentKey(typeof(TransformComponent)),
+                    Engine.ComponentKey(typeof(TransformComponent)), "TransformComponent key is unstable");
                 Assert(Engine.ComponentKey(typeof(PhysicsState)) !=
-                       Engine.ComponentKey(typeof(Position)),
+                       Engine.ComponentKey(typeof(TransformComponent)),
                     "different current project components produced the same key");
-                Assert(Engine.ComponentKey(typeof(Position)) !=
+                Assert(Engine.ComponentKey(typeof(TransformComponent)) !=
                        Engine.ComponentKey(typeof(MeshRendererComponent)),
                     "different current project components produced the same key");
             });

@@ -24,7 +24,6 @@
 //! and verified `repr(C)` size instead of by a host-typed query.
 
 // External crates
-use pill_engine::common_components::{register_common_components, Color, Position};
 use pill_engine::component::Component;
 use pill_engine::world::World;
 use pill_engine::PillLayout;
@@ -32,6 +31,65 @@ use pill_engine::PillLayout;
 // =============================================================================
 // Components
 // =============================================================================
+
+/// World-space position of an entity's draw origin, in pixels.
+///
+/// Plain `repr(C)` float pairs: a sprite's placement is the renderer's own
+/// concern, so the type lives beside the pipeline that draws it rather than in
+/// the ECS core. Its byte layout is what another binary binds against, since a
+/// `TypeId` is computed per compilation unit.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, PillLayout)]
+pub struct Position {
+    /// Horizontal pixel coordinate of the draw origin.
+    pub x: f32,
+    /// Vertical pixel coordinate of the draw origin.
+    pub y: f32,
+}
+impl Component for Position {}
+
+/// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
+///
+/// `#[repr(C)]` with normalized float channels, so a colour written by a
+/// project and read by the pipeline agrees byte for byte.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, PillLayout)]
+pub struct Color {
+    /// Red channel.
+    #[pill(color)]
+    pub r: f32,
+    /// Green channel.
+    #[pill(color)]
+    pub g: f32,
+    /// Blue channel.
+    #[pill(color)]
+    pub b: f32,
+    /// Alpha channel.
+    #[pill(color)]
+    pub a: f32,
+}
+impl Component for Color {}
+
+impl Color {
+    /// Opaque white, and what [`Default`] returns for a colour.
+    pub const WHITE: Color = Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+
+    /// Construct a color from its red, green, blue, and alpha channels.
+    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Self::WHITE
+    }
+}
 
 /// Axis-aligned colored rectangle drawn at an entity's [`Position`].
 ///
@@ -68,11 +126,13 @@ impl Default for Sprite {
 ///
 /// `Sprite`'s layout comes from `#[derive(PillLayout)]` - one `color` row the
 /// world expands into one scalar row per channel, which the inspector draws as
-/// a colour group. [`register_common_components`] is delegated to rather than
-/// restated, so a project wanting [`Position`] and [`Color`] without a renderer
-/// links no GPU code at all.
+/// a colour group. The engine's transform is registered first, so an entity
+/// carries both the pixel placement this renderer reads and the scene placement
+/// a 3D renderer would.
 pub fn register_components(world: &mut World) {
-    register_common_components(world);
+    pill_engine::register_transform_component(world);
+    world.register_component_with_layout::<Position>(Position::FIELD_LAYOUT);
+    world.register_component_with_layout::<Color>(Color::FIELD_LAYOUT);
     world.register_component_with_layout::<Sprite>(Sprite::FIELD_LAYOUT);
 }
 

@@ -55,15 +55,15 @@ use super::parallel::{
     ffi_parallel_for, parallel_for, PARALLEL_NESTED, PARALLEL_NO_SCOPE, PARALLEL_OK,
 };
 use super::queries::ffi_entity_stable_id;
-// The shared-ABI fixtures: the engine's `Position` and the renderer data's
-// `MeshRendererComponent`, bound the way a managed project gets them.
+// The shared-ABI fixtures: the engine's `TransformComponent` and the renderer
+// data's `MeshRendererComponent`, bound the way a managed project gets them.
 use super::context::ActiveSystemGuard;
 use super::manifest::parse_and_validate_manifest;
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
 use super::resources::resource_target;
-use pill_engine::common_components::Position;
+use pill_engine::common_components::TransformComponent;
 // The host depends on the renderer data crate for its dependency graph only
 // (see `pill_host/Cargo.toml`); these tests are the one place that names it,
 // to bind the real renderer components and call its asset functions.
@@ -105,7 +105,7 @@ const TEST_WORLD_ENTITY_COUNT: usize = 100;
 /// component lives in the project's `TracyLive` namespace.
 fn test_full_name(name: &str) -> String {
     match name {
-        "Position" => "pill_engine.common_components.Position".to_owned(),
+        "TransformComponent" => "pill_master_renderer.component.TransformComponent".to_owned(),
         "MeshRendererComponent" => {
             "pill_master_renderer.component.MeshRendererComponent".to_owned()
         }
@@ -223,7 +223,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
         let entity = engine
             .world_mut()
             .create_entity()
-            .with(Position { x: 0.0, y: 0.0 })
+            .with(TransformComponent::default())
             .with(MeshRendererComponent::default())
             .build()
             .unwrap();
@@ -296,13 +296,16 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             schema_hash: 2,
         },
     );
-    let position_key = test_stable_id("Position");
-    let position = Position { x: 9.0, y: 12.0 };
+    let transform_key = test_stable_id("TransformComponent");
+    let transform = TransformComponent {
+        translation: [9.0, 12.0, 0.0],
+        ..TransformComponent::default()
+    };
     let descriptor_a_value = 41_u32;
     let mut created = None;
 
-    // Step 1: Create a mixed entity holding Position and DescriptorA through the
-    // native command queue.
+    // Step 1: Create a mixed entity holding the transform and DescriptorA
+    // through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
@@ -312,10 +315,10 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             let entity = unsafe { entity.assume_init() };
             let blobs = [
                 NativeComponentBlob {
-                    component_key: position_key.0 as u64,
-                    component_key_high: (position_key.0 >> 64) as u64,
-                    data: std::ptr::from_ref(&position).cast(),
-                    size: std::mem::size_of::<Position>() as u32,
+                    component_key: transform_key.0 as u64,
+                    component_key_high: (transform_key.0 >> 64) as u64,
+                    data: std::ptr::from_ref(&transform).cast(),
+                    size: std::mem::size_of::<TransformComponent>() as u32,
                 },
                 NativeComponentBlob {
                     component_key: descriptor_a_key.0 as u64,
@@ -335,7 +338,11 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     let entity = created.unwrap();
     assert_eq!(engine.world().entity_count(), 1);
     assert_eq!(
-        engine.world().get_component::<Position>(entity).unwrap().x,
+        engine
+            .world()
+            .get_component::<TransformComponent>(entity)
+            .unwrap()
+            .translation[0],
         9.0
     );
 
@@ -401,7 +408,10 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             .unwrap(),
         77_u32.to_ne_bytes()
     );
-    assert!(engine.world().get_component::<Position>(entity).is_some());
+    assert!(engine
+        .world()
+        .get_component::<TransformComponent>(entity)
+        .is_some());
 
     // Step 3: Destroy the entity through the native command queue.
     engine
@@ -421,7 +431,7 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
     let stale = engine
         .world_mut()
         .create_entity()
-        .with(Position { x: 0.0, y: 0.0 })
+        .with(TransformComponent::default())
         .build()
         .unwrap();
     assert!(engine.world_mut().destroy_entity(stale));
@@ -445,7 +455,7 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
 /// Verify a managed Commands parameter makes its scheduler access exclusive.
 #[test]
 fn reflected_managed_commands_access_is_scheduler_exclusive() {
-    let mut commands_access = managed_access(&[("Position", 0)]);
+    let mut commands_access = managed_access(&[("TransformComponent", 0)]);
     commands_access.set_uses_commands(true);
     let disjoint_reader = managed_access(&[("MeshRendererComponent", 0)]);
     let scheduler = scheduler_for([commands_access, disjoint_reader]);
@@ -523,14 +533,17 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
     engine
         .world_mut()
         .create_entity()
-        .with(Position { x: 1.0, y: 2.0 })
+        .with(TransformComponent {
+            translation: [1.0, 2.0, 0.0],
+            ..TransformComponent::default()
+        })
         .build()
         .unwrap();
 
-    let position_id = test_stable_id("Position");
+    let transform_id = test_stable_id("TransformComponent");
     let renderable_id = test_stable_id("MeshRendererComponent");
     let accesses = [
-        native_access("Position", 1),
+        native_access("TransformComponent", 1),
         native_access("MeshRendererComponent", 0),
     ];
     let mut chunk = empty_chunk();
@@ -541,25 +554,33 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
 
         // Step 1: one index-based lookup yields the archetype identity the
         // managed enumerator would carry in its driver chunk.
-        assert_eq!(get_test_chunk("Position", 1, 0, &mut chunk), ABI_SUCCESS);
+        assert_eq!(
+            get_test_chunk("TransformComponent", 1, 0, &mut chunk),
+            ABI_SUCCESS
+        );
 
         // Step 2: the archetype-scoped twin resolves the same column directly.
         assert_eq!(
             ffi_get_archetype_chunk(
                 chunk.archetype_low,
                 chunk.archetype_high,
-                position_id.0 as u64,
-                (position_id.0 >> 64) as u64,
+                transform_id.0 as u64,
+                (transform_id.0 >> 64) as u64,
                 1,
                 &mut chunk,
             ),
             ABI_SUCCESS
         );
         assert_eq!(chunk.len, 1);
-        assert_eq!(chunk.element_size, std::mem::size_of::<Position>() as u32);
+        assert_eq!(
+            chunk.element_size,
+            std::mem::size_of::<TransformComponent>() as u32
+        );
         // SAFETY: the lookup succeeded and the asserted geometry guarantees
-        // the data pointer addresses one valid `Position` row.
-        assert_eq!(unsafe { *(chunk.data as *const Position) }.x, 1.0);
+        // the data pointer addresses one valid `TransformComponent` row.
+        let first_translation =
+            unsafe { *(chunk.data as *const TransformComponent) }.translation[0];
+        assert_eq!(first_translation, 1.0);
 
         // Step 3: an authorized component the archetype does not carry
         // reports absence (`0`), which the enumerator turns into
@@ -1139,12 +1160,12 @@ fn archetype_scoped_module_native_binding_rejects_live_layout_mismatch() {
 fn managed_shared_component_schema_mismatch_is_rejected() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
-    let stable_id = test_stable_id("Position");
+    let stable_id = test_stable_id("TransformComponent");
     let manifest = serde_json::json!([{
         "stable_id_low": stable_id.0 as u64,
         "stable_id_high": (stable_id.0 >> 64) as u64,
-        "full_name": test_full_name("Position"),
-        "size": 8,
+        "full_name": test_full_name("TransformComponent"),
+        "size": 40,
         "alignment": 4,
         "schema_hash": 0,
         "shared": true,
@@ -1163,15 +1184,17 @@ fn managed_shared_component_schema_mismatch_is_rejected() {
 
 /// Verify managed shared bindings use the renderer's concrete component types.
 ///
-/// The engine's `Position` and the renderer data's `MeshRendererComponent` are
-/// unconditional, so the managed bridge has one binding path in every build.
+/// The engine's `TransformComponent` and the renderer data's
+/// `MeshRendererComponent` are unconditional, so the managed bridge has one
+/// binding path in every build.
 #[test]
 fn csharp_world_supports_the_renderable_renderer_query() {
     let mut engine = Engine::new();
     setup_test_world(&mut engine);
 
-    let mut query =
-        pill_engine::Query::<(&Position, &MeshRendererComponent)>::new(engine.world_mut());
+    let mut query = pill_engine::Query::<(&TransformComponent, &MeshRendererComponent)>::new(
+        engine.world_mut(),
+    );
     assert_eq!(query.iter_mut().count(), TEST_WORLD_ENTITY_COUNT);
 }
 
@@ -1180,7 +1203,7 @@ fn csharp_world_supports_the_renderable_renderer_query() {
 fn disjoint_managed_writers_share_a_parallel_batch() {
     let scheduler = scheduler_for([
         managed_access(&[("PhysicsState", 1)]),
-        managed_access(&[("Position", 1)]),
+        managed_access(&[("TransformComponent", 1)]),
         managed_access(&[("MeshRendererComponent", 1)]),
     ]);
 
@@ -1192,8 +1215,8 @@ fn disjoint_managed_writers_share_a_parallel_batch() {
 #[test]
 fn managed_readers_of_the_same_component_share_a_parallel_batch() {
     let scheduler = scheduler_for([
-        managed_access(&[("Position", 0)]),
-        managed_access(&[("Position", 0)]),
+        managed_access(&[("TransformComponent", 0)]),
+        managed_access(&[("TransformComponent", 0)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 1);
@@ -1204,8 +1227,8 @@ fn managed_readers_of_the_same_component_share_a_parallel_batch() {
 #[test]
 fn managed_reader_and_writer_are_scheduled_in_different_batches() {
     let scheduler = scheduler_for([
-        managed_access(&[("Position", 0)]),
-        managed_access(&[("Position", 1)]),
+        managed_access(&[("TransformComponent", 0)]),
+        managed_access(&[("TransformComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
@@ -1233,7 +1256,7 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
         managed_access(&[]),
         managed_access(&[
             ("PhysicsState", 1),
-            ("Position", 1),
+            ("TransformComponent", 1),
             ("MeshRendererComponent", 1),
         ]),
     ]);
@@ -1249,7 +1272,7 @@ fn optional_managed_access_conflicts_when_the_component_may_be_present() {
     // optionality affects matching, never parallel safety.
     let scheduler = scheduler_for([
         managed_access(&[("PhysicsState", 1), ("MeshRendererComponent", 0)]),
-        managed_access(&[("Position", 1)]),
+        managed_access(&[("TransformComponent", 1)]),
         managed_access(&[("MeshRendererComponent", 1)]),
     ]);
 
@@ -1271,17 +1294,17 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
     engine.world_mut().set_system_last_run(baseline);
     engine.world_mut().increment_change_tick();
 
-    let accesses = [native_access("Position", 1)];
+    let accesses = [native_access("TransformComponent", 1)];
     let mut component_chunk = empty_chunk();
     let mut entity_chunk = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
-            get_test_chunk("Position", 1, 0, &mut component_chunk),
+            get_test_chunk("TransformComponent", 1, 0, &mut component_chunk),
             ABI_SUCCESS
         );
         assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), ABI_SUCCESS);
-        // SAFETY: the Position chunk was fetched successfully and row `37`
+        // SAFETY: the transform chunk was fetched successfully and row `37`
         // lies within its live length, so the chunk tick pointer is valid to
         // advance by that many rows.
         unsafe { simulate_managed_write(&component_chunk, 37) };
@@ -1290,10 +1313,10 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
     // SAFETY: the entity chunk was fetched successfully and row `37` indexes
     // a live entity within its declared length.
     let expected = unsafe { *((entity_chunk.entities as *const pill_engine::Entity).add(37)) };
-    let mut changed =
-        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
-            engine.world_mut(),
-        );
+    let mut changed = pill_engine::Query::<
+        (pill_engine::Entity,),
+        pill_engine::Changed<TransformComponent>,
+    >::new(engine.world_mut());
     let hits: Vec<_> = changed.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(hits, vec![expected]);
 }
@@ -1307,18 +1330,21 @@ fn managed_read_only_chunk_does_not_trigger_changed_filter() {
     engine.world_mut().set_system_last_run(baseline);
     engine.world_mut().increment_change_tick();
 
-    let accesses = [native_access("Position", 0)];
+    let accesses = [native_access("TransformComponent", 0)];
     let mut chunk = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
-        assert_eq!(get_test_chunk("Position", 0, 0, &mut chunk), ABI_SUCCESS);
+        assert_eq!(
+            get_test_chunk("TransformComponent", 0, 0, &mut chunk),
+            ABI_SUCCESS
+        );
         assert!(!chunk.ticks.is_null());
     }
 
-    let mut changed =
-        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
-            engine.world_mut(),
-        );
+    let mut changed = pill_engine::Query::<
+        (pill_engine::Entity,),
+        pill_engine::Changed<TransformComponent>,
+    >::new(engine.world_mut());
     assert_eq!(changed.iter_mut().count(), 0);
 }
 
@@ -1332,16 +1358,16 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     engine.world_mut().increment_change_tick();
 
     let accesses = [
-        native_access("Position", 1),
+        native_access("TransformComponent", 1),
         native_access("MeshRendererComponent", 1),
     ];
-    let mut positions = empty_chunk();
+    let mut transforms = empty_chunk();
     let mut renderables = empty_chunk();
     let mut entities = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
         assert_eq!(
-            get_test_chunk("Position", 1, 0, &mut positions),
+            get_test_chunk("TransformComponent", 1, 0, &mut transforms),
             ABI_SUCCESS
         );
         assert_eq!(
@@ -1349,12 +1375,12 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
             ABI_SUCCESS
         );
         assert_eq!(ffi_get_entity_chunk(0, &mut entities), ABI_SUCCESS);
-        assert_ne!(positions.ticks, renderables.ticks);
+        assert_ne!(transforms.ticks, renderables.ticks);
         // SAFETY: both chunks were fetched successfully and rows `3` and `7`
         // fall within their live lengths, so each tick pointer is valid to
         // advance by the requested row.
         unsafe {
-            simulate_managed_write(&positions, 3);
+            simulate_managed_write(&transforms, 3);
             simulate_managed_write(&renderables, 7);
         }
     }
@@ -1362,15 +1388,15 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     // SAFETY: the entity chunk was fetched successfully and each queried row
     // indexes a live entity within the chunk's declared length.
     let entity_at = |row| unsafe { *((entities.entities as *const pill_engine::Entity).add(row)) };
-    let mut changed_positions = pill_engine::Query::<
+    let mut changed_transforms = pill_engine::Query::<
         (pill_engine::Entity,),
-        pill_engine::Changed<Position>,
+        pill_engine::Changed<TransformComponent>,
     >::new(engine.world_mut());
-    let position_hits: Vec<_> = changed_positions
+    let transform_hits: Vec<_> = changed_transforms
         .iter_mut()
         .map(|(entity,)| entity)
         .collect();
-    assert_eq!(position_hits, vec![entity_at(3)]);
+    assert_eq!(transform_hits, vec![entity_at(3)]);
 
     let mut changed_renderables = pill_engine::Query::<
         (pill_engine::Entity,),
@@ -1445,7 +1471,7 @@ fn entity_chunks_expose_a_const_pointer() {
 fn mode_two_serves_only_observed_archetypes() {
     let mut engine = Engine::new();
     let bindings = setup_test_world(&mut engine);
-    let accesses = [native_access("Position", 0)];
+    let accesses = [native_access("TransformComponent", 0)];
     // The id, learned the way the world itself knows it; the managed path
     // never holds one before a validated term served it.
     let archetype = engine
@@ -1474,7 +1500,10 @@ fn mode_two_serves_only_observed_archetypes() {
 
         // Step 2: once a validated component term served the archetype, its
         // entity column resolves.
-        assert_eq!(get_test_chunk("Position", 0, 0, &mut chunk), ABI_SUCCESS);
+        assert_eq!(
+            get_test_chunk("TransformComponent", 0, 0, &mut chunk),
+            ABI_SUCCESS
+        );
         assert_eq!(
             ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
             ABI_SUCCESS

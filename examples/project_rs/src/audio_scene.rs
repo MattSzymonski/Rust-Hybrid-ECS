@@ -9,7 +9,7 @@
 
 // External crates
 use pill_audio::{AudioListenerComponent, AudioLoadQueue, AudioSourceComponent, Sound};
-use pill_engine::{AssetManager, Engine, Handle, Position, Query};
+use pill_engine::{AssetManager, Engine, Handle, Query, TransformComponent};
 
 const SOUND_NAME: &str = "sound_1";
 // Embed the project asset so development and shipping builds need no working-directory setup.
@@ -56,7 +56,10 @@ pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
         engine
             .world_mut()
             .create_entity()
-            .with(Position { x: 400.0, y: 300.0 })
+            .with(TransformComponent {
+                translation: [400.0, 300.0, 0.0],
+                ..TransformComponent::default()
+            })
             .with(AudioListenerComponent::default())
             .build()
             .map_err(|_| "could not create the audio listener")?;
@@ -70,7 +73,10 @@ pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
             .world_mut()
             .create_entity()
             // Keep the emitter near the listener: spatial attenuation uses world units.
-            .with(Position { x: 400.0, y: 300.0 })
+            .with(TransformComponent {
+                translation: [400.0, 300.0, 0.0],
+                ..TransformComponent::default()
+            })
             .with(AudioSourceComponent::playing(sound))
             .build()
             .map_err(|_| "could not create the audio source")?;
@@ -127,7 +133,9 @@ mod tests {
     #[test]
     fn reinitialization_keeps_one_source_and_listener() {
         let mut engine = Engine::new();
-        engine.world_mut().register_component::<Position>();
+        engine
+            .world_mut()
+            .register_component::<TransformComponent>();
         // Simulate the host initializing the configured extension first.
         pill_audio::register(&mut engine);
         initialize(&mut engine).unwrap();

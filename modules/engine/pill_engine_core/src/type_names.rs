@@ -10,8 +10,8 @@
 //! # Design
 //!
 //! The engine's code lives in `pill_engine_core`, so `type_name` reports its
-//! types as `pill_engine_core::common_components::Position`. Everything else
-//! knows them by the public path, `pill_engine::common_components::Position`:
+//! types as `pill_engine_core::common_components::TransformComponent`. Everything else
+//! knows them by the public path, `pill_engine::common_components::TransformComponent`:
 //! C# projects import the namespace `pill_engine.common_components`, and the
 //! component names and persisted keys the managed side receives are spelled
 //! that way. [`stable_type_name`](crate::type_names::stable_type_name) keeps
@@ -66,12 +66,12 @@ mod tests {
     #[test]
     fn engine_types_use_the_public_crate_name() {
         assert_eq!(
-            stable_type_name::<crate::Position>(),
-            "pill_engine::common_components::Position"
+            stable_type_name::<crate::TransformComponent>(),
+            "pill_engine::common_components::TransformComponent"
         );
         assert_eq!(
-            stable_type_name::<Vec<crate::Position>>(),
-            "alloc::vec::Vec<pill_engine::common_components::Position>"
+            stable_type_name::<Vec<crate::TransformComponent>>(),
+            "alloc::vec::Vec<pill_engine::common_components::TransformComponent>"
         );
     }
 
@@ -81,8 +81,8 @@ mod tests {
     fn other_types_are_unchanged_and_names_are_reused() {
         assert_eq!(stable_type_name::<u32>(), "u32");
         assert!(std::ptr::eq(
-            stable_type_name::<crate::Position>(),
-            stable_type_name::<crate::Position>()
+            stable_type_name::<crate::TransformComponent>(),
+            stable_type_name::<crate::TransformComponent>()
         ));
     }
 }
