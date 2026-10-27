@@ -127,6 +127,7 @@ pub use chrome::claim_pointer;
 pub use chrome::click_from_modifiers;
 pub use chrome::context_menu;
 pub use chrome::empty_area;
+pub use chrome::engine_badge;
 pub use chrome::floating_popup;
 pub use chrome::gizmo_mode_label;
 pub use chrome::gizmo_space_label;
@@ -176,7 +177,9 @@ pub use tab_inspector::inspector_header;
 pub use tab_inspector::inspector_section_header;
 pub use tab_inspector::inspector_tab;
 pub use tab_inspector::INSPECTOR_LABEL_WIDTH;
+pub use tab_inspector::INSPECTOR_VECTOR_FIELD_HEIGHT;
 pub use tab_inspector::INSPECTOR_VECTOR_FIELD_WIDTH;
+pub use tab_inspector::INSPECTOR_VECTOR_LABEL_WIDTH;
 
 /// The [`inspector_fields`] module: the inspector's field rows: the decorators
 /// a component declares, the row model and the control each row draws.
@@ -196,7 +199,9 @@ pub use inspector_fields::EntityRowInput;
 pub mod inspector_widgets;
 
 pub use inspector_widgets::ascending;
+pub use inspector_widgets::axis_slot;
 pub use inspector_widgets::component_rows;
+pub use inspector_widgets::fixed_width_field;
 pub use inspector_widgets::format_field_value;
 pub use inspector_widgets::integer_edit;
 pub use inspector_widgets::read_only_row;
@@ -229,11 +234,14 @@ pub use tab_assets::ASSETS_TREE_WIDTH_RANGE;
 /// The [`assets_tiles`] module: the assets tab's tiles, their menu and the asset dialog.
 pub mod assets_tiles;
 
+pub use assets_tiles::asset_container_menu;
 pub use assets_tiles::asset_dialog_window;
 pub use assets_tiles::asset_icon;
 pub use assets_tiles::asset_menu_items;
 pub use assets_tiles::asset_tile;
 pub use assets_tiles::asset_type_icon;
+pub use assets_tiles::remember_pane_rect;
+pub use assets_tiles::remember_tree_row_rect;
 pub use assets_tiles::tile_name_job;
 pub use assets_tiles::AssetTileWrites;
 pub use assets_tiles::ASSETS_TILE_CORNER_RADIUS;
@@ -400,6 +408,9 @@ pub fn run_frame(
     // The grid reports what it drew, so the executable asks for previews of
     // what is on screen only.
     preview_visible.clear();
+    // The rows record their rectangles either way - the shell's own tests read
+    // them - but only a scripted run asks for them in the log.
+    inspector.log_rects = shell_input.scripted;
     // Named through the package path, not as a file-local item: a hot patch
     // compiles this body in a crate of its own, where only the package's
     // public items exist (see the crate header).

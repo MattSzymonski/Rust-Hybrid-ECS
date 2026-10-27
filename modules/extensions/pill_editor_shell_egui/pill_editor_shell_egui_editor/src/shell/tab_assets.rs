@@ -42,58 +42,39 @@ pub fn assets_tab(
     // another tree) falls back to its nearest ancestor, so the grid never
     // lists a path the listing no longer holds.
     browser.settle(&snapshot.assets);
-    let selected_row = assets::selected_row(writes.selection, &snapshot.assets);
-    let selected_is_file = selected_row.is_some_and(|row| row.kind != "folder" && !row.read_only);
-    let missing_meta = selected_row.is_some_and(|row| {
-        row.kind != "folder" && !row.standalone && !row.has_meta && !row.read_only
+    // The tab's whole body, claimed before anything in it is drawn: the grid is
+    // only as tall as the dock row lets it, so the band under it, the strip
+    // beside the zoom bar and the count row all look like the folder's empty
+    // space but belong to no widget. A right-click on any of them opens the
+    // open folder's container menu - the one the grid's spare space offers -
+    // and a tile dropped there lands in the open folder. Panels, tree rows,
+    // tiles and every control register after this one, so their own menus and
+    // clicks win wherever they cover it.
+    let body = ui.available_rect_before_wrap();
+    let background = ui.interact(
+        body,
+        ui.id().with("pill_editor_shell_egui.assets_tab"),
+        egui::Sense::click_and_drag(),
+    );
+    if let Some(dragged) = background.dnd_release_payload::<String>() {
+        if let Some(to) = assets::drop_destination(&dragged, &browser.folder) {
+            assets::queue_move(writes.pending, &dragged, &to);
+        }
+    }
+    context_menu("assets", &background, writes.overlay_regions, &mut |ui| {
+        asset_container_menu(
+            ui,
+            snapshot,
+            writes.selection,
+            writes.dialog,
+            writes.pending,
+            &browser.folder,
+        );
     });
-    // Nothing is created inside a module's resources.
-    let folder_is_read_only = assets::is_read_only_key(&snapshot.assets, &browser.folder);
-    // The toolbar: creating opens the dialog; the rest act on the selected
-    // entry and queue recorded file commands. A button only appears when it
-    // can act. The tab's own title already names the panel, so a second
-    // heading would only cost the grid room.
+    // The panel has no management buttons: the empty strip's menu creates and
+    // opens a folder, a file's menu renames and deletes it. What is left of the
+    // bar is the count, which tells a person how much the walk found.
     ui.horizontal_wrapped(|ui| {
-        if !folder_is_read_only
-            && ui
-                .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
-                .clicked()
-        {
-            assets::open_create(
-                writes.dialog,
-                writes.selection,
-                &snapshot.assets,
-                &snapshot.standalone_types,
-            );
-        }
-        if selected_is_file {
-            if ui
-                .add(icons::IconButton::new(icons::Icon::Trash, "Delete Asset"))
-                .clicked()
-            {
-                assets::delete_selection(writes.pending, writes.selection, &snapshot.assets);
-            }
-            if ui
-                .add(icons::IconButton::new(
-                    icons::Icon::PencilSimple,
-                    "Rename Asset...",
-                ))
-                .clicked()
-            {
-                assets::open_rename(writes.dialog, writes.selection, &snapshot.assets);
-            }
-        }
-        if missing_meta
-            && ui
-                .add(icons::IconButton::new(
-                    icons::Icon::FileArrowDown,
-                    "Write Asset Meta",
-                ))
-                .clicked()
-        {
-            assets::write_meta_selection(writes.pending, writes.selection, &snapshot.assets);
-        }
-        ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("{} entries", snapshot.assets.len())).weak());
     });
     ui.separator();
@@ -102,7 +83,15 @@ pub fn assets_tab(
         .default_size(ASSETS_TREE_WIDTH)
         .size_range(ASSETS_TREE_WIDTH_RANGE)
         .show(ui, |ui| {
-            assets_tree(ui, snapshot, browser, writes.selection, writes.pending);
+            assets_tree(
+                ui,
+                snapshot,
+                browser,
+                writes.selection,
+                writes.dialog,
+                writes.pending,
+                writes.overlay_regions,
+            );
         });
     egui::Panel::top("pill_editor_shell_egui.assets_path").show(ui, |ui| {
         assets_path_bar(ui, browser);
@@ -121,13 +110,17 @@ pub fn assets_tab(
 /// click opens that folder in the grid and selects it (the create dialog's
 /// destination follows the selection); the caret opens and closes its
 /// children; a dropped tile moves its file into the row's folder, and the
-/// extensions side takes no drops at all.
+/// extensions side takes no drops at all. A row's menu is the container's -
+/// make an asset in that folder, open it in the file manager - and the spare
+/// space below the rows offers the same for the open folder.
 pub fn assets_tree(
     ui: &mut egui::Ui,
     snapshot: &EditorSnapshot,
     browser: &mut ProjectBrowser,
     selection: &mut EditorSelection,
+    dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
 ) {
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -159,22 +152,41 @@ pub fn assets_tree(
                     &snapshot.assets,
                     browser,
                     selection,
+                    dialog,
                     pending,
+                    overlay_regions,
+                    snapshot,
                     root.key,
                     1,
                 );
             }
+            // The spare space under the rows: the same container menu, for the
+            // folder the grid has open.
+            let rest = ui.available_rect_before_wrap();
+            let background = ui.interact(
+                rest,
+                ui.id().with("pill_editor_shell_egui.assets_tree_space"),
+                egui::Sense::click(),
+            );
+            let folder = browser.folder.clone();
+            context_menu("assets tree", &background, overlay_regions, &mut |ui| {
+                asset_container_menu(ui, snapshot, selection, dialog, pending, &folder);
+            });
         });
 }
 
 /// One level of the folder tree: a row per folder under `parent` and, for
 /// each open row, its own children under it.
+#[allow(clippy::too_many_arguments)]
 pub fn folder_tree_rows(
     ui: &mut egui::Ui,
     assets: &[AssetListing],
     browser: &mut ProjectBrowser,
     selection: &mut EditorSelection,
+    dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
+    overlay_regions: &mut Vec<ShellRect>,
+    snapshot: &EditorSnapshot,
     parent: &str,
     depth: usize,
 ) {
@@ -211,6 +223,11 @@ pub fn folder_tree_rows(
             if label.clicked() {
                 open = true;
             }
+            // The row is a container: its menu makes an asset inside it and
+            // opens it in the file manager.
+            context_menu("assets tree", &label, overlay_regions, &mut |ui| {
+                asset_container_menu(ui, snapshot, selection, dialog, pending, path);
+            });
             // A module's resource tree takes no drops: nothing may be written
             // into it.
             if let Some(dragged) = label.dnd_release_payload::<String>() {
@@ -218,7 +235,9 @@ pub fn folder_tree_rows(
                     dropped = Some(dragged);
                 }
             }
+            let row_rect = label.rect;
             label.on_hover_text(path);
+            remember_tree_row_rect(browser, path, row_rect);
         });
         if toggle {
             browser.toggle_expanded(path);
@@ -233,7 +252,18 @@ pub fn folder_tree_rows(
             }
         }
         if expanded {
-            folder_tree_rows(ui, assets, browser, selection, pending, path, depth + 1);
+            folder_tree_rows(
+                ui,
+                assets,
+                browser,
+                selection,
+                dialog,
+                pending,
+                overlay_regions,
+                snapshot,
+                path,
+                depth + 1,
+            );
         }
     }
 }
@@ -296,6 +326,47 @@ pub fn assets_grid(
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
             let columns = browser::tile_columns(ui.available_width(), cell.x);
             let entries = browser::children(&snapshot.assets, &folder);
+            // The pane behind the tiles, claimed before them: a right-click
+            // anywhere they do not cover - the gap beside a row's last tile, the
+            // space under the last row, whatever a short folder leaves - is the
+            // container's menu, and a tile dropped there lands in the open
+            // folder. A tile is registered after this, so it sits on top where
+            // the pointer is over one and its own menu wins there.
+            //
+            // The claimed rectangle has to reach past the visible pane down to
+            // the last row: a folder with more rows than the panel shows puts
+            // its lower rows outside the viewport slice, and a gap in one of
+            // those rows is exactly where a right-click used to answer nothing.
+            let pane = ui.available_rect_before_wrap();
+            let rows = entries.len().div_ceil(columns.max(1));
+            let covered = egui::Rect::from_min_size(
+                pane.min,
+                egui::vec2(
+                    pane.width().max(columns as f32 * cell.x),
+                    pane.height().max(rows as f32 * cell.y),
+                ),
+            );
+            let background = ui.interact(
+                covered,
+                ui.id().with("pill_editor_shell_egui.assets_pane"),
+                egui::Sense::click_and_drag(),
+            );
+            remember_pane_rect(browser, covered);
+            if let Some(dragged) = background.dnd_release_payload::<String>() {
+                if let Some(to) = assets::drop_destination(&dragged, &folder) {
+                    assets::queue_move(writes.pending, &dragged, &to);
+                }
+            }
+            context_menu("assets", &background, writes.overlay_regions, &mut |ui| {
+                asset_container_menu(
+                    ui,
+                    snapshot,
+                    writes.selection,
+                    writes.dialog,
+                    writes.pending,
+                    &folder,
+                );
+            });
             if entries.is_empty() {
                 ui.label(egui::RichText::new("This folder is empty").weak());
             }
@@ -306,43 +377,5 @@ pub fn assets_grid(
                     }
                 });
             }
-            let empty = ui.allocate_response(empty_area(ui), egui::Sense::click_and_drag());
-            if let Some(dragged) = empty.dnd_release_payload::<String>() {
-                if let Some(to) = assets::drop_destination(&dragged, &folder) {
-                    assets::queue_move(writes.pending, &dragged, &to);
-                }
-            }
-            context_menu("assets", &empty, writes.overlay_regions, &mut |ui| {
-                if ui
-                    .add(icons::IconButton::new(icons::Icon::Plus, "Create Asset..."))
-                    .clicked()
-                {
-                    assets::open_create(
-                        writes.dialog,
-                        writes.selection,
-                        &snapshot.assets,
-                        &snapshot.standalone_types,
-                    );
-                    ui.close();
-                }
-                // The open folder itself in the platform's file manager: the
-                // empty area has no file row to reveal, so it reveals the
-                // folder the grid is showing.
-                if ui
-                    .add(icons::IconButton::new(
-                        icons::Icon::FolderOpen,
-                        "Open Folder in File Explorer",
-                    ))
-                    .clicked()
-                {
-                    writes.pending.reveal(folder.clone());
-                    pill_core::info!(
-                        target: pill_core::telemetry::telemetry_target::ENGINE,
-                        path = folder.as_str(),
-                        "[editor] reveal queued"
-                    );
-                    ui.close();
-                }
-            });
         });
 }

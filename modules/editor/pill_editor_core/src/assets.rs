@@ -906,6 +906,50 @@ mod tests {
         );
     }
 
+    /// A scene dialog opens on the scene type, whatever the first type is, and
+    /// refuses to open at all when no scene type is registered - which is the
+    /// warning the person saw before the engine started registering its own.
+    #[test]
+    fn a_scene_dialog_needs_the_scene_type_and_chooses_it() {
+        let assets = vec![listing("scenes", "folder", false, false)];
+        let mut selection = EditorSelection::default();
+        selection.asset = Some("scenes".to_string());
+        let mut scene_types = types();
+        scene_types.push(StandaloneTypeInfo {
+            type_name: "pill_engine::scene::Scene".to_string(),
+            display_name: "Scene".to_string(),
+            extension: "scene".to_string(),
+        });
+        let mut dialog = None;
+        open_create_scene(
+            &mut dialog,
+            &selection,
+            &assets,
+            &scene_types,
+            CreateKind::SaveWorld,
+        );
+        assert_eq!(
+            dialog,
+            Some(AssetDialog::Create {
+                folder: "scenes".to_string(),
+                type_name: "pill_engine::scene::Scene".to_string(),
+                name: String::new(),
+                kind: CreateKind::SaveWorld,
+                overwrite: None,
+            })
+        );
+
+        let mut dialog = None;
+        open_create_scene(
+            &mut dialog,
+            &selection,
+            &assets,
+            &types(),
+            CreateKind::EmptyScene,
+        );
+        assert_eq!(dialog, None, "without a scene type the dialog is refused");
+    }
+
     /// A scene create is one recorded step that clears the world and writes it,
     /// and a save-as writes the world where the dialog said.
     #[test]

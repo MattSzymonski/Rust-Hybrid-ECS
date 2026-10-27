@@ -41,6 +41,7 @@ pub fn asset_settings_rows(
     asset_path: &str,
     settings: &JsonValue,
     assets: &[AssetListing],
+    engine_assets: &[EngineAsset],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
@@ -50,11 +51,16 @@ pub fn asset_settings_rows(
     match settings {
         JsonValue::Object(entries) => {
             for (key, value) in entries {
-                // A key a reference field owns is drawn by that field's row.
-                if references
-                    .iter()
-                    .any(|field| field.key == *key || field.key.starts_with(&format!("{key}.")))
-                {
+                // A key a reference field owns is drawn by that field's row -
+                // including a list family, whose entries arrive as
+                // `passes[0]`, `passes[1]`, ... and whose array would
+                // otherwise be walked as raw JSON, guids and all.
+                let owned = references.iter().any(|field| {
+                    field.key == *key
+                        || field.key.starts_with(&format!("{key}."))
+                        || reference_family(field) == Some(key.as_str())
+                });
+                if owned {
                     continue;
                 }
                 asset_settings_row(
@@ -80,6 +86,7 @@ pub fn asset_settings_rows(
                     settings,
                     field,
                     assets,
+                    engine_assets,
                     pending,
                     session,
                     overlay_regions,
@@ -91,6 +98,7 @@ pub fn asset_settings_rows(
                 settings,
                 references,
                 assets,
+                engine_assets,
                 pending,
                 session,
                 overlay_regions,
@@ -114,6 +122,7 @@ pub fn reference_list_rows(
     root: &JsonValue,
     references: &[AssetReferenceField],
     assets: &[AssetListing],
+    engine_assets: &[EngineAsset],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
@@ -121,7 +130,7 @@ pub fn reference_list_rows(
     let mut families: Vec<(String, String)> = references
         .iter()
         .filter_map(|field| {
-            let (family, _) = field.key.split_once('[')?;
+            let family = reference_family(field)?;
             Some((family.to_owned(), field.target.clone()))
         })
         .collect();
@@ -144,6 +153,7 @@ pub fn reference_list_rows(
             target,
             guid: None,
             nested: true,
+            label: None,
         };
         reference_row(
             ui,
@@ -151,6 +161,7 @@ pub fn reference_list_rows(
             root,
             &append,
             assets,
+            engine_assets,
             pending,
             session,
             overlay_regions,
@@ -194,7 +205,11 @@ pub fn reference_list_rows(
 /// commit carries the whole patched document), a container nests - except the
 /// two shapes that get a control of their own, a texture slot and a colour
 /// parameter.
-#[allow(clippy::too_many_arguments)]
+///
+/// A leaf draws from its key and its value alone; the row's assets, session
+/// and overlay regions exist for the rows below it, so the attributes are the
+/// recursion's own shape rather than an unused argument.
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 pub fn asset_settings_row(
     ui: &mut egui::Ui,
     asset_path: &str,
@@ -418,17 +433,16 @@ pub fn reference_guid(value: &JsonValue) -> Option<String> {
     }
 }
 
-/// The listing rows a reference's picker offers: the assets whose type is the
+/// The listing's rows a reference's picker offers: the assets whose type is the
 /// one the registry named for the field.
-///
-/// The comparison is on the type name's last segment, so a module's spelling of
-/// a type and the renderer's agree however each was registered.
 pub fn reference_candidates<'a>(assets: &'a [AssetListing], target: &str) -> Vec<&'a AssetListing> {
-    let target = target.rsplit("::").next().unwrap_or(target);
-    assets
-        .iter()
-        .filter(|row| row.kind.rsplit("::").next() == Some(target))
-        .collect()
+    inspector::picker_candidates(assets, &[], Some(target)).0
+}
+
+/// The list family a reference field's key belongs to: `passes[3]` is an entry
+/// of `passes`, and a key without brackets is its own field.
+pub fn reference_family(field: &AssetReferenceField) -> Option<&str> {
+    field.key.split_once('[').map(|(family, _)| family)
 }
 
 /// One reference field: the referenced asset's path (or its guid, when the
@@ -447,6 +461,7 @@ pub fn reference_row(
     root: &JsonValue,
     field: &AssetReferenceField,
     assets: &[AssetListing],
+    engine_assets: &[EngineAsset],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
@@ -461,8 +476,11 @@ pub fn reference_row(
         .as_deref()
         .and_then(|guid| assets.iter().find(|row| row.guid.as_deref() == Some(guid)))
         .map(|row| row.path.clone());
-    let text = match (&current_path, field.guid.as_deref()) {
-        (Some(path), _) => path.clone(),
+    // What the row reads: the label the executable resolved - a listing path,
+    // or the name the store loaded the asset under when it has no file - and
+    // only a guid's head when neither knows it.
+    let text = match (field.label.as_deref(), field.guid.as_deref()) {
+        (Some(label), _) => label.to_owned(),
         (None, Some(guid)) => format!("{}...", guid.chars().take(8).collect::<String>()),
         (None, None) => "(none)".to_string(),
     };
@@ -521,7 +539,9 @@ pub fn reference_row(
                             if ui.selectable_label(field.guid.is_none(), "None").clicked() {
                                 chosen = Some(None);
                             }
-                            for candidate in reference_candidates(assets, &field.target) {
+                            let (files, built) =
+                                inspector::picker_candidates(assets, engine_assets, Some(&field.target));
+                            for candidate in files {
                                 let current =
                                     current_path.as_deref() == Some(candidate.path.as_str());
                                 ui.horizontal(|ui| {
@@ -548,6 +568,28 @@ pub fn reference_row(
                                         );
                                     } else if focus.clicked() {
                                         pending.focus_asset(candidate.key());
+                                    }
+                                });
+                            }
+                            // The engine's own assets: they have no file, so no
+                            // folder to reveal, and choosing one writes its guid.
+                            // A candidate the store holds by name alone has no
+                            // guid to write, so it reads but cannot be chosen.
+                            for candidate in built {
+                                let current = field.guid.as_deref() == candidate.guid.as_deref();
+                                let pickable = candidate.guid.is_some();
+                                ui.horizontal(|ui| {
+                                    engine_badge(ui);
+                                    let row = ui.add_enabled_ui(pickable, |ui| {
+                                        ui.selectable_label(current, &candidate.name).clicked()
+                                    });
+                                    if row.inner {
+                                        chosen = candidate.guid.clone().map(Some);
+                                    }
+                                    if !pickable {
+                                        row.response.on_hover_text(
+                                            "The store holds it by name only, so no reference can name it",
+                                        );
                                     }
                                 });
                             }

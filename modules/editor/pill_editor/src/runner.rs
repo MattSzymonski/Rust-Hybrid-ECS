@@ -746,6 +746,10 @@ struct EditorWindow {
     /// The asset browser's rows, refreshed on a cadence and at once after
     /// any file command (the Assets tab draws them).
     asset_entries: Vec<AssetListing>,
+    /// The last walk's own rows, before the module roots' synthetic folders
+    /// are added: what the next walk is compared against to tell whether the
+    /// tree moved.
+    asset_walk: Vec<AssetListing>,
     /// The live standalone asset types the create dialog offers.
     standalone_types: Vec<StandaloneTypeInfo>,
     /// Whether a file command changed the tree: the next frame's listing
@@ -950,7 +954,7 @@ impl EditorWindow {
         // Step 1: the main window. A minimum size keeps an accidental drag of
         // the window's own edge from squeezing the dock unusable.
         let attributes = Window::default_attributes()
-            .with_title("Pill Editor (egui)")
+            .with_title("Pill")
             .with_inner_size(INITIAL_WINDOW_SIZE)
             .with_min_inner_size(MINIMUM_WINDOW_SIZE);
         let window = Arc::new(
@@ -1184,6 +1188,7 @@ impl EditorWindow {
             synthetic_gizmo_press: None,
             synthetic_gizmo_view: None,
             asset_entries: Vec::new(),
+            asset_walk: Vec::new(),
             standalone_types: Vec::new(),
             asset_listing_dirty: true,
             drop_preview: None,
@@ -2114,8 +2119,8 @@ impl EditorWindow {
         if !self.render_previews || !self.preview_in_flight.is_empty() {
             return;
         }
-        // The first visible tile without a preview and without a request.
-        let next = {
+        // Every visible tile still waiting for an image, in draw order.
+        let waiting: Vec<String> = {
             let world = self.host.host_mut().engine_mut().world_mut();
             let Some(state) = world.get_resource::<EguiShellState>() else {
                 return;
@@ -2123,14 +2128,15 @@ impl EditorWindow {
             state
                 .preview_visible
                 .iter()
-                .find(|path| {
-                    !state.previews.contains_key(*path) && !state.preview_refused.contains(*path)
+                .filter(|key| {
+                    !state.previews.contains_key(*key) && !state.preview_refused.contains(*key)
                 })
                 .cloned()
+                .collect()
         };
-        let Some(path) = next else {
+        if waiting.is_empty() {
             return;
-        };
+        }
         // A texture preview names its file, so the request needs the asset
         // root the listing's paths are relative to.
         let root = self
@@ -2141,8 +2147,38 @@ impl EditorWindow {
         let Some(root) = root else {
             return;
         };
-        let asset = previews::preview_asset_for(self.asset_entries.iter(), &path, &root);
-        let Some(asset) = asset else {
+        // The first tile the listing can name a preview for. A row with none -
+        // a folder, a scene, a file type the renderer cannot draw - is
+        // recorded as such, because a tile that is never answered would block
+        // every tile drawn after it: the grid lists folders first, so one
+        // folder used to starve a whole folder of files.
+        let mut skipped = Vec::new();
+        let mut next = None;
+        for key in waiting {
+            match previews::preview_asset_for(self.asset_entries.iter(), &key, &root) {
+                Some(asset) => {
+                    next = Some((key, asset));
+                    break;
+                }
+                None => skipped.push(key),
+            }
+        }
+        if !skipped.is_empty() {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+                for key in &skipped {
+                    state.preview_refused.insert(key.clone());
+                }
+            }
+            for key in &skipped {
+                info!(
+                    target: telemetry_target::ENGINE,
+                    path = key.as_str(),
+                    "[editor] preview skipped"
+                );
+            }
+        }
+        let Some((path, asset)) = next else {
             return;
         };
         let id = {
@@ -3527,6 +3563,33 @@ impl EditorWindow {
         );
     }
 
+    /// Log the store's own assets - the ones no file backs, which every picker
+    /// offers beside the listing's rows: the suite's window into what a picker
+    /// can reach beyond the project's `res`.
+    fn dump_engine_assets(&mut self) {
+        let rows = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource::<EditorSnapshot>()
+                .map(|snapshot| snapshot.engine_assets.clone())
+                .unwrap_or_default()
+        };
+        info!(
+            target: telemetry_target::ENGINE,
+            count = rows.len(),
+            "[test] engine assets"
+        );
+        for row in &rows {
+            info!(
+                target: telemetry_target::ENGINE,
+                kind = row.kind.as_str(),
+                name = row.name.as_str(),
+                guid = row.guid.as_deref().unwrap_or(""),
+                "[test] engine asset"
+            );
+        }
+    }
+
     /// Log the asset browser's rows: the count first, then one line per
     /// row with its kind and flags - the suite's window into the listing.
     fn dump_assets(&mut self) {
@@ -4469,6 +4532,9 @@ impl EditorWindow {
                 cursor: self.shell_cursor,
                 paste_text: paste_text.flatten(),
                 badges: self.badges.clone(),
+                // The row geometry tokens exist for the scripted channel; a
+                // person's editor logs none of them.
+                scripted: self.test_channel.is_some(),
             };
         }
         // Step 3a2: each popped-out window's own input record: its geometry,
@@ -5055,6 +5121,7 @@ impl EditorWindow {
             .filter_map(|entity| EditorSnapshot::capture_detail(engine, *entity))
             .collect();
         snapshot.assets = self.asset_entries.clone();
+        snapshot.engine_assets = engine_asset_rows(engine.world(), &self.asset_entries);
         snapshot.standalone_types = self.standalone_types.clone();
         snapshot.asset_detail = self.asset_detail.clone();
         snapshot.preferences = PreferencesView::from_document(
@@ -5113,19 +5180,12 @@ impl EditorWindow {
         if !(self.frame_index.is_multiple_of(ASSET_REFRESH_FRAMES) || self.asset_listing_dirty) {
             return false;
         }
+        // An edit asked for this pass, not the cadence: settings or a file
+        // changed, so the tiles' images and the Inspector's capture both have
+        // to follow.
+        let edited = self.asset_listing_dirty;
         self.asset_listing_dirty = false;
-        // The tree moving means an asset was re-imported or its settings were
-        // edited, so every preview is stale: dropping them is what makes the
-        // tiles render again on the frames that follow.
-        self.preview_in_flight.clear();
-        {
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(state) = world.get_resource_mut::<EguiShellState>() {
-                state.previews.clear();
-                state.preview_refused.clear();
-            }
-        }
-        self.asset_entries = self
+        let entries: Vec<AssetListing> = self
             .host
             .host_mut()
             .asset_entries()
@@ -5145,6 +5205,43 @@ impl EditorWindow {
                 guid: entry.guid.map(|guid| guid.to_string()),
             })
             .collect();
+        // The walk runs on a cadence, so most of its passes find the tree
+        // exactly as it was. Only a moved tree - or an edit - makes a tile's
+        // image stale; clearing the previews on every pass is what made them
+        // blink back to their icons every couple of seconds.
+        let tree_moved = entries != self.asset_walk;
+        // A tree that moved keeps the images of the rows that did not: a
+        // create or a delete changes one asset, and re-rendering the folder
+        // for it is the same flicker in a smaller place. An edit that left the
+        // tree alone names no asset, so every image may be stale.
+        let unchanged: std::collections::BTreeSet<String> = if tree_moved {
+            entries
+                .iter()
+                .filter(|row| {
+                    self.asset_walk
+                        .iter()
+                        .any(|old| old.key() == row.key() && *old == **row)
+                })
+                .map(AssetListing::key)
+                .collect()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        self.asset_walk = entries.clone();
+        self.asset_entries = entries;
+        if tree_moved || edited {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+                if tree_moved {
+                    state.previews.retain(|key, _| unchanged.contains(key));
+                    state.preview_refused.retain(|key| unchanged.contains(key));
+                } else {
+                    self.preview_in_flight.clear();
+                    state.previews.clear();
+                    state.preview_refused.clear();
+                }
+            }
+        }
         // Every module root needs its own row under the extensions root: the
         // walk lists what is inside a root, and the tree can only open a folder
         // it has a row for. The root itself is not a row - the panel draws it.
@@ -5177,13 +5274,16 @@ impl EditorWindow {
                 extension: info.extension,
             })
             .collect();
-        info!(
-            target: telemetry_target::ENGINE,
-            count = self.asset_entries.len(),
-            types = self.standalone_types.len(),
-            "[editor] asset listing refreshed"
-        );
-        true
+        let changed = tree_moved || edited;
+        if changed {
+            info!(
+                target: telemetry_target::ENGINE,
+                count = self.asset_entries.len(),
+                types = self.standalone_types.len(),
+                "[editor] asset listing refreshed"
+            );
+        }
+        changed
     }
 
     /// Capture the selected asset's detail for the Inspector's asset
@@ -5263,10 +5363,12 @@ impl EditorWindow {
         for (key, target) in declared {
             let Some(family) = key.strip_suffix(".*") else {
                 let value = settings.get(&key);
+                let guid = reference_guid(value);
                 fields.push(AssetReferenceField {
                     key,
                     target,
-                    guid: reference_guid(value),
+                    label: self.asset_label(&guid),
+                    guid,
                     nested: !matches!(value, Some(serde_json::Value::String(_))),
                 });
                 continue;
@@ -5275,10 +5377,12 @@ impl EditorWindow {
                 "textures" => {
                     for slot in self.shader_texture_slots(&Some(settings.clone())) {
                         let value = settings.get("textures").and_then(|map| map.get(&slot));
+                        let guid = reference_guid(value);
                         fields.push(AssetReferenceField {
                             key: format!("textures.{slot}"),
                             target: target.clone(),
-                            guid: reference_guid(value),
+                            label: self.asset_label(&guid),
+                            guid,
                             nested: false,
                         });
                     }
@@ -5290,10 +5394,12 @@ impl EditorWindow {
                         .cloned()
                         .unwrap_or_default();
                     for (index, entry) in entries.iter().enumerate() {
+                        let guid = reference_guid(Some(entry));
                         fields.push(AssetReferenceField {
                             key: format!("passes[{index}]"),
                             target: target.clone(),
-                            guid: reference_guid(Some(entry)),
+                            label: self.asset_label(&guid),
+                            guid,
                             nested: true,
                         });
                     }
@@ -5302,6 +5408,31 @@ impl EditorWindow {
             }
         }
         fields
+    }
+
+    /// What a reference row reads for the asset `guid` names: the listing's
+    /// path when the file is one, otherwise the name the store holds - a
+    /// chain's built-in passes are built in code, so their guid is the only
+    /// thing a file walk can know about them.
+    fn asset_label(&mut self, guid: &Option<String>) -> Option<String> {
+        let guid = guid.as_deref()?;
+        if let Some(path) = self
+            .asset_entries
+            .iter()
+            .find(|row| row.guid.as_deref() == Some(guid))
+            .map(|row| row.path.clone())
+        {
+            return Some(path);
+        }
+        let parsed = pill_engine_core::AssetGuid::parse(guid)?;
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let registry = world
+            .get_resource::<pill_engine_core::ImportRegistry>()
+            .cloned()?;
+        let assets = world.get_resource::<pill_engine_core::AssetManager>()?;
+        registry
+            .loaded_by_guid(assets, parsed)
+            .map(|(_type_name, name, _index, _generation)| name)
     }
 
     /// The texture slots the shader a material document names declares.
@@ -6777,7 +6908,7 @@ impl EditorWindow {
         if title == self.scene_title {
             return;
         }
-        self.window.set_title(&format!("{title} - Pill Editor"));
+        self.window.set_title(&format!("{title} - Pill"));
         info!(
             target: telemetry_target::ENGINE,
             title = title.as_str(),
@@ -7770,6 +7901,7 @@ impl EditorWindow {
                 Dump::Viewport => self.dump_viewport(),
                 Dump::Grid => self.dump_grid(),
                 Dump::Assets => self.dump_assets(),
+                Dump::EngineAssets => self.dump_engine_assets(),
                 Dump::Browser => self.dump_browser(),
                 Dump::StandaloneTypes => self.dump_standalone_types(),
                 Dump::Systems => self.dump_systems(),
@@ -9060,6 +9192,9 @@ fn snapshot_fields_changed(previous: &EditorSnapshot, current: &EditorSnapshot) 
     if previous.assets != current.assets {
         changed.push("assets");
     }
+    if previous.engine_assets != current.engine_assets {
+        changed.push("engine_assets");
+    }
     if previous.standalone_types != current.standalone_types {
         changed.push("standalone_types");
     }
@@ -9402,16 +9537,17 @@ fn open_in_file_manager(target: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        let native = native_path(target);
         let mut command = std::process::Command::new("explorer");
         if target.is_dir() {
-            command.arg(target);
+            command.arg(&native);
         } else {
             // Explorer parses `/select,<path>` itself and wants the *path*
             // quoted, not the whole token: a token quoted whole is rejected and
             // explorer falls back to the default folder. A raw argument is the
             // only way to put exactly that text on the command line, since
             // Rust would otherwise quote the token as one word.
-            command.raw_arg(format!("/select,\"{}\"", target.display()));
+            command.raw_arg(format!("/select,\"{}\"", native.display()));
         }
         let _ = command.spawn();
     }
@@ -9431,6 +9567,58 @@ fn open_in_file_manager(target: &std::path::Path) {
     }
 }
 
+/// `target` rebuilt from its components, so its text carries the platform's
+/// own separators.
+///
+/// A reveal target is joined from a `/`-separated relative path, and
+/// `Path::display` prints the string the path was built from - so the same
+/// path can read `res/materials/x.material` on Windows, which Explorer's
+/// `/select,` rejects before falling back to the user's Documents folder.
+fn native_path(target: &std::path::Path) -> std::path::PathBuf {
+    target.components().collect()
+}
+
+/// The store's own assets that no file of the project's backs - a chain's
+/// built-in passes, the renderer's default material - as the pickers offer
+/// them.
+///
+/// A row the listing already holds is left out: the file names that same asset,
+/// and two rows for one asset would be two ways to pick one thing.
+fn engine_asset_rows(
+    world: &pill_engine_core::World,
+    listing: &[AssetListing],
+) -> Vec<pill_editor_core::editor_state::EngineAsset> {
+    let Some(registry) = world
+        .get_resource::<pill_engine_core::ImportRegistry>()
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    let Some(assets) = world.get_resource::<pill_engine_core::AssetManager>() else {
+        return Vec::new();
+    };
+    registry
+        .loaded_assets(assets)
+        .into_iter()
+        .filter(|(_kind, guid, name)| match guid {
+            Some(guid) => {
+                let guid = guid.to_string();
+                !listing
+                    .iter()
+                    .any(|row| row.guid.as_deref() == Some(guid.as_str()))
+            }
+            None => !listing.iter().any(|row| row.path == *name),
+        })
+        .map(
+            |(kind, guid, name)| pill_editor_core::editor_state::EngineAsset {
+                kind,
+                name,
+                guid: guid.map(|guid| guid.to_string()),
+            },
+        )
+        .collect()
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -9438,6 +9626,25 @@ fn open_in_file_manager(target: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reveal's path reaches the file manager with the platform's own
+    /// separators: Explorer's `/select,` refuses a `/` and opens the user's
+    /// Documents folder instead.
+    #[test]
+    fn a_reveal_path_is_rebuilt_from_its_components() {
+        let target = std::path::Path::new("res").join("materials/unlit.material");
+        let native = native_path(&target);
+        assert_eq!(
+            native.components().count(),
+            target.components().count(),
+            "every segment survives"
+        );
+        #[cfg(target_os = "windows")]
+        assert!(
+            !native.to_string_lossy().contains('/'),
+            "a `/` makes Explorer fall back to Documents: {native:?}"
+        );
+    }
 
     /// The focus rule: a key or click from the game's window is the game's,
     /// and one from any editor window is the shell's alone.

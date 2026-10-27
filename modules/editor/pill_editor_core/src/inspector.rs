@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 
 // Current crate
 use crate::editor_state::{
-    AssetListing, ComponentView, EditorCommand, EntityDetail, EntityListEntry,
+    AssetListing, ComponentView, EditorCommand, EngineAsset, EntityDetail, EntityListEntry,
 };
 use crate::icons::Icon;
 
@@ -757,20 +757,47 @@ pub fn entity_candidates(entries: &[EntityListEntry]) -> Vec<&EntityListEntry> {
     entries.iter().collect()
 }
 
+/// The rows a picker offers for `target`: the listing's files of the type
+/// first, then the store's own assets of it - the ones built in code, which no
+/// directory walk can find.
+///
+/// Both sides compare on the type name's last segment, so a module's spelling
+/// of a type and the renderer's agree however each was registered. A field
+/// without a recorded type offers nothing, rather than every asset of every
+/// type.
+pub fn picker_candidates<'a>(
+    listing: &'a [AssetListing],
+    engine_assets: &'a [EngineAsset],
+    target: Option<&str>,
+) -> (Vec<&'a AssetListing>, Vec<&'a EngineAsset>) {
+    let Some(target) = target else {
+        return (Vec::new(), Vec::new());
+    };
+    (
+        listing
+            .iter()
+            .filter(|entry| names_type(&entry.kind, target))
+            .collect(),
+        engine_assets
+            .iter()
+            .filter(|asset| names_type(&asset.kind, target))
+            .collect(),
+    )
+}
+
+/// Whether a row's type name is the one a field asked for, compared on the
+/// last `::` segment.
+fn names_type(kind: &str, target: &str) -> bool {
+    kind.rsplit("::").next() == target.rsplit("::").next()
+}
+
 /// The assets an asset row's picker offers: every file of the listing whose
-/// type is the field's, in listing order. A field without a recorded type
-/// offers nothing, rather than every asset of every type.
+/// type is the field's, in listing order.
 pub fn asset_candidates<'a>(
     listing: &'a [AssetListing],
     asset_type: Option<&str>,
 ) -> Vec<&'a AssetListing> {
-    let Some(asset_type) = asset_type else {
-        return Vec::new();
-    };
-    listing
-        .iter()
-        .filter(|entry| entry.kind == asset_type)
-        .collect()
+    picker_candidates(listing, &[], asset_type).0
 }
 
 /// Whether a scripted or typed value names "no asset": the word that clears an
@@ -1965,6 +1992,60 @@ mod tests {
             .collect();
         assert_eq!(paths, ["models/cube.obj", "models/plane.obj"]);
         assert!(asset_candidates(&assets, None).is_empty());
+    }
+
+    /// A picker offers the project's files of the type first, then the store's
+    /// own assets of it - the ones built in code, which no directory walk can
+    /// find - and a type no engine asset has adds nothing.
+    #[test]
+    fn a_picker_offers_the_files_and_the_engines_own_assets() {
+        let listing = |path: &str, kind: &str| AssetListing {
+            root: String::new(),
+            path: path.to_owned(),
+            read_only: false,
+            kind: kind.to_owned(),
+            standalone: true,
+            has_meta: true,
+            guid: Some(format!("file-{path}")),
+        };
+        let built = |name: &str, kind: &str| EngineAsset {
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            guid: Some(format!("engine-{name}")),
+        };
+        let assets = vec![
+            listing("passes/unlit.render_pass", "demo::RenderPass"),
+            listing("passes/pbr.render_pass", "demo::RenderPass"),
+        ];
+        let engine_assets = vec![
+            built(
+                "pill.pbr.opaque",
+                "pill_master_renderer::assets::RenderPass",
+            ),
+            built(
+                "pill.pbr.skybox",
+                "pill_master_renderer::assets::RenderPass",
+            ),
+            built(
+                "pill.pbr.material",
+                "pill_master_renderer::assets::Material",
+            ),
+        ];
+        let (files, chosen) = picker_candidates(&assets, &engine_assets, Some("RenderPass"));
+        let paths: Vec<&str> = files.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["passes/unlit.render_pass", "passes/pbr.render_pass"]
+        );
+        let names: Vec<&str> = chosen.iter().map(|asset| asset.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["pill.pbr.opaque", "pill.pbr.skybox"],
+            "the module's passes come after the project's files"
+        );
+        // A type no engine asset names offers the files alone.
+        let (files, chosen) = picker_candidates(&assets, &engine_assets, Some("demo::Scene"));
+        assert!(files.is_empty() && chosen.is_empty());
     }
 
     /// An entity value becomes an entity row, not a read-only one.

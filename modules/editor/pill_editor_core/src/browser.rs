@@ -82,11 +82,10 @@ pub fn root_of(folder: &str) -> AssetRoot {
     ROOTS
         .iter()
         .copied()
-        .filter(|root| {
+        .rfind(|root| {
             !root.key.is_empty()
                 && (folder == root.key || folder.starts_with(&format!("{}/", root.key)))
         })
-        .next_back()
         .unwrap_or(ROOTS[0])
 }
 
@@ -114,6 +113,12 @@ pub struct ProjectBrowser {
     /// Each tile's last logged rectangle, keyed by its path: logged once per
     /// placement, so a suite can drag a tile without reading pixels.
     pub tile_rects: Vec<(String, [f32; 4])>,
+    /// Each folder tree row's last logged rectangle, keyed by the folder: what
+    /// a suite right-clicks without reading pixels.
+    pub tree_rects: Vec<(String, [f32; 4])>,
+    /// The grid pane's last logged rectangle: the area whose right-click opens
+    /// the container menu.
+    pub pane_rect: Option<[f32; 4]>,
 }
 
 impl Default for ProjectBrowser {
@@ -123,6 +128,8 @@ impl Default for ProjectBrowser {
             expanded: BTreeSet::new(),
             tile_size: DEFAULT_TILE_SIZE,
             tile_rects: Vec::new(),
+            tree_rects: Vec::new(),
+            pane_rect: None,
         }
     }
 }

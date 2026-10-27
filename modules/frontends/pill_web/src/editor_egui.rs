@@ -396,6 +396,10 @@ impl WebEditorApplication {
                     // projects nothing into a scene view, so the list stays
                     // empty.
                     badges: Vec::new(),
+                    // The page drives the editor through
+                    // `window.pillEditor.command`, so its row geometry is a
+                    // suite's to read.
+                    scripted: true,
                 };
             }
         }
@@ -665,6 +669,10 @@ fn scripted_name(command: &ScriptedCommand) -> &'static str {
         ScriptedCommand::Drop(_) => "drop",
         ScriptedCommand::HoverFile(_) => "hover file",
         ScriptedCommand::DragOut(_) => "drag out",
+        // A page's file manager is the download shelf, so neither verb has
+        // anything to open or repoint here.
+        ScriptedCommand::Reveal(_) => "reveal",
+        ScriptedCommand::PickReference { .. } => "pick reference",
     }
 }
 

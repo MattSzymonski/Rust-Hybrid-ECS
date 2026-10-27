@@ -352,6 +352,9 @@ pub enum Dump {
     Grid,
     /// `dump assets` - the asset listing's rows.
     Assets,
+    /// `dump engine-assets` - the store's own assets no file backs, which a
+    /// picker offers beside the listing's rows.
+    EngineAssets,
     /// `dump browser` - the project browser's open folder and open rows.
     Browser,
     /// `dump standalone-types` - the types the create dialog offers.
@@ -918,6 +921,7 @@ fn dump(cursor: &mut Cursor<'_>) -> Result<Dump, ParseError> {
         "viewport" => Dump::Viewport,
         "grid" => Dump::Grid,
         "assets" => Dump::Assets,
+        "engine-assets" => Dump::EngineAssets,
         "browser" => Dump::Browser,
         "standalone-types" => Dump::StandaloneTypes,
         "systems" => Dump::Systems,
@@ -1792,6 +1796,10 @@ mod tests {
             Accept {
                 line: "dump browser",
                 command: ScriptedCommand::Dump(Dump::Browser),
+            },
+            Accept {
+                line: "dump engine-assets",
+                command: ScriptedCommand::Dump(Dump::EngineAssets),
             },
             Accept {
                 line: "dump standalone-types",
