@@ -131,10 +131,9 @@ impl OrbitCamera {
     }
 
     /// Orbit around the pivot by a drag's pixel delta: dragging right turns
-    /// the view left, dragging down lifts it over the pivot, like Blender's
-    /// middle-mouse orbit.
+    /// the view right, dragging down lifts it over the pivot.
     pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
-        self.yaw += delta_x * ORBIT_RADIANS_PER_PIXEL;
+        self.yaw -= delta_x * ORBIT_RADIANS_PER_PIXEL;
         self.pitch = (self.pitch + delta_y * ORBIT_RADIANS_PER_PIXEL).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
@@ -288,6 +287,14 @@ mod tests {
         let before = camera.forward();
         camera.orbit(40.0, 0.0);
         assert!(!close(camera.forward()[0], before[0]), "yaw moved the view");
+        // The direction a horizontal drag turns the view is part of the
+        // contract: a drag to the right turns the view to the right, which
+        // swings the forward vector toward +X from a camera looking down -Z.
+        assert!(camera.yaw < 0.0, "a rightward drag turned the view left");
+        assert!(
+            camera.forward()[0] > 0.0,
+            "the view turned toward -X on a rightward drag"
+        );
         // A drag far past the pole clamps instead of flipping.
         camera.orbit(0.0, 100_000.0);
         assert!(close(camera.pitch, MAX_PITCH));

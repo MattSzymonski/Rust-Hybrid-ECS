@@ -451,6 +451,11 @@ impl ImportEntry {
 #[derive(Default, Clone)]
 pub struct ImportRegistry {
     entries: Vec<ImportEntry>,
+    /// The reference fields each type declares, by owner type name: the field
+    /// key a settings document uses and the type name it points at. A key that
+    /// ends in `.*` covers a family - `textures.*` is every texture slot the
+    /// asset's shader declares.
+    references: std::collections::BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl Resource for ImportRegistry {}
@@ -551,6 +556,58 @@ impl ImportRegistry {
             entry.registrations.retain(Registration::is_alive);
         }
         self.entries.retain(|entry| !entry.registrations.is_empty());
+        // A reference declaration belongs to the type that made it: a type no
+        // generation registers any more takes its declarations with it.
+        let live: std::collections::BTreeSet<String> = self
+            .entries
+            .iter()
+            .map(|entry| entry.type_name.clone())
+            .collect();
+        self.references.retain(|owner, _| live.contains(owner));
+    }
+
+    /// Record the reference fields `owner_type` declares: `(field key, target
+    /// type name)` pairs.
+    ///
+    /// A registry call rather than a schema in the file: the target is the Rust
+    /// type the field holds, named by [`Asset::metadata_type_name`], so a
+    /// renamed type moves here with the code instead of drifting. Declaring
+    /// again replaces the owner's whole list, which is what a reload does.
+    pub fn declare_references(&mut self, owner_type: &str, references: &[(&str, &str)]) {
+        let declared: Vec<(String, String)> = references
+            .iter()
+            .map(|(field, target)| ((*field).to_owned(), (*target).to_owned()))
+            .collect();
+        self.references.insert(owner_type.to_owned(), declared);
+    }
+
+    /// The reference fields `owner_type` declares, as `(field key, target type
+    /// name)` pairs in declaration order. A key ending in `.*` is the family a
+    /// caller expands from its own document.
+    pub fn reference_fields(&self, owner_type: &str) -> &[(String, String)] {
+        self.references
+            .get(owner_type)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// The type name the reference field `field` of `owner_type` points at.
+    ///
+    /// An exact declaration wins; otherwise a family declaration (`textures.*`)
+    /// covers every key below its prefix.
+    pub fn reference_target(&self, owner_type: &str, field: &str) -> Option<&str> {
+        let declared = self.references.get(owner_type)?;
+        if let Some((_, target)) = declared.iter().find(|(key, _)| key == field) {
+            return Some(target.as_str());
+        }
+        declared
+            .iter()
+            .filter_map(|(key, target)| {
+                let family = key.strip_suffix(".*")?;
+                (field == family || field.starts_with(&format!("{family}.")))
+                    .then_some(target.as_str())
+            })
+            .next()
     }
 
     /// The type that imports `extension` (without the dot, any case), if a

@@ -202,6 +202,7 @@ pub fn estimate_bytes(commands: &[EditorCommand]) -> usize {
                 type_name,
                 folder,
                 name,
+                ..
             } => type_name.len() + folder.len() + name.len(),
             EditorCommand::DeleteAssetFile { path } | EditorCommand::WriteAssetMeta { path } => {
                 path.len()

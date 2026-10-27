@@ -274,6 +274,21 @@ pub enum ScriptedCommand {
     Redo,
     /// `command editor.scene_new_view` - dock one more scene view.
     NewSceneView,
+    /// `reveal <path>` - ask the file manager to show one asset's file, the way
+    /// the Assets panel's row menu does. The path is the row's key, so a
+    /// module's resource carries its `extensions/<module>/` prefix.
+    Reveal(String),
+    /// `pick reference <asset> <key> <candidate>` - choose an asset in the
+    /// picker of one settings row, by the candidate's path, and queue the same
+    /// recorded edit the row's click queues.
+    PickReference {
+        /// The owning asset's path below the asset directory.
+        asset: String,
+        /// The settings key the row edits, such as `textures.color`.
+        key: String,
+        /// The candidate's path, as the Assets panel lists it.
+        candidate: String,
+    },
     /// `popout <tab>` - move a tab into its own OS window;
     /// `popout <tab> redock` puts it back in the dock.
     Popout {
@@ -618,6 +633,13 @@ impl ScriptedCommand {
                 }
                 _ => Err(ParseError::new("problem needs `open <index>`")),
             },
+            // `reveal <path>` is the row menu's show-in-file-manager action,
+            // driven from the channel: the executable resolves the key and
+            // opens the file manager.
+            "reveal" => {
+                let path = cursor.text("reveal needs a path")?;
+                Ok(ScriptedCommand::Reveal(path))
+            }
             "panel" => match cursor.word() {
                 Some("unload") => {
                     let source = cursor
@@ -963,7 +985,20 @@ fn pick(cursor: &mut Cursor<'_>) -> Result<ScriptedCommand, ParseError> {
                 field: field.to_string(),
             })
         }
-        _ => Err(ParseError::new("pick needs entity")),
+        // `pick reference <asset> <key> <candidate>`: the choice a picker row
+        // makes, by candidate path instead of by click.
+        Some("reference") => {
+            let reason = "pick reference needs an asset, a key and a candidate";
+            let asset = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let key = cursor.word().ok_or_else(|| ParseError::new(reason))?;
+            let candidate = cursor.text("pick reference needs a candidate")?;
+            Ok(ScriptedCommand::PickReference {
+                asset: asset.to_string(),
+                key: key.to_string(),
+                candidate,
+            })
+        }
+        _ => Err(ParseError::new("pick needs entity or reference")),
     }
 }
 
@@ -1607,6 +1642,18 @@ mod tests {
             Accept {
                 line: "command editor.scene_new_view",
                 command: ScriptedCommand::NewSceneView,
+            },
+            Accept {
+                line: "reveal models/cube.obj",
+                command: ScriptedCommand::Reveal("models/cube.obj".to_string()),
+            },
+            Accept {
+                line: "pick reference materials/a.material textures.color textures/rock.png",
+                command: ScriptedCommand::PickReference {
+                    asset: "materials/a.material".to_string(),
+                    key: "textures.color".to_string(),
+                    candidate: "textures/rock.png".to_string(),
+                },
             },
             Accept {
                 line: "popout inspector",

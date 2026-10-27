@@ -111,7 +111,7 @@ pub fn inspector_tab(
                 session,
                 overlay_regions,
                 detail.read_only,
-                &detail.texture_slots,
+                &detail.references,
             ),
             None => {
                 ui.label(egui::RichText::new("no editable settings").weak().italics());

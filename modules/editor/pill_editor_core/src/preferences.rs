@@ -55,7 +55,7 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 11] = [
     PreferenceField {
         key: crate::previews::RENDER_PREVIEWS_KEY,
         label: "render asset previews",
-        fallback: "false",
+        fallback: "true",
     },
     PreferenceField {
         key: "editor.gizmo_hit_radius",

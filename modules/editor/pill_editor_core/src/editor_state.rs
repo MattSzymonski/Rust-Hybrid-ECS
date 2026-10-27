@@ -312,9 +312,23 @@ pub struct AssetDetail {
     /// The import settings document (a standalone asset's body, or the
     /// sidecar's `settings`); `None` for folders and unknown extensions.
     pub settings: Option<serde_json::Value>,
-    /// The texture slots a material's shader declares, in declaration order:
-    /// every one gets a row, whether or not the document binds it yet.
-    pub texture_slots: Vec<String>,
+    /// The reference fields the asset's type declares, expanded: one entry per
+    /// picker the Inspector draws, whether or not the document binds it yet.
+    pub references: Vec<AssetReferenceField>,
+}
+
+/// One reference field of an asset's settings, as the Inspector draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetReferenceField {
+    /// The settings key the edit writes: `shader`, or `textures.<slot>`.
+    pub key: String,
+    /// The registered type name its picker offers, as a listing row's kind.
+    pub target: String,
+    /// The guid the document holds now, when it holds one.
+    pub guid: Option<String>,
+    /// Whether the document writes `{ "guid": … }` (a named reference) rather
+    /// than a bare guid string (a texture slot).
+    pub nested: bool,
 }
 
 impl AssetDetail {
@@ -1029,9 +1043,9 @@ pub enum EditorCommand {
     /// Create a standalone asset of `type_name` called `name` in `folder`,
     /// both relative to the asset directory.
     ///
-    /// The file is the type's default document with a fresh guid, written so
-    /// an existing file is never replaced, then imported at once; its
-    /// inverse is the deletion of the new file.
+    /// The file is the type's default document, written so an existing file is
+    /// never replaced unless the dialog asked for that, then imported at once;
+    /// its inverse is the deletion of the new file.
     CreateStandaloneAsset {
         /// The registered standalone type's name.
         type_name: String,
@@ -1041,6 +1055,10 @@ pub enum EditorCommand {
         /// The name the user typed; the type's naming rules add the
         /// extension.
         name: String,
+        /// What to do when the file is already there: `None` refuses (the
+        /// dialog has not asked yet), `Some(true)` replaces it and keeps its
+        /// guid, `Some(false)` replaces it with a fresh one.
+        overwrite: Option<bool>,
     },
     /// Delete the asset file at `path`, relative to the asset directory,
     /// together with its `.meta` sidecar.
@@ -1916,6 +1934,7 @@ impl EditorCommand {
                 type_name,
                 folder,
                 name,
+                overwrite,
             } => {
                 let root = asset_authoring_root()?;
                 let registry = engine
@@ -1965,18 +1984,42 @@ impl EditorCommand {
                 let relative = relative_folder.join(&file_name);
                 refuse_module_resource(command, &relative)?;
                 let destination = root.join(&relative);
-                if destination.exists() {
+                // An existing file is replaced only when the dialog said so,
+                // and the dialog says which guid survives.
+                let existing = destination.exists();
+                if existing && overwrite.is_none() {
                     return Err(format!(
                         "{command:?}: `{}` already exists",
                         asset_slash(&relative)
                     ));
                 }
+                let kept_guid = if existing && *overwrite == Some(true) {
+                    let text = std::fs::read_to_string(&destination).map_err(|error| {
+                        format!(
+                            "{command:?}: cannot read `{}`: {error}",
+                            asset_slash(&relative)
+                        )
+                    })?;
+                    let previous: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
+                    previous
+                        .get("guid")
+                        .and_then(|guid| guid.as_str())
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
                 let document = registry
                     .default_document(type_name)
                     .map_err(|error| format!("{command:?}: {error}"))?;
-                let guid = pill_engine::AssetGuid::random().map_err(|error| {
-                    format!("{command:?}: no random source for a guid: {error}")
-                })?;
+                let guid = match kept_guid {
+                    Some(guid) => guid,
+                    None => pill_engine::AssetGuid::random()
+                        .map_err(|error| {
+                            format!("{command:?}: no random source for a guid: {error}")
+                        })?
+                        .to_string(),
+                };
                 let file = serde_json::json!({
                     "format_version": pill_engine::asset_metadata::METADATA_FORMAT_VERSION,
                     "asset_type": type_name,
@@ -1990,8 +2033,13 @@ impl EditorCommand {
                 let sidecar_existed = sidecar
                     .as_ref()
                     .is_some_and(|meta| root.join(meta).exists());
-                pill_engine::asset_store::write_new(&destination, &bytes)
-                    .map_err(|error| format!("{command:?}: {error}"))?;
+                if existing {
+                    pill_engine::asset_store::write_replacing(&destination, &bytes)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
+                } else {
+                    pill_engine::asset_store::write_new(&destination, &bytes)
+                        .map_err(|error| format!("{command:?}: {error}"))?;
+                }
                 if let Err(error) = registry.import(
                     assets,
                     &relative,
@@ -3781,6 +3829,7 @@ mod tests {
                 type_name: "pill_editor_core::tests::Refused".to_owned(),
                 folder: String::new(),
                 name: "broken".to_owned(),
+                overwrite: None,
             }],
         );
         assert_eq!(failures.len(), 1, "the refusing import fails the create");
@@ -3872,6 +3921,7 @@ mod tests {
             type_name: "pill_ui_theme::ThemeOverrides".to_owned(),
             folder: String::new(),
             name: "probe".to_owned(),
+            overwrite: None,
         };
         let recorded = EditorCommand::apply_recorded(&mut engine, std::slice::from_ref(&create));
         assert!(recorded.failures.is_empty(), "{:?}", recorded.failures);

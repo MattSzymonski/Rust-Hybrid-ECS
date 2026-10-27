@@ -1106,6 +1106,75 @@ pub fn patch_settings(
     Ok(())
 }
 
+/// Replace the settings leaf a key path names, creating what is missing on the
+/// way.
+///
+/// This is the asset-settings rule: a slot or a reference row is drawn from
+/// what the *type* declares, so the file may not hold the key yet - an unbound
+/// texture slot is exactly that - and the first write is the one that creates
+/// it. A missing parent object is made; an array index one past the end appends.
+/// The typed component and resource editors keep using [`patch_settings`], whose
+/// stricter rule is what stops a stale row from inventing a field.
+pub fn patch_settings_inserting(
+    document: &mut JsonValue,
+    path: &[SettingsKey],
+    value: JsonValue,
+) -> Result<(), String> {
+    let (last, parents) = path
+        .split_last()
+        .ok_or_else(|| "a settings key path cannot be empty".to_string())?;
+    let mut current = document;
+    for (position, segment) in parents.iter().enumerate() {
+        current = match segment {
+            SettingsKey::Key(key) => {
+                if !current.is_object() {
+                    return Err(format!("`{key}` is not in the settings"));
+                }
+                let object = current
+                    .as_object_mut()
+                    .ok_or_else(|| format!("`{key}` is not in the settings"))?;
+                object
+                    .entry(key.clone())
+                    .or_insert_with(|| JsonValue::Object(serde_json::Map::new()))
+            }
+            SettingsKey::Index(index) => {
+                // An index one past the end appends, but only when the element
+                // it creates is an object: a path that would need a fresh array
+                // is a gap, not an append.
+                let creates_object = matches!(parents.get(position + 1), Some(SettingsKey::Key(_)))
+                    || matches!(last, SettingsKey::Key(_));
+                let elements = current
+                    .as_array_mut()
+                    .ok_or_else(|| format!("element [{index}] is not in the settings"))?;
+                if *index == elements.len() && creates_object {
+                    elements.push(JsonValue::Object(serde_json::Map::new()));
+                }
+                elements
+                    .get_mut(*index)
+                    .ok_or_else(|| format!("element [{index}] is not in the settings"))?
+            }
+        };
+    }
+    match last {
+        SettingsKey::Key(key) => {
+            let object = current
+                .as_object_mut()
+                .ok_or_else(|| format!("`{key}` is not in the settings"))?;
+            object.insert(key.clone(), value);
+        }
+        SettingsKey::Index(index) => match current {
+            JsonValue::Array(elements) if *index == elements.len() => elements.push(value),
+            _ => {
+                let slot = current
+                    .get_mut(*index)
+                    .ok_or_else(|| format!("element [{index}] is not in the settings"))?;
+                *slot = value;
+            }
+        },
+    }
+    Ok(())
+}
+
 /// Parse an edited text back into the JSON kind `current` already holds.
 pub fn parse_settings_value(text: &str, current: &JsonValue) -> Result<JsonValue, String> {
     let text = text.trim();
@@ -1308,6 +1377,37 @@ mod tests {
         assert_eq!(settings_field(&document, &path), Some(&json!(7)));
         let missing = parse_settings_key_path("nope").expect("parses");
         assert!(patch_settings(&mut document, &missing, json!(1)).is_err());
+    }
+
+    /// The inserting patch is the asset-settings rule: a slot the type declares
+    /// but the file does not hold yet is created, with its parent if need be,
+    /// while the strict patch keeps refusing the same path.
+    #[test]
+    fn the_inserting_patch_creates_the_leaf_the_file_lacks() {
+        let mut document = json!({ "textures": { "albedo": "aa" } });
+        let slot = parse_settings_key_path("textures.base_color").expect("parses");
+        assert!(patch_settings(&mut document, &slot, json!("bb")).is_err());
+        patch_settings_inserting(&mut document, &slot, json!("bb")).expect("inserts");
+        assert_eq!(settings_field(&document, &slot), Some(&json!("bb")));
+        // The sibling the file already held is untouched.
+        assert_eq!(
+            settings_field(&document, &slot[..1]),
+            Some(&json!({ "albedo": "aa", "base_color": "bb" }))
+        );
+
+        // A missing parent object is made, not refused.
+        let mut empty = json!({});
+        let deep = parse_settings_key_path("textures.normal").expect("parses");
+        patch_settings_inserting(&mut empty, &deep, json!("cc")).expect("creates the parent");
+        assert_eq!(settings_field(&empty, &deep), Some(&json!("cc")));
+
+        // One past the end of an array appends; further past it is refused.
+        let mut list = json!({ "passes": [{ "guid": "a" }] });
+        let append = parse_settings_key_path("passes[1].guid").expect("parses");
+        patch_settings_inserting(&mut list, &append, json!("b")).expect("appends");
+        assert_eq!(list["passes"][1]["guid"], json!("b"));
+        let gap = parse_settings_key_path("passes[5].guid").expect("parses");
+        assert!(patch_settings_inserting(&mut list, &gap, json!("c")).is_err());
     }
 
     #[test]

@@ -382,7 +382,11 @@ pub fn asset_dialog_window(
     let Some(current) = dialog.as_ref() else {
         return;
     };
+    // An existing name asks first: the same window gains a warning and the
+    // keep-the-guid checkbox, and its submit reads Replace.
+    let collision = assets::create_collision(current, &snapshot.standalone_types, &snapshot.assets);
     let (title, submit_label) = match current {
+        AssetDialog::Create { .. } if collision.is_some() => ("Replace Asset", "Replace"),
         AssetDialog::Create { .. } => ("Create Asset", "Create"),
         AssetDialog::Rename { .. } => ("Rename Asset", "Rename"),
     };
@@ -402,6 +406,8 @@ pub fn asset_dialog_window(
                     folder,
                     type_name,
                     name,
+                    kind,
+                    overwrite,
                 } => {
                     ui.label(format!(
                         "In res{}{}",
@@ -425,6 +431,38 @@ pub fn asset_dialog_window(
                         ui.label("Name");
                         ui.text_edit_singleline(name);
                     });
+                    if *kind != assets::CreateKind::Asset {
+                        ui.label(
+                            egui::RichText::new(match kind {
+                                assets::CreateKind::EmptyScene => {
+                                    "Creates an empty scene and opens it."
+                                }
+                                assets::CreateKind::SaveWorld => {
+                                    "Writes the current world to this file."
+                                }
+                                assets::CreateKind::Asset => "",
+                            })
+                            .weak()
+                            .italics(),
+                        );
+                    }
+                    if let Some(path) = collision.as_deref() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("{path} already exists."))
+                                .color(style::warning()),
+                        );
+                        let mut keep = overwrite.unwrap_or(true);
+                        if ui
+                            .checkbox(&mut keep, "Keep the existing guid")
+                            .on_hover_text(
+                                "Other assets that reference this one stay valid. Untick to write a fresh guid.",
+                            )
+                            .changed()
+                        {
+                            *overwrite = Some(keep);
+                        }
+                    }
                 }
                 AssetDialog::Rename { from, name } => {
                     ui.label(format!("Rename {from}"));
