@@ -62,10 +62,11 @@ pub use pill_renderer_api::frame::{
 // Current crate
 pub use assets::{
     load_shipped_texture, Material, MaterialBuilder, MaterialDocument, MaterialTexture, Mesh,
-    MeshImportSettings, MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline, Shader,
-    ShaderBuilder, ShaderImportSettings, ShaderParameterDeclaration, ShaderParameterSlot,
-    ShaderParameterType, ShaderTextureDeclaration, ShaderTextureSlot, Texture,
-    TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE, DEFAULT_NORMAL_TEXTURE,
+    MeshImportSettings, MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline,
+    RenderingPipelineDocument, Shader, ShaderBuilder, ShaderImportSettings,
+    ShaderParameterDeclaration, ShaderParameterSlot, ShaderParameterType, ShaderTextureDeclaration,
+    ShaderTextureSlot, Texture, TextureImportSettings, TextureType, DEFAULT_COLOR_TEXTURE,
+    DEFAULT_NORMAL_TEXTURE,
 };
 pub use components::*;
 pub use rendering_manager::RenderingManager;
@@ -106,7 +107,11 @@ pub fn register(engine: &mut Engine) -> u32 {
     engine.world_mut().register_standalone_asset::<Material>();
     // Passes are also files of their own (`.render_pass`), loaded by extension.
     engine.world_mut().register_standalone_asset::<RenderPass>();
-    engine.world_mut().register_asset::<RenderingPipeline>();
+    // Chains are files of their own too (`.pipeline`): the editor creates one
+    // from its dialog and a project loads it by path.
+    engine
+        .world_mut()
+        .register_standalone_asset::<RenderingPipeline>();
     // Declare the resources this crate inserts, before inserting them. Once the
     // crate is a loaded module, a reload keeps the existing values and never
     // calls `insert_resource` again, so this declaration is what re-points

@@ -101,13 +101,21 @@ pub fn install(
         .with_engine_parameters(true)
         .with_camera_parameters(true)
         .build()?;
-    let shader = assets.add_named(SHADER_NAME, shader)?;
+    let shader = assets.add_named_with_guid(
+        SHADER_NAME,
+        pill_engine::AssetGuid::from_name(SHADER_NAME),
+        shader,
+    )?;
 
     let pass = RenderPass::new("pill.simple.opaque")
         .with_shader(shader)
         .with_kind(PassKind::Geometry)
         .with_target(PassTarget::Surface);
-    let pass = assets.add_named(PASS_NAME, pass)?;
+    let pass = assets.add_named_with_guid(
+        PASS_NAME,
+        pill_engine::AssetGuid::from_name(PASS_NAME),
+        pass,
+    )?;
 
     let pipeline = assets.add_named(PIPELINE_NAME, RenderingPipeline::new().with_pass(pass))?;
 

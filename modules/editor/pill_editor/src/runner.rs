@@ -8086,10 +8086,15 @@ impl EditorWindow {
                 "[editor] scene tab docked"
             );
         } else {
-            warn!(
+            // The menu named a tab the dock no longer holds: a panel the
+            // person closed. Naming it is a request to show it again, so it
+            // comes back to the focused leaf instead of being dropped.
+            state.dock.state_mut().push_to_focused_leaf(tab);
+            pill_editor_core::layout::activate_tab(state.dock.state_mut(), tab);
+            info!(
                 target: telemetry_target::ENGINE,
                 tab = tab.name(),
-                "[editor] tab activation needs the tab in the dock"
+                "[editor] tab docked"
             );
         }
     }
