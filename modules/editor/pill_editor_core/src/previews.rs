@@ -26,13 +26,14 @@ use crate::editor_state::AssetListing;
 /// The preference key previews live under.
 pub const RENDER_PREVIEWS_KEY: &str = "editor.render_asset_previews";
 
-/// Whether the file asks for rendered asset previews; absent, blank or
-/// unparsable means off, which is the cheap posture.
+/// Whether the file asks for rendered asset previews; only a stored `false`
+/// turns them off, so a fresh preferences file renders them and an absent key
+/// cannot silently change the posture.
 pub fn render_previews(document: &Map<String, Value>) -> bool {
     match crate::preferences::lookup(document, RENDER_PREVIEWS_KEY) {
         Some(Value::Bool(enabled)) => *enabled,
-        Some(Value::String(text)) => text.trim().eq_ignore_ascii_case("true"),
-        _ => false,
+        Some(Value::String(text)) => !text.trim().eq_ignore_ascii_case("false"),
+        _ => true,
     }
 }
 
@@ -108,12 +109,12 @@ mod tests {
         }
     }
 
-    /// The preference reads a boolean, a boolean's text, and nothing else as
-    /// off.
+    /// The preference reads a boolean and a boolean's text; a file that says
+    /// nothing renders them, and only a stored `false` turns them off.
     #[test]
-    fn the_preview_preference_reads_booleans_and_defaults_off() {
+    fn the_preview_preference_reads_booleans_and_defaults_on() {
         let mut document = Map::new();
-        assert!(!render_previews(&document));
+        assert!(render_previews(&document));
         crate::preferences::set_key(&mut document, RENDER_PREVIEWS_KEY, Value::Bool(true)).unwrap();
         assert!(render_previews(&document));
         crate::preferences::set_key(&mut document, RENDER_PREVIEWS_KEY, Value::Bool(false))
@@ -129,10 +130,19 @@ mod tests {
         crate::preferences::set_key(
             &mut document,
             RENDER_PREVIEWS_KEY,
-            Value::String("yes".to_string()),
+            Value::String("false".to_string()),
         )
         .unwrap();
         assert!(!render_previews(&document));
+        // Anything that is not the word "false" leaves them on: a typo must
+        // not take the feature away from someone who asked for it.
+        crate::preferences::set_key(
+            &mut document,
+            RENDER_PREVIEWS_KEY,
+            Value::String("yes".to_string()),
+        )
+        .unwrap();
+        assert!(render_previews(&document));
     }
 
     /// A row's preview comes from its type's last segment: a texture and a

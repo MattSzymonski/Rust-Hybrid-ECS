@@ -57,6 +57,9 @@ pub struct AttachedRenderer {
     /// Whether a frame with draw calls has been presented, for the one-time
     /// first-frame line.
     presented_scene: bool,
+    /// The draw count last reported in the log, so a frame that changes how
+    /// much it draws is reported once rather than every frame.
+    reported_draw_calls: u32,
     /// Every surface attached after the primary window, by surface id: the
     /// window kept alive for it, and what re-attaching it to a new backend
     /// takes. Declared after `renderer`, so the backend drops first.
@@ -101,6 +104,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
+            reported_draw_calls: 0,
             extra_surfaces: BTreeMap::new(),
         })
     }
@@ -130,6 +134,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
+            reported_draw_calls: 0,
             extra_surfaces: BTreeMap::new(),
         })
     }
@@ -397,6 +402,21 @@ impl AttachedRenderer {
             return Ok(());
         };
         let outcome = self.renderer.render(frame, assets)?;
+        let metrics = self.renderer.metrics();
+        // A frame whose draw count moves is worth one line: it is how a chain
+        // that stopped drawing a pass - a material no pass names, a shader
+        // that failed to load - is visible in a run, and how a test reads what
+        // a settled frame actually drew without a person watching the window.
+        if metrics.draw_calls != self.reported_draw_calls {
+            self.reported_draw_calls = metrics.draw_calls;
+            info!(
+                target: telemetry_target::RENDERING,
+                draw_calls = metrics.draw_calls,
+                passes = metrics.passes,
+                instances = frame.instances.len(),
+                "[render] frame draws"
+            );
+        }
         if !self.presented_scene
             && matches!(outcome, pill_renderer_api::FrameOutcome::Presented)
             && self.renderer.metrics().draw_calls > 0

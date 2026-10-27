@@ -202,6 +202,24 @@ pub fn run_menu_action(
                 &viewer.snapshot.standalone_types,
             );
         }
+        menubar::MenuAction::CreateScene => {
+            assets::open_create_scene(
+                viewer.asset_dialog,
+                viewer.selection,
+                &viewer.snapshot.assets,
+                &viewer.snapshot.standalone_types,
+                assets::CreateKind::EmptyScene,
+            );
+        }
+        menubar::MenuAction::SaveSceneAs => {
+            assets::open_create_scene(
+                viewer.asset_dialog,
+                viewer.selection,
+                &viewer.snapshot.assets,
+                &viewer.snapshot.standalone_types,
+                assets::CreateKind::SaveWorld,
+            );
+        }
         menubar::MenuAction::WriteAssetMeta => {
             assets::write_meta_selection(viewer.pending, viewer.selection, &viewer.snapshot.assets);
         }

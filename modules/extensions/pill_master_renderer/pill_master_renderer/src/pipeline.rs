@@ -33,7 +33,7 @@ use std::{
 };
 
 // External crates
-use pill_core::{info, warn};
+use pill_core::{debug, info, warn};
 use pill_engine::AssetManager;
 
 // Current crate
@@ -65,6 +65,20 @@ pub(crate) enum PassSlot {
     Unsupported(String),
 }
 
+/// One run of queue positions a geometry pass records, and which pipeline it
+/// draws them through.
+///
+/// `own_pipeline` is true for the instances the pass's own shader shades; false
+/// for instances no pass in the chain claimed, which draw through the pipeline
+/// their own material carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DrawRange {
+    /// Positions in the frame's sorted queue (also instance indices).
+    pub range: Range<u32>,
+    /// Whether the pass's own pipeline draws this run.
+    pub own_pipeline: bool,
+}
+
 /// One pass the renderer will record.
 pub(crate) enum PassPlan<'a> {
     /// Instances, batched by material, into the pass's targets.
@@ -73,11 +87,14 @@ pub(crate) enum PassPlan<'a> {
     /// sorted queue, which are also the instances' positions in the instance
     /// buffer. A pass that takes the whole queue, the built-in chain's shape,
     /// is one range; a shader-filtered pass is one range per run of its
-    /// shader. Nothing is copied either way.
+    /// shader. Nothing is copied either way. A pass that names a shader also
+    /// takes the runs no pass in the chain claimed, when it writes the surface:
+    /// those draw through their own materials' pipelines, so an assigned
+    /// material is never left off the screen.
     Geometry {
         label: &'a str,
         queue: &'a [RenderQueueItem],
-        ranges: Vec<Range<u32>>,
+        ranges: Vec<DrawRange>,
         outputs: Vec<PassOutput<'a>>,
         clear: bool,
         /// The pass's own pipeline, when it built one. `None` leaves each
@@ -125,7 +142,7 @@ impl PassPlan<'_> {
         match self {
             PassPlan::Geometry { ranges, .. } => ranges
                 .iter()
-                .map(|range| (range.end - range.start) as usize)
+                .map(|draw| (draw.range.end - draw.range.start) as usize)
                 .sum(),
             PassPlan::Fullscreen { .. } => 1,
         }
@@ -288,6 +305,18 @@ impl ScriptableRenderingPipeline {
         shader_handles: &HashMap<u64, RendererShaderHandle>,
     ) -> Vec<PassPlan<'a>> {
         let mut plan = Vec::with_capacity(chain.len());
+        // The shaders a geometry pass in this chain draws, and whether the runs
+        // no pass claimed have been handed to a pass yet. One pass takes them,
+        // so nothing is drawn twice.
+        let mut claimed: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        for pass in chain.iter().filter(|pass| pass.kind == PassKind::Geometry) {
+            if let Some(key) = &pass.shader {
+                if let Some(handle) = shader_handles.get(key) {
+                    claimed.insert(handle.data().index as u8);
+                }
+            }
+        }
+        let mut unclaimed_given = false;
         for (index, pass) in chain.iter().enumerate() {
             // The pass's own target first, then the ones it writes beside it.
             let outputs: Vec<PassOutput<'_>> = std::iter::once(&pass.target)
@@ -311,21 +340,62 @@ impl ScriptableRenderingPipeline {
                         continue;
                     }
 
-                    let ranges = match pass.shader {
+                    let mut ranges: Vec<DrawRange> = match pass.shader {
                         // The pass draws the instances shaded by the shader it
                         // names, when that shader is still loaded. One that no
                         // longer is draws nothing: falling back to the default
                         // shader would hand this pass instances another pass
                         // already took.
                         Some(key) => match shader_handles.get(&key) {
-                            Some(handle) => shader_ranges(render_queue, handle.data().index as u8),
+                            Some(handle) => shader_ranges(render_queue, handle.data().index as u8)
+                                .into_iter()
+                                .map(|range| DrawRange {
+                                    range,
+                                    own_pipeline: true,
+                                })
+                                .collect(),
                             None => Vec::new(),
                         },
                         // No shader named: the pass draws every instance, each
                         // with the pipeline its own material names. This is the
                         // built-in chain.
-                        None => whole_queue(render_queue),
+                        None => whole_queue(render_queue)
+                            .into_iter()
+                            .map(|range| DrawRange {
+                                range,
+                                own_pipeline: false,
+                            })
+                            .collect(),
                     };
+                    // The instances no pass in the chain claimed draw here,
+                    // through their own materials' pipelines, so an assigned
+                    // material is never invisible. Only a pass writing the
+                    // surface can: a material's pipeline is built for the
+                    // surface's formats.
+                    let writes_surface_only = outputs
+                        .iter()
+                        .all(|output| matches!(output, PassOutput::Surface));
+                    if pass.shader.is_some() && !unclaimed_given && writes_surface_only {
+                        let unclaimed = unclaimed_ranges(render_queue, &claimed);
+                        if !unclaimed.is_empty() {
+                            // Per frame, so it stays at debug: the chain's own
+                            // line already reports the pass's draw count.
+                            debug!(
+                                target: pill_core::telemetry::telemetry_target::RENDERING,
+                                pass = pass.name.as_str(),
+                                instances = unclaimed
+                                    .iter()
+                                    .map(|range| (range.end - range.start) as usize)
+                                    .sum::<usize>(),
+                                "Pass draws the instances no pass in the chain claimed"
+                            );
+                            ranges.extend(unclaimed.into_iter().map(|range| DrawRange {
+                                range,
+                                own_pipeline: false,
+                            }));
+                        }
+                        unclaimed_given = true;
+                    }
                     let pass_index = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => Some(index),
                         _ => None,
@@ -602,6 +672,28 @@ fn whole_queue(render_queue: &[RenderQueueItem]) -> Vec<Range<u32>> {
     }
 }
 
+/// The runs of the queue whose shader no pass in `claimed` names.
+///
+/// These are the instances an assigned material queued and no geometry pass
+/// would draw: one run per shader, in queue order.
+fn unclaimed_ranges(
+    render_queue: &[RenderQueueItem],
+    claimed: &std::collections::HashSet<u8>,
+) -> Vec<Range<u32>> {
+    let mut ranges: Vec<Range<u32>> = Vec::new();
+    for (position, item) in render_queue.iter().enumerate() {
+        if claimed.contains(&decompose_render_queue_key(item.key).shader_index) {
+            continue;
+        }
+        let position = position as u32;
+        match ranges.last_mut() {
+            Some(run) if run.end == position => run.end += 1,
+            _ => ranges.push(position..position + 1),
+        }
+    }
+    ranges
+}
+
 /// The runs of the queue drawn by the shader in slot `shader_index`.
 ///
 /// The queue is sorted by draw order first and shader second, so one shader's
@@ -730,6 +822,56 @@ mod tests {
         }
     }
 
+    /// A pass that names a shader takes the runs no pass in the chain claims,
+    /// and draws them through their own materials rather than its pipeline.
+    ///
+    /// Here the named shader is not loaded (the handle map is empty), so it
+    /// claims nothing and the queue's shader is unclaimed: exactly the case a
+    /// material the chain never thought about is in.
+    #[test]
+    fn a_pass_that_names_a_shader_takes_the_runs_no_pass_claims() {
+        let mut naming = pass(PassKind::Geometry, PassTarget::Surface);
+        naming.shader = Some(7);
+        let chain = vec![naming];
+        let queue = vec![item_of_shader(3), item_of_shader(3), item_of_shader(3)];
+        let mut pipeline = ScriptableRenderingPipeline::new();
+        pipeline.passes.push(PassSlot::Unshaded);
+
+        let plan = pipeline.plan(&chain, &queue, &HashMap::new());
+
+        assert_eq!(plan.len(), 1);
+        match &plan[0] {
+            PassPlan::Geometry { ranges, .. } => {
+                assert_eq!(ranges.len(), 1, "the whole queue is one unclaimed run");
+                assert_eq!(ranges[0].range, 0..3);
+                assert!(
+                    !ranges[0].own_pipeline,
+                    "an unclaimed run draws through its material's pipeline"
+                );
+            }
+            PassPlan::Fullscreen { .. } => panic!("a geometry pass planned as fullscreen"),
+        }
+    }
+
+    /// A pass whose targets include an offscreen one takes no unclaimed runs: a
+    /// material's pipeline is built for the surface's formats.
+    #[test]
+    fn an_offscreen_pass_leaves_the_unclaimed_runs_alone() {
+        let mut naming = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
+        naming.shader = Some(7);
+        let chain = vec![naming];
+        let queue = vec![item_of_shader(3)];
+        let mut pipeline = ScriptableRenderingPipeline::new();
+        pipeline.passes.push(PassSlot::Unshaded);
+
+        let plan = pipeline.plan(&chain, &queue, &HashMap::new());
+
+        match &plan[0] {
+            PassPlan::Geometry { ranges, .. } => assert!(ranges.is_empty()),
+            PassPlan::Fullscreen { .. } => panic!("a geometry pass planned as fullscreen"),
+        }
+    }
+
     #[test]
     fn a_chain_signature_covers_everything_the_gpu_objects_depend_on() {
         let surface = pass(PassKind::Geometry, PassTarget::Surface);
@@ -791,7 +933,8 @@ mod tests {
             } => {
                 // The whole queue as one range: nothing is copied.
                 assert_eq!(ranges.len(), 1);
-                assert_eq!(ranges[0], 0..2);
+                assert_eq!(ranges[0].range, 0..2);
+                assert!(!ranges[0].own_pipeline);
                 // No pass pipeline of its own: each instance draws through the
                 // pipeline its material names.
                 assert!(pass_index.is_none());
@@ -807,6 +950,29 @@ mod tests {
             key: u64::from(shader_index) << 48,
             entity_index: 0,
         }
+    }
+
+    /// The runs no pass in the chain claims are exactly the shaders it never
+    /// names, so an assigned material is drawn by whichever pass takes them.
+    #[test]
+    fn unclaimed_ranges_are_the_shaders_no_pass_names() {
+        let queue = vec![
+            item_of_shader(0),
+            item_of_shader(0),
+            item_of_shader(1),
+            item_of_shader(2),
+            item_of_shader(1),
+        ];
+        let claimed: std::collections::HashSet<u8> = [0u8, 1u8].into_iter().collect();
+        assert_eq!(unclaimed_ranges(&queue, &claimed), vec![3..4]);
+        let nothing: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        // Adjacent runs of unclaimed shaders join into one range.
+        assert_eq!(unclaimed_ranges(&queue, &nothing), vec![0..5]);
+        let everything: std::collections::HashSet<u8> = [0u8, 1u8, 2u8].into_iter().collect();
+        assert_eq!(
+            unclaimed_ranges(&queue, &everything),
+            Vec::<Range<u32>>::new()
+        );
     }
 
     #[test]

@@ -44,11 +44,11 @@ pub const MENU_TITLE_COUNT: usize = Menu::ALL.len();
 /// One menu title: the strip's entry, in the order it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Menu {
-    /// The scene document's rows, the asset actions and quitting the editor.
+    /// The scene document's rows, the Preferences tab and quitting the editor.
     File,
-    /// History, the clipboard, entity deletion and the Preferences tab.
+    /// History, the clipboard and entity deletion.
     Edit,
-    /// A new entity.
+    /// A new entity, a new scene and a new asset.
     Create,
     /// The gizmo's tool, space and snapping, the scene grid and the
     /// simulation controls.
@@ -154,6 +154,10 @@ pub enum MenuAction {
     },
     /// Open the create-asset dialog.
     CreateAsset,
+    /// Open the same dialog to create a scene, with the scene type chosen.
+    CreateScene,
+    /// Open the same dialog to write the current world as a scene.
+    SaveSceneAs,
     /// Write the selected asset's missing `.meta` sidecar.
     WriteAssetMeta,
     /// Undo the newest recorded step.
@@ -282,11 +286,9 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
         "editor.paste" => MenuAction::Clipboard(crate::clipboard::ClipboardAction::Paste),
         // The scene document's rows. Open acts on the scene
         // selected in the Assets tab, so it greys out until one is; Save needs
-        // an open scene file, and Save As always has somewhere to write.
-        "editor.scene_new" => MenuAction::Queue {
-            label: "new scene".to_string(),
-            commands: vec![EditorCommand::SceneNew],
-        },
+        // an open scene file, and Save As asks for a name and a folder in the
+        // create dialog, the same window an asset is created in.
+        "editor.scene_new" => MenuAction::CreateScene,
         "editor.scene_open" => match scene_selection(view.selection) {
             Some(path) => MenuAction::Queue {
                 label: format!("open scene {path}"),
@@ -304,12 +306,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
                 commands: vec![EditorCommand::SceneSave],
             }
         }
-        "editor.scene_save_as" => MenuAction::Queue {
-            label: "save scene as".to_string(),
-            commands: vec![EditorCommand::SceneSaveAs {
-                path: view.snapshot.scene_save_path.clone(),
-            }],
-        },
+        "editor.scene_save_as" => MenuAction::SaveSceneAs,
         "editor.asset.create" => MenuAction::CreateAsset,
         "editor.asset_write_meta" => {
             // The toolbar's rule: only a sourced file without a sidecar can
@@ -484,30 +481,30 @@ mod tests {
     }
 
     #[test]
-    fn the_file_menu_offers_the_asset_actions_and_quitting() {
+    fn the_file_menu_offers_the_scene_rows_the_preferences_tab_and_quitting() {
         let commands = commands_fixture();
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let entries = entries(Menu::File, &view_over(&snapshot, &selection, &commands));
-        // Two rules split the rows: New/Open/Save, then Save As with the
-        // asset rows, then Quit.
+        // Three rules split the rows: Open/Save, then Save As with the sidecar
+        // write, then the Preferences tab, then Quit.
         assert_eq!(
             labels(&entries),
             vec![
-                "New Scene",
                 "Open Scene",
                 "Save Scene",
                 "Save Scene As",
-                "Create Asset...",
                 "Write Asset Meta",
+                "Editor preferences",
                 "Quit Editor",
             ]
         );
         // The empty selection is what greys the sidecar write out.
-        assert!(!actions(&entries)[5].1);
-        // One rule before Save Scene As and one above Quit Editor.
-        assert_eq!(separators(&entries), 2);
-        assert!(matches!(entries[3], MenuEntry::Separator));
+        assert!(!actions(&entries)[3].1);
+        assert!(actions(&entries)[4].1, "the preferences tab always opens");
+        assert_eq!(separators(&entries), 3);
+        assert!(matches!(entries[2], MenuEntry::Separator));
+        assert!(matches!(entries[5], MenuEntry::Separator));
         assert!(matches!(entries[7], MenuEntry::Separator));
     }
 
@@ -519,21 +516,12 @@ mod tests {
         let disabled = entries(Menu::Edit, &view_over(&snapshot, &selection, &commands));
         assert_eq!(
             labels(&disabled),
-            vec![
-                "Undo",
-                "Redo",
-                "Copy",
-                "Cut",
-                "Paste",
-                "Delete Entity",
-                "Preferences..."
-            ]
+            vec!["Undo", "Redo", "Copy", "Cut", "Paste", "Delete Entity"]
         );
         let rows = actions(&disabled);
         assert!(!rows[0].1, "no undo history yet");
         assert!(!rows[1].1, "no redo history yet");
         assert!(!rows[5].1, "nothing selected to delete");
-        assert!(rows[6].1, "the preferences tab always opens");
         // Copy and cut need something to carry; paste is always offered,
         // because whether the clipboard holds a payload is the executable's
         // answer.
@@ -574,7 +562,12 @@ mod tests {
         let snapshot = snapshot_fixture();
         let selection = EditorSelection::default();
         let menu = entries(Menu::Create, &view_over(&snapshot, &selection, &commands));
-        assert_eq!(labels(&menu), vec!["New Entity"]);
+        // The entity create, then the two asset rows the person asked to move
+        // here: a scene and a standalone asset.
+        assert_eq!(
+            labels(&menu),
+            vec!["New Entity", "Create Scene", "Create Asset..."]
+        );
         match &menu[0] {
             MenuEntry::Action {
                 action: MenuAction::Queue { label, commands },

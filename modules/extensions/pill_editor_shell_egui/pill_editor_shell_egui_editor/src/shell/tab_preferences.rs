@@ -39,11 +39,21 @@ pub fn preferences_tab(
             let buffer = buffers.entry(field.key.to_string()).or_default();
             // The previews switch is a real checkbox - a boolean row whose
             // state the person can see - written back as the text the
-            // document's parser reads.
+            // document's parser reads. It applies the moment it is ticked: the
+            // tiles on screen start rendering without a Save, while every other
+            // row still waits for one.
             if field.key == pill_editor_core::previews::RENDER_PREVIEWS_KEY {
                 let mut enabled = buffer.trim().eq_ignore_ascii_case("true");
                 if ui.checkbox(&mut enabled, field.label).changed() {
                     *buffer = if enabled { "true" } else { "false" }.to_string();
+                    pending.push(vec![EditorCommand::SetPreferences {
+                        values: vec![(field.key.to_string(), buffer.clone())],
+                    }]);
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        enabled,
+                        "[editor] preference applied"
+                    );
                 }
                 continue;
             }

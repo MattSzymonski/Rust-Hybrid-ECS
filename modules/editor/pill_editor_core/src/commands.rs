@@ -758,15 +758,12 @@ fn builtin_commands() -> Vec<CommandSpec> {
         CommandSpec::new("editor.entity_delete", "Delete Entity")
             .menu(&["Edit", "Delete Entity"])
             .separator(),
-        CommandSpec::new("editor.preferences_open", "Preferences...")
-            .menu(&["Edit", "Preferences..."])
-            .separator(),
-        // The scene document's rows, at the head of File:
-        // what the editor opens and writes. Save As carries no chord for the
-        // same reason the other rows do not - the menu and the palette carry
-        // it - and Open acts on the scene selected in the Assets tab.
-        CommandSpec::new("editor.scene_new", "New Scene")
-            .menu(&["File", "New Scene"])
+        // The scene document's rows: what the editor opens and writes. Save As
+        // carries no chord for the same reason the other rows do not - the menu
+        // and the palette carry it - and Open acts on the scene selected in the
+        // Assets tab.
+        CommandSpec::new("editor.scene_new", "Create Scene")
+            .menu(&["Create", "Create Scene"])
             .bind(Blender, "ctrl+n")
             .bind(Unity, "ctrl+n")
             .bind(Godot, "ctrl+n")
@@ -782,15 +779,20 @@ fn builtin_commands() -> Vec<CommandSpec> {
             .menu(&["File", "Save Scene As"])
             .separator(),
         // The Assets dialogs' buttons. They are registered like
-        // any other command - the button row runs them by id - with no menu
-        // entry of their own: they answer through the dialog they were
-        // pressed on, and invoked without one they warn and do nothing.
+        // any other command - the button row runs them by id - and Create keeps
+        // its menu row beside the entity and scene creates. Rename has no menu
+        // row: it answers through the dialog it was pressed on, and invoked
+        // without one it warns and does nothing.
         CommandSpec::new("editor.asset.create", "Create Asset...")
-            .menu(&["File", "Create Asset..."]),
+            .menu(&["Create", "Create Asset..."]),
         CommandSpec::new("editor.asset.rename", "Rename Asset"),
-        // File's trailing rows: the sidecar write and quitting.
+        // File's trailing rows: the sidecar write, the Preferences tab and
+        // quitting.
         CommandSpec::new("editor.asset_write_meta", "Write Asset Meta")
             .menu(&["File", "Write Asset Meta"]),
+        CommandSpec::new("editor.preferences_open", "Editor preferences")
+            .menu(&["File", "Editor preferences"])
+            .separator(),
         CommandSpec::new("editor.quit", "Quit Editor")
             .menu(&["File", "Quit Editor"])
             .separator(),
@@ -1062,6 +1064,10 @@ pub struct PendingEditorCommands {
     /// executable knows where the project lives and which file manager the OS
     /// has.
     pub reveals: Vec<String>,
+    /// Keys the shell asked the editor to show in the Assets panel, in request
+    /// order. Not commands either: moving a selection changes nothing in the
+    /// world, and only the executable owns the panel's open folder.
+    pub focuses: Vec<String>,
 }
 
 impl PendingEditorCommands {
@@ -1101,6 +1107,17 @@ impl PendingEditorCommands {
     /// Take the reveal requests waiting for the executable's OS half.
     pub fn take_reveals(&mut self) -> Vec<String> {
         std::mem::take(&mut self.reveals)
+    }
+
+    /// Ask the editor to show `key` in the Assets panel: the selection moves to
+    /// the asset and the panel opens the folder that holds it.
+    pub fn focus_asset(&mut self, key: impl Into<String>) {
+        self.focuses.push(key.into());
+    }
+
+    /// Take the focus requests waiting for the executable.
+    pub fn take_focuses(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.focuses)
     }
 
     /// Queue an edit the history should record as one undo step.

@@ -4,12 +4,14 @@
 //!
 //! - `asset_settings_rows` and `asset_settings_row`: the selected asset's
 //!   settings as a recursive row walk.
+//! - `reference_row`: one row per reference field the asset's type declares -
+//!   the same row for a material's shader, its texture slots and a chain's
+//!   pass list, driven by the snapshot's answers rather than by knowing a
+//!   renderer type.
 //! - `settings_commit`: the recorded command one committed settings value
 //!   queues.
-//! - The two shapes a material document needs rows of their own for: a colour
-//!   parameter (`parameters.<slot>.Color`, an array of numbers) drawn as a
-//!   picker, and a texture slot (`textures.<slot>`, a guid) drawn as a
-//!   type-filtered picker with a drop target.
+//! - The colour parameter shape (`parameters.<slot>.Color`, an array of
+//!   numbers) drawn as a swatch.
 //!
 //! # Design
 //!
@@ -17,7 +19,8 @@
 //! whole patched document, so undo and the file's round trip are unchanged
 //! whatever row wrote it. A row that references another asset writes that
 //! asset's **guid**, which is what the file holds: each listing row carries
-//! its own guid for exactly this.
+//! its own guid for exactly this. The first write is what creates a slot the
+//! document does not hold yet.
 //!
 //! The globs below are absolute paths, so a patch crate resolves them too.
 
@@ -25,16 +28,13 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The last segment of a texture asset's registered type name: a slot's
-/// picker filters by it without naming a renderer crate.
-pub const TEXTURE_TYPE_SUFFIX: &str = "Texture";
-
 /// The settings document's rows: objects and arrays nest their children,
 /// every scalar leaf edits - unless `read_only`, when every row reads a module
 /// resource that nothing may write.
 ///
-/// `texture_slots` are the slots the asset's shader declares: each gets a row,
-/// whether or not the document binds it yet.
+/// `references` are the reference fields the asset's type declares: each gets a
+/// picker row, whether or not the document binds it yet, and the document key
+/// behind it is left out of the walk so one field has one row.
 #[allow(clippy::too_many_arguments)]
 pub fn asset_settings_rows(
     ui: &mut egui::Ui,
@@ -45,11 +45,18 @@ pub fn asset_settings_rows(
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
     read_only: bool,
-    texture_slots: &[String],
+    references: &[AssetReferenceField],
 ) {
     match settings {
         JsonValue::Object(entries) => {
             for (key, value) in entries {
+                // A key a reference field owns is drawn by that field's row.
+                if references
+                    .iter()
+                    .any(|field| field.key == *key || field.key.starts_with(&format!("{key}.")))
+                {
+                    continue;
+                }
                 asset_settings_row(
                     ui,
                     asset_path,
@@ -66,29 +73,119 @@ pub fn asset_settings_rows(
             if read_only {
                 return;
             }
-            // A slot the shader declares but the document does not bind is
-            // exactly the one a person wants to fill: without a row there is
-            // no way to pick a texture for it.
-            let bound = entries.get("textures");
-            for slot in texture_slots {
-                if bound.is_some_and(|textures| textures.get(slot.as_str()).is_some()) {
-                    continue;
-                }
-                texture_slot_row(
+            for field in references {
+                reference_row(
                     ui,
                     asset_path,
                     settings,
-                    &format!("textures.{slot}"),
-                    &None,
+                    field,
                     assets,
                     pending,
                     session,
                     overlay_regions,
                 );
             }
+            reference_list_rows(
+                ui,
+                asset_path,
+                settings,
+                references,
+                assets,
+                pending,
+                session,
+                overlay_regions,
+            );
         }
         other => {
             read_only_row(ui, "settings", &other.to_string());
+        }
+    }
+}
+
+/// The list families a reference field set names - `passes[0]`, `passes[1]`, ...
+/// - as one editable list each: an append row, and a row of moves per entry.
+///
+/// A chain's pass list is the first such family; the moves rewrite the whole
+/// array in one recorded step, so undo takes back the move and not the file.
+#[allow(clippy::too_many_arguments)]
+pub fn reference_list_rows(
+    ui: &mut egui::Ui,
+    asset_path: &str,
+    root: &JsonValue,
+    references: &[AssetReferenceField],
+    assets: &[AssetListing],
+    pending: &mut PendingEditorCommands,
+    session: &mut InspectorSession,
+    overlay_regions: &mut Vec<ShellRect>,
+) {
+    let mut families: Vec<(String, String)> = references
+        .iter()
+        .filter_map(|field| {
+            let (family, _) = field.key.split_once('[')?;
+            Some((family.to_owned(), field.target.clone()))
+        })
+        .collect();
+    families.sort();
+    families.dedup();
+    for (family, target) in families {
+        let entries = root
+            .get(&family)
+            .and_then(|list| list.as_array())
+            .cloned()
+            .unwrap_or_default();
+        ui.separator();
+        ui.label(
+            egui::RichText::new(format!("{family} ({})", entries.len())).color(style::text_muted()),
+        );
+        // Appending is the picker row of the entry one past the end: the
+        // inserting patch is what creates it.
+        let append = AssetReferenceField {
+            key: format!("{family}[{}]", entries.len()),
+            target,
+            guid: None,
+            nested: true,
+        };
+        reference_row(
+            ui,
+            asset_path,
+            root,
+            &append,
+            assets,
+            pending,
+            session,
+            overlay_regions,
+        );
+        for (index, _) in entries.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{family}[{index}]")).color(style::text_muted()),
+                );
+                if ui
+                    .add_enabled(index > 0, egui::Button::new("Up").small())
+                    .clicked()
+                {
+                    let mut moved = entries.clone();
+                    moved.swap(index, index - 1);
+                    settings_commit(pending, asset_path, root, &family, JsonValue::Array(moved));
+                }
+                if ui
+                    .add_enabled(index + 1 < entries.len(), egui::Button::new("Down").small())
+                    .clicked()
+                {
+                    let mut moved = entries.clone();
+                    moved.swap(index, index + 1);
+                    settings_commit(pending, asset_path, root, &family, JsonValue::Array(moved));
+                }
+                if ui
+                    .add(egui::Button::new("Remove").small())
+                    .on_hover_text("Drop this entry from the list")
+                    .clicked()
+                {
+                    let mut fewer = entries.clone();
+                    fewer.remove(index);
+                    settings_commit(pending, asset_path, root, &family, JsonValue::Array(fewer));
+                }
+            });
         }
     }
 }
@@ -135,35 +232,6 @@ pub fn asset_settings_row(
             }
             other => read_only_row(ui, &key, &other.to_string()),
         }
-        return;
-    }
-    if key == "shader" || key == "shader.guid" {
-        let reference = reference_guid(value);
-        shader_row(
-            ui,
-            asset_path,
-            root,
-            "shader",
-            &reference,
-            assets,
-            pending,
-            session,
-            overlay_regions,
-        );
-        return;
-    }
-    if let Some(reference) = texture_slot_value(&key, value) {
-        texture_slot_row(
-            ui,
-            asset_path,
-            root,
-            &key,
-            &reference,
-            assets,
-            pending,
-            session,
-            overlay_regions,
-        );
         return;
     }
     if let Some(channels) = colour_parameter(&key, value) {
@@ -282,29 +350,6 @@ pub fn asset_settings_row(
     }
 }
 
-/// The reference a texture slot holds, when `key` names one: the key is
-/// `textures.<slot>` (or its `.guid` leaf) and the value is a guid string, a
-/// nested object's `guid`, or `null` for an empty slot.
-///
-/// `Some(None)` is an empty slot; `None` is not a texture slot at all.
-pub fn texture_slot_value(key: &str, value: &JsonValue) -> Option<Option<String>> {
-    let leaf = key.strip_suffix(".guid").unwrap_or(key);
-    let slot = leaf.strip_prefix("textures.")?;
-    if slot.is_empty() {
-        return None;
-    }
-    match value {
-        JsonValue::Null => Some(None),
-        JsonValue::String(guid) => Some(Some(guid.clone())),
-        JsonValue::Object(entries) => match entries.get("guid") {
-            Some(JsonValue::Null) | None => Some(None),
-            Some(JsonValue::String(guid)) => Some(Some(guid.clone())),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// The channel values of a colour parameter, when `key` names one: a `Color`
 /// leaf holding three or four numbers (the material document's
 /// `parameters.<slot>.Color`).
@@ -360,151 +405,6 @@ pub fn colour_parameter_row(
     });
 }
 
-/// One texture slot: the referenced texture's name (or its guid, when the
-/// listing no longer holds it), a clear button, a drop target and a
-/// type-filtered picker that opens under the row.
-///
-/// Every choice writes the chosen asset's guid, which is what the file holds.
-#[allow(clippy::too_many_arguments)]
-pub fn texture_slot_row(
-    ui: &mut egui::Ui,
-    asset_path: &str,
-    root: &JsonValue,
-    key: &str,
-    reference: &Option<String>,
-    assets: &[AssetListing],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
-) {
-    let texture_key = key.strip_suffix(".guid").unwrap_or(key);
-    let texture_path = reference
-        .as_deref()
-        .and_then(|guid| assets.iter().find(|row| row.guid.as_deref() == Some(guid)))
-        .map(|row| row.path.clone());
-    let text = match (&texture_path, reference) {
-        (Some(path), _) => path.clone(),
-        (None, Some(guid)) => format!("{}…", guid.chars().take(8).collect::<String>()),
-        (None, None) => "(none)".to_string(),
-    };
-    let slot = texture_key
-        .strip_prefix("textures.")
-        .unwrap_or(texture_key)
-        .to_string();
-    // `Some(Some(guid))` points the slot at a texture, `Some(None)` clears it;
-    // collected while drawing and queued once afterwards.
-    let mut chosen: Option<Option<String>> = None;
-    let mut button_rect = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(slot.as_str()).color(style::text_muted()));
-        let response = ui.add_sized(
-            egui::vec2(
-                (ui.available_width() - inspector_fields::ASSET_ROW_CLEAR_WIDTH).max(60.0),
-                18.0,
-            ),
-            egui::Button::new(icons::rich(icons::Icon::Image, &text)).truncate(),
-        );
-        if response.dnd_hover_payload::<String>().is_some() {
-            ui.painter().rect_stroke(
-                response.rect,
-                2.0,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        if let Some(path) = response.dnd_release_payload::<String>() {
-            chosen = texture_guid_for(assets, &path).map(Some);
-        }
-        if response.clicked() {
-            session.settings_picker = match session.settings_picker.as_deref() {
-                Some(open) if open == texture_key => None,
-                _ => Some(texture_key.to_string()),
-            };
-            session.settings_search.clear();
-            pill_core::info!(
-                target: pill_core::telemetry::telemetry_target::ENGINE,
-                slot = slot.as_str(),
-                "[editor] settings texture picker"
-            );
-        }
-        button_rect = Some(response.rect);
-        if ui
-            .add_enabled(reference.is_some(), egui::Button::new("x").small())
-            .on_hover_text("Clear the texture")
-            .clicked()
-        {
-            chosen = Some(None);
-        }
-    });
-
-    if session.settings_picker.as_deref() == Some(texture_key) {
-        if let Some(rect) = button_rect {
-            let picker_id = egui::Id::new((
-                "pill_editor_shell_egui.settings_picker",
-                texture_key.to_string(),
-            ));
-            floating_popup(
-                ui,
-                picker_id,
-                rect,
-                rect.width().max(180.0),
-                overlay_regions,
-                &mut |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut session.settings_search)
-                            .hint_text("Search textures")
-                            .desired_width(f32::INFINITY),
-                    );
-                    let search = session.settings_search.to_lowercase();
-                    egui::ScrollArea::vertical()
-                        .max_height(inspector_fields::ASSET_PICKER_HEIGHT)
-                        .show(ui, |ui| {
-                            if ui.selectable_label(reference.is_none(), "None").clicked() {
-                                chosen = Some(None);
-                            }
-                            for candidate in texture_candidates(assets)
-                                .into_iter()
-                                .filter(|candidate| candidate.path.to_lowercase().contains(&search))
-                            {
-                                let current =
-                                    texture_path.as_deref() == Some(candidate.path.as_str());
-                                if ui.selectable_label(current, &candidate.path).clicked() {
-                                    chosen = candidate.guid.clone().map(Some);
-                                }
-                            }
-                        });
-                },
-            );
-        }
-    }
-
-    if let Some(reference) = chosen {
-        session.settings_picker = None;
-        let value = match reference {
-            Some(guid) => JsonValue::String(guid),
-            None => JsonValue::Null,
-        };
-        settings_commit(pending, asset_path, root, texture_key, value);
-    }
-}
-
-/// The listing rows a texture slot's picker offers: the files whose type is a
-/// texture, in listing order.
-pub fn texture_candidates(assets: &[AssetListing]) -> Vec<&AssetListing> {
-    assets
-        .iter()
-        .filter(|row| {
-            row.kind
-                .rsplit("::")
-                .next()
-                .is_some_and(|name| name == TEXTURE_TYPE_SUFFIX)
-        })
-        .collect()
-}
-
-/// The last segment of a shader asset's registered type name.
-pub const SHADER_TYPE_SUFFIX: &str = "Shader";
-
 /// The guid a settings reference holds, in either spelling: the value itself
 /// when the document writes a bare guid, or the object form's `guid`.
 pub fn reference_guid(value: &JsonValue) -> Option<String> {
@@ -518,50 +418,58 @@ pub fn reference_guid(value: &JsonValue) -> Option<String> {
     }
 }
 
-/// The listing rows a shader reference's picker offers, in listing order.
-pub fn shader_candidates(assets: &[AssetListing]) -> Vec<&AssetListing> {
+/// The listing rows a reference's picker offers: the assets whose type is the
+/// one the registry named for the field.
+///
+/// The comparison is on the type name's last segment, so a module's spelling of
+/// a type and the renderer's agree however each was registered.
+pub fn reference_candidates<'a>(assets: &'a [AssetListing], target: &str) -> Vec<&'a AssetListing> {
+    let target = target.rsplit("::").next().unwrap_or(target);
     assets
         .iter()
-        .filter(|row| {
-            row.kind
-                .rsplit("::")
-                .next()
-                .is_some_and(|name| name == SHADER_TYPE_SUFFIX)
-        })
+        .filter(|row| row.kind.rsplit("::").next() == Some(target))
         .collect()
 }
 
-/// One shader reference: the shader's path (or its guid when the listing no
-/// longer holds it), a clear button, a drop target and a picker over the
-/// shaders the listing names.
+/// One reference field: the referenced asset's path (or its guid, when the
+/// listing no longer holds it), a clear button, a drop target and a picker over
+/// the rows of the type the field accepts.
 ///
-/// Every choice writes the reference's object form, which is what a saved
-/// `.material` holds.
+/// Every choice writes the chosen asset's guid in the shape the document
+/// already uses - the object form for a named reference, the bare string for a
+/// texture slot - and a field the document does not hold yet writes the object
+/// form. The same row serves a material's shader, its declared slots and a
+/// chain's pass list, because what differs between them is data.
 #[allow(clippy::too_many_arguments)]
-pub fn shader_row(
+pub fn reference_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
-    key: &str,
-    reference: &Option<String>,
+    field: &AssetReferenceField,
     assets: &[AssetListing],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
     overlay_regions: &mut Vec<ShellRect>,
 ) {
-    let shader_path = reference
+    let key = field.key.as_str();
+    let label = key
+        .split_once('.')
+        .map(|(_, leaf)| leaf.to_owned())
+        .unwrap_or_else(|| key.to_owned());
+    let current_path = field
+        .guid
         .as_deref()
         .and_then(|guid| assets.iter().find(|row| row.guid.as_deref() == Some(guid)))
         .map(|row| row.path.clone());
-    let text = match (&shader_path, reference) {
+    let text = match (&current_path, field.guid.as_deref()) {
         (Some(path), _) => path.clone(),
-        (None, Some(guid)) => format!("{}…", guid.chars().take(8).collect::<String>()),
+        (None, Some(guid)) => format!("{}...", guid.chars().take(8).collect::<String>()),
         (None, None) => "(none)".to_string(),
     };
     let mut chosen: Option<Option<String>> = None;
     let mut button_rect = None;
     ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("shader").color(style::text_muted()));
+        ui.label(egui::RichText::new(&label).color(style::text_muted()));
         let response = ui.add_sized(
             egui::vec2(
                 (ui.available_width() - inspector_fields::ASSET_ROW_CLEAR_WIDTH).max(60.0),
@@ -582,13 +490,14 @@ pub fn shader_row(
             pill_core::info!(
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 slot = key,
-                "[editor] settings shader picker"
+                target = field.target.as_str(),
+                "[editor] settings reference picker"
             );
         }
         button_rect = Some(response.rect);
         if ui
-            .add_enabled(reference.is_some(), egui::Button::new("x").small())
-            .on_hover_text("Clear the shader")
+            .add_enabled(field.guid.is_some(), egui::Button::new("x").small())
+            .on_hover_text("Clear the reference")
             .clicked()
         {
             chosen = Some(None);
@@ -598,8 +507,8 @@ pub fn shader_row(
     if session.settings_picker.as_deref() == Some(key) {
         if let Some(rect) = button_rect {
             let picker_id =
-                egui::Id::new(("pill_editor_shell_egui.shader_picker", key.to_string()));
-            floating_popup(
+                egui::Id::new(("pill_editor_shell_egui.reference_picker", key.to_string()));
+            let area = floating_popup(
                 ui,
                 picker_id,
                 rect,
@@ -609,23 +518,62 @@ pub fn shader_row(
                     egui::ScrollArea::vertical()
                         .max_height(inspector_fields::ASSET_PICKER_HEIGHT)
                         .show(ui, |ui| {
-                            for candidate in shader_candidates(assets) {
+                            if ui.selectable_label(field.guid.is_none(), "None").clicked() {
+                                chosen = Some(None);
+                            }
+                            for candidate in reference_candidates(assets, &field.target) {
                                 let current =
-                                    shader_path.as_deref() == Some(candidate.path.as_str());
-                                if ui.selectable_label(current, &candidate.path).clicked() {
-                                    chosen = candidate.guid.clone().map(Some);
-                                }
+                                    current_path.as_deref() == Some(candidate.path.as_str());
+                                ui.horizontal(|ui| {
+                                    let response = ui.selectable_label(current, &candidate.path);
+                                    if response.clicked() {
+                                        chosen = candidate.guid.clone().map(Some);
+                                    }
+                                    // The focus affordance: a single click shows the
+                                    // candidate in the Assets panel - the selection
+                                    // moves and its folder opens - while the picker
+                                    // stays open, so browsing does not throw the edit
+                                    // away; a double click also makes it the
+                                    // Inspector's subject and closes the picker.
+                                    let focus = ui
+                                        .small_button("o")
+                                        .on_hover_text("Show this asset in the Assets panel");
+                                    if focus.double_clicked() {
+                                        pending.focus_asset(candidate.key());
+                                        session.settings_picker = None;
+                                        pill_core::info!(
+                                            target: pill_core::telemetry::telemetry_target::ENGINE,
+                                            path = candidate.path.as_str(),
+                                            "[editor] asset focused"
+                                        );
+                                    } else if focus.clicked() {
+                                        pending.focus_asset(candidate.key());
+                                    }
+                                });
                             }
                         });
                 },
             );
+            // Any press outside the picker and its button closes it, whatever
+            // button it was: a picker that only closes by picking fights the
+            // person who changed their mind. The press that opens the picker is
+            // on the button, so it never closes what it just opened.
+            let press =
+                ui.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
+            if let (true, Some(at)) = press {
+                let on_button = rect.contains(at);
+                if !on_button && !area.response.rect.contains(at) {
+                    session.settings_picker = None;
+                }
+            }
         }
     }
 
     if let Some(reference) = chosen {
         session.settings_picker = None;
         let value = match reference {
-            Some(guid) => serde_json::json!({ "guid": guid }),
+            Some(guid) if field.nested => serde_json::json!({ "guid": guid }),
+            Some(guid) => JsonValue::String(guid),
             None => JsonValue::Null,
         };
         settings_commit(pending, asset_path, root, key, value);
@@ -657,7 +605,10 @@ pub fn settings_commit(
         return;
     };
     let mut document = root.clone();
-    if let Err(message) = inspector::patch_settings(&mut document, &path, value) {
+    // The inserting rule: a slot or a reference the type declares but the file
+    // does not hold yet is created by its first write, which is exactly the
+    // unbound-texture case.
+    if let Err(message) = inspector::patch_settings_inserting(&mut document, &path, value) {
         pill_core::warn!(
             target: pill_core::telemetry::telemetry_target::ECS,
             key,
@@ -705,10 +656,10 @@ mod tests {
         assert_eq!(reference_guid(&serde_json::Value::Null), None);
     }
 
-    /// A shader reference's picker offers shaders, and a texture slot's picker
-    /// offers textures: neither lists the other's rows.
+    /// A picker offers the type its field accepts, and nothing else: the same
+    /// filter serves a shader reference, a texture slot and a pass entry.
     #[test]
-    fn the_pickers_offer_their_own_kind() {
+    fn a_reference_lists_the_type_its_field_accepts() {
         let assets = vec![
             row(
                 "materials/a.material",
@@ -725,16 +676,23 @@ mod tests {
                 "pill_master_renderer::assets::Texture",
                 Some("t"),
             ),
+            row(
+                "passes/opaque.render_pass",
+                "pill_master_renderer::assets::RenderPass",
+                Some("p"),
+            ),
         ];
-        let shaders: Vec<&str> = shader_candidates(&assets)
-            .iter()
-            .map(|row| row.path.as_str())
-            .collect();
-        assert_eq!(shaders, vec!["shaders/pbr.hlsl"]);
-        let textures: Vec<&str> = texture_candidates(&assets)
-            .iter()
-            .map(|row| row.path.as_str())
-            .collect();
-        assert_eq!(textures, vec!["textures/rock.png"]);
+        let shaders = |target: &str| -> Vec<String> {
+            reference_candidates(&assets, target)
+                .iter()
+                .map(|row| row.path.clone())
+                .collect()
+        };
+        assert_eq!(
+            shaders("pill_master_renderer::assets::Shader"),
+            vec!["shaders/pbr.hlsl"]
+        );
+        assert_eq!(shaders("Texture"), vec!["textures/rock.png"]);
+        assert_eq!(shaders("RenderPass"), vec!["passes/opaque.render_pass"]);
     }
 }

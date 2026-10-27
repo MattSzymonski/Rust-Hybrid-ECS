@@ -51,6 +51,11 @@ pub enum AssetDialog {
         type_name: String,
         /// The typed name; the type's naming rules add the extension.
         name: String,
+        /// What confirming writes.
+        kind: CreateKind,
+        /// Set once the person confirmed an existing name: `Some(true)` keeps
+        /// that file's guid, `Some(false)` writes a fresh one.
+        overwrite: Option<bool>,
     },
     /// The rename dialog: the path being renamed and the typed new name.
     Rename {
@@ -59,6 +64,17 @@ pub enum AssetDialog {
         /// The typed new name; the file keeps its extension.
         name: String,
     },
+}
+
+/// What a create dialog writes when it is confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKind {
+    /// A standalone asset's default document.
+    Asset,
+    /// An empty scene: the world is cleared and its empty document written.
+    EmptyScene,
+    /// The current world, written as a new scene (Save Scene As).
+    SaveWorld,
 }
 
 /// The selected asset's row, when the selection names one the snapshot
@@ -130,6 +146,8 @@ pub fn open_create(
         folder: folder.clone(),
         type_name,
         name: String::new(),
+        kind: CreateKind::Asset,
+        overwrite: None,
     });
     pill_core::info!(
         target: telemetry_target::ECS,
@@ -137,6 +155,84 @@ pub fn open_create(
         folder = folder.as_str(),
         "[editor] asset dialog opened"
     );
+}
+
+/// Open the create dialog for a scene: the same window a material or a pass is
+/// created in, with the scene type chosen and the folder following the
+/// selection.
+///
+/// `kind` says what confirming writes - an empty scene (the Create menu's row)
+/// or the current world (Save Scene As) - and nothing touches the world until
+/// the step runs, so cancelling leaves the open scene as it was.
+pub fn open_create_scene(
+    dialog: &mut Option<AssetDialog>,
+    selection: &EditorSelection,
+    assets: &[AssetListing],
+    types: &[StandaloneTypeInfo],
+    kind: CreateKind,
+) {
+    let Some(scene_type) = types
+        .iter()
+        .find(|info| info.extension.eq_ignore_ascii_case("scene"))
+    else {
+        pill_core::warn!(
+            target: telemetry_target::ECS,
+            "[editor] no scene type is registered"
+        );
+        return;
+    };
+    open_create(dialog, selection, assets, types);
+    if let Some(AssetDialog::Create {
+        type_name,
+        kind: chosen,
+        ..
+    }) = dialog.as_mut()
+    {
+        *type_name = scene_type.type_name.clone();
+        *chosen = kind;
+    }
+    pill_core::info!(
+        target: telemetry_target::ECS,
+        dialog = "create scene",
+        "[editor] asset dialog opened"
+    );
+}
+
+/// The path a create would write, when the name already exists: the dialog
+/// asks before it replaces anything.
+///
+/// `None` when the type or name is incomplete, or when nothing is in the way.
+pub fn create_collision(
+    dialog: &AssetDialog,
+    types: &[StandaloneTypeInfo],
+    assets: &[AssetListing],
+) -> Option<String> {
+    let AssetDialog::Create {
+        folder,
+        type_name,
+        name,
+        ..
+    } = dialog
+    else {
+        return None;
+    };
+    if name.trim().is_empty() {
+        return None;
+    }
+    let extension = types
+        .iter()
+        .find(|info| info.type_name == *type_name)
+        .map(|info| info.extension.clone())?;
+    let file = pill_engine::asset_metadata::standalone_file_name(name, &extension).ok()?;
+    let path = if folder.is_empty() {
+        file
+    } else {
+        format!("{folder}/{file}")
+    };
+    assets
+        .iter()
+        .any(|row| row.path == path && row.root.is_empty())
+        .then_some(path)
 }
 
 /// Open the rename dialog for the selected file; the name field arrives
@@ -167,8 +263,13 @@ pub fn open_rename(
     );
 }
 
-/// The create dialog's Create button: queue the recorded create command and
-/// close the dialog; a missing type or name warns and keeps it open.
+/// The create dialog's Create button: queue the recorded step and close the
+/// dialog; a missing type or name warns and keeps it open.
+///
+/// What the step is depends on what the dialog was opened for: a standalone
+/// asset's default document, an empty scene, or the current world saved as a
+/// scene. A scene step only touches the world once it runs, so cancelling the
+/// dialog leaves the current scene exactly as it was.
 pub fn submit_create(
     dialog: &mut Option<AssetDialog>,
     pending: &mut PendingEditorCommands,
@@ -177,6 +278,8 @@ pub fn submit_create(
         folder,
         type_name,
         name,
+        kind,
+        overwrite,
     }) = dialog.as_ref()
     else {
         pill_core::warn!(
@@ -195,15 +298,34 @@ pub fn submit_create(
     let folder = folder.clone();
     let type_name = type_name.clone();
     let name = name.clone();
-    pending.push_recorded(
-        vec![EditorCommand::CreateStandaloneAsset {
-            type_name: type_name.clone(),
-            folder,
-            name: name.clone(),
-        }],
-        format!("create asset {name}"),
-        None,
-    );
+    let kind = *kind;
+    let overwrite = *overwrite;
+    if kind == CreateKind::Asset {
+        pending.push_recorded(
+            vec![EditorCommand::CreateStandaloneAsset {
+                type_name: type_name.clone(),
+                folder,
+                name: name.clone(),
+                overwrite,
+            }],
+            format!("create asset {name}"),
+            None,
+        );
+    } else {
+        let path = scene_path(&folder, &name);
+        let (commands, label) = match kind {
+            CreateKind::EmptyScene => (
+                vec![EditorCommand::SceneNew, EditorCommand::SceneSaveAs { path }],
+                format!("create scene {name}"),
+            ),
+            CreateKind::SaveWorld => (
+                vec![EditorCommand::SceneSaveAs { path }],
+                format!("save scene as {name}"),
+            ),
+            CreateKind::Asset => unreachable!("handled above"),
+        };
+        pending.push_recorded(commands, label, None);
+    }
     pill_core::info!(
         target: telemetry_target::ECS,
         type_name = type_name.as_str(),
@@ -212,6 +334,17 @@ pub fn submit_create(
     );
     close(dialog, "create");
     true
+}
+
+/// The path a scene create writes: the dialog's folder and the typed name with
+/// the scene extension.
+fn scene_path(folder: &str, name: &str) -> String {
+    let file = crate::scene_workflow::scene_file_name(name);
+    if folder.is_empty() {
+        file
+    } else {
+        format!("{folder}/{file}")
+    }
 }
 
 /// The rename dialog's Rename button: build the new path from the typed
@@ -424,6 +557,59 @@ pub fn drop_destination(from: &str, folder: &str) -> Option<String> {
     (to != from).then_some(to)
 }
 
+/// The absolute path a reveal opens, for a key that may name an extension's
+/// resource.
+///
+/// A key under the extensions root (`extensions/<module>/<path>`) resolves
+/// below that module's own directory, because a module's resources do not live
+/// under the project's asset directory at all; every other key resolves the way
+/// [`reveal_target`] does. An unknown module is a refusal that names it, since
+/// a row for a module that has since unloaded must not open some other tree.
+///
+/// # Errors
+///
+/// A message naming the refusal, which the executable logs instead of opening
+/// anything.
+pub fn reveal_target_in(
+    asset_root: &Path,
+    module_roots: &[(String, PathBuf)],
+    path: &str,
+) -> Result<PathBuf, String> {
+    let relative = path.trim().replace('\\', "/");
+    let extensions_prefix = format!("{}/", crate::editor_state::EXTENSIONS_ROOT);
+    let Some(rest) = relative.strip_prefix(extensions_prefix.as_str()) else {
+        return reveal_target(asset_root, path);
+    };
+    let (module, below) = rest.split_once('/').unwrap_or((rest, ""));
+    // A module may declare several roots (its `res`, its shader sources, the
+    // images it ships); the listing merges them under the module's name, so a
+    // reveal looks for the one root that actually holds the file.
+    let directories: Vec<&PathBuf> = module_roots
+        .iter()
+        .filter(|(name, _)| name == module)
+        .map(|(_, directory)| directory)
+        .collect();
+    if directories.is_empty() {
+        return Err(format!("`{path}` names no loaded extension"));
+    }
+    if below.starts_with('/') || Path::new(below).is_absolute() {
+        return Err(format!("`{path}` is not a path below the extension's root"));
+    }
+    if below.split('/').any(|segment| segment == "..") {
+        return Err(format!("`{path}` climbs out of the extension's root"));
+    }
+    if below.is_empty() {
+        return Ok(directories[0].clone());
+    }
+    for directory in directories {
+        let target = directory.join(below);
+        if target.exists() {
+            return Ok(target);
+        }
+    }
+    Err(format!("`{path}` is not on disk"))
+}
+
 /// The absolute path a reveal opens, for a project-relative asset path.
 ///
 /// The empty path is the asset root itself - the Assets panel's open folder at
@@ -509,6 +695,51 @@ mod tests {
         assert!(reveal_target(&root, "/etc").is_err());
         assert!(reveal_target(&root, "models/missing.obj").is_err());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A reveal of an extension's resource resolves below the module root that
+    /// holds it - a module may declare several - and an unloaded module is
+    /// refused by name.
+    #[test]
+    fn an_extension_reveal_resolves_below_its_module_root() {
+        let project = scratch_folder("project");
+        let first = scratch_folder("extension_res");
+        let second = scratch_folder("extension_sources");
+        std::fs::create_dir_all(second.join("shaders")).unwrap();
+        std::fs::write(second.join("shaders/a.hlsl"), b"// shader").unwrap();
+        let roots = vec![
+            ("pill_demo".to_string(), first.clone()),
+            ("pill_demo".to_string(), second.clone()),
+        ];
+
+        // The second root of the module is the one that holds the shader.
+        assert_eq!(
+            reveal_target_in(&project, &roots, "extensions/pill_demo/shaders/a.hlsl").unwrap(),
+            second.join("shaders/a.hlsl")
+        );
+        // A file below the first root resolves there instead.
+        assert_eq!(
+            reveal_target_in(&project, &roots, "extensions/pill_demo/models/cube.obj").unwrap(),
+            first.join("models/cube.obj")
+        );
+        // The module's own row opens its first root.
+        assert_eq!(
+            reveal_target_in(&project, &roots, "extensions/pill_demo").unwrap(),
+            first
+        );
+        // A project path still resolves below the project's asset directory.
+        assert_eq!(
+            reveal_target_in(&project, &roots, "models/cube.obj").unwrap(),
+            project.join("models/cube.obj")
+        );
+        // An unloaded module, an escape and a missing file are refusals.
+        let unloaded = reveal_target_in(&project, &roots, "extensions/pill_gone/a.hlsl");
+        assert!(unloaded.is_err());
+        assert!(reveal_target_in(&project, &roots, "extensions/pill_demo/../../outside").is_err());
+        assert!(reveal_target_in(&project, &roots, "extensions/pill_demo/missing.hlsl").is_err());
+        std::fs::remove_dir_all(&project).ok();
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&second).ok();
     }
 
     fn listing(path: &str, kind: &str, standalone: bool, has_meta: bool) -> AssetListing {
@@ -629,6 +860,8 @@ mod tests {
                 folder: String::new(),
                 type_name: "pill_master_renderer::Material".to_string(),
                 name: String::new(),
+                kind: CreateKind::Asset,
+                overwrite: None,
             })
         );
         // A selected folder is the target.
@@ -653,6 +886,8 @@ mod tests {
             folder: "textures".to_string(),
             type_name: "pill_master_renderer::Material".to_string(),
             name: "rock".to_string(),
+            kind: CreateKind::Asset,
+            overwrite: None,
         });
         let mut pending = PendingEditorCommands::default();
         assert!(submit_create(&mut dialog, &mut pending));
@@ -666,6 +901,49 @@ mod tests {
                 type_name: "pill_master_renderer::Material".to_string(),
                 folder: "textures".to_string(),
                 name: "rock".to_string(),
+                overwrite: None,
+            }]
+        );
+    }
+
+    /// A scene create is one recorded step that clears the world and writes it,
+    /// and a save-as writes the world where the dialog said.
+    #[test]
+    fn submitting_a_scene_create_writes_the_chosen_path() {
+        let mut dialog = Some(AssetDialog::Create {
+            folder: "scenes".to_string(),
+            type_name: "pill_engine::Scene".to_string(),
+            name: "level two".to_string(),
+            kind: CreateKind::EmptyScene,
+            overwrite: None,
+        });
+        let mut pending = PendingEditorCommands::default();
+        assert!(submit_create(&mut dialog, &mut pending));
+        let batch = &batches(&pending)[0];
+        assert_eq!(batch.label, "create scene level two");
+        assert_eq!(
+            batch.commands,
+            vec![
+                EditorCommand::SceneNew,
+                EditorCommand::SceneSaveAs {
+                    path: "scenes/level two.scene".to_string()
+                },
+            ]
+        );
+
+        let mut dialog = Some(AssetDialog::Create {
+            folder: String::new(),
+            type_name: "pill_engine::Scene".to_string(),
+            name: "copy".to_string(),
+            kind: CreateKind::SaveWorld,
+            overwrite: None,
+        });
+        let mut pending = PendingEditorCommands::default();
+        assert!(submit_create(&mut dialog, &mut pending));
+        assert_eq!(
+            batches(&pending)[0].commands,
+            vec![EditorCommand::SceneSaveAs {
+                path: "copy.scene".to_string()
             }]
         );
     }
@@ -676,6 +954,8 @@ mod tests {
             folder: String::new(),
             type_name: "pill_master_renderer::Material".to_string(),
             name: "   ".to_string(),
+            kind: CreateKind::Asset,
+            overwrite: None,
         });
         let mut pending = PendingEditorCommands::default();
         assert!(!submit_create(&mut dialog, &mut pending));

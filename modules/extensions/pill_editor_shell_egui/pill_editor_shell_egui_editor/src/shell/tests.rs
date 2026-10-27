@@ -628,7 +628,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
             "flip_v": false,
             "waves": [{ "amplitude": 1.0 }],
         })),
-        texture_slots: Vec::new(),
+        references: Vec::new(),
     });
     let mut pending = PendingEditorCommands::default();
     let context = egui::Context::default();

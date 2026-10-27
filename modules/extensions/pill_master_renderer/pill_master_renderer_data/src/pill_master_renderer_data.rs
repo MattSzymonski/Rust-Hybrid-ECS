@@ -112,6 +112,36 @@ pub fn register(engine: &mut Engine) -> u32 {
     engine
         .world_mut()
         .register_standalone_asset::<RenderingPipeline>();
+    // The reference fields these types' documents use, so the editor can draw a
+    // picker without knowing a renderer type: each target is the Rust type the
+    // field holds, so a renamed type moves here with the code. A `.*` key is a
+    // family - every texture slot the material's shader declares, every entry
+    // of a chain's pass list.
+    if let Some(registry) = engine
+        .world_mut()
+        .get_resource_mut::<pill_engine::ImportRegistry>()
+    {
+        registry.declare_references(
+            <Material as pill_engine::StandaloneAsset>::metadata_type_name(),
+            &[
+                (
+                    "shader",
+                    <Shader as pill_engine::ImportedAsset>::metadata_type_name(),
+                ),
+                (
+                    "textures.*",
+                    <Texture as pill_engine::ImportedAsset>::metadata_type_name(),
+                ),
+            ],
+        );
+        registry.declare_references(
+            <RenderingPipeline as pill_engine::StandaloneAsset>::metadata_type_name(),
+            &[(
+                "passes.*",
+                <RenderPass as pill_engine::StandaloneAsset>::metadata_type_name(),
+            )],
+        );
+    }
     // Declare the resources this crate inserts, before inserting them. Once the
     // crate is a loaded module, a reload keeps the existing values and never
     // calls `insert_resource` again, so this declaration is what re-points

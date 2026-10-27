@@ -49,8 +49,8 @@ use pill_editor_core::commands::{
 use pill_editor_core::console::{ConsoleChannel, ConsoleLine, ConsoleState};
 use pill_editor_core::drain::{self, HistoryDirection};
 use pill_editor_core::editor_state::{
-    AssetDetail, AssetListing, EditorCommand, EditorSelection, EditorSnapshot, EntityPickRequest,
-    SelectionClick, StandaloneTypeInfo,
+    AssetDetail, AssetListing, AssetReferenceField, EditorCommand, EditorSelection, EditorSnapshot,
+    EntityPickRequest, SelectionClick, StandaloneTypeInfo,
 };
 use pill_editor_core::egui;
 use pill_editor_core::entities;
@@ -3924,6 +3924,7 @@ impl EditorWindow {
                     folder: if folder == "-" { String::new() } else { folder },
                     name: name.clone(),
                     type_name,
+                    overwrite: None,
                 },
                 format!("create asset {name}"),
             ),
@@ -4265,16 +4266,12 @@ impl EditorWindow {
             );
             return;
         };
-        let Some(current) = inspector::settings_field(&document, &key_path) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                path,
-                key,
-                "[editor] asset settings edit refused"
-            );
-            return;
-        };
-        let value = match inspector::parse_settings_value(value_text, current) {
+        // A leaf the document does not hold yet reads as text: that is the
+        // unbound-slot case, and the picker's value is a guid string.
+        let kind = inspector::settings_field(&document, &key_path)
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(String::new()));
+        let value = match inspector::parse_settings_value(value_text, &kind) {
             Ok(value) => value,
             Err(message) => {
                 warn!(
@@ -4287,7 +4284,8 @@ impl EditorWindow {
             }
         };
         let mut patched = document;
-        if let Err(message) = inspector::patch_settings(&mut patched, &key_path, value) {
+        // The same inserting rule the Inspector's settings rows use.
+        if let Err(message) = inspector::patch_settings_inserting(&mut patched, &key_path, value) {
             warn!(
                 target: telemetry_target::ENGINE,
                 key,
@@ -4296,12 +4294,73 @@ impl EditorWindow {
             );
             return;
         }
+        self.queue_settings_value(path, key, patched);
+    }
+
+    /// Queue the recorded step that writes `patched` over `path`'s settings.
+    fn queue_settings_value(&mut self, path: &str, key: &str, patched: serde_json::Value) {
         let (edit, label) = inspector::settings_edit(path, patched, key);
         let coalesce = inspector::settings_coalesce_key(path, key);
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(vec![edit], label, Some(coalesce));
         }
+    }
+
+    /// Queue the edit a picker row's choice would make: the chosen guid in the
+    /// shape the field's document uses.
+    ///
+    /// The shape is the row's own answer - the object form for a named
+    /// reference, a bare guid for a texture slot - so a scripted pick and a
+    /// click cannot write different documents.
+    fn pick_reference(&mut self, path: &str, key: &str, guid: &str) {
+        let Some(document) = self.read_asset_settings(path) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                path,
+                "[editor] asset settings edit refused"
+            );
+            return;
+        };
+        let kind = self
+            .asset_entries
+            .iter()
+            .find(|row| row.path == path || row.key() == path)
+            .map(|row| row.kind.clone())
+            .unwrap_or_default();
+        let nested = self
+            .asset_reference_fields(&kind, &Some(document.clone()))
+            .into_iter()
+            .find(|field| field.key == key)
+            .map(|field| field.nested)
+            // A slot the shader has not declared yet (its shader reference is
+            // still another one) still writes the texture-slot shape, so the
+            // document does not gain an object a renderer would not read.
+            .unwrap_or_else(|| !key.starts_with("textures."));
+        let value = if nested {
+            serde_json::json!({ "guid": guid })
+        } else {
+            serde_json::Value::String(guid.to_owned())
+        };
+        let Ok(key_path) = inspector::parse_settings_key_path(key) else {
+            warn!(
+                target: telemetry_target::ENGINE,
+                key,
+                "[editor] asset settings edit refused"
+            );
+            return;
+        };
+        let mut patched = document;
+        if let Err(message) = inspector::patch_settings_inserting(&mut patched, &key_path, value) {
+            warn!(
+                target: telemetry_target::ENGINE,
+                key,
+                message = message.as_str(),
+                "[editor] asset settings edit refused"
+            );
+            return;
+        }
+        self.queue_settings_value(path, key, patched);
     }
 
     /// Run one world frame: input, the shell's pass, the overlay draw.
@@ -5162,7 +5221,7 @@ impl EditorWindow {
             } else {
                 self.read_asset_settings(&path)
             };
-            let texture_slots = self.material_texture_slots(&settings);
+            let references = self.asset_reference_fields(&kind, &settings);
             AssetDetail {
                 root,
                 path,
@@ -5170,9 +5229,79 @@ impl EditorWindow {
                 kind,
                 standalone,
                 settings,
-                texture_slots,
+                references,
             }
         });
+    }
+
+    /// The reference fields the asset's type declares, expanded against its
+    /// document: one entry per picker the Inspector draws, with the guid the
+    /// document holds now.
+    ///
+    /// The registry names the fields and the type each points at - `shader`,
+    /// `textures.*`, `passes.*` - and the families are expanded here, because
+    /// only the document knows how many entries a family has: a material's
+    /// texture slots come from the shader beside it, a chain's entries from its
+    /// own list.
+    fn asset_reference_fields(
+        &mut self,
+        kind: &str,
+        settings: &Option<serde_json::Value>,
+    ) -> Vec<AssetReferenceField> {
+        let Some(settings) = settings.as_ref() else {
+            return Vec::new();
+        };
+        let world = self.host.host_mut().engine_mut().world_mut();
+        let Some(registry) = world
+            .get_resource::<pill_engine_core::ImportRegistry>()
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let declared = registry.reference_fields(kind).to_vec();
+        let mut fields = Vec::new();
+        for (key, target) in declared {
+            let Some(family) = key.strip_suffix(".*") else {
+                let value = settings.get(&key);
+                fields.push(AssetReferenceField {
+                    key,
+                    target,
+                    guid: reference_guid(value),
+                    nested: !matches!(value, Some(serde_json::Value::String(_))),
+                });
+                continue;
+            };
+            match family {
+                "textures" => {
+                    for slot in self.shader_texture_slots(&Some(settings.clone())) {
+                        let value = settings.get("textures").and_then(|map| map.get(&slot));
+                        fields.push(AssetReferenceField {
+                            key: format!("textures.{slot}"),
+                            target: target.clone(),
+                            guid: reference_guid(value),
+                            nested: false,
+                        });
+                    }
+                }
+                "passes" => {
+                    let entries = settings
+                        .get(family)
+                        .and_then(|list| list.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    for (index, entry) in entries.iter().enumerate() {
+                        fields.push(AssetReferenceField {
+                            key: format!("passes[{index}]"),
+                            target: target.clone(),
+                            guid: reference_guid(Some(entry)),
+                            nested: true,
+                        });
+                    }
+                }
+                other => debug_assert!(false, "unexpanded reference family `{other}`"),
+            }
+        }
+        fields
     }
 
     /// The texture slots the shader a material document names declares.
@@ -5181,7 +5310,7 @@ impl EditorWindow {
     /// bind group from them, so the Inspector asks the same source. The shader
     /// is found through its guid, which is what the document holds, and its
     /// declarations are read from the `.hlsl.meta` the listing row points at.
-    fn material_texture_slots(&mut self, settings: &Option<serde_json::Value>) -> Vec<String> {
+    fn shader_texture_slots(&mut self, settings: &Option<serde_json::Value>) -> Vec<String> {
         let Some(reference) = settings
             .as_ref()
             .and_then(|document| document.get("shader"))
@@ -5240,10 +5369,46 @@ impl EditorWindow {
     /// which only this side can carry out.
     fn apply_pending_commands(&mut self) {
         self.apply_reveals();
+        self.apply_focuses();
         let now_millis = self.started.elapsed().as_millis() as u64;
         let outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
         if outcome.files_changed {
             self.asset_listing_dirty = true;
+        }
+    }
+
+    /// Show every queued focus request: the selection moves to the asset and
+    /// the Assets panel opens the folder that holds it.
+    ///
+    /// The shell cannot do either - the selection is a world resource and the
+    /// open folder lives in the session it only borrows per pass - so the
+    /// request crosses here and lands in one place, which is also what makes it
+    /// one log line a suite can read.
+    fn apply_focuses(&mut self) {
+        let keys = {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            world
+                .get_resource_mut::<PendingEditorCommands>()
+                .map(|pending| pending.take_focuses())
+                .unwrap_or_default()
+        };
+        for key in keys {
+            let world = self.host.host_mut().engine_mut().world_mut();
+            if let Some(selection) = world.get_resource_mut::<EditorSelection>() {
+                selection.asset = Some(key.clone());
+            }
+            if let Some(state) = world.get_resource_mut::<EguiShellState>() {
+                let folder = key
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_default();
+                state.browser.open(&folder);
+            }
+            info!(
+                target: telemetry_target::ENGINE,
+                path = key.as_str(),
+                "[editor] asset focused in the panel"
+            );
         }
     }
 
@@ -5280,8 +5445,15 @@ impl EditorWindow {
             }
             return;
         };
+        // A module's resources live outside the project's tree, so a key under
+        // the extensions root resolves against that module's own directory.
+        let module_roots: Vec<(String, std::path::PathBuf)> =
+            pill_engine_core::asset_store::module_roots()
+                .into_iter()
+                .map(|root| (root.module, root.directory))
+                .collect();
         for path in paths {
-            match assets::reveal_target(&root, &path) {
+            match assets::reveal_target_in(&root, &module_roots, &path) {
                 Ok(target) => {
                     open_in_file_manager(&target);
                     info!(
@@ -5428,6 +5600,17 @@ impl EditorWindow {
                     state.previews.clear();
                     state.preview_refused.clear();
                 }
+            } else if let Some(state) = self
+                .host
+                .host_mut()
+                .engine_mut()
+                .world_mut()
+                .get_resource_mut::<EguiShellState>()
+            {
+                // Turning previews on asks again for everything a refusal left
+                // behind, so a tile refused while the switch was off does not
+                // stay blank for the session.
+                state.preview_refused.clear();
             }
             info!(
                 target: telemetry_target::ENGINE,
@@ -7527,6 +7710,44 @@ impl EditorWindow {
                 field,
                 value,
             } => self.scripted_panel_field(&component, &field, &value),
+            ScriptedCommand::Reveal(path) => {
+                let world = self.host.host_mut().engine_mut().world_mut();
+                if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+                    pending.reveal(path.clone());
+                }
+                info!(
+                    target: telemetry_target::ENGINE,
+                    path = path.as_str(),
+                    "[editor] reveal queued"
+                );
+            }
+            ScriptedCommand::PickReference {
+                asset,
+                key,
+                candidate,
+            } => {
+                // The choice a picker row makes: the candidate's own guid,
+                // written through the same settings edit the row queues.
+                let guid = self
+                    .asset_entries
+                    .iter()
+                    .find(|row| row.path == candidate || row.key() == candidate)
+                    .and_then(|row| row.guid.clone());
+                match guid {
+                    Some(guid) => {
+                        info!(
+                            target: telemetry_target::ENGINE,
+                            key = key.as_str(),
+                            candidate = candidate.as_str(),
+                            guid = guid.as_str(),
+                            "[editor] reference pick queued"
+                        );
+                        self.pick_reference(&asset, &key, &guid);
+                    }
+                    None => self
+                        .reject_scripted(line, "pick reference needs a candidate carrying a guid"),
+                }
+            }
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
             ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
@@ -9159,6 +9380,18 @@ fn scaled_view_rect(
     (x, y, width, height)
 }
 
+/// The guid a settings reference holds, in either spelling: the value itself
+/// when the document writes a bare guid, or the object form's `guid`.
+fn reference_guid(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(guid) => Some(guid.clone()),
+        other => other
+            .get("guid")
+            .and_then(|guid| guid.as_str())
+            .map(str::to_owned),
+    }
+}
+
 /// Ask the platform's file manager to show `target`: Windows and macOS select
 /// the file beside its siblings, and the FreeDesktop helper opens the folder
 /// that holds it.
@@ -9168,12 +9401,17 @@ fn scaled_view_rect(
 fn open_in_file_manager(target: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let mut command = std::process::Command::new("explorer");
         if target.is_dir() {
             command.arg(target);
         } else {
-            // `explorer` takes the file and its selection switch as one word.
-            command.arg(format!("/select,{}", target.display()));
+            // Explorer parses `/select,<path>` itself and wants the *path*
+            // quoted, not the whole token: a token quoted whole is rejected and
+            // explorer falls back to the default folder. A raw argument is the
+            // only way to put exactly that text on the command line, since
+            // Rust would otherwise quote the token as one word.
+            command.raw_arg(format!("/select,\"{}\"", target.display()));
         }
         let _ = command.spawn();
     }

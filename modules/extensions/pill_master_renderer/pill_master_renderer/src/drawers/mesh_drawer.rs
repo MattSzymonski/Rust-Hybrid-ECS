@@ -121,6 +121,15 @@ impl DrawingContext {
         self.accumulated_instance_range = position..position;
     }
 
+    /// Forget which shader is bound, so the next item rebinds the pipeline even
+    /// when its key is the same as the previous item's.
+    ///
+    /// The queue key is a cache of the bound state, and the pipeline is not part
+    /// of it: a run drawn through another pipeline has to say so once.
+    pub fn forget_bound_shader(&mut self) {
+        self.shader_handle = None;
+    }
+
     /// Binds the pipeline and bind groups the given shader draws through.
     ///
     /// The shader's own pipeline is used unless the pass supplies an override,
@@ -320,7 +329,7 @@ impl MeshDrawer {
         // Rendering data
         camera: &RendererCamera,
         render_queue: &[RenderQueueItem],
-        ranges: &[Range<u32>],
+        ranges: &[crate::pipeline::DrawRange],
         viewport: RenderViewport,
         // Counts the pass's visible coverage and shader invocations, when GPU
         // profiling is on.
@@ -356,12 +365,24 @@ impl MeshDrawer {
         // Key of the last item whose state was checked. It carries across
         // ranges, like the bound state it stands for.
         let mut previous_key: Option<u64> = None;
+        // Which pipeline the last range was drawn through, so a change of
+        // pipeline rebinds even when the item's key is unchanged.
+        let mut own_pipeline: Option<bool> = None;
 
-        for range in ranges {
+        for draw in ranges {
             // A range starts a new run of instance indices: whatever the
             // previous range accumulated is drawn first.
-            current_drawing_context.start_run(&mut render_pass, range.start);
-            let items = &render_queue[range.start as usize..range.end as usize];
+            current_drawing_context.start_run(&mut render_pass, draw.range.start);
+            // The pass's own pipeline cannot draw instances another shader
+            // shades: a run the pass does not own draws through its material's
+            // pipeline, and the shader state has to be rebound for it.
+            if own_pipeline != Some(draw.own_pipeline) {
+                own_pipeline = Some(draw.own_pipeline);
+                current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
+                current_drawing_context.forget_bound_shader();
+            }
+            let pipeline = if draw.own_pipeline { pipeline } else { None };
+            let items = &render_queue[draw.range.start as usize..draw.range.end as usize];
 
             for render_queue_item in items {
                 // The key packs every handle the draw binds, so an item whose

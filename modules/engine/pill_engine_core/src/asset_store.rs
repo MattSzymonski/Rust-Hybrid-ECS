@@ -680,6 +680,37 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
     placed.map_err(write_error)
 }
 
+/// Write `bytes` as `destination`, replacing a file that is already there.
+///
+/// The overwrite counterpart of [`write_new`]: the bytes go to a temporary
+/// sibling first and are renamed over the destination only when complete, so a
+/// crash never leaves a half-written asset and a reader never sees one.
+///
+/// # Errors
+///
+/// [`AssetLoadError::Write`] with the underlying error when the file cannot be
+/// written or moved into place.
+pub fn write_replacing(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
+    let write_error = |source| AssetLoadError::Write {
+        path: destination.to_owned(),
+        source,
+    };
+    let file_name = destination.file_name().ok_or_else(|| {
+        write_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no file name",
+        ))
+    })?;
+    let directory = destination.parent().unwrap_or(Path::new("."));
+    let temporary = directory.join(temporary_name(file_name));
+    std::fs::write(&temporary, bytes).map_err(write_error)?;
+    let renamed = std::fs::rename(&temporary, destination);
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    renamed.map_err(write_error)
+}
+
 /// A sibling name for `file_name` that no other writer in this or another
 /// process picks at the same time.
 fn temporary_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
