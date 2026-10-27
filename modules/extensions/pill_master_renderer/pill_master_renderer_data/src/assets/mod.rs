@@ -37,7 +37,7 @@ pub use render_pass::RenderPassDocument;
 // (`pill_renderer_api::frame`), where a resolved pass is written too;
 // re-exported so `assets::` reaches it beside the types that carry it.
 pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
-pub use rendering_pipeline::RenderingPipeline;
+pub use rendering_pipeline::{RenderingPipeline, RenderingPipelineDocument};
 pub use shader::{parameter_slots_by_name, texture_slots_by_name};
 pub use shader::{
     Shader, ShaderBuilder, ShaderImportSettings, ShaderParameterDeclaration, ShaderParameterSlot,

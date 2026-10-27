@@ -795,6 +795,7 @@ dependencies = [
  "pill_engine",
  "pill_renderer_api",
  "serde",
+ "serde_json",
  "thiserror",
  "tobj",
  "trait_type_map",

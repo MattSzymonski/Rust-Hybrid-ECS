@@ -237,7 +237,11 @@ pub fn install(
         .with_kind(PassKind::Geometry)
         .with_target(PassTarget::Offscreen(HDR_TARGET.to_owned()))
         .with_order(0);
-    let opaque = assets.add_named(OPAQUE_PASS, opaque)?;
+    let opaque = assets.add_named_with_guid(
+        OPAQUE_PASS,
+        pill_engine::AssetGuid::from_name(OPAQUE_PASS),
+        opaque,
+    )?;
 
     // The sky, behind the lit surface and into the same target, so it reads the
     // depth the lit pass left. Off until a project gives it a material.

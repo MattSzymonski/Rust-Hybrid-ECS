@@ -166,7 +166,11 @@ pub fn install(
         // the pixels is the reason a pass declares its own target size.
         .with_target_scale(2)
         .with_order(1);
-    let bloom = assets.add_named(BLOOM_PASS, bloom)?;
+    let bloom = assets.add_named_with_guid(
+        BLOOM_PASS,
+        pill_engine::AssetGuid::from_name(BLOOM_PASS),
+        bloom,
+    )?;
 
     let composite = fullscreen_shader(
         "pill_pbr_bloom_composite",
@@ -189,7 +193,11 @@ pub fn install(
         .with_parameter("bloom", MaterialParameter::Color([0.6, 0.0, 0.0]))
         .with_target(PassTarget::Offscreen(LIT_TARGET.to_owned()))
         .with_order(2);
-    let composite_pass = assets.add_named(COMPOSITE_PASS, composite_pass)?;
+    let composite_pass = assets.add_named_with_guid(
+        COMPOSITE_PASS,
+        pill_engine::AssetGuid::from_name(COMPOSITE_PASS),
+        composite_pass,
+    )?;
 
     // Solved from the art parameters, so an artist sets the look and these follow.
     let contrast = 1.6;
@@ -217,7 +225,11 @@ pub fn install(
         .with_parameter("c", MaterialParameter::Scalar(c))
         .with_target(PassTarget::Offscreen(LDR_TARGET.to_owned()))
         .with_order(3);
-    let tonemap_pass = assets.add_named(TONEMAP_PASS, tonemap_pass)?;
+    let tonemap_pass = assets.add_named_with_guid(
+        TONEMAP_PASS,
+        pill_engine::AssetGuid::from_name(TONEMAP_PASS),
+        tonemap_pass,
+    )?;
 
     // The last stage writes the swapchain, so the chain ends where it has to.
     let lens = fullscreen_shader(
@@ -246,7 +258,11 @@ pub fn install(
         .with_parameter("grain", MaterialParameter::Color([0.06, 1.0, 0.0]))
         .with_target(PassTarget::Surface)
         .with_order(4);
-    let lens_pass = assets.add_named(LENS_PASS, lens_pass)?;
+    let lens_pass = assets.add_named_with_guid(
+        LENS_PASS,
+        pill_engine::AssetGuid::from_name(LENS_PASS),
+        lens_pass,
+    )?;
 
     Ok(vec![bloom, composite_pass, tonemap_pass, lens_pass])
 }

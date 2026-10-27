@@ -13,14 +13,24 @@
 //! renderer when the game hands this asset over through `RenderingManager`,
 //! because that is the side that owns the device.
 //!
+//! It is also a file of its own (`.pipeline`): a chain the editor can create and
+//! a project can load by path, whose body lists the `.render_pass` files in the
+//! order they run.
+//!
 //! Nothing else belongs here. A pass already carries the shader it draws with
 //! and the values it reads, so a pipeline that also listed its shaders and
 //! textures would be saying the same thing twice - and would go stale the moment
 //! a pass was edited. What an installer put in the store is the store's
 //! business: `AssetManager::handle_by_name` is the index for it.
 
-use pill_engine::{pill_mirror_object, Asset, Handle};
+// External crates
+use pill_engine::{
+    pill_mirror_object, Asset, AssetLoadResult, AssetManager, AssetReference, Handle,
+    StandaloneAsset,
+};
+use serde::{Deserialize, Serialize};
 
+// Current crate
 use crate::RenderPass;
 
 /// The passes a frame runs, in the order they were added.
@@ -72,6 +82,41 @@ impl Asset for RenderingPipeline {
     }
 }
 
+/// The pipeline as its file holds it: the passes, in the order they run.
+///
+/// Each entry names a `.render_pass` file by guid, so a chain outlives a pass
+/// being moved or renamed and one pass can appear in several chains.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RenderingPipelineDocument {
+    /// The passes, in the order they run.
+    pub passes: Vec<AssetReference<RenderPass>>,
+}
+
+// The metadata type name defaults to the shared name above, so every binary's
+// copy of `RenderingPipeline` reads the same files.
+impl StandaloneAsset for RenderingPipeline {
+    type Document = RenderingPipelineDocument;
+    const FILE_EXTENSION: &'static str = "pipeline";
+
+    fn from_document(
+        _name: &str,
+        document: RenderingPipelineDocument,
+        assets: &AssetManager,
+    ) -> AssetLoadResult<Self> {
+        // A reference that resolves to nothing stays an invalid handle, exactly
+        // as a material's does: the chain the renderer builds skips a pass it
+        // cannot reach rather than refusing the whole file.
+        Ok(Self {
+            passes: document
+                .passes
+                .iter()
+                .map(|pass| pass.resolve(assets))
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +135,38 @@ mod tests {
     #[test]
     fn an_empty_pipeline_has_no_passes() {
         assert!(RenderingPipeline::new().passes.is_empty());
+    }
+
+    /// A chain's file names its passes by guid, and the document resolves them
+    /// back to the handles the renderer wants, in the order they are listed.
+    #[test]
+    fn a_document_resolves_its_passes_in_order() {
+        let mut assets = AssetManager::new();
+        let first = assets
+            .add_named_with_guid(
+                "first",
+                pill_engine::AssetGuid::from_name("first"),
+                RenderPass::new("first"),
+            )
+            .expect("a free name");
+        let second = assets
+            .add_named_with_guid(
+                "second",
+                pill_engine::AssetGuid::from_name("second"),
+                RenderPass::new("second"),
+            )
+            .expect("a free name");
+
+        let document = RenderingPipelineDocument {
+            passes: vec![
+                AssetReference::from_handle(&assets, second).expect("a guid to name it by"),
+                AssetReference::from_handle(&assets, first).expect("a guid to name it by"),
+            ],
+        };
+        let pipeline =
+            RenderingPipeline::from_document("pipelines/main.pipeline", document, &assets)
+                .expect("the passes resolve");
+
+        assert_eq!(pipeline.passes, vec![second, first]);
     }
 }
