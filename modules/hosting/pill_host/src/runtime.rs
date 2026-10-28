@@ -572,7 +572,7 @@ impl FrameDriver for DevHost {
     fn set_surface_viewport(
         &mut self,
         _id: pill_renderer_api::SurfaceId,
-        _viewport: Option<RenderViewport>,
+        _viewport: Option<pill_renderer_api::RenderViewport>,
     ) {
     }
 
