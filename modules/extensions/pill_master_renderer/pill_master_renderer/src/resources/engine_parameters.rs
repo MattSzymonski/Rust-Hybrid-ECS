@@ -20,9 +20,6 @@
 // External crates
 use wgpu::util::DeviceExt;
 
-// Current crate
-use crate::error::Result;
-
 /// The engine-wide uniform block a pass may read, in its GPU layout.
 ///
 /// Fog and the frame's size and time are frame state rather than pass state,
@@ -131,13 +128,7 @@ impl EngineParameters {
     /// A pipeline that reads engine parameters must be built against
     /// [`bind_group_layout`](EngineParameters::bind_group_layout), which is
     /// what makes this one group bindable by every pass.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error: creating a buffer, a layout, and a bind group
-    /// only records work, and wgpu reports a rejected descriptor through the
-    /// device's error handler.
-    pub fn new(device: &wgpu::Device) -> Result<Self> {
+    pub fn new(device: &wgpu::Device) -> Self {
         let parameters_data = EngineParametersData::new();
 
         let parameters_uniform_buffer =
@@ -170,14 +161,12 @@ impl EngineParameters {
             label: Some("engine_parameters_bind_group"),
         });
 
-        let camera = Self {
+        Self {
             parameters_data,
             parameters_uniform_buffer,
             bind_group_layout,
             bind_group,
-        };
-
-        Ok(camera)
+        }
     }
 
     /// Refills the buffer with a frame's values.

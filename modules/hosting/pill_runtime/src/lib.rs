@@ -52,10 +52,10 @@ mod telemetry;
 /// names this crate alone.
 pub use pill_engine::common_components::TransformComponent;
 pub use pill_renderer_api::{
-    ensure_preview_resources, frame_grid, CameraBinding, CameraComponent, FrameGrid, PickHit,
-    PickRequests, PickResults, PresentPreference, PreviewAsset, PreviewImage, PreviewRequests,
-    PreviewResults, RenderViewport, RendererError, SceneGrid, SelectionOutlines, SurfaceCameras,
-    SurfaceId, SurfaceOptions,
+    editor_view_surfaces, ensure_preview_resources, frame_grid, CameraBinding, CameraComponent,
+    PickHit, PickRequests, PickResults, PresentPreference, PreviewAsset, PreviewImage,
+    PreviewRequests, PreviewResults, RenderViewport, RendererError, SceneGrid, SelectionOutlines,
+    SurfaceCameras, SurfaceId, SurfaceOptions,
 };
 pub use runtime::{
     insert_debug_resources, mount_asset_pack, run_one_frame, set_surface_camera, setup,

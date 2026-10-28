@@ -16,8 +16,10 @@
 //! C# computes for its `RenderingManager` marker, so a managed system declares
 //! `ResMut<RenderingManager>` and calls `Clear()`.
 
+// External crates
 use pill_engine::{pill_mirror_impl, pill_mirror_method, pill_mirror_resource, Handle};
 
+// Current crate
 use crate::RenderingPipeline;
 
 /// The pipeline the renderer runs, as the game declared it.

@@ -32,8 +32,8 @@ use std::f32::consts::PI;
 // External crates
 use glam::Vec3;
 use pill_engine::{
-    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
-    AssetLoadResult, AssetLoader, ImportedAsset, PillMirror,
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
+    AssetLoader, ImportedAsset, PillMirror,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,15 +60,6 @@ pub enum TextureType {
     /// A normal map, whose bytes are directions rather than colours.
     /// Uploaded as linear data, so they reach a shader exactly as stored.
     Normal,
-    /// A depth buffer, sampled by a pass that reconstructs position or measures
-    /// distance.
-    ///
-    /// Not a kind of asset: no file decodes to one, and the renderer refuses a
-    /// texture asset that claims to be one. It exists so a shader can say that a
-    /// slot reads depth, which is what decides the binding wgpu will accept -
-    /// a depth texture cannot be bound where a filterable colour texture is
-    /// expected.
-    Depth,
     /// An equirectangular panorama: longitude across, latitude down, the whole
     /// sphere of directions around a point in one 2:1 image.
     ///
@@ -92,7 +83,7 @@ impl TextureType {
     /// for an environment texture.
     pub fn bytes_per_texel(self) -> usize {
         match self {
-            TextureType::Color | TextureType::Normal | TextureType::Depth => 4,
+            TextureType::Color | TextureType::Normal => 4,
             TextureType::Equirect | TextureType::Cubemap => 8,
         }
     }
@@ -117,7 +108,7 @@ impl TextureType {
 /// texture, view and sampler, and re-uploads them when the asset's version
 /// moves, so a game edits the texture it holds instead of GPU state.
 #[derive(Clone, Debug)]
-#[pill_mirror_object(asset, import)]
+#[pill_mirror_object(asset, import, shared = "pill_master_renderer::assets::Texture")]
 pub struct Texture {
     /// Label used in logs, profiling and error messages.
     pub name: String,
@@ -393,28 +384,6 @@ fn sample_bilinear(panorama: &[f32], width: u32, height: u32, u: f32, v: f32) ->
     result
 }
 
-/// The pinned shared name of [`Texture`]; see the comment on its `Asset` impl.
-const TEXTURE_SHARED_NAME: &str = "pill_master_renderer::assets::Texture";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for Texture {
-    fn shared_name() -> Option<&'static str> {
-        Some(TEXTURE_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 =
-            pill_engine::component::shared_component_identity(TEXTURE_SHARED_NAME);
-        Some(IDENTITY)
-    }
-}
-
 /// How to read an image file as a texture: what its `.meta` file holds.
 ///
 /// Every field is part of the metadata file format, so a rename breaks
@@ -449,16 +418,6 @@ impl ImportedAsset for Texture {
         source_bytes: &[u8],
         settings: &TextureImportSettings,
     ) -> AssetLoadResult<Self> {
-        // The renderer refuses a depth texture asset anyway; refusing it here
-        // names the file whose metadata asked for it.
-        if settings.texture_type == TextureType::Depth {
-            return Err(AssetLoadError::Decode {
-                label: name.to_owned(),
-                detail:
-                    "`Depth` is not a texture asset type; an image file holds color, normal or environment data"
-                        .to_owned(),
-            });
-        }
         Self::decode(name.to_owned(), settings.texture_type, source_bytes)
     }
 }
@@ -536,15 +495,14 @@ mod tests {
         assert_eq!(texture.rgba, [10, 20, 30, 255]);
     }
 
+    /// A `.meta` that asks for a depth buffer fails to load: depth is a slot's
+    /// binding kind, not a texture asset, so no image file can be one.
     #[test]
-    fn import_refuses_depth() {
-        let settings = TextureImportSettings {
-            texture_type: TextureType::Depth,
-        };
-        assert!(matches!(
-            Texture::import("d.png", &one_pixel_png(), &settings),
-            Err(AssetLoadError::Decode { .. })
-        ));
+    fn a_depth_texture_asset_does_not_deserialize() {
+        assert!(
+            serde_json::from_str::<TextureImportSettings>(r#"{"texture_type":"Depth"}"#).is_err(),
+            "`Depth` is not a texture asset type; an image file holds color, normal or environment data"
+        );
     }
 
     /// The on-disk form: the variant name, and the default for a missing field.

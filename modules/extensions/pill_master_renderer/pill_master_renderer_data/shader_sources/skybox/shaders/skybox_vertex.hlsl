@@ -8,6 +8,8 @@
 //
 // Edit here - `pill_assets` regenerates the .wgsl.
 
+#include "common.hlsl"
+
 struct VertexOutput
 {
     float4 position : SV_Position;
@@ -18,13 +20,7 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vs_main(uint vertex_index : SV_VertexID)
 {
-    float2 corner[3] = {
-        float2(-1.0, -3.0),
-        float2( 3.0,  1.0),
-        float2(-1.0,  1.0)
-    };
-
-    float2 position = corner[vertex_index];
+    float2 position = fullscreen_triangle_corner(vertex_index);
 
     VertexOutput output;
     // z = w: depth 1.0, the far plane, behind everything a geometry pass drew.

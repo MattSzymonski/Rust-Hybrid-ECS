@@ -291,7 +291,12 @@ impl ApplicationHandler for WindowedApplication {
             }
             WindowEvent::Resized(size) => {
                 if let Some(host) = &mut self.host {
-                    FrameDriver::resize(host, size.width, size.height);
+                    FrameDriver::resize_surface(
+                        host,
+                        pill_runtime::SurfaceId::PRIMARY,
+                        size.width,
+                        size.height,
+                    );
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),

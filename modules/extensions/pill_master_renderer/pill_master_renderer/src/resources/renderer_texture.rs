@@ -63,9 +63,8 @@ impl RendererTexture {
     /// # Errors
     ///
     /// Returns [`crate::error::RendererError::Other`] naming the asset when the
-    /// bytes do not match the size and type, when `texture_type` is
-    /// [`TextureType::Depth`], or when the driver refuses the texture, the
-    /// upload, or the sampler.
+    /// bytes do not match the size and type, or when the driver refuses the
+    /// texture, the upload, or the sampler.
     pub fn new_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -106,17 +105,6 @@ impl RendererTexture {
             // Half floats: an environment's range runs well past 1.0, and this
             // is the widest float format every backend filters.
             TextureType::Equirect | TextureType::Cubemap => wgpu::TextureFormat::Rgba16Float,
-            // A file has no way to carry depth, so an asset that says it does is
-            // a mistake the caller should hear about rather than a texture with
-            // the wrong channels.
-            TextureType::Depth => {
-                return Err(crate::error::RendererError::Other {
-                    detail: format!(
-                        "texture `{}` is loaded as depth, which only the renderer's own depth buffer can be",
-                        name.unwrap_or("<unnamed>")
-                    ),
-                });
-            }
         };
 
         // Create texture. Scoped: a driver refusal must arrive as a message

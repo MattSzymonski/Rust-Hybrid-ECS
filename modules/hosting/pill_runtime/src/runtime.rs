@@ -73,12 +73,6 @@ pub trait FrameDriver {
     /// windowed driver: the renderer failed).
     fn run_frame(&mut self) -> Result<Option<FrameReport>, Self::Error>;
 
-    /// Forward a physical window resize; nothing to do without a window.
-    fn resize(&mut self, _width: u32, _height: u32) {}
-
-    /// Restrict drawing to a region of the window; nothing to do without one.
-    fn set_render_viewport(&mut self, _viewport: Option<RenderViewport>) {}
-
     /// Queue an input event for the next frame.
     ///
     /// Required rather than defaulted: a driver that forgot to forward input
@@ -116,10 +110,17 @@ pub trait FrameDriver {
     fn detach_surface(&mut self, _id: SurfaceId) {}
 
     /// Forward a physical resize of surface `id`; nothing to do without one.
-    fn resize_surface(&mut self, _id: SurfaceId, _width: u32, _height: u32) {}
+    ///
+    /// Required rather than defaulted: a driver that forgot to forward a
+    /// resize would keep drawing at the old size with nothing in the log to
+    /// say why. A driver without a renderer implements it as a no-op.
+    fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32);
 
     /// Restrict drawing to a region of surface `id`; nothing to do without one.
-    fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
+    ///
+    /// Required for the same reason [`Self::resize_surface`] is. A driver
+    /// without a renderer implements it as a no-op.
+    fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>);
 
     /// Whether surface `id` may present on the next frame (the frontend's
     /// pacing); nothing to do without a renderer.
@@ -365,6 +366,12 @@ impl FrameDriver for Runtime {
     fn run_frame(&mut self) -> Result<Option<FrameReport>, Self::Error> {
         Ok(Runtime::run_frame(self))
     }
+
+    // A headless runtime draws no surface, so a resize and a viewport have
+    // nothing to reach.
+    fn resize_surface(&mut self, _id: SurfaceId, _width: u32, _height: u32) {}
+
+    fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
 
     fn push_input(&mut self, event: InputEvent) {
         self.engine.push_input_event(event);

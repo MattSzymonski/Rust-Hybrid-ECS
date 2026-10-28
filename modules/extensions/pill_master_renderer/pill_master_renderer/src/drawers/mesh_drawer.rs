@@ -21,13 +21,12 @@
 //! or written per pass.
 
 // Standard library
-use std::{num::NonZeroU32, ops::Range};
+use std::ops::Range;
 
 // External crates
 use pill_core::{debug, PillStyle};
 
 // Current crate
-use crate::error::Result;
 use crate::{
     components::RenderViewport,
     config::{
@@ -35,7 +34,7 @@ use crate::{
         MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
     },
     profiler::Profiler,
-    render_queue::{decompose_render_queue_key, RenderQueueItem},
+    render_queue::RenderQueueItem,
     resources::{
         RendererCamera, RendererMaterialHandle, RendererMeshHandle, RendererResourceStorage,
         RendererShader, RendererShaderHandle,
@@ -157,7 +156,7 @@ impl DrawingContext {
         // shader was built with cannot know either.
         render_pass.set_pipeline(pipeline_override.unwrap_or(&shader.render_pipeline));
 
-        if shader.pass_engine_parameters {
+        if shader.reads_engine_parameters {
             render_pass.set_bind_group(
                 ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
                 &renderer_resource_storage.engine_parameters.bind_group,
@@ -166,7 +165,7 @@ impl DrawingContext {
             debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Engine parameters bound");
         }
 
-        if shader.pass_camera_parameters {
+        if shader.reads_camera_parameters {
             render_pass.set_bind_group(
                 CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
                 &camera.bind_group,
@@ -312,10 +311,8 @@ impl MeshDrawer {
     /// buffer and nothing is copied here. Consecutive items that share their
     /// shader, material and mesh become one instanced draw.
     ///
-    /// # Errors
-    ///
-    /// Never returns an error: every step is a wgpu call that reports nothing
-    /// to check; the `Result` keeps the call site uniform with the frame path.
+    /// `pass_pipeline` is the pass's own pipeline, which a run the pass owns
+    /// draws through; a run it does not own draws through its material's.
     #[allow(clippy::too_many_arguments)]
     pub fn record_draw_commands(
         &mut self,
@@ -323,18 +320,18 @@ impl MeshDrawer {
         encoder: &mut wgpu::CommandEncoder,
         renderer_resource_storage: &RendererResourceStorage,
         label: &str,
-        pipeline: Option<&wgpu::RenderPipeline>,
+        pass_pipeline: Option<&wgpu::RenderPipeline>,
         color_attachments: &[Option<wgpu::RenderPassColorAttachment>],
         depth_stencil_attachment: wgpu::RenderPassDepthStencilAttachment,
         // Rendering data
         camera: &RendererCamera,
         render_queue: &[RenderQueueItem],
-        ranges: &[crate::pipeline::DrawRange],
+        ranges: &[crate::chain::DrawRange],
         viewport: RenderViewport,
         // Counts the pass's visible coverage and shader invocations, when GPU
         // profiling is on.
         profiler: Option<&Profiler>,
-    ) -> Result<()> {
+    ) {
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments,
@@ -381,65 +378,51 @@ impl MeshDrawer {
                 current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
                 current_drawing_context.forget_bound_shader();
             }
-            let pipeline = if draw.own_pipeline { pipeline } else { None };
+            let override_pipeline = if draw.own_pipeline {
+                pass_pipeline
+            } else {
+                None
+            };
             let items = &render_queue[draw.range.start as usize..draw.range.end as usize];
 
             for render_queue_item in items {
                 // The key packs every handle the draw binds, so an item whose
-                // key equals the one before it needs nothing rebound: it only
-                // extends the current draw. The queue is sorted by key, so
-                // that is nearly every item, and the key is unpacked only
-                // where the bound state actually changes.
+                // The key orders the queue; the handles the draw binds travel
+                // beside it, so nothing is rebuilt from it here.
                 if previous_key == Some(render_queue_item.key) {
                     current_drawing_context.accumulate_instance();
                     continue;
                 }
                 previous_key = Some(render_queue_item.key);
 
-                let render_queue_key_fields = decompose_render_queue_key(render_queue_item.key);
-
-                // Recreate resource handles
-                let renderer_shader_handle = RendererShaderHandle::new(
-                    render_queue_key_fields.shader_index.into(),
-                    NonZeroU32::new(render_queue_key_fields.shader_version.into()).unwrap(),
-                );
-                let renderer_material_handle = RendererMaterialHandle::new(
-                    render_queue_key_fields.material_index.into(),
-                    NonZeroU32::new(render_queue_key_fields.material_version.into()).unwrap(),
-                );
-                let renderer_mesh_handle = RendererMeshHandle::new(
-                    render_queue_key_fields.mesh_index.into(),
-                    NonZeroU32::new(render_queue_key_fields.mesh_version.into()).unwrap(),
-                );
-
                 // Check for shader change
-                if current_drawing_context.shader_handle != Some(renderer_shader_handle) {
+                if current_drawing_context.shader_handle != Some(render_queue_item.shader) {
                     current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
                     current_drawing_context.change_shader(
                         renderer_resource_storage,
-                        renderer_shader_handle,
-                        pipeline,
+                        render_queue_item.shader,
+                        override_pipeline,
                         &mut render_pass,
                         camera,
                     );
                 }
 
                 // Check for material change
-                if current_drawing_context.material_handle != Some(renderer_material_handle) {
+                if current_drawing_context.material_handle != Some(render_queue_item.material) {
                     current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
                     current_drawing_context.change_material(
                         renderer_resource_storage,
-                        renderer_material_handle,
+                        render_queue_item.material,
                         &mut render_pass,
                     );
                 }
 
                 // Check for mesh change
-                if current_drawing_context.mesh_handle != Some(renderer_mesh_handle) {
+                if current_drawing_context.mesh_handle != Some(render_queue_item.mesh) {
                     current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
                     current_drawing_context.change_mesh(
                         renderer_resource_storage,
-                        renderer_mesh_handle,
+                        render_queue_item.mesh,
                         &mut render_pass,
                     );
                 }
@@ -459,7 +442,5 @@ impl MeshDrawer {
         // Drop render_pass before returning: the borrow of the encoder has to
         // end here, and the caller finishes the encoder.
         drop(render_pass);
-
-        Ok(())
     }
 }

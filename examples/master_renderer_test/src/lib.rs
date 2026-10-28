@@ -189,7 +189,7 @@ mod tests {
             .expect("the material is loaded under its path");
 
         let shader = assets
-            .handle_by_name::<Shader>(pbr_pipeline::SHADER_NAME)
+            .handle_by_name::<Shader>(pbr_pipeline::SHADER_PATH)
             .expect("the chain installed its shader");
         assert_eq!(material.shader, shader);
         assert_eq!(assets.guid_of(shader), Some(pbr_pipeline::SHADER_GUID));

@@ -44,7 +44,7 @@ pub mod frame;
 pub mod instance;
 
 /// The frame's chain as GPU objects: a pass pipeline each, and the plan a frame is recorded from.
-mod pipeline;
+mod chain;
 
 /// The asset preview path: one small off-screen render, read back as pixels.
 mod preview;
@@ -55,10 +55,13 @@ mod overlay;
 /// The query sets and readbacks behind GPU profiling measurements.
 pub mod profiler;
 
-/// Queue items and the packed key fields that order a frame's draws.
+/// Mapping a GPU buffer back to the CPU without stalling a frame.
+mod readback;
+
+/// Queue items: what one instance draws with, in the order a frame draws them.
 pub mod render_queue;
 
-/// The wgpu renderer: device and surface lifecycle, pipelines and submission.
+/// The wgpu renderer: the surfaces, the GPU caches and the frame submission.
 pub mod renderer;
 
 /// The GPU objects behind the asset store, kept level with it one type at a time.

@@ -110,8 +110,6 @@ pub use views::scene_badges;
 pub use views::scene_body_rect;
 pub use views::scene_overlay;
 pub use views::shell_rect;
-pub use views::SCENE_BUTTON_GAP;
-pub use views::SCENE_BUTTON_WIDTH;
 pub use views::SCENE_COUNTER_HEIGHT;
 pub use views::SCENE_COUNTER_MARGIN;
 pub use views::SCENE_COUNTER_WIDTH;

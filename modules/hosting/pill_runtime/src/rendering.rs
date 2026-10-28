@@ -59,7 +59,7 @@ pub struct AttachedRenderer {
     presented_scene: bool,
     /// The draw count last reported in the log, so a frame that changes how
     /// much it draws is reported once rather than every frame.
-    reported_draw_calls: u32,
+    reported_passes_with_draws: u32,
     /// Every surface attached after the primary window, by surface id: the
     /// window kept alive for it, and what re-attaching it to a new backend
     /// takes. Declared after `renderer`, so the backend drops first.
@@ -104,7 +104,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
-            reported_draw_calls: 0,
+            reported_passes_with_draws: 0,
             extra_surfaces: BTreeMap::new(),
         })
     }
@@ -134,7 +134,7 @@ impl AttachedRenderer {
             surface_size: (width, height),
             viewport: None,
             presented_scene: false,
-            reported_draw_calls: 0,
+            reported_passes_with_draws: 0,
             extra_surfaces: BTreeMap::new(),
         })
     }
@@ -196,7 +196,8 @@ impl AttachedRenderer {
         self.window = window;
         self.window_data = window_data;
         self.surface_size = (width, height);
-        self.renderer.set_viewport(self.viewport);
+        self.renderer
+            .set_surface_viewport(SurfaceId::PRIMARY, self.viewport);
         self.reattach_extra_surfaces();
     }
 
@@ -204,7 +205,8 @@ impl AttachedRenderer {
     /// extra surface.
     pub fn replace_backend(&mut self, renderer: Box<dyn PillRenderer>) {
         self.renderer = renderer;
-        self.renderer.set_viewport(self.viewport);
+        self.renderer
+            .set_surface_viewport(SurfaceId::PRIMARY, self.viewport);
         self.reattach_extra_surfaces();
     }
 
@@ -309,7 +311,17 @@ impl AttachedRenderer {
     }
 
     /// Forward a physical resize of surface `id`.
+    ///
+    /// One method serves every surface: the primary keeps its size here, an
+    /// attached surface in its own record, and a caller never has to know
+    /// which form reaches which.
     pub fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
+        if id == SurfaceId::PRIMARY {
+            self.surface_size = (width, height);
+            self.renderer.resize_surface(id, width, height);
+            self.renderer.set_surface_viewport(id, self.viewport);
+            return;
+        }
         if let Some(surface) = self.extra_surfaces.get_mut(&id.0) {
             surface.size = (width, height);
             self.renderer.resize_surface(id, width, height);
@@ -319,6 +331,11 @@ impl AttachedRenderer {
 
     /// Restrict drawing to a region of surface `id`; `None` draws all of it.
     pub fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
+        if id == SurfaceId::PRIMARY {
+            self.viewport = viewport;
+            self.renderer.set_surface_viewport(id, viewport);
+            return;
+        }
         if let Some(surface) = self.extra_surfaces.get_mut(&id.0) {
             surface.viewport = viewport;
             self.renderer.set_surface_viewport(id, viewport);
@@ -370,20 +387,6 @@ impl AttachedRenderer {
         self.viewport
     }
 
-    /// Forward a physical window resize to the backend.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.surface_size = (width, height);
-        self.renderer.resize(width, height);
-        self.renderer.set_viewport(self.viewport);
-    }
-
-    /// Restrict drawing to a physical region of the window; `None` draws the
-    /// whole window.
-    pub fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.viewport = viewport;
-        self.renderer.set_viewport(viewport);
-    }
-
     /// Draw the frame the `rendering` system left in `world`, when it did.
     ///
     /// The renderer reads both resources straight out of the world - the
@@ -403,15 +406,16 @@ impl AttachedRenderer {
         };
         let outcome = self.renderer.render(frame, assets)?;
         let metrics = self.renderer.metrics();
-        // A frame whose draw count moves is worth one line: it is how a chain
-        // that stopped drawing a pass - a material no pass names, a shader
-        // that failed to load - is visible in a run, and how a test reads what
-        // a settled frame actually drew without a person watching the window.
-        if metrics.draw_calls != self.reported_draw_calls {
-            self.reported_draw_calls = metrics.draw_calls;
+        // A frame whose drawn-pass count moves is worth one line: it is how a
+        // chain that stopped drawing a pass - a material no pass names, a
+        // shader that failed to load - is visible in a run, and how a test
+        // reads what a settled frame actually drew without a person watching
+        // the window.
+        if metrics.passes_with_draws != self.reported_passes_with_draws {
+            self.reported_passes_with_draws = metrics.passes_with_draws;
             info!(
                 target: telemetry_target::RENDERING,
-                draw_calls = metrics.draw_calls,
+                passes_with_draws = metrics.passes_with_draws,
                 passes = metrics.passes,
                 instances = frame.instances.len(),
                 "[render] frame draws"
@@ -419,7 +423,7 @@ impl AttachedRenderer {
         }
         if !self.presented_scene
             && matches!(outcome, pill_renderer_api::FrameOutcome::Presented)
-            && self.renderer.metrics().draw_calls > 0
+            && self.renderer.metrics().passes_with_draws > 0
         {
             self.presented_scene = true;
             // Through the log rather than stdout: a browser has no stdout, and
@@ -427,7 +431,9 @@ impl AttachedRenderer {
             info!(
                 target: telemetry_target::RENDERING,
                 "[render] First frame: {outcome:?}; camera={}; instances={}; {:?}",
-                frame.has_camera,
+                frame
+                    .surface_views
+                    .contains_key(&pill_renderer_api::SurfaceId::PRIMARY),
                 frame.instances.len(),
                 self.renderer.metrics()
             );
@@ -502,15 +508,14 @@ impl RenderingRuntime {
             .await
     }
 
-    /// Forward a physical window resize to the renderer.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.display.resize(width, height);
+    /// Forward a physical resize of surface `id` to the renderer.
+    pub fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
+        self.display.resize_surface(id, width, height);
     }
 
-    /// Restrict drawing to a physical region of the window; `None` draws the
-    /// whole window.
-    pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.display.set_viewport(viewport);
+    /// Restrict drawing to a region of surface `id`; `None` draws all of it.
+    pub fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
+        self.display.set_surface_viewport(id, viewport);
     }
 
     /// Run one frame and draw its world.
@@ -549,14 +554,6 @@ impl FrameDriver for RenderingRuntime {
 
     fn run_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
         self.run_one_frame()
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        RenderingRuntime::resize(self, width, height);
-    }
-
-    fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
-        RenderingRuntime::set_render_viewport(self, viewport);
     }
 
     fn push_input(&mut self, event: InputEvent) {

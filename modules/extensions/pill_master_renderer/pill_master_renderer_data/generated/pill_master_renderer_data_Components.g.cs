@@ -495,6 +495,20 @@ public enum ShaderParameterType : byte
 
 namespace pill_master_renderer_data {
 
+/// <summary>The Rust enum <c>pill_master_renderer_data::assets::shader::ShaderTextureKind</c>.</summary>
+public enum ShaderTextureKind : byte
+{
+    Color = 0,
+    Normal = 1,
+    Equirect = 2,
+    Cubemap = 3,
+    Depth = 4,
+}
+
+}
+
+namespace pill_master_renderer_data {
+
 /// <summary>The Rust value <c>pill_master_renderer_data::assets::shader::ShaderTextureSlot</c>, owned by this object until it is moved
 /// into a Rust call or disposed.</summary>
 public sealed partial class ShaderTextureSlot : global::TracyLive.RustObject, global::TracyLive.IRustObject<ShaderTextureSlot>
@@ -509,19 +523,19 @@ public sealed partial class ShaderTextureSlot : global::TracyLive.RustObject, gl
     internal ShaderTextureSlot(global::TracyLive.RustObjectHandle handle) : base(handle, RustType) { }
 
     /// <summary>Calls the Rust function <c>pill_master_renderer_data::assets::shader::ShaderTextureSlot::new</c>.</summary>
-    public static global::pill_master_renderer_data.ShaderTextureSlot New(string name, global::pill_master_renderer_data.TextureType texture_type, (uint, uint) bindings)
+    public static global::pill_master_renderer_data.ShaderTextureSlot New(string name, global::pill_master_renderer_data.ShaderTextureKind kind, (uint, uint) bindings)
     {
         var __call = global::TracyLive.MirrorCall.Begin("pill_master_renderer_data::assets::shader::ShaderTextureSlot", "new");
         __call.PushString(name);
-        __call.Push(texture_type);
+        __call.Push(kind);
         __call.PushField(0, bindings.Item1); __call.PushField(4, bindings.Item2); __call.EndSlot();
         __call.Invoke();
         return new global::pill_master_renderer_data.ShaderTextureSlot(__call.ResultObject(0));
     }
 
     /// <summary>Calls the Rust function <c>pill_master_renderer_data::assets::shader::ShaderTextureSlot::new</c>.</summary>
-    public ShaderTextureSlot(string name, global::pill_master_renderer_data.TextureType texture_type, (uint, uint) bindings)
-        : this(New(name, texture_type, bindings).TakeHandle())
+    public ShaderTextureSlot(string name, global::pill_master_renderer_data.ShaderTextureKind kind, (uint, uint) bindings)
+        : this(New(name, kind, bindings).TakeHandle())
     {
     }
 }
@@ -596,9 +610,8 @@ public enum TextureType : byte
 {
     Color = 0,
     Normal = 1,
-    Depth = 2,
-    Equirect = 3,
-    Cubemap = 4,
+    Equirect = 2,
+    Cubemap = 3,
 }
 
 }

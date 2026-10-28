@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 // External crates
 use indexmap::IndexMap;
 use pill_engine::{
-    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
-    AssetLoadResult, AssetLoader, ImportedAsset, PillMirror,
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
+    AssetLoader, ImportedAsset, PillMirror,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,12 +55,16 @@ pub enum ShaderParameterType {
 /// Slots are how a value finds the uniform meant for it: a material carries
 /// its parameters by name, and the shader's slots say which names it accepts
 /// and what the matching value packs as.
-#[derive(Debug, Clone)]
+///
+/// This is also the type a `.hlsl.meta` declares its uniforms with: one type,
+/// one serialized shape, so a new slot attribute is added here only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[pill_mirror_object]
 pub struct ShaderParameterSlot {
     /// The name the source binds the uniform under.
     pub name: String,
     /// The kind of value the uniform carries, which decides how it packs.
+    #[serde(rename = "type")]
     pub parameter_type: ShaderParameterType,
 }
 
@@ -76,15 +80,69 @@ impl ShaderParameterSlot {
     }
 }
 
+/// What a shader texture slot reads: a texture asset's texels, or a depth
+/// buffer.
+///
+/// A depth buffer is no asset - no file decodes to one - so it has no place in
+/// [`TextureType`], the texel layout a texture asset carries. A slot names both
+/// because both are things a shader can bind, and the kind is what decides the
+/// binding wgpu accepts: a depth texture cannot be bound where a filterable
+/// colour texture is expected.
+///
+/// Serialized by variant name, so a `.hlsl.meta` writes `"type": "Color"` or
+/// `"type": "Depth"` and reads every file it wrote before the split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PillMirror)]
+#[repr(u8)]
+pub enum ShaderTextureKind {
+    /// A colour image, sampled as sRGB light.
+    Color,
+    /// A normal map, whose bytes are directions.
+    Normal,
+    /// A high-dynamic-range equirectangular panorama.
+    Equirect,
+    /// A cubemap projected from a panorama.
+    Cubemap,
+    /// A depth buffer, which only a pass's own input can supply.
+    Depth,
+}
+
+impl ShaderTextureKind {
+    /// The asset texel layout this slot reads, or `None` for a depth buffer,
+    /// which no asset carries.
+    pub fn texture_type(self) -> Option<TextureType> {
+        match self {
+            Self::Color => Some(TextureType::Color),
+            Self::Normal => Some(TextureType::Normal),
+            Self::Equirect => Some(TextureType::Equirect),
+            Self::Cubemap => Some(TextureType::Cubemap),
+            Self::Depth => None,
+        }
+    }
+}
+
+impl From<TextureType> for ShaderTextureKind {
+    fn from(texture_type: TextureType) -> Self {
+        match texture_type {
+            TextureType::Color => Self::Color,
+            TextureType::Normal => Self::Normal,
+            TextureType::Equirect => Self::Equirect,
+            TextureType::Cubemap => Self::Cubemap,
+        }
+    }
+}
+
 /// One texture a shader declares, under the name its source gives it, with the
 /// bindings it declares it at.
-#[derive(Debug, Clone)]
+///
+/// This is also the type a `.hlsl.meta` declares its textures with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[pill_mirror_object]
 pub struct ShaderTextureSlot {
     /// The name the source binds the texture under.
     pub name: String,
-    /// The kind of texture the slot expects.
-    pub texture_type: TextureType,
+    /// What the slot reads.
+    #[serde(rename = "type")]
+    pub kind: ShaderTextureKind,
     /// The binding the shader declares the texture at.
     pub texture_binding: u32,
     /// The binding the shader declares the sampler at.
@@ -93,16 +151,34 @@ pub struct ShaderTextureSlot {
 
 #[pill_mirror_impl]
 impl ShaderTextureSlot {
-    /// A slot for `name`, of `texture_type`, at the texture and sampler
-    /// bindings the shader declares it at.
+    /// A slot for `name`, reading `kind`, at the texture and sampler bindings
+    /// the shader declares it at.
     #[pill_mirror_method]
-    pub fn new(name: impl Into<String>, texture_type: TextureType, bindings: (u32, u32)) -> Self {
+    pub fn new(name: impl Into<String>, kind: ShaderTextureKind, bindings: (u32, u32)) -> Self {
         Self {
             name: name.into(),
-            texture_type,
+            kind,
             texture_binding: bindings.0,
             sampler_binding: bindings.1,
         }
+    }
+}
+
+/// A slot under the name its source gives it: what keying either kind needs.
+pub trait SlotName {
+    /// The name the source binds the slot under.
+    fn slot_name(&self) -> &str;
+}
+
+impl SlotName for ShaderParameterSlot {
+    fn slot_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl SlotName for ShaderTextureSlot {
+    fn slot_name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -113,41 +189,24 @@ impl ShaderTextureSlot {
 /// values pack into the uniform buffer. A name declared twice keeps its first
 /// declaration and reports the later one: collapsing the pair silently would
 /// leave the packed layout disagreeing with the shader's own declarations.
-pub fn parameter_slots_by_name(
+///
+/// `declared` names the slot kind in that warning - "parameter" or "texture".
+pub fn slots_by_name<S: SlotName>(
     shader_name: &str,
-    slots: impl IntoIterator<Item = ShaderParameterSlot>,
-) -> IndexMap<String, ShaderParameterSlot> {
+    declared: &'static str,
+    slots: impl IntoIterator<Item = S>,
+) -> IndexMap<String, S> {
     let mut keyed = IndexMap::new();
     for slot in slots {
-        if keyed.contains_key(&slot.name) {
+        if keyed.contains_key(slot.slot_name()) {
             pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
-                "shader `{shader_name}` declares parameter slot `{}` twice; the later declaration is ignored",
-                slot.name
+                "shader `{shader_name}` declares {declared} slot `{}` twice; the later declaration is ignored",
+                slot.slot_name()
             );
             continue;
         }
-        keyed.insert(slot.name.clone(), slot);
-    }
-    keyed
-}
-
-/// [`parameter_slots_by_name`], for texture slots.
-pub fn texture_slots_by_name(
-    shader_name: &str,
-    slots: impl IntoIterator<Item = ShaderTextureSlot>,
-) -> IndexMap<String, ShaderTextureSlot> {
-    let mut keyed = IndexMap::new();
-    for slot in slots {
-        if keyed.contains_key(&slot.name) {
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
-                "shader `{shader_name}` declares texture slot `{}` twice; the later declaration is ignored",
-                slot.name
-            );
-            continue;
-        }
-        keyed.insert(slot.name.clone(), slot);
+        keyed.insert(slot.slot_name().to_owned(), slot);
     }
     keyed
 }
@@ -158,7 +217,7 @@ pub fn texture_slots_by_name(
 /// the sources go to the pipeline, and the slots say how the uniform buffer
 /// and the texture bindings have to be laid out for that pipeline.
 #[derive(Clone, Debug)]
-#[pill_mirror_object(asset)]
+#[pill_mirror_object(asset, shared = "pill_master_renderer::assets::Shader")]
 pub struct Shader {
     /// Name used in logs and error messages.
     pub name: String,
@@ -307,8 +366,8 @@ impl ShaderBuilder {
         })?;
 
         let name = self.name;
-        let parameter_slots = parameter_slots_by_name(&name, self.parameter_slots);
-        let texture_slots = texture_slots_by_name(&name, self.texture_slots);
+        let parameter_slots = slots_by_name(&name, "parameter", self.parameter_slots);
+        let texture_slots = slots_by_name(&name, "texture", self.texture_slots);
         Ok(Shader {
             name,
             vertex_wgsl: vertex_source.load_string()?,
@@ -318,28 +377,6 @@ impl ShaderBuilder {
             pass_engine_parameters: self.pass_engine_parameters,
             pass_camera_parameters: self.pass_camera_parameters,
         })
-    }
-}
-
-/// The pinned shared name of [`Shader`]; see the comment on its `Asset` impl.
-const SHADER_SHARED_NAME: &str = "pill_master_renderer::assets::Shader";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for Shader {
-    fn shared_name() -> Option<&'static str> {
-        Some(SHADER_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 =
-            pill_engine::component::shared_component_identity(SHADER_SHARED_NAME);
-        Some(IDENTITY)
     }
 }
 
@@ -357,37 +394,13 @@ pub struct ShaderImportSettings {
     /// vertex stage this source pairs with.
     pub vertex: String,
     /// The uniforms the shader declares, in the order their values pack.
-    pub parameters: Vec<ShaderParameterDeclaration>,
+    pub parameters: Vec<ShaderParameterSlot>,
     /// The textures the shader declares, with the bindings it uses them at.
-    pub textures: Vec<ShaderTextureDeclaration>,
+    pub textures: Vec<ShaderTextureSlot>,
     /// Whether the shader reads the engine's parameters, at set 0.
     pub engine_parameters: bool,
     /// Whether the shader reads the camera's parameters, at set 1.
     pub camera_parameters: bool,
-}
-
-/// One uniform a `.hlsl.meta` declares.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShaderParameterDeclaration {
-    /// The name the source binds the uniform under.
-    pub name: String,
-    /// The kind of value it carries, which decides how it packs.
-    #[serde(rename = "type")]
-    pub parameter_type: ShaderParameterType,
-}
-
-/// One texture a `.hlsl.meta` declares, with the bindings it declares it at.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShaderTextureDeclaration {
-    /// The name the source binds the texture under.
-    pub name: String,
-    /// The kind of texture the slot expects.
-    #[serde(rename = "type")]
-    pub texture_type: TextureType,
-    /// The binding the shader declares the texture at.
-    pub texture_binding: u32,
-    /// The binding the shader declares the sampler at.
-    pub sampler_binding: u32,
 }
 
 // The metadata type name defaults to the shared name above, so every binary's
@@ -414,16 +427,8 @@ impl ImportedAsset for Shader {
         Shader::new(name.to_owned())
             .with_vertex_source(AssetLoader::Path(settings.vertex.clone().into()))
             .with_fragment_source(AssetLoader::Path(fragment))
-            .with_parameter_slots(settings.parameters.iter().map(|declared| {
-                ShaderParameterSlot::new(declared.name.clone(), declared.parameter_type)
-            }))
-            .with_texture_slots(settings.textures.iter().map(|declared| {
-                ShaderTextureSlot::new(
-                    declared.name.clone(),
-                    declared.texture_type,
-                    (declared.texture_binding, declared.sampler_binding),
-                )
-            }))
+            .with_parameter_slots(settings.parameters.iter().cloned())
+            .with_texture_slots(settings.textures.iter().cloned())
             .with_engine_parameters(settings.engine_parameters)
             .with_camera_parameters(settings.camera_parameters)
             .build()
@@ -441,4 +446,97 @@ fn cooked_beside(source: &str) -> AssetLoadResult<PathBuf> {
         });
     }
     Ok(cooked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.hlsl.meta` declares its slots as the slot types themselves, by
+    /// variant name: the shape every committed meta is written in, depth
+    /// included.
+    #[test]
+    fn a_meta_declares_its_slots_as_the_slot_types() {
+        let settings: ShaderImportSettings = serde_json::from_str(
+            r#"{
+                "vertex": "common_shaders/default_vertex.hlsl",
+                "parameters": [
+                    { "name": "tint", "type": "Color" },
+                    { "name": "exposure", "type": "Scalar" }
+                ],
+                "textures": [
+                    { "name": "color", "type": "Color", "texture_binding": 0, "sampler_binding": 1 },
+                    { "name": "normal", "type": "Normal", "texture_binding": 2, "sampler_binding": 3 },
+                    { "name": "depth", "type": "Depth", "texture_binding": 4, "sampler_binding": 5 }
+                ]
+            }"#,
+        )
+        .expect("the meta shape loads");
+
+        assert_eq!(
+            settings.parameters[1].parameter_type,
+            ShaderParameterType::Scalar
+        );
+        assert_eq!(
+            settings.textures[0].kind.texture_type(),
+            Some(TextureType::Color)
+        );
+        assert_eq!(settings.textures[2].kind, ShaderTextureKind::Depth);
+        assert_eq!(
+            settings.textures[2].kind.texture_type(),
+            None,
+            "a depth buffer is no asset texel layout"
+        );
+    }
+
+    /// A slot serializes under the spelling a meta reads: the kind's name in
+    /// `type`, so a file this build writes loads in the next.
+    #[test]
+    fn a_texture_slot_serializes_as_the_name_it_is_read_by() {
+        let slot = ShaderTextureSlot::new("sky", ShaderTextureKind::Cubemap, (0, 1));
+        let json = serde_json::to_value(&slot).unwrap();
+
+        assert_eq!(json["type"], serde_json::json!("Cubemap"));
+        assert_eq!(json["texture_binding"], serde_json::json!(0));
+        assert_eq!(json["sampler_binding"], serde_json::json!(1));
+        assert_eq!(
+            serde_json::from_value::<ShaderTextureSlot>(json).unwrap(),
+            slot
+        );
+    }
+
+    /// Every texel layout an asset can carry names one slot kind and back.
+    #[test]
+    fn every_texture_type_names_its_slot_kind() {
+        for texture_type in [
+            TextureType::Color,
+            TextureType::Normal,
+            TextureType::Equirect,
+            TextureType::Cubemap,
+        ] {
+            assert_eq!(
+                ShaderTextureKind::from(texture_type).texture_type(),
+                Some(texture_type)
+            );
+        }
+    }
+
+    /// Keying a slot list keeps the source's order and the first declaration
+    /// of a repeated name, so the packed layout agrees with the shader.
+    #[test]
+    fn slots_keep_their_order_and_the_first_of_a_repeated_name() {
+        let keyed = slots_by_name(
+            "test",
+            "parameter",
+            [
+                ShaderParameterSlot::new("tint", ShaderParameterType::Color),
+                ShaderParameterSlot::new("roughness", ShaderParameterType::Scalar),
+                ShaderParameterSlot::new("tint", ShaderParameterType::Scalar),
+            ],
+        );
+
+        let names: Vec<&str> = keyed.keys().map(String::as_str).collect();
+        assert_eq!(names, ["tint", "roughness"]);
+        assert_eq!(keyed["tint"].parameter_type, ShaderParameterType::Color);
+    }
 }

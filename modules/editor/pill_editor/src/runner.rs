@@ -86,8 +86,8 @@ use pill_engine_core::InputEvent;
 use pill_host::{take_notices, HostConfig, HostNotice, RenderingHost};
 use pill_input::winit_events::translate_window_event;
 use pill_runtime::{
-    frame_grid, CameraBinding, CameraComponent, FrameDriver, PickHit, PickRequests, PickResults,
-    SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
+    editor_view_surfaces, CameraBinding, CameraComponent, FrameDriver, PickHit, PickRequests,
+    PickResults, SelectionOutlines, SurfaceCameras, SurfaceId, SurfaceOptions, TransformComponent,
 };
 use pill_ui_theme::{load_overrides, ThemeOverrides, ThemePathScope};
 use winit::application::ApplicationHandler;
@@ -1279,7 +1279,8 @@ impl EditorWindow {
         // The primary surface lives on the game view's window when it
         // exists; only the fallback posture sizes it from the main window.
         if self.game_surface.is_none() {
-            self.host.resize(width.max(1), height.max(1));
+            self.host
+                .resize_surface(SurfaceId::PRIMARY, width.max(1), height.max(1));
         }
         if let Some(overlay) = &mut self.overlay {
             overlay.resize(&self.device, self.size);
@@ -1321,17 +1322,16 @@ impl EditorWindow {
 
     /// Handle the game window's resize: the primary surface reconfigures
     /// with its window, like the scene view surfaces - a stale render
-    /// target draws the project at the wrong size inside the Game tab.
-    /// `resize_surface` does nothing for the primary, so the host's main
-    /// resize is the one that reaches it. The placement cache is cleared,
-    /// so the next layout pass re-applies the dock's rectangle.
+    /// target draws the project at the wrong size inside the Game tab. The
+    /// placement cache is cleared, so the next layout pass re-applies the
+    /// dock's rectangle.
     fn resize_game(&mut self, width: u32, height: u32) {
         let Some(game) = &mut self.game_surface else {
             return;
         };
         game.placed = None;
         let (width, height) = (width.max(1), height.max(1));
-        self.host.resize(width, height);
+        self.host.resize_surface(SurfaceId::PRIMARY, width, height);
         info!(
             target: telemetry_target::ENGINE,
             width,
@@ -3548,16 +3548,16 @@ impl EditorWindow {
         let world = self.host.host_mut().engine_mut().world_mut();
         let cameras = world.get_resource::<SurfaceCameras>();
         let grid = cameras.map(|cameras| cameras.grid).unwrap_or_default();
-        let surfaces = cameras
-            .and_then(|cameras| frame_grid(cameras, cameras.grid))
-            .map(|grid| {
-                grid.surfaces
-                    .iter()
-                    .map(|surface| surface.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-            .unwrap_or_default();
+        // The surfaces the renderer draws it on are the frame's editor views -
+        // the view-bound set - and it draws them only while the switch is on.
+        let surfaces = match cameras {
+            Some(cameras) if grid.enabled => editor_view_surfaces(cameras)
+                .iter()
+                .map(|surface| surface.0.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => String::new(),
+        };
         info!(
             target: telemetry_target::ENGINE,
             enabled = grid.enabled,
@@ -9631,21 +9631,15 @@ fn engine_asset_rows(
 
 /// Whether the listing already shows the store asset `name` carries.
 ///
-/// One asset is one row: a guid the file declares, the path the store holds it
-/// under, or - for an asset added under a short name - a file of that name. The
-/// renderer does exactly the last: it loads `defaults/pill.pbr.material` and
-/// adds those bytes to the store as `pill.pbr.material`, so a picker left to
-/// the raw facts offers the same material twice, once of them unreachable.
+/// One asset is one row: a guid the file declares, or the path the store holds
+/// it under. A code-built asset has neither and keeps its own row.
 fn listing_backs(listing: &[AssetListing], guid: Option<&str>, name: &str) -> bool {
     if let Some(guid) = guid {
         return listing.iter().any(|row| row.guid.as_deref() == Some(guid));
     }
-    let file_name = name.rsplit('/').next().unwrap_or(name);
-    listing.iter().any(|row| {
-        row.path == name
-            || row.path.ends_with(&format!("/{name}"))
-            || row.path.rsplit('/').next() == Some(file_name)
-    })
+    listing
+        .iter()
+        .any(|row| row.path == name || row.path.ends_with(&format!("/{name}")))
 }
 
 // =============================================================================
@@ -9695,10 +9689,6 @@ mod tests {
             row("shaders/pbr_fragment.hlsl", Some("7b2f")),
         ];
 
-        assert!(
-            listing_backs(&listing, None, "pill.pbr.material"),
-            "the short name the store holds the default material under is that file"
-        );
         assert!(
             listing_backs(&listing, None, "defaults/pill.pbr.material"),
             "the store's own path is the same row"

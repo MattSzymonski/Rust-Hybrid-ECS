@@ -19,31 +19,30 @@
 //!
 //! # Where the shaders are
 //!
-//! The lit fragment stage is in `shader_sources/simple_pipeline/shaders/`. The
-//! vertex stage it pairs with lives in `shader_sources/common_shaders/`, because
-//! it is not this pipeline's alone: the renderer's fallback material is built
-//! from the same pair - a material written for the fallback draws here without
-//! being rebuilt - and the PBR geometry pass reuses the vertex stage, since every
-//! lit pass in the crate starts from the same instance layout. Three readers, one
-//! copy of the vertex stage.
+//! The lit fragment stage is in `shader_sources/simple_pipeline/shaders/`, and
+//! is imported from there like a project's own shader: its slots and its guid
+//! live in the `.hlsl.meta` beside it. The vertex stage it pairs with lives in
+//! `shader_sources/common_shaders/`, because it is not this pipeline's alone: the
+//! renderer's fallback material is built from the same pair - a material written
+//! for the fallback draws here without being rebuilt - and the PBR geometry pass
+//! reuses the vertex stage, since every lit pass in the crate starts from the
+//! same instance layout. Three readers, one copy of the vertex stage.
 //!
 //! The build script cooks the whole `shader_sources/` tree in one call: every
 //! directory that directly holds `.hlsl` files is a source directory, and every
 //! `include/` in the tree is on every source's include path.
 //!
-//! Nothing here reads a file at runtime: the WGSL is cooked into the crate at
-//! build time and embedded, so the pipeline installs for a project whose assets
-//! live somewhere the renderer has never heard of.
+//! The one text this crate embeds is the fallback pair itself
+//! ([`DEFAULT_VERTEX`] and [`DEFAULT_LIT_FRAGMENT`]): the GPU module builds its
+//! stand-in shader from it before any store exists, so it cannot be read from
+//! one.
 
 // External crates
 use pill_engine::{AssetManager, Handle};
 
 // Current crate
 use crate::{
-    assets::{
-        PassKind, PassTarget, RenderPass, RenderingPipeline, Shader, ShaderParameterSlot,
-        ShaderParameterType, ShaderTextureSlot, TextureType,
-    },
+    assets::{PassKind, PassTarget, RenderPass, RenderingPipeline},
     config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
 
@@ -55,16 +54,25 @@ config_shader_file!(
 
 /// The shader assets [`install`] creates, and the files each is built from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
-    shader_asset_name: SHADER_NAME,
-    vertex: DEFAULT_VERTEX,
-    fragment: DEFAULT_LIT_FRAGMENT,
+    shader_asset_name: SHADER_PATH,
+    vertex_path: DEFAULT_VERTEX.relative_path,
+    fragment_path: DEFAULT_LIT_FRAGMENT.relative_path,
 }];
 
 /// Asset name the installed pipeline is stored under.
 pub const PIPELINE_NAME: &str = "pill.simple.pipeline";
 
-/// Asset name of the shader the pass draws through.
-pub const SHADER_NAME: &str = "pill.simple.shader";
+/// The shader the pass draws through: the path its `.hlsl` source is imported
+/// under, because an imported asset is named by the path it came from.
+pub const SHADER_PATH: &str = "simple_pipeline/shaders/default_lit_fragment.hlsl";
+
+/// The guid the shader is stored under.
+///
+/// Derived from a name rather than drawn at random, so every checkout and every
+/// run gives it the same one; the `.hlsl.meta` beside the source carries this
+/// value and [`install`] asserts the two agree.
+pub const SHADER_GUID: pill_engine::AssetGuid =
+    pill_engine::AssetGuid::from_name("pill.simple.shader");
 
 /// Asset name of the pass the pipeline holds.
 pub const PASS_NAME: &str = "pill.simple.pass";
@@ -85,29 +93,9 @@ pub fn install(
         return Ok(pipeline);
     }
 
-    let shader = Shader::new("pill_simple")
-        .with_wgsl(
-            DEFAULT_VERTEX.embedded_source,
-            DEFAULT_LIT_FRAGMENT.embedded_source,
-        )
-        .with_parameter_slots(vec![
-            ShaderParameterSlot::new("tint", ShaderParameterType::Color),
-            ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
-        ])
-        .with_texture_slots(vec![
-            ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
-            ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
-        ])
-        .with_engine_parameters(true)
-        .with_camera_parameters(true)
-        .build()?;
-    let shader = assets.add_named_with_guid(
-        SHADER_NAME,
-        pill_engine::AssetGuid::from_name(SHADER_NAME),
-        shader,
-    )?;
+    let shader = crate::config::import_shader(assets, SHADER_PATH, SHADER_GUID)?;
 
-    let pass = RenderPass::new("pill.simple.opaque")
+    let pass = RenderPass::new(PASS_NAME)
         .with_shader(shader)
         .with_kind(PassKind::Geometry)
         .with_target(PassTarget::Surface);

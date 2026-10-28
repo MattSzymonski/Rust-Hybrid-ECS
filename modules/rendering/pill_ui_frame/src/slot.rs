@@ -4,7 +4,9 @@
 //! # Responsibilities
 //!
 //! - [`UiFrameSlot`]: one world resource holding the newest [`UiFrame`] a UI
-//!   producer built, with `publish` and `take` as its whole surface.
+//!   producer built - `publish` and `take` for the frame, the pair that asks
+//!   for and reports a texture resend, and the emptiness checks that go with
+//!   holding nothing.
 //!
 //! # Design
 //!
@@ -89,6 +91,8 @@ impl UiFrameSlot {
     /// Called by a painter whose texture map starts empty - a renderer module
     /// that was just rebuilt - because the producer's dirty set is empty by
     /// then and a one-shot push has no other way to know the images were lost.
+    /// [`crate::texture`] states the whole rule, the dirty set and this request
+    /// together.
     pub fn request_texture_resend(&mut self) {
         self.texture_resend_generation = self.texture_resend_generation.wrapping_add(1);
     }
@@ -107,6 +111,7 @@ mod tests {
     use super::*;
     use crate::draw::{Color, DrawList, Rect, TextureId};
     use crate::frame::UiDraw;
+    use crate::texture::{UiTexture, UiTextureFilter};
 
     /// A frame carrying one draw list, so emptiness is observable.
     fn drawn_frame() -> UiFrame {
@@ -174,5 +179,35 @@ mod tests {
         slot.publish(drawn_frame());
         let _ = slot.take();
         assert_eq!(slot.texture_resend_generation(), asked);
+    }
+
+    /// A frame's textures wait for the renderer however few surfaces the frame
+    /// draws: they belong to the update, not to a surface. The renderer applies
+    /// them before it decides what to draw, so a frame that drew nothing still
+    /// carries them on the next update.
+    #[test]
+    fn a_frame_keeps_its_textures_until_a_renderer_takes_it() {
+        let mut slot = UiFrameSlot::new();
+        let mut frame = UiFrame::default();
+        frame.textures.textures.push(UiTexture {
+            id: TextureId(1),
+            width: 1,
+            height: 1,
+            revision: 1,
+            pixels: std::sync::Arc::from(vec![0u8, 0, 0, 255].into_boxed_slice()),
+            filter: UiTextureFilter::Nearest,
+        });
+        slot.publish(frame);
+
+        // A frame with no draws is still not an empty slot while it carries
+        // textures: the renderer has something to apply.
+        assert!(!slot.is_empty());
+        let taken = slot.take();
+        assert_eq!(taken.textures.textures.len(), 1);
+        assert_eq!(taken.textures.textures[0].revision, 1);
+        assert!(
+            slot.take().textures.textures.is_empty(),
+            "the take drained them"
+        );
     }
 }

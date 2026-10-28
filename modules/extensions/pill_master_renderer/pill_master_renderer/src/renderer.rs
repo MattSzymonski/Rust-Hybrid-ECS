@@ -1,17 +1,17 @@
 //! The master renderer: draws a frame's resolved chain and instances, over the
-//! device, surface, and frame state [`State`] owns.
+//! device and frame state [`State`] owns.
 //!
 //! # Responsibilities
 //!
 //! - Keep the GPU caches level with the asset store, one asset type at a time,
 //!   rebuilding only what moved ([`Renderer`] and its per-type sync helpers).
-//! - Hold the chain's GPU objects in a `ScriptableRenderingPipeline`: rebuild
-//!   them when the frame says they moved, and plan each frame's passes.
+//! - Hold each surface's chain in a [`GpuChain`]: rebuild it when the frame
+//!   says it moved, and plan each frame's passes.
 //! - Submit through [`State`]: one command encoder, one wgpu render pass per
 //!   planned pass, then the present.
-//! - Draw into several surfaces from one device: the primary one the renderer
-//!   was built on, and every one attached since ([`ExtraTarget`]), each through
-//!   its own camera.
+//! - Draw into several surfaces from one device - the primary one the renderer
+//!   was built on and every one attached since - each an entry of one map
+//!   ([`SurfaceTarget`]) and each drawn through its own camera.
 //! - Draw the overlay - debug drawing, outlines, picking - over each surface
 //!   after its chain (`crate::overlay`).
 //!
@@ -22,12 +22,11 @@
 //! the store's revision, the chain's generation - so an unchanged frame costs
 //! two comparisons and no rebuilds; creation failures are named and skipped.
 //!
-//! An extra surface owns what is sized to it - its swapchain, depth buffer,
-//! offscreen targets, their pass objects and its camera's uniform buffer. It is
-//! swapped into [`State`] for its own frame and back out; the device, the asset
-//! caches and the queue are shared.
-
-#![allow(clippy::too_many_arguments)]
+//! A surface owns what is sized to it - its swapchain, depth buffer, offscreen
+//! targets, their pass objects, its camera's uniform buffer and the overlay's
+//! targets - whether it is the primary one or one attached later. The device,
+//! the asset caches and the queue are shared, and [`State`] draws a surface by
+//! being handed its target: no per-surface field is ever swapped in and out.
 
 // Standard library
 use std::collections::{BTreeMap, HashMap};
@@ -42,6 +41,7 @@ use pill_renderer_api::{CameraComponent, RawWindowData, SurfaceId, SurfaceOption
 // Current crate
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
+    chain::{GpuChain, PassOutput, PassPlan, PassSlot},
     components::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -50,9 +50,8 @@ use crate::{
     },
     drawers::mesh_drawer::MeshDrawer,
     error::{capturing_validation, RendererError, Result},
-    frame::{PassTarget, RenderFrame, ResolvedPass},
-    overlay::{self, Overlay, OverlayFrame},
-    pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
+    frame::RenderFrame,
+    overlay::{self, Overlay, OverlayFrame, OverlayTargets},
     profiler::Profiler,
     render_queue::RenderQueueItem,
     rendering_resources_manager::RenderingResourcesManager,
@@ -94,42 +93,45 @@ const CLEAR_TRANSPARENT: wgpu::Color = wgpu::Color {
 /// picture before the pass that was going to bring it back into range runs.
 pub(crate) const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// The master renderer: the asset caches, the frame's chain, and the submission
-/// behind the [`PillRenderer`] contract.
+/// Fog the engine parameters carry more than the frame does.
+///
+/// The block's layout declares a fog colour and density first, because a
+/// project's shader may read them, but no frontend sets them yet: the frame
+/// writes "no fog" rather than leaving the buffer to whatever the previous
+/// write put there.
+const NO_FOG_DENSITY: f32 = 0.0;
+const NO_FOG_COLOR: [f32; 3] = [0.0; 3];
+
+/// The master renderer: the asset caches, a chain per surface, and the
+/// submission behind the [`PillRenderer`] contract.
 ///
 /// One renderer owns the surface of the window it was built on, every surface
 /// attached since, and everything drawn to them: the GPU state, the resources
-/// manager that keeps the store level with the GPU, and the chain that turns a
-/// frame into passes.
+/// manager that keeps the store level with the GPU, and each surface's chain.
 pub struct Renderer {
-    /// The wgpu device, surface, and frame state this renderer drives.
+    /// The wgpu device, queue and shared caches this renderer draws from.
     pub state: State,
     /// The GPU object behind every live asset, and the version it was built
     /// from: the frame-to-GPU diff, one asset type at a time.
     rendering_resources_manager: RenderingResourcesManager,
-    camera: RendererCameraHandle,
-    viewport: Option<RenderViewport>,
-    minimized: bool,
-    /// The frame's chain as GPU objects: a pass pipeline each, and the plan a
-    /// frame is recorded from.
-    pipeline: ScriptableRenderingPipeline,
     metrics: RenderMetrics,
     /// The frame's instances in queue order, as uploaded. Kept between frames
     /// so its allocation is reused.
     queued_instances: Vec<Instance>,
-    /// Whether the primary surface may present this frame (the frontend's
-    /// pacing; see [`PillRenderer::set_surface_ready`]).
-    primary_ready: bool,
-    /// Every surface attached after the primary one, by surface id.
-    extra_targets: BTreeMap<u32, ExtraTarget>,
+    /// Every surface this renderer draws, by id: the one it was built on under
+    /// [`SurfaceId::PRIMARY`], and each one attached since.
+    targets: BTreeMap<u32, SurfaceTarget>,
 }
 
-/// One surface attached after the primary one, and everything sized to it.
+/// One surface the renderer draws into, and everything sized to it.
 ///
-/// Swapped into [`State`] while it renders: `surface`, `depth_texture` and
-/// `offscreen` trade places with the state's own, so the chain is built and
-/// recorded by exactly the code the primary surface uses.
-struct ExtraTarget {
+/// The primary surface the renderer was built on and every surface attached
+/// since are the same type in one map: a swapchain, the depth buffer sized to
+/// it, the offscreen targets its chain declares, the chain's own pass objects,
+/// the camera it is drawn through, and the overlay's targets.
+pub(crate) struct SurfaceTarget {
+    /// Which surface this is, as the frame's views, picks and UI name it.
+    id: SurfaceId,
     /// The surface's swapchain.
     surface: Surface,
     /// Its depth buffer, sized to it.
@@ -137,9 +139,11 @@ struct ExtraTarget {
     /// Its offscreen targets, sized to it.
     offscreen: HashMap<String, RendererTexture>,
     /// The chain's pass objects bound to this surface's targets.
-    pipeline: ScriptableRenderingPipeline,
+    chain: GpuChain,
     /// The uniform buffer its camera is uploaded to.
     camera: RendererCameraHandle,
+    /// The overlay's targets, sized to it.
+    overlay_targets: OverlayTargets,
     /// The region drawn to, or `None` for the whole surface.
     viewport: Option<RenderViewport>,
     /// Whether the surface is zero-sized.
@@ -147,7 +151,70 @@ struct ExtraTarget {
     /// Whether the surface may present this frame.
     ready: bool,
     /// Whether a frame has been presented to it, for the one-time line.
+    ///
+    /// The primary surface's first frame is not announced - it is the window
+    /// the renderer was built on - so it starts out presented.
     presented: bool,
+}
+
+impl SurfaceTarget {
+    /// Rebuild what is sized to the surface for `width` by `height`.
+    ///
+    /// The swapchain, the depth buffer and the overlay's targets are rebuilt
+    /// here; the offscreen targets are dropped and the chain told to rebuild
+    /// the passes bound to them on the next frame, because those are sized to
+    /// the surface too.
+    fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        overlay: &Overlay,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        self.minimized = width == 0 || height == 0;
+        if self.minimized {
+            return Ok(());
+        }
+        self.surface.resize(device, width, height)?;
+        // Committed only once the surface took the new size, so a refusal
+        // leaves a surface and a depth buffer that still agree with each
+        // other rather than a stale depth buffer under the new swapchain.
+        let depth_texture = RendererTexture::new_depth_texture(
+            device,
+            self.surface.configuration(),
+            "depth_texture",
+        )?;
+        self.depth_texture = depth_texture;
+        self.overlay_targets = overlay.new_targets(device, self.surface.size());
+        self.offscreen.clear();
+        self.chain.invalidate_targets();
+        Ok(())
+    }
+}
+
+/// One surface's frame between the acquire and the present.
+///
+/// Everything the recording phases need that changes per frame: the acquired
+/// image, the view the passes draw into, the camera's buffer, and the frame
+/// itself. Holding it apart from [`SurfaceTarget`] is what lets the phases be
+/// recorded in named steps without threading a dozen arguments through each.
+struct SurfaceDraw<'a> {
+    /// Which surface this is, as the overlay and the UI name it.
+    surface: u32,
+    /// The image acquired from the surface, presented at the end.
+    image: wgpu::SurfaceTexture,
+    /// The view the passes draw into, through the surface's own format.
+    view: wgpu::TextureView,
+    /// The size of the acquired image, in pixels.
+    size: (u32, u32),
+    /// The region of it this frame covers.
+    viewport: RenderViewport,
+    /// The uniform buffer the surface's camera was uploaded to.
+    camera: RendererCameraHandle,
+    /// The frame being drawn.
+    frame: &'a RenderFrame,
+    /// The frame's queue: in it, a queue position is an instance index.
+    render_queue: &'a [RenderQueueItem],
 }
 
 impl Renderer {
@@ -189,94 +256,16 @@ impl Renderer {
     pub async unsafe fn new_async(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
         info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
         // SAFETY: forwarded from this function's own contract.
-        let mut state = unsafe { State::new(window, width, height) }.await?;
+        let (mut state, primary) = unsafe { State::new(window, width, height) }.await?;
         let rendering_resources_manager = RenderingResourcesManager::new(&mut state)?;
-        let camera = state
-            .renderer_resource_storage
-            .cameras
-            .insert(RendererCamera::new(
-                &state.device,
-                state.camera_bind_group_layout.clone(),
-            )?);
         Ok(Self {
             state,
             rendering_resources_manager,
-            camera,
-            viewport: None,
-            minimized: width == 0 || height == 0,
-            pipeline: ScriptableRenderingPipeline::new(),
             metrics: RenderMetrics::default(),
             queued_instances: Vec::new(),
-            primary_ready: true,
-            extra_targets: BTreeMap::new(),
+            targets: BTreeMap::from([(primary.id.0, primary)]),
         })
     }
-
-    /// Render one extra surface through `view`, with the queue and instances
-    /// the primary surface already prepared for this frame.
-    ///
-    /// Swaps the target's surface-sized objects into [`State`] for the length
-    /// of the call and swaps them back whatever the outcome, so the state is
-    /// the primary surface's again when this returns.
-    fn render_extra_target(
-        &mut self,
-        id: u32,
-        frame: &RenderFrame,
-        assets_manager: &AssetManager,
-        render_queue: &[RenderQueueItem],
-        view: (CameraComponent, TransformComponent),
-    ) -> Result<()> {
-        let Renderer {
-            state,
-            rendering_resources_manager,
-            extra_targets,
-            ..
-        } = self;
-        let Some(target) = extra_targets.get_mut(&id) else {
-            return Ok(());
-        };
-        swap_target_into_state(state, target);
-        target.pipeline.ensure(
-            &frame.passes,
-            assets_manager,
-            frame.chain_generation,
-            rendering_resources_manager.chain_context(state),
-        );
-        let plan = target.pipeline.plan(
-            &frame.passes,
-            render_queue,
-            rendering_resources_manager.shader_handles(),
-        );
-        let outcome = state.render(
-            (id, target.camera),
-            &plan,
-            target.pipeline.passes(),
-            frame,
-            (&view.0, &view.1),
-            render_queue,
-            target.viewport,
-        );
-        drop(plan);
-        swap_target_into_state(state, target);
-        if outcome.is_ok() && !target.presented {
-            target.presented = true;
-            info!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
-                "[render] surface {id} first frame presented"
-            );
-        }
-        outcome
-    }
-}
-
-/// Trade an extra target's surface-sized objects with the state's own.
-///
-/// Called twice per extra surface per frame: once to make the state draw into
-/// the target, once to restore it.
-fn swap_target_into_state(state: &mut State, target: &mut ExtraTarget) {
-    std::mem::swap(&mut state.surface, &mut target.surface);
-    std::mem::swap(&mut state.depth_texture, &mut target.depth_texture);
-    std::mem::swap(&mut state.offscreen, &mut target.offscreen);
 }
 
 impl Drop for Renderer {
@@ -314,60 +303,38 @@ impl PillRenderer for Renderer {
         self.metrics
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        self.minimized = width == 0 || height == 0;
-        if self.minimized {
-            return;
-        }
-        if let Err(error) = self.state.resize(width, height) {
-            // Warned instead of panicking: a size the driver will not take is
-            // not worth killing a running game over, and the next resize event
-            // tries again.
-            pill_core::warn!(
-                target: pill_core::telemetry::telemetry_target::RENDERING,
-                "surface resize to {width}x{height} failed: {error}"
-            );
-            return;
-        }
-        // An offscreen target is sized to the surface, so a new surface size
-        // makes every one of them wrong; the chain is rebuilt with them on
-        // the next frame.
-        self.state.offscreen.clear();
-        self.pipeline.invalidate_targets();
-    }
-
-    fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.viewport = viewport;
-    }
-
     fn render(
         &mut self,
         frame: &RenderFrame,
         assets_manager: &AssetManager,
     ) -> Result<FrameOutcome> {
-        // Every surface that draws this frame: the primary one through the
-        // frame's chosen camera, each extra one through the camera resolved for
-        // it. A surface that is minimized, has no camera, or may not present
-        // yet is left out.
-        let primary_drawn = !self.minimized && frame.has_camera && self.primary_ready;
-        let extra_views: Vec<(u32, (CameraComponent, TransformComponent))> = self
-            .extra_targets
-            .iter()
-            .filter(|(_, target)| !target.minimized && target.ready)
-            .filter_map(|(id, _)| {
-                frame
-                    .surface_views
-                    .get(id)
-                    .map(|view| (*id, (view.camera, view.transform)))
-            })
-            .collect();
+        // The frame's UI textures belong to the update, not to a surface: they
+        // are applied here, once, before any surface is looked at, so a frame
+        // that draws nothing keeps them for the next one.
+        let state = &mut self.state;
+        state
+            .ui_renderer
+            .apply_texture_set(&state.device, &state.queue, &frame.ui.textures);
+        // Every surface that draws this frame, the primary first, each through
+        // the camera the frame resolved for it. A surface that is minimized,
+        // has no camera, or may not present yet is left out.
+        let primary_surface = SurfaceId::PRIMARY.0;
+        let mut drawn: Vec<(u32, &CameraComponent, &TransformComponent)> =
+            Vec::with_capacity(self.targets.len());
+        for (id, target) in &self.targets {
+            if target.minimized || !target.ready {
+                continue;
+            }
+            // A surface with no camera this frame is not drawn, and its picks
+            // are answered as undrawn below.
+            let Some(view) = frame.surface_views.get(&SurfaceId(*id)) else {
+                continue;
+            };
+            drawn.push((*id, &view.camera, &view.transform));
+        }
         // A pick on a surface not drawn this frame is answered at once: its
         // pixel holds nothing this frame could read back.
-        let drawn_surfaces: Vec<u32> = primary_drawn
-            .then_some(SurfaceId::PRIMARY.0)
-            .into_iter()
-            .chain(extra_views.iter().map(|(id, _)| *id))
-            .collect();
+        let drawn_surfaces: Vec<u32> = drawn.iter().map(|(id, _, _)| *id).collect();
         self.state
             .overlay
             .answer_undrawn(&frame.pick_requests, &drawn_surfaces);
@@ -385,13 +352,6 @@ impl PillRenderer for Renderer {
         self.rendering_resources_manager
             .sync(assets_manager, &mut self.state);
         drop(sync_zone);
-        self.pipeline.ensure(
-            &frame.passes,
-            assets_manager,
-            frame.chain_generation,
-            self.rendering_resources_manager
-                .chain_context(&mut self.state),
-        );
         let queue_zone = pill_core::profile_scope!("renderer: build queue");
         let render_queue = self
             .rendering_resources_manager
@@ -426,47 +386,109 @@ impl PillRenderer for Renderer {
         // An empty chain is a game that asked for nothing, not a game that
         // asked for the built-in pass: the frame's writer puts that pass in the
         // chain itself.
+        //
+        // The primary surface's chain is rebuilt and logged every frame, drawn
+        // or not: it is the frame's chain, and both the line and the metrics
+        // describe the frame rather than the window's state. It is never
+        // missing - it is inserted when the renderer is built, and detaching it
+        // is refused - so the `else` is unreachable.
         let plan_zone = pill_core::profile_scope!("renderer: plan");
-        let plan = self.pipeline.plan(
-            &frame.passes,
-            &render_queue,
-            self.rendering_resources_manager.shader_handles(),
-        );
-        self.pipeline.log(&plan);
-        self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
-        self.metrics.passes = plan.len() as u32;
+        let Some(primary_target) = self.targets.get_mut(&primary_surface) else {
+            return Ok(FrameOutcome::Skipped);
+        };
+        let primary_plan = {
+            let context = self.rendering_resources_manager.chain_context(
+                &mut self.state,
+                primary_target.surface.format(),
+                primary_target.surface.size(),
+                &primary_target.depth_texture,
+                &mut primary_target.offscreen,
+            );
+            primary_target.chain.ensure(
+                &frame.passes,
+                assets_manager,
+                frame.chain_generation,
+                context,
+            );
+            let plan = primary_target.chain.plan(
+                &frame.passes,
+                &render_queue,
+                self.rendering_resources_manager.shader_handles(),
+            );
+            primary_target.chain.log(&plan);
+            plan
+        };
+        self.metrics.passes_with_draws = primary_plan
+            .iter()
+            .filter(|entry| entry.draws() > 0)
+            .count() as u32;
+        self.metrics.passes = primary_plan.len() as u32;
 
         drop(plan_zone);
 
         let submitted = Instant::now();
         let submit_zone = pill_core::profile_scope!("renderer: submit");
-        if primary_drawn {
-            self.state.render(
-                (SurfaceId::PRIMARY.0, self.camera),
-                &plan,
-                self.pipeline.passes(),
+        for (id, view_camera, view_transform) in drawn {
+            let Some(target) = self.targets.get_mut(&id) else {
+                continue;
+            };
+            // The primary's plan is the one prepared above; every other surface
+            // keeps a chain of its own, rebuilt from the same frame here.
+            let extra_plan;
+            let plan = if id == primary_surface {
+                primary_plan.as_slice()
+            } else {
+                let _extra_zone = pill_core::profile_scope!("renderer: extra surface");
+                let context = self.rendering_resources_manager.chain_context(
+                    &mut self.state,
+                    target.surface.format(),
+                    target.surface.size(),
+                    &target.depth_texture,
+                    &mut target.offscreen,
+                );
+                target.chain.ensure(
+                    &frame.passes,
+                    assets_manager,
+                    frame.chain_generation,
+                    context,
+                );
+                extra_plan = target.chain.plan(
+                    &frame.passes,
+                    &render_queue,
+                    self.rendering_resources_manager.shader_handles(),
+                );
+                extra_plan.as_slice()
+            };
+            let outcome = self.state.render(
+                target,
+                plan,
                 frame,
-                (&frame.camera, &frame.camera_transform),
+                view_camera,
+                view_transform,
                 &render_queue,
-                self.viewport,
-            )?;
-        }
-        drop(plan);
-        drop(submit_zone);
-        // The extra surfaces, each with the queue and instances built above.
-        for (id, view) in extra_views {
-            let _extra_zone = pill_core::profile_scope!("renderer: extra surface");
-            if let Err(error) =
-                self.render_extra_target(id, frame, assets_manager, &render_queue, view)
-            {
+            );
+            match outcome {
+                Ok(()) => {
+                    if !target.presented {
+                        target.presented = true;
+                        info!(
+                            target: pill_core::telemetry::telemetry_target::RENDERING,
+                            "[render] surface {id} first frame presented"
+                        );
+                    }
+                }
                 // One surface failing - a lost swapchain on a window that is
-                // closing - never stops the others from drawing.
-                pill_core::warn!(
+                // closing - never stops the others drawing. The primary's
+                // failure ends the frame: without it there is nothing left to
+                // draw.
+                Err(error) if id == primary_surface => return Err(error),
+                Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
                     "surface {id} was not drawn: {error}"
-                );
+                ),
             }
         }
+        drop(submit_zone);
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
         // One asset preview, when an editor asked for one:
         // its own encoder and submission, after the frame's surfaces, so it
@@ -480,9 +502,8 @@ impl PillRenderer for Renderer {
         // sync rebuilds them all, and drop the pass objects so the rebuild
         // reaches the bind groups that reference the old ones.
         self.rendering_resources_manager.invalidate();
-        self.pipeline.invalidate();
-        for target in self.extra_targets.values_mut() {
-            target.pipeline.invalidate();
+        for target in self.targets.values_mut() {
+            target.chain.invalidate();
         }
     }
 
@@ -509,7 +530,7 @@ impl PillRenderer for Renderer {
                 window,
                 width,
                 height,
-                self.state.surface.format(),
+                self.state.surface_format,
                 options.present,
             )
         }?;
@@ -518,6 +539,10 @@ impl PillRenderer for Renderer {
             surface.configuration(),
             "depth_texture",
         )?;
+        let overlay_targets = self
+            .state
+            .overlay
+            .new_targets(&self.state.device, surface.size());
         let camera = self
             .state
             .renderer_resource_storage
@@ -525,19 +550,21 @@ impl PillRenderer for Renderer {
             .insert(RendererCamera::new(
                 &self.state.device,
                 self.state.camera_bind_group_layout.clone(),
-            )?);
-        let target = ExtraTarget {
+            ));
+        let target = SurfaceTarget {
+            id,
             surface,
             depth_texture,
             offscreen: HashMap::new(),
-            pipeline: ScriptableRenderingPipeline::new(),
+            chain: GpuChain::new(),
             camera,
+            overlay_targets,
             viewport: None,
             minimized: width == 0 || height == 0,
             ready: true,
             presented: false,
         };
-        if let Some(replaced) = self.extra_targets.insert(id.0, target) {
+        if let Some(replaced) = self.targets.insert(id.0, target) {
             self.state
                 .renderer_resource_storage
                 .cameras
@@ -551,7 +578,12 @@ impl PillRenderer for Renderer {
     }
 
     fn detach_surface(&mut self, id: SurfaceId) {
-        let Some(target) = self.extra_targets.remove(&id.0) else {
+        if id == SurfaceId::PRIMARY {
+            // The renderer is built on the primary surface: it goes when the
+            // renderer does, never before.
+            return;
+        }
+        let Some(target) = self.targets.remove(&id.0) else {
             return;
         };
         // Wait for the GPU before the swapchain goes: a frame still in flight
@@ -577,52 +609,28 @@ impl PillRenderer for Renderer {
     }
 
     fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32) {
-        if id == SurfaceId::PRIMARY {
-            self.resize(width, height);
-            return;
-        }
-        let Some(target) = self.extra_targets.get_mut(&id.0) else {
+        let Some(target) = self.targets.get_mut(&id.0) else {
             return;
         };
-        target.minimized = width == 0 || height == 0;
-        if target.minimized {
-            return;
-        }
-        let resized = target
-            .surface
-            .resize(&self.state.device, width, height)
-            .and_then(|()| {
-                RendererTexture::new_depth_texture(
-                    &self.state.device,
-                    target.surface.configuration(),
-                    "depth_texture",
-                )
-            });
-        match resized {
-            Ok(depth_texture) => {
-                target.depth_texture = depth_texture;
-                target.offscreen.clear();
-                target.pipeline.invalidate_targets();
-            }
-            Err(error) => pill_core::warn!(
+        if let Err(error) = target.resize(&self.state.device, &self.state.overlay, width, height) {
+            // Warned instead of panicking: a size the driver will not take is
+            // not worth killing a running game over, and the next resize event
+            // tries again.
+            pill_core::warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
                 "surface {} resize to {width}x{height} failed: {error}", id.0
-            ),
+            );
         }
     }
 
     fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>) {
-        if id == SurfaceId::PRIMARY {
-            self.viewport = viewport;
-        } else if let Some(target) = self.extra_targets.get_mut(&id.0) {
+        if let Some(target) = self.targets.get_mut(&id.0) {
             target.viewport = viewport;
         }
     }
 
     fn set_surface_ready(&mut self, id: SurfaceId, ready: bool) {
-        if id == SurfaceId::PRIMARY {
-            self.primary_ready = ready;
-        } else if let Some(target) = self.extra_targets.get_mut(&id.0) {
+        if let Some(target) = self.targets.get_mut(&id.0) {
             target.ready = ready;
         }
     }
@@ -762,34 +770,29 @@ fn draw_preview(
     Ok(())
 }
 
-/// The wgpu objects behind a [`Renderer`]: device, surface, and frame state.
+/// The wgpu state every surface shares: the device, the queue, the caches and
+/// the painters.
 ///
-/// Owns the device and queue, the [`Surface`] built from them, the depth
-/// texture, and the offscreen colour targets the current chain declares. Kept
-/// beside [`Renderer`] rather than inside it so the GPU lifetime - new, resize,
-/// reconfigure - has a home independent of the asset caches.
+/// Kept beside [`Renderer`] rather than inside it so the GPU lifetime - new,
+/// and the surfaces' own - has a home independent of the asset caches. Nothing
+/// sized to a surface lives here: that is [`SurfaceTarget`]'s, one per surface.
 pub struct State {
     /// The per-type cache of every GPU resource - shaders, textures, meshes,
     /// materials - and the engine parameters table.
     pub(crate) renderer_resource_storage: RendererResourceStorage,
-    /// The window's swapchain, and the colour format every pipeline that
-    /// renders to it declares.
-    pub(crate) surface: Surface,
+    /// The colour format every pipeline that renders to a surface declares.
+    ///
+    /// One format for every surface: a surface attached later is refused
+    /// unless it can be drawn in this one, so an asset's GPU object - built
+    /// once, whatever surfaces exist - is built for it.
+    pub(crate) surface_format: wgpu::TextureFormat,
     /// The device every GPU object in this module is created from.
     pub(crate) device: wgpu::Device,
     /// The queue every upload and frame submission goes through.
     pub(crate) queue: wgpu::Queue,
-    /// Format of the depth buffer shared by the geometry passes.
+    /// Format of the depth buffer each surface owns, and of every geometry
+    /// pass's depth attachment.
     pub(crate) depth_format: wgpu::TextureFormat,
-    /// The depth buffer every geometry pass writes. Rebuilt when the surface
-    /// is, because it is sized the same way.
-    pub(crate) depth_texture: RendererTexture,
-    /// The offscreen colour targets the current chain names, by that name.
-    ///
-    /// Owned here rather than by the passes that write them: two passes name
-    /// the same target - one writes it, the next reads it - and a texture owned
-    /// by either would be a lifetime the chain cannot express.
-    pub(crate) offscreen: HashMap<String, RendererTexture>,
     mesh_drawer: MeshDrawer,
     /// GPU timestamps and pipeline statistics, when `PILL_GPU_PROFILE` asked
     /// for them and the device has the features.
@@ -798,9 +801,11 @@ pub struct State {
     frames_since_gpu_report: u32,
     /// Layout every camera bind group is built from.
     pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
-    /// The instance the surfaces were created from; an extra surface needs it.
+    /// The instance the surfaces were created from; a surface attached later
+    /// needs it.
     pub(crate) instance: wgpu::Instance,
-    /// The adapter the device runs on; an extra surface is checked against it.
+    /// The adapter the device runs on; a surface attached later is checked
+    /// against it.
     pub(crate) adapter: wgpu::Adapter,
     /// Debug drawing, outlines and picking, drawn over every surface's chain.
     pub(crate) overlay: Overlay,
@@ -808,7 +813,7 @@ pub struct State {
     /// back between frames.
     pub(crate) preview: crate::preview::PreviewRenderer,
     /// The UI painter: the game's UI and the debug labels, over every
-    /// surface's overlay. Its pipeline is tied to the surface's colour format,
+    /// surface's overlay. Its pipeline is tied to the surfaces' colour format,
     /// and the debug font is registered in it from the start.
     pub(crate) ui_renderer: UiRenderer,
     /// UI frames since the UI pass last logged what it drew, so the log
@@ -817,14 +822,28 @@ pub struct State {
 }
 
 impl State {
+    /// The shared state, beside the primary surface's target.
+    ///
+    /// The surface is one of the surfaces the state draws rather than part of
+    /// its own state, so it comes back as a [`SurfaceTarget`] like every
+    /// surface attached later.
+    ///
     /// # Safety
     ///
     /// As [`Surface::create`]: `window` must outlive the state.
-    async unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
+    async unsafe fn new(
+        window: RawWindowData,
+        width: u32,
+        height: u32,
+    ) -> Result<(Self, SurfaceTarget)> {
         // SAFETY: forwarded from this function's own contract.
         let (surface, device, queue, instance, adapter) =
             unsafe { Surface::create(window, width, height) }.await?;
-        let depth_format = wgpu::TextureFormat::Depth32Float;
+        // One definition for both sides of the contract: the attachment is
+        // created with this format and every pipeline that renders into it
+        // declares it, so the constant is the only place it is written.
+        let depth_format = RendererTexture::DEPTH_FORMAT;
+        let surface_format = surface.format();
         let depth_texture =
             RendererTexture::new_depth_texture(&device, surface.configuration(), "depth_texture")?;
         // Scoped like every other creation: a refused layout would otherwise
@@ -850,24 +869,42 @@ impl State {
         })?;
         let overlay = Overlay::new(
             &device,
-            surface.format(),
+            surface_format,
             depth_format,
             &camera_bind_group_layout,
         )?;
-        let mut ui_renderer = UiRenderer::new(&device, surface.format());
+        let mut ui_renderer = UiRenderer::new(&device, surface_format);
         ui_renderer.apply_texture_set(&device, &queue, &overlay::font::texture_set());
-        let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
+        let mut renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
         let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE);
         let gpu_profiler = create_gpu_profiler(&device, &queue, surface.backend());
         let preview = crate::preview::PreviewRenderer::new(&device);
-        Ok(Self {
-            renderer_resource_storage,
+        let overlay_targets = overlay.new_targets(&device, surface.size());
+        let camera = renderer_resource_storage
+            .cameras
+            .insert(RendererCamera::new(
+                &device,
+                camera_bind_group_layout.clone(),
+            ));
+        let primary = SurfaceTarget {
+            id: SurfaceId::PRIMARY,
             surface,
+            depth_texture,
+            offscreen: HashMap::new(),
+            chain: GpuChain::new(),
+            camera,
+            overlay_targets,
+            viewport: None,
+            minimized: width == 0 || height == 0,
+            ready: true,
+            presented: true,
+        };
+        let state = Self {
+            renderer_resource_storage,
+            surface_format,
             device,
             queue,
             depth_format,
-            depth_texture,
-            offscreen: HashMap::new(),
             mesh_drawer,
             gpu_profiler,
             frames_since_gpu_report: 0,
@@ -878,32 +915,17 @@ impl State {
             preview,
             ui_renderer,
             frames_since_ui_report: 0,
-        })
+        };
+        Ok((state, primary))
     }
 
-    /// Resize the surface and rebuild the depth buffer that matches it.
-    ///
-    /// Only committed once the surface accepted the new size, so a refusal
-    /// leaves the old, consistent surface and depth pair in place instead of a
-    /// configuration that disagrees with the swapchain; the caller reports the
-    /// refusal instead of the host dying on a resize it cannot honour.
-    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-        self.surface.resize(&self.device, width, height)?;
-        self.depth_texture = RendererTexture::new_depth_texture(
-            &self.device,
-            self.surface.configuration(),
-            "depth_texture",
-        )?;
-        Ok(())
-    }
-
-    /// Draw the debug labels and the frame's UI for `surface_id`, uploading
-    /// texture changes first.
+    /// Draw the debug labels and the frame's UI for `surface_id`.
     ///
     /// The labels go first, in surface pixels, and the game's lists naming
     /// `surface_id` follow, so the game's UI stays on top; every surface
     /// records through this same path, each with its own id, and all of a
-    /// surface's lists go to the painter in one call.
+    /// surface's lists go to the painter in one call. The frame's textures were
+    /// applied by [`Renderer::render`] before this ran, so nothing here uploads.
     fn record_ui(
         &mut self,
         surface_id: u32,
@@ -913,10 +935,6 @@ impl State {
         frame: &RenderFrame,
         labels: &pill_ui_frame::DrawList,
     ) {
-        if !frame.ui.textures.is_empty() {
-            self.ui_renderer
-                .apply_texture_set(&self.device, &self.queue, &frame.ui.textures);
-        }
         let mut lists = vec![(labels, 1.0)];
         lists.extend(
             frame
@@ -948,65 +966,50 @@ impl State {
             );
         }
     }
-    /// Create a target for every offscreen output the chain declares.
+
+    /// Draw one surface's frame into `target`: the chain's passes, the overlay,
+    /// the UI, and the present.
     ///
-    /// Rebuilt whenever the chain is, and sized to the surface: one that no
-    /// longer matches the window would be sampled at a different scale from the
-    /// pass that wrote it, which shows up as a picture that shrinks with the
-    /// window rather than one that resizes with it.
-    pub(crate) fn ensure_offscreen_targets(&mut self, chain: &[ResolvedPass]) {
-        let (width, height) = self.surface.size();
-        let device = &self.device;
-        let targets = &mut self.offscreen;
-        targets.clear();
-
-        for pass in chain {
-            // The pass's own target first, then the ones it writes beside it.
-            // The scale is the first pass's: a target belongs to the chain, and
-            // the pass that names it first is asking on everyone's behalf.
-            let scale = pass.target_scale.max(1);
-            let written = std::iter::once(&pass.target).chain(pass.extra_targets.iter());
-            for target in written {
-                let PassTarget::Offscreen(name) = target else {
-                    continue;
-                };
-                if targets.contains_key(name) {
-                    continue;
-                }
-                match RendererTexture::new_render_target(
-                    device,
-                    name,
-                    (width / scale).max(1),
-                    (height / scale).max(1),
-                    OFFSCREEN_FORMAT,
-                ) {
-                    Ok(target) => {
-                        targets.insert(name.clone(), target);
-                    }
-                    // Reported instead of fatal: the passes that read it each
-                    // say they are not drawn, which is the same outcome their
-                    // own failure path would produce.
-                    Err(error) => {
-                        pill_core::warn!(
-                            target: pill_core::telemetry::telemetry_target::RENDERING,
-                            "offscreen target `{name}` was not created: {error}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
+    /// The target is handed in rather than swapped into the state's own fields,
+    /// so a per-surface field has one home whether the surface is the primary
+    /// one or one attached later.
     fn render(
         &mut self,
-        (surface_id, camera_handle): (u32, RendererCameraHandle),
+        target: &mut SurfaceTarget,
         plan: &[PassPlan],
-        passes: &[PassSlot],
         frame: &RenderFrame,
-        (view_camera, view_transform): (&CameraComponent, &TransformComponent),
+        camera: &CameraComponent,
+        transform: &TransformComponent,
         render_queue: &[RenderQueueItem],
-        viewport: Option<RenderViewport>,
     ) -> Result<()> {
+        let draw = self.begin_surface_frame(target, frame, camera, transform, render_queue)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_encoder"),
+            });
+        // One wgpu render pass per pass of the chain, into the same encoder: the
+        // first clears the targets it writes, the rest add to what is there.
+        for entry in plan {
+            self.record_pass(&mut encoder, entry, target, &draw);
+        }
+        self.record_overlay_and_ui(&mut encoder, target, &draw);
+        self.finish_surface_frame(encoder, draw)
+    }
+
+    /// Acquire one surface's image and prepare everything the passes read.
+    ///
+    /// The device-loss check, the swapchain acquire, the engine parameters, the
+    /// camera the surface is drawn through and the profiler's frame all happen
+    /// here, so the recording phases only record.
+    fn begin_surface_frame<'a>(
+        &mut self,
+        target: &mut SurfaceTarget,
+        frame: &'a RenderFrame,
+        camera: &CameraComponent,
+        transform: &TransformComponent,
+        render_queue: &'a [RenderQueueItem],
+    ) -> Result<SurfaceDraw<'a>> {
         // A lost device draws nothing and reports nothing, so the loss the
         // callback latched is the frame path's only chance to say so: returning
         // it here ends the run with a reason instead of a frozen picture.
@@ -1016,22 +1019,20 @@ impl State {
         // Both borrows are of separate fields, so the surface can reconfigure
         // itself against the device that created it.
         let acquire_zone = pill_core::profile_scope!("renderer: acquire surface");
-        let surface_frame = self.surface.acquire(&self.device)?;
+        let image = target.surface.acquire(&self.device)?;
         drop(acquire_zone);
-        let (width, height) = self.surface.size();
+        let size = target.surface.size();
         // Through the sRGB view the pipelines were built for, which is not the
         // texture's own format on a surface without sRGB formats.
-        let view = surface_frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.surface.format()),
-                ..Default::default()
-            });
+        let view = image.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(target.surface.format()),
+            ..Default::default()
+        });
         self.renderer_resource_storage.engine_parameters.update(
             &self.queue,
-            0.0,
-            [0.0; 3],
-            [width, height],
+            NO_FOG_DENSITY,
+            NO_FOG_COLOR,
+            [size.0, size.1],
             [
                 frame.seconds,
                 frame.delta_seconds,
@@ -1039,76 +1040,110 @@ impl State {
                 0.0,
             ],
         );
-        let camera = self
+        let viewport = target
+            .viewport
+            .and_then(|value| value.clamped_to(size.0, size.1))
+            .unwrap_or_else(|| RenderViewport::full(size.0, size.1));
+        let camera_handle = target.camera;
+        let renderer_camera = self
             .renderer_resource_storage
             .cameras
             .get_mut(camera_handle)
             .ok_or(RendererError::RendererResourceNotFound)?;
-        let viewport = viewport
-            .and_then(|value| value.clamped_to(width, height))
-            .unwrap_or_else(|| RenderViewport::full(width, height));
-        camera.update(
+        renderer_camera.update(
             &self.queue,
-            view_camera,
-            view_transform,
+            camera,
+            transform,
             viewport.width as f32 / viewport.height as f32,
         );
-        let camera = self
-            .renderer_resource_storage
-            .cameras
-            .get(camera_handle)
-            .ok_or(RendererError::RendererResourceNotFound)?;
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render_encoder"),
-            });
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.begin_frame(&self.device, &self.queue);
         }
-        // One wgpu render pass per pass of the chain, into the same encoder: the
-        // first clears the targets it writes, the rest add to what is there.
-        for entry in plan {
-            let _pass_zone = pill_core::profile_scope!(
-                "renderer pass: {}",
-                entry.label();
-                [("{} draws", entry.draws())]
-            );
-            // Every target the pass writes, in the order the shader's
-            // `SV_TARGET` list names them.
-            let mut views = Vec::with_capacity(entry.outputs().len());
-            let mut missing_target = false;
-            for output in entry.outputs() {
-                match output {
-                    PassOutput::Surface => views.push(&view),
-                    // A pass whose target was never created draws nothing rather
-                    // than into the wrong one; the chain log already named the
-                    // pass that could not be built.
-                    PassOutput::Offscreen(name) => match self.offscreen.get(*name) {
-                        Some(texture) => views.push(&texture.texture_view),
-                        None => missing_target = true,
-                    },
+        Ok(SurfaceDraw {
+            surface: target.id.0,
+            image,
+            view,
+            size,
+            viewport,
+            camera: camera_handle,
+            frame,
+            render_queue,
+        })
+    }
+
+    /// Record one pass of the chain into `encoder`.
+    ///
+    /// A pass whose target or camera is gone records nothing: the chain log
+    /// already named the pass that could not be built.
+    fn record_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        entry: &PassPlan,
+        target: &SurfaceTarget,
+        draw: &SurfaceDraw,
+    ) {
+        let _pass_zone = pill_core::profile_scope!(
+            "renderer pass: {}",
+            entry.label();
+            [("{} draws", entry.draws())]
+        );
+        let Some(color_attachments) = self.pass_color_attachments(entry, target, draw) else {
+            return;
+        };
+        let clear = entry.clears();
+        // Whether a GPU timestamp was written before the pass, so the one after
+        // it closes a pair.
+        let timed = match entry {
+            PassPlan::Geometry { .. } => {
+                self.record_geometry_pass(encoder, entry, target, draw, &color_attachments, clear)
+            }
+            PassPlan::Fullscreen { .. } => {
+                self.record_fullscreen_pass(encoder, entry, target, draw, &color_attachments, clear)
+            }
+        };
+        if timed {
+            write_gpu_timestamp(&mut self.gpu_profiler, encoder, entry.label());
+        }
+    }
+
+    /// The colour attachments a pass writes, in the order the shader's
+    /// `SV_TARGET` list names them.
+    ///
+    /// `None` when one of them was never created: the pass then draws nothing,
+    /// because drawing into the remaining targets would leave a picture the
+    /// next pass cannot read.
+    fn pass_color_attachments<'a>(
+        &self,
+        entry: &PassPlan,
+        target: &'a SurfaceTarget,
+        draw: &'a SurfaceDraw,
+    ) -> Option<Vec<Option<wgpu::RenderPassColorAttachment<'a>>>> {
+        let (width, height) = draw.size;
+        let viewport = draw.viewport;
+        let mut views = Vec::with_capacity(entry.outputs().len());
+        for output in entry.outputs() {
+            match output {
+                PassOutput::Surface => views.push(&draw.view),
+                PassOutput::Offscreen(name) => {
+                    views.push(&target.offscreen.get(*name)?.texture_view);
                 }
             }
-            if missing_target {
-                continue;
-            }
-
-            let clear = entry.clears();
-            // `LoadOp::Clear` ignores the scissor, so an opaque colour here
-            // repaints the whole swapchain image whatever the viewport says.
-            // When the frame owns only part of the target, that would paint
-            // over everything else sharing the window - the editor's panels -
-            // once per frame. A transparent clear keeps those pixels, and is
-            // asked for only where the surface can actually carry alpha: in an
-            // `Opaque` mode the same clear would be opaque black instead.
-            let shared_target =
-                !covers_target(viewport, width, height) && self.surface.composites();
-            let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = entry
+        }
+        // `LoadOp::Clear` ignores the scissor, so an opaque colour here repaints
+        // the whole swapchain image whatever the viewport says. When the frame
+        // owns only part of the target, that would paint over everything else
+        // sharing the window - the editor's panels - once per frame. A
+        // transparent clear keeps those pixels, and is asked for only where the
+        // surface can actually carry alpha: in an `Opaque` mode the same clear
+        // would be opaque black instead.
+        let shared_target = !covers_target(viewport, width, height) && target.surface.composites();
+        let clear = entry.clears();
+        Some(
+            entry
                 .outputs()
                 .iter()
                 .zip(views.iter())
-                .map(|(output, target)| {
+                .map(|(output, view)| {
                     let load = match output {
                         PassOutput::Surface if shared_target => {
                             wgpu::LoadOp::Clear(CLEAR_TRANSPARENT)
@@ -1116,7 +1151,7 @@ impl State {
                         _ => color_load(clear),
                     };
                     Some(wgpu::RenderPassColorAttachment {
-                        view: target,
+                        view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -1125,176 +1160,191 @@ impl State {
                         },
                     })
                 })
-                .collect();
+                .collect(),
+        )
+    }
 
-            // Whether a GPU timestamp was written before the pass, so the one
-            // after it closes a pair.
-            let timed;
-            match entry {
-                PassPlan::Geometry {
-                    label,
-                    queue,
-                    ranges,
-                    pass_index,
-                    ..
-                } => {
-                    timed = write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, label);
-                    let depth_stencil_attachment = wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_texture.texture_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: if clear {
-                                wgpu::LoadOp::Clear(1.0)
-                            } else {
-                                wgpu::LoadOp::Load
-                            },
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    };
-                    // A pass that built a pipeline draws through it: the
-                    // pipeline holds the targets' formats and the pass's depth
-                    // and culling, none of which an instance may choose.
-                    let pipeline = pass_index.and_then(|index| match passes.get(index) {
-                        Some(PassSlot::Drawable(pass)) => Some(&pass.pipeline),
-                        _ => None,
-                    });
-                    self.mesh_drawer.record_draw_commands(
-                        &mut encoder,
-                        &self.renderer_resource_storage,
-                        label,
-                        pipeline,
-                        &color_attachments,
-                        depth_stencil_attachment,
-                        camera,
-                        queue,
-                        ranges,
-                        viewport,
-                        self.gpu_profiler.as_ref(),
-                    )?;
-                }
-                PassPlan::Fullscreen {
-                    label,
-                    pass_index,
-                    tests_depth,
-                    ..
-                } => {
-                    let Some(PassSlot::Drawable(pass)) = passes.get(*pass_index) else {
-                        continue;
-                    };
-                    timed = write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, label);
-                    // A post-processing step has no depth: it overwrites every
-                    // pixel it covers, and the depth left behind describes
-                    // geometry that is not what this triangle is. A skybox reads
-                    // that depth without writing it, so it fills only what no
-                    // mesh covered; as the frame's first pass it opens the
-                    // buffer at the far plane like a geometry pass would.
-                    let depth_stencil_attachment =
-                        tests_depth.then(|| wgpu::RenderPassDepthStencilAttachment {
-                            view: &self.depth_texture.texture_view,
-                            depth_ops: Some(wgpu::Operations {
-                                load: if clear {
-                                    wgpu::LoadOp::Clear(1.0)
-                                } else {
-                                    wgpu::LoadOp::Load
-                                },
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        });
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some(label),
-                        color_attachments: &color_attachments,
-                        depth_stencil_attachment,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    render_pass.set_pipeline(&pass.pipeline);
-                    // A fullscreen pass covers its whole target unless it is
-                    // clipped, and the post-processing stages - the ones that
-                    // write the swapchain - would otherwise spread the scene
-                    // over the entire window instead of the rectangle the
-                    // geometry passes drew into.
-                    //
-                    // Only the scissor moves. The viewport has to stay the whole
-                    // target, because this pass derives its texture coordinates
-                    // from its own position in NDC: mapping NDC onto a
-                    // sub-rectangle would stretch the source into it rather than
-                    // clip the picture to it. The scissor is expressed in this
-                    // pass's own target, which the chain may have scaled down.
-                    let (target_width, target_height) = match entry.outputs().first() {
-                        Some(PassOutput::Offscreen(name)) => {
-                            self.offscreen.get(*name).map_or((width, height), |target| {
-                                let extent = target.texture.size();
-                                (extent.width, extent.height)
-                            })
-                        }
-                        _ => (width, height),
-                    };
-                    let scissor =
-                        viewport_in_target(viewport, width, height, target_width, target_height);
-                    render_pass.set_scissor_rect(
-                        scissor.x,
-                        scissor.y,
-                        scissor.width,
-                        scissor.height,
-                    );
-                    if pass.pass_engine_parameters {
-                        render_pass.set_bind_group(
-                            ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-                            &self.renderer_resource_storage.engine_parameters.bind_group,
-                            &[],
-                        );
-                    }
-                    if pass.pass_camera_parameters {
-                        render_pass.set_bind_group(
-                            CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-                            &camera.bind_group,
-                            &[],
-                        );
-                    }
-                    if let Some(bind_group) = &pass.parameters_bind_group {
-                        render_pass.set_bind_group(
-                            MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-                            bind_group,
-                            &[],
-                        );
-                    }
-                    if let Some(bind_group) = &pass.textures_bind_group {
-                        render_pass.set_bind_group(
-                            MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
-                            bind_group,
-                            &[],
-                        );
-                    }
-                    render_pass.draw(0..3, 0..1);
-                }
+    /// Record a geometry pass: the instances it was handed, through the
+    /// pipeline it built or through each instance's own material.
+    ///
+    /// Returns whether a GPU timestamp was written before the pass.
+    fn record_geometry_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        entry: &PassPlan,
+        target: &SurfaceTarget,
+        draw: &SurfaceDraw,
+        color_attachments: &[Option<wgpu::RenderPassColorAttachment>],
+        clear: bool,
+    ) -> bool {
+        let PassPlan::Geometry {
+            label,
+            queue,
+            ranges,
+            pass_index,
+            ..
+        } = entry
+        else {
+            return false;
+        };
+        let Some(camera) = self.renderer_resource_storage.cameras.get(draw.camera) else {
+            return false;
+        };
+        let timed = write_gpu_timestamp(&mut self.gpu_profiler, encoder, label);
+        // A pass that built a pipeline draws through it: the pipeline holds the
+        // targets' formats and the pass's depth and culling, none of which an
+        // instance may choose.
+        let pass_pipeline = pass_index.and_then(|index| match target.chain.passes().get(index) {
+            Some(PassSlot::Drawable(pass)) => Some(&pass.pipeline),
+            _ => None,
+        });
+        self.mesh_drawer.record_draw_commands(
+            encoder,
+            &self.renderer_resource_storage,
+            label,
+            pass_pipeline,
+            color_attachments,
+            depth_attachment(&target.depth_texture.texture_view, clear),
+            camera,
+            queue,
+            ranges,
+            draw.viewport,
+            self.gpu_profiler.as_ref(),
+        );
+        timed
+    }
+
+    /// Record a fullscreen pass: its single triangle over the whole target,
+    /// clipped to the frame's rectangle.
+    ///
+    /// Returns whether a GPU timestamp was written before the pass.
+    fn record_fullscreen_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        entry: &PassPlan,
+        target: &SurfaceTarget,
+        draw: &SurfaceDraw,
+        color_attachments: &[Option<wgpu::RenderPassColorAttachment>],
+        clear: bool,
+    ) -> bool {
+        let PassPlan::Fullscreen {
+            label,
+            pass_index,
+            tests_depth,
+            ..
+        } = entry
+        else {
+            return false;
+        };
+        let Some(PassSlot::Drawable(pass)) = target.chain.passes().get(*pass_index) else {
+            return false;
+        };
+        let Some(camera) = self.renderer_resource_storage.cameras.get(draw.camera) else {
+            return false;
+        };
+        let timed = write_gpu_timestamp(&mut self.gpu_profiler, encoder, label);
+        // A post-processing step has no depth: it overwrites every pixel it
+        // covers, and the depth left behind describes geometry that is not what
+        // this triangle is. A skybox reads that depth without writing it, so it
+        // fills only what no mesh covered; as the frame's first pass it opens
+        // the buffer at the far plane like a geometry pass would.
+        let depth_stencil_attachment =
+            tests_depth.then(|| depth_attachment(&target.depth_texture.texture_view, clear));
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments,
+            depth_stencil_attachment,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        render_pass.set_pipeline(&pass.pipeline);
+        // A fullscreen pass covers its whole target unless it is clipped, and
+        // the post-processing stages - the ones that write the swapchain -
+        // would otherwise spread the scene over the entire window instead of
+        // the rectangle the geometry passes drew into.
+        //
+        // Only the scissor moves. The viewport has to stay the whole target,
+        // because this pass derives its texture coordinates from its own
+        // position in NDC: mapping NDC onto a sub-rectangle would stretch the
+        // source into it rather than clip the picture to it. The scissor is
+        // expressed in this pass's own target, which the chain may have scaled
+        // down.
+        let (width, height) = draw.size;
+        let (target_width, target_height) = match entry.outputs().first() {
+            Some(PassOutput::Offscreen(name)) => {
+                target
+                    .offscreen
+                    .get(*name)
+                    .map_or((width, height), |texture| {
+                        let extent = texture.texture.size();
+                        (extent.width, extent.height)
+                    })
             }
-            if timed {
-                write_gpu_timestamp(&mut self.gpu_profiler, &mut encoder, entry.label());
-            }
+            _ => (width, height),
+        };
+        let scissor = viewport_in_target(draw.viewport, width, height, target_width, target_height);
+        render_pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+        if pass.reads_engine_parameters {
+            render_pass.set_bind_group(
+                ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                &self.renderer_resource_storage.engine_parameters.bind_group,
+                &[],
+            );
         }
+        if pass.reads_camera_parameters {
+            render_pass.set_bind_group(
+                CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                &camera.bind_group,
+                &[],
+            );
+        }
+        if let Some(bind_group) = &pass.parameters_bind_group {
+            render_pass.set_bind_group(
+                MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                bind_group,
+                &[],
+            );
+        }
+        if let Some(bind_group) = &pass.textures_bind_group {
+            render_pass.set_bind_group(MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX, bind_group, &[]);
+        }
+        render_pass.draw(0..3, 0..1);
+        timed
+    }
+
+    /// Record the overlay and the UI over the chain's picture.
+    fn record_overlay_and_ui(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &mut SurfaceTarget,
+        draw: &SurfaceDraw,
+    ) {
+        let surface_id = draw.surface;
         // Over the chain's picture: outlines, debug lines and labels, gizmos,
         // and the pick buffer when this surface has picks waiting.
         let overlay_zone = pill_core::profile_scope!("renderer: overlay");
+        let Some(camera) = self.renderer_resource_storage.cameras.get(draw.camera) else {
+            return;
+        };
         let labels = overlay::label_list(
-            &frame.debug,
+            &draw.frame.debug,
             &camera.parameters_data.view_projection_matrix,
-            viewport,
+            draw.viewport,
         );
         self.overlay.record(
             &self.device,
             &self.queue,
-            &mut encoder,
+            encoder,
+            &mut target.overlay_targets,
             OverlayFrame {
                 surface: surface_id,
-                color_view: &view,
-                depth_view: &self.depth_texture.texture_view,
-                size: (width, height),
-                viewport,
+                color_view: &draw.view,
+                depth_view: &target.depth_texture.texture_view,
+                viewport: draw.viewport,
                 camera,
-                frame,
-                render_queue,
+                frame: draw.frame,
+                render_queue: draw.render_queue,
                 instance_buffer: self.mesh_drawer.instance_buffer(),
                 storage: &self.renderer_resource_storage,
             },
@@ -1303,13 +1353,17 @@ impl State {
         // The debug labels and the game's UI, over the chain's picture,
         // through the [`ui`](crate::ui) painter.
         self.record_ui(
-            surface_id,
-            &mut encoder,
-            &view,
-            (width, height),
-            frame,
-            &labels,
+            surface_id, encoder, &draw.view, draw.size, draw.frame, &labels,
         );
+    }
+
+    /// Resolve the profiler's queries, submit the frame's commands and present
+    /// the image.
+    fn finish_surface_frame(
+        &mut self,
+        mut encoder: wgpu::CommandEncoder,
+        draw: SurfaceDraw,
+    ) -> Result<()> {
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.resolve_timestamp_queries(&self.device, &mut encoder);
             profiler.resolve_pipeline_statistics_queries(&self.device, &mut encoder);
@@ -1328,14 +1382,15 @@ impl State {
         drop(queue_submit_zone);
         self.overlay.after_submit();
         let present_zone = pill_core::profile_scope!("renderer: present");
-        self.queue.present(surface_frame);
+        self.queue.present(draw.image);
         drop(present_zone);
         if let Some(profiler) = &mut self.gpu_profiler {
             profiler.end_frame();
             self.frames_since_gpu_report += 1;
             if self.frames_since_gpu_report >= GPU_REPORT_INTERVAL {
                 self.frames_since_gpu_report = 0;
-                profiler.log_latest(u64::from(viewport.width) * u64::from(viewport.height));
+                profiler
+                    .log_latest(u64::from(draw.viewport.width) * u64::from(draw.viewport.height));
             }
         }
         Ok(())
@@ -1402,6 +1457,29 @@ fn write_gpu_timestamp(
         .as_mut()
         .and_then(|profiler| profiler.write_timestamp(encoder, label))
         .is_some()
+}
+
+/// The depth attachment a geometry pass writes, or a skybox reads.
+///
+/// A pass that opens the frame's targets clears it to the far plane, so the
+/// oldest geometry is drawn wherever nothing has written yet; every later pass
+/// keeps what is there.
+fn depth_attachment(
+    view: &wgpu::TextureView,
+    clear: bool,
+) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    wgpu::RenderPassDepthStencilAttachment {
+        view,
+        depth_ops: Some(wgpu::Operations {
+            load: if clear {
+                wgpu::LoadOp::Clear(1.0)
+            } else {
+                wgpu::LoadOp::Load
+            },
+            store: wgpu::StoreOp::Store,
+        }),
+        stencil_ops: None,
+    }
 }
 
 /// The colour a pass opens its target with, or the values already in it.

@@ -14,11 +14,9 @@
 // * The light rig is a constant here, as it is in the port's default shader:
 //   `DirectionalLightComponent` is registered but never read by the renderer.
 // * Material parameters are four `float4` slots, which is exactly how the Rust
-//   side packs them - 16 bytes per slot, in slot order. (The default lit shader
-//   predates that rule and declares a packed `float3`+`float`, which is why its
-//   `specularity` reads padding.)
+//   side packs them - 16 bytes per slot, in slot order.
 
-#include "common.hlsl"
+#include "lit_common.hlsl"
 
 // One `float4` per slot, in slot order, because that is what the Rust side
 // writes: 16 bytes per slot, a `Color` in xyz, a `Scalar` in x. Nothing may read
@@ -123,23 +121,13 @@ float3 accumulate_light(
     return (kD * diffuse_burley(NoV, NoL, LoH, roughness, albedo) + specular) * radiance * NoL;
 }
 
-struct PixelInput
-{
-    [[vk::location(0)]] float3 vertex_position       : TEXCOORD0;
-    [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD1;
-    [[vk::location(2)]] float3 TBN_tangent           : TEXCOORD2;
-    [[vk::location(3)]] float3 TBN_bitangent         : TEXCOORD3;
-    [[vk::location(4)]] float3 TBN_normal            : TEXCOORD4;
-    [[vk::location(5)]] float3 world_position        : TEXCOORD5;
-};
-
 struct PixelOutput
 {
     [[vk::location(0)]] float4 output : SV_TARGET0;
 };
 
 [shader("fragment")]
-PixelOutput fs_main(PixelInput input)
+PixelOutput fs_main(LitVaryings input)
 {
     PixelOutput result;
 
@@ -203,15 +191,7 @@ PixelOutput fs_main(PixelInput input)
     float3 ambient = albedo * AMBIENT_STRENGTH + F0 * AMBIENT_STRENGTH;
 
     float3 color = ambient + direct + emissive;
-
-    // The same exp-squared fog the default shader applies, so both agree.
-    float fog_distance = length(camera.camera_position - input.world_position);
-    float fog_factor = clamp(
-        1.0 - exp(-engine.fog_density * engine.fog_density * fog_distance * fog_distance),
-        0.0,
-        1.0
-    );
-    color = lerp(color, engine.fog_color, fog_factor);
+    color = apply_fog(color, input.world_position);
 
     result.output = float4(color, 1.0);
     return result;

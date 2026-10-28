@@ -16,7 +16,7 @@
 use pill_engine::{AssetManager, Handle, World};
 use pill_master_renderer_data::{
     AssetLoader, Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType,
-    ShaderTextureSlot, Texture, TextureType,
+    ShaderTextureKind, ShaderTextureSlot, Texture, TextureType,
 };
 use std::path::PathBuf;
 
@@ -82,7 +82,7 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
                 )])
                 .with_texture_slots(vec![ShaderTextureSlot::new(
                     "color",
-                    TextureType::Color,
+                    ShaderTextureKind::Color,
                     (0, 1),
                 )])
                 .with_engine_parameters(true)
@@ -103,7 +103,7 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
                 )])
                 .with_texture_slots(vec![ShaderTextureSlot::new(
                     "color",
-                    TextureType::Color,
+                    ShaderTextureKind::Color,
                     (0, 1),
                 )])
                 .with_engine_parameters(true)

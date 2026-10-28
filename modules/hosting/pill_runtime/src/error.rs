@@ -48,10 +48,11 @@ mod tests {
     /// error it carries rather than one of its own.
     #[test]
     fn every_composed_arm_reports_the_leaf_code() {
-        let renderer = RenderingError::Renderer(pill_renderer_api::RendererError::NoAlphaModes);
+        let renderer =
+            RenderingError::Renderer(pill_renderer_api::RendererError::RendererResourceNotFound);
         assert_eq!(
             renderer.code().map(|code| code.to_string()).as_deref(),
-            Some("engine::renderer::no_alpha_modes")
+            Some("engine::renderer::renderer_resource_not_found")
         );
 
         let host = RenderingError::from(pill_core::error::HostError::from(

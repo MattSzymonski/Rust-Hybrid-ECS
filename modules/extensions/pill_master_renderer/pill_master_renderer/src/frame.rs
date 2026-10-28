@@ -27,6 +27,7 @@ use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, S
 pub use pill_renderer_api::frame::{
     CullMode, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
 };
+use pill_renderer_api::{AssetKey, ChainSource};
 
 // Current crate
 use crate::{
@@ -34,6 +35,12 @@ use crate::{
     components::{CameraComponent, MeshRendererComponent, TransformComponent},
     resources::RenderingManager,
 };
+
+/// The frame's typed key for `handle`: the asset layer's packing, in the type
+/// the contract names a key with.
+fn frame_key<T: pill_engine::Asset>(handle: Handle<T>) -> AssetKey {
+    AssetKey(asset_key(handle))
+}
 
 /// The chain a frame should run, read from the pipeline the game set.
 ///
@@ -76,21 +83,21 @@ fn resolve_passes(
         // parameters and textures, under whatever the pass sets itself. Folded
         // in here, where the chain is resolved, so the renderer sees one plain
         // pass and a material edit moves the asset revision that re-resolves it.
-        let mut shader = (pass.shader != Handle::INVALID).then(|| asset_key(pass.shader));
+        let mut shader = (pass.shader != Handle::INVALID).then(|| frame_key(pass.shader));
         let mut parameters = BTreeMap::new();
         let mut textures = BTreeMap::new();
         if pass.material != Handle::INVALID {
             match assets.get(pass.material) {
                 Some(material) => {
                     if shader.is_none() && material.shader != Handle::INVALID {
-                        shader = Some(asset_key(material.shader));
+                        shader = Some(frame_key(material.shader));
                     }
                     parameters.extend(material.parameters.clone());
                     textures.extend(
                         material
                             .textures
                             .iter()
-                            .map(|(slot, binding)| (slot.clone(), asset_key(binding.texture))),
+                            .map(|(slot, binding)| (slot.clone(), frame_key(binding.texture))),
                     );
                 }
                 None => warn!(
@@ -104,23 +111,16 @@ fn resolve_passes(
         textures.extend(
             pass.textures
                 .iter()
-                .map(|(slot, handle)| (slot.clone(), asset_key(*handle))),
+                .map(|(slot, handle)| (slot.clone(), frame_key(*handle))),
         );
 
         passes.push(ResolvedPass {
             name: pass.name.clone(),
             shader,
-            kind: pass.kind,
-            target: pass.target.clone(),
-            extra_targets: pass.extra_targets.clone(),
-            target_scale: pass.target_scale,
-            blend: pass.blend,
-            depth_write: pass.depth_write,
-            cull: pass.cull,
+            settings: pass.settings.clone(),
             parameters,
             inputs: pass.inputs.clone(),
             textures,
-            order: pass.order,
         });
     }
     if stale_handles > 0 {
@@ -130,7 +130,7 @@ fn resolve_passes(
             pipeline.passes.len()
         );
     }
-    passes.sort_by_key(|pass| pass.order);
+    passes.sort_by_key(|pass| pass.settings.order);
 
     // Contract from `RenderPass`: one pass writes the surface and it runs last,
     // or the window shows something other than what the chain produced. Named
@@ -138,7 +138,7 @@ fn resolve_passes(
     let surface_positions: Vec<usize> = passes
         .iter()
         .enumerate()
-        .filter(|(_, pass)| matches!(pass.target, PassTarget::Surface))
+        .filter(|(_, pass)| matches!(pass.settings.target, PassTarget::Surface))
         .map(|(index, _)| index)
         .collect();
     let surface_is_last = surface_positions.len() == 1 && surface_positions[0] + 1 == passes.len();
@@ -283,13 +283,13 @@ pub fn rendering_system(
     // is resolved again only when the pipeline handle or the revision moved.
     // Resolution clones every pass's strings and maps, and the renderer uses
     // the generation it produces to recognise the chain it already built from.
-    let chain_source = (
-        assets.revision(),
-        manager
+    let chain_source = ChainSource {
+        revision: assets.revision(),
+        pipeline: manager
             .get()
             .and_then(|manager| manager.pipeline())
-            .map(asset_key),
-    );
+            .map(frame_key),
+    };
     if frame.chain_source != Some(chain_source) {
         frame.passes = resolve_passes(assets, manager.get());
         frame.chain_source = Some(chain_source);
@@ -311,13 +311,12 @@ pub fn rendering_system(
         .get_mut()
         .map(|mut debug_draw| debug_draw.collect_frame(delta_seconds))
         .unwrap_or_default();
-    match outlines.get() {
-        Some(outlines) => {
-            frame.outlined.clone_from(&outlines.entities);
-            frame.outline_color = outlines.color;
-        }
-        None => frame.outlined.clear(),
-    }
+    // The outlines an editor asked for, as the resource holds them; a world
+    // without the resource outlines nothing.
+    frame.outlines = outlines
+        .get()
+        .cloned()
+        .unwrap_or_else(pill_renderer_api::SelectionOutlines::default);
     // Picks asked for since the last frame; the renderer answers them later.
     frame.pick_requests = pick_requests
         .get_mut()
@@ -341,7 +340,7 @@ pub fn rendering_system(
     let primary_binding = bindings.and_then(|bindings| {
         bindings
             .bindings
-            .get(&pill_renderer_api::SurfaceId::PRIMARY.0)
+            .get(&pill_renderer_api::SurfaceId::PRIMARY)
     });
     let selected = match primary_binding {
         Some(binding) => {
@@ -354,17 +353,19 @@ pub fn rendering_system(
                 .map(|(entity, camera, transform)| (entity.id(), *camera, *transform)),
         ),
     };
-    frame.has_camera = selected.is_some();
-    if let Some((camera, transform)) = selected {
-        frame.camera = camera;
-        frame.camera_transform = transform;
-    }
-    // Every other surface's camera, resolved from its binding; a surface whose
-    // binding resolves to nothing is left out, and draws nothing.
+    // Every surface's camera, the primary one included: its binding when it
+    // has one, the frame's chosen world camera otherwise. A surface with no
+    // camera is left out, and draws nothing.
     frame.surface_views.clear();
+    if let Some((camera, transform)) = selected {
+        frame.surface_views.insert(
+            pill_renderer_api::SurfaceId::PRIMARY,
+            pill_renderer_api::SurfaceView { camera, transform },
+        );
+    }
     if let Some(bindings) = bindings {
         for (surface, binding) in &bindings.bindings {
-            if *surface == pill_renderer_api::SurfaceId::PRIMARY.0 {
+            if *surface == pill_renderer_api::SurfaceId::PRIMARY {
                 continue;
             }
             if let Some(view) =
@@ -376,9 +377,9 @@ pub fn rendering_system(
     }
     // The scene grid, when a frontend asked for one: every surface bound to a
     // view camera draws it - the editor's own viewports - and a surface drawn
-    // through a world camera never does.
-    frame.grid =
-        bindings.and_then(|bindings| pill_renderer_api::frame_grid(bindings, bindings.grid));
+    // through a world camera never does. Only its spacing travels; the
+    // surfaces are the editor views named below.
+    frame.grid_cell_size = bindings.and_then(pill_renderer_api::frame_grid);
     // The editor's views, for the chrome that only belongs on them:
     // the gizmo handles and the selection outlines. The answer is the
     // view-bound set whether or not the grid is on, so turning the grid off
@@ -446,8 +447,8 @@ pub fn rendering_system(
         frame.instances.push(RenderInstance {
             entity,
             transform: *transform,
-            mesh: asset_key(renderer.mesh),
-            material: asset_key(renderer.material),
+            mesh: frame_key(renderer.mesh),
+            material: frame_key(renderer.material),
             rendering_order,
         });
     }
@@ -485,8 +486,8 @@ mod tests {
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].name, "builtin.default");
         assert_eq!(passes[0].shader, None);
-        assert_eq!(passes[0].kind, PassKind::Geometry);
-        assert_eq!(passes[0].target, PassTarget::Surface);
+        assert_eq!(passes[0].settings.kind, PassKind::Geometry);
+        assert_eq!(passes[0].settings.target, PassTarget::Surface);
     }
 
     #[test]
@@ -551,7 +552,7 @@ mod tests {
         let passes = resolve_passes(&assets, Some(&manager));
 
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].shader, Some(asset_key(shader)));
+        assert_eq!(passes[0].shader, Some(frame_key(shader)));
     }
 
     #[test]
@@ -579,7 +580,7 @@ mod tests {
         let passes = resolve_passes(&assets, Some(&manager));
 
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].textures.get("grain"), Some(&asset_key(texture)));
+        assert_eq!(passes[0].textures.get("grain"), Some(&frame_key(texture)));
     }
 
     /// A pass that names a material takes the material's shader, parameters and
@@ -633,8 +634,8 @@ mod tests {
 
         let passes = resolve_passes(&assets, Some(&manager));
 
-        assert_eq!(passes[0].shader, Some(asset_key(shader)));
-        assert_eq!(passes[0].textures.get("sky"), Some(&asset_key(texture)));
+        assert_eq!(passes[0].shader, Some(frame_key(shader)));
+        assert_eq!(passes[0].textures.get("sky"), Some(&frame_key(texture)));
         assert_eq!(
             passes[0].parameters.get("skybox_exposure"),
             Some(&MaterialParameter::Scalar(2.0))

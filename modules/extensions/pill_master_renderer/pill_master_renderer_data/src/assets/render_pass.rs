@@ -25,17 +25,19 @@
 //! skybox pass draws a sky: the sky is a `.material` file an artist edits, and
 //! the pass only says when and where it is drawn.
 
+// Standard library
 use std::collections::BTreeMap;
 
+// External crates
 use pill_engine::{
-    pill_mirror_object, Asset, AssetLoadResult, AssetManager, AssetReference, Handle,
-    StandaloneAsset,
+    pill_mirror_object, AssetLoadResult, AssetManager, AssetReference, Handle, StandaloneAsset,
 };
+// The pass vocabulary is part of the frame contract, so it lives there.
+use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassSettings, PassTarget};
 use serde::{Deserialize, Serialize};
 
-// The pass vocabulary is part of the frame contract, so it lives there.
+// Current crate
 use crate::{Material, Shader, Texture};
-use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
 ///
@@ -45,7 +47,7 @@ use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget
 /// that built it is reloaded and its retired image eventually unmapped - and
 /// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
-#[pill_mirror_object(asset, standalone)]
+#[pill_mirror_object(asset, standalone, shared = "pill_master_renderer::assets::RenderPass")]
 pub struct RenderPass {
     /// Label used in logs, profiling and error messages.
     pub name: String,
@@ -76,36 +78,8 @@ pub struct RenderPass {
     /// handle to hold. A name no earlier pass writes fails when the chain is
     /// built, naming the pass and the target rather than showing a flat frame.
     pub inputs: BTreeMap<String, String>,
-    /// What the pass draws.
-    pub kind: PassKind,
-    /// Where the pass reads and writes.
-    pub target: PassTarget,
-    /// Further targets the pass writes in the same draw, in the order the
-    /// shader's `SV_TARGET1`, `SV_TARGET2` ... name them.
-    ///
-    /// This is how a geometry pass leaves a normal buffer behind for a later
-    /// pass to read: one draw, several pictures.
-    pub extra_targets: Vec<PassTarget>,
-    /// Divisor for the size of the targets this pass writes: 2 is half the
-    /// surface, 1 (the default) is all of it.
-    ///
-    /// The first pass to name a target decides its size, because the target
-    /// belongs to the chain rather than to any one pass. A pass at half size is
-    /// how the expensive, blurry steps - ambient occlusion, depth of field, a
-    /// bloom level - cost a quarter of the pixels. Only a fullscreen pass can be
-    /// scaled: a pass's attachments must all be one size, and a geometry or
-    /// skybox pass pairs its colour target with the surface's depth buffer, so
-    /// the renderer does not draw such a pass at a scale.
-    pub target_scale: u32,
-    /// Whether the pass blends its output over what the target already holds.
-    pub blend: bool,
-    /// Whether the pass writes depth. A translucent pass reads depth and does
-    /// not write it, so what is behind it still passes the test.
-    pub depth_write: bool,
-    /// Which faces the pass drops.
-    pub cull: CullMode,
-    /// Ordering key: lower runs first. Equal orders keep the pipeline's order.
-    pub order: u8,
+    /// What the pass draws, where it writes, and how the draw is set up.
+    pub settings: PassSettings,
     /// Whether the pass runs at all. A disabled pass stays in the pipeline, so
     /// toggling one is a one-field change rather than an edit to the chain.
     pub enabled: bool,
@@ -122,14 +96,7 @@ impl RenderPass {
             parameters: BTreeMap::new(),
             textures: BTreeMap::new(),
             inputs: BTreeMap::new(),
-            kind: PassKind::Geometry,
-            target: PassTarget::Surface,
-            extra_targets: Vec::new(),
-            target_scale: 1,
-            blend: false,
-            depth_write: true,
-            cull: CullMode::Back,
-            order: 0,
+            settings: PassSettings::default(),
             enabled: true,
         }
     }
@@ -166,49 +133,49 @@ impl RenderPass {
 
     /// Choose what the pass draws.
     pub fn with_kind(mut self, kind: PassKind) -> Self {
-        self.kind = kind;
+        self.settings.kind = kind;
         self
     }
 
     /// Choose where the pass reads and writes.
     pub fn with_target(mut self, target: PassTarget) -> Self {
-        self.target = target;
+        self.settings.target = target;
         self
     }
 
     /// Choose when the pass runs.
     pub fn with_order(mut self, order: u8) -> Self {
-        self.order = order;
+        self.settings.order = order;
         self
     }
 
     /// Write a further target in the same draw.
     pub fn with_extra_target(mut self, target: PassTarget) -> Self {
-        self.extra_targets.push(target);
+        self.settings.extra_targets.push(target);
         self
     }
 
     /// Write this pass's targets at `1 / scale` of the surface.
     pub fn with_target_scale(mut self, scale: u32) -> Self {
-        self.target_scale = scale.max(1);
+        self.settings.target_scale = scale.max(1);
         self
     }
 
     /// Blend over what the target holds instead of replacing it.
     pub fn with_blend(mut self, blend: bool) -> Self {
-        self.blend = blend;
+        self.settings.blend = blend;
         self
     }
 
     /// Write depth, or only read it.
     pub fn with_depth_write(mut self, depth_write: bool) -> Self {
-        self.depth_write = depth_write;
+        self.settings.depth_write = depth_write;
         self
     }
 
     /// Choose which faces the pass drops.
     pub fn with_cull(mut self, cull: CullMode) -> Self {
-        self.cull = cull;
+        self.settings.cull = cull;
         self
     }
 
@@ -240,22 +207,10 @@ pub struct RenderPassDocument {
     pub textures: BTreeMap<String, AssetReference<Texture>>,
     /// See [`RenderPass::inputs`].
     pub inputs: BTreeMap<String, String>,
-    /// See [`RenderPass::kind`].
-    pub kind: PassKind,
-    /// See [`RenderPass::target`].
-    pub target: PassTarget,
-    /// See [`RenderPass::extra_targets`].
-    pub extra_targets: Vec<PassTarget>,
-    /// See [`RenderPass::target_scale`].
-    pub target_scale: u32,
-    /// See [`RenderPass::blend`].
-    pub blend: bool,
-    /// See [`RenderPass::depth_write`].
-    pub depth_write: bool,
-    /// See [`RenderPass::cull`].
-    pub cull: CullMode,
-    /// See [`RenderPass::order`].
-    pub order: u8,
+    /// See [`RenderPass::settings`]; flattened, so a `.render_pass` file
+    /// carries these fields at its top level like every other one.
+    #[serde(flatten)]
+    pub settings: PassSettings,
     /// See [`RenderPass::enabled`].
     pub enabled: bool,
 }
@@ -263,22 +218,14 @@ pub struct RenderPassDocument {
 impl Default for RenderPassDocument {
     /// [`RenderPass::new`]'s pass.
     fn default() -> Self {
-        let pass = RenderPass::new(String::new());
         Self {
             shader: AssetReference::unset(),
             material: AssetReference::unset(),
-            parameters: pass.parameters,
+            parameters: BTreeMap::new(),
             textures: BTreeMap::new(),
-            inputs: pass.inputs,
-            kind: pass.kind,
-            target: pass.target,
-            extra_targets: pass.extra_targets,
-            target_scale: pass.target_scale,
-            blend: pass.blend,
-            depth_write: pass.depth_write,
-            cull: pass.cull,
-            order: pass.order,
-            enabled: pass.enabled,
+            inputs: BTreeMap::new(),
+            settings: PassSettings::default(),
+            enabled: true,
         }
     }
 }
@@ -304,38 +251,14 @@ impl StandaloneAsset for RenderPass {
             parameters: document.parameters,
             textures,
             inputs: document.inputs,
-            kind: document.kind,
-            target: document.target,
-            extra_targets: document.extra_targets,
-            target_scale: document.target_scale.max(1),
-            blend: document.blend,
-            depth_write: document.depth_write,
-            cull: document.cull,
-            order: document.order,
+            // A hand-edited file can write a zero scale, which no target can
+            // be divided by.
+            settings: PassSettings {
+                target_scale: document.settings.target_scale.max(1),
+                ..document.settings
+            },
             enabled: document.enabled,
         })
-    }
-}
-
-/// The pinned shared name of [`RenderPass`]; see the comment on its `Asset` impl.
-const RENDER_PASS_SHARED_NAME: &str = "pill_master_renderer::assets::RenderPass";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for RenderPass {
-    fn shared_name() -> Option<&'static str> {
-        Some(RENDER_PASS_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 =
-            pill_engine::component::shared_component_identity(RENDER_PASS_SHARED_NAME);
-        Some(IDENTITY)
     }
 }
 
@@ -357,32 +280,70 @@ mod tests {
         let reference = RenderPass::new("passes/a.render_pass");
         assert_eq!(pass.name, reference.name);
         assert_eq!(pass.shader, Handle::INVALID);
-        assert_eq!(pass.kind, reference.kind);
-        assert_eq!(pass.target, reference.target);
-        assert_eq!(pass.target_scale, 1);
-        assert_eq!(pass.cull, reference.cull);
-        assert!(pass.enabled && pass.depth_write && !pass.blend);
+        assert_eq!(pass.settings, reference.settings);
+        assert!(pass.enabled);
     }
 
     /// A document round-trips through its file JSON, including the pass
-    /// vocabulary's enums.
+    /// vocabulary's enums. The settings block is flattened, so the file keeps
+    /// the shape it had when the fields were written on the document itself.
     #[test]
     fn a_document_round_trips_through_json() {
         let document = RenderPassDocument {
-            kind: PassKind::Fullscreen,
-            target: PassTarget::Offscreen("hdr".to_owned()),
-            cull: CullMode::None,
-            order: 7,
+            settings: PassSettings {
+                kind: PassKind::Fullscreen,
+                target: PassTarget::Offscreen("hdr".to_owned()),
+                cull: CullMode::None,
+                order: 7,
+                ..PassSettings::default()
+            },
             ..RenderPassDocument::default()
         };
         let json = serde_json::to_value(&document).unwrap();
         assert_eq!(json["target"], serde_json::json!({"Offscreen": "hdr"}));
+        assert_eq!(json["kind"], serde_json::json!("Fullscreen"));
+        assert_eq!(json["order"], serde_json::json!(7));
         let read: RenderPassDocument = serde_json::from_value(json).unwrap();
-        assert_eq!(read.target, PassTarget::Offscreen("hdr".to_owned()));
         assert_eq!(
-            (read.kind, read.cull, read.order),
-            (PassKind::Fullscreen, CullMode::None, 7)
+            read.settings,
+            PassSettings {
+                kind: PassKind::Fullscreen,
+                target: PassTarget::Offscreen("hdr".to_owned()),
+                cull: CullMode::None,
+                order: 7,
+                ..PassSettings::default()
+            }
         );
+    }
+
+    /// A `.render_pass` file written before the settings block existed still
+    /// loads: the block is flattened, so its fields sit at the top level of
+    /// the asset exactly where the document used to name them.
+    #[test]
+    fn a_flat_document_file_still_loads() {
+        let json = serde_json::json!({
+            "blend": false,
+            "cull": "Back",
+            "depth_write": true,
+            "enabled": true,
+            "extra_targets": [],
+            "inputs": {},
+            "kind": "Geometry",
+            "material": null,
+            "order": 0,
+            "parameters": {},
+            "shader": { "guid": "73cff470b05f0370f5e4fba32f4d9b09" },
+            "target": { "Offscreen": "hdr" },
+            "target_scale": 1,
+            "textures": {}
+        });
+        let document: RenderPassDocument = serde_json::from_value(json).unwrap();
+        assert_eq!(document.settings.kind, PassKind::Geometry);
+        assert_eq!(
+            document.settings.target,
+            PassTarget::Offscreen("hdr".to_owned())
+        );
+        assert!(document.settings.depth_write && document.enabled);
     }
 
     #[test]
@@ -391,8 +352,8 @@ mod tests {
 
         assert_eq!(pass.name, "opaque");
         assert_eq!(pass.shader, Handle::INVALID);
-        assert_eq!(pass.kind, PassKind::Geometry);
-        assert_eq!(pass.target, PassTarget::Surface);
+        assert_eq!(pass.settings.kind, PassKind::Geometry);
+        assert_eq!(pass.settings.target, PassTarget::Surface);
         assert!(pass.enabled);
     }
 
@@ -406,9 +367,12 @@ mod tests {
             .with_enabled(false);
 
         assert_eq!(pass.name, "tonemap");
-        assert_eq!(pass.kind, PassKind::Fullscreen);
-        assert_eq!(pass.target, PassTarget::Offscreen("hdr".to_owned()));
-        assert_eq!(pass.order, 9);
+        assert_eq!(pass.settings.kind, PassKind::Fullscreen);
+        assert_eq!(
+            pass.settings.target,
+            PassTarget::Offscreen("hdr".to_owned())
+        );
+        assert_eq!(pass.settings.order, 9);
         assert_eq!(pass.parameters.len(), 1);
         assert!(!pass.enabled);
     }

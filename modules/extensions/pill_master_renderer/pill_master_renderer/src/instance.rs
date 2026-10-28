@@ -110,7 +110,8 @@ pub(crate) fn build_queued_instances(
         .zip(render_queue.par_chunks(INSTANCES_PER_TASK))
         .for_each(|(output_part, queue_part)| {
             for (instance, item) in output_part.iter_mut().zip(queue_part) {
-                *instance = Instance::new(&frame_instances[item.entity_index as usize].transform);
+                *instance =
+                    Instance::new(&frame_instances[item.frame_instance_index as usize].transform);
             }
         });
 }
@@ -151,6 +152,20 @@ impl Vertex for Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_renderer_api::AssetKey;
+
+    /// A queue item for `frame_instance_index`; the handles are irrelevant to
+    /// the instance it builds.
+    fn queue_item(frame_instance_index: u32) -> RenderQueueItem {
+        let version = std::num::NonZeroU32::new(1).unwrap();
+        RenderQueueItem {
+            key: 0,
+            frame_instance_index,
+            shader: crate::resources::RendererShaderHandle::new(0, version),
+            material: crate::resources::RendererMaterialHandle::new(0, version),
+            mesh: crate::resources::RendererMeshHandle::new(0, version),
+        }
+    }
 
     /// The world position the shader computes for a model-space `point`: the
     /// three rows dotted with `(point, 1)`, which is what `mul(model, v)` does
@@ -272,19 +287,13 @@ mod tests {
                     rotation: Quat::IDENTITY.to_array(),
                     scale: [1.0; 3],
                 },
-                mesh: 0,
-                material: 0,
+                mesh: AssetKey(0),
+                material: AssetKey(0),
                 rendering_order: 0,
             })
             .collect();
         // The queue in reverse entity order.
-        let queue: Vec<RenderQueueItem> = (0..count as u32)
-            .rev()
-            .map(|entity_index| RenderQueueItem {
-                key: 0,
-                entity_index,
-            })
-            .collect();
+        let queue: Vec<RenderQueueItem> = (0..count as u32).rev().map(queue_item).collect();
         let mut output = Vec::new();
 
         build_queued_instances(&queue, &frame_instances, &mut output);
@@ -305,15 +314,12 @@ mod tests {
                     rotation: Quat::IDENTITY.to_array(),
                     scale: [1.0; 3],
                 },
-                mesh: 0,
-                material: 0,
+                mesh: AssetKey(0),
+                material: AssetKey(0),
                 rendering_order: 0,
             })
             .collect();
-        let queue = [2, 0, 1].map(|entity_index| RenderQueueItem {
-            key: 0,
-            entity_index,
-        });
+        let queue = [2, 0, 1].map(queue_item);
         let mut output = Vec::new();
 
         build_queued_instances(&queue, &frame_instances, &mut output);

@@ -565,6 +565,17 @@ impl FrameDriver for DevHost {
         Ok(run_one_frame(self))
     }
 
+    // The bare dev host draws no surface; its renderer lives in
+    // [`RenderingHost`], which implements the same methods for real.
+    fn resize_surface(&mut self, _id: pill_renderer_api::SurfaceId, _width: u32, _height: u32) {}
+
+    fn set_surface_viewport(
+        &mut self,
+        _id: pill_renderer_api::SurfaceId,
+        _viewport: Option<RenderViewport>,
+    ) {
+    }
+
     fn push_input(&mut self, event: InputEvent) {
         self.engine_mut().push_input_event(event);
     }
@@ -710,9 +721,9 @@ impl RenderingHost {
         })
     }
 
-    /// Forward a physical window resize to the engine renderer.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.display.resize(width, height);
+    /// Forward a physical resize of surface `id` to the engine renderer.
+    pub fn resize_surface(&mut self, id: pill_renderer_api::SurfaceId, width: u32, height: u32) {
+        self.display.resize_surface(id, width, height);
     }
 
     /// Reload the renderer module when its sources changed, and keep the
@@ -977,13 +988,17 @@ impl RenderingHost {
         }
     }
 
-    /// Restrict engine drawing to a physical region of the native surface.
+    /// Restrict engine drawing to a region of surface `id`.
     ///
-    /// Use `None` for full-window rendering. Embedded frontends can leave the
+    /// Use `None` for full-surface rendering. Embedded frontends can leave the
     /// corresponding WebView region transparent and keep surrounding UI
     /// panels opaque.
-    pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.display.set_viewport(viewport);
+    pub fn set_surface_viewport(
+        &mut self,
+        id: pill_renderer_api::SurfaceId,
+        viewport: Option<RenderViewport>,
+    ) {
+        self.display.set_surface_viewport(id, viewport);
     }
 
     /// Tell the host the frontend has nothing for the scene surfaces to draw:
@@ -1101,14 +1116,6 @@ impl FrameDriver for RenderingHost {
 
     fn run_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
         self.run_one_frame()
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        RenderingHost::resize(self, width, height);
-    }
-
-    fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
-        RenderingHost::set_render_viewport(self, viewport);
     }
 
     fn push_input(&mut self, event: InputEvent) {
@@ -1697,8 +1704,8 @@ type ShaderChangedFunction = unsafe extern "C" fn(
     wgsl_len: usize,
 ) -> u32;
 
-/// Start watching the renderer data crate's shaders, when the host has a
-/// renderer and its data crate has a `shaders/` directory.
+/// Start watching the renderer data crate's shader sources, when the host has
+/// a renderer and its data crate has a `shader_sources/` directory.
 ///
 /// A watch that cannot start is reported and leaves the host without shader
 /// reload; nothing else depends on it.
@@ -1710,10 +1717,13 @@ fn start_shader_watcher(host: &DevHost) -> Option<crate::shader_watcher::ShaderW
         crate::config::RENDERER_DATA_SUFFIX
     );
     let slot = host.extensions.iter().find(|slot| slot.name() == data)?;
+    // The tree the data crate cooks from, at its crate root: the build script
+    // and the watcher have to name the same directory, or a shader edit lands
+    // where nothing is watching.
     let shaders_directory = host
         .workspace_root
         .join(slot.crate_directory())
-        .join("shaders");
+        .join(crate::config::RENDERER_SHADER_SOURCES_DIRECTORY);
     match crate::shader_watcher::ShaderWatcher::spawn(&data, shaders_directory) {
         Ok(watcher) => watcher,
         Err(error) => {

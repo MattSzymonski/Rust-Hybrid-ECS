@@ -35,7 +35,7 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::utils::format_error_chain;
 use pill_core::{error, info, warn};
 use pill_input::winit_events::{translate_device_event, translate_window_event};
-use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject};
+use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
@@ -232,7 +232,7 @@ impl ApplicationHandler for WebApplication {
                         && size.height > 0
                         && (size.width, size.height) != (width, height)
                     {
-                        attached.resize(size.width, size.height);
+                        attached.resize_surface(SurfaceId::PRIMARY, size.width, size.height);
                     }
                     *driver.borrow_mut() = Some(attached);
                     info!(target: telemetry_target::RENDERING, "renderer attached to the canvas");
@@ -256,7 +256,7 @@ impl ApplicationHandler for WebApplication {
         match event {
             WindowEvent::Resized(size) => {
                 if let Some(driver) = self.driver.borrow_mut().as_mut() {
-                    driver.resize(size.width, size.height);
+                    driver.resize_surface(SurfaceId::PRIMARY, size.width, size.height);
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),

@@ -18,8 +18,6 @@
 
 // Standard library
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 
 // External crates
 use pill_core::profiling::{GpuApi, GpuStatistics, GpuTimeline, GpuTimelineSpan};
@@ -29,6 +27,11 @@ use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
     PipelineStatisticsTypes, PollType, QuerySet, QuerySetDescriptor, QueryType, Queue,
 };
+
+// Current crate
+#[cfg(test)]
+use crate::readback::MapOutcome;
+use crate::readback::{MapState, Readback};
 
 /*
 The three query kinds, and what each number answers:
@@ -126,11 +129,6 @@ pub struct Profiler {
     latest_occlusion: Vec<u64>,
 }
 
-/// Where one readback buffer's `map_async` stands.
-const MAP_PENDING: u8 = 0;
-const MAP_DONE: u8 = 1;
-const MAP_FAILED: u8 = 2;
-
 /// What one ring slot's frame recorded, kept until its results are read
 /// back without blocking.
 #[derive(Default)]
@@ -144,19 +142,16 @@ struct FrameRecord {
     timestamp_count: u32,
     statistics_count: u32,
     occlusion_count: u32,
-    /// The timestamp, statistics and occlusion readbacks in flight, each `MAP_*`.
-    timestamp_map: Option<Arc<AtomicU8>>,
-    statistics_map: Option<Arc<AtomicU8>>,
-    occlusion_map: Option<Arc<AtomicU8>>,
+    /// The timestamp, statistics and occlusion readbacks in flight.
+    timestamp_map: Option<MapState>,
+    statistics_map: Option<MapState>,
+    occlusion_map: Option<MapState>,
 }
 
 impl FrameRecord {
     /// Whether a readback was asked for and every one asked for finished.
     fn is_ready(&self) -> bool {
-        let finished = |map: &Option<Arc<AtomicU8>>| {
-            map.as_ref()
-                .is_none_or(|state| state.load(Ordering::Acquire) != MAP_PENDING)
-        };
+        let finished = |map: &Option<MapState>| map.as_ref().is_none_or(MapState::finished);
         self.is_waiting()
             && finished(&self.timestamp_map)
             && finished(&self.statistics_map)
@@ -171,34 +166,19 @@ impl FrameRecord {
     }
 }
 
-/// Starts mapping `buffer` for reading, returning where the map stands.
-fn map_for_reading(buffer: &Buffer) -> Arc<AtomicU8> {
-    let state = Arc::new(AtomicU8::new(MAP_PENDING));
-    let callback_state = Arc::clone(&state);
-    buffer
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            let outcome = if result.is_ok() { MAP_DONE } else { MAP_FAILED };
-            callback_state.store(outcome, Ordering::Release);
-        });
-    state
+/// The first `count` values of a mapped readback's bytes.
+fn first_values(bytes: &[u8], count: usize) -> Vec<u64> {
+    let values: &[u64] = bytemuck::cast_slice(bytes);
+    values[..count.min(values.len())].to_vec()
 }
 
-/// The first `count` values of a mapped readback buffer, which is then
-/// unmapped. Empty when the map failed, which leaves nothing to unmap.
-fn take_mapped(buffer: &Buffer, state: &AtomicU8, count: usize) -> Vec<u64> {
-    if state.load(Ordering::Acquire) != MAP_DONE {
-        return Vec::new();
-    }
-    let data = match buffer.slice(..).get_mapped_range() {
-        Ok(data) => data,
-        Err(_) => return Vec::new(),
-    };
-    let values: &[u64] = bytemuck::cast_slice(&data);
-    let taken = values[..count.min(values.len())].to_vec();
-    drop(data);
-    buffer.unmap();
-    taken
+/// Says that a kind of measurement never arrived, so a profiling run reports
+/// why it has no numbers instead of reporting nothing.
+fn warn_readback(kind: &str) {
+    warn!(
+        target: pill_core::telemetry::telemetry_target::RENDERING,
+        "PILL_GPU_PROFILE: the {kind} readback could not be read, so this frame reports none"
+    );
 }
 
 impl Profiler {
@@ -421,13 +401,13 @@ impl Profiler {
             record.occlusion_count = occlusion_count;
             record.timestamp_map = timestamp_buffer
                 .filter(|_| timestamp_count > 0)
-                .map(map_for_reading);
+                .map(MapState::start);
             record.statistics_map = statistics_buffer
                 .filter(|_| statistics_count > 0)
-                .map(map_for_reading);
+                .map(MapState::start);
             record.occlusion_map = occlusion_buffer
                 .filter(|_| occlusion_count > 0)
-                .map(map_for_reading);
+                .map(MapState::start);
         }
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
     }
@@ -450,7 +430,15 @@ impl Profiler {
             if let (Some(state), Some(buffers)) =
                 (&record.timestamp_map, &self.timestamp_buffers[slot])
             {
-                let ticks = take_mapped(&buffers.readback, state, record.timestamp_count as usize);
+                let ticks = match state.poll(&buffers.readback, |bytes| {
+                    first_values(bytes, record.timestamp_count as usize)
+                }) {
+                    Readback::Done(ticks) => ticks,
+                    Readback::Pending | Readback::Failed => Vec::new(),
+                };
+                if ticks.is_empty() && record.timestamp_count > 0 {
+                    warn_readback("timestamps");
+                }
                 let mut timings = Vec::new();
                 for (pair_index, pair) in ticks.chunks_exact(2).enumerate() {
                     if let Some(Some(span)) = record.spans.get(pair_index) {
@@ -475,11 +463,15 @@ impl Profiler {
                 (&record.statistics_map, &self.pipeline_buffers[slot])
             {
                 let stride = self.pipeline_statistics_types.bits().count_ones() as usize;
-                let values = take_mapped(
-                    &buffers.readback,
-                    state,
-                    record.statistics_count as usize * stride,
-                );
+                let values = match state.poll(&buffers.readback, |bytes| {
+                    first_values(bytes, record.statistics_count as usize * stride)
+                }) {
+                    Readback::Done(values) => values,
+                    Readback::Pending | Readback::Failed => Vec::new(),
+                };
+                if values.is_empty() && record.statistics_count > 0 {
+                    warn_readback("pipeline statistics");
+                }
                 let statistics: Vec<GpuStatistics> = values
                     .chunks_exact(stride.max(1))
                     .map(|query| statistics_of(self.pipeline_statistics_types, query))
@@ -501,8 +493,15 @@ impl Profiler {
             if let (Some(state), Some(buffers)) =
                 (&record.occlusion_map, &self.occlusion_buffers[slot])
             {
-                let samples =
-                    take_mapped(&buffers.readback, state, record.occlusion_count as usize);
+                let samples = match state.poll(&buffers.readback, |bytes| {
+                    first_values(bytes, record.occlusion_count as usize)
+                }) {
+                    Readback::Done(samples) => samples,
+                    Readback::Pending | Readback::Failed => Vec::new(),
+                };
+                if samples.is_empty() && record.occlusion_count > 0 {
+                    warn_readback("occlusion samples");
+                }
                 if !samples.is_empty() {
                     self.latest_occlusion = samples;
                 }
@@ -893,14 +892,17 @@ fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) 
     encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
     queue.submit(std::iter::once(encoder.finish()));
 
-    let state = map_for_reading(&readback);
+    let state = MapState::start(&readback);
     device
         .poll(PollType::Wait {
             submission_index: None,
             timeout: None,
         })
         .ok()?;
-    take_mapped(&readback, &state, 1).first().copied()
+    match state.poll(&readback, |bytes| first_values(bytes, 1)) {
+        Readback::Done(values) => values.first().copied(),
+        Readback::Pending | Readback::Failed => None,
+    }
 }
 
 #[cfg(test)]
@@ -923,15 +925,14 @@ mod tests {
 
     #[test]
     fn a_slot_is_ready_only_once_every_readback_it_asked_for_finished() {
-        let pending = Arc::new(AtomicU8::new(MAP_PENDING));
         let mut record = FrameRecord {
-            timestamp_map: Some(Arc::clone(&pending)),
-            statistics_map: Some(Arc::new(AtomicU8::new(MAP_DONE))),
+            timestamp_map: Some(MapState::at_outcome(MapOutcome::Pending)),
+            statistics_map: Some(MapState::at_outcome(MapOutcome::Mapped)),
             ..FrameRecord::default()
         };
         assert!(record.is_waiting() && !record.is_ready());
 
-        pending.store(MAP_FAILED, Ordering::Release);
+        record.timestamp_map = Some(MapState::at_outcome(MapOutcome::Failed));
         assert!(record.is_ready(), "a failed map still finishes the slot");
 
         record.timestamp_map = None;

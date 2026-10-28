@@ -4,7 +4,7 @@
 // HLSL matrix constructors are row-major, so values here are transposed
 // from the original GLSL column-major constructors.
 
-#include "common.hlsl"
+#include "lit_common.hlsl"
 
 struct VertexInput
 {
@@ -18,18 +18,6 @@ struct VertexInput
     [[vk::location(5)]] float4 model_row_0           : TEXCOORD1;
     [[vk::location(6)]] float4 model_row_1           : TEXCOORD2;
     [[vk::location(7)]] float4 model_row_2           : TEXCOORD3;
-};
-
-struct VertexOutput
-{
-    [[vk::location(0)]] float3 vertex_position       : TEXCOORD0;
-    [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD1;
-    [[vk::location(2)]] float3 TBN_tangent           : TEXCOORD2;
-    [[vk::location(3)]] float3 TBN_bitangent         : TEXCOORD3;
-    [[vk::location(4)]] float3 TBN_normal            : TEXCOORD4;
-    [[vk::location(5)]] float3 world_position        : TEXCOORD5;
-
-    float4 sv_position : SV_POSITION;
 };
 
 float3x3 inverse_mat3(float3x3 m)
@@ -66,7 +54,7 @@ float3x3 inverse_mat3(float3x3 m)
 }
 
 [shader("vertex")]
-VertexOutput vs_main(VertexInput input)
+LitVaryings vs_main(VertexInput input)
 {
     // Built once per instance on the CPU, so a vertex only assembles it.
     float4x4 model_matrix = float4x4(
@@ -87,16 +75,16 @@ VertexOutput vs_main(VertexInput input)
     // reads each row as a separate location and reconstructs the matrix.
     float3x3 TBN_matrix = transpose(float3x3(tangent, bitangent, normal));
 
-    float4 model_space = mul(model_matrix, float4(input.vertex_position, 1.0));
+    float4 world_position = mul(model_matrix, float4(input.vertex_position, 1.0));
 
-    VertexOutput output;
+    LitVaryings output;
     output.TBN_tangent = TBN_matrix[0];
     output.TBN_bitangent = TBN_matrix[1];
     output.TBN_normal = TBN_matrix[2];
-    output.vertex_position = mul(TBN_matrix, model_space.xyz);
-    output.world_position = model_space.xyz;
+    output.tangent_space_position = mul(TBN_matrix, world_position.xyz);
+    output.world_position = world_position.xyz;
     output.vertex_texture_coords = input.vertex_texture_coords;
-    output.sv_position = mul(camera.camera_view_projection, model_space);
+    output.sv_position = mul(camera.camera_view_projection, world_position);
 
     return output;
 }

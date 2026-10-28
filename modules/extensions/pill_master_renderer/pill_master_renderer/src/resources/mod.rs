@@ -18,12 +18,13 @@ mod renderer_pass;
 mod renderer_resource_storage;
 mod renderer_shader;
 mod renderer_texture;
+mod shader_bindings;
 
 // --- Use ---
 
-pub use renderer_shader::RendererShader;
-
 pub use renderer_material::RendererMaterial;
+
+pub use renderer_shader::{RendererShader, UniformGroups};
 
 pub use renderer_texture::RendererTexture;
 

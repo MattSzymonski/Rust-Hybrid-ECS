@@ -76,7 +76,7 @@ fn create_assets(
 
     let pipeline = simple_pipeline::install(assets)?;
     let shader = assets
-        .handle_by_name::<Shader>(simple_pipeline::SHADER_NAME)
+        .handle_by_name::<Shader>(simple_pipeline::SHADER_PATH)
         .ok_or("the simple pipeline installed without its shader")?;
 
     let mesh = match assets.handle_by_name::<Mesh>(CUBE_MESH) {

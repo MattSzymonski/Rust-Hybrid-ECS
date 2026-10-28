@@ -17,31 +17,25 @@
 //! queue.
 
 // Standard library
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 
 // External crates
 use pill_engine::Entity;
 use pill_renderer_api::{decode_pick_value, PickHit, PickRequest, PickResult};
 
+// Current crate
+use crate::readback::{MappedReadback, Readback};
+
 /// Bytes between two copied pixels: wgpu copies whole rows, aligned to this.
 const SLOT_BYTES: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
-
-/// The mapping state of one readback, shared with the map callback.
-const MAPPING_PENDING: u8 = 0;
-const MAPPING_DONE: u8 = 1;
-const MAPPING_FAILED: u8 = 2;
 
 /// The copies one frame recorded for one surface.
 struct PendingReadback {
     /// One slot of [`SLOT_BYTES`] per request, in request order.
-    buffer: wgpu::Buffer,
+    readback: MappedReadback,
     /// The requests, one per slot.
     requests: Vec<PickRequest>,
     /// The entity at each queue position of the frame drawn.
     entities: Vec<Entity>,
-    /// Where the map callback reports, once mapping has started.
-    state: Option<Arc<AtomicU8>>,
 }
 
 /// Every pick on its way back from the GPU, and the answers that arrived.
@@ -113,10 +107,9 @@ impl PickReadback {
             );
         }
         self.pending.push(PendingReadback {
-            buffer,
+            readback: MappedReadback::new(buffer),
             requests: inside,
             entities,
-            state: None,
         });
     }
 
@@ -125,25 +118,8 @@ impl PickReadback {
     /// Called after the frame that recorded them was submitted: a buffer
     /// asked to map before its copy is submitted makes the submission fail.
     pub fn start_mapping(&mut self) {
-        for readback in self
-            .pending
-            .iter_mut()
-            .filter(|readback| readback.state.is_none())
-        {
-            let state = Arc::new(AtomicU8::new(MAPPING_PENDING));
-            let reported = Arc::clone(&state);
-            readback
-                .buffer
-                .slice(..)
-                .map_async(wgpu::MapMode::Read, move |result| {
-                    let value = if result.is_ok() {
-                        MAPPING_DONE
-                    } else {
-                        MAPPING_FAILED
-                    };
-                    reported.store(value, Ordering::Release);
-                });
-            readback.state = Some(state);
+        for readback in &mut self.pending {
+            readback.readback.start();
         }
     }
 
@@ -155,41 +131,55 @@ impl PickReadback {
             let _ = device.poll(wgpu::PollType::Poll);
         }
         let mut still_pending = Vec::with_capacity(self.pending.len());
-        for readback in self.pending.drain(..) {
-            let state = readback
-                .state
-                .as_ref()
-                .map_or(MAPPING_PENDING, |state| state.load(Ordering::Acquire));
-            match state {
-                MAPPING_DONE => match readback.buffer.slice(..).get_mapped_range() {
-                    Ok(bytes) => {
-                        let hits = (0..readback.requests.len())
-                            .map(|slot| decode_slot(&bytes, slot, &readback.entities))
-                            .collect::<Vec<_>>();
-                        drop(bytes);
-                        readback.buffer.unmap();
-                        for (request, hit) in readback.requests.into_iter().zip(hits) {
-                            self.finished.push(PickResult { request, hit });
-                        }
-                    }
-                    Err(_) => readback.buffer.unmap(),
-                },
-                // A readback the GPU could not deliver answers nothing rather
-                // than leaving its caller waiting forever.
-                MAPPING_FAILED => {
-                    for request in readback.requests {
-                        self.finished.push(PickResult {
-                            request,
-                            hit: PickHit::Nothing,
-                        });
+        for PendingReadback {
+            mut readback,
+            requests,
+            entities,
+        } in self.pending.drain(..)
+        {
+            let outcome = readback.poll(|bytes| {
+                (0..requests.len())
+                    .map(|slot| decode_slot(bytes, slot, &entities))
+                    .collect::<Vec<_>>()
+            });
+            match outcome {
+                Readback::Done(hits) => {
+                    for (request, hit) in requests.into_iter().zip(hits) {
+                        self.finished.push(PickResult { request, hit });
                     }
                 }
-                _ => still_pending.push(readback),
+                // A readback the GPU could not deliver answers nothing rather
+                // than leaving its caller waiting forever, and says so once.
+                Readback::Failed => {
+                    pill_core::warn!(
+                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        "[pick] {} request(s) could not be read back",
+                        requests.len()
+                    );
+                    self.finished.extend(nothing_answers(requests));
+                }
+                Readback::Pending => still_pending.push(PendingReadback {
+                    readback,
+                    requests,
+                    entities,
+                }),
             }
         }
         self.pending = still_pending;
         std::mem::take(&mut self.finished)
     }
+}
+
+/// The answers a readback that never arrived leaves: one "nothing" per
+/// request, so no caller waits for an answer that cannot come.
+fn nothing_answers(requests: Vec<PickRequest>) -> Vec<PickResult> {
+    requests
+        .into_iter()
+        .map(|request| PickResult {
+            request,
+            hit: PickHit::Nothing,
+        })
+        .collect()
 }
 
 /// What slot `slot` of a mapped readback holds.
@@ -236,5 +226,27 @@ mod tests {
         readback.answer(request, PickHit::Nothing);
         assert_eq!(readback.finished.len(), 1);
         assert_eq!(std::mem::take(&mut readback.finished)[0].request.id, 3);
+    }
+
+    /// A readback the GPU could not deliver answers every request it carried,
+    /// once each, so no caller waits for an answer that cannot come.
+    #[test]
+    fn a_failed_readback_answers_every_request_with_nothing() {
+        let requests: Vec<PickRequest> = [11, 12]
+            .into_iter()
+            .map(|id| PickRequest {
+                id,
+                surface: pill_renderer_api::SurfaceId::PRIMARY,
+                x: 4,
+                y: 4,
+            })
+            .collect();
+
+        let answers = nothing_answers(requests);
+
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].request.id, 11);
+        assert_eq!(answers[1].request.id, 12);
+        assert!(answers.iter().all(|answer| answer.hit == PickHit::Nothing));
     }
 }
