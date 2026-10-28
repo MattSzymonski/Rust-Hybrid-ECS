@@ -21,6 +21,7 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The panel's registry id.
 pub const SPLINE_PANEL_ID: &str = "shell.spline_tool";
@@ -92,8 +93,7 @@ pub fn spline_tool_panel(ui: &mut egui::Ui, context: &mut PanelContext<'_>) {
     if points > 0 {
         ui.label(format!("{points} control points"));
         for index in 0..points.min(POINTS_SHOWN) {
-            ui.horizontal(|ui| {
-                ui.label(format!("point {index}"));
+            row(ui, &format!("point {index}"), None, &mut |ui| {
                 for axis in 0..3 {
                     let Some(field) = point_leaf(component, index, axis) else {
                         continue;

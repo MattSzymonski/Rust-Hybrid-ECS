@@ -46,7 +46,7 @@ pub struct PreferenceField {
 }
 
 /// The editable rows, in the order the tab draws them.
-pub const PREFERENCE_FIELDS: [PreferenceField; 11] = [
+pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
     PreferenceField {
         key: "keymap_preset",
         label: "keymap preset",
@@ -61,6 +61,13 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 11] = [
         key: "editor.gizmo_hit_radius",
         label: "gizmo hit radius",
         fallback: "0.07",
+    },
+    PreferenceField {
+        key: GIZMO_ICON_SIZE_KEY,
+        label: "gizmo icon size",
+        // Two steps up from the fixed 10-point mark the badges carried
+        // before the row existed, so the default reads clearly larger.
+        fallback: "20",
     },
     PreferenceField {
         key: "code_editor_command",
@@ -157,11 +164,44 @@ pub const GIZMO_HIT_RADIUS_DEFAULT: f32 = 0.07;
 /// from.
 pub const GIZMO_HIT_RADIUS_RANGE: (f32, f32) = (0.01, 0.35);
 
+/// The preference key the scene badges' icon size lives under.
+pub const GIZMO_ICON_SIZE_KEY: &str = "editor.gizmo_icon_size";
+
+/// The icon size used when the file says nothing, in points: twice the fixed
+/// 10-point mark the badges drew before the preference existed.
+pub const GIZMO_ICON_SIZE_DEFAULT: f32 = 20.0;
+
+/// The range a file's icon size is clamped into, in points: small enough to
+/// stay a mark over the scene, large enough to keep it clickable.
+pub const GIZMO_ICON_SIZE_RANGE: (f32, f32) = (8.0, 64.0);
+
+/// The scene badges' icon size the file asks for, in points.
+///
+/// The mark and the rectangle that picks it both scale with this one number.
+/// A missing, blank or unparsable value keeps the default, and a value outside
+/// [`GIZMO_ICON_SIZE_RANGE`] is clamped rather than trusted: a zero or
+/// negative size would draw nothing to click on.
+pub fn gizmo_icon_size(document: &Map<String, Value>) -> f32 {
+    let value = match lookup(document, GIZMO_ICON_SIZE_KEY) {
+        Some(Value::Number(number)) => number.as_f64().map(|number| number as f32),
+        Some(Value::String(text)) => text.trim().parse::<f32>().ok(),
+        _ => None,
+    };
+    value
+        .filter(|size| size.is_finite())
+        .unwrap_or(GIZMO_ICON_SIZE_DEFAULT)
+        .clamp(GIZMO_ICON_SIZE_RANGE.0, GIZMO_ICON_SIZE_RANGE.1)
+}
+
 /// The file's current values as the tab shows them.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreferencesView {
     /// One display string per editable field, keyed like the fields.
     pub values: BTreeMap<String, String>,
+    /// The scene badges' icon size, in points: the shell's drawing needs the
+    /// number, not the row's text, so it is parsed here from the same
+    /// document the rows show.
+    pub gizmo_icon_size: f32,
     /// The project key the per-project entry is remembered under.
     pub project: Option<String>,
     /// The project's remembered gizmo entry, as the file holds it (the
@@ -169,6 +209,18 @@ pub struct PreferencesView {
     pub project_gizmo: GizmoProjectPreferences,
     /// Whether the file carries the project's entry at all.
     pub project_remembered: bool,
+}
+
+impl Default for PreferencesView {
+    fn default() -> Self {
+        Self {
+            values: BTreeMap::new(),
+            gizmo_icon_size: GIZMO_ICON_SIZE_DEFAULT,
+            project: None,
+            project_gizmo: GizmoProjectPreferences::default(),
+            project_remembered: false,
+        }
+    }
 }
 
 impl PreferencesView {
@@ -192,6 +244,7 @@ impl PreferencesView {
             .unwrap_or_default();
         Self {
             values,
+            gizmo_icon_size: gizmo_icon_size(document),
             project: project.map(str::to_string),
             project_gizmo,
             project_remembered: project_entry.is_some(),
@@ -373,6 +426,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(gizmo_hit_radius(&document), GIZMO_HIT_RADIUS_DEFAULT);
+    }
+
+    #[test]
+    fn the_gizmo_icon_size_defaults_doubles_and_clamps() {
+        let mut document = Map::new();
+        // Absent: the default, twice the 10-point mark the badges drew before
+        // the row existed.
+        assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_DEFAULT);
+        // A number and a numeric string both read.
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(28)).unwrap();
+        assert_eq!(gizmo_icon_size(&document), 28.0);
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!("36")).unwrap();
+        assert_eq!(gizmo_icon_size(&document), 36.0);
+        // A value outside the range is clamped, and junk keeps the default.
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(0)).unwrap();
+        assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_RANGE.0);
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(900)).unwrap();
+        assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_RANGE.1);
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!("big")).unwrap();
+        assert_eq!(gizmo_icon_size(&document), GIZMO_ICON_SIZE_DEFAULT);
+        // The view carries the parsed size beside the row's text.
+        set_key(&mut document, GIZMO_ICON_SIZE_KEY, serde_json::json!(24)).unwrap();
+        let view = PreferencesView::from_document(&document, None);
+        assert_eq!(view.text(GIZMO_ICON_SIZE_KEY), "24");
+        assert_eq!(view.gizmo_icon_size, 24.0);
+        assert_eq!(
+            PreferencesView::default().gizmo_icon_size,
+            GIZMO_ICON_SIZE_DEFAULT
+        );
     }
 
     #[test]

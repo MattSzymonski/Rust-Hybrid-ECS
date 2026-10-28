@@ -14,6 +14,7 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The Statistics tab: the frame's numbers, then one row per drawn tab.
 pub fn statistics_tab(
@@ -27,50 +28,67 @@ pub fn statistics_tab(
     } else {
         0.0
     };
-    egui::Grid::new("pill_editor_shell_egui.statistics")
-        .num_columns(2)
-        .spacing([18.0, 4.0])
-        .show(ui, |ui| {
-            row(ui, "frames per second", &format!("{frames_per_second:.1}"));
-            row(ui, "frame time", &format!("{frame_micros:.0} us"));
-            row(
-                ui,
-                "shell pass",
-                &format!(
-                    "{:.0} us ({} passes)",
-                    stats.shell_micros, stats.shell_passes
-                ),
-            );
-            row(ui, "entities", &snapshot.entities.len().to_string());
-            row(ui, "systems", &snapshot.systems.len().to_string());
-            row(ui, "console lines", &snapshot.console.total.to_string());
-            row(ui, "problems", &snapshot.problems.len().to_string());
-        });
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "frames per second",
+        &format!("{frames_per_second:.1}"),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "frame time",
+        &format!("{frame_micros:.0} us"),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "shell pass",
+        &format!(
+            "{:.0} us ({} passes)",
+            stats.shell_micros, stats.shell_passes
+        ),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "entities",
+        &snapshot.entities.len().to_string(),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "systems",
+        &snapshot.systems.len().to_string(),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "console lines",
+        &snapshot.console.total.to_string(),
+    );
+    value_row_in(
+        ui,
+        WIDE_ROW_LABEL_WIDTH,
+        "problems",
+        &snapshot.problems.len().to_string(),
+    );
     ui.separator();
     if stats.tabs.is_empty() {
         ui.weak("No tab measured yet");
         return;
     }
     ui.label(egui::RichText::new("per-tab body time").strong());
-    egui::Grid::new("pill_editor_shell_egui.statistics.tabs")
-        .num_columns(3)
-        .spacing([18.0, 2.0])
-        .show(ui, |ui| {
-            for entry in &stats.tabs {
-                ui.label(entry.tab.title());
-                ui.label(format!("{:.0} us", entry.micros));
-                ui.label(format!("{} passes", entry.passes));
-                ui.end_row();
-            }
-        });
-}
-
-/// One label/value pair of the top grid.
-///
-/// Public so a patched tab body can still call it: a patch crate reaches this
-/// module only through the crate root's re-export.
-pub fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(label);
-    ui.label(egui::RichText::new(value).monospace());
-    ui.end_row();
+    for entry in &stats.tabs {
+        row_in(
+            ui,
+            WIDE_ROW_LABEL_WIDTH,
+            &entry.tab.title(),
+            None,
+            &mut |ui| {
+                ui.monospace(format!("{:.0} us", entry.micros));
+                ui.weak(format!("{} passes", entry.passes));
+            },
+        );
+    }
 }

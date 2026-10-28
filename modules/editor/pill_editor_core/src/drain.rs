@@ -48,6 +48,9 @@ pub struct DrainOutcome {
     /// Whether a batch touched files on disk, so the asset listing needs an
     /// immediate walk.
     pub files_changed: bool,
+    /// Whether a batch wrote an asset's settings document, so the Inspector's
+    /// rows read it again.
+    pub settings_changed: bool,
 }
 
 /// Apply every queued batch, then prune a history a reload invalidated.
@@ -81,6 +84,15 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
         // once: the Assets toolbar acts on what the rows say.
         if batch.commands.iter().any(command_touches_files) {
             outcome.files_changed = true;
+        }
+        // A settings write leaves the listing's shape alone, but the document
+        // the Inspector's rows draw is now the old one.
+        if batch
+            .commands
+            .iter()
+            .any(|command| matches!(command, EditorCommand::SetAssetSettings { .. }))
+        {
+            outcome.settings_changed = true;
         }
         for (index, message) in recorded.failures {
             pill_core::warn!(

@@ -325,6 +325,7 @@ pub fn asset_type_icon(asset_type: &str) -> icons::Icon {
         "Texture" => icons::Icon::Image,
         "Material" => icons::Icon::Sphere,
         "Shader" => icons::Icon::Code,
+        "RenderPass" => icons::Icon::Faders,
         _ => icons::Icon::File,
     }
 }

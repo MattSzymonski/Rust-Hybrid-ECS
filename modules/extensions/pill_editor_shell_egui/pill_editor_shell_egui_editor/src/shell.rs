@@ -133,6 +133,7 @@ pub use chrome::gizmo_mode_label;
 pub use chrome::gizmo_space_label;
 pub use chrome::log_context_menu;
 pub use chrome::mark_menu_region;
+pub use chrome::paint_active_tab_underline;
 pub use chrome::remember_moved_rect;
 pub use chrome::select_asset;
 pub use chrome::select_entity;
@@ -152,6 +153,22 @@ pub use menus::scene_context_menu;
 pub mod toolbox_panel;
 
 pub use toolbox_panel::toolbox_overlay;
+
+/// The [`rows`] module: the one label/control row every tab draws its fields
+/// with.
+pub mod rows;
+
+pub use rows::label_cell;
+pub use rows::label_cell_in;
+pub use rows::label_gap;
+pub use rows::row;
+pub use rows::row_in;
+pub use rows::value_row;
+pub use rows::value_row_in;
+pub use rows::ROW_HEIGHT;
+pub use rows::ROW_LABEL_GAP;
+pub use rows::ROW_LABEL_WIDTH;
+pub use rows::WIDE_ROW_LABEL_WIDTH;
 
 /// The [`tab_entities`] module: the entities tab: the entity rows and their menu.
 pub mod tab_entities;
@@ -176,7 +193,6 @@ pub use tab_inspector::inspector_add_popup;
 pub use tab_inspector::inspector_header;
 pub use tab_inspector::inspector_section_header;
 pub use tab_inspector::inspector_tab;
-pub use tab_inspector::INSPECTOR_LABEL_WIDTH;
 pub use tab_inspector::INSPECTOR_VECTOR_FIELD_HEIGHT;
 pub use tab_inspector::INSPECTOR_VECTOR_FIELD_WIDTH;
 pub use tab_inspector::INSPECTOR_VECTOR_LABEL_WIDTH;
@@ -411,6 +427,14 @@ pub fn run_frame(
     // The rows record their rectangles either way - the shell's own tests read
     // them - but only a scripted run asks for them in the log.
     inspector.log_rects = shell_input.scripted;
+    // The accent underline belongs to each leaf's active tab alone; the dock
+    // draws its line under every tab in one colour, so the pass reads which
+    // tabs are active before the dock paints them.
+    let active_tabs: Vec<EditorTab> = dock
+        .state()
+        .iter_leaves()
+        .filter_map(|(_path, leaf)| leaf.tabs.get(leaf.active.0).copied())
+        .collect();
     // Named through the package path, not as a file-local item: a hot patch
     // compiles this body in a crate of its own, where only the package's
     // public items exist (see the crate header).
@@ -427,6 +451,7 @@ pub fn run_frame(
         game_rect: None,
         overlay_regions: Vec::new(),
         frames_per_second: shell_input.frames_per_second,
+        active_tabs: &active_tabs,
         tab_redock: None,
         tab_popout: None,
         console_filters,
@@ -810,6 +835,10 @@ pub struct EditorTabViewer<'a> {
     pub overlay_regions: Vec<ShellRect>,
     /// The editor's smoothed frame rate, for the scene's counter.
     pub frames_per_second: f32,
+    /// The tabs each leaf shows as active this pass, one per leaf: the tab
+    /// bar carries its accent underline under these tabs alone, so a tab that
+    /// is not selected keeps the strip's neutral line.
+    pub active_tabs: &'a [EditorTab],
     /// The surface a tab menu asked to re-dock, drained by `run_frame`
     /// after the dock finishes drawing.
     pub tab_redock: Option<SurfaceIndex>,
@@ -1051,9 +1080,14 @@ impl TabViewer for EditorTabViewer<'_> {
         });
     }
 
-    /// The tab button hook: a right-click that opens the tab menu is logged
+    /// The tab button hook: the selected tab's accent underline is painted
+    /// here (the dock knows the tab's rectangle but has one line colour for
+    /// all of them), and a right-click that opens the tab menu is logged
     /// here, once per click - the menu content runs every frame it is open.
-    fn on_tab_button(&mut self, _tab: &mut Self::Tab, response: &egui::Response) {
+    fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
+        if self.active_tabs.contains(&*tab) {
+            pill_editor_shell_egui_editor::shell::paint_active_tab_underline(response);
+        }
         if response.secondary_clicked() {
             log_context_menu("tab");
         }

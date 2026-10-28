@@ -117,11 +117,14 @@ public static class SceneStartup
         // styles need.
         rendering.Clear();
 
-        // The OBJ decode lives in the renderer; the loader supplies only the bytes.
+        // The OBJ decode lives in the renderer; the loader supplies only the
+        // bytes. The bundled file's UVs are authored top-down, against a
+        // sampler whose V starts at the image's top edge, so the default
+        // bottom-up flip would scatter every island over the texture.
         byte[] obj = AssetLoader.Path("models/chimpanzini_bananini.obj").Load();
         Handle<Mesh> mesh = assets.AddNamed(
             "italian_brainrot.mesh",
-            Mesh.FromObjBytes("chimpanzini_bananini", obj));
+            Mesh.FromObjBytesTopDown("chimpanzini_bananini", obj));
         Handle<Texture> color = assets.AddNamed(
             "italian_brainrot.color",
             Texture.New(

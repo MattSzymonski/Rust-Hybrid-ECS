@@ -265,6 +265,16 @@ public sealed partial class Mesh : global::TracyLive.RustObject, global::TracyLi
         return new global::pill_master_renderer_data.Mesh(__call.ResultObject(0));
     }
 
+    /// <summary>Calls the Rust function <c>pill_master_renderer_data::assets::mesh::Mesh::from_obj_bytes_top_down</c>.</summary>
+    public static global::pill_master_renderer_data.Mesh FromObjBytesTopDown(string name, global::System.ReadOnlySpan<byte> bytes)
+    {
+        var __call = global::TracyLive.MirrorCall.Begin("pill_master_renderer_data::assets::mesh::Mesh", "from_obj_bytes_top_down");
+        __call.PushString(name);
+        __call.PushSpan(bytes);
+        __call.Invoke();
+        return new global::pill_master_renderer_data.Mesh(__call.ResultObject(0));
+    }
+
     /// <summary>Calls the Rust function <c>pill_master_renderer_data::assets::mesh::Mesh::triangle</c>.</summary>
     public static global::pill_master_renderer_data.Mesh Triangle()
     {

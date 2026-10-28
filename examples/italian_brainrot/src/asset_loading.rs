@@ -50,7 +50,11 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
             let obj = AssetLoader::Path("models/chimpanzini_bananini.obj".into()).load()?;
             assets.add_named(
                 "italian_brainrot.mesh",
-                Mesh::from_obj_bytes("chimpanzini_bananini", &obj)?,
+                // The bundled file is the original demo's: its UVs are
+                // authored top-down, against a sampler whose V starts at the
+                // image's top edge, so the default bottom-up flip would
+                // scatter every island over the texture.
+                Mesh::from_obj_bytes_top_down("chimpanzini_bananini", &obj)?,
             )?
         }
     };
@@ -161,7 +165,8 @@ mod tests {
         let obj = AssetLoader::Path("models/chimpanzini_bananini.obj".into())
             .load()
             .expect("the bundled OBJ is readable");
-        let mesh = Mesh::from_obj_bytes("chimpanzini_bananini", &obj).expect("a valid OBJ");
+        let mesh =
+            Mesh::from_obj_bytes_top_down("chimpanzini_bananini", &obj).expect("a valid OBJ");
 
         assert!(!mesh.vertices.is_empty());
         assert!(!mesh.indices.is_empty());

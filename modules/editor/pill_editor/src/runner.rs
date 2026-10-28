@@ -846,8 +846,8 @@ struct EditorWindow {
     test_channel: Option<TestChannel>,
     /// A scripted left-button drag in flight, when one is.
     scripted_drag: Option<ScriptedDrag>,
-    /// The scene title the main window last showed, so the window is only
-    /// retitled when the document's state actually changed.
+    /// The scene title last reported, so the log names each state the
+    /// document went through once instead of every frame.
     scene_title: String,
     /// Quit after this many seconds, when the environment asks for it.
     test_seconds: Option<f64>,
@@ -1041,6 +1041,10 @@ impl EditorWindow {
         // module, with the renderer attached to the primary window.
         let config = HostConfig::from_environment_for_editor_frontend("egui")
             .map_err(pill_core::error::HostError::from)?;
+        // The window names the project, as the project's own settings file
+        // spells it; the open scene is the document's state and is reported
+        // through the scene-title log instead.
+        window.set_title(&format!("Pill - {}", config.name));
         let mut host =
             pill_host::setup_rendering(config, primary_window, primary_size.0, primary_size.1)?;
         info!(
@@ -4489,8 +4493,10 @@ impl EditorWindow {
         // Step 2c2: where each entity lands in each visible scene view, for
         // the shell's badges.
         self.publish_badges();
-        // Step 2d: the main window names the open scene and its unsaved marker.
-        self.sync_scene_title();
+        // Step 2d: the document's title is reported when it moves, so the log
+        // names the scene the session holds; the window's own title names the
+        // project.
+        self.report_scene_title();
         // Step 3: the shell boundary's input resource.
         if let Some(input) = self
             .host
@@ -5289,8 +5295,8 @@ impl EditorWindow {
     /// Capture the selected asset's detail for the Inspector's asset
     /// section, when the selection or the tree changed: reading the settings
     /// document is a disk read, so the capture follows the listing's cadence
-    /// instead of running every frame. A settings edit marks the listing
-    /// dirty, so the widgets see the document the command wrote.
+    /// instead of running every frame. A settings write forgets the captured
+    /// path, so the widgets see the document the command wrote.
     fn refresh_asset_detail(&mut self, listing_refreshed: bool) {
         let selected = {
             let world = self.host.host_mut().engine_mut().world_mut();
@@ -5505,6 +5511,13 @@ impl EditorWindow {
         let outcome = drain::apply_pending(self.host.host_mut().engine_mut(), now_millis);
         if outcome.files_changed {
             self.asset_listing_dirty = true;
+        }
+        if outcome.settings_changed {
+            // The Inspector's rows draw the document the command just wrote;
+            // forgetting the captured path is what makes the next frame read it
+            // again, so a committed row shows its new value (and a reordered
+            // list its new order) at once.
+            self.asset_detail_path = None;
         }
     }
 
@@ -6891,13 +6904,13 @@ impl EditorWindow {
         }
     }
 
-    /// Keep the main window's title equal to the open scene and its unsaved
-    /// marker.
+    /// Report the open scene and its unsaved marker when they change.
     ///
-    /// The title is recomputed every frame from the session resource and only
-    /// pushed to the window when it changed, so the log names each state the
-    /// document went through - which is what the editor suite waits for.
-    fn sync_scene_title(&mut self) {
+    /// The title is recomputed every frame from the session resource and
+    /// logged only when it changed, so the log names each state the document
+    /// went through - which is what the editor suite waits for. The window's
+    /// own title names the project, so nothing here touches it.
+    fn report_scene_title(&mut self) {
         let title = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world
@@ -6908,7 +6921,6 @@ impl EditorWindow {
         if title == self.scene_title {
             return;
         }
-        self.window.set_title(&format!("{title} - Pill"));
         info!(
             target: telemetry_target::ENGINE,
             title = title.as_str(),

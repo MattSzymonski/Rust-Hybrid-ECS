@@ -3,6 +3,7 @@
 //! # Responsibilities
 //!
 //! - `tab_icon`: the icon a dock tab draws beside its title.
+//! - `paint_active_tab_underline`: the accent line under the active tab's name, the one tab the dock does not colour itself.
 //! - The selection moves the tabs and the menus make, each logging the token a suite watches for.
 //! - The redock action, the empty-area helper and the context-menu logging and region marking every menu goes through.
 //! - The once-per-rect logging the inspector's sections and the viewport badges use.
@@ -32,6 +33,24 @@ pub fn tab_icon(tab: EditorTab) -> icons::Icon {
         // set is the grid, which is as close as a generic "extension" gets.
         EditorTab::Module(_) => icons::Icon::GridFour,
     }
+}
+
+/// Paint the accent underline under the active tab's name.
+///
+/// The dock draws the strip's separator line under every tab in one neutral
+/// colour, so the accent that marks the selected tab is the shell's to paint.
+/// The line sits where the dock would have drawn its own: the last pixel of
+/// the tab bar, spanning the tab button.
+///
+/// Public because [`run_frame`]'s generated hot patch reaches it through the
+/// package path.
+pub fn paint_active_tab_underline(response: &egui::Response) {
+    let pixel = response.ctx.pixels_per_point().recip();
+    response.ctx.layer_painter(response.layer_id).hline(
+        response.rect.x_range(),
+        response.rect.bottom() - pixel,
+        (pixel, style::accent()),
+    );
 }
 
 /// One gizmo mode's lowercase name, for the preferences rows.

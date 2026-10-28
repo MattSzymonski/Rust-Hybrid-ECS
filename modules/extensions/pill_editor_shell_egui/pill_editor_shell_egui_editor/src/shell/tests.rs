@@ -544,6 +544,175 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     );
 }
 
+/// Dragging a list row reorders it: the drop rewrites the whole array in one
+/// recorded step, and the picker of the row the pointer lands on does not
+/// swallow the drag on the way.
+#[test]
+fn a_dragged_row_reorders_the_list() {
+    const PASS_TYPE: &str = "pill_master_renderer::assets::RenderPass";
+    const ASSET: &str = "pipelines/main.pipeline";
+
+    #[cfg(test)]
+    fn draw(
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+        document: &serde_json::Value,
+        references: &[AssetReferenceField],
+        pending: &mut PendingEditorCommands,
+        session: &mut InspectorSession,
+        regions: &mut Vec<ShellRect>,
+    ) {
+        run_pass_with(context, events, &mut |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.allocate_ui(egui::vec2(420.0, 300.0), |ui| {
+                    inspector_settings::reference_list_rows(
+                        ui,
+                        ASSET,
+                        document,
+                        references,
+                        &[],
+                        &[],
+                        pending,
+                        session,
+                        regions,
+                    );
+                });
+            });
+        });
+    }
+
+    let document = serde_json::json!({
+        "passes": [{ "guid": "a" }, { "guid": "b" }, { "guid": "c" }]
+    });
+    let references: Vec<AssetReferenceField> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(index, guid)| AssetReferenceField {
+            key: format!("passes[{index}]"),
+            target: PASS_TYPE.to_string(),
+            guid: Some((*guid).to_string()),
+            nested: true,
+            label: None,
+        })
+        .collect();
+    let mut pending = PendingEditorCommands::default();
+    let mut session = InspectorSession::default();
+    let mut regions: Vec<ShellRect> = Vec::new();
+    let context = egui::Context::default();
+    style::apply(&context);
+
+    // One idle pass lays the rows out and records their rectangles.
+    draw(
+        &context,
+        Vec::new(),
+        &document,
+        &references,
+        &mut pending,
+        &mut session,
+        &mut regions,
+    );
+    let rows: Vec<egui::Rect> = (0..3)
+        .map(|index| {
+            let key = format!("{ASSET}:passes[{index}]");
+            session
+                .settings_row_rects
+                .iter()
+                .find(|(logged, _)| *logged == key)
+                .map(|(_, rect)| *rect)
+                .expect("the row drew")
+        })
+        .collect();
+
+    // Press on the first row's picker, move just below the third row's middle,
+    // release: the scripted drag's three frames, in the event shapes the
+    // window bridge produces.
+    let from = egui::pos2(rows[0].right() - 40.0, rows[0].center().y);
+    let to = egui::pos2(rows[2].right() - 40.0, rows[2].bottom() - 1.0);
+    let press = egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    };
+    let release = egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::default(),
+    };
+    for events in [
+        vec![egui::Event::PointerMoved(from), press],
+        vec![egui::Event::PointerMoved(to)],
+        vec![release],
+    ] {
+        draw(
+            &context,
+            events,
+            &document,
+            &references,
+            &mut pending,
+            &mut session,
+            &mut regions,
+        );
+    }
+
+    assert_eq!(
+        pending.batches.len(),
+        1,
+        "the drop queued one recorded edit"
+    );
+    let EditorCommand::SetAssetSettings { path, settings } = &pending.batches[0].commands[0] else {
+        panic!(
+            "the drop writes the settings document: {:?}",
+            pending.batches[0].commands
+        );
+    };
+    assert_eq!(path, ASSET);
+    let order: Vec<&str> = settings["passes"]
+        .as_array()
+        .expect("the list stays an array")
+        .iter()
+        .map(|entry| entry["guid"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(order, vec!["b", "c", "a"], "the first row moved to the end");
+}
+
+/// A row starts its label where its column starts - a label centred in the
+/// column would drift with its own length - and keeps the row's gap before the
+/// control, whatever the label and the panel's item spacing are.
+#[test]
+fn a_row_left_aligns_its_label_and_keeps_the_gap() {
+    let context = egui::Context::default();
+    style::apply(&context);
+    // The control's offset from the row's left edge, for one label.
+    let measure = |label: &str| -> f32 {
+        let mut offset = 0.0;
+        run_pass(&context, &mut |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.allocate_ui(egui::vec2(520.0, 120.0), |ui| {
+                    let row_left = ui.cursor().left();
+                    row_in(ui, WIDE_ROW_LABEL_WIDTH, label, None, &mut |ui| {
+                        let response = ui
+                            .add_sized(egui::vec2(80.0, ROW_HEIGHT), egui::Button::new("control"));
+                        offset = response.rect.left() - row_left;
+                    });
+                });
+            });
+        });
+        offset
+    };
+    let short = measure("a");
+    let long = measure("a label long enough to fill its column");
+    assert_eq!(
+        short, long,
+        "the control sits at one x whatever the label says"
+    );
+    assert!(
+        short >= WIDE_ROW_LABEL_WIDTH + ROW_LABEL_GAP - 0.5,
+        "the control starts past the label column and its gap, got {short}"
+    );
+}
+
 /// A click on an entity row moves the shared selection; a second click on the
 /// selected row is not a change.
 #[test]

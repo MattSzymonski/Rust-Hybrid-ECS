@@ -6,7 +6,7 @@
 //!   order the pipeline's vertex step reads them, plus a 32-bit index list.
 //! - Build meshes three ways: from buffers the game already holds, from the
 //!   built-in triangle used as a stand-in, and by decoding a Wavefront OBJ
-//!   buffer.
+//!   buffer - flipping V, or keeping it as authored for a top-down asset.
 //! - Derive tangent space after an OBJ decode. A file carries positions, UVs
 //!   and normals, so the tangents and bitangents the shaders read are
 //!   accumulated from the mesh's triangles and normalized here.
@@ -39,7 +39,8 @@ pub struct MeshVertex {
     /// Object-space position.
     pub position: [f32; 3],
     /// Texture coordinates for the shader's UV input. The OBJ decoder flips
-    /// V, because a file counts it upward from the bottom edge.
+    /// V, because a file counts it upward from the bottom edge; a top-down
+    /// asset decodes through `Mesh::from_obj_bytes_top_down` instead.
     pub texture_coordinates: [f32; 2],
     /// Object-space normal. A decoded vertex the file gives no normal for
     /// falls back to +Y.
@@ -130,6 +131,33 @@ impl Mesh {
     #[pill_mirror_method]
     pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
         Self::decode_obj(name.into(), bytes, &MeshImportSettings::default())
+    }
+
+    /// Decodes a Wavefront OBJ buffer whose V coordinates are taken as
+    /// authored: top-down, `0.0` at the image's top edge, which is how the
+    /// renderer samples.
+    ///
+    /// [`Self::from_obj_bytes`] is the decode for a file that counts V up
+    /// from the bottom edge - the OBJ convention - and flips it; an asset
+    /// authored against a top-left sampler, a port of an older demo being the
+    /// usual case, decodes through here so its UV islands land where the
+    /// texture was painted. The metadata import states the same choice as
+    /// [`MeshImportSettings::flip_v`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`AssetLoadError::Decode`] cases as
+    /// [`Self::from_obj_bytes`].
+    #[pill_mirror_method]
+    pub fn from_obj_bytes_top_down(
+        name: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<Self, AssetLoadError> {
+        let settings = MeshImportSettings {
+            flip_v: false,
+            ..MeshImportSettings::default()
+        };
+        Self::decode_obj(name.into(), bytes, &settings)
     }
 
     /// The OBJ decode behind [`Self::from_obj_bytes`] and the metadata import,
@@ -345,6 +373,25 @@ f 1/1 2/2 3/3\n";
     #[test]
     fn rejects_a_buffer_with_no_triangles() {
         assert!(Mesh::from_obj_bytes("empty", b"").is_err());
+    }
+
+    /// The top-down decode keeps every V as authored, so it is the mirror of
+    /// the default decode's flip and nothing else moves.
+    #[test]
+    fn the_top_down_decode_mirrors_the_default_flip() {
+        let flipped = Mesh::from_obj_bytes("t", TRIANGLE_OBJ.as_bytes()).unwrap();
+        let top_down = Mesh::from_obj_bytes_top_down("t", TRIANGLE_OBJ.as_bytes()).unwrap();
+        assert_eq!(flipped.indices, top_down.indices);
+        assert_eq!(flipped.vertices.len(), top_down.vertices.len());
+        for (flipped, top_down) in flipped.vertices.iter().zip(&top_down.vertices) {
+            assert_eq!(flipped.position, top_down.position);
+            assert_eq!(
+                flipped.texture_coordinates[0],
+                top_down.texture_coordinates[0]
+            );
+            let mirrored = flipped.texture_coordinates[1] + top_down.texture_coordinates[1];
+            assert!((mirrored - 1.0).abs() < 1.0e-6, "{mirrored}");
+        }
     }
 
     /// An import with no metadata file decodes through the default settings,

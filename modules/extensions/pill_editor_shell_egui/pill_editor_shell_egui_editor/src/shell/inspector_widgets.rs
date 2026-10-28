@@ -13,6 +13,7 @@ use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::tab_inspector::{
     INSPECTOR_VECTOR_FIELD_HEIGHT, INSPECTOR_VECTOR_LABEL_WIDTH,
 };
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The edit control for one scalar, honouring the widget the row model chose:
 /// a slider over a `[Range]`, a drag value with a `[Min]` floor, and the plain
@@ -297,11 +298,14 @@ pub fn scalar_edit(ui: &mut egui::Ui, value: &FieldValue) -> Option<FieldValue> 
     }
 }
 
-/// One read-only (name, value) row.
+/// One read-only (name, value) row: the shared label column, then the value.
+/// The label carries itself as a tooltip, because the column truncates a
+/// long name before its widget would, and a value too long for the row is
+/// truncated with its own tooltip rather than pushing the row wider.
 pub fn read_only_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(label).color(style::text_muted()));
-        ui.label(value);
+    row(ui, label, Some(label), &mut |ui| {
+        ui.add(egui::Label::new(value).truncate())
+            .on_hover_text(value);
     });
 }
 

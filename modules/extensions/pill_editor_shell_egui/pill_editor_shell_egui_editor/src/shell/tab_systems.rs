@@ -57,19 +57,29 @@ pub fn systems_tab(
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         for system in &snapshot.systems {
-            ui.horizontal(|ui| {
-                ui.label(systems::system_row_label(system));
-                if ui
-                    .add(icons::IconButton::new(
-                        icons::Icon::Power,
-                        systems::system_state_label(system.enabled),
-                    ))
-                    .clicked()
-                {
-                    let (command, label) = systems::system_toggle(system.index, !system.enabled);
-                    pending.push_recorded(vec![command], label, None);
-                }
-            });
+            // A system's own row label carries the module it belongs to, so a
+            // long crate name is the one label the wide column can truncate;
+            // the tooltip keeps the whole of it reachable.
+            let name = systems::system_row_label(system);
+            row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                &name,
+                Some(name.as_str()),
+                &mut |ui| {
+                    if ui
+                        .add(icons::IconButton::new(
+                            icons::Icon::Power,
+                            systems::system_state_label(system.enabled),
+                        ))
+                        .clicked()
+                    {
+                        let (command, label) =
+                            systems::system_toggle(system.index, !system.enabled);
+                        pending.push_recorded(vec![command], label, None);
+                    }
+                },
+            );
         }
     });
 }

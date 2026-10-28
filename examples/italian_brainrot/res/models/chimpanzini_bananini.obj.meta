@@ -3,7 +3,7 @@
   "asset_type": "pill_master_renderer::assets::Mesh",
   "guid": "d4dd16ebefca04635260b6017ad53f99",
   "settings": {
-    "flip_v": true,
+    "flip_v": false,
     "calculate_tangents": true
   }
 }

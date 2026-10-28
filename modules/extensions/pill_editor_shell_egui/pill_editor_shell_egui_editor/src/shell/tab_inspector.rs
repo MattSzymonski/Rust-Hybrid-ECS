@@ -12,10 +12,6 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
-/// The Inspector's label column width, in points: Unity's label/control
-/// split leaves the control side most of a narrow panel.
-pub const INSPECTOR_LABEL_WIDTH: f32 = 80.0;
-
 /// One vector element's group width, in points: the axis letter and its
 /// field together, so a wrap moves the pair and never separates them.
 pub const INSPECTOR_VECTOR_FIELD_WIDTH: f32 = 58.0;
