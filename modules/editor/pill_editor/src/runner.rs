@@ -9600,14 +9600,9 @@ fn engine_asset_rows(
     registry
         .loaded_assets(assets)
         .into_iter()
-        .filter(|(_kind, guid, name)| match guid {
-            Some(guid) => {
-                let guid = guid.to_string();
-                !listing
-                    .iter()
-                    .any(|row| row.guid.as_deref() == Some(guid.as_str()))
-            }
-            None => !listing.iter().any(|row| row.path == *name),
+        .filter(|(_kind, guid, name)| {
+            let guid = guid.map(|guid| guid.to_string());
+            !listing_backs(listing, guid.as_deref(), name)
         })
         .map(
             |(kind, guid, name)| pill_editor_core::editor_state::EngineAsset {
@@ -9617,6 +9612,25 @@ fn engine_asset_rows(
             },
         )
         .collect()
+}
+
+/// Whether the listing already shows the store asset `name` carries.
+///
+/// One asset is one row: a guid the file declares, the path the store holds it
+/// under, or - for an asset added under a short name - a file of that name. The
+/// renderer does exactly the last: it loads `defaults/pill.pbr.material` and
+/// adds those bytes to the store as `pill.pbr.material`, so a picker left to
+/// the raw facts offers the same material twice, once of them unreachable.
+fn listing_backs(listing: &[AssetListing], guid: Option<&str>, name: &str) -> bool {
+    if let Some(guid) = guid {
+        return listing.iter().any(|row| row.guid.as_deref() == Some(guid));
+    }
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    listing.iter().any(|row| {
+        row.path == name
+            || row.path.ends_with(&format!("/{name}"))
+            || row.path.rsplit('/').next() == Some(file_name)
+    })
 }
 
 // =============================================================================
@@ -9643,6 +9657,48 @@ mod tests {
         assert!(
             !native.to_string_lossy().contains('/'),
             "a `/` makes Explorer fall back to Documents: {native:?}"
+        );
+    }
+
+    /// A store asset a listing row already backs is not offered again: the
+    /// renderer's default material is the case that matters, because the file
+    /// that ships it and the name the store holds it under differ.
+    #[test]
+    fn a_listing_row_stands_for_the_store_asset_it_backs() {
+        let row = |path: &str, guid: Option<&str>| AssetListing {
+            root: String::new(),
+            path: path.to_string(),
+            read_only: false,
+            kind: "Material".to_string(),
+            standalone: false,
+            has_meta: guid.is_some(),
+            guid: guid.map(str::to_string),
+        };
+        let listing = [
+            row("defaults/pill.pbr.material", None),
+            row("materials/unlit.material", Some("6a1e")),
+            row("shaders/pbr_fragment.hlsl", Some("7b2f")),
+        ];
+
+        assert!(
+            listing_backs(&listing, None, "pill.pbr.material"),
+            "the short name the store holds the default material under is that file"
+        );
+        assert!(
+            listing_backs(&listing, None, "defaults/pill.pbr.material"),
+            "the store's own path is the same row"
+        );
+        assert!(
+            listing_backs(&listing, Some("6a1e"), "anything"),
+            "a guid the file declares is the row, whatever the store names it"
+        );
+        assert!(
+            !listing_backs(&listing, None, "pill.pbr.opaque"),
+            "a pass built in code has no file, so its row stays"
+        );
+        assert!(
+            !listing_backs(&listing, Some("ffff"), "pill.pbr.skybox"),
+            "a guid no file declares leaves the store's row alone"
         );
     }
 

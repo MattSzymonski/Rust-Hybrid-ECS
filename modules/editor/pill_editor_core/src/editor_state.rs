@@ -805,7 +805,7 @@ impl EditorSnapshot {
 }
 
 /// The asset value `reference` names - a path relative to `res`, a guid the
-/// project's files carry, or a guid the store already holds - loading the asset
+/// project's files carry, or a name the store already holds - loading the asset
 /// first when it is not loaded.
 ///
 /// The value carries the type the asset loaded as, so the field write that
@@ -839,7 +839,22 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
                 });
             }
         },
-        None => reference.to_owned(),
+        None => {
+            // A name the store holds is an asset with no file to load - a
+            // chain's built-in pass, the renderer's default material - so it
+            // is addressed by the name it was added under.
+            let held = world
+                .get_resource::<pill_engine::AssetManager>()
+                .and_then(|assets| registry.loaded_by_name(assets, reference));
+            if let Some((asset_type, index, generation)) = held {
+                return Ok(FieldValue::Asset {
+                    asset_type: Some(asset_type),
+                    index,
+                    generation,
+                });
+            }
+            reference.to_owned()
+        }
     };
     let assets = world
         .get_resource_mut::<pill_engine::AssetManager>()
@@ -3717,6 +3732,46 @@ mod tests {
         let unknown = pill_engine::AssetGuid::random().expect("a fresh guid");
         let error = resolve_asset_reference(&mut engine, &unknown.to_string()).unwrap_err();
         assert!(error.contains(&unknown.to_string()), "{error}");
+    }
+
+    /// A pick may name a store asset by the name it was added under, which is
+    /// the only identity an asset built in code without a guid has.
+    #[test]
+    fn a_pick_takes_the_name_the_store_holds_an_asset_under() {
+        let mut engine = Engine::new();
+        pill_ui_theme::register(engine.world_mut());
+        {
+            let world = engine.world_mut();
+            let assets = world
+                .get_resource_mut::<pill_engine::AssetManager>()
+                .expect("the engine owns an asset store");
+            assets
+                .add_named(
+                    "pill.theme.default",
+                    pill_ui_theme::ThemeOverrides::default(),
+                )
+                .expect("the name is free");
+        }
+        let value = resolve_asset_reference(&mut engine, "pill.theme.default")
+            .expect("a stored name resolves");
+        match value {
+            FieldValue::Asset {
+                asset_type,
+                index,
+                generation,
+            } => {
+                assert_eq!(asset_type.as_deref(), Some("pill_ui_theme::ThemeOverrides"));
+                let handle = engine
+                    .world()
+                    .get_resource::<pill_engine::AssetManager>()
+                    .and_then(|assets| {
+                        assets.handle_by_name::<pill_ui_theme::ThemeOverrides>("pill.theme.default")
+                    })
+                    .expect("the asset stayed loaded");
+                assert_eq!((index, generation), (handle.index(), handle.generation()));
+            }
+            other => panic!("expected an asset value, got {other:?}"),
+        }
     }
 
     /// A component holding a reference to another entity, as the derive lays

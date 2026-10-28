@@ -545,9 +545,26 @@ pub fn reference_row(
                                 let current =
                                     current_path.as_deref() == Some(candidate.path.as_str());
                                 ui.horizontal(|ui| {
-                                    let response = ui.selectable_label(current, &candidate.path);
-                                    if response.clicked() {
+                                    // A module's own resource: shown so a person
+                                    // sees what exists, but an import setting of
+                                    // a read-only resource is not this project's
+                                    // to write, so the row explains itself
+                                    // instead of taking the click.
+                                    let from_module = !candidate.root.is_empty();
+                                    if from_module {
+                                        engine_badge(ui);
+                                    }
+                                    let pickable = candidate.guid.is_some();
+                                    let row = ui.add_enabled_ui(pickable, |ui| {
+                                        ui.selectable_label(current, &candidate.path).clicked()
+                                    });
+                                    if row.inner {
                                         chosen = candidate.guid.clone().map(Some);
+                                    }
+                                    if !pickable {
+                                        row.response.on_hover_text(
+                                            "Shipped with the engine, so its settings are read-only",
+                                        );
                                     }
                                     // The focus affordance: a single click shows the
                                     // candidate in the Assets panel - the selection
@@ -571,25 +588,21 @@ pub fn reference_row(
                                     }
                                 });
                             }
-                            // The engine's own assets: they have no file, so no
-                            // folder to reveal, and choosing one writes its guid.
-                            // A candidate the store holds by name alone has no
-                            // guid to write, so it reads but cannot be chosen.
+                            // The store's own assets: they have no file, so no
+                            // folder to reveal, and choosing one writes its
+                            // guid - or the name it was added under, which the
+                            // field write resolves through the store.
                             for candidate in built {
                                 let current = field.guid.as_deref() == candidate.guid.as_deref();
-                                let pickable = candidate.guid.is_some();
                                 ui.horizontal(|ui| {
                                     engine_badge(ui);
-                                    let row = ui.add_enabled_ui(pickable, |ui| {
-                                        ui.selectable_label(current, &candidate.name).clicked()
-                                    });
-                                    if row.inner {
-                                        chosen = candidate.guid.clone().map(Some);
-                                    }
-                                    if !pickable {
-                                        row.response.on_hover_text(
-                                            "The store holds it by name only, so no reference can name it",
-                                        );
+                                    if ui.selectable_label(current, &candidate.name).clicked() {
+                                        chosen = Some(Some(
+                                            candidate
+                                                .guid
+                                                .clone()
+                                                .unwrap_or_else(|| candidate.name.clone()),
+                                        ));
                                     }
                                 });
                             }

@@ -121,6 +121,8 @@ type IdentityFunction = fn(&AssetManager, u32, u32) -> Option<AssetIdentity>;
 type GuidByPathFunction = fn(&AssetManager, &Path) -> Option<AssetGuid>;
 /// What the store holds for a guid: its name and the handle's raw parts.
 type LoadedByGuidFunction = fn(&AssetManager, AssetGuid) -> Option<(String, u32, u32)>;
+/// The handle the store holds an asset under a name, as its raw parts.
+type LoadedByNameFunction = fn(&AssetManager, &str) -> Option<(u32, u32)>;
 /// Every live asset of the type, as its guid and its name.
 type LoadedFunction = fn(&AssetManager) -> Vec<(Option<AssetGuid>, String)>;
 
@@ -151,6 +153,7 @@ struct ImportFunctions {
     identity: IdentityFunction,
     guid_by_path: GuidByPathFunction,
     loaded_by_guid: LoadedByGuidFunction,
+    loaded_by_name: LoadedByNameFunction,
     loaded: LoadedFunction,
     /// `Some` for a standalone type, whose file is the asset; `None` for a
     /// sourced one.
@@ -174,6 +177,7 @@ impl ImportFunctions {
             identity: identity_of::<T>,
             guid_by_path: guid_by_path::<T>,
             loaded_by_guid: loaded_by_guid_of::<T>,
+            loaded_by_name: handle_by_name_of::<T>,
             loaded: loaded_of::<T>,
             default_document: None,
             ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
@@ -194,6 +198,7 @@ impl ImportFunctions {
             identity: identity_of::<T>,
             guid_by_path: guid_by_path::<T>,
             loaded_by_guid: loaded_by_guid_of::<T>,
+            loaded_by_name: handle_by_name_of::<T>,
             loaded: loaded_of::<T>,
             default_document: Some(default_standalone_document::<T>),
             ensure_metadata: None,
@@ -328,6 +333,16 @@ where
         handle.index(),
         handle.generation(),
     ))
+}
+
+/// The raw parts of the handle the store holds `T` under `name`, if any.
+fn handle_by_name_of<T>(assets: &AssetManager, name: &str) -> Option<(u32, u32)>
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    assets
+        .handle_by_name::<T>(name)
+        .map(|handle| (handle.index(), handle.generation()))
 }
 
 /// Every live `T` in the store, as its guid and its name.
@@ -838,6 +853,20 @@ impl ImportRegistry {
             let registration = entry.current()?;
             (registration.functions.loaded_by_guid)(assets, guid)
                 .map(|(name, index, generation)| (entry.type_name.clone(), name, index, generation))
+        })
+    }
+
+    /// The type the store holds an asset named `name` as, with the handle's raw
+    /// parts; `None` when no live type has it loaded.
+    ///
+    /// An asset built in code - a chain's built-in passes, the renderer's
+    /// default material - has no file for a tool to name and may have no guid,
+    /// so its name in the store is the one identity it always has.
+    pub fn loaded_by_name(&self, assets: &AssetManager, name: &str) -> Option<(String, u32, u32)> {
+        self.entries.iter().find_map(|entry| {
+            let registration = entry.current()?;
+            (registration.functions.loaded_by_name)(assets, name)
+                .map(|(index, generation)| (entry.type_name.clone(), index, generation))
         })
     }
 
@@ -1636,6 +1665,18 @@ mod tests {
         );
         let other = AssetGuid::random().expect("a fresh guid");
         assert_eq!(registry.loaded_by_guid(&assets, other), None);
+
+        // A name answers with the type and the handle, which is what a picker
+        // writes for an asset that no guid names.
+        let (type_name, index, generation) = registry
+            .loaded_by_name(&assets, "notes/built.txt")
+            .expect("the name answers");
+        assert_eq!(type_name, Text::metadata_type_name());
+        assert_eq!(
+            (index, generation),
+            (built_handle.index(), built_handle.generation())
+        );
+        assert_eq!(registry.loaded_by_name(&assets, "notes/missing.txt"), None);
 
         let loaded = registry.loaded_assets(&assets);
         assert_eq!(loaded.len(), 2, "{loaded:?}");

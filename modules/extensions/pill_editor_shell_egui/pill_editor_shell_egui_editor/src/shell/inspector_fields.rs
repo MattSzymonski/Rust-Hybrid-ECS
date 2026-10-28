@@ -566,81 +566,94 @@ pub fn inspector_asset_row(
     if session.asset_picker.as_deref() == Some(key.as_str()) {
         if let Some((rect, _)) = button_rect {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
-            let area = floating_popup(
-                ui,
-                picker_id,
-                rect,
-                rect.width().max(180.0),
-                overlay_regions,
-                &mut |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut session.asset_search)
-                            .hint_text("Search assets")
-                            .desired_width(f32::INFINITY),
-                    );
-                    let search = session.asset_search.to_lowercase();
-                    let (files, built) = inspector::picker_candidates(
-                        input.assets,
-                        input.engine_assets,
-                        input.asset_type,
-                    );
-                    egui::ScrollArea::vertical()
-                        .max_height(ASSET_PICKER_HEIGHT)
-                        .show(ui, |ui| {
-                            if ui.selectable_label(false, "None").clicked() {
-                                chosen = Some(None);
-                            }
-                            for candidate in files.into_iter().filter(|candidate| {
-                                candidate.path.to_lowercase().contains(&search)
-                            }) {
-                                let current = matches!(&label, AssetReferenceLabel::Named(name)
+            let area =
+                floating_popup(
+                    ui,
+                    picker_id,
+                    rect,
+                    rect.width().max(180.0),
+                    overlay_regions,
+                    &mut |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut session.asset_search)
+                                .hint_text("Search assets")
+                                .desired_width(f32::INFINITY),
+                        );
+                        let search = session.asset_search.to_lowercase();
+                        let (files, built) = inspector::picker_candidates(
+                            input.assets,
+                            input.engine_assets,
+                            input.asset_type,
+                        );
+                        egui::ScrollArea::vertical()
+                            .max_height(ASSET_PICKER_HEIGHT)
+                            .show(ui, |ui| {
+                                if ui.selectable_label(false, "None").clicked() {
+                                    chosen = Some(None);
+                                }
+                                for candidate in files.into_iter().filter(|candidate| {
+                                    candidate.path.to_lowercase().contains(&search)
+                                }) {
+                                    let current = matches!(&label, AssetReferenceLabel::Named(name)
                                     if *name == candidate.path);
-                                ui.horizontal(|ui| {
-                                    if ui.selectable_label(current, &candidate.path).clicked() {
-                                        chosen = Some(Some(candidate.path.clone()));
-                                    }
-                                    // The focus affordance the asset-settings
-                                    // picker carries: showing a candidate in the
-                                    // Assets panel keeps the picker open, so
-                                    // looking one up does not throw the edit
-                                    // away.
-                                    if ui
-                                        .small_button("o")
-                                        .on_hover_text("Show this asset in the Assets panel")
-                                        .clicked()
-                                    {
-                                        pending.focus_asset(candidate.key());
-                                    }
-                                });
-                            }
-                            // The engine's own assets: no file, so no folder to
-                            // reveal, and the pick writes their guid. One the
-                            // store holds by name alone reads but cannot be
-                            // chosen.
-                            for candidate in built.into_iter().filter(|candidate| {
-                                candidate.name.to_lowercase().contains(&search)
-                            }) {
-                                let current = matches!(&label, AssetReferenceLabel::Named(name)
-                                    if *name == candidate.name);
-                                let pickable = candidate.guid.is_some();
-                                ui.horizontal(|ui| {
-                                    engine_badge(ui);
-                                    let row = ui.add_enabled_ui(pickable, |ui| {
-                                        ui.selectable_label(current, &candidate.name).clicked()
+                                    ui.horizontal(|ui| {
+                                        // A row under a module root is the engine's
+                                        // own file, not the project's: the badge is
+                                        // what tells the two apart, since the path
+                                        // of a module's resource reads like any other.
+                                        let from_module = !candidate.root.is_empty();
+                                        if from_module {
+                                            engine_badge(ui);
+                                        }
+                                        let mut row = ui.selectable_label(current, &candidate.path);
+                                        if from_module {
+                                            row = row.on_hover_text(format!(
+                                                "Shipped with the {} module",
+                                                candidate.root
+                                            ));
+                                        }
+                                        if row.clicked() {
+                                            chosen = Some(Some(candidate.path.clone()));
+                                        }
+                                        // The focus affordance the asset-settings
+                                        // picker carries: showing a candidate in the
+                                        // Assets panel keeps the picker open, so
+                                        // looking one up does not throw the edit
+                                        // away.
+                                        if ui
+                                            .small_button("o")
+                                            .on_hover_text("Show this asset in the Assets panel")
+                                            .clicked()
+                                        {
+                                            pending.focus_asset(candidate.key());
+                                        }
                                     });
-                                    if row.inner {
-                                        chosen = candidate.guid.clone().map(Some);
-                                    }
-                                    if !pickable {
-                                        row.response.on_hover_text(
-                                            "The store holds it by name only, so no reference can name it",
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                },
-            );
+                                }
+                                // The store's own assets: the ones built in code,
+                                // which no directory walk finds. A row is picked by
+                                // its guid when it has one and by the name it was
+                                // added under otherwise, which the field write
+                                // resolves through the store.
+                                for candidate in built.into_iter().filter(|candidate| {
+                                    candidate.name.to_lowercase().contains(&search)
+                                }) {
+                                    let current = matches!(&label, AssetReferenceLabel::Named(name)
+                                    if *name == candidate.name);
+                                    ui.horizontal(|ui| {
+                                        engine_badge(ui);
+                                        if ui.selectable_label(current, &candidate.name).clicked() {
+                                            chosen = Some(Some(
+                                                candidate
+                                                    .guid
+                                                    .clone()
+                                                    .unwrap_or_else(|| candidate.name.clone()),
+                                            ));
+                                        }
+                                    });
+                                }
+                            });
+                    },
+                );
             // Any press outside the picker and its row closes it, whatever
             // button it was: a picker that only closes by picking fights the
             // person who changed their mind. The press that opens the picker
