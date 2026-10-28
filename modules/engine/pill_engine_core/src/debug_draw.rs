@@ -46,6 +46,10 @@ pub struct DebugStyle {
     /// Whether scene geometry in front hides it (`true`), or it shows through
     /// everything (`false`).
     pub depth_test: bool,
+    /// Whether it is an editor's own chrome - a drag guide, a constraint line -
+    /// rather than the game's drawing. An editor view shows chrome, a game
+    /// surface does not.
+    pub chrome: bool,
     /// How long it stays.
     pub lifetime: DebugLifetime,
 }
@@ -55,6 +59,7 @@ impl Default for DebugStyle {
         Self {
             color: [1.0, 1.0, 1.0, 1.0],
             depth_test: true,
+            chrome: false,
             lifetime: DebugLifetime::OneFrame,
         }
     }
@@ -95,6 +100,8 @@ pub struct DebugLine {
     pub color: DebugColor,
     /// Whether scene geometry hides it.
     pub depth_test: bool,
+    /// Whether only an editor view draws it.
+    pub chrome: bool,
 }
 
 /// One text label of a frame.
@@ -240,6 +247,7 @@ impl DebugDraw {
                     end,
                     color: style.color,
                     depth_test: style.depth_test,
+                    chrome: style.chrome,
                 },
                 lifetime: style.lifetime,
             });
