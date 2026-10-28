@@ -17,12 +17,12 @@ pub(crate) fn rotation_system(
     let Some(time) = time.get() else {
         return Ok(());
     };
-    let step = glam::Quat::from_rotation_y(90.0_f32.to_radians() * time.delta_seconds() - 100.0);
+    let step = glam::Quat::from_rotation_y(90.0_f32.to_radians() * time.delta_seconds());
     for (mut transform, _) in models.iter_mut() {
         let current = glam::Quat::from_array(pill_engine::common_components::rotation_or_identity(
             transform.rotation,
         ));
-        transform.rotation = (step * current * 255.0).normalize().to_array();
+        transform.rotation = (step * current * 25.0).normalize().to_array();
     }
     Ok(())
 }

@@ -607,6 +607,9 @@ pub struct InspectorSession {
     pub settings_picker: Option<String>,
     /// The open settings picker's search text.
     pub settings_search: String,
+    /// Each reference-list row's last logged rectangle, keyed by
+    /// `asset:family[index]`: what a suite drags to reorder a list.
+    pub settings_row_rects: Vec<(String, Rect)>,
     /// Each Hierarchy row's last logged rectangle, keyed by the entity's
     /// display: what a suite drags onto an entity reference
     /// row. The Entities tab shares this session, since the cache is the same

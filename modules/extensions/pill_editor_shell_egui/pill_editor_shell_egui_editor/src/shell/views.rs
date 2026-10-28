@@ -126,15 +126,64 @@ pub fn frame_counter_rect(ui: &egui::Ui) -> egui::Rect {
     )
 }
 
-/// The side of a scene badge's chip, in points.
-pub const SCENE_BADGE_SIZE: f32 = 16.0;
+/// The padding a badge's mark leaves inside its clickable rectangle, in
+/// points; the icon size preference sets the mark, and this is the rest.
+pub const SCENE_BADGE_PADDING: f32 = 3.0;
 
-/// Draw one scene view's entity badges: a chip at each point the executable
-/// projected, carrying the entity's component mark - a camera, a light - or a
-/// plain dot when it has neither.
+/// The spread a badge's shadow is blurred over, as a fraction of the mark's
+/// size.
+pub const SCENE_BADGE_SHADOW_BLUR: f32 = 0.1;
+
+/// How far the whole shadow sits down and right of the mark, as a fraction of
+/// the mark's size: a CSS shadow's direction, kept short so the mark still
+/// reads as standing on its point.
+pub const SCENE_BADGE_SHADOW_DISTANCE: f32 = 0.05;
+
+/// The opacity of one shadow sample. The shadow is the mark drawn at
+/// [`SCENE_BADGE_SHADOW_SAMPLES`], so the faded copies add up in the middle and
+/// thin out at the rim.
+pub const SCENE_BADGE_SHADOW_ALPHA: f32 = 0.22;
+
+/// The unit offsets a badge's shadow is sampled at: the centre and a ring
+/// around it, which together read as one soft edge instead of a second hard
+/// glyph.
+pub const SCENE_BADGE_SHADOW_SAMPLES: [(f32, f32); 9] = [
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (0.5, 0.5),
+    (0.0, 1.0),
+    (-0.5, 0.5),
+    (-1.0, 0.0),
+    (-0.5, -0.5),
+    (0.0, -1.0),
+    (0.5, -0.5),
+];
+
+/// The centres a badge's shadow is drawn at: the mark's own centre moved to the
+/// shadow's place, then to each blur sample around it.
+pub fn badge_shadow_centres(mark: egui::Rect) -> [egui::Pos2; SCENE_BADGE_SHADOW_SAMPLES.len()] {
+    let distance = mark.width() * SCENE_BADGE_SHADOW_DISTANCE;
+    let blur = mark.width() * SCENE_BADGE_SHADOW_BLUR;
+    let origin = mark.center() + egui::vec2(distance, distance);
+    let mut centres = [origin; SCENE_BADGE_SHADOW_SAMPLES.len()];
+    for (centre, (x, y)) in centres.iter_mut().zip(SCENE_BADGE_SHADOW_SAMPLES) {
+        *centre = origin + egui::vec2(x * blur, y * blur);
+    }
+    centres
+}
+
+/// Draw one scene view's entity badges: the entity's component mark - a
+/// camera, a light - or a plain dot when it has neither, at each point the
+/// executable projected.
 ///
-/// A chip is the UI's: its rectangle joins the frame's overlay regions, so a
-/// click on it selects its entity instead of pressing the scene behind it.
+/// A badge is the mark alone, with no chip behind it, standing on a short
+/// blurred drop shadow in the theme's shadow ink - the way a CSS shadow keeps a
+/// glyph readable over a busy surface. The mark's size is the
+/// `editor.gizmo_icon_size` preference, and the rectangle that picks it scales
+/// with it. The mark carries the state: a selected entity's is red, and
+/// hovering brightens an unselected one. A badge is the UI's: its rectangle
+/// joins the frame's overlay regions, so a click on it selects its entity
+/// instead of pressing the scene behind it.
 pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: usize) {
     let badges: Vec<ShellBadge> = viewer
         .badges
@@ -145,11 +194,15 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
     if badges.is_empty() {
         return;
     }
+    // The preference is parsed and clamped into its range by the snapshot, so
+    // this only has to size the mark and the rectangle around it.
+    let icon_size = viewer.snapshot.preferences.gizmo_icon_size;
+    let badge_size = icon_size + SCENE_BADGE_PADDING * 2.0;
     let mut picked = None;
     for badge in badges {
         let rect = egui::Rect::from_center_size(
             egui::pos2(badge.x, badge.y),
-            egui::Vec2::splat(SCENE_BADGE_SIZE),
+            egui::Vec2::splat(badge_size),
         );
         let response = ui.interact(
             rect,
@@ -157,6 +210,7 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
             egui::Sense::click(),
         );
         let hovered = response.hovered();
+        let selected = viewer.selection.entities().contains(&badge.entity);
         let key = format!("{view}:{}", badge.entity);
         if remember_moved_rect(&mut viewer.inspector.badge_rects, &key, rect) {
             pill_core::info!(
@@ -170,20 +224,6 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
                 "[editor] scene badge rect"
             );
         }
-        ui.painter().circle_filled(
-            rect.center(),
-            SCENE_BADGE_SIZE * 0.5,
-            if hovered {
-                style::selection()
-            } else {
-                style::overlay()
-            },
-        );
-        ui.painter().circle_stroke(
-            rect.center(),
-            SCENE_BADGE_SIZE * 0.5,
-            egui::Stroke::new(1.0, style::overlay_border()),
-        );
         let label = viewer
             .snapshot
             .entities
@@ -191,22 +231,54 @@ pub fn scene_badges(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, view: u
             .find(|entry| entry.entity == badge.entity)
             .map(|entry| entry.archetype_label.as_str())
             .unwrap_or_default();
+        // The shadow keeps the theme's shadow ink whatever the mark is doing:
+        // hover and selection are read from the mark's own colour.
+        let shadow_ink = icons::with_alpha(style::shadow(), SCENE_BADGE_SHADOW_ALPHA);
+        let mark = rect.shrink(SCENE_BADGE_PADDING);
+        let ink = match (selected, hovered) {
+            (true, _) => style::danger(),
+            (false, true) => style::text_strong(),
+            (false, false) => style::text(),
+        };
         match inspector::badge_icon(label) {
-            Some(icon) => icons::paint_duotone(
-                ui.painter(),
-                rect.shrink(3.0),
-                icon,
-                if hovered {
-                    style::text_strong()
-                } else {
-                    style::text()
-                },
-            ),
+            Some(icon) => {
+                // A blurred shadow is the mark itself drawn at each sample of
+                // [`badge_shadow_centres`], so the copies sum into a soft edge.
+                for centre in badge_shadow_centres(mark) {
+                    icons::paint_duotone(
+                        ui.painter(),
+                        egui::Rect::from_center_size(centre, mark.size()),
+                        icon,
+                        shadow_ink,
+                    );
+                }
+                icons::paint_duotone(ui.painter(), mark, icon, ink);
+            }
             None => {
+                let dot_ink = match (selected, hovered) {
+                    (true, _) => style::danger(),
+                    (false, true) => style::text_strong(),
+                    (false, false) => style::text_muted(),
+                };
+                for centre in badge_shadow_centres(mark) {
+                    ui.painter()
+                        .circle_filled(centre, icon_size * 0.3, shadow_ink);
+                }
                 ui.painter()
-                    .circle_filled(rect.center(), 3.0, style::text_muted());
+                    .circle_filled(mark.center(), icon_size * 0.3, dot_ink);
             }
         }
+        // A hovered badge used to outline itself in the accent. Paused: the
+        // mark brightens instead, so no box is put back around it.
+        //
+        // if hovered {
+        //     ui.painter().rect_stroke(
+        //         rect,
+        //         egui::CornerRadius::same(3),
+        //         egui::Stroke::new(1.0, style::accent()),
+        //         egui::StrokeKind::Inside,
+        //     );
+        // }
         if response.clicked() {
             picked = Some(badge.entity);
         }

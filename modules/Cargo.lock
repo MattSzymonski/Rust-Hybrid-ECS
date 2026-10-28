@@ -1334,12 +1334,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "host_project_circus_recreation"
+name = "host_project_master_renderer_test"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "pill_assets",
  "pill_engine",
  "pill_master_renderer_data",
+ "serde",
+ "trait_type_map",
 ]
 
 [[package]]

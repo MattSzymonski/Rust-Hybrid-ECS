@@ -198,7 +198,7 @@ pub fn inspector_field_row(
             // instead of clipping them past the panel's edge.
             ui.horizontal_wrapped(|ui| {
                 let label = ui.add_sized(
-                    egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
+                    egui::vec2(ROW_LABEL_WIDTH, ROW_HEIGHT),
                     egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
                         .truncate(),
                 );
@@ -332,7 +332,7 @@ pub fn inspector_field_row(
             // that live in fields of their own.
             ui.horizontal_wrapped(|ui| {
                 let label = ui.add_sized(
-                    egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
+                    egui::vec2(ROW_LABEL_WIDTH, ROW_HEIGHT),
                     egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
                         .truncate(),
                 );
@@ -1164,25 +1164,16 @@ pub fn field_widget_name(widget: &inspector::FieldWidget) -> &'static str {
     }
 }
 
-/// The Inspector's two columns: the field's label on the left, its widget on
-/// the right - Unity's label/control split. A decorator's tooltip shows while
-/// the pointer rests on the label.
+/// The Inspector's field row: the shared label/control row ([`row`]), with
+/// the field's label on the left and its widget in the control column. A
+/// decorator's tooltip shows while the pointer rests on the label.
 pub fn inspector_row(
     ui: &mut egui::Ui,
     label: &str,
     tooltip: Option<&str>,
     widget: &mut dyn FnMut(&mut egui::Ui),
 ) {
-    ui.horizontal(|ui| {
-        let label = ui.add_sized(
-            egui::vec2(INSPECTOR_LABEL_WIDTH, 18.0),
-            egui::Label::new(egui::RichText::new(label).color(style::text_muted())).truncate(),
-        );
-        if let Some(text) = tooltip {
-            label.on_hover_text(text);
-        }
-        widget(ui);
-    });
+    row(ui, label, tooltip, widget);
 }
 
 /// Whether a value has its own widget kind.

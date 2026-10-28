@@ -44,7 +44,11 @@ pub fn preferences_tab(
             // row still waits for one.
             if field.key == pill_editor_core::previews::RENDER_PREVIEWS_KEY {
                 let mut enabled = buffer.trim().eq_ignore_ascii_case("true");
-                if ui.checkbox(&mut enabled, field.label).changed() {
+                let mut changed = false;
+                row_in(ui, WIDE_ROW_LABEL_WIDTH, field.label, None, &mut |ui| {
+                    changed = ui.checkbox(&mut enabled, "").changed();
+                });
+                if changed {
                     *buffer = if enabled { "true" } else { "false" }.to_string();
                     pending.push(vec![EditorCommand::SetPreferences {
                         values: vec![(field.key.to_string(), buffer.clone())],
@@ -57,9 +61,8 @@ pub fn preferences_tab(
                 }
                 continue;
             }
-            ui.horizontal(|ui| {
-                ui.label(field.label);
-                ui.add(egui::TextEdit::singleline(buffer).desired_width(150.0));
+            row_in(ui, WIDE_ROW_LABEL_WIDTH, field.label, None, &mut |ui| {
+                ui.add(egui::TextEdit::singleline(buffer).desired_width(ui.available_width()));
             });
         }
         let mut save = false;
@@ -92,36 +95,60 @@ pub fn preferences_tab(
         }
         ui.separator();
         ui.heading("Project");
-        ui.label(format!(
-            "Project: {}",
-            view.project.as_deref().unwrap_or("(unknown)")
-        ));
+        value_row_in(
+            ui,
+            WIDE_ROW_LABEL_WIDTH,
+            "project",
+            view.project.as_deref().unwrap_or("(unknown)"),
+        );
         if view.project_remembered {
-            ui.label(format!(
-                "Remembered tool: mode={} space={} snap={}",
+            value_row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                "remembered mode",
                 view.project_gizmo.mode.map_or("(unset)", gizmo_mode_label),
+            );
+            value_row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                "remembered space",
                 view.project_gizmo
                     .space
                     .map_or("(unset)", gizmo_space_label),
-                view.project_gizmo
+            );
+            value_row_in(
+                ui,
+                WIDE_ROW_LABEL_WIDTH,
+                "remembered snap",
+                &view
+                    .project_gizmo
                     .snap
                     .map_or("(unset)".to_string(), |snap| snap.to_string()),
-            ));
-        } else {
-            ui.label(
-                egui::RichText::new(
-                    "Remembered tool: none yet - a tool choice is remembered per project.",
-                )
-                .weak(),
             );
+        } else {
+            row_in(ui, WIDE_ROW_LABEL_WIDTH, "remembered", None, &mut |ui| {
+                ui.weak("none yet - a tool choice is remembered per project.");
+            });
         }
-        ui.label(format!(
-            "Active: mode={} space={} snap={}",
+        value_row_in(
+            ui,
+            WIDE_ROW_LABEL_WIDTH,
+            "active mode",
             gizmo_mode_label(snapshot.gizmo.mode),
+        );
+        value_row_in(
+            ui,
+            WIDE_ROW_LABEL_WIDTH,
+            "active space",
             gizmo_space_label(snapshot.gizmo.space),
-            snapshot.gizmo.snap,
-        ));
-        ui.horizontal(|ui| {
+        );
+        value_row_in(
+            ui,
+            WIDE_ROW_LABEL_WIDTH,
+            "active snap",
+            &snapshot.gizmo.snap.to_string(),
+        );
+        row_in(ui, WIDE_ROW_LABEL_WIDTH, "gizmo", None, &mut |ui| {
             for (mode, label, icon) in TOOL_ROWS {
                 let button =
                     icons::IconButton::new(icon, label).active(snapshot.gizmo.mode == mode);

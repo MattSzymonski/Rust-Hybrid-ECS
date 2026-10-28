@@ -15,6 +15,7 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The resource section: a heading, then one row per editable field.
 pub fn resource_section(
@@ -26,8 +27,7 @@ pub fn resource_section(
     ui.label("A world resource. Every edit here is one undo step.");
     ui.separator();
     for field in &view.fields {
-        ui.horizontal(|ui| {
-            ui.label(field.label.as_str());
+        row(ui, field.label.as_str(), None, &mut |ui| {
             match &field.value {
                 FieldValue::Bool(value) => {
                     let mut checked = *value;

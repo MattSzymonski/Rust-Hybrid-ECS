@@ -90,6 +90,8 @@ pub struct Palette {
     pub overlay: Color32,
     /// A floating panel's border.
     pub overlay_border: Color32,
+    /// The ink a drop shadow is cast in.
+    pub shadow: Color32,
     /// A log line at `info`.
     pub log_info: Color32,
     /// A log line at `debug`.
@@ -123,6 +125,7 @@ impl Palette {
             selection_bar: color(palette.selection_bar),
             overlay: color(palette.overlay),
             overlay_border: color(palette.overlay_border),
+            shadow: color(theme.shape.window_shadow.color),
             log_info: color(palette.log_info),
             log_debug: color(palette.log_debug),
             log_warn: color(palette.log_warn),
@@ -289,6 +292,13 @@ pub fn overlay() -> Color32 {
 /// A floating panel's border.
 pub fn overlay_border() -> Color32 {
     palette().overlay_border
+}
+
+/// The ink a drop shadow is cast in: the theme's window-shadow colour, so a
+/// mark floating over the scene shadows itself in the same ink as every
+/// other floating surface.
+pub fn shadow() -> Color32 {
+    palette().shadow
 }
 
 /// A log line at `info`.
@@ -779,11 +789,13 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
     style.dock_area_padding = None;
     // The tab strip: a darker band; the active tab takes the body's fill and
     // carries the accent underline, so it reads as one surface with its
-    // panel.
+    // panel. The strip's own line under the tabs is the neutral separator:
+    // the accent underline is the selected tab's alone and the shell paints
+    // it, because the dock uses one line colour for every tab.
     style.tab_bar.bg_fill = palette.frame;
     style.tab_bar.height = 26.0;
     style.tab_bar.corner_radius = CornerRadius::ZERO;
-    style.tab_bar.hline_color = palette.accent;
+    style.tab_bar.hline_color = palette.line;
     style.tab_bar.inner_margin = egui::Margin::symmetric(6, 3);
     style.tab.active = tab_faces(palette.panel, palette.text_strong);
     style.tab.focused = tab_faces(palette.panel, palette.text_strong);
@@ -792,7 +804,10 @@ pub fn dock_style(egui_style: &egui::Style, palette: &Palette) -> egui_dock::Sty
     style.tab.inactive_with_kb_focus = tab_faces(Color32::TRANSPARENT, palette.text_muted);
     style.tab.hovered = tab_faces(palette.panel_raised, palette.text);
     style.tab.focused_with_kb_focus = tab_faces(palette.panel_raised, palette.text);
-    style.tab.hline_below_active_tab_name = true;
+    // The active tab merges with its body: the shell paints the accent
+    // underline there itself, so the dock must not run the neutral line
+    // under it.
+    style.tab.hline_below_active_tab_name = false;
     style.tab.spacing = 0.0;
     style.tab.tab_body.bg_fill = palette.panel;
     style.tab.tab_body.inner_margin = egui::Margin::same(6);
@@ -1031,6 +1046,7 @@ mod tests {
         assert_eq!(text_muted(), color(theme.palette.text_muted));
         assert_eq!(accent(), color(theme.palette.accent));
         assert_eq!(overlay(), color(theme.palette.overlay));
+        assert_eq!(shadow(), color(theme.shape.window_shadow.color));
         assert_eq!(log_warn(), color(theme.palette.log_warn));
     }
 
@@ -1162,7 +1178,11 @@ mod tests {
         let palette = Palette::from_theme(&default_theme());
         let dock = dock_style(&egui::Style::default(), &palette);
         assert_eq!(dock.tab_bar.bg_fill, palette.frame);
-        assert_eq!(dock.tab_bar.hline_color, palette.accent);
+        assert_eq!(dock.tab_bar.hline_color, palette.line);
+        assert!(
+            !dock.tab.hline_below_active_tab_name,
+            "the shell paints the active tab's accent underline itself"
+        );
         assert_eq!(dock.tab.active.bg_fill, palette.panel);
         assert_eq!(dock.tab.active.text_color, palette.text_strong);
         assert_eq!(dock.tab.inactive.text_color, palette.text_muted);
