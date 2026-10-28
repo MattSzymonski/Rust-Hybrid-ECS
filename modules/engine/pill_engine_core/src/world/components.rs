@@ -24,6 +24,29 @@
 use super::*;
 
 // =============================================================================
+// ColumnChunk
+// =============================================================================
+
+/// One archetype's raw rows of one component, as a language binding reads them.
+///
+/// Every chunk accessor returns this type, so a caller reads `len` as a row
+/// count and `element_size` as the row stride by name instead of by position -
+/// the two are adjacent in the signatures they used to be carried in, and the
+/// descriptor lane returned only one of them.
+pub struct ColumnChunk<'a> {
+    /// The archetype the rows belong to.
+    pub archetype: ArchetypeId,
+    /// The column's contiguous row buffer, one `element_size` block per row.
+    pub data: *mut u8,
+    /// Rows in the column.
+    pub len: usize,
+    /// Bytes per row, read from the live column.
+    pub element_size: usize,
+    /// The column's change ticks, one per row.
+    pub ticks: &'a mut [ComponentTicks],
+}
+
+// =============================================================================
 // World - Components
 // =============================================================================
 
@@ -71,7 +94,7 @@ impl World {
                     query = query_type,
                     declared_hash = format!("{declared_hash:#018x}"),
                     registered_hash = format!("{registered_hash:#018x}"),
-                    "query refused: its binary was built against a different layout of this                      shared component than the one registered now; it matches nothing until                      that binary is rebuilt"
+                    "query refused: its binary was built against a different layout of this shared component than the one registered now; it matches nothing until that binary is rebuilt"
                 );
             }
             return Some(component_id);
@@ -370,7 +393,7 @@ impl World {
         component_id: ComponentId,
         fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
     ) -> Result<(), crate::component_field::ComponentFieldError> {
-        let component_size = self.component_registry.get_size(&component_id);
+        let component_size = self.component_layout(component_id).map(|(size, _)| size);
         for field in &fields {
             let Some(end) = field.offset.checked_add(field.size) else {
                 return Err(
@@ -578,7 +601,7 @@ impl World {
         // The registry reports the 128-type ceiling as a typed error (with the
         // offending name and current count) rather than panicking; propagate it.
         self.component_registry
-            .register_descriptor(stable_id, name, size)?;
+            .register_descriptor(stable_id, name)?;
         self.storage_factories.insert(
             component_id,
             StorageFactory::Descriptor(ColumnLayout::new(size, align, schema_hash, blittability)?),
@@ -687,13 +710,9 @@ impl World {
             migrated += column.relayout_validated(layout.clone(), plan, previous_size);
         }
 
-        // Publish the new layout to everyone who reads it back: the storage
-        // factory the chunk accessors consult, and the registry copy the
-        // diagnostics and later registrations compare against. Both records
-        // move together, or `get_layout` keeps reporting the placeholder
-        // alignment registration started with.
-        self.component_registry
-            .update_descriptor_layout(&component_id, &layout);
+        // Publish the new shape to the one record that describes storage: the
+        // factory the chunk accessors and the size readers consult. The
+        // columns that were just reshaped carry the same shape.
         self.storage_factories
             .insert(component_id, StorageFactory::Descriptor(layout));
         Ok(migrated)
@@ -775,13 +794,7 @@ impl World {
             for (row, entity) in archetype.entities.iter().enumerate() {
                 let old_bytes = column.bytes(row).ok_or(WorldError::DescriptorRowInvalid)?;
                 let mut new_bytes = vec![0_u8; new_size];
-                for planned in plan.fields() {
-                    let FieldSource::OldOffset(source_offset) = planned.source else {
-                        continue;
-                    };
-                    new_bytes[planned.offset..planned.offset + planned.bytes]
-                        .copy_from_slice(&old_bytes[source_offset..source_offset + planned.bytes]);
-                }
+                plan.apply(old_bytes, &mut new_bytes);
                 moves.push((*entity, new_bytes));
             }
         }
@@ -800,27 +813,35 @@ impl World {
         // declared again and its bit returns to the pool. Every archetype that
         // carried it was emptied by Step 2, which is the precondition the
         // retirement's bit rule checks.
-        self.retire_component_registration(old_component_id);
+        self.retire_registration(old_component_id);
         Ok(moved_rows)
     }
 
     /// Return a raw descriptor component column for language bindings.
+    ///
+    /// `chunk_position` indexes the archetypes that carry the component in the
+    /// map's iteration order, so it is only stable for the pass it is read in.
     pub fn descriptor_component_chunk_mut(
         &mut self,
         component_id: ComponentId,
-        chunk_index: usize,
-    ) -> Option<(ArchetypeId, *mut u8, usize, &mut [ComponentTicks])> {
+        chunk_position: usize,
+    ) -> Option<ColumnChunk<'_>> {
         let archetype = self
             .archetypes
             .values_mut()
             .filter(|archetype| archetype.component_types.contains(&component_id))
-            .nth(chunk_index)?;
+            .nth(chunk_position)?;
         let archetype_id = archetype.id;
-        let (data, len, ticks) = archetype
-            .component_storages
-            .get_mut(component_id)?
-            .raw_rows_and_ticks_mut();
-        Some((archetype_id, data, len, ticks))
+        let column = archetype.component_storages.get_mut(component_id)?;
+        let element_size = column.elem_size();
+        let (data, len, ticks) = column.raw_rows_and_ticks_mut();
+        Some(ColumnChunk {
+            archetype: archetype_id,
+            data,
+            len,
+            element_size,
+            ticks,
+        })
     }
 
     /// Return a raw native component column for language bindings.
@@ -835,8 +856,8 @@ impl World {
     pub fn native_component_chunk_mut(
         &mut self,
         component_id: ComponentId,
-        chunk_index: usize,
-    ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
+        chunk_position: usize,
+    ) -> Option<ColumnChunk<'_>> {
         if !component_id.is_native_storage() {
             return None;
         }
@@ -844,12 +865,18 @@ impl World {
             .archetypes
             .values_mut()
             .filter(|archetype| archetype.component_types.contains(&component_id))
-            .nth(chunk_index)?;
+            .nth(chunk_position)?;
         let archetype_id = archetype.id;
         let column = archetype.component_storages.get_mut(component_id)?;
         let element_size = column.elem_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
-        Some((archetype_id, data, len, element_size, ticks))
+        Some(ColumnChunk {
+            archetype: archetype_id,
+            data,
+            len,
+            element_size,
+            ticks,
+        })
     }
 
     /// Return a raw descriptor component column from one already-known archetype.
@@ -859,13 +886,18 @@ impl World {
         &mut self,
         component_id: ComponentId,
         archetype_id: ArchetypeId,
-    ) -> Option<(ArchetypeId, *mut u8, usize, &mut [ComponentTicks])> {
+    ) -> Option<ColumnChunk<'_>> {
         let archetype = self.archetypes.get_mut(&archetype_id)?;
-        let (data, len, ticks) = archetype
-            .component_storages
-            .get_mut(component_id)?
-            .raw_rows_and_ticks_mut();
-        Some((archetype_id, data, len, ticks))
+        let column = archetype.component_storages.get_mut(component_id)?;
+        let element_size = column.elem_size();
+        let (data, len, ticks) = column.raw_rows_and_ticks_mut();
+        Some(ColumnChunk {
+            archetype: archetype_id,
+            data,
+            len,
+            element_size,
+            ticks,
+        })
     }
 
     /// Return a raw native component column from one already-known archetype.
@@ -875,7 +907,7 @@ impl World {
         &mut self,
         component_id: ComponentId,
         archetype_id: ArchetypeId,
-    ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
+    ) -> Option<ColumnChunk<'_>> {
         if !component_id.is_native_storage() {
             return None;
         }
@@ -886,7 +918,13 @@ impl World {
         let column = archetype.component_storages.get_mut(component_id)?;
         let element_size = column.elem_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
-        Some((archetype_id, data, len, element_size, ticks))
+        Some(ColumnChunk {
+            archetype: archetype_id,
+            data,
+            len,
+            element_size,
+            ticks,
+        })
     }
 
     /// Total number of rows every archetype currently stores for one
@@ -1141,39 +1179,101 @@ impl World {
         self.remove_component_by_id(entity, ComponentId::of::<T>())
     }
 
-    /// Remove a component identified by [`ComponentId`] from one entity.
+    /// Add a component the world addresses by [`ComponentId`], migrating the
+    /// entity to the archetype that gains it.
     ///
-    /// This is the non-generic core of [`Self::remove_component`]; the host
-    /// uses it when dropping data for a type it can no longer name statically
-    /// (a component a reloaded module stopped registering).
-    pub(crate) fn remove_component_by_id(
+    /// The one implementation behind [`Self::add_component`],
+    /// [`Self::add_descriptor_component`] and the command queue's deferred add,
+    /// so a rule added here (the duplicate refusal, the registration refusal)
+    /// holds on every path that adds a component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] when the entity has no location,
+    /// [`WorldError::ArchetypeMissing`] when its recorded archetype is gone,
+    /// [`WorldError::DescriptorComponentAlreadyPresent`] when it already
+    /// carries the component, [`WorldError::DescriptorComponentNotRegistered`]
+    /// when this world never registered the id, and whatever the migration or
+    /// `attach` reports.
+    pub(crate) fn try_add_component_by_id<F>(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-    ) -> Result<(), RemoveComponentError> {
-        let _zone =
-            crate::profile_scope!("remove component", [("Entity being mutated: {:?}", entity)]);
-
-        // Step 1: Validate - the entity must exist and currently carry the
-        // component.
-        let location = match self.entity_locations.get(&entity) {
-            Some(loc) => *loc,
-            None => return Err(RemoveComponentError::EntityNotFound),
+        attach: F,
+    ) -> Result<(), WorldError>
+    where
+        F: FnOnce(&mut ComponentColumns) -> Result<(), WorldError>,
+    {
+        // Step 1: Locate the entity and reject a stale archetype reference.
+        let location = *self
+            .entity_locations
+            .get(&entity)
+            .ok_or(WorldError::EntityNotFound)?;
+        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: location.archetype_id,
+            });
         };
 
-        let old_archetype = match self.archetypes.get(&location.archetype_id) {
-            Some(arch) => arch,
-            None => return Err(RemoveComponentError::EntityNotFound),
-        };
-
-        // Check if entity has this component
-        if !old_archetype.component_types.contains(&component_id) {
-            return Err(RemoveComponentError::ComponentNotFound);
+        // Step 2: Refuse one the entity already carries.
+        if old_archetype.component_types.contains(&component_id) {
+            return Err(WorldError::DescriptorComponentAlreadyPresent);
         }
 
-        // Step 2: Build the destination component set without T. If no
-        // components remain, destroy the entity instead of migrating it to
-        // an empty archetype.
+        // Step 3: Refuse a type this world never registered. Registration is
+        // what allocates the archetype bit, so an unregistered type would
+        // resolve the destination back to the entity's current archetype -
+        // storing nothing while reporting success.
+        if !self.storage_factories.contains_key(&component_id) {
+            return Err(WorldError::DescriptorComponentNotRegistered { id: component_id });
+        }
+
+        // Step 4: Build the destination component set with the id appended.
+        let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
+        new_component_ids.extend_from_slice(&old_archetype.component_types);
+        new_component_ids.push(component_id);
+        new_component_ids.sort();
+
+        // Step 5: Migrate the entity. Existing components are carried by the
+        // move; the only thing left to write is the component being added.
+        self.move_entity_to_archetype(entity, new_component_ids, attach)
+    }
+
+    /// Remove a component the world addresses by [`ComponentId`], migrating the
+    /// entity or destroying it when nothing else remains.
+    ///
+    /// The one implementation behind [`Self::remove_component_by_id`] and the
+    /// command queue's deferred remove.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] when the entity has no location,
+    /// [`WorldError::ArchetypeMissing`] when its recorded archetype is gone,
+    /// [`WorldError::DescriptorComponentMissing`] when it does not carry the
+    /// component, and whatever the migration reports.
+    pub(crate) fn try_remove_component_by_id(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Result<(), WorldError> {
+        // Step 1: Locate the entity and reject a stale archetype reference.
+        let location = *self
+            .entity_locations
+            .get(&entity)
+            .ok_or(WorldError::EntityNotFound)?;
+        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: location.archetype_id,
+            });
+        };
+
+        // Step 2: Refuse a component the entity does not carry, and build the
+        // surviving set.
+        if !old_archetype.component_types.contains(&component_id) {
+            return Err(WorldError::DescriptorComponentMissing);
+        }
         let new_component_ids: Vec<ComponentId> = old_archetype
             .component_types
             .iter()
@@ -1181,29 +1281,51 @@ impl World {
             .cloned()
             .collect();
 
-        // If no components left, destroy the entity instead.
-        // The entity may already be gone; that's fine - we just need to
-        // stop trying to migrate it.
+        // Step 3: An entity with no remaining components is destroyed instead
+        // of migrated to an empty archetype. It may already be gone, which is
+        // not an error here.
         if new_component_ids.is_empty() {
             let _ = self.destroy_entity(entity);
             return Ok(());
         }
 
-        // Step 3: Migrate the entity to the new archetype. Every surviving
-        // component is carried by the move itself; the removed one is left
-        // behind in the source archetype and released there.
+        // Step 4: Migrate the surviving components. The move carries them; the
+        // removed one is left behind in the source archetype and released
+        // there.
         self.move_entity_to_archetype(entity, new_component_ids, |_| Ok(()))
-            .unwrap_or_else(|error| {
-                // The entity and its archetype were validated above, so a
-                // migration failure here is an internal-invariant break, not a
-                // user error. Name the entity and the failure so the report is
-                // startable; the descriptor paths propagate the same failure as
-                // a typed error instead, because their inputs come from outside
-                // the engine.
-                panic!("internal invariant broken while migrating entity {entity:?}: {error}")
-            });
+    }
 
-        Ok(())
+    /// Remove a component identified by [`ComponentId`] from one entity.
+    ///
+    /// This is the non-generic core of [`Self::remove_component`]; the host
+    /// uses it when dropping data for a type it can no longer name statically
+    /// (a component a reloaded module stopped registering).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the migration itself fails: the entity and its archetype
+    /// are validated before it starts, so a failure there is an
+    /// internal-invariant break, not a caller error.
+    pub(crate) fn remove_component_by_id(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Result<(), RemoveComponentError> {
+        let _zone =
+            crate::profile_scope!("remove component", [("Entity being mutated: {:?}", entity)]);
+        self.try_remove_component_by_id(entity, component_id)
+            .map_err(|error| match error {
+                WorldError::EntityNotFound | WorldError::ArchetypeMissing { .. } => {
+                    RemoveComponentError::EntityNotFound
+                }
+                WorldError::DescriptorComponentMissing => RemoveComponentError::ComponentNotFound,
+                // The entity and its archetype were validated before the
+                // migration started, so a failure here is an
+                // internal-invariant break. The descriptor paths propagate the
+                // same failure as a typed error instead, because their inputs
+                // come from outside the engine.
+                other => panic!("internal invariant broken while migrating entity {entity:?}: {other}"),
+            })
     }
 
     /// Add a component to an existing entity, moving it to a new archetype.

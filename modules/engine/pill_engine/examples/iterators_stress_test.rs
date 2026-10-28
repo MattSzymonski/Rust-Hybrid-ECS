@@ -229,7 +229,9 @@ fn collision_and_movement_system(
         static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
         let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
         if frame == 0 {
-            pill_core::info!("Parallel batch stats: {}", stats);
+            if let Some(stats) = stats {
+                pill_core::info!("Parallel batch stats: {}", stats);
+            }
         }
     }
 }

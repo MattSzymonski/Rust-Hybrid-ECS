@@ -9,6 +9,10 @@
 //! - Own the import pipeline on [`AssetManager`]: [`AssetManager::import`],
 //!   [`AssetManager::reimport`], [`AssetManager::ensure_metadata`] and
 //!   [`AssetManager::follow_move`].
+//! - Hold the name rule every editor's create dialog shares
+//!   ([`standalone_file_name`], [`checked_relative`]): which base names and
+//!   characters Windows refuses. It lives here so one rule serves them all;
+//!   a standalone file is what such a name is usually for.
 //!
 //! # Design
 //!
@@ -415,9 +419,59 @@ fn parse_metadata<T: ImportedAsset>(
     Ok(StoredMetadata { guid, settings })
 }
 
-/// Check the header every asset file shares - a `.meta` sidecar or a
-/// standalone asset - and return its guid and the value under `body_field`
-/// (`None` when absent or `null`).
+/// What a header says, before any caller checks the type it expected.
+pub(crate) struct RawHeader {
+    /// The `asset_type` the file declares.
+    pub asset_type: String,
+    /// The guid the file carries.
+    pub guid: AssetGuid,
+}
+
+/// Read the header every asset file shares - a `.meta` sidecar or a standalone
+/// asset - refusing one this engine cannot read.
+///
+/// This is the one statement of the on-disk contract: the format version range
+/// and the 32-digit guid rule. The type the caller expected is checked by
+/// [`parse_header`], because the asset index reads the same header without
+/// expecting one particular type.
+///
+/// The error is the detail sentence alone; [`parse_header`] re-attaches the
+/// path it knows.
+pub(crate) fn read_header(
+    bytes: &[u8],
+) -> Result<(RawHeader, serde_json::Map<String, serde_json::Value>), String> {
+    let document: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("not valid JSON: {error}"))?;
+    let serde_json::Value::Object(header) = document else {
+        return Err("not a JSON object".to_owned());
+    };
+
+    let version = header
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "`format_version` is missing".to_owned())?;
+    if version == 0 || version > u64::from(METADATA_FORMAT_VERSION) {
+        return Err(format!(
+            "format version {version} is not supported; this engine reads up to {METADATA_FORMAT_VERSION}"
+        ));
+    }
+
+    let asset_type = header
+        .get("asset_type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "`asset_type` is missing".to_owned())?
+        .to_owned();
+    let guid = header
+        .get("guid")
+        .and_then(serde_json::Value::as_str)
+        .and_then(AssetGuid::parse)
+        .ok_or_else(|| "`guid` is missing or not 32 hexadecimal digits".to_owned())?;
+
+    Ok((RawHeader { asset_type, guid }, header))
+}
+
+/// Check the header every asset file shares and return its guid and the value
+/// under `body_field` (`None` when absent or `null`).
 ///
 /// The header is checked before the body is looked at, so the error says what
 /// is actually wrong: a newer format, another asset type, or a bad guid.
@@ -431,43 +485,19 @@ pub(crate) fn parse_header(
         path: path.to_owned(),
         detail,
     };
-    let document: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| fail(format!("not valid JSON: {error}")))?;
-    let header = document
-        .as_object()
-        .ok_or_else(|| fail("not a JSON object".to_owned()))?;
-
-    let version = header
-        .get("format_version")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| fail("`format_version` is missing".to_owned()))?;
-    if version == 0 || version > u64::from(METADATA_FORMAT_VERSION) {
+    let (raw, header) = read_header(bytes).map_err(fail)?;
+    if raw.asset_type != expected_type {
         return Err(fail(format!(
-            "format version {version} is not supported; this engine reads up to {METADATA_FORMAT_VERSION}"
+            "it describes a `{}`, not a `{expected_type}`",
+            raw.asset_type
         )));
     }
-
-    let asset_type = header
-        .get("asset_type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| fail("`asset_type` is missing".to_owned()))?;
-    if asset_type != expected_type {
-        return Err(fail(format!(
-            "it describes a `{asset_type}`, not a `{expected_type}`"
-        )));
-    }
-
-    let guid = header
-        .get("guid")
-        .and_then(serde_json::Value::as_str)
-        .and_then(AssetGuid::parse)
-        .ok_or_else(|| fail("`guid` is missing or not 32 hexadecimal digits".to_owned()))?;
 
     let body = match header.get(body_field) {
         None | Some(serde_json::Value::Null) => None,
         Some(body) => Some(body.clone()),
     };
-    Ok((guid, body))
+    Ok((raw.guid, body))
 }
 
 /// Whether two settings values are the same, compared through their JSON form
@@ -500,18 +530,6 @@ fn render_metadata<T: ImportedAsset>(
         })?;
     bytes.push(b'\n');
     Ok(bytes)
-}
-
-/// `settings` as the JSON a metadata file carries, for recording what decoded a
-/// loaded asset; see [`AssetManager::ensure_metadata`].
-fn settings_json<T: ImportedAsset>(
-    path: &Path,
-    settings: &T::ImportSettings,
-) -> AssetLoadResult<serde_json::Value> {
-    serde_json::to_value(settings).map_err(|error| AssetLoadError::Metadata {
-        path: path.to_owned(),
-        detail: format!("the settings cannot be recorded: {error}"),
-    })
 }
 
 // =============================================================================
@@ -680,7 +698,7 @@ impl AssetManager {
         // remember them - a later `ensure_metadata` writes what actually
         // decoded the asset instead of the type's defaults.
         if metadata == MetadataSource::InMemoryOnly {
-            self.set_import_settings(handle, settings_json::<T>(&metadata_path, &settings)?);
+            self.set_import_settings(handle, settings_to_json::<T>(&metadata_path, &settings)?);
         }
         Ok(ImportOutcome {
             handle,
@@ -767,7 +785,7 @@ impl AssetManager {
         // what a sidecar created now has to say; an earlier record would name
         // settings the loaded value no longer has.
         if metadata == MetadataSource::InMemoryOnly {
-            self.set_import_settings(handle, settings_json::<T>(&metadata_path, &settings)?);
+            self.set_import_settings(handle, settings_to_json::<T>(&metadata_path, &settings)?);
         }
         Ok(ReimportOutcome {
             handle,
@@ -901,7 +919,29 @@ impl AssetManager {
             Err(AssetLoadError::PathNotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let Some(handle) = self.handle_by_guid::<T>(stored.guid) else {
+        self.follow_move_of::<T>(asset_name, stored.guid, &metadata_path)
+    }
+
+    /// Follow a move once the path's identity is known.
+    ///
+    /// The two lanes read the guid differently - a `.meta` sidecar, or the
+    /// file's own header - and agree on everything after that: the asset must
+    /// already be loaded under another name, the old source must be gone, and
+    /// the loaded asset takes the new name. Keeping the decision here means a
+    /// new precondition is added once.
+    ///
+    /// `identity_path` is what the error names when the rename fails: the
+    /// sidecar for a sourced asset, the source itself for a standalone one.
+    pub(crate) fn follow_move_of<T>(
+        &mut self,
+        asset_name: String,
+        guid: AssetGuid,
+        identity_path: &Path,
+    ) -> Result<Option<String>, AssetImportError>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let Some(handle) = self.handle_by_guid::<T>(guid) else {
             return Ok(None);
         };
         let Some(old_name) = self.name_of(handle).map(str::to_owned) else {
@@ -911,9 +951,9 @@ impl AssetManager {
         if asset_store::locate_file(Path::new(&old_name)).is_some() {
             return Ok(None);
         }
-        self.rename(handle, asset_name.clone())
+        self.rename(handle, asset_name)
             .map_err(|error| AssetLoadError::Metadata {
-                path: metadata_path.clone(),
+                path: identity_path.to_owned(),
                 detail: format!("the moved asset could not take its new name: {error}"),
             })?;
         Ok(Some(old_name))
@@ -966,6 +1006,11 @@ pub fn normalize_settings_json<T: ImportedAsset>(
 }
 
 /// `settings` as a JSON value, with `path` naming the failure.
+///
+/// The one serializer behind every entry point that reports a type's settings:
+/// [`settings_json_for`] reads them from the metadata file or the defaults, and
+/// [`normalize_settings_json`] round-trips a read-modify-write. Fields the type
+/// does not declare are dropped by the round-trip, not by this serializer.
 fn settings_to_json<T: ImportedAsset>(
     path: &Path,
     settings: &T::ImportSettings,
@@ -1843,6 +1888,29 @@ mod tests {
     // -------------------------------------------------------------------------
     // Settings as JSON
     // -------------------------------------------------------------------------
+
+    /// The index and the importer read one header contract.
+    ///
+    /// A format the engine cannot read is refused by both, which is what
+    /// sharing the reader buys: a version bump is one edit, and the two cannot
+    /// end up disagreeing about whether a file is an asset.
+    #[test]
+    fn a_newer_format_is_refused_by_the_reader_and_the_parser() {
+        let bytes = format!(
+            r#"{{"format_version": {}, "asset_type": "Note", "guid": "00000000000000000000000000000001"}}"#,
+            METADATA_FORMAT_VERSION + 1
+        );
+        assert!(read_header(bytes.as_bytes()).is_err());
+        assert!(matches!(
+            parse_header(
+                Path::new("a.note.meta"),
+                bytes.as_bytes(),
+                "Note",
+                "settings"
+            ),
+            Err(AssetLoadError::Metadata { .. })
+        ));
+    }
 
     #[test]
     fn settings_json_comes_from_the_metadata_file_or_the_defaults() {

@@ -218,7 +218,7 @@ pub fn saved_reference(
             index,
             generation,
         } => {
-            if (*index, *generation) == (u32::MAX, u32::MAX) {
+            if value.references_nothing() {
                 return None;
             }
             let type_name = asset_type.as_deref()?;
@@ -263,68 +263,70 @@ pub fn restore_asset_reference(
     registry: &ImportRegistry,
     saved: &SavedAssetReference,
 ) -> FieldValue {
-    let loaded =
+    // Try the guid, then the path hint. Written as three flat steps rather than
+    // one nested match: each miss reports once per guid and leaves the
+    // reference invalid rather than failing the document that names it.
+    let guid_error =
         match registry.load_by_guid(assets, database, saved.guid, MetadataPolicy::ReadIfPresent) {
-            Ok(outcome) => Some(outcome),
-            Err(guid_error) => match saved.path.as_deref() {
-                Some(path) => match registry.load_by_path(
-                    assets,
-                    Path::new(path),
-                    MetadataPolicy::ReadIfPresent,
-                ) {
-                    Ok(outcome) => {
-                        report_once(
-                            saved.guid,
-                            &format!("is unknown here; resolved by its path hint `{path}` instead"),
-                        );
-                        Some(outcome)
-                    }
-                    Err(path_error) => {
-                        report_once(
-                            saved.guid,
-                            &format!(
-                                "resolves to no asset ({guid_error}; the path hint `{path}`: \
-                             {path_error}); using the invalid handle"
-                            ),
-                        );
-                        None
-                    }
-                },
-                None => {
-                    report_once(
-                        saved.guid,
-                        &format!(
-                            "resolves to no asset ({guid_error}) and carries no path hint; \
-                         using the invalid handle"
-                        ),
-                    );
-                    None
-                }
-            },
+            Ok(outcome) => return reference_to(&outcome),
+            Err(error) => error,
         };
-    match loaded {
-        Some(outcome) => FieldValue::Asset {
-            asset_type: Some(outcome.type_name),
-            index: outcome.index,
-            generation: outcome.generation,
-        },
-        None => FieldValue::Asset {
-            asset_type: None,
-            index: u32::MAX,
-            generation: u32::MAX,
-        },
+    let Some(path) = saved.path.as_deref() else {
+        report_once(
+            saved.guid,
+            &format!(
+                "resolves to no asset ({guid_error}) and carries no path hint; \
+                 using the invalid handle"
+            ),
+        );
+        return FieldValue::unset_asset();
+    };
+    match registry.load_by_path(assets, Path::new(path), MetadataPolicy::ReadIfPresent) {
+        Ok(outcome) => {
+            report_once(
+                saved.guid,
+                &format!("is unknown here; resolved by its path hint `{path}` instead"),
+            );
+            reference_to(&outcome)
+        }
+        Err(path_error) => {
+            report_once(
+                saved.guid,
+                &format!(
+                    "resolves to no asset ({guid_error}; the path hint `{path}`: \
+                     {path_error}); using the invalid handle"
+                ),
+            );
+            FieldValue::unset_asset()
+        }
     }
 }
 
-/// Report `guid` as a reference problem, once per process.
-fn report_once(guid: AssetGuid, reason: &str) {
+/// The reference value a loaded asset's outcome stands for.
+fn reference_to(outcome: &crate::asset_import_registry::ErasedImportOutcome) -> FieldValue {
+    FieldValue::Asset {
+        asset_type: Some(outcome.type_name.clone()),
+        index: outcome.index,
+        generation: outcome.generation,
+    }
+}
+
+/// Whether this is the first report of `guid` in this process, recording it.
+///
+/// One set serves every lane that reports an unresolvable reference, so a guid
+/// named by both a typed field and a scene entry produces one warning rather
+/// than one per lane.
+pub(crate) fn first_report_of(guid: AssetGuid) -> bool {
     static REPORTED: OnceLock<Mutex<HashSet<AssetGuid>>> = OnceLock::new();
-    let first = REPORTED
+    REPORTED
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(guid);
-    if first {
+        .insert(guid)
+}
+
+fn report_once(guid: AssetGuid, reason: &str) {
+    if first_report_of(guid) {
         pill_core::warn!("saved asset reference {guid} {reason}");
     }
 }
@@ -710,14 +712,7 @@ mod tests {
             let assets = world.get_resource_mut::<AssetManager>().unwrap();
             restore_asset_reference(assets, &database, &registry, &missing)
         };
-        assert_eq!(
-            restored,
-            FieldValue::Asset {
-                asset_type: None,
-                index: u32::MAX,
-                generation: u32::MAX,
-            }
-        );
+        assert_eq!(restored, FieldValue::unset_asset());
     }
 
     /// The stored forms: the object with a hint, the object without one, and

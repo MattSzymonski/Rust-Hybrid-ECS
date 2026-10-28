@@ -11,6 +11,10 @@
 //! - Write a new standalone file ([`render_standalone`]), and read or check
 //!   its document as JSON for code that does not know its type.
 //!
+//! A new standalone file's name is validated by
+//! [`crate::asset_metadata::standalone_file_name`], which lives with the import
+//! pipeline so every editor's create dialog shares one rule.
+//!
 //! # Design
 //!
 //! A material or a render pass has no image or model behind it: it is data.
@@ -266,21 +270,7 @@ impl AssetManager {
             Err(AssetLoadError::PathNotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        let Some(handle) = self.handle_by_guid::<T>(guid) else {
-            return Ok(None);
-        };
-        let Some(old_name) = self.name_of(handle).map(str::to_owned) else {
-            return Ok(None);
-        };
-        if asset_store::locate_file(Path::new(&old_name)).is_some() {
-            return Ok(None);
-        }
-        self.rename(handle, asset_name)
-            .map_err(|error| AssetLoadError::Metadata {
-                path: path.to_owned(),
-                detail: format!("the moved asset could not take its new name: {error}"),
-            })?;
-        Ok(Some(old_name))
+        self.follow_move_of::<T>(asset_name, guid, path)
     }
 }
 

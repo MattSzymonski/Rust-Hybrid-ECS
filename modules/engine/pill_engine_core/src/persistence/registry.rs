@@ -245,32 +245,19 @@ impl World {
         dropped_entities
     }
 
-    /// Drop every column belonging to the given component ids and forget their
-    /// registrations.
-    ///
-    /// The id-keyed counterpart of [`Self::drop_forgotten_components`], used by
-    /// the host when a failed generation's registrations have to go: the ids
-    /// are the only handle that separates them from a rollback generation's
-    /// re-registration of the same names. Rows are removed through
-    /// `remove_component_by_id`, so a type the failed generation's `init`
-    /// managed to give rows to does not leak them into an image that is about
-    /// to be retired. A name-keyed entry (deserializer, schema hash) goes only
-    /// when no surviving registration still claims the name.
-    ///
-    /// The sweep itself lives in [`Self::retire_component_storage`], which is
-    /// also its public face: the two differ in caller, not in what they do.
-    pub fn drop_forgotten_component_ids(&mut self, component_ids: &[ComponentId]) -> usize {
-        self.retire_component_storage(component_ids)
-    }
-
     /// Retire the storage of the given component ids.
     ///
-    /// The general form of the id-keyed sweep: every entity carrying an id
-    /// loses that one component through `remove_component_by_id`, the
-    /// registration is retired (its bit released when no archetype with live
-    /// rows still references it, the rule [`Self::retire_registration`]
-    /// documents), and a name-keyed entry (deserializer, schema hash) goes only
-    /// when no surviving registration still claims the name.
+    /// The id-keyed sweep, used by the host when a failed generation's
+    /// registrations have to go: the ids are the only handle that separates
+    /// them from a rollback generation's re-registration of the same names.
+    /// Every entity carrying an id loses that one component through
+    /// `remove_component_by_id` - so a type the failed generation's `init`
+    /// managed to give rows to does not leak them into an image that is about
+    /// to be retired - the registration is retired (its bit released when no
+    /// archetype with live rows still references it, the rule
+    /// [`Self::retire_registration`] documents), and a name-keyed entry
+    /// (deserializer, schema hash) goes only when no surviving registration
+    /// still claims the name.
     ///
     /// Covers the descriptor lane, unlike the name-based
     /// [`Self::drop_forgotten_components`]: a managed component has no Rust
@@ -334,7 +321,7 @@ impl World {
     /// one means rows still reference the bit, and then the registration is
     /// removed *without* releasing the bit - a leaked bit is recoverable, an
     /// aliased archetype is not.
-    pub(super) fn retire_registration(&mut self, component_id: ComponentId) {
+    pub(crate) fn retire_registration(&mut self, component_id: ComponentId) {
         let bit = self.component_registry.get_bit(&component_id);
         let rows_still_reference_bit = bit.is_some_and(|bit| {
             self.archetypes.values().any(|archetype| {
@@ -356,16 +343,6 @@ impl World {
         self.retired_native_storage_ops.remove(&component_id);
         self.persist_serializers.remove(&component_id);
         self.persist_inserters.remove(&component_id);
-    }
-
-    /// Retire a registration for callers outside this module.
-    ///
-    /// [`Self::retire_registration`] is module-private because the sweeps that
-    /// call it must run first; `World`'s descriptor remap performs that sweep
-    /// itself (it empties the source before calling), and lives outside this
-    /// module, so it needs the door.
-    pub(crate) fn retire_component_registration(&mut self, component_id: ComponentId) {
-        self.retire_registration(component_id);
     }
 
     /// Remove every registration artifact for one forgotten component type so

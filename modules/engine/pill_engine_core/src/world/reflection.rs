@@ -272,7 +272,7 @@ impl World {
 
         // Archetype storage (component columns + entities + ticks)
         for archetype in self.archetypes.values() {
-            total += archetype.memory_estimate(&self.component_registry);
+            total += archetype.memory_estimate();
         }
 
         // Entity location map, at a fixed per-entry allowance for the key, the
@@ -292,7 +292,6 @@ impl World {
 
         // Storage factories and script data
         total += self.storage_factories.len() * 128;
-        total += self.script_components.len() * 24;
         total += self.script_updaters.len() * 32;
 
         total

@@ -877,12 +877,10 @@ fn rename_component_entry(
 fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
     match undo {
         ComponentUndo::Added { component_id } => {
-            // `drop_forgotten_component_ids` removes the rows and every
+            // `retire_component_storage` removes the rows and every
             // registration artifact of the id, which is exactly what an
             // added-then-refused component has to give back.
-            let dropped = engine
-                .world_mut()
-                .drop_forgotten_component_ids(&[component_id]);
+            let dropped = engine.world_mut().retire_component_storage(&[component_id]);
             info!(
                 target: telemetry_target::HOT_RELOAD,
                 dropped,

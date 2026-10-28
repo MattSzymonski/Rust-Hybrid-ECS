@@ -48,7 +48,7 @@ use crate::asset::{Asset, AssetLoadResult, AssetManager};
 use crate::asset_database::AssetDatabase;
 use crate::asset_import_registry::ImportRegistry;
 use crate::asset_standalone::StandaloneAsset;
-use crate::commands::ByteComponentAdder;
+use crate::commands::{ByteComponentAdder, CommandError};
 use crate::component_field::{is_handle_tag, FieldValue};
 use crate::engine::Engine;
 use crate::entity::{Entity, EntityId};
@@ -278,10 +278,7 @@ fn saved_field(
 /// Whether `value` names something, for the two reference variants.
 fn is_set_reference(value: &FieldValue) -> bool {
     match value {
-        FieldValue::Asset {
-            index, generation, ..
-        } => (*index, *generation) != (u32::MAX, u32::MAX),
-        FieldValue::Entity { id, generation } => !Entity::from_raw(*id, *generation).is_null(),
+        FieldValue::Asset { .. } | FieldValue::Entity { .. } => !value.references_nothing(),
         _ => false,
     }
 }
@@ -315,16 +312,33 @@ fn bytes_of(text: &str) -> Option<Vec<u8>> {
 // =============================================================================
 
 /// What [`load_scene`] made of a document.
+///
+/// Each bucket admits one kind of loss:
+///
+/// - [`unknown_components`](Self::unknown_components): the world knows no
+///   component of that name, so nothing could be attached.
+/// - [`failed_components`](Self::failed_components): the world knows the type
+///   but could not attach it - the reason is the field layer's or a command's
+///   own message.
+/// - [`skipped_entities`](Self::skipped_entities): a document entry was dropped
+///   because its id repeats or is already taken.
+/// - [`skipped_fields`](Self::skipped_fields): one field of an attached
+///   component could not be written, by `<entity>: <component>.<field>`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SceneLoad {
     /// Entities created.
     pub entities: usize,
     /// Components attached.
     pub components: usize,
-    /// Component type names the world does not know, or cannot attach.
+    /// Component type names the world does not know.
     pub unknown_components: Vec<String>,
+    /// Components that failed to attach although the type is registered, each
+    /// entry naming the entity, the component and the reason.
+    pub failed_components: Vec<String>,
     /// References naming an entity the document did not create.
     pub unresolved_references: usize,
+    /// Document entries whose entity was not created, with the reason.
+    pub skipped_entities: Vec<String>,
     /// Fields the document named that could not be written, by
     /// `<entity>: <component>.<field>`.
     pub skipped_fields: Vec<String>,
@@ -351,7 +365,7 @@ pub fn load_scene(
     for scene_entity in &document.entities {
         if !seen.insert(scene_entity.id) {
             report
-                .skipped_fields
+                .skipped_entities
                 .push(format!("{}: the id repeats in this scene", scene_entity.id));
             continue;
         }
@@ -366,7 +380,7 @@ pub fn load_scene(
                 created.push((entity, scene_entity));
             }
             Err(_) => report
-                .skipped_fields
+                .skipped_entities
                 .push(format!("{}: the id is already taken", scene_entity.id)),
         }
     }
@@ -382,7 +396,10 @@ pub fn load_scene(
                         fresh.insert((*entity, name.clone()));
                     }
                 }
-                Err(()) => report.unknown_components.push(name.clone()),
+                Err(AttachError::UnknownType) => report.unknown_components.push(name.clone()),
+                Err(failure) => report
+                    .failed_components
+                    .push(format!("{entity}: {name} could not attach: {failure}")),
             }
         }
     }
@@ -418,14 +435,15 @@ pub fn load_scene(
                     if !is_handle_tag(tag) && tag != &"entity" {
                         continue;
                     }
-                    if engine
-                        .world_mut()
-                        .write_component_field(*entity, name, field, cleared_field(tag))
-                        .is_err()
-                    {
+                    if let Err(error) = engine.world_mut().write_component_field(
+                        *entity,
+                        name,
+                        field,
+                        cleared_field(tag),
+                    ) {
                         report
                             .skipped_fields
-                            .push(format!("{entity}: {name}.{field} was refused"));
+                            .push(format!("{entity}: {name}.{field} was refused: {error}"));
                     }
                 }
             }
@@ -457,14 +475,13 @@ pub fn load_scene(
                         continue;
                     }
                 };
-                if engine
+                if let Err(error) = engine
                     .world_mut()
                     .write_component_field(*entity, name, field, value)
-                    .is_err()
                 {
                     report
                         .skipped_fields
-                        .push(format!("{entity}: {name}.{field} was refused"));
+                        .push(format!("{entity}: {name}.{field} was refused: {error}"));
                 }
             }
         }
@@ -476,10 +493,34 @@ pub fn load_scene(
     report
 }
 
+/// Why a scene document's component could not be attached.
+#[derive(Debug)]
+enum AttachError {
+    /// The world knows no component of that name.
+    UnknownType,
+    /// The world knows the type but could not attach it; the message is the
+    /// field layer's or a command's own reason.
+    Failed(String),
+}
+
+impl std::fmt::Display for AttachError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownType => formatter.write_str("the world knows no component of this name"),
+            Self::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
 /// Attach `name` with its defaults to `entity`, reporting whether the image was
-/// freshly attached; `Err(())` when the world does not know the type or cannot
-/// build an image for it.
-fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<bool, ()> {
+/// freshly attached.
+///
+/// # Errors
+///
+/// [`AttachError::UnknownType`] when the world knows no component of that
+/// name; [`AttachError::Failed`] when it knows the type but the image cannot be
+/// built or the add command is refused, carrying that layer's own reason.
+fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<bool, AttachError> {
     if engine
         .world()
         .resolve_entity_component_id(entity, name)
@@ -490,15 +531,17 @@ fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<b
         // references are not the zero-filled ones, so they are left alone.
         return Ok(false);
     }
-    let bytes = engine
-        .world()
-        .build_component_image(name, &[])
-        .map_err(|_| ())?;
+    // The type is resolved first so "unknown" and "known but unbuildable" stay
+    // separate answers: only the first is an unknown component.
     let component_id = engine
         .world()
         .resolve_component_id_by_name_any(name)
-        .map_err(|_| ())?
-        .ok_or(())?;
+        .map_err(|_| AttachError::UnknownType)?
+        .ok_or(AttachError::UnknownType)?;
+    let bytes = engine
+        .world()
+        .build_component_image(name, &[])
+        .map_err(|error| AttachError::Failed(error.to_string()))?;
     engine.queue_deferred_commands(move |_world, queue| {
         if component_id.is_native_storage() {
             queue.add_component_adder_to_entity(
@@ -509,8 +552,19 @@ fn attach_component(engine: &mut Engine, entity: Entity, name: &str) -> Result<b
             queue.add_descriptor_component_to_entity(entity, component_id, bytes);
         }
     });
-    engine.flush_deferred_commands().map_err(|_| ())?;
+    engine
+        .flush_deferred_commands()
+        .map_err(|errors| AttachError::Failed(join_command_errors(errors)))?;
     Ok(true)
+}
+
+/// Renders a failed command batch as one reason string.
+fn join_command_errors(errors: Vec<CommandError>) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// What one document value means for the field it is written into.
@@ -657,11 +711,7 @@ fn cleared_field(tag: &str) -> FieldValue {
             generation: Entity::NULL.generation(),
         }
     } else {
-        FieldValue::Asset {
-            asset_type: None,
-            index: u32::MAX,
-            generation: u32::MAX,
-        }
+        FieldValue::unset_asset()
     }
 }
 
@@ -1111,6 +1161,93 @@ mod tests {
         assert_eq!(actor.speed, 1.25);
         assert_eq!(actor.target, Entity::NULL, "an absent reference is unset");
         assert_eq!(actor.note, Handle::default(), "and so is an absent handle");
+    }
+
+    /// A component the world knows but cannot build an image for is reported
+    /// in its own bucket with the reason, not as an unknown type.
+    ///
+    /// The two failures mean different things to whoever reads the report: an
+    /// unknown name is a missing registration, while an unbuildable image is a
+    /// registered type the field layer cannot create - a heap-backed or
+    /// layout-less component.
+    #[test]
+    fn a_registered_component_that_cannot_be_attached_is_reported_with_its_reason() {
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        struct Layoutless {
+            value: u32,
+        }
+        impl Component for Layoutless {}
+
+        let mut scratch = Scratch::new("unbuildable");
+        scratch
+            .engine
+            .world_mut()
+            .register_component::<Layoutless>();
+        let id = EntityId::from_name("hero");
+        let document = SceneDocument {
+            entities: vec![SceneEntity {
+                id,
+                components: BTreeMap::from([(
+                    ComponentRegistry::registered_name::<Layoutless>(),
+                    BTreeMap::from([("value".to_string(), serde_json::json!(3))]),
+                )]),
+            }],
+        };
+
+        let report = load_scene(&mut scratch.engine, &AssetDatabase::new(), &document);
+
+        assert!(
+            report.unknown_components.is_empty(),
+            "the type is registered, so it is not unknown: {:?}",
+            report.unknown_components
+        );
+        assert_eq!(
+            report.failed_components.len(),
+            1,
+            "one component failed to attach: {:?}",
+            report.failed_components
+        );
+        let said = &report.failed_components[0];
+        assert!(
+            said.contains("could not attach") && said.contains("no registered field layout"),
+            "the entry carries the field layer's reason: {said}"
+        );
+        assert_eq!(report.components, 0);
+    }
+
+    /// A document that repeats an entity id reports the dropped entry as an
+    /// entity, not as a field.
+    #[test]
+    fn a_repeated_entity_id_is_reported_as_a_skipped_entity() {
+        let mut scratch = Scratch::new("repeated-id");
+        let id = EntityId::from_name("hero");
+        let components = BTreeMap::from([(
+            actor_component(),
+            BTreeMap::from([("speed".to_string(), serde_json::json!(1.0))]),
+        )]);
+        let document = SceneDocument {
+            entities: vec![
+                SceneEntity {
+                    id,
+                    components: components.clone(),
+                },
+                SceneEntity { id, components },
+            ],
+        };
+
+        let report = load_scene(&mut scratch.engine, &AssetDatabase::new(), &document);
+
+        assert_eq!(report.entities, 1, "only the first entry creates an entity");
+        assert_eq!(
+            report.skipped_entities,
+            vec![format!("{id}: the id repeats in this scene")]
+        );
+        assert!(
+            report.skipped_fields.is_empty(),
+            "nothing was lost at field level: {:?}",
+            report.skipped_fields
+        );
     }
 
     /// A document value that does not fit its field's type is refused and

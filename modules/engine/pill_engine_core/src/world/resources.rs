@@ -483,23 +483,14 @@ impl World {
         }
 
         // Step 1: Read and reshape the stored value before anything moves.
-        // `FieldPlan::validate` speaks descriptor rows, so the bounds are
-        // checked here and reported with the resource's own variant.
+        // `FieldPlan::validate` speaks descriptor rows, so its refusal is
+        // reported with the resource's own variant.
         let mut moved = 0;
         if let Some(old_bytes) = self.foreign_resource_bytes(old_id).map(<[u8]>::to_vec) {
+            plan.validate(old_size, new_size)
+                .map_err(|_| WorldError::ForeignResourcePlanOutOfBounds { id: old_id })?;
             let mut new_bytes = vec![0_u8; new_size];
-            for planned in plan.fields() {
-                let FieldSource::OldOffset(source_offset) = planned.source else {
-                    continue;
-                };
-                if planned.offset + planned.bytes > new_size
-                    || source_offset + planned.bytes > old_size
-                {
-                    return Err(WorldError::ForeignResourcePlanOutOfBounds { id: old_id });
-                }
-                new_bytes[planned.offset..planned.offset + planned.bytes]
-                    .copy_from_slice(&old_bytes[source_offset..source_offset + planned.bytes]);
-            }
+            plan.apply(&old_bytes, &mut new_bytes);
             // Step 2: Write it under the successor. The insert stamps the
             // change tick, so a reader observes the move as the change it is.
             self.insert_foreign_resource_bytes(new_id, &new_bytes)?;
@@ -972,13 +963,9 @@ impl World {
             if self.resources.remove(id).is_some() {
                 dropped += 1;
             }
-            self.resource_ticks.remove(id);
-            self.resource_factories.remove(id);
-            self.resource_field_layouts.remove(id);
-            self.shared_resource_claims.remove(id);
             // The id is unregistered now, so a later registration is a fresh
             // one and has to be visible to the next "registered since" diff.
-            self.resource_registration_stamps.remove(id);
+            self.remove_resource_records(*id);
         }
         dropped
     }
@@ -1010,6 +997,22 @@ impl World {
         }
     }
 
+    /// Remove every per-id record this world keeps for a resource.
+    ///
+    /// One place decides which maps a removal clears, so a removal path cannot
+    /// leave one behind - a stale `resource_field_layouts` entry would serve
+    /// the previous value's offsets over a value registered under the same id
+    /// again. The claim count is deliberately untouched: it belongs to
+    /// [`release_resource_claims`](Self::release_resource_claims), and
+    /// [`drop_resources`](Self::drop_resources) consults it before calling here.
+    fn remove_resource_records(&mut self, id: ResourceId) {
+        self.resource_ticks.remove(&id);
+        self.resource_factories.remove(&id);
+        self.resource_field_layouts.remove(&id);
+        self.shared_resource_claims.remove(&id);
+        self.resource_registration_stamps.remove(&id);
+    }
+
     /// Remove a resource and return it if it existed.
     ///
     /// # Errors
@@ -1036,10 +1039,7 @@ impl World {
                 });
             }
         };
-        self.resource_ticks.remove(&id);
-        self.resource_factories.remove(&id);
-        self.shared_resource_claims.remove(&id);
-        self.resource_registration_stamps.remove(&id);
+        self.remove_resource_records(id);
         Ok(Some(value))
     }
 

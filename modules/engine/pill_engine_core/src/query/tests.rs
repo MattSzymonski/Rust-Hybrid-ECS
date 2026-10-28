@@ -266,7 +266,7 @@ fn row_only_filters_are_not_skipped() {
     impl QueryFilter for RejectAll {
         type State = ();
         fn init_state(
-            _archetype: &mut crate::archetype::Archetype,
+            _archetype: &crate::archetype::Archetype,
             _last_run: crate::Tick,
             _this_run: crate::Tick,
         ) -> Self::State {
@@ -410,20 +410,19 @@ fn test_par_iter_tracked_stats() {
     }
 
     let mut query = Query::<(&Position,)>::new(&mut world);
-    let result = query.par_iter_mut().tracked().for_each(|_| {});
+    let stats = query
+        .par_iter_mut()
+        .tracked()
+        .for_each(|_| {})
+        .expect("tracked iteration returns stats");
 
-    match result {
-        ParForEachResult::Tracked(stats) => {
-            assert_eq!(stats.total_entities, 500);
-            assert!(stats.batch_count > 0);
-            assert!(stats.num_threads > 0);
-            assert!(stats.avg_batch_size > 0.0);
-        }
-        ParForEachResult::Untracked => panic!("Expected tracked result"),
-    }
+    assert_eq!(stats.total_entities, 500);
+    assert!(stats.batch_count > 0);
+    assert!(stats.num_threads > 0);
+    assert!(stats.avg_batch_size > 0.0);
 }
 
-/// Verifies that untracked parallel iteration returns `Untracked` and no stats.
+/// Verifies that untracked parallel iteration returns no stats.
 #[test]
 fn test_par_iter_untracked() {
     let mut world = setup_world();
@@ -437,8 +436,7 @@ fn test_par_iter_untracked() {
     let mut query = Query::<(&Position,)>::new(&mut world);
     let result = query.par_iter_mut().for_each(|_| {});
 
-    assert!(matches!(result, ParForEachResult::Untracked));
-    assert!(result.stats().is_none());
+    assert!(result.is_none());
 }
 
 /// Verifies that `entity_count()` works correctly on a parallel iterator.
@@ -482,25 +480,6 @@ fn test_batch_stats_display() {
     assert!(display.contains("entities: 1000"));
 }
 
-/// Verifies that `ParForEachResult` Display implementation works for both variants.
-#[test]
-fn test_par_for_each_result_display() {
-    let stats = BatchStats {
-        num_threads: 4,
-        batch_count: 5,
-        total_entities: 100,
-        min_batch_size: 20,
-        max_batch_size: 20,
-        avg_batch_size: 20.0,
-    };
-
-    let tracked = ParForEachResult::Tracked(stats);
-    let untracked = ParForEachResult::Untracked;
-
-    assert!(format!("{}", tracked).contains("threads: 4"));
-    assert_eq!(format!("{}", untracked), "Untracked");
-}
-
 // =============================================================================
 // QueryTarget Trait Tests
 // =============================================================================
@@ -510,6 +489,19 @@ fn test_par_for_each_result_display() {
 fn test_component_ids() {
     let ids = <(&Position, &Velocity)>::component_ids();
     assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&ComponentId::of::<Position>()));
+    assert!(ids.contains(&ComponentId::of::<Velocity>()));
+}
+
+/// The mask a query builds and the access a system reports come from one
+/// description: `component_ids()` is exactly `reads ++ writes`.
+#[test]
+fn test_component_ids_are_the_reported_access() {
+    let ids = <(&Position, &mut Velocity)>::component_ids();
+    let (reads, writes) = <(&Position, &mut Velocity)>::report_component_access();
+
+    let derived: Vec<ComponentId> = reads.into_iter().chain(writes).collect();
+    assert_eq!(ids, derived);
     assert!(ids.contains(&ComponentId::of::<Position>()));
     assert!(ids.contains(&ComponentId::of::<Velocity>()));
 }

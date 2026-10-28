@@ -86,14 +86,96 @@ pub struct ErasedImportOutcome {
     pub generation: u32,
     /// Where the guid and settings came from.
     pub metadata: MetadataSource,
-    /// For an import: the path was already loaded and nothing was decoded.
-    /// For a reimport: the loaded value was replaced in its slot.
-    pub previously_loaded: bool,
+    /// What the call did with a value that was already there, which is what a
+    /// consumer asking "did this change?" needs - and, unlike a bare bool, it
+    /// keeps loading from replacing.
+    pub change: ImportChange,
     /// The asset's content version after the call.
     pub content_version: Option<u64>,
     /// The asset's content version before the call, when it was loaded: a
     /// reimport moves it, an import of a loaded path leaves it.
     pub previous_content_version: Option<u64>,
+}
+
+impl ErasedImportOutcome {
+    /// Whether the call found a value already there - either because the path
+    /// was already loaded, or because it replaced one.
+    pub fn previously_loaded(&self) -> bool {
+        !matches!(self.change, ImportChange::Fresh)
+    }
+
+    /// The outcome of a call that imported a path, or found it loaded.
+    ///
+    /// The previous content version follows from the change: a path that was
+    /// already loaded keeps the version it had, and a fresh import had none.
+    fn of_import<T>(
+        assets: &AssetManager,
+        type_name: &str,
+        handle: Handle<T>,
+        guid: Option<AssetGuid>,
+        metadata: MetadataSource,
+        already_loaded: bool,
+    ) -> Self
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let change = if already_loaded {
+            ImportChange::AlreadyLoaded
+        } else {
+            ImportChange::Fresh
+        };
+        let content_version = assets.content_version(handle);
+        Self {
+            type_name: type_name.to_owned(),
+            name: assets.name_of(handle).unwrap_or_default().to_owned(),
+            guid,
+            index: handle.index(),
+            generation: handle.generation(),
+            metadata,
+            change,
+            content_version,
+            previous_content_version: content_version.filter(|_| already_loaded),
+        }
+    }
+
+    /// The outcome of a call that replaced a loaded value.
+    ///
+    /// `previous_content_version` is read before the call, because the reimport
+    /// is what moves it.
+    fn of_reimport<T>(
+        assets: &AssetManager,
+        type_name: &str,
+        handle: Handle<T>,
+        guid: Option<AssetGuid>,
+        metadata: MetadataSource,
+        previous_content_version: Option<u64>,
+    ) -> Self
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        Self {
+            type_name: type_name.to_owned(),
+            name: assets.name_of(handle).unwrap_or_default().to_owned(),
+            guid,
+            index: handle.index(),
+            generation: handle.generation(),
+            metadata,
+            change: ImportChange::Replaced,
+            content_version: assets.content_version(handle),
+            previous_content_version,
+        }
+    }
+}
+
+/// What a call did with a path that already had a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportChange {
+    /// Nothing was there: the asset was decoded and added.
+    Fresh,
+    /// The path was already loaded and nothing was decoded.
+    AlreadyLoaded,
+    /// The loaded value was replaced in its slot.
+    Replaced,
 }
 
 /// Import a path as one asset type.
@@ -214,21 +296,14 @@ fn import_standalone_erased<T: StandaloneAsset>(
     _policy: MetadataPolicy,
 ) -> ErasedImportResult {
     let outcome = assets.import_standalone::<T>(path)?;
-    let content_version = assets.content_version(outcome.handle);
-    Ok(ErasedImportOutcome {
-        type_name: T::metadata_type_name().to_owned(),
-        name: assets
-            .name_of(outcome.handle)
-            .unwrap_or_default()
-            .to_owned(),
-        guid: outcome.guid,
-        index: outcome.handle.index(),
-        generation: outcome.handle.generation(),
-        metadata: outcome.metadata,
-        previously_loaded: outcome.already_loaded,
-        content_version,
-        previous_content_version: content_version.filter(|_| outcome.already_loaded),
-    })
+    Ok(ErasedImportOutcome::of_import::<T>(
+        assets,
+        T::metadata_type_name(),
+        outcome.handle,
+        outcome.guid,
+        outcome.metadata,
+        outcome.already_loaded,
+    ))
 }
 
 /// [`AssetManager::reimport_standalone`] for `T`.
@@ -240,20 +315,14 @@ fn reimport_standalone_erased<T: StandaloneAsset>(
         .and_then(|name| assets.handle_by_name::<T>(&name))
         .and_then(|handle| assets.content_version(handle));
     let outcome = assets.reimport_standalone::<T>(path)?;
-    Ok(ErasedImportOutcome {
-        type_name: T::metadata_type_name().to_owned(),
-        name: assets
-            .name_of(outcome.handle)
-            .unwrap_or_default()
-            .to_owned(),
-        guid: outcome.guid,
-        index: outcome.handle.index(),
-        generation: outcome.handle.generation(),
-        metadata: outcome.metadata,
-        previously_loaded: outcome.replaced,
-        content_version: assets.content_version(outcome.handle),
+    Ok(ErasedImportOutcome::of_reimport::<T>(
+        assets,
+        T::metadata_type_name(),
+        outcome.handle,
+        outcome.guid,
+        outcome.metadata,
         previous_content_version,
-    })
+    ))
 }
 
 /// [`AssetManager::import`] for `T`, with the type's default initial settings.
@@ -263,21 +332,14 @@ fn import_erased<T: ImportedAsset>(
     policy: MetadataPolicy,
 ) -> ErasedImportResult {
     let outcome = assets.import(AssetImport::<T>::new(path, policy))?;
-    let content_version = assets.content_version(outcome.handle);
-    Ok(ErasedImportOutcome {
-        type_name: T::metadata_type_name().to_owned(),
-        name: assets
-            .name_of(outcome.handle)
-            .unwrap_or_default()
-            .to_owned(),
-        guid: outcome.guid,
-        index: outcome.handle.index(),
-        generation: outcome.handle.generation(),
-        metadata: outcome.metadata,
-        previously_loaded: outcome.already_loaded,
-        content_version,
-        previous_content_version: content_version.filter(|_| outcome.already_loaded),
-    })
+    Ok(ErasedImportOutcome::of_import::<T>(
+        assets,
+        T::metadata_type_name(),
+        outcome.handle,
+        outcome.guid,
+        outcome.metadata,
+        outcome.already_loaded,
+    ))
 }
 
 /// Whether a `T` is loaded under `path`'s normalized name.
@@ -367,20 +429,14 @@ fn reimport_erased<T: ImportedAsset>(assets: &mut AssetManager, path: &Path) -> 
         .and_then(|name| assets.handle_by_name::<T>(&name))
         .and_then(|handle| assets.content_version(handle));
     let outcome = assets.reimport::<T>(path)?;
-    Ok(ErasedImportOutcome {
-        type_name: T::metadata_type_name().to_owned(),
-        name: assets
-            .name_of(outcome.handle)
-            .unwrap_or_default()
-            .to_owned(),
-        guid: outcome.guid,
-        index: outcome.handle.index(),
-        generation: outcome.handle.generation(),
-        metadata: outcome.metadata,
-        previously_loaded: outcome.replaced,
-        content_version: assets.content_version(outcome.handle),
+    Ok(ErasedImportOutcome::of_reimport::<T>(
+        assets,
+        T::metadata_type_name(),
+        outcome.handle,
+        outcome.guid,
+        outcome.metadata,
         previous_content_version,
-    })
+    ))
 }
 
 // =============================================================================
@@ -1152,7 +1208,7 @@ impl ImportRegistry {
         for relative in sourced.into_iter().chain(standalone) {
             let name = relative.to_string_lossy().replace('\\', "/");
             match self.import(assets, &relative, policy) {
-                Ok(outcome) if outcome.previously_loaded => report.already_loaded.push(name),
+                Ok(outcome) if outcome.previously_loaded() => report.already_loaded.push(name),
                 Ok(outcome) => {
                     if outcome.metadata == MetadataSource::CreatedOnDisk {
                         report.metadata_created.push(name.clone());
@@ -1439,7 +1495,7 @@ mod tests {
         std::fs::write(&meta, edited).unwrap();
         let reimported = registry.reimport(&mut assets, Path::new("a.txt")).unwrap();
 
-        assert!(reimported.previously_loaded);
+        assert!(reimported.previously_loaded());
         assert_eq!(reimported.guid, imported.guid);
         assert!(reimported.content_version > imported.content_version);
         assert_eq!(assets.get_by_name::<Text>("a.txt").unwrap().0, "HELLO");

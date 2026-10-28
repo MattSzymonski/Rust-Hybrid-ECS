@@ -42,5 +42,6 @@ fn main() {
     // Name the example programs the package ships.
     pill_core::info!("Run examples with: cargo run --example <name>");
     pill_core::info!("Available: iterators_stress_test, change_detection_demo,");
-    pill_core::info!("           scripting_demo, parallel_systems_demo, resources_demo");
+    pill_core::info!("           scripting_demo, parallel_systems_demo, resources_demo,");
+    pill_core::info!("           tracy_live (needs --features profiling)");
 }

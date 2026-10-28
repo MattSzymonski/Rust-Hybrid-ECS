@@ -37,7 +37,7 @@ use std::path::Path;
 // Current crate
 use crate::asset::AssetGuid;
 use crate::asset_import_registry::ImportRegistry;
-use crate::asset_metadata::{METADATA_EXTENSION, METADATA_FORMAT_VERSION};
+use crate::asset_metadata::METADATA_EXTENSION;
 use crate::asset_store::AssetPack;
 use crate::resource::Resource;
 
@@ -276,19 +276,14 @@ fn read_record(root: &Path, relative: &str, registry: &ImportRegistry) -> Option
 
 /// The `asset_type` and `guid` of a header, when it is one this engine reads.
 ///
-/// The same three checks the importer's header parser makes - a supported
-/// `format_version`, an `asset_type`, a 32-digit guid - without requiring an
-/// expected type, since the index is built before anything is imported.
+/// The header contract itself lives in
+/// [`asset_metadata::read_header`](crate::asset_metadata::read_header), so the
+/// index and the importer cannot disagree about which versions are readable or
+/// what a guid looks like. The index only wants the identity, not the body, and
+/// has nothing to report a refusal to.
 fn read_identity(bytes: &[u8]) -> Option<(String, AssetGuid)> {
-    let document: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let header = document.as_object()?;
-    let version = header.get("format_version")?.as_u64()?;
-    if version == 0 || version > u64::from(METADATA_FORMAT_VERSION) {
-        return None;
-    }
-    let asset_type = header.get("asset_type")?.as_str()?.to_owned();
-    let guid = AssetGuid::parse(header.get("guid")?.as_str()?)?;
-    Some((asset_type, guid))
+    let (header, _) = crate::asset_metadata::read_header(bytes).ok()?;
+    Some((header.asset_type, header.guid))
 }
 
 /// Whether `path`'s extension is a standalone type's.
@@ -612,11 +607,11 @@ mod tests {
                 MetadataPolicy::ReadIfPresent,
             )
             .expect("the guid resolves to a path and imports");
-        assert!(!by_guid.previously_loaded);
+        assert!(!by_guid.previously_loaded());
         let by_path = registry
             .load_by_path(assets, Path::new("a.note"), MetadataPolicy::ReadIfPresent)
             .expect("the path imports");
-        assert!(by_path.previously_loaded);
+        assert!(by_path.previously_loaded());
         assert_eq!(
             (by_guid.index, by_guid.generation),
             (by_path.index, by_path.generation)

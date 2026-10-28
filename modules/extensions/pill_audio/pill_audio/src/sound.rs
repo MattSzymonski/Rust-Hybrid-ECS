@@ -387,7 +387,7 @@ mod tests {
             )
             .expect("`.mp3` maps to Sound");
         assert_eq!(erased.type_name, "pill_audio::Sound");
-        assert!(erased.previously_loaded);
+        assert!(erased.previously_loaded());
         assert_eq!(erased.guid, created.guid);
 
         std::fs::remove_dir_all(&root).unwrap();

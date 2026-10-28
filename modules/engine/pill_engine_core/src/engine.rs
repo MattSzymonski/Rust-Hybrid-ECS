@@ -16,10 +16,14 @@
 //! graph running systems in parallel batches via Rayon, (3) flush deferred
 //! commands. Systems that use [`Commands`] always run sequentially due to
 //! their exclusive-world-access requirement.
+//!
+//! The engine is the one owner of the registered systems, and each record
+//! carries the access pattern the scheduler derives its conflict data from.
+//! Every structural change - a registration, a removal, a clear - invalidates
+//! the scheduler; the frame rebuilds the batches once, before it dispatches.
 
 // Standard library
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 // External crates
@@ -73,12 +77,35 @@ impl SystemOwner {
     pub const fn extension(index: usize) -> Self {
         Self(index as u64 + 1)
     }
+
+    /// The extension index this owner encodes, or `None` for the project and
+    /// the engine.
+    pub fn extension_index(self) -> Option<usize> {
+        if self == Self::PROJECT || self == Self::ENGINE {
+            None
+        } else {
+            Some((self.0 - 1) as usize)
+        }
+    }
+}
+
+impl std::fmt::Display for SystemOwner {
+    /// `project`, `engine`, or `extension <n>` - the one place a consumer
+    /// turns an owner into text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.extension_index() {
+            None if *self == Self::PROJECT => formatter.write_str("project"),
+            None => formatter.write_str("engine"),
+            Some(index) => write!(formatter, "extension {index}"),
+        }
+    }
 }
 
 /// One registered system with its runtime bookkeeping.
 ///
-/// Holds the system's name, boxed instance, enabled state, and the per-frame
-/// timing data that feeds adaptive parallelism and profiling.
+/// Holds the system's name, boxed instance, access pattern, enabled state,
+/// and the per-frame timing data that feeds adaptive parallelism and
+/// profiling.
 struct RegisteredSystem {
     /// Run after deferred commands, including while paused.
     post_update: bool,
@@ -88,6 +115,12 @@ struct RegisteredSystem {
     owner: SystemOwner,
     /// Boxed system instance, invoked with the world and command queue.
     system: Box<dyn System>,
+    /// The components and resources this system touches.
+    ///
+    /// Owned here rather than by the scheduler so the access list and the
+    /// system list cannot fall out of step: there is one list, and the
+    /// scheduler derives its conflict data from it on demand.
+    access: SystemAccess,
     /// World tick at which this system was last executed.
     ///
     /// Used to seed `World::system_last_run` so change-detection filters
@@ -105,6 +138,24 @@ struct RegisteredSystem {
     /// Populated during `run_systems_sequential` / `run_systems_parallel`
     /// and consumed by the parallel-utilization metrics.
     last_duration: u64,
+}
+
+/// One member of a parallel batch, as the worker closure sees it.
+///
+/// A batch's per-member data used to live in four index-parallel vectors
+/// (batch position, last run, reserved tick, enabled flag, name), which only
+/// a comment kept aligned. One record per member makes the alignment a field.
+struct BatchMember<'a> {
+    /// Position in the engine's registered-system vector.
+    system_index: usize,
+    /// Tick at which this system last ran, from before the batch started.
+    last_run: u32,
+    /// Tick reserved for this member on the dispatching thread.
+    this_run: u32,
+    /// Registration name, for the Tracy span and the failure record.
+    name: &'a str,
+    /// Whether this member runs in the update phase of this batch.
+    runs: bool,
 }
 
 /// A read-only snapshot of one registered system, in registration order.
@@ -167,8 +218,6 @@ pub struct Engine {
     system_failures: Vec<SystemFailure>,
     /// Whether parallel execution is enabled
     parallel_execution: bool,
-    /// Whether the execution graph needs rebuilding (dirty after enable/disable)
-    graph_dirty: bool,
     /// When true, `process_frame` skips the system-execution phase (but still
     /// bumps the world tick, updates scripts, and flushes deferred commands).
     ///
@@ -225,7 +274,10 @@ impl Engine {
     // Construction
     // -------------------------------------------------------------------------
 
-    /// Creates a new engine with no registered systems.
+    /// Creates an engine with no registered systems, the engine-owned
+    /// resources every build assumes (`Time`, `Input`, `AssetManager`) and the
+    /// `Scene` asset type registered before any generation starts, so a reload
+    /// cannot retire it.
     pub fn new() -> Self {
         // !!! Order matters: name the main thread in Tracy BEFORE any zone
         // is emitted on it.  Tracy auto-registers a thread the first time
@@ -286,7 +338,6 @@ impl Engine {
             scheduler: SystemScheduler::new(),
             system_failures: Vec::new(),
             parallel_execution: true,
-            graph_dirty: false,
             systems_paused: false,
             single_step_pending: false,
             should_exit_on_error: false,
@@ -471,16 +522,13 @@ impl Engine {
 
     /// Sets the enabled state of a system by name.
     ///
-    /// Returns `true` if the system was found, `false` otherwise.
-    /// Marks the execution graph as dirty so it is rebuilt before the
-    /// next frame, ensuring parallel batches reflect the new enabled set.
+    /// Returns `true` if the system was found, `false` otherwise. The batch
+    /// graph does not change: a disabled system keeps its place and is skipped
+    /// at dispatch, because batches are decided by conflicts alone.
     pub fn set_system_enabled(&mut self, name: &str, enabled: bool) -> bool {
         for system in &mut self.systems {
             if system.name == name {
-                if system.enabled != enabled {
-                    system.enabled = enabled;
-                    self.graph_dirty = true;
-                }
+                system.enabled = enabled;
                 return true;
             }
         }
@@ -539,17 +587,48 @@ impl Engine {
         let Some(system) = self.systems.get_mut(index) else {
             return false;
         };
-        if system.enabled != enabled {
-            system.enabled = enabled;
-            self.graph_dirty = true;
-        }
+        system.enabled = enabled;
         true
     }
 
     /// Prints the execution graph for debugging.
-    pub fn print_execution_graph(&self) {
-        let names: Vec<&str> = self.systems.iter().map(|s| s.name.as_str()).collect();
-        self.scheduler.print_execution_graph(&names);
+    ///
+    /// Rebuilds the batches first when the system set changed since the last
+    /// frame, so the report matches what the next frame would dispatch.
+    pub fn print_execution_graph(&mut self) {
+        self.scheduler.ensure_execution_graph(
+            self.systems
+                .iter()
+                .map(|registered_system| &registered_system.access),
+        );
+        let mut lines = Vec::new();
+        for (batch_index, batch) in self.scheduler.execution_graph().iter().enumerate() {
+            lines.push(format!(
+                "Batch {batch_index}: {} systems (parallel)",
+                batch.len()
+            ));
+            for &system_index in batch {
+                let Some(registered_system) = self.systems.get(system_index) else {
+                    lines.push(format!("  - <unknown system {system_index}>"));
+                    continue;
+                };
+                let access = &registered_system.access;
+                lines.push(format!(
+                    "  - {} (reads: {}, writes: {}, res_reads: {}, res_writes: {}, commands: {})",
+                    registered_system.name,
+                    access.reads_count(),
+                    access.writes_count(),
+                    access.resource_reads_count(),
+                    access.resource_writes_count(),
+                    access.uses_commands
+                ));
+            }
+        }
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "{}",
+            pill_core::telemetry::log_block("System execution graph", lines)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -616,16 +695,37 @@ impl Engine {
         F: IntoSystem<Input>,
         Input: SystemParam,
     {
-        // Analyze system access pattern
+        let (system_name, access, boxed_system) = self.prepare_system(name, system);
+        self.push_system(system_name, access, boxed_system, false);
+    }
+
+    /// Register a post-flush system. Commands emitted here apply next frame.
+    pub fn register_post_update_system<F, Input>(&mut self, name: impl Into<String>, system: F)
+    where
+        F: IntoSystem<Input>,
+        Input: SystemParam,
+    {
+        let (system_name, access, boxed_system) = self.prepare_system(name, system);
+        self.push_system(system_name, access, boxed_system, true);
+    }
+
+    /// Derives a registration's access pattern and boxes its system.
+    ///
+    /// The half both registration entry points share: report the access the
+    /// parameter tuple declares, then box the system - through a hot-patch
+    /// dispatch slot when that feature is on, so a later patch is one atomic
+    /// store rather than a re-registration.
+    fn prepare_system<F, Input>(
+        &mut self,
+        name: impl Into<String>,
+        system: F,
+    ) -> (String, SystemAccess, Box<dyn System>)
+    where
+        F: IntoSystem<Input>,
+        Input: SystemParam,
+    {
         let mut access = SystemAccess::new();
         Input::report_access(&mut access);
-
-        // Precompute ComponentMask bitfields for O(1) conflict detection.
-        access.build_component_masks(&self.world.component_registry);
-
-        // Register with scheduler
-        self.scheduler.register_system(access);
-
         let system_name: String = name.into();
 
         // Box the system. With hot patching enabled the call to the user's
@@ -659,34 +759,7 @@ impl Engine {
         #[cfg(not(feature = "hot_patch"))]
         let boxed_system = system.into_system();
 
-        // Store system
-        self.systems.push(RegisteredSystem {
-            post_update: false,
-            name: system_name,
-            owner: self.active_owner,
-            system: boxed_system,
-            // Starts suspended when its owner is (see `disabled_owners`).
-            enabled: !self.disabled_owners.contains(&self.active_owner),
-            last_run: 0,
-            average_duration: 0,
-            last_duration: 0,
-        });
-
-        // Rebuild execution graph
-        self.scheduler.build_execution_graph();
-    }
-
-    /// Register a post-flush system. Commands emitted here apply next frame.
-    pub fn register_post_update_system<F, Input>(&mut self, name: impl Into<String>, system: F)
-    where
-        F: IntoSystem<Input>,
-        Input: SystemParam,
-    {
-        self.register_system(name, system);
-        self.systems
-            .last_mut()
-            .expect("just registered")
-            .post_update = true;
+        (system_name, access, boxed_system)
     }
 
     // -------------------------------------------------------------------------
@@ -757,25 +830,45 @@ impl Engine {
     pub unsafe fn register_system_with_access<F>(
         &mut self,
         name: impl Into<String>,
-        mut access: SystemAccess,
+        access: SystemAccess,
         system: F,
     ) where
         F: FnMut(&mut World, &mut CommandQueue) -> Result<(), SystemError> + Send + 'static,
     {
-        access.build_component_masks(&self.world.component_registry);
-        self.scheduler.register_system(access);
+        self.push_system(name.into(), access, Box::new(system), false);
+    }
+
+    /// Pushes one registered system and invalidates the scheduler's graph.
+    ///
+    /// Every registration entry point ends here, so a system's owner, its
+    /// phase, its suspended-at-registration state and the invalidation cannot
+    /// drift between them. `post_update` is a parameter rather than a field
+    /// written after the push, so a record never exists with a phase that
+    /// disagrees with the batches it was placed in.
+    ///
+    /// The batches themselves are not built here: the frame rebuilds them once
+    /// from the whole list, so a module registering many systems pays for one
+    /// rebuild rather than one per registration.
+    fn push_system(
+        &mut self,
+        name: String,
+        access: SystemAccess,
+        system: Box<dyn System>,
+        post_update: bool,
+    ) {
         self.systems.push(RegisteredSystem {
-            post_update: false,
-            name: name.into(),
+            post_update,
+            name,
             owner: self.active_owner,
-            system: Box::new(system),
+            system,
+            access,
             // Starts suspended when its owner is (see `disabled_owners`).
             enabled: !self.disabled_owners.contains(&self.active_owner),
             last_run: 0,
             average_duration: 0,
             last_duration: 0,
         });
-        self.scheduler.build_execution_graph();
+        self.scheduler.invalidate();
     }
     /// Attributes every system registered from now on to `owner`.
     ///
@@ -800,8 +893,9 @@ impl Engine {
     /// owner's state. Enabling turns every system of `owner` back on, including
     /// any disabled individually with [`Self::set_system_enabled`] meanwhile.
     ///
-    /// The execution graph is rebuilt before the next frame, as for a single
-    /// system's toggle. Returns the number of systems `owner` currently has.
+    /// Returns the number of systems `owner` currently has. The batch graph is
+    /// not touched: it lists every registered system and a disabled one is
+    /// skipped at dispatch.
     pub fn set_systems_enabled_for_owner(&mut self, owner: SystemOwner, enabled: bool) -> usize {
         // Step 1: Record the owner's state for systems registered later.
         if enabled {
@@ -810,8 +904,7 @@ impl Engine {
             self.disabled_owners.push(owner);
         }
 
-        // Step 2: Apply it to the systems registered so far, marking the graph
-        // dirty once if anything changed.
+        // Step 2: Apply it to the systems registered so far.
         let mut owned = 0;
         for system in self
             .systems
@@ -819,10 +912,7 @@ impl Engine {
             .filter(|system| system.owner == owner)
         {
             owned += 1;
-            if system.enabled != enabled {
-                system.enabled = enabled;
-                self.graph_dirty = true;
-            }
+            system.enabled = enabled;
         }
         owned
     }
@@ -842,36 +932,24 @@ impl Engine {
     ///
     /// Returns the number of systems removed.
     pub fn clear_systems_owned_by(&mut self, owner: SystemOwner) -> usize {
-        // Build the keep mask before mutating anything, so the scheduler's
-        // access patterns can be filtered with the same indices the systems
-        // vector uses.
-        let keep: Vec<bool> = self
-            .systems
-            .iter()
-            .map(|system| system.owner != owner)
-            .collect();
-        let removed_count = keep.iter().filter(|keep_it| !**keep_it).count();
+        // Forget the dispatch slots of the systems about to be removed, so a
+        // later patch can never install into a system that no longer runs.
+        let mut removed_count = 0;
+        for registered_system in &self.systems {
+            if registered_system.owner == owner {
+                self.hot_patch_registry.remove(&registered_system.name);
+                removed_count += 1;
+            }
+        }
         if removed_count == 0 {
             return 0;
         }
 
-        // Forget the dispatch slots of the systems about to be removed, so a
-        // later patch can never install into a system that no longer runs.
-        for (position, system) in self.systems.iter().enumerate() {
-            if !keep[position] {
-                self.hot_patch_registry.remove(&system.name);
-            }
-        }
-
-        let mut index = 0;
-        self.systems.retain(|_| {
-            let keep_this = keep[index];
-            index += 1;
-            keep_this
-        });
-        self.scheduler.retain(&keep);
-        self.graph_dirty = false;
-        self.scheduler.build_execution_graph();
+        self.systems
+            .retain(|registered_system| registered_system.owner != owner);
+        // The graph's indices address the system list, whose positions have
+        // shifted; the next frame rebuilds it from the survivors.
+        self.scheduler.invalidate();
         removed_count
     }
 
@@ -886,10 +964,9 @@ impl Engine {
         self.systems.clear();
         // Every system is gone, so no dispatch slot may remain patchable.
         self.hot_patch_registry = crate::hot_patch::HotPatchRegistry::new();
+        // The graph and its conflict matrix describe systems that no longer
+        // exist; the next frame derives an empty one from the empty list.
         self.scheduler.clear();
-        self.graph_dirty = false;
-        // Reset the execution graph so it does not reference stale indices.
-        self.scheduler.build_execution_graph();
     }
 
     /// Drains the system failures recorded since the previous drain.
@@ -998,7 +1075,7 @@ impl Engine {
             // this frame sees the same values and none sees last frame's.
             //
             // Done here rather than in a registered system because
-            // `build_execution_graph` batches in registration order: a time
+            // `ensure_execution_graph` batches in registration order: a time
             // system would only be ordered ahead of its readers if every
             // project registered it first, and a project that registers one
             // late would hand its earlier systems stale values with nothing in
@@ -1021,33 +1098,19 @@ impl Engine {
             #[cfg(debug_assertions)]
             self.world.debug_clear_resource_locks();
 
-            // Step 2: Rebuild the execution graph when systems changed since
-            // the last frame, so parallel batches reflect the active set.
-            if self.graph_dirty {
-                self.scheduler.build_execution_graph();
-                self.graph_dirty = false;
-            }
+            // Step 2: Rebuild the execution graph when the system set changed
+            // since the last frame, so parallel batches reflect the active
+            // set. Both the conflict matrix and the batches are derived here,
+            // once per change, from the systems' own access patterns.
+            self.scheduler.ensure_execution_graph(
+                self.systems
+                    .iter()
+                    .map(|registered_system| &registered_system.access),
+            );
 
             // Step 3: Emit per-archetype memory breakdowns when the archetype
             // set changed since the last frame.
-            let current_generation = self.world.archetype_generation;
-            if current_generation != self.last_archetype_generation {
-                self.last_archetype_generation = current_generation;
-                for _archetype in self.world.archetypes.values() {
-                    crate::profile_message!(
-                        "archetype {:?}: {} entities, {} component types, ~{} bytes",
-                        _archetype.id,
-                        _archetype.entity_count(),
-                        _archetype.component_types.len(),
-                        _archetype.memory_estimate(&self.world.component_registry),
-                    );
-                }
-                crate::profile_message!(
-                    "total world memory estimate: ~{} bytes ({} KB)",
-                    self.world.memory_estimate(),
-                    self.world.memory_estimate() / 1024,
-                );
-            }
+            self.emit_archetype_memory_breakdown();
 
             // Step 4: Run all systems (parallel batches or sequential fallback).
             //
@@ -1121,63 +1184,101 @@ impl Engine {
 
             crate::profile_frame_mark!();
 
-            // Emit per-frame time-series plots for Tracy (native plot API).
-            crate::profile_plot!(entity_count, self.world.entity_count() as f64);
-            crate::profile_plot!(archetype_count, self.world.archetypes.len() as f64);
-            crate::profile_plot!(frame_time_us, frame_start.elapsed().as_micros() as f64);
-            // Memory estimate: sums archetype columns, entity locations, resources, and overhead.
-            crate::profile_plot!(
-                memory_estimate_kb,
-                self.world.memory_estimate() as f64 / 1024.0
-            );
-            // ECS internals.
-            crate::profile_plot!(free_entity_ids, self.world.free_entity_ids.len() as f64);
-            crate::profile_plot!(component_types, self.world.component_registry.len() as f64);
-            crate::profile_plot!(resource_count, self.world.resources.len() as f64);
-            crate::profile_plot!(registered_systems, self.systems.len() as f64);
-            crate::profile_plot!(
-                execution_batches,
-                self.scheduler.execution_graph().len() as f64
-            );
-            crate::profile_plot!(
-                commands_executed,
-                self.world.commands_executed_this_frame as f64
-            );
-
-            // Repeated numerical state also flows through the shared `metrics`
-            // recorder so it can reach HUDs, files, and remote sinks without
-            // duplicating the Tracy plots above.
-            #[cfg(feature = "metrics")]
-            {
-                metrics::gauge!("ecs.entities").set(self.world.entity_count() as f64);
-                metrics::gauge!("ecs.archetypes").set(self.world.archetypes.len() as f64);
-                metrics::gauge!("ecs.systems").set(self.systems.len() as f64);
-                metrics::gauge!("ecs.components").set(self.world.component_registry.len() as f64);
-                metrics::histogram!("engine.frame_time_ms")
-                    .record(frame_start.elapsed().as_secs_f64() * 1000.0);
-            }
+            self.emit_frame_telemetry(frame_start);
         } // <- frame zone ends here
 
         // FPS limiter - sleep remaining budget OUTSIDE the frame zone
-        if let Some(budget) = self.frame_budget {
-            let elapsed = frame_start.elapsed();
-            if elapsed < budget {
-                if self.trace_frame_wait {
-                    let _zone = crate::profile_scope!(
-                        "frame wait",
-                        [
-                            ("Frame budget (microseconds): {}", budget.as_micros()),
-                            ("Work elapsed (microseconds): {}", elapsed.as_micros())
-                        ]
-                    );
-                    std::thread::sleep(budget - elapsed);
-                } else {
-                    std::thread::sleep(budget - elapsed);
-                }
-            }
-        }
+        self.wait_for_frame_budget(frame_start);
 
         result
+    }
+
+    /// Emit the per-frame Tracy plots and metrics-reporter gauges.
+    #[cfg_attr(not(feature = "profiling"), allow(unused_variables))]
+    fn emit_frame_telemetry(&self, frame_start: Instant) {
+        // Emit per-frame time-series plots for Tracy (native plot API).
+        crate::profile_plot!(entity_count, self.world.entity_count() as f64);
+        crate::profile_plot!(archetype_count, self.world.archetypes.len() as f64);
+        crate::profile_plot!(frame_time_us, frame_start.elapsed().as_micros() as f64);
+        // Memory estimate: sums archetype columns, entity locations, resources, and overhead.
+        crate::profile_plot!(
+            memory_estimate_kb,
+            self.world.memory_estimate() as f64 / 1024.0
+        );
+        // ECS internals.
+        crate::profile_plot!(free_entity_ids, self.world.free_entity_ids.len() as f64);
+        crate::profile_plot!(component_types, self.world.component_registry.len() as f64);
+        crate::profile_plot!(resource_count, self.world.resources.len() as f64);
+        crate::profile_plot!(registered_systems, self.systems.len() as f64);
+        crate::profile_plot!(
+            execution_batches,
+            self.scheduler.execution_graph().len() as f64
+        );
+        crate::profile_plot!(
+            commands_executed,
+            self.world.commands_executed_this_frame as f64
+        );
+
+        // The same numbers also flow through the shared `metrics` recorder,
+        // which forwards them to Tracy's plot API when a profiler is attached.
+        // It keeps no copy of its own: a reader that wants these values reads
+        // Tracy or logs them.
+        #[cfg(feature = "metrics")]
+        {
+            metrics::gauge!("ecs.entities").set(self.world.entity_count() as f64);
+            metrics::gauge!("ecs.archetypes").set(self.world.archetypes.len() as f64);
+            metrics::gauge!("ecs.systems").set(self.systems.len() as f64);
+            metrics::gauge!("ecs.components").set(self.world.component_registry.len() as f64);
+            metrics::histogram!("engine.frame_time_ms")
+                .record(frame_start.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    /// Emit one memory-breakdown block when the archetype set has changed.
+    #[cfg_attr(not(feature = "profiling"), allow(unused_variables))]
+    fn emit_archetype_memory_breakdown(&mut self) {
+        let current_generation = self.world.archetype_generation;
+        if current_generation == self.last_archetype_generation {
+            return;
+        }
+        self.last_archetype_generation = current_generation;
+        for archetype in self.world.archetypes.values() {
+            crate::profile_message!(
+                "archetype {:?}: {} entities, {} component types, ~{} bytes",
+                archetype.id,
+                archetype.entity_count(),
+                archetype.component_types.len(),
+                archetype.memory_estimate(),
+            );
+        }
+        crate::profile_message!(
+            "total world memory estimate: ~{} bytes ({} KB)",
+            self.world.memory_estimate(),
+            self.world.memory_estimate() / 1024,
+        );
+    }
+
+    /// Sleep off whatever remains of the frame budget, outside the frame zone.
+    fn wait_for_frame_budget(&self, frame_start: Instant) {
+        let Some(budget) = self.frame_budget else {
+            return;
+        };
+        let elapsed = frame_start.elapsed();
+        if elapsed >= budget {
+            return;
+        }
+        if self.trace_frame_wait {
+            let _zone = crate::profile_scope!(
+                "frame wait",
+                [
+                    ("Frame budget (microseconds): {}", budget.as_micros()),
+                    ("Work elapsed (microseconds): {}", elapsed.as_micros())
+                ]
+            );
+            std::thread::sleep(budget - elapsed);
+        } else {
+            std::thread::sleep(budget - elapsed);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1196,35 +1297,14 @@ impl Engine {
                 self.systems.len()
             )]
         );
+        let world = &mut self.world;
+        let queue = &mut self.queue;
+        let failures = &mut self.system_failures;
         for registered_system in &mut self.systems {
             if !registered_system.enabled || registered_system.post_update != post_update {
                 continue;
             }
-            let _tracy_sys = crate::profile_scope!(
-                "system: {}",
-                registered_system.name;
-                [("System last ran at tick: {}", registered_system.last_run), ("System splitting hint execution time (ns): {}", registered_system.average_duration)]
-            );
-            // Seed the change-detection baseline for this system: filters
-            // such as `Changed<T>` will compare against `last_run`.
-            self.world.system_last_run = registered_system.last_run;
-
-            // Feed timing hint to query iterators inside this system.
-            let system_start = Instant::now();
-
-            let started_at = self.world.change_tick().get();
-            let result = registered_system
-                .system
-                .run(&mut self.world, &mut self.queue);
-            if let Err(error) = result {
-                self.system_failures
-                    .push(SystemFailure::new(registered_system.name.clone(), error));
-            }
-            record_system_run(
-                registered_system,
-                started_at,
-                system_start.elapsed().as_nanos() as u64,
-            );
+            run_registered_system(world, queue, failures, registered_system);
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -1276,32 +1356,21 @@ impl Engine {
             if batch_size == 1 {
                 // Single system - run directly on main thread, skip rayon
                 let system_index = systems_batch[0];
-                let registered = &mut self.systems[system_index];
-                if !registered.enabled || registered.post_update {
-                    continue;
+                let runs = {
+                    let registered_system = &self.systems[system_index];
+                    // The post-flush phase runs after the command flush, never
+                    // from a batch.
+                    registered_system.enabled && !registered_system.post_update
+                };
+                if runs {
+                    let registered_system = &mut self.systems[system_index];
+                    run_registered_system(
+                        &mut self.world,
+                        &mut self.queue,
+                        &mut self.system_failures,
+                        registered_system,
+                    );
                 }
-                self.world.system_last_run = registered.last_run;
-
-                // Feed timing hint to query iterators inside this system.
-                let system_start = Instant::now();
-
-                let started_at = self.world.change_tick().get();
-
-                let _zone = crate::profile_scope!(
-                    "system: {}",
-                    registered.name;
-                    [("System last ran at tick: {}", registered.last_run), ("System splitting hint execution time (ns): {}", registered.average_duration)]
-                );
-                let result = registered.system.run(&mut self.world, &mut self.queue);
-                if let Err(error) = result {
-                    self.system_failures
-                        .push(SystemFailure::new(registered.name.clone(), error));
-                }
-                record_system_run(
-                    registered,
-                    started_at,
-                    system_start.elapsed().as_nanos() as u64,
-                );
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -1316,23 +1385,30 @@ impl Engine {
                 let started_at = self.world.change_tick().get();
 
                 // Step 1: Collect per-system data and raw pointers for disjoint
-                // parallel access.
+                // parallel access. One record per batch member replaces the
+                // index-parallel vectors this used to carry, so the alignment
+                // between a member's index, its ticks, its name and whether it
+                // runs is structural rather than a comment.
                 let _zone = crate::profile_scope!("setup systems batch ({} systems)", batch_size);
-                let last_runs: Vec<u32> = systems_batch
-                    .iter()
-                    .map(|&system_index| self.systems[system_index].last_run)
-                    .collect();
-
-                // Reserve one tick per batch member on this thread, before any
-                // pointer is handed out: this is the last point where
-                // `&mut self.world` is legitimately held, and it is what keeps
-                // the workers from read-modify-writing the shared counter.
-                // Disabled members reserve too, so indices stay aligned with
-                // `systems_batch`.
-                let this_runs: Vec<u32> = systems_batch
-                    .iter()
-                    .map(|_| self.world.increment_change_tick().get())
-                    .collect();
+                let systems_ptr = crate::query::ptr::SendPtrMut::new(self.systems.as_mut_ptr());
+                let mut members: Vec<BatchMember<'_>> = Vec::with_capacity(batch_size);
+                for &system_index in systems_batch {
+                    let registered_system = &self.systems[system_index];
+                    members.push(BatchMember {
+                        system_index,
+                        last_run: registered_system.last_run,
+                        // Reserve one tick per batch member on this thread,
+                        // before any pointer is handed out: this is the last
+                        // point where `&mut self.world` is legitimately held,
+                        // and it is what keeps the workers from
+                        // read-modify-writing the shared counter. Disabled
+                        // members reserve too, so every member carries the
+                        // tick its index reserved.
+                        this_run: self.world.increment_change_tick().get(),
+                        name: registered_system.name.as_str(),
+                        runs: registered_system.enabled && !registered_system.post_update,
+                    });
+                }
 
                 // - Prepare raw pointers for parallel access -
                 //
@@ -1357,23 +1433,6 @@ impl Engine {
                     crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.world));
                 let queue_ptr =
                     crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.queue));
-                let systems_ptr = crate::query::ptr::SendPtrMut::new(self.systems.as_mut_ptr());
-
-                // Pre-compute enabled flags to avoid capturing self.systems in closure
-                // This is a small fixed-size read that avoids Vec allocation in most cases
-                let enabled_flags: Vec<bool> = systems_batch
-                    .iter()
-                    .map(|&system_index| {
-                        self.systems[system_index].enabled
-                            && !self.systems[system_index].post_update
-                    })
-                    .collect();
-
-                // Pre-compute system names for profiling spans in the parallel closure.
-                let system_names: Vec<&str> = systems_batch
-                    .iter()
-                    .map(|&system_index| self.systems[system_index].name.as_str())
-                    .collect();
                 drop(_zone);
 
                 // Step 2: Dispatch all systems in the batch across Rayon workers.
@@ -1384,36 +1443,30 @@ impl Engine {
                     "dispatch systems batch ({} systems across rayon)",
                     batch_size
                 );
-                let batch_len = systems_batch.len();
-
-                // Track how many Rayon tasks were spawned.
-                let task_count = Arc::new(AtomicUsize::new(0));
 
                 // Collect failed systems from the worker threads; the
                 // scheduler guarantees disjoint system state, but the error
                 // buffer itself is shared and must stay synchronized.
                 let batch_failures = Mutex::new(Vec::<(String, SystemError)>::new());
 
-                (0..batch_len).into_par_iter().for_each(|i| {
-                    task_count.fetch_add(1, Ordering::Relaxed);
-
+                members.into_par_iter().enumerate().for_each(|(_position, member)| {
                     // Name the parallel worker thread for Tracy visibility.
                     crate::profile_thread!("parallel worker");
 
-                    if !enabled_flags[i] {
+                    if !member.runs {
                         return;
                     }
 
                     let _zone = crate::profile_scope!(
                         "system: {}",
-                        system_names[i];
-                        [("System position in batch: {}", i), ("Total systems in this batch: {}", batch_len)]
+                        member.name;
+                        [("System position in batch: {}", _position), ("Total systems in this batch: {}", batch_size)]
                     );
 
                     let previous_override =
-                        set_per_thread_last_run_tick(Some(Tick::new(last_runs[i])));
+                        set_per_thread_last_run_tick(Some(Tick::new(member.last_run)));
                     let previous_this_run =
-                        set_per_thread_this_run_tick(Some(Tick::new(this_runs[i])));
+                        set_per_thread_this_run_tick(Some(Tick::new(member.this_run)));
 
                     // SAFETY: The scheduler proved that the systems in this
                     // batch access disjoint components and resources, so no two
@@ -1421,7 +1474,7 @@ impl Engine {
                     // state; command-using systems never share a batch. Each
                     // pointer was derived from `self` while `&mut self` was held
                     // for the whole batch, so the underlying allocations outlive
-                    // every closure invocation. `system_index` comes from
+                    // every closure invocation. `member.system_index` comes from
                     // `systems_batch`, which the scheduler built from
                     // `self.systems`, so `add(system_index)` stays within the
                     // `systems` allocation. The only shared mutable buffer,
@@ -1435,14 +1488,13 @@ impl Engine {
                         let world = &mut *world_ptr.as_ptr();
                         let system_start = Instant::now();
                         let queue = &mut *queue_ptr.as_ptr();
-                        let system_index = systems_batch[i];
-                        let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
+                        let registered_system = &mut *systems_ptr.as_ptr().add(member.system_index);
                         let result = registered_system.system.run(world, queue);
                         if let Err(error) = result {
                             batch_failures
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .push((system_names[i].to_string(), error));
+                                .push((member.name.to_string(), error));
                         }
                         record_system_run(
                             registered_system,
@@ -1459,8 +1511,8 @@ impl Engine {
                     "parallel system dispatch: batch {} of {} completed, {} systems spawned as {} rayon tasks across the thread pool",
                     batch_index + 1,
                     batches_len,
-                    batch_len,
-                    task_count.load(Ordering::Relaxed),
+                    batch_size,
+                    batch_size,
                 );
                 drop(_zone);
 
@@ -1487,6 +1539,44 @@ impl Engine {
         }
         self.world.system_last_run = 0;
     }
+}
+
+/// Runs one registered system on the calling thread.
+///
+/// The one definition of a run - the change-detection baseline, the timing,
+/// the failure record and the bookkeeping - shared by the sequential loop, the
+/// single-system batch lane and the post-flush phase. The parallel closure
+/// keeps its own body: its bookkeeping goes through thread-local ticks and a
+/// shared failure buffer.
+///
+/// Takes the engine's fields rather than `&mut Engine` so the caller can hold
+/// the scheduler's execution graph borrowed for its loop.
+fn run_registered_system(
+    world: &mut World,
+    queue: &mut CommandQueue,
+    failures: &mut Vec<SystemFailure>,
+    registered_system: &mut RegisteredSystem,
+) {
+    let _tracy_sys = crate::profile_scope!(
+        "system: {}",
+        registered_system.name;
+        [("System last ran at tick: {}", registered_system.last_run), ("System splitting hint execution time (ns): {}", registered_system.average_duration)]
+    );
+    // Seed the change-detection baseline for this system: filters such as
+    // `Changed<T>` compare against `last_run`.
+    world.system_last_run = registered_system.last_run;
+
+    // Feed the timing hint to the query iterators inside this system.
+    let system_start = Instant::now();
+    let started_at = world.change_tick().get();
+    if let Err(error) = registered_system.system.run(world, queue) {
+        failures.push(SystemFailure::new(registered_system.name.clone(), error));
+    }
+    record_system_run(
+        registered_system,
+        started_at,
+        system_start.elapsed().as_nanos() as u64,
+    );
 }
 
 /// Apply the bookkeeping every dispatch path owes a system that just ran.
@@ -1649,6 +1739,45 @@ mod tests {
         assert!(failures
             .iter()
             .any(|failure| failure.system == "second_failure"));
+    }
+
+    /// A post-update system runs after the update phase and the command flush,
+    /// even when it was registered before the system whose work it follows.
+    ///
+    /// The phase is a property of the registration, not of its position: a
+    /// post-update system registered first would run first if registration
+    /// order decided, and the command flush would then happen after it.
+    #[test]
+    fn post_update_systems_run_after_the_update_phase_whatever_their_order() {
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut engine = Engine::new();
+        let post_update_order = Arc::clone(&order);
+        engine.register_post_update_system("after_flush", move || {
+            post_update_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("post_update");
+        });
+        let update_order = Arc::clone(&order);
+        engine.register_system("before_flush", move || {
+            update_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push("update");
+        });
+
+        engine.process_frame().unwrap();
+
+        let order = order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            *order,
+            vec!["update", "post_update"],
+            "the post-update phase follows the update phase and the command flush"
+        );
     }
 
     /// Every parallel batch member gets exactly one reserved tick: queries

@@ -201,6 +201,7 @@ pub use asset_import_registry::AssetIdentity;
 pub use asset_import_registry::{
     ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
 };
+pub use asset_loading::{import_scene_document, load_scene_asset, scene_database};
 pub use asset_metadata::{
     AssetImport, AssetImportError, ImportOutcome, ImportedAsset, MetadataPolicy, MetadataSource,
     ReimportOutcome,
@@ -256,7 +257,8 @@ pub use pill_engine_macros::{
 
 // World container and its entity-builder and error types.
 pub use world::{
-    AddComponentError, BuildError, EntityBuilder, EntityRow, RemoveComponentError, World,
+    AddComponentError, BuildError, ColumnChunk, EntityBuilder, EntityRow, RemoveComponentError,
+    World,
 };
 
 // ----------------------------------------------------------------------------

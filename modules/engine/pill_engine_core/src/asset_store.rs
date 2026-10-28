@@ -627,17 +627,9 @@ pub fn write_beside(
     if destination.exists() {
         return Ok(Some(destination));
     }
-    let write_error = |source| AssetLoadError::Write {
-        path: destination.clone(),
-        source,
-    };
-
-    let temporary = directory.join(temporary_name(file_name));
-    std::fs::write(&temporary, bytes).map_err(write_error)?;
-    let placed = place_file(&temporary, &destination, Existing::Keep, hard_link);
-    // The temporary is gone after a successful fallback rename; ignore that.
-    let _ = std::fs::remove_file(&temporary);
-    placed.map_err(write_error)?;
+    write_then_place(&destination, bytes, |temporary| {
+        place_file(temporary, &destination, Existing::Keep, hard_link)
+    })?;
     Ok(Some(destination))
 }
 
@@ -657,27 +649,24 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
         path: destination.to_owned(),
         source,
     };
-    let file_name = destination.file_name().ok_or_else(|| {
-        write_error(std::io::Error::new(
+    if destination.file_name().is_none() {
+        return Err(write_error(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "no file name",
-        ))
-    })?;
-    let directory = destination.parent().unwrap_or(Path::new("."));
+        )));
+    }
     if destination.exists() {
         return Err(write_error(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "the file already exists",
         )));
     }
-    let temporary = directory.join(temporary_name(file_name));
-    std::fs::write(&temporary, bytes).map_err(write_error)?;
     // A hard link fails when the destination exists, which is the guarantee
     // wanted here; unlike `write_beside`, an existing file is an error rather
     // than someone else's equally good copy.
-    let placed = place_file(&temporary, destination, Existing::Refuse, hard_link);
-    let _ = std::fs::remove_file(&temporary);
-    placed.map_err(write_error)
+    write_then_place(destination, bytes, |temporary| {
+        place_file(temporary, destination, Existing::Refuse, hard_link)
+    })
 }
 
 /// Write `bytes` as `destination`, replacing a file that is already there.
@@ -691,6 +680,23 @@ pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
 /// [`AssetLoadError::Write`] with the underlying error when the file cannot be
 /// written or moved into place.
 pub fn write_replacing(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
+    write_then_place(destination, bytes, |temporary| {
+        std::fs::rename(temporary, destination)
+    })
+}
+
+/// Write `bytes` to a temporary sibling of `destination` and let `place` move
+/// it into place, cleaning the sibling up whatever happened.
+///
+/// The three writers differ only in how they treat a destination that already
+/// exists, so the temporary-file half - the sibling name, the complete write,
+/// the cleanup - lives here once. A crash or a second writer therefore never
+/// sees a half-written file, whichever writer ran.
+fn write_then_place(
+    destination: &Path,
+    bytes: &[u8],
+    place: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> AssetLoadResult<()> {
     let write_error = |source| AssetLoadError::Write {
         path: destination.to_owned(),
         source,
@@ -704,11 +710,11 @@ pub fn write_replacing(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> 
     let directory = destination.parent().unwrap_or(Path::new("."));
     let temporary = directory.join(temporary_name(file_name));
     std::fs::write(&temporary, bytes).map_err(write_error)?;
-    let renamed = std::fs::rename(&temporary, destination);
-    if renamed.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    renamed.map_err(write_error)
+    let placed = place(&temporary);
+    // A successful fallback rename consumed the temporary; ignoring that error
+    // keeps it from looking like a failed write.
+    let _ = std::fs::remove_file(&temporary);
+    placed.map_err(write_error)
 }
 
 /// A sibling name for `file_name` that no other writer in this or another

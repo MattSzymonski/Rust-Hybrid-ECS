@@ -237,11 +237,9 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
 
 /// Build an execution graph for the supplied managed system accesses.
 fn scheduler_for(accesses: impl IntoIterator<Item = SystemAccess>) -> SystemScheduler {
+    let accesses: Vec<SystemAccess> = accesses.into_iter().collect();
     let mut scheduler = SystemScheduler::new();
-    for access in accesses {
-        scheduler.register_system(access);
-    }
-    scheduler.build_execution_graph();
+    scheduler.ensure_execution_graph(accesses.iter());
     scheduler
 }
 
@@ -1270,19 +1268,15 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
 fn optional_managed_access_conflicts_when_the_component_may_be_present() {
     // OptionalWrite<MeshRendererComponent> exports the same scheduler write as Write<MeshRendererComponent>;
     // optionality affects matching, never parallel safety.
-    let scheduler = scheduler_for([
-        managed_access(&[("PhysicsState", 1), ("MeshRendererComponent", 0)]),
-        managed_access(&[("TransformComponent", 1)]),
-        managed_access(&[("MeshRendererComponent", 1)]),
-    ]);
+    let first = managed_access(&[("PhysicsState", 1), ("MeshRendererComponent", 0)]);
+    let second = managed_access(&[("TransformComponent", 1)]);
+    let third = managed_access(&[("MeshRendererComponent", 1)]);
+    let scheduler = scheduler_for([first.clone(), second.clone(), third.clone()]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
     assert_same_batch(&scheduler, &[0, 1]);
     assert_different_batches(&scheduler, 0, 2);
-    assert!(!scheduler
-        .get_access(1)
-        .unwrap()
-        .conflicts_with(scheduler.get_access(2).unwrap()));
+    assert!(!second.conflicts_with(&third));
 }
 
 /// Verify marking one managed write is observed by Rust's Changed filter.

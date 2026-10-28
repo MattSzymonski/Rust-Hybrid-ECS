@@ -55,6 +55,15 @@ pub struct PillHotSlotDescriptor {
 
 inventory::collect!(PillHotSlotDescriptor);
 
+impl PillHotSlotDescriptor {
+    /// The `#[pill_hot_fn]` this artifact declares under `qualified_name`.
+    pub fn find(qualified_name: &str) -> Option<&'static Self> {
+        inventory::iter::<PillHotSlotDescriptor>
+            .into_iter()
+            .find(|descriptor| descriptor.qualified_name == qualified_name)
+    }
+}
+
 /// Redirect a `#[pill_hot_fn]` declared in THIS artifact.
 ///
 /// # Errors
@@ -69,12 +78,11 @@ pub fn install_plain_function(
     address: usize,
     signature: &str,
 ) -> Result<(), HotPatchError> {
-    let descriptor = inventory::iter::<PillHotSlotDescriptor>
-        .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)
-        .ok_or_else(|| HotPatchError::UnknownSystem {
+    let descriptor = PillHotSlotDescriptor::find(qualified_name).ok_or_else(|| {
+        HotPatchError::UnknownSystem {
             name: qualified_name.to_string(),
-        })?;
+        }
+    })?;
 
     if address == 0 {
         return Err(HotPatchError::NullAddress {
@@ -99,17 +107,19 @@ pub fn install_plain_function(
 /// Returns [`HotPatchError::UnknownSystem`] when this artifact declares no such
 /// function.
 pub fn reset_plain_function(qualified_name: &str) -> Result<(), HotPatchError> {
-    let descriptor = inventory::iter::<PillHotSlotDescriptor>
-        .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)
-        .ok_or_else(|| HotPatchError::UnknownSystem {
+    let descriptor = PillHotSlotDescriptor::find(qualified_name).ok_or_else(|| {
+        HotPatchError::UnknownSystem {
             name: qualified_name.to_string(),
-        })?;
+        }
+    })?;
     descriptor.slot.reset();
     Ok(())
 }
 
 /// Names of every `#[pill_hot_fn]` this artifact declares.
+///
+/// Registry: `PillHotSlotDescriptor`. [`hot_function_names`] lists the
+/// `#[pill_hot]` systems instead; they are different registries.
 pub fn plain_function_names() -> impl Iterator<Item = &'static str> {
     inventory::iter::<PillHotSlotDescriptor>
         .into_iter()
@@ -124,10 +134,7 @@ pub fn plain_function_names() -> impl Iterator<Item = &'static str> {
 /// space. A patch artifact derives its own copy from the same source through
 /// the same macro, which is what makes the two comparable.
 pub fn plain_function_signature(qualified_name: &str) -> Option<&'static str> {
-    inventory::iter::<PillHotSlotDescriptor>
-        .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)
-        .map(|descriptor| descriptor.signature)
+    PillHotSlotDescriptor::find(qualified_name).map(|descriptor| descriptor.signature)
 }
 
 /// Address and signature of a `#[pill_hot_fn]` this artifact declares.
@@ -137,9 +144,7 @@ pub fn plain_function_signature(qualified_name: &str) -> Option<&'static str> {
 /// address to jump to, and the signature text that copy compares against its
 /// own before accepting it.
 pub fn plain_function_entry(qualified_name: &str) -> Option<(usize, &'static str)> {
-    let descriptor = inventory::iter::<PillHotSlotDescriptor>
-        .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)?;
+    let descriptor = PillHotSlotDescriptor::find(qualified_name)?;
     // `None` means this artifact declares the function but cannot address its
     // body - true of every inherent method outside a patch. Reporting nothing
     // is correct: the caller is asking a patch where its replacement lives.
@@ -179,20 +184,29 @@ pub struct PillFunctionAddress {
 
 inventory::collect!(PillFunctionAddress);
 
-/// Address of one function inside this artifact, by qualified path.
-pub fn function_address(qualified_name: &str) -> Option<usize> {
-    inventory::iter::<PillFunctionAddress>
-        .into_iter()
-        .find(|entry| entry.qualified_name == qualified_name)
-        .map(|entry| (entry.address)())
+impl PillFunctionAddress {
+    /// The build-script entry this artifact holds for `qualified_name`.
+    pub fn find(qualified_name: &str) -> Option<&'static Self> {
+        inventory::iter::<PillFunctionAddress>
+            .into_iter()
+            .find(|entry| entry.qualified_name == qualified_name)
+    }
 }
 
-/// The declaration this artifact was built with, by qualified path.
-pub fn function_signature(qualified_name: &str) -> Option<&'static str> {
-    inventory::iter::<PillFunctionAddress>
-        .into_iter()
-        .find(|entry| entry.qualified_name == qualified_name)
-        .map(|entry| entry.signature)
+/// Address of one scanned function inside this artifact, by qualified path.
+///
+/// Registry: `PillFunctionAddress` (the build-script scan). A `#[pill_hot_fn]`
+/// slot is [`plain_function_entry`]; a `#[pill_hot]` system is
+/// [`resolve_hot_function`].
+pub fn scanned_function_address(qualified_name: &str) -> Option<usize> {
+    PillFunctionAddress::find(qualified_name).map(|entry| (entry.address)())
+}
+
+/// The declaration the build-script scan recorded for one function.
+///
+/// Registry: `PillFunctionAddress`.
+pub fn scanned_function_signature(qualified_name: &str) -> Option<&'static str> {
+    PillFunctionAddress::find(qualified_name).map(|entry| entry.signature)
 }
 
 /// Every function this artifact can report, for diagnostics.
@@ -227,6 +241,62 @@ fn text_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// Decode a qualified name the host passed across the C ABI, or answer
+/// `refused`.
+///
+/// Every resolver export in a loadable artifact opens the same way - refuse a
+/// null pointer, read the C string, refuse a name that is not UTF-8 - so the
+/// prologue lives here once instead of in each expansion. The refusal value is
+/// the export's own ("zero", "one", "no such function"), which is why the
+/// caller supplies it.
+///
+/// # Safety
+///
+/// `qualified_name` must be null or address a NUL-terminated C string readable
+/// for the duration of `body`.
+pub unsafe fn with_qualified_name<R>(
+    qualified_name: *const std::ffi::c_char,
+    refused: R,
+    body: impl FnOnce(&str) -> R,
+) -> R {
+    if qualified_name.is_null() {
+        return refused;
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string readable for the
+    // duration of this call.
+    let name = unsafe { std::ffi::CStr::from_ptr(qualified_name) };
+    match name.to_str() {
+        Ok(name) => body(name),
+        Err(_) => refused,
+    }
+}
+
+/// Write a signature's pointer and length through the two out-parameters a
+/// resolver export reports it through, or nothing when either is null.
+///
+/// The signature text comes from `concat!` and is therefore not NUL-terminated,
+/// so a resolver reports it as a pointer and a byte count rather than a string.
+///
+/// # Safety
+///
+/// Both pointers must be null or address writable slots, and `signature` must
+/// outlive the caller's use of what it reads.
+pub unsafe fn write_signature_out(
+    signature: &'static [u8],
+    out_signature: *mut *const u8,
+    out_signature_length: *mut usize,
+) {
+    if out_signature.is_null() || out_signature_length.is_null() {
+        return;
+    }
+    // SAFETY: both pointers were checked non-null and the caller guarantees
+    // they address writable slots.
+    unsafe {
+        *out_signature = signature.as_ptr();
+        *out_signature_length = signature.len();
+    }
+}
+
 // =============================================================================
 // Compile-time registry of hot-patchable functions
 // =============================================================================
@@ -256,19 +326,28 @@ pub struct PillHotFunctionDescriptor {
 
 inventory::collect!(PillHotFunctionDescriptor);
 
+impl PillHotFunctionDescriptor {
+    /// The `#[pill_hot]` system this artifact declares under `qualified_name`.
+    pub fn find(qualified_name: &str) -> Option<&'static Self> {
+        inventory::iter::<PillHotFunctionDescriptor>
+            .into_iter()
+            .find(|descriptor| descriptor.qualified_name == qualified_name)
+    }
+}
+
 /// Look up a hot-patchable function declared in THIS artifact.
 ///
 /// Returns its dispatch address and signature hash, or `None` when no
 /// `#[pill_hot]` function carries that qualified name. A host calls the
 /// equivalent through the artifact's exported resolver rather than directly.
 pub fn resolve_hot_function(qualified_name: &str) -> Option<(usize, u64)> {
-    inventory::iter::<PillHotFunctionDescriptor>
-        .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)
-        .map(|descriptor| (descriptor.resolve)())
+    PillHotFunctionDescriptor::find(qualified_name).map(|descriptor| (descriptor.resolve)())
 }
 
-/// Every hot-patchable function this artifact declares, for diagnostics.
+/// Every `#[pill_hot]` system this artifact declares, for diagnostics.
+///
+/// Registry: `PillHotFunctionDescriptor`. [`plain_function_names`] lists the
+/// `#[pill_hot_fn]` slots instead.
 pub fn hot_function_names() -> impl Iterator<Item = &'static str> {
     inventory::iter::<PillHotFunctionDescriptor>
         .into_iter()

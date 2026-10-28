@@ -104,15 +104,12 @@ macro_rules! register_batch_systems {
 // Helper Functions
 // =============================================================================
 
-/// Builds a `SystemScheduler` with `system_count` registered systems.
+/// Builds the access patterns of `system_count` systems.
 ///
 /// Every third system writes a component while the others read it, producing
 /// a realistic 1/3-write conflict mix for the graph-build benchmark.
-fn build_scheduler(system_count: usize) -> SystemScheduler {
-    // Step 1: Create an empty scheduler.
-    let mut scheduler = SystemScheduler::new();
-
-    // Step 2: Register one system per component index with the conflict mix.
+fn build_accesses(system_count: usize) -> Vec<SystemAccess> {
+    let mut accesses = Vec::with_capacity(system_count);
     for i in 0..system_count {
         let mut access = SystemAccess::new();
         let type_id = DISTINCT_TYPE_IDS[i % DISTINCT_TYPE_IDS.len()];
@@ -122,9 +119,9 @@ fn build_scheduler(system_count: usize) -> SystemScheduler {
         } else {
             access.add_read(ComponentId::native(type_id));
         }
-        scheduler.register_system(access);
+        accesses.push(access);
     }
-    scheduler
+    accesses
 }
 
 /// Builds an `Engine` with `system_count` registered systems and 100
@@ -218,9 +215,10 @@ fn bench_graph_build(criterion: &mut Criterion) {
             &system_count,
             |benchmark, &system_count| {
                 benchmark.iter_batched(
-                    || build_scheduler(system_count),
-                    |mut scheduler| {
-                        scheduler.build_execution_graph();
+                    || build_accesses(system_count),
+                    |accesses| {
+                        let mut scheduler = SystemScheduler::new();
+                        scheduler.ensure_execution_graph(accesses.iter());
                         black_box(scheduler.execution_graph().len());
                     },
                     criterion::BatchSize::LargeInput,

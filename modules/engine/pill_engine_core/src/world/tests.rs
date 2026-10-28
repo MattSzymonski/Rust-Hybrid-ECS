@@ -647,7 +647,7 @@ fn relayout_keeps_the_component_id_and_its_bit() {
 
     // The same id still names the same component; only its size moved.
     assert_eq!(world.component_registry().get_bit(&component), Some(bit));
-    assert_eq!(world.component_registry().get_size(&component), Some(16));
+    assert_eq!(world.component_layout(component), Some((16, 8)));
     assert_eq!(
         world.component_registry().get_name(&component),
         Some("Project.Bit")
@@ -1022,10 +1022,16 @@ fn native_component_chunk_mut_exposes_raw_rows() {
     // Copy the raw facts out while the mutable chunk borrow is still
     // scoped, so the world can be re-borrowed below.
     let (archetype_id, data, len, element_size, ticks_len) = {
-        let (archetype_id, data, len, element_size, ticks) = world
+        let chunk = world
             .native_component_chunk_mut(component_id, 0)
             .expect("one archetype column should exist");
-        (archetype_id, data, len, element_size, ticks.len())
+        (
+            chunk.archetype,
+            chunk.data,
+            chunk.len,
+            chunk.element_size,
+            chunk.ticks.len(),
+        )
     };
     assert_eq!(archetype_id, world.entity_locations[&entity].archetype_id);
     assert_eq!(len, 1);
@@ -2784,10 +2790,14 @@ fn a_shared_claim_survives_one_subjects_retirement() {
     assert!(world.get_resource::<AccountedResource>().is_none());
 }
 
-/// A relayout republishes the whole registry layout - alignment and schema
-/// hash included - so `get_layout` never describes a column that is gone.
+/// A relayout moves the factory, the live column and the schema hash together.
+///
+/// The registry used to keep a second copy of a descriptor component's shape -
+/// a placeholder at registration that a relayout then repaired. Storage shape
+/// has one owner now, so this pins the factory to the column that allocates the
+/// rows and to the size readers consult.
 #[test]
-fn relayout_republishes_the_registry_layout() {
+fn relayout_moves_the_factory_and_the_column_together() {
     let mut world = World::new();
     let component_id = world
         .register_component_descriptor(
@@ -2807,23 +2817,29 @@ fn relayout_republishes_the_registry_layout() {
         .relayout_descriptor_component(component_id, 16, 8, 200, &FieldPlan::new())
         .expect("the empty plan fits both layouts");
 
-    let record = world
-        .component_registry()
-        .get_layout(&component_id)
-        .expect("registered");
-    assert_eq!(record.size, 16);
-    assert_eq!(
-        record.align, 8,
-        "the registration-time placeholder alignment moved with the storage"
-    );
-    assert_eq!(record.schema_hash, Some(200));
     let Some(StorageFactory::Descriptor(layout)) = world.storage_factories.get(&component_id)
     else {
         panic!("the factory is not a descriptor factory");
     };
     assert_eq!(
         (layout.size, layout.align, layout.schema_hash),
-        (record.size, record.align, record.schema_hash.unwrap())
+        (16, 8, 200),
+        "the factory carries the relayout"
+    );
+    assert_eq!(
+        world.component_layout(component_id),
+        Some((16, 8)),
+        "the readers that ask for a component's storage shape see the new one"
+    );
+    let column = world
+        .archetypes
+        .values()
+        .find_map(|archetype| archetype.component_storages.get(component_id))
+        .expect("the row's column");
+    assert_eq!(
+        (column.element_size(), column.elem_align()),
+        (16, 8),
+        "the column that allocates the rows carries the same shape"
     );
 }
 
@@ -3614,5 +3630,115 @@ fn a_wrapped_tick_counter_still_reports_a_change() {
     assert!(
         ticks.is_added(last_run, this_run),
         "an add after the wrap is still newer than the run before it"
+    );
+}
+
+/// A removal drops every per-id record, the declared field layout included.
+///
+/// The two removal sweeps used to enumerate their own subset, and
+/// `remove_resource` left `resource_field_layouts` behind, so a value
+/// re-registered under the same id inherited the previous value's offsets.
+#[test]
+fn removing_a_resource_drops_its_declared_field_layout() {
+    #[derive(Debug, PartialEq)]
+    struct RemovedProbe(u32);
+    impl crate::resource::Resource for RemovedProbe {}
+
+    let mut world = World::new();
+    world.insert_resource(RemovedProbe(7));
+    let id = ResourceId::of::<RemovedProbe>();
+    world
+        .register_resource_field_layout(
+            id,
+            vec![crate::component_registry::ComponentFieldDescriptor {
+                name: "value",
+                type_tag: "u32",
+                offset: 0,
+                size: 4,
+                align: 4,
+                element_count: 0,
+                decorators: std::borrow::Cow::Borrowed(&[]),
+            }],
+        )
+        .expect("the field fits the registered size");
+    assert!(world.resource_field_layout(id).is_some());
+
+    let removed = world
+        .remove_resource::<RemovedProbe>()
+        .expect("the value is a RemovedProbe");
+    assert_eq!(removed, Some(RemovedProbe(7)));
+    assert!(
+        world.resource_field_layout(id).is_none(),
+        "a removal must drop the id's layout record, not leave it for the next registration"
+    );
+}
+
+/// A script component that counts its own dispatches, so a double
+/// registration is visible as a count above one after a single frame.
+#[derive(Debug, Default)]
+struct CountingScript {
+    dispatches: u32,
+}
+
+impl Component for CountingScript {}
+
+impl ScriptComponent for CountingScript {
+    fn update(&mut self, _script_context: &mut ScriptContext) {
+        self.dispatches += 1;
+    }
+}
+
+/// Reads the counting script's own dispatch count back out of the world.
+fn dispatches_of(world: &World, entity: Entity) -> u32 {
+    world
+        .get_component::<CountingScript>(entity)
+        .expect("the entity carries the script")
+        .dispatches
+}
+
+/// Registering one script type twice must still dispatch it once per frame:
+/// the updater table replaces its entry instead of queueing a second one.
+#[test]
+fn registering_a_script_component_twice_dispatches_it_once_per_frame() {
+    let mut world = World::new();
+    world.register_script_component::<CountingScript>();
+    world.register_script_component::<CountingScript>();
+
+    let entity = world.create_entity().build().expect("the entity builds");
+    world
+        .add_component(entity, CountingScript::default())
+        .expect("the script attaches");
+
+    let mut commands = CommandQueue::new();
+    world.update_scripts(&mut commands);
+
+    assert_eq!(
+        dispatches_of(&world, entity),
+        1,
+        "a re-registered script type must not run twice per frame"
+    );
+}
+
+/// A retired script type that registers again may land on another bit;
+/// dispatch reads the current one, so the script keeps running.
+#[test]
+fn a_re_registered_script_component_dispatches_on_its_new_bit() {
+    let mut world = World::new();
+    world.register_script_component::<CountingScript>();
+    world.retire_component_storage(&[ComponentId::of::<CountingScript>()]);
+    world.register_script_component::<CountingScript>();
+
+    let entity = world.create_entity().build().expect("the entity builds");
+    world
+        .add_component(entity, CountingScript::default())
+        .expect("the script attaches");
+
+    let mut commands = CommandQueue::new();
+    world.update_scripts(&mut commands);
+
+    assert_eq!(
+        dispatches_of(&world, entity),
+        1,
+        "a re-registered script type must dispatch through its current bit"
     );
 }

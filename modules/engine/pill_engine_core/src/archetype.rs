@@ -607,6 +607,34 @@ impl FieldPlan {
         self.fields.is_empty()
     }
 
+    /// Write one row's bytes according to this plan.
+    ///
+    /// `source` is the old row, `destination` the new one. A caller that wants
+    /// the bytes no instruction covers to be defined zeroes the destination
+    /// first, because `ZeroFill` writes nothing of its own.
+    ///
+    /// Every arm is handled here, so a default attached with
+    /// [`Self::set_default`] lands the same way whichever lane applies the
+    /// plan. The instructions are not re-checked against the row sizes:
+    /// callers run [`Self::validate`] once before applying the plan to every
+    /// stored row, so the check is paid for once rather than per row.
+    pub fn apply(&self, source: &[u8], destination: &mut [u8]) {
+        for field in &self.fields {
+            match field.source {
+                FieldSource::OldOffset(offset) => destination
+                    [field.offset..field.offset + field.bytes]
+                    .copy_from_slice(&source[offset..offset + field.bytes]),
+                // Only the leading bytes of a default are part of the value;
+                // the rest of the field keeps the destination's zero fill.
+                FieldSource::Default { bytes, len } => {
+                    let len = usize::from(len);
+                    destination[field.offset..field.offset + len].copy_from_slice(&bytes[..len]);
+                }
+                FieldSource::ZeroFill => {}
+            }
+        }
+    }
+
     /// Check every instruction against the two row sizes.
     ///
     /// Callers run this before touching a row, so a plan that does not fit is
@@ -1537,7 +1565,7 @@ impl ComponentColumn {
         // this correct in place as well as across buffers: every source byte is
         // read before the destination row is zeroed.
         if rows != 0 {
-            let mut scratch = vec![0_u8; old_size.max(layout.size)];
+            let mut scratch = vec![0_u8; old_size];
             for row in 0..rows {
                 // SAFETY: `row < rows` counts only initialized rows, and both
                 // buffers are allocated for at least `rows` rows.
@@ -1546,28 +1574,10 @@ impl ComponentColumn {
                     std::ptr::copy_nonoverlapping(source, scratch.as_mut_ptr(), old_size);
                     let destination = new_data.as_ptr().add(row * layout.size);
                     std::ptr::write_bytes(destination, 0, layout.size);
-                    for field in plan.fields() {
-                        match field.source {
-                            FieldSource::OldOffset(offset) => {
-                                std::ptr::copy_nonoverlapping(
-                                    scratch.as_ptr().add(offset),
-                                    destination.add(field.offset),
-                                    field.bytes,
-                                );
-                            }
-                            // The destination row is zeroed above; a default is
-                            // checked to fit the field when it is set, so only
-                            // its leading bytes move and the rest stays zero.
-                            FieldSource::Default { bytes, len } => {
-                                std::ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    destination.add(field.offset),
-                                    usize::from(len),
-                                );
-                            }
-                            FieldSource::ZeroFill => {}
-                        }
-                    }
+                    plan.apply(
+                        &scratch,
+                        std::slice::from_raw_parts_mut(destination, layout.size),
+                    );
                 }
             }
         }
@@ -1987,17 +1997,19 @@ impl Archetype {
     /// Estimate the memory footprint of this archetype in bytes.
     ///
     /// Sums entity IDs, component column capacities x element sizes,
-    /// and change-detection tick vectors.
-    pub fn memory_estimate(&self, registry: &crate::component::ComponentRegistry) -> usize {
+    /// and change-detection tick vectors. Each column reports its own stride:
+    /// the archetype is asked about the memory it holds, so the columns holding
+    /// it are the record to read.
+    pub fn memory_estimate(&self) -> usize {
         // Step 1: Account for the entity ID array (16 bytes per entity).
         let mut total = self.entities.capacity() * std::mem::size_of::<crate::entity::Entity>();
 
         // Step 2: Account for each component column (entity count as a lower bound).
         for &component_id in &self.component_types {
-            if let Some(size) = registry.get_size(&component_id) {
+            if let Some(column) = self.component_storages.get(component_id) {
                 // A column's capacity is not exposed, so the entity count is a
                 // lower bound; the real allocation may be larger.
-                total += self.entities.len() * size;
+                total += self.entities.len() * column.element_size();
             }
         }
 

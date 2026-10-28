@@ -30,13 +30,21 @@
 //! world flattens it into dotted leaf rows at registration
 //! ([`World::register_component_with_layout`]), so the tag survives only when
 //! no layout was resolvable.
+//!
+//! # Row byte convention
+//!
+//! A row's bytes are native-endian, including an asset handle's two `u32`s
+//! (index, then generation) and an entity reference's slot and generation. The
+//! C# mirror reads the same row from the same process, so no byte order has to
+//! cross a machine boundary; a field that ever does would need its own stated
+//! convention here.
 
 // Standard library
 use std::mem::size_of;
 use std::sync::OnceLock;
 
 // Current crate
-use crate::archetype::ArchetypeId;
+use crate::archetype::{ArchetypeId, ComponentColumn};
 use crate::component::{ComponentId, Tick};
 use crate::component_registry::{ComponentFieldDescriptor, FieldDecorator};
 use crate::entity::Entity;
@@ -142,6 +150,41 @@ pub enum FieldValue {
 }
 
 impl FieldValue {
+    /// The cleared-reference value: [`Handle::INVALID`](crate::Handle::INVALID)'s
+    /// pair, with no recorded asset type.
+    ///
+    /// The field layer's one spelling of "this reference points at nothing",
+    /// so a saver, a restorer and a clearer agree without re-deriving it.
+    #[must_use]
+    pub fn unset_asset() -> Self {
+        Self::Asset {
+            asset_type: None,
+            index: crate::asset::INVALID_ASSET_INDEX,
+            generation: crate::asset::INVALID_ASSET_GENERATION,
+        }
+    }
+
+    /// Whether this value is a reference that points at nothing.
+    ///
+    /// True for a cleared asset reference ([`Self::unset_asset`]) whatever
+    /// wrote it, and for the null entity handle.
+    #[must_use]
+    pub fn references_nothing(&self) -> bool {
+        match self {
+            Self::Asset {
+                index, generation, ..
+            } => {
+                (*index, *generation)
+                    == (
+                        crate::asset::INVALID_ASSET_INDEX,
+                        crate::asset::INVALID_ASSET_GENERATION,
+                    )
+            }
+            Self::Entity { id, generation } => crate::Entity::from_raw(*id, *generation).is_null(),
+            _ => false,
+        }
+    }
+
     /// The closed-vocabulary tag a value's variant corresponds to.
     ///
     /// Mirrors the `type_tag` strings the derive emits, so a mismatch can name
@@ -149,19 +192,19 @@ impl FieldValue {
     /// labels below for diagnostics.
     pub(crate) fn variant_tag(&self) -> &'static str {
         match self {
-            Self::F32(_) => "f32",
-            Self::F64(_) => "f64",
-            Self::I8(_) => "i8",
-            Self::I16(_) => "i16",
-            Self::I32(_) => "i32",
-            Self::I64(_) => "i64",
-            Self::U8(_) => "u8",
-            Self::U16(_) => "u16",
-            Self::U32(_) => "u32",
-            Self::U64(_) => "u64",
-            Self::Bool(_) => "bool",
-            Self::Usize(_) => "usize",
-            Self::Isize(_) => "isize",
+            Self::F32(_) => ScalarKind::F32.tag(),
+            Self::F64(_) => ScalarKind::F64.tag(),
+            Self::I8(_) => ScalarKind::I8.tag(),
+            Self::I16(_) => ScalarKind::I16.tag(),
+            Self::I32(_) => ScalarKind::I32.tag(),
+            Self::I64(_) => ScalarKind::I64.tag(),
+            Self::U8(_) => ScalarKind::U8.tag(),
+            Self::U16(_) => ScalarKind::U16.tag(),
+            Self::U32(_) => ScalarKind::U32.tag(),
+            Self::U64(_) => ScalarKind::U64.tag(),
+            Self::Bool(_) => ScalarKind::Bool.tag(),
+            Self::Usize(_) => ScalarKind::Usize.tag(),
+            Self::Isize(_) => ScalarKind::Isize.tag(),
             Self::Array(_) => "array",
             Self::List { .. } => "list",
             Self::Text(_) => "text",
@@ -344,79 +387,166 @@ const HANDLE_SIZE: usize = 8;
 /// generation, and the padding `#[repr(C)]` puts after them.
 const ENTITY_REFERENCE_SIZE: usize = size_of::<Entity>();
 
+/// The scalar primitives the field vocabulary names.
+///
+/// One entry per tag, so the size table, both codecs and the derive's tag
+/// strings cannot drift apart: adding a scalar here is what makes it readable
+/// and writable, and the rest of this file asks the kind instead of repeating
+/// the tag strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarKind {
+    /// A 32-bit float.
+    F32,
+    /// A 64-bit float.
+    F64,
+    /// An 8-bit signed integer.
+    I8,
+    /// A 16-bit signed integer.
+    I16,
+    /// A 32-bit signed integer.
+    I32,
+    /// A 64-bit signed integer.
+    I64,
+    /// An 8-bit unsigned integer.
+    U8,
+    /// A 16-bit unsigned integer.
+    U16,
+    /// A 32-bit unsigned integer.
+    U32,
+    /// A 64-bit unsigned integer.
+    U64,
+    /// A boolean, one byte.
+    Bool,
+    /// A pointer-sized unsigned integer.
+    Usize,
+    /// A pointer-sized signed integer.
+    Isize,
+}
+
+impl ScalarKind {
+    /// The kind a tag names, or `None` when the tag is not a scalar.
+    fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "f32" => Self::F32,
+            "f64" => Self::F64,
+            "i8" => Self::I8,
+            "i16" => Self::I16,
+            "i32" => Self::I32,
+            "i64" => Self::I64,
+            "u8" => Self::U8,
+            "u16" => Self::U16,
+            "u32" => Self::U32,
+            "u64" => Self::U64,
+            "bool" => Self::Bool,
+            "usize" => Self::Usize,
+            "isize" => Self::Isize,
+            _ => return None,
+        })
+    }
+
+    /// The tag this kind is named by, as the derive emits it.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::Bool => "bool",
+            Self::Usize => "usize",
+            Self::Isize => "isize",
+        }
+    }
+
+    /// The size of one value in bytes.
+    fn size(self) -> usize {
+        match self {
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F64 | Self::I64 | Self::U64 => 8,
+            Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::I16 | Self::U16 => 2,
+            // Pointer-sized: 4 bytes on wasm32, 8 on 64-bit targets.
+            Self::Usize => size_of::<usize>(),
+            Self::Isize => size_of::<isize>(),
+        }
+    }
+
+    /// Append one value, reporting whether it is of this kind.
+    fn encode(self, value: &FieldValue, output: &mut Vec<u8>) -> bool {
+        match (self, value) {
+            (Self::F32, FieldValue::F32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::F64, FieldValue::F64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::I8, FieldValue::I8(value)) => output.push(*value as u8),
+            (Self::I16, FieldValue::I16(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::I32, FieldValue::I32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::I64, FieldValue::I64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::U8, FieldValue::U8(value)) => output.push(*value),
+            (Self::U16, FieldValue::U16(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::U32, FieldValue::U32(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::U64, FieldValue::U64(value)) => output.extend_from_slice(&value.to_ne_bytes()),
+            (Self::Bool, FieldValue::Bool(value)) => output.push(u8::from(*value)),
+            (Self::Usize, FieldValue::Usize(value)) => {
+                output.extend_from_slice(&value.to_ne_bytes())
+            }
+            (Self::Isize, FieldValue::Isize(value)) => {
+                output.extend_from_slice(&value.to_ne_bytes())
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Decode one value at `offset`, or `None` when the buffer is too short.
+    fn decode(self, bytes: &[u8], offset: usize) -> Option<FieldValue> {
+        fn read<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
+            bytes.get(offset..offset + N)?.try_into().ok()
+        }
+        Some(match self {
+            Self::F32 => FieldValue::F32(f32::from_ne_bytes(read::<4>(bytes, offset)?)),
+            Self::F64 => FieldValue::F64(f64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::I8 => FieldValue::I8(*bytes.get(offset)? as i8),
+            Self::I16 => FieldValue::I16(i16::from_ne_bytes(read::<2>(bytes, offset)?)),
+            Self::I32 => FieldValue::I32(i32::from_ne_bytes(read::<4>(bytes, offset)?)),
+            Self::I64 => FieldValue::I64(i64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::U8 => FieldValue::U8(*bytes.get(offset)?),
+            Self::U16 => FieldValue::U16(u16::from_ne_bytes(read::<2>(bytes, offset)?)),
+            Self::U32 => FieldValue::U32(u32::from_ne_bytes(read::<4>(bytes, offset)?)),
+            Self::U64 => FieldValue::U64(u64::from_ne_bytes(read::<8>(bytes, offset)?)),
+            Self::Bool => FieldValue::Bool(bytes.get(offset).copied()? != 0),
+            Self::Usize => FieldValue::Usize(usize::from_ne_bytes(read::<{ size_of::<usize>() }>(
+                bytes, offset,
+            )?)),
+            Self::Isize => FieldValue::Isize(isize::from_ne_bytes(read::<{ size_of::<isize>() }>(
+                bytes, offset,
+            )?)),
+        })
+    }
+}
+
 /// The size in bytes of one scalar whose tag is in the closed vocabulary.
 fn scalar_size(tag: &str) -> Option<usize> {
-    Some(match tag {
-        "f32" => 4,
-        "f64" => 8,
-        "i8" => 1,
-        "u8" => 1,
-        "i16" => 2,
-        "u16" => 2,
-        "i32" => 4,
-        "u32" => 4,
-        "i64" => 8,
-        "u64" => 8,
-        "bool" => 1,
-        "usize" => size_of::<usize>(),
-        "isize" => size_of::<isize>(),
-        _ => return None,
-    })
+    ScalarKind::from_tag(tag).map(ScalarKind::size)
 }
 
 /// Whether a tag names one of the scalar primitives.
 fn is_scalar_tag(tag: &str) -> bool {
-    scalar_size(tag).is_some()
+    ScalarKind::from_tag(tag).is_some()
 }
 
 /// Encode one scalar value into `output`, returning whether the tag matched.
 fn encode_scalar(tag: &str, value: &FieldValue, output: &mut Vec<u8>) -> bool {
-    match (tag, value) {
-        ("f32", FieldValue::F32(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("f64", FieldValue::F64(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("i8", FieldValue::I8(v)) => output.push(*v as u8),
-        ("i16", FieldValue::I16(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("i32", FieldValue::I32(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("i64", FieldValue::I64(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("u8", FieldValue::U8(v)) => output.push(*v),
-        ("u16", FieldValue::U16(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("u32", FieldValue::U32(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("u64", FieldValue::U64(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("bool", FieldValue::Bool(v)) => output.push(u8::from(*v)),
-        ("usize", FieldValue::Usize(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        ("isize", FieldValue::Isize(v)) => output.extend_from_slice(&v.to_ne_bytes()),
-        _ => return false,
-    }
-    true
+    ScalarKind::from_tag(tag).is_some_and(|kind| kind.encode(value, output))
 }
 
 /// Decode one scalar from a byte buffer at `offset`, or `None` when the tag is
 /// not a scalar.
 fn decode_scalar(bytes: &[u8], offset: usize, tag: &str) -> Option<FieldValue> {
-    fn read<const N: usize>(bytes: &[u8], offset: usize) -> Option<[u8; N]> {
-        bytes.get(offset..offset + N)?.try_into().ok()
-    }
-    Some(match tag {
-        "f32" => FieldValue::F32(f32::from_ne_bytes(read::<4>(bytes, offset)?)),
-        "f64" => FieldValue::F64(f64::from_ne_bytes(read::<8>(bytes, offset)?)),
-        "i8" => FieldValue::I8(*bytes.get(offset)? as i8),
-        "i16" => FieldValue::I16(i16::from_ne_bytes(read::<2>(bytes, offset)?)),
-        "i32" => FieldValue::I32(i32::from_ne_bytes(read::<4>(bytes, offset)?)),
-        "i64" => FieldValue::I64(i64::from_ne_bytes(read::<8>(bytes, offset)?)),
-        "u8" => FieldValue::U8(*bytes.get(offset)?),
-        "u16" => FieldValue::U16(u16::from_ne_bytes(read::<2>(bytes, offset)?)),
-        "u32" => FieldValue::U32(u32::from_ne_bytes(read::<4>(bytes, offset)?)),
-        "u64" => FieldValue::U64(u64::from_ne_bytes(read::<8>(bytes, offset)?)),
-        "bool" => FieldValue::Bool(bytes.get(offset).copied()? != 0),
-        // Pointer-sized: 4 bytes on wasm32, 8 on 64-bit targets.
-        "usize" => FieldValue::Usize(usize::from_ne_bytes(read::<{ size_of::<usize>() }>(
-            bytes, offset,
-        )?)),
-        "isize" => FieldValue::Isize(isize::from_ne_bytes(read::<{ size_of::<isize>() }>(
-            bytes, offset,
-        )?)),
-        _ => return None,
-    })
+    ScalarKind::from_tag(tag)?.decode(bytes, offset)
 }
 
 /// The number of bytes one fixed-array element occupies, from the descriptor.
@@ -635,11 +765,139 @@ fn decode_tagged(bytes: &[u8], offset: usize, tag: &'static str, size: usize) ->
 // Row access
 // =============================================================================
 
+/// One field's location: the entity's row, its component and the descriptor.
+///
+/// What every single-field entry point needs before it can read or write, so
+/// the resolution rule and its error payloads live in
+/// [`World::resolve_field`] rather than in each entry point.
+struct ResolvedField {
+    /// The archetype holding the entity.
+    archetype_id: ArchetypeId,
+    /// The entity's row within that archetype.
+    row: usize,
+    /// The component carried by that entity.
+    component_id: ComponentId,
+    /// The requested field's descriptor.
+    descriptor: ComponentFieldDescriptor,
+}
+
 impl World {
     /// The archetype id and row of a live entity, for component access.
     fn entity_row_location(&self, entity: Entity) -> Option<(ArchetypeId, usize)> {
         let location = self.entity_locations.get(&entity)?;
         Some((location.archetype_id, location.index_in_archetype))
+    }
+
+    /// The registered field layout of a component, refusing an empty one.
+    ///
+    /// Borrowed rather than copied: the field entry points read one or every
+    /// descriptor out of it, and the inspector calls them once per row per
+    /// frame.
+    fn field_layout(
+        &self,
+        component_id: ComponentId,
+        component: &str,
+    ) -> Result<&[ComponentFieldDescriptor], ComponentFieldError> {
+        let layout = self.component_field_layout(component_id).ok_or(
+            ComponentFieldError::ComponentHasNoFieldLayout {
+                component: component.to_string(),
+            },
+        )?;
+        if layout.is_empty() {
+            return Err(ComponentFieldError::ComponentHasNoFieldLayout {
+                component: component.to_string(),
+            });
+        }
+        Ok(layout)
+    }
+
+    /// Locate one field of one component on one entity.
+    ///
+    /// The one place entity, component, layout and field are resolved, so a
+    /// new entry point cannot invent its own error path: every miss reports the
+    /// same variant with the same payload.
+    fn resolve_field(
+        &self,
+        entity: Entity,
+        component: &str,
+        field: &str,
+    ) -> Result<ResolvedField, ComponentFieldError> {
+        let (archetype_id, row) = self
+            .entity_row_location(entity)
+            .ok_or(ComponentFieldError::EntityNotFound)?;
+        let component_id = self.resolve_entity_component_id(entity, component).ok_or(
+            ComponentFieldError::ComponentNotFound {
+                component: component.to_string(),
+            },
+        )?;
+        let descriptor = self
+            .field_layout(component_id, component)?
+            .iter()
+            .find(|descriptor| descriptor.name == field)
+            .ok_or(ComponentFieldError::FieldNotFound {
+                component: component.to_string(),
+                field: field.to_string(),
+            })?;
+        Ok(ResolvedField {
+            archetype_id,
+            row,
+            component_id,
+            descriptor: descriptor.clone(),
+        })
+    }
+
+    /// One component column of one archetype, for a row that exists.
+    ///
+    /// `component_name` only feeds the error path: the caller resolved the
+    /// component through the entity, so a missing column or a row past its end
+    /// is a storage desync and reports the component the caller named.
+    fn row_column(
+        &self,
+        archetype_id: ArchetypeId,
+        row: usize,
+        component_id: ComponentId,
+        component_name: &str,
+    ) -> Result<&ComponentColumn, ComponentFieldError> {
+        let column = self
+            .archetypes
+            .get(&archetype_id)
+            .ok_or(ComponentFieldError::EntityNotFound)?
+            .component_storages
+            .get(component_id)
+            .ok_or(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            })?;
+        if row >= column.len() {
+            return Err(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            });
+        }
+        Ok(column)
+    }
+
+    /// [`Self::row_column`]'s mutable twin, for the write lanes.
+    fn row_column_mut(
+        &mut self,
+        archetype_id: ArchetypeId,
+        row: usize,
+        component_id: ComponentId,
+        component_name: &str,
+    ) -> Result<&mut ComponentColumn, ComponentFieldError> {
+        let column = self
+            .archetypes
+            .get_mut(&archetype_id)
+            .ok_or(ComponentFieldError::EntityNotFound)?
+            .component_storages
+            .get_mut(component_id)
+            .ok_or(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            })?;
+        if row >= column.len() {
+            return Err(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            });
+        }
+        Ok(column)
     }
 
     /// Copy one entity's component row for `component_id` into an owned buffer.
@@ -651,53 +909,29 @@ impl World {
         archetype_id: ArchetypeId,
         row: usize,
         component_id: ComponentId,
-    ) -> Option<Vec<u8>> {
-        let archetype = self.archetypes.get(&archetype_id)?;
-        match component_id {
-            _ if component_id.is_native_storage() => {
-                let column = archetype.component_storages.get(component_id)?;
-                if row >= column.len() {
-                    return None;
-                }
-                let element_size = column.elem_size();
-                let mut buffer = vec![0u8; element_size];
-                // SAFETY: the row is within the column (`row < len`) and the
-                // buffer is exactly one element long; nothing mutates the
-                // column while this shared borrow is alive.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        column.raw_ptr().add(row * element_size),
-                        buffer.as_mut_ptr(),
-                        element_size,
-                    );
-                }
-                Some(buffer)
-            }
-            _ => archetype
-                .component_storages
-                .get(component_id)?
-                .bytes(row)
-                .map(<[u8]>::to_vec),
+        component_name: &str,
+    ) -> Result<Vec<u8>, ComponentFieldError> {
+        let column = self.row_column(archetype_id, row, component_id, component_name)?;
+        if !component_id.is_native_storage() {
+            return column.bytes(row).map(<[u8]>::to_vec).ok_or(
+                ComponentFieldError::ComponentStorageMissing {
+                    component: component_name.to_string(),
+                },
+            );
         }
-    }
-
-    /// Resolve a component's field layout as an owned list of descriptors.
-    fn owned_field_layout(
-        &self,
-        component_id: ComponentId,
-        component: &str,
-    ) -> Result<Vec<ComponentFieldDescriptor>, ComponentFieldError> {
-        let layout = self.component_field_layout(component_id).ok_or(
-            ComponentFieldError::ComponentHasNoFieldLayout {
-                component: component.to_string(),
-            },
-        )?;
-        if layout.is_empty() {
-            return Err(ComponentFieldError::ComponentHasNoFieldLayout {
-                component: component.to_string(),
-            });
+        let element_size = column.elem_size();
+        let mut buffer = vec![0u8; element_size];
+        // SAFETY: the row is within the column (`row < len`, checked by the
+        // lookup) and the buffer is exactly one element long; nothing mutates
+        // the column while this shared borrow is alive.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                column.raw_ptr().add(row * element_size),
+                buffer.as_mut_ptr(),
+                element_size,
+            );
         }
-        Ok(layout.to_vec())
+        Ok(buffer)
     }
 }
 
@@ -718,38 +952,22 @@ impl World {
         component_name: &str,
         field_name: &str,
     ) -> Result<FieldValue, ComponentFieldError> {
-        // Step 1: Locate the entity and its component within its archetype.
-        let (archetype_id, row) = self
-            .entity_row_location(entity)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
-        let component_id = self
-            .resolve_entity_component_id(entity, component_name)
-            .ok_or(ComponentFieldError::ComponentNotFound {
-                component: component_name.to_string(),
-            })?;
-
-        // Step 2: Copy the layout and locate the requested field.
-        let layout = self.owned_field_layout(component_id, component_name)?;
-        let descriptor = layout
-            .iter()
-            .find(|descriptor| descriptor.name == field_name)
-            .ok_or(ComponentFieldError::FieldNotFound {
-                component: component_name.to_string(),
-                field: field_name.to_string(),
-            })?;
-
-        // Step 3: Copy the row and decode the single field. A copy that comes
-        // back empty after both lookups succeeded is a storage desync, not a
-        // dead handle, so it reports the component by name.
-        let row_bytes = self
-            .copy_component_row_bytes(archetype_id, row, component_id)
-            .ok_or(ComponentFieldError::ComponentStorageMissing {
-                component: component_name.to_string(),
-            })?;
-        Ok(self.with_asset_type(
+        let ResolvedField {
+            archetype_id,
+            row,
             component_id,
             descriptor,
-            decode_field(&row_bytes, descriptor),
+        } = self.resolve_field(entity, component_name, field_name)?;
+
+        // Copy the row and decode the single field. A copy that comes back
+        // missing after both lookups succeeded is a storage desync, not a dead
+        // handle, so it reports the component by name.
+        let row_bytes =
+            self.copy_component_row_bytes(archetype_id, row, component_id, component_name)?;
+        Ok(self.with_asset_type(
+            component_id,
+            &descriptor,
+            decode_field(&row_bytes, &descriptor),
         ))
     }
 
@@ -762,7 +980,8 @@ impl World {
         entity: Entity,
         component_name: &str,
     ) -> Result<Vec<FieldValue>, ComponentFieldError> {
-        // Step 1: Locate the entity and its component within its archetype.
+        // The entity and component half of `resolve_field`; this one reads every
+        // descriptor, so it keeps the borrowed layout instead of one clone.
         let (archetype_id, row) = self
             .entity_row_location(entity)
             .ok_or(ComponentFieldError::EntityNotFound)?;
@@ -772,15 +991,12 @@ impl World {
                 component: component_name.to_string(),
             })?;
 
-        // Step 2: Copy the layout and the whole row once.
-        let layout = self.owned_field_layout(component_id, component_name)?;
-        let row_bytes = self
-            .copy_component_row_bytes(archetype_id, row, component_id)
-            .ok_or(ComponentFieldError::ComponentStorageMissing {
-                component: component_name.to_string(),
-            })?;
+        // Copy the layout and the whole row once.
+        let layout = self.field_layout(component_id, component_name)?;
+        let row_bytes =
+            self.copy_component_row_bytes(archetype_id, row, component_id, component_name)?;
 
-        // Step 3: Decode every field from the one row image.
+        // Decode every field from the one row image.
         Ok(layout
             .iter()
             .map(|descriptor| {
@@ -1028,31 +1244,21 @@ impl World {
     /// An ambiguous suffix resolves to `None` - an opaque field is readable, a
     /// wrong one is not.
     fn resolve_nested_layout(&self, path: &str) -> Option<Vec<ComponentFieldDescriptor>> {
-        let suffix = format!("::{path}");
-
-        // Registered components, exact match then unique suffix match.
-        let mut component_hit = None;
-        let mut component_suffix_matches = 0usize;
-        for (component_id, layout) in &self.component_field_layouts {
-            let Some(name) = self.component_registry.get_name(component_id) else {
-                continue;
-            };
-            if name == path {
-                return Some(layout.fields().to_vec());
-            }
-            if name.ends_with(&suffix) {
-                component_suffix_matches += 1;
-                if component_suffix_matches == 1 {
-                    component_hit = Some(layout.fields().to_vec());
+        // Registered components, through the rule both candidate sources share.
+        let component_names = self
+            .component_field_layouts
+            .keys()
+            .filter_map(|component_id| self.component_registry.get_name(component_id));
+        if let Some(name) = crate::component_registry::resolve_unique_name(path, component_names) {
+            for (component_id, layout) in &self.component_field_layouts {
+                if self.component_registry.get_name(component_id) == Some(name) {
+                    return Some(layout.fields().to_vec());
                 }
             }
         }
-        if component_suffix_matches == 1 {
-            return component_hit;
-        }
 
         // The registering DLL's value types, through the resolver it installed;
-        // it applies the same exact-then-unique-suffix rule.
+        // it applies the same rule.
         let resolver = self.value_type_layout_resolver?;
         resolver(path).map(<[ComponentFieldDescriptor]>::to_vec)
     }
@@ -1177,9 +1383,10 @@ fn encode_field_write(
             found: value.variant_tag(),
         });
     }
-    // A handle field takes an asset value: its index and generation, in the
-    // handle's `repr(C)` order. The asset type is checked by the caller,
-    // which knows the field's record (`World::write_component_field`).
+    // A handle field takes an asset value: its index and generation, encoded
+    // like every other `u32` in a row (see the module's row byte convention).
+    // The asset type is checked by the caller, which knows the field's record
+    // (`World::write_component_field`).
     if let FieldValue::Asset {
         index, generation, ..
     } = value
@@ -1192,8 +1399,8 @@ fn encode_field_write(
             });
         }
         let mut bytes = Vec::with_capacity(HANDLE_SIZE);
-        bytes.extend_from_slice(&index.to_le_bytes());
-        bytes.extend_from_slice(&generation.to_le_bytes());
+        encode_scalar("u32", &FieldValue::U32(*index), &mut bytes);
+        encode_scalar("u32", &FieldValue::U32(*generation), &mut bytes);
         return Ok(FieldWrite {
             row_offset: descriptor.offset,
             bytes,
@@ -1311,31 +1518,19 @@ impl World {
         field_name: &str,
         value: FieldValue,
     ) -> Result<(), ComponentFieldError> {
-        // Step 1: Resolve, copy the layout, and find the field.
-        let (archetype_id, row) = self
-            .entity_row_location(entity)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
-        let component_id = self
-            .resolve_entity_component_id(entity, component_name)
-            .ok_or(ComponentFieldError::ComponentNotFound {
-                component: component_name.to_string(),
-            })?;
-        let layout = self.owned_field_layout(component_id, component_name)?;
-        let descriptor = layout
-            .iter()
-            .find(|descriptor| descriptor.name == field_name)
-            .ok_or(ComponentFieldError::FieldNotFound {
-                component: component_name.to_string(),
-                field: field_name.to_string(),
-            })?;
-
-        // Step 2: Validate and encode the payload BEFORE touching any column,
-        // so a refused edit leaves the world untouched.
+        // Resolve, then validate and encode the payload BEFORE touching any
+        // column, so a refused edit leaves the world untouched.
+        let ResolvedField {
+            archetype_id,
+            row,
+            component_id,
+            descriptor,
+        } = self.resolve_field(entity, component_name, field_name)?;
         self.check_asset_type(component_id, field_name, &value)?;
-        let write = encode_field_write(descriptor, field_name, &value)?;
+        let write = encode_field_write(&descriptor, field_name, &value)?;
 
-        // Step 3: Write the payload and stamp the row's changed tick, each in
-        // its own archetype borrow so column and tick lookups never overlap.
+        // Write the payload and stamp the row's changed tick, each in its own
+        // archetype borrow so column and tick lookups never overlap.
         //
         // The world tick is bumped first so the stamped `changed` value is
         // strictly newer than every system's `last_run` baseline. Edits are
@@ -1383,7 +1578,7 @@ impl World {
             .ok_or(ComponentFieldError::ComponentNotFound {
                 component: component_name.to_string(),
             })?;
-        let layout = self.owned_field_layout(component_id, component_name)?;
+        let layout = self.field_layout(component_id, component_name)?;
         let (size, _) = self.component_layout(component_id).ok_or(
             ComponentFieldError::ComponentHasNoFieldLayout {
                 component: component_name.to_string(),
@@ -1420,25 +1615,14 @@ impl World {
         index: usize,
         value: FieldValue,
     ) -> Result<(), ComponentFieldError> {
-        // Step 1: Resolve, copy the layout, and find the field.
-        let (archetype_id, row) = self
-            .entity_row_location(entity)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
-        let component_id = self
-            .resolve_entity_component_id(entity, component_name)
-            .ok_or(ComponentFieldError::ComponentNotFound {
-                component: component_name.to_string(),
-            })?;
-        let layout = self.owned_field_layout(component_id, component_name)?;
-        let descriptor = layout
-            .iter()
-            .find(|descriptor| descriptor.name == field_name)
-            .ok_or(ComponentFieldError::FieldNotFound {
-                component: component_name.to_string(),
-                field: field_name.to_string(),
-            })?;
+        let ResolvedField {
+            archetype_id,
+            row,
+            component_id,
+            descriptor,
+        } = self.resolve_field(entity, component_name, field_name)?;
 
-        // Step 2: The field must be a fixed array of scalar primitives.
+        // The field must be a fixed array of scalar primitives.
         let Some(inner_tag) = descriptor.type_tag.strip_prefix("array:") else {
             return Err(ComponentFieldError::TypeMismatch {
                 field: field_name.to_string(),
@@ -1472,9 +1656,9 @@ impl World {
             });
         }
 
-        // Step 3: Write the element and stamp the row's changed tick. The tick
-        // is bumped first for the same reason the whole-field write bumps it:
-        // a between-frame edit must be visible to `Changed<T>` filters.
+        // Write the element and stamp the row's changed tick. The tick is
+        // bumped first for the same reason the whole-field write bumps it: a
+        // between-frame edit must be visible to `Changed<T>` filters.
         let row_offset = descriptor.offset + index * element_size;
         let current_tick = self.increment_change_tick();
         self.apply_row_write(
@@ -1510,30 +1694,13 @@ impl World {
     ) -> Result<(), ComponentFieldError> {
         match component_id {
             _ if component_id.is_native_storage() => {
-                let archetype = self
-                    .archetypes
-                    .get_mut(&archetype_id)
-                    .ok_or(ComponentFieldError::EntityNotFound)?;
-                let element_size;
-                let destination;
-                {
-                    let column = archetype.component_storages.get_mut(component_id).ok_or(
-                        ComponentFieldError::ComponentStorageMissing {
-                            component: component_name.to_string(),
-                        },
-                    )?;
-                    if row >= column.len() {
-                        return Err(ComponentFieldError::ComponentStorageMissing {
-                            component: component_name.to_string(),
-                        });
-                    }
-                    element_size = column.elem_size();
-                    // SAFETY: `row < column.len()` was checked above, so the
-                    // pointer stays inside the column's allocation, and the
-                    // column borrow keeps that allocation alive through this
-                    // statement.
-                    destination = unsafe { column.as_mut_ptr().add(row * element_size) };
-                }
+                let column =
+                    self.row_column_mut(archetype_id, row, component_id, component_name)?;
+                let element_size = column.elem_size();
+                // SAFETY: the lookup checked `row < column.len()`, so the
+                // pointer stays inside the column's allocation, and the column
+                // borrow keeps that allocation alive through this statement.
+                let destination = unsafe { column.as_mut_ptr().add(row * element_size) };
                 // Checked arithmetic on the way to the write: a wrapping sum
                 // would pass a caller-supplied offset near `usize::MAX` and
                 // let the copy below run off the row.
@@ -1559,31 +1726,14 @@ impl World {
                 Ok(())
             }
             _ => {
-                let archetype = self
-                    .archetypes
-                    .get_mut(&archetype_id)
-                    .ok_or(ComponentFieldError::EntityNotFound)?;
-                let element_size;
-                let mut row_bytes;
-                {
-                    let column = archetype.component_storages.get_mut(component_id).ok_or(
-                        ComponentFieldError::ComponentStorageMissing {
-                            component: component_name.to_string(),
-                        },
-                    )?;
-                    element_size = column.element_size();
-                    if row >= column.len() {
-                        return Err(ComponentFieldError::ComponentStorageMissing {
-                            component: component_name.to_string(),
-                        });
-                    }
-                    row_bytes = column
-                        .bytes(row)
-                        .ok_or(ComponentFieldError::ComponentStorageMissing {
-                            component: component_name.to_string(),
-                        })?
-                        .to_vec();
-                }
+                let mut row_bytes = self
+                    .row_column_mut(archetype_id, row, component_id, component_name)?
+                    .bytes(row)
+                    .ok_or(ComponentFieldError::ComponentStorageMissing {
+                        component: component_name.to_string(),
+                    })?
+                    .to_vec();
+                let element_size = row_bytes.len();
                 // The same checked arithmetic as the native branch: the row
                 // slice below would otherwise be ranged with a wrapped sum.
                 let Some(end) = row_offset
@@ -1602,20 +1752,11 @@ impl World {
                     },
                 )?;
                 target.copy_from_slice(bytes);
-                let archetype = self
-                    .archetypes
-                    .get_mut(&archetype_id)
-                    .ok_or(ComponentFieldError::EntityNotFound)?;
-                let column = archetype.component_storages.get_mut(component_id).ok_or(
-                    ComponentFieldError::ComponentStorageMissing {
+                self.row_column_mut(archetype_id, row, component_id, component_name)?
+                    .set_bytes(row, &row_bytes)
+                    .map_err(|_| ComponentFieldError::ComponentStorageMissing {
                         component: component_name.to_string(),
-                    },
-                )?;
-                column.set_bytes(row, &row_bytes).map_err(|_| {
-                    ComponentFieldError::ComponentStorageMissing {
-                        component: component_name.to_string(),
-                    }
-                })
+                    })
             }
         }
     }
@@ -1629,14 +1770,9 @@ impl World {
         component_name: &str,
         tick: Tick,
     ) -> Result<(), ComponentFieldError> {
-        let archetype = self
-            .archetypes
-            .get_mut(&archetype_id)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
-        let row_ticks = archetype
-            .component_storages
-            .get_mut(component_id)
-            .and_then(|column| column.row_ticks_mut(row))
+        let row_ticks = self
+            .row_column_mut(archetype_id, row, component_id, component_name)?
+            .row_ticks_mut(row)
             .ok_or(ComponentFieldError::ComponentStorageMissing {
                 component: component_name.to_string(),
             })?;
@@ -2079,7 +2215,9 @@ mod tests {
             panic!("a struct-tagged field must read as opaque, got {captured:?}");
         };
         assert_eq!(type_tag, "struct:NoSuchTypeExists");
-        assert_eq!(bytes, 0xAAAA_BBBBu32.to_le_bytes());
+        // The captured bytes are the row's own, so they carry the module's
+        // native-endian convention rather than a fixed byte order.
+        assert_eq!(bytes, 0xAAAA_BBBBu32.to_ne_bytes());
 
         // A field write of the captured payload lands the same bytes back.
         world
@@ -2094,7 +2232,7 @@ mod tests {
         let image = world
             .build_component_image(&name, &[("mystery".to_string(), captured.clone())])
             .expect("the captured image builds");
-        assert_eq!(image, 0xAAAA_BBBBu32.to_le_bytes());
+        assert_eq!(image, 0xAAAA_BBBBu32.to_ne_bytes());
 
         // A payload whose size or tag does not pin to the field is refused.
         let short = FieldValue::Opaque {
@@ -2249,6 +2387,49 @@ mod tests {
         );
     }
 
+    /// The tag table, both codecs and the diagnostic names all agree.
+    ///
+    /// They used to be hand-copied matches, so a scalar could be sized but not
+    /// decoded - or decoded but reported by a name nothing else knew. A tag is
+    /// a vocabulary entry only if every one of them accepts it.
+    #[test]
+    fn every_scalar_tag_sizes_encodes_decodes_and_names_itself() {
+        let values = [
+            FieldValue::F32(1.5),
+            FieldValue::F64(-2.25),
+            FieldValue::I8(-3),
+            FieldValue::I16(-300),
+            FieldValue::I32(-70_000),
+            FieldValue::I64(-5_000_000_000),
+            FieldValue::U8(7),
+            FieldValue::U16(600),
+            FieldValue::U32(70_000),
+            FieldValue::U64(5_000_000_000),
+            FieldValue::Bool(true),
+            FieldValue::Usize(12),
+            FieldValue::Isize(-12),
+        ];
+        for value in values {
+            let tag = value.variant_tag();
+            let size = scalar_size(tag).unwrap_or_else(|| panic!("`{tag}` is a scalar tag"));
+            assert!(is_scalar_tag(tag), "`{tag}` is a scalar tag");
+
+            let mut bytes = Vec::new();
+            assert!(encode_scalar(tag, &value, &mut bytes), "`{tag}` encodes");
+            assert_eq!(bytes.len(), size, "`{tag}` encodes to its declared size");
+
+            let decoded = decode_scalar(&bytes, 0, tag).expect("the encoded value decodes");
+            assert_eq!(decoded, value, "`{tag}` survives its own round trip");
+        }
+
+        // A tag nothing claims stays outside the vocabulary rather than
+        // half-known.
+        assert_eq!(scalar_size("u128"), None);
+        assert!(!is_scalar_tag("u128"));
+        assert!(!encode_scalar("u128", &FieldValue::U8(1), &mut Vec::new()));
+        assert_eq!(decode_scalar(&[0_u8; 16], 0, "u128"), None);
+    }
+
     #[test]
     fn round_trip_every_scalar_field() {
         let mut world = test_world();
@@ -2394,6 +2575,63 @@ mod tests {
                 component: name.to_string(),
                 field: "missing_field".to_string(),
             })
+        );
+    }
+
+    /// Every single-field entry point misses the same way.
+    ///
+    /// They share one resolver, so a read and an array-element write have to
+    /// report a dead entity, a missing component and a missing field with the
+    /// same variant and payload; a new entry point that grows its own preamble
+    /// fails here.
+    #[test]
+    fn every_entry_point_reports_the_same_misses() {
+        let mut world = test_world();
+        let entity = world
+            .create_entity()
+            .with(sample_value())
+            .build()
+            .expect("entity builds");
+        let name = "pill_engine::component_field::tests::SampleComponent";
+
+        // One probe per entry point, for each kind of miss.
+        for (component, field) in [("missing::Type", "a_float"), (name, "missing_field")] {
+            let read = world.read_component_field(entity, component, field).err();
+            let write = world
+                .write_component_field(entity, component, field, FieldValue::F32(0.0))
+                .err();
+            let element = world
+                .write_component_array_element(entity, component, field, 0, FieldValue::I16(0))
+                .err();
+            assert_eq!(read, write, "read and write agree on `{field}`");
+            assert_eq!(write, element, "the array write agrees on `{field}`");
+        }
+        assert_eq!(
+            world.read_component_field(entity, "missing::Type", "a_float"),
+            Err(ComponentFieldError::ComponentNotFound {
+                component: "missing::Type".to_string(),
+            })
+        );
+        assert_eq!(
+            world.read_component_field(entity, name, "missing_field"),
+            Err(ComponentFieldError::FieldNotFound {
+                component: name.to_string(),
+                field: "missing_field".to_string(),
+            })
+        );
+
+        let _ = world.destroy_entity(entity);
+        assert_eq!(
+            world.read_component_field(entity, name, "a_float"),
+            Err(ComponentFieldError::EntityNotFound)
+        );
+        assert_eq!(
+            world.write_component_field(entity, name, "a_float", FieldValue::F32(0.0)),
+            Err(ComponentFieldError::EntityNotFound)
+        );
+        assert_eq!(
+            world.write_component_array_element(entity, name, "an_array", 0, FieldValue::I16(0)),
+            Err(ComponentFieldError::EntityNotFound)
         );
     }
 

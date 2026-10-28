@@ -4,7 +4,7 @@
 //!
 //! - Provide short, engine-facing aliases for `glam` vectors, matrices, and
 //!   colors.
-//! - Define the `Direction` vocabulary used by transform and input code.
+//! - Define the `Direction` vocabulary reserved for transform and input code.
 //!
 //! # Design
 //!
@@ -32,9 +32,11 @@ pub type Vector4f = Vec4;
 /// RGB color stored as a 3D float vector.
 pub type Color = Vec3;
 
-/// 3x3 float matrix.
+/// 3x3 float matrix: three `Vec3` columns, indexed `matrix[column][row]`.
 pub type Matrix3f = Mat3;
-/// 3x3 float matrix (column-major variant).
+/// 3x3 float matrix whose columns are `Vec3A`: the same maths as
+/// [`Matrix3f`], 16-byte aligned and 48 bytes wide, so its layout is not
+/// interchangeable with `Matrix3f`'s.
 pub type Matrix3fA = Mat3A;
 
 /// 4x4 float matrix.
@@ -46,9 +48,9 @@ pub type Matrix4f = Mat4;
 
 /// Axis-aligned direction vocabulary.
 ///
-/// Names a cardinal axis in either the local or world frame. Used by transform
-/// and input code so callers can express movement and facing without depending
-/// on `glam`'s vector constants.
+/// Names a cardinal axis in either the local or world frame, so a caller can
+/// express movement and facing without depending on `glam`'s vector constants.
+/// No code in the workspace uses it yet: it is reserved vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Local forward.

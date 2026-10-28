@@ -44,11 +44,20 @@ impl Instant {
     }
 
     /// The time from `earlier` to this instant, zero if `earlier` is later.
+    ///
+    /// Saturating, like [`std::time::Instant::duration_since`] on current
+    /// Rust: it never panics on a reversed pair. [`saturating_duration_since`]
+    /// is the same operation under its standard name; prefer this one in new
+    /// code.
+    ///
+    /// [`saturating_duration_since`]: Instant::saturating_duration_since
     pub fn duration_since(&self, earlier: Instant) -> Duration {
         self.0.saturating_duration_since(earlier.0)
     }
 
     /// The time from `earlier` to this instant, zero if `earlier` is later.
+    ///
+    /// The standard spelling of [`duration_since`](Instant::duration_since).
     pub fn saturating_duration_since(&self, earlier: Instant) -> Duration {
         self.0.saturating_duration_since(earlier.0)
     }

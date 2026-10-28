@@ -734,8 +734,9 @@ pub(crate) struct MirroredFunction<'a> {
     /// The descriptor's `type_name`: the owner's qualified name, or the
     /// declaring module's path for a free function.
     pub(crate) type_name: TokenStream2,
-    /// The descriptor's `owner_kind`; empty when the attribute cannot know it.
-    pub(crate) owner_kind: &'static str,
+    /// The descriptor's `owner_kind`, as a path to the facade constant that
+    /// names it; the unknown kind when the attribute cannot know it.
+    pub(crate) owner_kind: TokenStream2,
 }
 
 /// Build the trampoline and descriptor submission for one function.
@@ -973,7 +974,7 @@ pub(crate) fn mirror_impl(impl_block: syn::ItemImpl) -> syn::Result<TokenStream2
             signature: &method.sig,
             owner: Some(owner.clone()),
             type_name: type_name.clone(),
-            owner_kind: "",
+            owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_UNKNOWN },
         })?);
     }
     Ok(quote! {
@@ -993,7 +994,7 @@ pub(crate) fn mirror_fn(item: syn::ItemFn) -> syn::Result<TokenStream2> {
         signature: &item.sig,
         owner: None,
         type_name: quote! { ::core::module_path!() },
-        owner_kind: "module",
+        owner_kind: quote! { ::pill_engine::component_registry::OWNER_KIND_MODULE },
     })?;
     Ok(quote! {
         #item
@@ -1010,10 +1011,11 @@ pub(crate) fn mirror_fn(item: syn::ItemFn) -> syn::Result<TokenStream2> {
 struct TypeRow<'a> {
     /// The type's identifier.
     ident: &'a syn::Ident,
-    /// The row's name.
-    name: &'a str,
-    /// The owner kind it declares.
-    kind: &'a str,
+    /// The row's name, as the expression the emitted descriptor carries.
+    name: proc_macro2::TokenStream,
+    /// The owner kind it declares, as a path to the facade constant that names
+    /// it - the same constant the host matches against.
+    kind: proc_macro2::TokenStream,
     /// `return_tag`.
     return_tag: String,
     /// `arg_tags`.
@@ -1191,8 +1193,8 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
     }
     let mut rows = vec![type_row(TypeRow {
         ident,
-        name: "__type",
-        kind: "object",
+        name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
+        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
         return_tag: String::new(),
         arg_tags: Vec::new(),
         arg_names: flag_names,
@@ -1234,8 +1236,8 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
         });
         rows.push(type_row(TypeRow {
             ident,
-            name: &row_name,
-            kind: "object",
+            name: quote! { #row_name },
+            kind: quote! { ::pill_engine::component_registry::OWNER_KIND_OBJECT },
             return_tag: String::new(),
             arg_tags: Vec::new(),
             arg_names: Vec::new(),
@@ -1345,8 +1347,8 @@ pub(crate) fn mirror_resource(
     };
     let row = type_row(TypeRow {
         ident,
-        name: "__type",
-        kind: "resource",
+        name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
+        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_RESOURCE },
         return_tag: String::new(),
         arg_tags: Vec::new(),
         arg_names: vec![name.value()],
@@ -1487,8 +1489,8 @@ pub(crate) fn mirror_enum(
     };
     let row = type_row(TypeRow {
         ident,
-        name: "__type",
-        kind: "enum",
+        name: quote! { ::pill_engine::component_registry::MIRROR_TYPE_ROW },
+        kind: quote! { ::pill_engine::component_registry::OWNER_KIND_ENUM },
         return_tag: representation.clone(),
         arg_tags: values.iter().map(ToString::to_string).collect(),
         arg_names: names.iter().map(ToString::to_string).collect(),

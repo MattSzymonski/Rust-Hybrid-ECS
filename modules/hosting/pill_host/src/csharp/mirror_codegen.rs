@@ -121,9 +121,9 @@ impl MirrorScope {
             .filter(|method| method.method_name == MIRROR_TYPE_ROW)
         {
             let kind = match row.owner_kind.as_str() {
-                "object" => MirrorKind::Object,
-                "enum" => MirrorKind::Enum,
-                "resource" => MirrorKind::Resource,
+                pill_engine::component_registry::OWNER_KIND_OBJECT => MirrorKind::Object,
+                pill_engine::component_registry::OWNER_KIND_ENUM => MirrorKind::Enum,
+                pill_engine::component_registry::OWNER_KIND_RESOURCE => MirrorKind::Resource,
                 other => {
                     return Err(format!(
                         "type row of `{}` has unknown kind `{other}`",
