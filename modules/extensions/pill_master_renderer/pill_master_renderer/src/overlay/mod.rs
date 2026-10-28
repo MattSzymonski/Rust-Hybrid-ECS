@@ -1065,7 +1065,8 @@ type ClipVertex = ([f32; 4], [f32; 3]);
 /// line's centre, so the fragment shader can fade the edge. Widening happens
 /// in screen space after projection, which keeps a line the same width at any
 /// depth. `gizmos` is the editor-view switch: the project's own debug lines
-/// always draw, the gizmo handles only on an editor view.
+/// always draw, the editor's chrome - its drag guides and its gizmo handles -
+/// only on an editor view.
 fn line_vertices(
     debug: &DebugFrame,
     view_projection: &pill_core::math::Matrix4f,
@@ -1089,6 +1090,9 @@ fn line_vertices(
     let mut tested = Vec::new();
     let mut on_top = Vec::new();
     for line in &debug.lines {
+        if line.chrome && !gizmos {
+            continue;
+        }
         if line.depth_test {
             push_line(&mut tested, line.start, line.end, line.color);
         } else {
@@ -1488,7 +1492,9 @@ mod tests {
     }
 
     /// A surface that is not an editor view draws the project's own debug
-    /// lines and no editor chrome: no gizmo lines, no gizmo triangles.
+    /// lines and no editor chrome: no gizmo lines, no gizmo triangles, and none
+    /// of the editor's chrome lines - the drag guides it draws as plain debug
+    /// lines but marks as its own.
     #[test]
     fn a_game_surface_draws_its_debug_lines_without_the_editor_chrome() {
         let mut draw = pill_engine::DebugDraw::new(true);
@@ -1496,6 +1502,15 @@ mod tests {
             [-1.0, 0.0, -5.0],
             [1.0, 0.0, -5.0],
             pill_engine::DebugStyle::default(),
+        );
+        draw.line(
+            [-1.0, 1.0, -5.0],
+            [1.0, 1.0, -5.0],
+            pill_engine::DebugStyle {
+                chrome: true,
+                depth_test: false,
+                ..pill_engine::DebugStyle::default()
+            },
         );
         draw.gizmo_line([-1.0, 0.0, -5.0], [1.0, 0.0, -5.0], [1.0, 4.0, 1.0, 1.0], 5);
         draw.gizmo_triangle(
@@ -1509,13 +1524,18 @@ mod tests {
         assert_eq!(
             tested.len() + on_top.len(),
             6,
-            "the project's own line stays"
+            "the project's own line stays, and the editor's guide does not"
         );
         assert!(triangle_vertices(&frame, &projection, (100.0, 100.0), false).is_empty());
         // The same frame on an editor view draws the chrome as well.
         let (editor_tested, editor_on_top) =
             line_vertices(&frame, &projection, (100.0, 100.0), true);
-        assert_eq!(editor_tested.len() + editor_on_top.len(), 12);
+        assert_eq!(
+            editor_tested.len() + editor_on_top.len(),
+            18,
+            "the guide joins the gizmo line on an editor view"
+        );
+        assert_eq!(editor_on_top.len(), 12, "the guide is drawn on top");
         assert_eq!(
             triangle_vertices(&frame, &projection, (100.0, 100.0), true).len(),
             3

@@ -9453,9 +9453,11 @@ fn gizmo_plane_name(first: usize, second: usize) -> &'static str {
 /// press's pivot to the current one.
 ///
 /// They are plain debug lines, not gizmo geometry: no handle id, so a pick
-/// never names them and they cannot be grabbed. The axis guide uses the
-/// handle's own colour; the displacement line is neutral so it never reads
-/// as a fourth axis.
+/// never names them and they cannot be grabbed. They are marked as the
+/// editor's chrome, which is what keeps them off a game surface - the game
+/// viewport shows the project's frame, not the editor's drag. The axis guide
+/// uses the handle's own colour; the displacement line is neutral so it never
+/// reads as a fourth axis.
 fn draw_gizmo_guides(
     debug: &mut DebugDraw,
     kind: HandleKind,
@@ -9467,6 +9469,7 @@ fn draw_gizmo_guides(
     let style = |color: [f32; 4]| DebugStyle {
         color,
         depth_test: false,
+        chrome: true,
         ..DebugStyle::default()
     };
     if let Some((_, axis)) = kind.axis() {
