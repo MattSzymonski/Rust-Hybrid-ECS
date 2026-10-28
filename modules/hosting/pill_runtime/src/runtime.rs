@@ -287,8 +287,9 @@ impl Runtime {
         self.frame_count += 1;
         let elapsed = self.last_report.elapsed().as_secs_f64();
         if elapsed < FRAME_REPORT_INTERVAL_SECONDS {
-            // Repeated numerical state is recorded every frame through metrics,
-            // independent of the low-frequency console report.
+            // The same numbers flow through the shared `metrics` recorder, which
+            // forwards them to Tracy when a profiler is attached; the recorder
+            // keeps no copy, so the console report stays the printed record.
             #[cfg(feature = "metrics")]
             record_frame_metrics(
                 self.engine.world().entity_count(),

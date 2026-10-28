@@ -57,8 +57,13 @@ pub trait QueryFilter {
     /// Default: `false` - most filters do actual work.
     const ACCEPTS_ALL: bool = false;
 
-    /// Components that filtered archetypes MUST contain.
-    /// Folded into the query mask so non-matching archetypes are skipped.
+    /// Components whose storage this filter inspects.
+    ///
+    /// Two consumers read this list: the default `archetype_filter_pairs`
+    /// turns it into one must-contain / must-not-contain pair, and the
+    /// scheduler's access report unions it (which is what `Or` overrides for).
+    /// The query's archetype mask is built from `archetype_filter_pairs`, not
+    /// from this method.
     fn included_component_ids() -> Vec<ComponentId> {
         Vec::new()
     }
@@ -99,7 +104,12 @@ pub trait QueryFilter {
     }
 
     /// Initialize per-archetype state for row-level filtering.
-    fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State;
+    ///
+    /// Takes the archetype by shared reference because that is all a filter
+    /// needs: every implementation only reads a column's ticks. The shared
+    /// borrow is also what lets a tuple or [`Or`] initialize its members in a
+    /// single expression.
+    fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State;
 
     /// Decide whether the row at `index` in this archetype passes the filter.
     fn matches(state: &Self::State, index: usize) -> bool;
@@ -114,7 +124,7 @@ impl QueryFilter for () {
     type State = ();
     const ACCEPTS_ALL: bool = true;
 
-    fn init_state(_archetype: &mut Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
+    fn init_state(_archetype: &Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
 
     #[inline(always)]
     fn matches(_state: &Self::State, _index: usize) -> bool {
@@ -140,7 +150,7 @@ impl<T: Component> QueryFilter for With<T> {
         vec![ComponentId::of::<T>()]
     }
 
-    fn init_state(_archetype: &mut Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
+    fn init_state(_archetype: &Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
 
     #[inline(always)]
     fn matches(_state: &Self::State, _index: usize) -> bool {
@@ -161,7 +171,7 @@ impl<T: Component> QueryFilter for Without<T> {
         vec![ComponentId::of::<T>()]
     }
 
-    fn init_state(_archetype: &mut Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
+    fn init_state(_archetype: &Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
 
     #[inline(always)]
     fn matches(_state: &Self::State, _index: usize) -> bool {
@@ -261,7 +271,7 @@ impl<T: Component> QueryFilter for Changed<T> {
         vec![ComponentId::of::<T>()]
     }
 
-    fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
+    fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State {
         match archetype.component_storages.get(ComponentId::of::<T>()) {
             Some(column) => TickFilterState::new(column.ticks(), last_run, this_run),
             // Component not in this archetype - possible when Changed<T>
@@ -303,7 +313,7 @@ impl<T: Component> QueryFilter for Added<T> {
         vec![ComponentId::of::<T>()]
     }
 
-    fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
+    fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State {
         match archetype.component_storages.get(ComponentId::of::<T>()) {
             Some(column) => TickFilterState::new(column.ticks(), last_run, this_run),
             None => TickFilterState::missing(),
@@ -358,17 +368,8 @@ macro_rules! impl_query_filter_tuple {
             }
 
             #[allow(non_snake_case)]
-            fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-                let archetype_ptr = archetype as *mut Archetype;
-                // SAFETY: `archetype_ptr` derives from the live `&mut
-                // Archetype` parameter, so it stays valid for this call. Each
-                // tuple element's `&mut *archetype_ptr` is a temporary that is
-                // dropped as soon as that element's call returns, so the
-                // borrows are sequential and never simultaneously alive. Every
-                // filter `init_state` implementation only reads archetype
-                // metadata (e.g. a column's change ticks), never mutating
-                // it, so no aliasing or mutation violation can occur.
-                unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
+            fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State {
+                ($($T::init_state(archetype, last_run, this_run),)*)
             }
 
             #[allow(non_snake_case)]
@@ -406,6 +407,10 @@ macro_rules! impl_query_filter_or {
         impl<$($T: QueryFilter),*> QueryFilter for Or<($($T,)*)> {
             type State = ($($T::State,)*);
 
+            // The union is the scheduler's access report: every branch's
+            // storage is read while `matches` runs. Archetype scoping does not
+            // use it - `archetype_filter_pairs` accepts an archetype that
+            // matches any one branch.
             fn included_component_ids() -> Vec<ComponentId> {
                 let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
                 $(ids.extend($T::included_component_ids());)*
@@ -439,17 +444,8 @@ macro_rules! impl_query_filter_or {
             }
 
             #[allow(non_snake_case)]
-            fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-                let archetype_ptr = archetype as *mut Archetype;
-                // SAFETY: `archetype_ptr` derives from the live `&mut
-                // Archetype` parameter, so it stays valid for this call. Each
-                // tuple element's `&mut *archetype_ptr` is a temporary that is
-                // dropped as soon as that element's call returns, so the
-                // borrows are sequential and never simultaneously alive. Every
-                // filter `init_state` implementation only reads archetype
-                // metadata (e.g. a column's change ticks), never mutating
-                // it, so no aliasing or mutation violation can occur.
-                unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
+            fn init_state(archetype: &Archetype, last_run: Tick, this_run: Tick) -> Self::State {
+                ($($T::init_state(archetype, last_run, this_run),)*)
             }
 
             #[allow(non_snake_case)]

@@ -49,7 +49,9 @@ use trait_type_map::TraitAccessible;
 
 // Current crate
 use crate::asset::{Asset, AssetGuid, AssetLoader, AssetManager, Handle};
-use crate::asset_metadata::{AssetImport, ImportedAsset, MetadataPolicy, MetadataSource};
+use crate::asset_metadata::{
+    AssetImport, ImportOutcome, ImportedAsset, MetadataPolicy, MetadataSource,
+};
 use crate::asset_standalone::StandaloneAsset;
 
 // =============================================================================
@@ -71,6 +73,12 @@ pub const OPTION_ARGUMENT_FLAG_OFFSET: usize = 15;
 /// Offset of an `option:` return's value inside the return buffer; the
 /// presence byte is at offset 0.
 pub const OPTION_RETURN_VALUE_OFFSET: usize = 16;
+
+/// Offset of an `assets.import` return's "already loaded" byte.
+pub const IMPORT_ALREADY_LOADED_OFFSET: usize = 8;
+
+/// Offset of an `assets.import` return's metadata-source byte.
+pub const IMPORT_METADATA_SOURCE_OFFSET: usize = 9;
 
 /// What a failed mirrored call reports.
 pub type MirrorResult<T> = Result<T, String>;
@@ -773,10 +781,12 @@ pub mod assets {
     /// slot 2 the policy (`0` read if present, `1` create if missing), slot 3
     /// the initial settings as JSON (empty for the type's defaults).
     ///
-    /// Writes the handle at 0, whether the path was already loaded at 8 and
-    /// where the guid came from at 9 (`0` a file, `1` written now, `2` memory
-    /// only); returns the guid through the string channel, empty when the
-    /// asset carries none - the encoding [`guid_of`] already uses.
+    /// Writes the handle at [`IMPORT_ALREADY_LOADED_OFFSET`]'s buffer start,
+    /// whether the path was already loaded at [`IMPORT_ALREADY_LOADED_OFFSET`]
+    /// and where the guid came from at [`IMPORT_METADATA_SOURCE_OFFSET`] (`0` a
+    /// file, `1` written now, `2` memory only); returns the guid through the
+    /// string channel, empty when the asset carries none - the encoding
+    /// [`guid_of`] already uses.
     ///
     /// # Safety
     ///
@@ -809,10 +819,9 @@ pub mod assets {
                 let outcome = assets
                     .import(request)
                     .map_err(|error| format!("import of `{path}` failed: {error}"))?;
-                outcome.handle.write_return(ret);
-                *ret.add(8) = u8::from(outcome.already_loaded);
-                *ret.add(9) = metadata_source_code(outcome.metadata);
-                set_return_string(guid_text(outcome.guid));
+                // SAFETY: `ret` addresses the return buffer the caller
+                // promised for the duration of this call.
+                write_import_outcome(&outcome, ret);
             }
             Ok(())
         })
@@ -836,10 +845,9 @@ pub mod assets {
                 let outcome = assets
                     .import_standalone::<T>(Path::new(path))
                     .map_err(|error| format!("import of `{path}` failed: {error}"))?;
-                outcome.handle.write_return(ret);
-                *ret.add(8) = u8::from(outcome.already_loaded);
-                *ret.add(9) = metadata_source_code(outcome.metadata);
-                set_return_string(guid_text(outcome.guid));
+                // SAFETY: `ret` addresses the return buffer the caller
+                // promised for the duration of this call.
+                write_import_outcome(&outcome, ret);
             }
             Ok(())
         })
@@ -854,6 +862,29 @@ pub mod assets {
     /// empty string when the asset has none.
     fn guid_text(guid: Option<AssetGuid>) -> String {
         guid.map(|guid| guid.to_string()).unwrap_or_default()
+    }
+
+    /// Write an import result's return buffer: the handle at 0, the two flag
+    /// bytes at their named offsets, and the guid through the string channel.
+    ///
+    /// Both import trampolines answer with this shape, so the layout the
+    /// managed side reads is written once.
+    ///
+    /// # Safety
+    ///
+    /// `ret` must address the return buffer the caller promised, writable for
+    /// the whole call.
+    unsafe fn write_import_outcome<T: Asset>(outcome: &ImportOutcome<T>, ret: *mut u8) {
+        // SAFETY: `ret` addresses the return buffer, writable for the whole
+        // call, which is the caller's promise.
+        unsafe { outcome.handle.write_return(ret) };
+        // SAFETY: `ret` addresses the return buffer, which is at least a slot
+        // header long - the two flag bytes sit inside it.
+        unsafe {
+            *ret.add(IMPORT_ALREADY_LOADED_OFFSET) = u8::from(outcome.already_loaded);
+            *ret.add(IMPORT_METADATA_SOURCE_OFFSET) = metadata_source_code(outcome.metadata);
+        }
+        set_return_string(guid_text(outcome.guid));
     }
 
     /// The byte a metadata source crosses as.

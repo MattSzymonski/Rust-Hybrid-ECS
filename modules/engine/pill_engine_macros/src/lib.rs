@@ -156,7 +156,7 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     // field's live buffer. An unsupported field type is a compile error here,
     // before the host would have to guess at a mirror.
     let (declared_layout, layout_reference, field_accessors) =
-        match component_field_descriptors(&input, ident, true, true) {
+        match component_field_descriptors(&input, ident, LayoutSubject::Component) {
             Ok(triple) => triple,
             Err(error) => return error.to_compile_error().into(),
         };
@@ -335,10 +335,9 @@ pub fn derive_pill_layout(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // The accessor half is dropped: a layout-only type has no registration
-    // that could carry heap-field trampolines, and a container field stays
-    // read-only through the generic field path either way.
-    match component_field_descriptors(&input, &input.ident, true, true) {
+    // A layout-only type emits no accessors: it has no registration that could
+    // carry heap-field trampolines.
+    match component_field_descriptors(&input, &input.ident, LayoutSubject::LayoutOnly) {
         Ok((declared_layout, _layout_reference, _accessors)) => declared_layout.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -370,26 +369,64 @@ fn empty_field_layout(ident: &syn::Ident) -> proc_macro2::TokenStream {
     layout_emission(ident, &quote! { &[] })
 }
 
+/// Which derive is asking for field descriptors, and therefore what the
+/// emission may contain.
+///
+/// The four variants are exactly the four callers: two `true`s at a call site
+/// cannot say whether the caller keeps the accessor stream, which is how the
+/// component derive and the layout derive came to share a spelling while
+/// behaving differently.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutSubject {
+    /// `#[derive(PillComponent)]`: container fields allowed, heap-field
+    /// accessors emitted, layout consts emitted.
+    Component,
+    /// `#[derive(PillLayout)]`: container fields allowed, no accessors - a
+    /// layout-only type has no registration that could carry trampolines - and
+    /// layout consts emitted.
+    LayoutOnly,
+    /// A `#[derive(PillMirror)]` value type: no container fields (it crosses
+    /// the boundary as plain data), no accessors, layout consts emitted.
+    MirroredValue,
+    /// `pill_value_type!` on a foreign type: no container fields, no accessors,
+    /// and no consts (an inherent const or trait impl would violate the orphan
+    /// rule).
+    ForeignValue,
+}
+
+impl LayoutSubject {
+    /// Whether a `Vec`/`String`-shaped field may appear at all.
+    fn allows_containers(self) -> bool {
+        matches!(self, Self::Component | Self::LayoutOnly)
+    }
+
+    /// Whether the heap-field accessor trampolines are emitted.
+    fn emits_accessors(self) -> bool {
+        matches!(self, Self::Component)
+    }
+
+    /// Whether the inherent `FIELD_LAYOUT` const and the `ComponentLayout`
+    /// impl are emitted.
+    fn emits_layout_consts(self) -> bool {
+        !matches!(self, Self::ForeignValue)
+    }
+}
+
 /// Emit a `static` carrying one [`ComponentFieldDescriptor`] per named field,
 /// the expression that names it, and the heap-field accessor machinery when
 /// the struct declares container fields.
 ///
 /// `self_type` is the path every offset is taken through: the derived type's
 /// own name for the derives, or the declared path when `pill_value_type!`
-/// describes a foreign type. `allow_containers` is `true` for
-/// `#[derive(PillComponent)]`, whose values live in native columns that
-/// managed code may reach through generated accessors, and `false` for
-/// `#[derive(PillMirror)]` value types, which cross the boundary as plain data
-/// and therefore cannot own a heap buffer. `emit_layout_consts` is `false` for
-/// a foreign type, which can carry neither an inherent const nor a trait impl.
+/// describes a foreign type. `subject` names which derive is asking, which is
+/// what decides container fields, accessors and consts.
 ///
 /// Enums, unions, unit structs and tuple structs have no named fields to
 /// mirror and yield an empty layout.
 fn component_field_descriptors(
     input: &DeriveInput,
     self_type: &dyn ToTokens,
-    allow_containers: bool,
-    emit_layout_consts: bool,
+    subject: LayoutSubject,
 ) -> syn::Result<(
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
@@ -417,7 +454,8 @@ fn component_field_descriptors(
         let field_ident = field.ident.as_ref().expect("named field has an identifier");
         let field_ty = &field.ty;
         let field_name = field_ident.to_string();
-        let type_tag = field_type_tag(field_ty, allow_containers)?;
+        let tag = field_type_tag(field_ty, subject.allows_containers())?;
+        let type_tag = &tag.text;
         let decorators = parse_field_decorators(&field.attrs)?;
         // Array lengths may be a literal or a `const` path; both resolve in a
         // const context, so the count is computed here rather than parsed.
@@ -442,14 +480,16 @@ fn component_field_descriptors(
         // A container field additionally gets one accessor per supported
         // operation, so a managed mirror iterates the live buffer instead of
         // copying the row's 24-byte header somewhere else.
-        if let Some(kind) = heap_field_accessor(&type_tag) {
-            accessors.push(emit_heap_field_accessor(
-                ident,
-                field_ident,
-                &field_name,
-                &type_name,
-                kind,
-            ));
+        if subject.emits_accessors() {
+            if let Some(kind) = tag.accessor {
+                accessors.push(emit_heap_field_accessor(
+                    ident,
+                    field_ident,
+                    &field_name,
+                    &type_name,
+                    kind,
+                ));
+            }
         }
     }
 
@@ -457,7 +497,7 @@ fn component_field_descriptors(
     // A foreign type can carry neither an inherent const nor the
     // `ComponentLayout` impl (both are orphan-rule violations), so its
     // declaration emits the descriptor list alone.
-    let layout_consts = if emit_layout_consts {
+    let layout_consts = if subject.emits_layout_consts() {
         layout_emission(ident, &quote! { #static_name })
     } else {
         quote! {}
@@ -477,6 +517,36 @@ fn component_field_descriptors(
 /// The argument list of a decorator written with parentheses, e.g.
 /// `range(0.0, 100.0)`.
 type DecoratorArguments = syn::punctuated::Punctuated<syn::Lit, syn::Token![,]>;
+
+/// Every field decorator a field may declare, with the usage a refusal shows.
+///
+/// One list, read by both refusal messages, so the parser and the text it
+/// answers with cannot drift apart - a decorator added to the parser without
+/// naming it here fails the test below, and a listed one that the parser does
+/// not accept fails it too. A decorator with two forms (parenthesised or not)
+/// appears once per form.
+const FIELD_DECORATOR_USAGE: &[(&str, &str)] = &[
+    ("hide_in_inspector", "hide_in_inspector"),
+    ("color", "color"),
+    ("vector", "vector"),
+    ("header", "header(\"Text\")"),
+    ("tooltip", "tooltip(\"Text\")"),
+    ("space", "space(10.0)"),
+    ("min", "min(0.0)"),
+    ("range", "range(0.0, 100.0)"),
+    ("text_area", "text_area"),
+    ("text_area", "text_area(3, 10)"),
+    ("multiline", "multiline(5)"),
+];
+
+/// The decorator vocabulary as one sentence list, for a refusal message.
+fn field_decorator_list() -> String {
+    FIELD_DECORATOR_USAGE
+        .iter()
+        .map(|(_, usage)| format!("`{usage}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Parse the `#[pill(...)]` decorators a field declares into the expression
 /// the descriptor emission stores in `decorators`.
@@ -638,18 +708,18 @@ fn add_field_decorator(
             path,
             format!(
                 "`{}` declares the type, not a field; a field takes one of the field \
-                 decorators (`hide_in_inspector`, `header(\"Text\")`, `space(10.0)`, \
-                 `tooltip(\"Text\")`, `range(0.0, 100.0)`, `text_area`, \
-                 `text_area(3, 10)`, `multiline(5)`, `min(0.0)`)",
-                path.to_token_stream()
+                 decorators ({})",
+                path.to_token_stream(),
+                field_decorator_list()
             ),
         ));
     }
     Err(syn::Error::new_spanned(
         path,
-        "unknown `pill` field decorator; expected `hide_in_inspector`, `header(\"Text\")`, \
-         `space(10.0)`, `tooltip(\"Text\")`, `range(0.0, 100.0)`, `text_area`, \
-         `text_area(3, 10)`, `multiline(5)` or `min(0.0)`",
+        format!(
+            "unknown `pill` field decorator; expected {}",
+            field_decorator_list()
+        ),
     ))
 }
 
@@ -750,25 +820,85 @@ enum HeapFieldKind {
     String,
 }
 
-/// Recognise a container tag the derive emitted, or `None` for every other
-/// tag in the vocabulary.
-fn heap_field_accessor(type_tag: &str) -> Option<HeapFieldKind> {
-    // `vec:string` is checked before the `vec:` prefix below, because its
-    // accessor set is per element rather than a span over the run.
-    if type_tag == "vec:string" {
-        return Some(HeapFieldKind::VecString);
+/// A field's wire tag, with the accessor set the tag implies.
+///
+/// The walk that builds the tag already decides whether the field is a
+/// container and what its element is; carrying the decision out with the text
+/// means no second function has to strip the prefixes back off - a drift there
+/// would have silently emitted a `vec:f32` row with no accessor trampolines.
+struct FieldTag {
+    /// The tag the descriptor carries (`f32`, `vec:f32`, `struct:<path>`, ...).
+    text: String,
+    /// The accessor set the tag implies, when the field owns heap memory.
+    accessor: Option<HeapFieldKind>,
+}
+
+impl FieldTag {
+    /// A tag with no accessor trampolines behind it.
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            accessor: None,
+        }
     }
-    if let Some(element_tag) = type_tag.strip_prefix("vec:") {
-        return Some(HeapFieldKind::Vec {
-            element_tag: element_tag.to_string(),
-        });
+}
+
+/// One trampoline an accessor kind offers, with what the descriptor says
+/// about it.
+///
+/// The kind decides the list of these ([`emit_heap_field_accessor`]), so which
+/// operations a container has is one readable list rather than five
+/// accumulators whose emptiness meant "no such operation".
+struct AccessorEmission {
+    /// The operation the descriptor names it by (`view`, `resize`, ...).
+    operation: &'static str,
+    /// The exported symbol the host resolves.
+    symbol: String,
+    /// The trampoline itself.
+    trampoline: proc_macro2::TokenStream,
+}
+
+/// Emit the resize trampoline every container kind shares.
+///
+/// `Vec`, `DynamicBuffer` and `Vec<String>` all rewrite their length the same
+/// way - grow with `Default`, refuse a null row - and differ only in what the
+/// doc says the rewrite does to outstanding views, so the doc lines come in as
+/// the caller's token stream and the body is written once.
+///
+/// `resize` needs `E: Default + Clone`. The derive only accepts a primitive or
+/// a `#[derive(PillMirror)]` struct as `E`, and both are, so the bound is
+/// satisfied by the field's element type rather than by the component's.
+fn emit_resize_trampoline(
+    type_ident: &syn::Ident,
+    field_ident: &syn::Ident,
+    doc: proc_macro2::TokenStream,
+) -> AccessorEmission {
+    let symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
+    let resize_fn = syn::Ident::new(&symbol, field_ident.span());
+    let trampoline = quote! {
+        #doc
+        #[doc(hidden)]
+        #[no_mangle]
+        pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
+            if row.is_null() {
+                return 1;
+            }
+            // SAFETY: the caller guarantees `row` addresses a live component
+            // value and holds the write declaration the mutation needs, so the
+            // exclusive reference is valid for the whole call.
+            let component = unsafe { &mut *(row as *mut #type_ident) };
+            component.#field_ident.resize(
+                new_length,
+                ::core::default::Default::default(),
+            );
+            0
+        }
+    };
+    AccessorEmission {
+        operation: "resize",
+        symbol,
+        trampoline,
     }
-    if let Some(element_tag) = type_tag.strip_prefix("dynbuf:") {
-        return Some(HeapFieldKind::DynamicBuffer {
-            element_tag: element_tag.to_string(),
-        });
-    }
-    (type_tag == "string").then_some(HeapFieldKind::String)
 }
 
 /// Emit the accessor trampolines and the descriptor submission for one
@@ -841,141 +971,83 @@ fn emit_heap_field_accessor(
         }
     };
 
-    let mut resize = quote! {};
-    let mut set = quote! {};
-    let mut item = quote! {};
-    let mut set_item = quote! {};
-    let mut push = quote! {};
-    let mut resize_symbol = String::new();
-    let mut set_symbol = String::new();
-    let mut item_symbol = String::new();
-    let mut set_item_symbol = String::new();
-    let mut push_symbol = String::new();
+    let mut emissions: Vec<AccessorEmission> = Vec::new();
     let (kind_tag, element_tag) = match &kind {
         HeapFieldKind::Vec { element_tag } => {
-            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
-            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
-            resize = quote! {
-                /// Resize trampoline for the `#field_ident` field, generated by
-                /// `#[derive(PillComponent)]`.
-                ///
-                /// Rewrites the vector to `new_length` elements and returns 0,
-                /// or returns 1 when `row` is null. Growing fills the new
-                /// elements with the element type's `Default`. Existing
-                /// elements keep their values; the buffer may move, so a view
-                /// taken before the call must not be used afterwards.
-                ///
-                /// # Safety
-                ///
-                /// `row` must point at a live `#type_ident` value the caller
-                /// holds write access to.
-                #[doc(hidden)]
-                #[no_mangle]
-                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
-                    if row.is_null() {
-                        return 1;
-                    }
-                    // SAFETY: the caller guarantees `row` addresses a live
-                    // component value and holds the write declaration the
-                    // mutation needs, so the exclusive reference is valid for
-                    // the whole call.
-                    let component = unsafe { &mut *(row as *mut #type_ident) };
-                    // `resize` needs `E: Default + Clone`. The derive only
-                    // accepts a primitive or a `#[derive(PillMirror)]` struct
-                    // as `E`, and both are, so the bound is satisfied by the
-                    // field's element type rather than by the component's.
-                    component.#field_ident.resize(
-                        new_length,
-                        ::core::default::Default::default(),
-                    );
-                    0
-                }
-            };
+            emissions.push(emit_resize_trampoline(
+                type_ident,
+                field_ident,
+                quote! {
+                    /// Resize trampoline for the `#field_ident` field, generated by
+                    /// `#[derive(PillComponent)]`.
+                    ///
+                    /// Rewrites the vector to `new_length` elements and returns 0,
+                    /// or returns 1 when `row` is null. Growing fills the new
+                    /// elements with the element type's `Default`. Existing
+                    /// elements keep their values; the buffer may move, so a view
+                    /// taken before the call must not be used afterwards.
+                    ///
+                    /// # Safety
+                    ///
+                    /// `row` must point at a live `#type_ident` value the caller
+                    /// holds write access to.
+                },
+            ));
             ("vec", element_tag.as_str())
         }
         HeapFieldKind::DynamicBuffer { element_tag } => {
-            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
-            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
-            resize = quote! {
-                /// Resize trampoline for the `#field_ident` buffer, generated
-                /// by `#[derive(PillComponent)]`.
-                ///
-                /// Rewrites the buffer to `new_length` elements and returns 0,
-                /// or returns 1 when `row` is null. Growing fills the new
-                /// elements with the element type's `Default`. This is the one
-                /// operation that can retire the block, so it ends every
-                /// outstanding view of it; the handle is re-read from the row
-                /// afterwards.
-                ///
-                /// # Safety
-                ///
-                /// `row` must point at a live `#type_ident` value the caller
-                /// holds write access to.
-                #[doc(hidden)]
-                #[no_mangle]
-                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
-                    if row.is_null() {
-                        return 1;
-                    }
-                    // SAFETY: the caller guarantees `row` addresses a live
-                    // component value and holds the write declaration the
-                    // mutation needs, so the exclusive reference is valid for
-                    // the whole call.
-                    let component = unsafe { &mut *(row as *mut #type_ident) };
-                    // The block is engine-owned, so this reallocate-and-release
-                    // pair runs the shared native-buffer service rather than
-                    // whatever code currently owns the element heap.
-                    component.#field_ident.resize(
-                        new_length,
-                        ::core::default::Default::default(),
-                    );
-                    0
-                }
-            };
+            emissions.push(emit_resize_trampoline(
+                type_ident,
+                field_ident,
+                quote! {
+                    /// Resize trampoline for the `#field_ident` buffer, generated
+                    /// by `#[derive(PillComponent)]`.
+                    ///
+                    /// Rewrites the buffer to `new_length` elements and returns 0,
+                    /// or returns 1 when `row` is null. Growing fills the new
+                    /// elements with the element type's `Default`. This is the one
+                    /// operation that can retire the block, so it ends every
+                    /// outstanding view of it; the handle is re-read from the row
+                    /// afterwards.
+                    ///
+                    /// # Safety
+                    ///
+                    /// `row` must point at a live `#type_ident` value the caller
+                    /// holds write access to.
+                },
+            ));
             ("dynbuf", element_tag.as_str())
         }
         HeapFieldKind::VecString => {
-            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
-            item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_item");
-            set_item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set_item");
-            push_symbol = format!("pill_accessor_{type_ident}_{field_ident}_push");
-            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
+            emissions.push(emit_resize_trampoline(
+                type_ident,
+                field_ident,
+                quote! {
+                    /// Resize trampoline for the `#field_ident` list, generated by
+                    /// `#[derive(PillComponent)]`.
+                    ///
+                    /// Rewrites the list to `new_length` elements and returns 0,
+                    /// or returns 1 when `row` is null. Growing fills the new
+                    /// elements with empty strings. This is the one operation that
+                    /// can move the outer allocation, so it ends every outstanding
+                    /// element pointer.
+                    ///
+                    /// # Safety
+                    ///
+                    /// `row` must point at a live `#type_ident` value the caller
+                    /// holds write access to.
+                },
+            ));
+            let item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_item");
+            let set_item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set_item");
+            let push_symbol = format!("pill_accessor_{type_ident}_{field_ident}_push");
             let item_fn = syn::Ident::new(&item_symbol, field_ident.span());
             let set_item_fn = syn::Ident::new(&set_item_symbol, field_ident.span());
             let push_fn = syn::Ident::new(&push_symbol, field_ident.span());
-            resize = quote! {
-                /// Resize trampoline for the `#field_ident` list, generated by
-                /// `#[derive(PillComponent)]`.
-                ///
-                /// Rewrites the list to `new_length` elements and returns 0,
-                /// or returns 1 when `row` is null. Growing fills the new
-                /// elements with empty strings. This is the one operation that
-                /// can move the outer allocation, so it ends every outstanding
-                /// element pointer.
-                ///
-                /// # Safety
-                ///
-                /// `row` must point at a live `#type_ident` value the caller
-                /// holds write access to.
-                #[doc(hidden)]
-                #[no_mangle]
-                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
-                    if row.is_null() {
-                        return 1;
-                    }
-                    // SAFETY: the caller guarantees `row` addresses a live
-                    // component value and holds the write declaration the
-                    // mutation needs, so the exclusive reference is valid for
-                    // the whole call.
-                    let component = unsafe { &mut *(row as *mut #type_ident) };
-                    component.#field_ident.resize(
-                        new_length,
-                        ::core::default::Default::default(),
-                    );
-                    0
-                }
-            };
-            item = quote! {
+            emissions.push(AccessorEmission {
+                operation: "item",
+                symbol: item_symbol,
+                trampoline: quote! {
                 /// Element-view trampoline for the `#field_ident` list,
                 /// generated by `#[derive(PillComponent)]`.
                 ///
@@ -1014,8 +1086,12 @@ fn emit_heap_field_accessor(
                     }
                     0
                 }
-            };
-            set_item = quote! {
+                },
+            });
+            emissions.push(AccessorEmission {
+                operation: "set_item",
+                symbol: set_item_symbol,
+                trampoline: quote! {
                 /// Element-replace trampoline for the `#field_ident` list,
                 /// generated by `#[derive(PillComponent)]`.
                 ///
@@ -1062,8 +1138,12 @@ fn emit_heap_field_accessor(
                     slot.push_str(text);
                     0
                 }
-            };
-            push = quote! {
+                },
+            });
+            emissions.push(AccessorEmission {
+                operation: "push",
+                symbol: push_symbol,
+                trampoline: quote! {
                 /// Append trampoline for the `#field_ident` list, generated by
                 /// `#[derive(PillComponent)]`.
                 ///
@@ -1102,13 +1182,17 @@ fn emit_heap_field_accessor(
                     component.#field_ident.push(text.to_string());
                     0
                 }
-            };
+                },
+            });
             ("vecstring", "string")
         }
         HeapFieldKind::String => {
-            set_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set");
+            let set_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set");
             let set_fn = syn::Ident::new(&set_symbol, field_ident.span());
-            set = quote! {
+            emissions.push(AccessorEmission {
+                operation: "set",
+                symbol: set_symbol,
+                trampoline: quote! {
                 /// Replace-in-place trampoline for the `#field_ident` field,
                 /// generated by `#[derive(PillComponent)]`.
                 ///
@@ -1150,18 +1234,31 @@ fn emit_heap_field_accessor(
                     component.#field_ident.push_str(text);
                     0
                 }
-            };
+                },
+            });
             ("string", "")
         }
     };
 
+    // The descriptor spells "this kind has no such operation" as an empty
+    // symbol, so each field is looked up in the list instead of accumulated.
+    let symbol = |operation: &str| {
+        emissions
+            .iter()
+            .find(|emission| emission.operation == operation)
+            .map(|emission| emission.symbol.clone())
+            .unwrap_or_default()
+    };
+    let resize_symbol = symbol("resize");
+    let set_symbol = symbol("set");
+    let item_symbol = symbol("item");
+    let set_item_symbol = symbol("set_item");
+    let push_symbol = symbol("push");
+    let trampolines = emissions.iter().map(|emission| &emission.trampoline);
+
     quote! {
         #view
-        #resize
-        #set
-        #item
-        #set_item
-        #push
+        #(#trampolines)*
 
         ::pill_engine::submit! {
             ::pill_engine::component_registry::PillFieldAccessorDescriptor {
@@ -1207,7 +1304,7 @@ fn flattened_path(path: &syn::Path, separator: &str) -> String {
 /// members) and are rejected otherwise (mirrored value types, which cross the
 /// boundary as plain data). `char` is rejected outright because Rust's and
 /// C#'s widths disagree.
-fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String> {
+fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<FieldTag> {
     match ty {
         syn::Type::Path(path) if path.qself.is_none() => {
             let segment = path.path.segments.last();
@@ -1216,14 +1313,17 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                 .unwrap_or_default();
             match last.as_str() {
                 "f32" | "f64" | "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64"
-                | "u64" | "bool" | "usize" | "isize" => Ok(last),
+                | "u64" | "bool" | "usize" | "isize" => Ok(FieldTag::plain(last)),
                 "char" => Err(syn::Error::new_spanned(
                     ty,
                     "`char` fields cannot be mirrored: Rust `char` is 4 bytes while C# `char` is 2",
                 )),
                 "String" => {
                     if allow_containers {
-                        Ok("string".to_string())
+                        Ok(FieldTag {
+                            text: "string".to_string(),
+                            accessor: Some(HeapFieldKind::String),
+                        })
                     } else {
                         Err(heap_owned_rejection(ty, "String"))
                     }
@@ -1236,16 +1336,28 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                     // must be inside the closed vocabulary too.
                     let element = container_element_type(segment, &last)
                         .map_err(|message| syn::Error::new_spanned(ty, message))?;
-                    let element_tag = field_type_tag(element, allow_containers)?;
+                    let element_tag = field_type_tag(element, allow_containers)?.text;
                     if is_primitive_tag(&element_tag) || element_tag.starts_with("struct:") {
                         let prefix = if last == "Vec" { "vec" } else { "dynbuf" };
-                        Ok(format!("{prefix}:{element_tag}"))
+                        let text = format!("{prefix}:{element_tag}");
+                        let accessor = if last == "Vec" {
+                            HeapFieldKind::Vec { element_tag }
+                        } else {
+                            HeapFieldKind::DynamicBuffer { element_tag }
+                        };
+                        Ok(FieldTag {
+                            text,
+                            accessor: Some(accessor),
+                        })
                     } else if element_tag == "string" {
                         if last == "Vec" {
                             // Elements are individually allocated strings, so
                             // there is no span over them; C# reaches each one
                             // through its own accessor instead.
-                            Ok("vec:string".to_string())
+                            Ok(FieldTag {
+                                text: "vec:string".to_string(),
+                                accessor: Some(HeapFieldKind::VecString),
+                            })
                         } else {
                             Err(syn::Error::new_spanned(
                                 ty,
@@ -1288,7 +1400,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                 // rather than as a `struct:` so the field layer reads and
                 // writes it as a reference the editor can pick, instead of an
                 // opaque pair of numbers.
-                "Entity" => Ok("entity".to_string()),
+                "Entity" => Ok(FieldTag::plain("entity".to_string())),
                 // An asset handle keeps the asset it names, so the C# mirror
                 // can type the field as `Handle<Mesh>` rather than an opaque
                 // `Handle`. Still a `struct:` tag: every reader that folds or
@@ -1309,8 +1421,8 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                             _ => None,
                         });
                     Ok(match asset {
-                        Some(asset) => format!("struct:Handle<{asset}>"),
-                        None => "struct:Handle".to_string(),
+                        Some(asset) => FieldTag::plain(format!("struct:Handle<{asset}>")),
+                        None => FieldTag::plain("struct:Handle".to_string()),
                     })
                 }
                 _ => {
@@ -1319,7 +1431,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                     // its fully-qualified path so `PillMirror` descriptors
                     // resolve by name.
                     let qualified = flattened_path(&path.path, "::");
-                    Ok(format!("struct:{qualified}"))
+                    Ok(FieldTag::plain(format!("struct:{qualified}")))
                 }
             }
         }
@@ -1327,7 +1439,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
             // The element count lives in `element_count` (computed from the
             // length expression at compile time), so the tag only carries the
             // element type.
-            let inner = field_type_tag(&array.elem, allow_containers)?;
+            let inner = field_type_tag(&array.elem, allow_containers)?.text;
             if inner.starts_with("vec:") || inner.starts_with("dynbuf:") || inner == "string" {
                 return Err(syn::Error::new_spanned(
                     ty,
@@ -1335,7 +1447,7 @@ fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String>
                      `DynamicBuffer` field instead",
                 ));
             }
-            Ok(format!("array:{inner}"))
+            Ok(FieldTag::plain(format!("array:{inner}")))
         }
         other => Err(syn::Error::new_spanned(
             other,
@@ -1445,7 +1557,7 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
     // no meaning here: there is no live row for managed code to reach a buffer
     // through, and the mirror is copied by value.
     let (declared_layout, layout_reference, _accessors) =
-        match component_field_descriptors(&input, ident, false, true) {
+        match component_field_descriptors(&input, ident, LayoutSubject::MirroredValue) {
             Ok(triple) => triple,
             Err(error) => return error.to_compile_error().into(),
         };
@@ -1526,11 +1638,14 @@ pub fn pill_value_type(input: TokenStream) -> TokenStream {
     // A foreign type can carry neither the inherent `FIELD_LAYOUT` const nor
     // the trait impl, so the emitter skips them and the submit below is the
     // only registration output.
-    let (declared_layout, layout_reference, _accessors) =
-        match component_field_descriptors(&synthetic, &declaration.type_path, false, false) {
-            Ok(triple) => triple,
-            Err(error) => return error.to_compile_error().into(),
-        };
+    let (declared_layout, layout_reference, _accessors) = match component_field_descriptors(
+        &synthetic,
+        &declaration.type_path,
+        LayoutSubject::ForeignValue,
+    ) {
+        Ok(triple) => triple,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     // Joined the same way the field tag is, so the descriptor name matches
     // what a component field spelled with this path produces.
@@ -2279,28 +2394,33 @@ fn hot_patch_resolver_export(
             if qualified_name.is_null() {
                 return 0;
             }
-            // SAFETY: the caller guarantees a NUL-terminated string readable
-            // for the duration of this call.
-            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
-            let Ok(name) = name.to_str() else {
-                return 0;
-            };
-            let Some(address) = ::pill_engine::hot_patch::function_address(name) else {
-                return 0;
-            };
-            // The declaration this artifact was built with, so the caller can
-            // refuse a replacement whose shape no longer matches.
-            if let Some(signature) = ::pill_engine::hot_patch::function_signature(name) {
-                if !out_signature.is_null() && !out_signature_length.is_null() {
-                    // SAFETY: both pointers were checked non-null and the caller
-                    // guarantees they address writable slots.
-                    unsafe {
-                        *out_signature = signature.as_ptr();
-                        *out_signature_length = signature.len();
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::hot_patch::with_qualified_name(qualified_name, 0, |name| {
+                    let Some(address) =
+                        ::pill_engine::hot_patch::scanned_function_address(name)
+                    else {
+                        return 0;
+                    };
+                    // The declaration this artifact was built with, so the
+                    // caller can refuse a replacement whose shape no longer
+                    // matches.
+                    if let Some(signature) =
+                        ::pill_engine::hot_patch::scanned_function_signature(name)
+                    {
+                        // SAFETY: the caller upholds the contract documented
+                        // above for both out-parameters.
+                        unsafe {
+                            ::pill_engine::hot_patch::write_signature_out(
+                                signature.as_bytes(),
+                                out_signature,
+                                out_signature_length,
+                            );
+                        }
                     }
-                }
+                    address
+                })
             }
-            address
         }
 
         /// How many of this artifact's functions have a length the exception
@@ -2336,18 +2456,14 @@ fn hot_patch_resolver_export(
         pub unsafe extern "C" fn #reset_name(
             qualified_name: *const ::core::ffi::c_char,
         ) -> u32 {
-            if qualified_name.is_null() {
-                return 1;
-            }
-            // SAFETY: the caller guarantees a NUL-terminated string readable
-            // for the duration of this call.
-            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
-            let Ok(name) = name.to_str() else {
-                return 1;
-            };
-            match ::pill_engine::hot_patch::reset_plain_function(name) {
-                Ok(()) => 0,
-                Err(_) => 1,
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::hot_patch::with_qualified_name(qualified_name, 1, |name| {
+                    match ::pill_engine::hot_patch::reset_plain_function(name) {
+                        Ok(()) => 0,
+                        Err(_) => 1,
+                    }
+                })
             }
         }
 
@@ -2376,25 +2492,25 @@ fn hot_patch_resolver_export(
             if qualified_name.is_null() {
                 return 0;
             }
-            // SAFETY: the caller guarantees a NUL-terminated string readable
-            // for the duration of this call.
-            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
-            let Ok(name) = name.to_str() else {
-                return 0;
-            };
-            match ::pill_engine::hot_patch::plain_function_entry(name) {
-                Some((address, signature)) => {
-                    if !out_signature.is_null() && !out_signature_length.is_null() {
-                        // SAFETY: both pointers were checked non-null and the
-                        // caller guarantees they address writable slots.
-                        unsafe {
-                            *out_signature = signature.as_ptr();
-                            *out_signature_length = signature.len();
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::hot_patch::with_qualified_name(qualified_name, 0, |name| {
+                    match ::pill_engine::hot_patch::plain_function_entry(name) {
+                        Some((address, signature)) => {
+                            // SAFETY: the caller upholds the contract documented
+                            // above for both out-parameters.
+                            unsafe {
+                                ::pill_engine::hot_patch::write_signature_out(
+                                    signature.as_bytes(),
+                                    out_signature,
+                                    out_signature_length,
+                                );
+                            }
+                            address
                         }
+                        None => 0,
                     }
-                    address
-                }
-                None => 0,
+                })
             }
         }
 
@@ -2424,21 +2540,25 @@ fn hot_patch_resolver_export(
             if qualified_name.is_null() || signature.is_null() {
                 return 1;
             }
-            // SAFETY: the caller guarantees NUL-terminated strings readable for
-            // the duration of this call.
-            let (name, signature) = unsafe {
-                (
-                    ::std::ffi::CStr::from_ptr(qualified_name),
-                    ::std::ffi::CStr::from_ptr(signature),
-                )
-            };
-            let (Ok(name), Ok(signature)) = (name.to_str(), signature.to_str()) else {
-                return 1;
-            };
-            match ::pill_engine::hot_patch::install_plain_function(name, address, signature) {
-                Ok(()) => 0,
-                Err(::pill_engine::hot_patch::HotPatchError::UnknownSystem { .. }) => 1,
-                Err(_) => 2,
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::hot_patch::with_qualified_name(qualified_name, 1, |name| {
+                    // SAFETY: the caller guarantees a NUL-terminated string
+                    // readable for the duration of this call.
+                    let signature = unsafe { ::std::ffi::CStr::from_ptr(signature) };
+                    let Ok(signature) = signature.to_str() else {
+                        return 1;
+                    };
+                    match ::pill_engine::hot_patch::install_plain_function(
+                        name,
+                        address,
+                        signature,
+                    ) {
+                        Ok(()) => 0,
+                        Err(::pill_engine::hot_patch::HotPatchError::UnknownSystem { .. }) => 1,
+                        Err(_) => 2,
+                    }
+                })
             }
         }
 
@@ -2459,25 +2579,21 @@ fn hot_patch_resolver_export(
             qualified_name: *const ::core::ffi::c_char,
             out_signature_hash: *mut u64,
         ) -> usize {
-            if qualified_name.is_null() {
-                return 0;
-            }
-            // SAFETY: the caller guarantees a NUL-terminated string readable
-            // for the duration of this call.
-            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
-            let Ok(name) = name.to_str() else {
-                return 0;
-            };
-            match ::pill_engine::hot_patch::resolve_hot_function(name) {
-                Some((address, signature_hash)) => {
-                    if !out_signature_hash.is_null() {
-                        // SAFETY: the caller guarantees a writable `u64` when
-                        // the pointer is non-null.
-                        unsafe { *out_signature_hash = signature_hash };
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::hot_patch::with_qualified_name(qualified_name, 0, |name| {
+                    match ::pill_engine::hot_patch::resolve_hot_function(name) {
+                        Some((address, signature_hash)) => {
+                            if !out_signature_hash.is_null() {
+                                // SAFETY: the caller guarantees a writable `u64`
+                                // when the pointer is non-null.
+                                unsafe { *out_signature_hash = signature_hash };
+                            }
+                            address
+                        }
+                        None => 0,
                     }
-                    address
-                }
-                None => 0,
+                })
             }
         }
     }
@@ -2646,15 +2762,14 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             out: *mut ::pill_engine::component_registry::PillValueTypeDescriptor,
             max: u32,
         ) -> u32 {
-            let descriptors = ::pill_engine::component_registry::value_type_descriptors();
-            let count = (descriptors.len() as u32).min(max);
-            for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
-                // SAFETY: `index < count <= max`, so `out.add(index)` stays
-                // inside the buffer the host promised, and
-                // `PillValueTypeDescriptor` is `Copy`.
-                unsafe { out.add(index).write(**descriptor); }
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::component_registry::copy_descriptors(
+                    &::pill_engine::component_registry::value_type_descriptors(),
+                    out,
+                    max,
+                )
             }
-            count
         }
 
         /// Number of `#[pill_mirror_method]` descriptors this artifact
@@ -2679,15 +2794,14 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             out: *mut ::pill_engine::component_registry::PillMethodDescriptor,
             max: u32,
         ) -> u32 {
-            let descriptors = ::pill_engine::component_registry::mirror_method_descriptors();
-            let count = (descriptors.len() as u32).min(max);
-            for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
-                // SAFETY: `index < count <= max`, so `out.add(index)` stays
-                // inside the buffer the host promised, and
-                // `PillMethodDescriptor` is `Copy`.
-                unsafe { out.add(index).write(**descriptor); }
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::component_registry::copy_descriptors(
+                    &::pill_engine::component_registry::mirror_method_descriptors(),
+                    out,
+                    max,
+                )
             }
-            count
         }
 
         /// Number of heap-field accessor descriptors this artifact declares,
@@ -2713,15 +2827,14 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             out: *mut ::pill_engine::component_registry::PillFieldAccessorDescriptor,
             max: u32,
         ) -> u32 {
-            let descriptors = ::pill_engine::component_registry::field_accessor_descriptors();
-            let count = (descriptors.len() as u32).min(max);
-            for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
-                // SAFETY: `index < count <= max`, so `out.add(index)` stays
-                // inside the buffer the host promised, and
-                // `PillFieldAccessorDescriptor` is `Copy`.
-                unsafe { out.add(index).write(**descriptor); }
+            // SAFETY: the caller upholds the contract documented above.
+            unsafe {
+                ::pill_engine::component_registry::copy_descriptors(
+                    &::pill_engine::component_registry::field_accessor_descriptors(),
+                    out,
+                    max,
+                )
             }
-            count
         }
 
             #init_export
@@ -2823,4 +2936,44 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+#[cfg(test)]
+mod decorator_vocabulary_tests {
+    use super::*;
+
+    /// Every decorator the vocabulary lists is one the parser accepts, and the
+    /// refusal text names every listed one.
+    ///
+    /// The parser and its refusal used to be two hand-copied lists, and the
+    /// refusal had already fallen behind (`color` and `vector` were accepted but
+    /// never offered). This is the check that keeps the next decorator from
+    /// repeating it.
+    #[test]
+    fn the_refusal_text_lists_exactly_the_accepted_decorators() {
+        for (key, usage) in FIELD_DECORATOR_USAGE {
+            let source = format!("struct Probe {{ #[pill({usage})] value: f32 }}");
+            let probe: syn::DeriveInput =
+                syn::parse_str(&source).expect("the usage is a valid field declaration");
+            let syn::Data::Struct(data) = &probe.data else {
+                panic!("the probe is a struct");
+            };
+            let field = data
+                .fields
+                .iter()
+                .next()
+                .expect("the probe declares one field");
+            let emitted = parse_field_decorators(&field.attrs)
+                .unwrap_or_else(|error| panic!("`{key}` is listed but refused: {error}"));
+            assert!(
+                !emitted.is_empty(),
+                "`{key}` is listed but emitted no decorator"
+            );
+        }
+
+        let message = field_decorator_list();
+        for (_, usage) in FIELD_DECORATOR_USAGE {
+            assert!(message.contains(usage), "the refusal text names `{usage}`");
+        }
+    }
 }

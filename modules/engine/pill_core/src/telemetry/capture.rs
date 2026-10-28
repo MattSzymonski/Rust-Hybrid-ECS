@@ -21,9 +21,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 // External crates
-use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::layer::{Context, Layer};
+
+// Current crate
+use super::StyledFieldVisitor;
 
 /// Lines a capture ring holds when nothing else is asked for.
 pub const DEFAULT_CAPTURE_CAPACITY: usize = 4096;
@@ -83,11 +86,21 @@ impl LogBuffer {
         }
     }
 
+    /// Take the ring, recovering it from a poison.
+    ///
+    /// A poisoned ring still holds every line written before the panic, and the
+    /// console is the surface that has to show what went wrong - so a panic
+    /// must not turn the panel permanently blank. Every accessor recovers the
+    /// same way, which is also what the crate's other locks do.
+    fn ring(&self) -> std::sync::MutexGuard<'_, Ring> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Append one line, dropping the oldest beyond the capacity.
     pub fn push(&self, level: u8, target: &str, message: String) {
-        let Ok(mut ring) = self.inner.lock() else {
-            return;
-        };
+        let mut ring = self.ring();
         let seq = ring.next_seq;
         ring.next_seq += 1;
         ring.lines.push_back(LogLine {
@@ -103,9 +116,7 @@ impl LogBuffer {
 
     /// Every line with a sequence number greater than `after`, oldest first.
     pub fn since(&self, after: u64) -> Vec<LogLine> {
-        let Ok(ring) = self.inner.lock() else {
-            return Vec::new();
-        };
+        let ring = self.ring();
         ring.lines
             .iter()
             .filter(|line| line.seq > after)
@@ -115,18 +126,12 @@ impl LogBuffer {
 
     /// The sequence number of the newest line (0 while empty).
     pub fn latest_seq(&self) -> u64 {
-        match self.inner.lock() {
-            Ok(ring) => ring.next_seq - 1,
-            Err(_) => 0,
-        }
+        self.ring().next_seq - 1
     }
 
     /// Lines currently held.
     pub fn len(&self) -> usize {
-        match self.inner.lock() {
-            Ok(ring) => ring.lines.len(),
-            Err(_) => 0,
-        }
+        self.ring().lines.len()
     }
 
     /// Whether the ring holds no lines.
@@ -136,10 +141,7 @@ impl LogBuffer {
 
     /// Lines the ring can hold before dropping the oldest.
     pub fn capacity(&self) -> usize {
-        match self.inner.lock() {
-            Ok(ring) => ring.capacity,
-            Err(_) => 0,
-        }
+        self.ring().capacity
     }
 }
 
@@ -176,59 +178,69 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
         if level < self.minimum_level {
             return;
         }
-        let mut visitor = MessageVisitor::default();
+        let mut visitor = StyledFieldVisitor::plain(event.is_log());
         event.record(&mut visitor);
-        self.buffer.push(level, metadata.target(), visitor.finish());
-    }
-}
-
-/// Renders one event into the console's line shape.
-#[derive(Default)]
-struct MessageVisitor {
-    message: String,
-    fields: String,
-    has_message: bool,
-}
-
-impl MessageVisitor {
-    fn finish(self) -> String {
-        if self.fields.is_empty() {
-            return self.message;
-        }
-        if !self.has_message {
-            return self.fields;
-        }
-        format!("{}  {}", self.message, self.fields)
-    }
-
-    fn push_field(&mut self, field: &Field, rendered: String) {
-        if !self.fields.is_empty() {
-            self.fields.push(' ');
-        }
-        self.fields.push_str(field.name());
-        self.fields.push('=');
-        self.fields.push_str(&rendered);
-    }
-}
-
-impl Visit for MessageVisitor {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-            self.has_message = true;
-        } else {
-            self.push_field(field, value.to_string());
-        }
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.push_field(field, format!("{value:?}"));
+        self.buffer
+            .push(level, metadata.target(), visitor.into_line());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A captured line is the formatter's line: same fields, same value
+    /// spelling, bridged `log.*` fields dropped.
+    ///
+    /// The two lanes share one visitor, so this pins the shape they inherit
+    /// rather than a second renderer's idea of it.
+    #[test]
+    fn a_captured_line_matches_the_formatter_line_shape() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = LogBuffer::with_capacity(8);
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer::new(buffer.clone(), Level::INFO));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "engine::resources",
+                module = "pill_spline",
+                "texture created"
+            );
+        });
+
+        let lines = buffer.since(0);
+        assert_eq!(lines.len(), 1, "one event, one line");
+        assert_eq!(
+            lines[0].message, "texture created  module=\"pill_spline\"",
+            "a string field keeps its `Debug` form, as the terminal lane shows it"
+        );
+    }
+
+    /// A poisoned ring still serves the lines written before the panic.
+    ///
+    /// The console is the surface built to show what went wrong, so a panic
+    /// elsewhere must not blank it for the rest of the session.
+    #[test]
+    fn a_poisoned_ring_still_returns_its_lines() {
+        let buffer = LogBuffer::with_capacity(8);
+        buffer.push(3, "test", "before the panic".to_string());
+
+        // Poison the ring: a thread panics while holding the guard.
+        let poisoned = buffer.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.inner.lock().expect("the ring is unpoisoned here");
+            panic!("a writer panicked while holding the guard");
+        })
+        .join();
+        assert!(buffer.inner.is_poisoned(), "the ring is poisoned");
+
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.latest_seq(), 1);
+        assert_eq!(buffer.since(0).len(), 1);
+        buffer.push(3, "test", "after the panic".to_string());
+        assert_eq!(buffer.since(1).len(), 1, "capture continues after a poison");
+    }
 
     #[test]
     fn the_ring_drops_oldest_and_tracks_sequence() {

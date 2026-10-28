@@ -46,8 +46,16 @@ pub trait QueryTarget {
     /// Cached per-archetype state (e.g. storage pointers) for this target.
     type State;
 
-    /// Get the component IDs required by this query.
-    fn component_ids() -> Vec<ComponentId>;
+    /// Get the component ids this query target touches.
+    ///
+    /// Derived from [`report_component_access`](QueryTarget::report_component_access)
+    /// rather than spelled a second time: the mask a query builds and the
+    /// access a system reports come from one description, so they cannot
+    /// disagree about what the target touches.
+    fn component_ids() -> Vec<ComponentId> {
+        let (reads, writes) = Self::report_component_access();
+        reads.into_iter().chain(writes).collect()
+    }
 
     /// Report component access for system dependency analysis.
     /// Returns `(reads, writes)` as vectors of `ComponentId`.
@@ -85,10 +93,6 @@ pub trait QueryTarget {
 impl QueryTarget for Entity {
     type Item<'a> = Entity;
     type State = SendPtr<Vec<Entity>>;
-
-    fn component_ids() -> Vec<ComponentId> {
-        Vec::new()
-    }
 
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
         (Vec::new(), Vec::new())
@@ -130,10 +134,6 @@ impl QueryTarget for Entity {
 impl<T: Component + Sync> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<crate::archetype::ComponentColumn>;
-
-    fn component_ids() -> Vec<ComponentId> {
-        vec![ComponentId::of::<T>()]
-    }
 
     fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
         declared_shared_schema::<T>().into_iter().collect()
@@ -185,11 +185,10 @@ pub struct MutFetchState<T: Component> {
 // outlives the query.
 //
 // Disjoint access is established by `SystemAccess::conflicts_with`, which the
-// scheduler consults before placing two systems in the same parallel batch; it
-// only takes its bitmask fast path when both systems' masks are complete, and
-// otherwise compares the full access sets. That completeness rule is what makes
-// this impl sound: "no access" is never inferred from an empty mask, so two
-// systems writing the same component cannot be batched together.
+// scheduler consults before placing two systems in the same parallel batch. It
+// compares each system's declared component and resource sets directly, so two
+// systems writing the same component always conflict and are never batched
+// together.
 //
 // Within one batch, `ParQueryIter` assigns each thread a disjoint entity range,
 // so no two threads fetch the same row.
@@ -206,10 +205,6 @@ unsafe impl<T: Component> Sync for MutFetchState<T> {}
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = Mut<'a, T>;
     type State = MutFetchState<T>;
-
-    fn component_ids() -> Vec<ComponentId> {
-        vec![ComponentId::of::<T>()]
-    }
 
     fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
         declared_shared_schema::<T>().into_iter().collect()
@@ -264,12 +259,6 @@ macro_rules! impl_query_target_tuple {
         impl<$($T: QueryTarget),*> QueryTarget for ($($T,)*) {
             type Item<'a> = ($($T::Item<'a>,)*);
             type State = ($($T::State,)*);
-
-            fn component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
-                $(ids.extend($T::component_ids());)*
-                ids
-            }
 
             fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
                 let mut schemas = Vec::new();

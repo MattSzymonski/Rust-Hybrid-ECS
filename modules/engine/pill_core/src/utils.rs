@@ -7,7 +7,6 @@
 //!   ([`AssetPathError`]).
 //! - Construct and inspect fixed-width bitmasks.
 //! - Format project-level error chains for reporting.
-//! - Generate C-ABI project entry points for dynamic loading.
 //!
 //! # Design
 //!
@@ -191,31 +190,6 @@ pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = cause.source();
     }
     message
-}
-
-// =============================================================================
-// Project entry-point generation
-// =============================================================================
-
-/// Generate a C-ABI project entry point plus an in-process constructor.
-///
-/// The macro expands to an `extern "C" fn get_project()` returning a raw
-/// pointer to a boxed project, and a plain Rust `create_project()` that
-/// returns the boxed project for embedding runtimes.
-#[macro_export]
-macro_rules! create_project {
-    ($project_constructor:expr, $project_trait:path) => {
-        #[no_mangle]
-        pub extern "C" fn get_project() -> *mut std::ffi::c_void {
-            let project: Box<dyn $project_trait> = Box::new($project_constructor);
-            Box::into_raw(Box::new(project)) as *mut std::ffi::c_void
-        }
-
-        /// Returns a boxed project for embedding runtimes.
-        pub fn create_project() -> Box<dyn $project_trait> {
-            Box::new($project_constructor)
-        }
-    };
 }
 
 // =============================================================================

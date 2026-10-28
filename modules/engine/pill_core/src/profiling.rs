@@ -51,6 +51,41 @@ pub const PROFILE_FINE_TARGET: &str = crate::telemetry::telemetry_target::PROFIL
 compile_error!("`profiling` and `profiling-minimal` are mutually exclusive. Enable only one.");
 
 // ============================================================================
+// Shared profiling data
+// ============================================================================
+
+// These two name no Tracy type, so they are declared once for every posture and
+// re-exported from whichever `enabled` module is compiled. A field added here is
+// checked by every feature set, including the one shipping builds use.
+
+/// The graphics API a GPU timeline's timestamps come from, for its label in
+/// Tracy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuApi {
+    /// Vulkan.
+    Vulkan,
+    /// Direct3D 12.
+    Direct3D12,
+    /// OpenGL.
+    OpenGL,
+    /// Anything Tracy has no label for.
+    Other,
+}
+
+/// One geometry pass's pipeline statistics, for [`plot_gpu_statistics`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuStatistics {
+    /// Vertex shader invocations.
+    pub vertex_invocations: u64,
+    /// Primitives that entered clipping.
+    pub clipper_invocations: u64,
+    /// Primitives that survived clipping and were rasterized.
+    pub clipper_primitives_out: u64,
+    /// Fragment shader invocations.
+    pub fragment_invocations: u64,
+}
+
+// ============================================================================
 // Tracy-enabled implementation (shared by both `profiling` and `profiling-minimal`)
 // ============================================================================
 
@@ -62,6 +97,9 @@ mod enabled {
 
     // External crates
     use tracy_client::Client;
+
+    // Current crate
+    pub use super::{GpuApi, GpuStatistics};
 
     /// Lazy-initialized client handle. The first call to `client()` starts Tracy.
     pub(crate) fn client() -> Client {
@@ -258,20 +296,6 @@ mod enabled {
         #[inline]
         pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
     }
-    /// The graphics API a GPU timeline's timestamps come from, for its label
-    /// in Tracy.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum GpuApi {
-        /// Vulkan.
-        Vulkan,
-        /// Direct3D 12.
-        Direct3D12,
-        /// OpenGL.
-        OpenGL,
-        /// Anything Tracy has no label for.
-        Other,
-    }
-
     /// A GPU timeline in Tracy: GPU work shown as zones on a track of its
     /// own, beside the CPU threads.
     ///
@@ -379,19 +403,6 @@ mod enabled {
     #[inline(never)]
     pub fn profiler_connected() -> bool {
         Client::is_running() && Client::is_connected()
-    }
-
-    /// One geometry pass's pipeline statistics, for [`plot_gpu_statistics`].
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct GpuStatistics {
-        /// Vertex shader invocations.
-        pub vertex_invocations: u64,
-        /// Primitives that entered clipping.
-        pub clipper_invocations: u64,
-        /// Primitives that survived clipping and were rasterized.
-        pub clipper_primitives_out: u64,
-        /// Fragment shader invocations.
-        pub fragment_invocations: u64,
     }
 
     /// Adds one frame's pipeline statistics to Tracy's plots.
@@ -536,6 +547,9 @@ mod enabled {
     // Standard library
     use std::fmt::Arguments;
 
+    // Current crate
+    pub use super::{GpuApi, GpuStatistics};
+
     /// Compile-time no-op CPU zone guard.
     ///
     /// Compiled when no profiling feature is enabled; every method is an
@@ -600,19 +614,6 @@ mod enabled {
     #[doc(hidden)]
     pub struct OpaqueFrameName;
 
-    /// Compile-time stand-in for the graphics API a GPU timeline labels.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum GpuApi {
-        /// Vulkan.
-        Vulkan,
-        /// Direct3D 12.
-        Direct3D12,
-        /// OpenGL.
-        OpenGL,
-        /// Anything else.
-        Other,
-    }
-
     /// Compile-time no-op GPU timeline: never created without Tracy.
     pub struct GpuTimeline;
 
@@ -650,19 +651,6 @@ mod enabled {
         /// Compile-time no-op: there is nothing to let go of.
         #[inline(always)]
         pub fn discard(self) {}
-    }
-
-    /// One geometry pass's pipeline statistics.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct GpuStatistics {
-        /// Vertex shader invocations.
-        pub vertex_invocations: u64,
-        /// Primitives that entered clipping.
-        pub clipper_invocations: u64,
-        /// Primitives that survived clipping and were rasterized.
-        pub clipper_primitives_out: u64,
-        /// Fragment shader invocations.
-        pub fragment_invocations: u64,
     }
 
     /// Compile-time no-op: no profiler can connect without Tracy.

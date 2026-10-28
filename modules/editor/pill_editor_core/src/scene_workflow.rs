@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 // External crates
 use pill_engine::{
-    load_scene, render_standalone, save_scene, AssetDatabase, AssetGuid, AssetManager, Engine,
-    ImportRegistry, Resource, Scene, SceneLoad, World,
+    import_scene_document, load_scene, render_standalone, save_scene, scene_database, AssetGuid,
+    AssetManager, Engine, ImportRegistry, Resource, Scene, SceneLoad, World,
 };
 
 // Current crate
@@ -115,30 +115,11 @@ pub fn new_scene(engine: &mut Engine) -> usize {
 /// Returns why the file could not be imported, when it carries no guid, or
 /// when no asset types are registered to instantiate it.
 pub fn open_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
-    let registry = engine
-        .world()
-        .get_resource::<ImportRegistry>()
-        .cloned()
-        .ok_or_else(|| "no asset types are registered".to_string())?;
-    let (document, guid) = {
-        let assets = engine
-            .world_mut()
-            .get_resource_mut::<AssetManager>()
-            .ok_or_else(|| "the engine has no AssetManager".to_string())?;
-        let imported = assets
-            .import_standalone::<Scene>(Path::new(path))
-            .map_err(|error| format!("{error}"))?;
-        let document = assets
-            .get(imported.handle)
-            .map(|scene| scene.document().clone())
-            .ok_or_else(|| "the scene did not stay loaded".to_string())?;
-        // A standalone scene carries its guid in the file's own header.
-        let guid = imported
-            .guid
-            .ok_or_else(|| format!("the scene file `{path}` carries no guid"))?;
-        (document, guid)
-    };
-    let database = asset_database(&registry);
+    let (document, guid) = import_scene_document(engine, path)?;
+    // A standalone scene carries its guid in the file's own header; the editor
+    // needs it to save the file back under the same identity.
+    let guid = guid.ok_or_else(|| format!("the scene file `{path}` carries no guid"))?;
+    let database = scene_database(engine);
     clear_world(engine.world_mut());
     let report = load_scene(engine, &database, &document);
     let world = engine.world_mut();
@@ -289,15 +270,6 @@ fn existing_guid(engine: &mut Engine, path: &str) -> Option<AssetGuid> {
 /// A fresh guid for a scene file that does not exist yet.
 fn fresh_guid() -> Result<AssetGuid, String> {
     AssetGuid::random().map_err(|error| format!("no random source for a scene guid: {error}"))
-}
-
-/// The project's asset directory as the database a load resolves references
-/// through.
-fn asset_database(registry: &ImportRegistry) -> AssetDatabase {
-    match pill_engine::asset_store::mounted_directory() {
-        Some(root) => AssetDatabase::from_directory(&root, registry),
-        None => AssetDatabase::new(),
-    }
 }
 
 /// Destroy every entity, returning how many there were.

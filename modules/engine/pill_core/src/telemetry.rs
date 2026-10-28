@@ -156,33 +156,6 @@ impl LoggingConfig {
             .with_directive("naga", LevelFilter::WARN)
     }
 
-    /// Validate a complete `RUST_LOG`-style filter string strictly.
-    ///
-    /// The project's `logging:` settings reach the subscriber through
-    /// [`LoggingConfig::build_env_filter`]; this checks the same string early,
-    /// so a mistyped configuration fails loudly.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TelemetryError::InvalidFilter`] when any directive cannot
-    /// be parsed.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use pill_core::telemetry::LoggingConfig;
-    ///
-    /// LoggingConfig::validate_filter("engine=debug,wgpu=warn")
-    ///     .expect("valid RUST_LOG-style string");
-    /// ```
-    pub fn validate_filter(strict_filter: &str) -> Result<(), TelemetryError> {
-        EnvFilter::try_new(strict_filter).map_err(|source| TelemetryError::InvalidFilter {
-            filter: strict_filter.to_owned(),
-            source: Box::new(source),
-        })?;
-        Ok(())
-    }
-
     /// Build a strict [`EnvFilter`] from this configuration.
     ///
     /// # Errors
@@ -238,12 +211,13 @@ impl Default for LoggingConfig {
 /// [`set_timestamp_format`]. It is one process-wide value, held in
 /// `pill_core` so every DLL's log lines agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum TimestampFormat {
     /// `[dd.mm.yyyy hh:mm:ss:mmm]`, written `date_time` in settings.
-    DateTime,
+    DateTime = 1,
     /// `[hh:mm:ss:mmm]`, written `time` in settings. The default.
     #[default]
-    Time,
+    Time = 0,
 }
 
 impl TimestampFormat {
@@ -287,8 +261,21 @@ impl TimestampFormat {
     }
 }
 
-/// The active [`TimestampFormat`], as its position in the enum.
+/// The active [`TimestampFormat`], as the discriminant it declares.
 static TIMESTAMP_FORMAT: AtomicU8 = AtomicU8::new(TimestampFormat::Time as u8);
+
+/// Decodes a stored discriminant; `None` for a byte no variant wrote.
+///
+/// An exhaustive match is the point: a new format adds a stored value, and
+/// this is the one place that has to learn to read it back. A `!= DateTime`
+/// test would silently report the default instead.
+const fn timestamp_format_from_discriminant(value: u8) -> Option<TimestampFormat> {
+    match value {
+        0 => Some(TimestampFormat::Time),
+        1 => Some(TimestampFormat::DateTime),
+        _ => None,
+    }
+}
 
 /// Set how every later log line writes its time.
 pub fn set_timestamp_format(format: TimestampFormat) {
@@ -297,11 +284,7 @@ pub fn set_timestamp_format(format: TimestampFormat) {
 
 /// How log lines currently write their time.
 pub fn timestamp_format() -> TimestampFormat {
-    if TIMESTAMP_FORMAT.load(Ordering::Relaxed) == TimestampFormat::DateTime as u8 {
-        TimestampFormat::DateTime
-    } else {
-        TimestampFormat::Time
-    }
+    timestamp_format_from_discriminant(TIMESTAMP_FORMAT.load(Ordering::Relaxed)).unwrap_or_default()
 }
 
 /// Whether log lines end with the `file:line` that emitted them. Off by
@@ -442,15 +425,45 @@ where
 }
 
 /// `tracing` visitor that collects the message and the structured fields
-/// separately, so the formatter can lay them out in a fixed order whatever
-/// order the callsite declared them in.
-struct StyledFieldVisitor {
+/// separately, so a lane can lay them out in a fixed order whatever order the
+/// callsite declared them in.
+///
+/// Both renderers use it: the terminal and file lanes write the two parts into
+/// their line, and the capture lane joins them for the editor console. Sharing
+/// it is what keeps the console from showing a different line than the log file
+/// for the same event - which fields appear, and how a value reads.
+pub(crate) struct StyledFieldVisitor {
     ansi: bool,
     /// Drop the `log.*` fields of a bridged `log` record; the normalized
     /// metadata already carries what they hold.
     skip_log_fields: bool,
     message: String,
     fields: String,
+}
+
+impl StyledFieldVisitor {
+    /// A visitor for one event that styles nothing and drops the bridged
+    /// `log.*` fields when the record came through `log`.
+    pub(crate) fn plain(skip_log_fields: bool) -> Self {
+        Self {
+            ansi: false,
+            skip_log_fields,
+            message: String::new(),
+            fields: String::new(),
+        }
+    }
+
+    /// The line a reader sees: the message, then its fields after the same
+    /// two-space gap the terminal line puts between them.
+    pub(crate) fn into_line(self) -> String {
+        if self.fields.is_empty() {
+            return self.message;
+        }
+        if self.message.is_empty() {
+            return self.fields;
+        }
+        format!("{}  {}", self.message, self.fields)
+    }
 }
 
 impl Visit for StyledFieldVisitor {
@@ -542,8 +555,8 @@ type FileLaneArtifacts = (
 /// Build and install the engine telemetry subscriber stack.
 ///
 /// The terminal and file lanes are filtered independently and both are
-/// live-reloadable through [`TelemetryHandles::reload_logging`] and
-/// [`TelemetryHandles::reload_file`]. The Tracy lane only ever sees
+/// live-reloadable through [`TelemetryHandles::reload_logging_config`] and
+/// [`TelemetryHandles::reload_file_config`]. The Tracy lane only ever sees
 /// `profile::*` targets.
 #[derive(Debug, Clone, Default)]
 pub struct TelemetryBuilder {
@@ -770,46 +783,14 @@ impl TelemetryBuilder {
 #[derive(Debug, Clone)]
 pub struct TelemetryHandles {
     /// Reload handle for the terminal logging filter.
-    pub logging_filter: reload::Handle<EnvFilter, Registry>,
+    logging_filter: reload::Handle<EnvFilter, Registry>,
     /// Reload handle for the file logging filter, when a file lane exists.
-    pub file_filter: Option<reload::Handle<EnvFilter, TerminalStack>>,
+    file_filter: Option<reload::Handle<EnvFilter, TerminalStack>>,
     /// Keeps the file writer alive for the app lifetime.
     _file_guard: Option<Arc<FileGuard>>,
 }
 
 impl TelemetryHandles {
-    /// Reload the terminal logging filter from a strict filter string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TelemetryError::InvalidFilter`] when the replacement string
-    /// cannot be parsed; the previous filter stays active.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use pill_core::telemetry::TelemetryBuilder;
-    ///
-    /// let handles = TelemetryBuilder::new()
-    ///     .init()
-    ///     .expect("default configuration installs cleanly");
-    /// handles
-    ///     .reload_logging("engine=debug,wgpu=warn")
-    ///     .expect("replacement filter must parse");
-    /// ```
-    pub fn reload_logging(&self, filter: &str) -> Result<(), TelemetryError> {
-        let filter =
-            EnvFilter::try_new(filter).map_err(|source| TelemetryError::InvalidFilter {
-                filter: filter.to_owned(),
-                source: Box::new(source),
-            })?;
-        self.logging_filter
-            .reload(filter)
-            .map_err(|error| TelemetryError::Reload {
-                error: error.to_string(),
-            })
-    }
-
     /// Reload the terminal logging filter from a [`LoggingConfig`].
     ///
     /// # Errors
@@ -818,12 +799,7 @@ impl TelemetryHandles {
     /// configuration cannot be parsed, or [`TelemetryError::Reload`] when the
     /// reload itself fails; the previous filter stays active either way.
     pub fn reload_logging_config(&self, config: &LoggingConfig) -> Result<(), TelemetryError> {
-        let filter = config.build_env_filter()?;
-        self.logging_filter
-            .reload(filter)
-            .map_err(|error| TelemetryError::Reload {
-                error: error.to_string(),
-            })
+        reload_filter(&self.logging_filter, config.build_env_filter()?)
     }
 
     /// Reload the file logging filter from a [`LoggingConfig`]. Does nothing
@@ -836,38 +812,23 @@ impl TelemetryHandles {
         let Some(handle) = &self.file_filter else {
             return Ok(());
         };
-        let filter = config.build_env_filter()?;
-        handle
-            .reload(filter)
-            .map_err(|error| TelemetryError::Reload {
-                error: error.to_string(),
-            })
+        reload_filter(handle, config.build_env_filter()?)
     }
+}
 
-    /// Reload the file logging filter from a strict filter string.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TelemetryError::InvalidFilter`] when the replacement string
-    /// cannot be parsed, or [`TelemetryError::Reload`] when no file lane is
-    /// installed.
-    pub fn reload_file(&self, filter: &str) -> Result<(), TelemetryError> {
-        let Some(handle) = &self.file_filter else {
-            return Err(TelemetryError::Reload {
-                error: "no file logging lane installed".to_owned(),
-            });
-        };
-        let filter =
-            EnvFilter::try_new(filter).map_err(|source| TelemetryError::InvalidFilter {
-                filter: filter.to_owned(),
-                source: Box::new(source),
-            })?;
-        handle
-            .reload(filter)
-            .map_err(|error| TelemetryError::Reload {
-                error: error.to_string(),
-            })
-    }
+/// Replace one lane's live filter, reporting a refused reload.
+///
+/// Both lanes reload the same way, so the error mapping is written once here
+/// rather than once per lane.
+fn reload_filter<S>(
+    handle: &reload::Handle<EnvFilter, S>,
+    filter: EnvFilter,
+) -> Result<(), TelemetryError> {
+    handle
+        .reload(filter)
+        .map_err(|error| TelemetryError::Reload {
+            error: error.to_string(),
+        })
 }
 
 // =============================================================================
@@ -1106,13 +1067,6 @@ mod tests {
         assert!(config.build_env_filter().is_err());
     }
 
-    /// An invalid RUST_LOG-style string is a strict configuration error.
-    #[test]
-    fn invalid_filter_string_is_a_configuration_error() {
-        assert!(LoggingConfig::validate_filter("engine=info, ====").is_err());
-        assert!(LoggingConfig::validate_filter("engine=debug,wgpu=warn").is_ok());
-    }
-
     /// The terminal formatter renders level, target, and message text.
     #[test]
     fn terminal_formatter_renders_level_target_and_message() {
@@ -1162,6 +1116,18 @@ mod tests {
         let render = |format: TimestampFormat| moment.format(format.pattern()).to_string();
         assert_eq!(render(TimestampFormat::DateTime), "03.10.2026 09:05:07:042");
         assert_eq!(render(TimestampFormat::Time), "09:05:07:042");
+
+        // A byte no variant wrote is not a format, and the reader falls back to
+        // the default rather than guessing.
+        assert_eq!(
+            timestamp_format_from_discriminant(0),
+            Some(TimestampFormat::Time)
+        );
+        assert_eq!(
+            timestamp_format_from_discriminant(1),
+            Some(TimestampFormat::DateTime)
+        );
+        assert_eq!(timestamp_format_from_discriminant(2), None);
     }
 
     /// Color codes in a message reach no lane that cannot show them: a plain
@@ -1410,12 +1376,14 @@ mod tests {
             .expect("telemetry install should succeed");
         assert!(handles.file_filter.is_some());
 
-        assert!(handles.reload_logging("engine=debug,wgpu=warn").is_ok());
-        assert!(handles.reload_logging("engine=debug, ====").is_err());
-        assert!(handles.reload_logging("a=b=c").is_err());
-
-        assert!(handles.reload_file("engine=debug").is_ok());
-        assert!(handles.reload_file("engine=debug, ====").is_err());
+        // A valid configuration reloads both lanes; an unparsable directive is
+        // refused and leaves the live filters alone.
+        assert!(handles.reload_logging_config(&LoggingConfig::new()).is_ok());
+        assert!(handles.reload_file_config(&LoggingConfig::new()).is_ok());
+        let broken =
+            LoggingConfig::new().with_directive("a=b=c", tracing::level_filters::LevelFilter::INFO);
+        assert!(handles.reload_logging_config(&broken).is_err());
+        assert!(handles.reload_file_config(&broken).is_err());
         let _ = std::fs::remove_dir_all(directory);
     }
 

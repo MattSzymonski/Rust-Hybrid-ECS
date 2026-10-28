@@ -834,7 +834,7 @@ impl ReloadTransaction<'_> {
                     ids = ?stranded,
                     "dropping registrations from the failed generation; their storage factories point into the image being retired"
                 );
-                let dropped = engine.world_mut().drop_forgotten_component_ids(&stranded);
+                let dropped = engine.world_mut().retire_component_storage(&stranded);
                 debug!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     dropped, "removed rows that belonged to the failed generation"

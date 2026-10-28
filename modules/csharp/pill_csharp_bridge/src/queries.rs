@@ -176,28 +176,26 @@ fn ffi_get_component_chunk_guarded(
     // into the managed caller's output buffer.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
         Some(ComponentBinding::Managed { component_id, .. }) => {
-            // The stride comes from the live column, never from the binding's
-            // copy of the layout: `data` points into that column, and only the
-            // column describes what is stored there. A binding that drifted
-            // must not be able to make managed row arithmetic walk off the
-            // column; a missing column fails closed like an unknown component.
-            let Some((live_size, _)) = world.component_layout(component_id) else {
-                return 2;
-            };
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            let Some((archetype, data, len, ticks)) =
+            // The stride comes from the live column inside the accessor, never
+            // from the binding's copy of the layout: `data` points into that
+            // column, and only the column describes what is stored there. A
+            // binding that drifted must not be able to make managed row
+            // arithmetic walk off the column; a missing column fails closed
+            // like an unknown component.
+            let Some(chunk) =
                 world.descriptor_component_chunk_mut(component_id, chunk_index as usize)
             else {
                 return 0;
             };
             write_component_chunk(
                 output,
-                archetype,
-                data,
-                len,
-                live_size,
-                ticks.as_mut_ptr(),
+                chunk.archetype,
+                chunk.data,
+                chunk.len,
+                chunk.element_size,
+                chunk.ticks.as_mut_ptr(),
                 change_tick,
                 scope_token,
             );
@@ -210,21 +208,20 @@ fn ffi_get_component_chunk_guarded(
             let scope_token = active_scope_token();
             // The native twin of the descriptor path: serve the module's native
             // column as raw bytes so managed code and Rust share one storage.
-            let Some((archetype, data, len, element_size, ticks)) =
-                world.native_component_chunk_mut(component_id, chunk_index as usize)
+            let Some(chunk) = world.native_component_chunk_mut(component_id, chunk_index as usize)
             else {
                 return 0;
             };
-            if !module_binding_matches_live_column(component_id, size, element_size) {
+            if !module_binding_matches_live_column(component_id, size, chunk.element_size) {
                 return 2;
             }
             write_component_chunk(
                 output,
-                archetype,
-                data,
-                len,
-                element_size,
-                ticks.as_mut_ptr(),
+                chunk.archetype,
+                chunk.data,
+                chunk.len,
+                chunk.element_size,
+                chunk.ticks.as_mut_ptr(),
                 change_tick,
                 scope_token,
             );
@@ -324,23 +321,20 @@ fn ffi_get_archetype_chunk_guarded(
         Some(ComponentBinding::Managed { component_id, .. }) => {
             // As in the index-based callback: the stride is the live column's,
             // so a drifted binding cannot mislead managed row arithmetic.
-            let Some((live_size, _)) = world.component_layout(component_id) else {
-                return 2;
-            };
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            let Some((archetype, data, len, ticks)) =
+            let Some(chunk) =
                 world.descriptor_component_chunk_in_archetype(component_id, archetype_id)
             else {
                 return 0;
             };
             write_component_chunk(
                 output,
-                archetype,
-                data,
-                len,
-                live_size,
-                ticks.as_mut_ptr(),
+                chunk.archetype,
+                chunk.data,
+                chunk.len,
+                chunk.element_size,
+                chunk.ticks.as_mut_ptr(),
                 change_tick,
                 scope_token,
             );
@@ -351,21 +345,20 @@ fn ffi_get_archetype_chunk_guarded(
         }) => {
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            let Some((archetype, data, len, element_size, ticks)) =
-                world.native_component_chunk_in_archetype(component_id, archetype_id)
+            let Some(chunk) = world.native_component_chunk_in_archetype(component_id, archetype_id)
             else {
                 return 0;
             };
-            if !module_binding_matches_live_column(component_id, size, element_size) {
+            if !module_binding_matches_live_column(component_id, size, chunk.element_size) {
                 return 2;
             }
             write_component_chunk(
                 output,
-                archetype,
-                data,
-                len,
-                element_size,
-                ticks.as_mut_ptr(),
+                chunk.archetype,
+                chunk.data,
+                chunk.len,
+                chunk.element_size,
+                chunk.ticks.as_mut_ptr(),
                 change_tick,
                 scope_token,
             );

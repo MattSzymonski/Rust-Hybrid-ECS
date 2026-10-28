@@ -23,9 +23,7 @@
 //! frame.
 
 // Standard library
-use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::{Mutex, OnceLock};
 
 // External crates
 use trait_type_map::TraitAccessible;
@@ -100,7 +98,7 @@ impl<T: Asset> AssetReference<T> {
             return handle;
         }
         if let Some(guid) = self.guid {
-            if first_report_of(guid) {
+            if crate::saved_references::first_report_of(guid) {
                 pill_core::warn!(
                     "asset reference {guid} ({}) resolves to no loaded asset; using the invalid handle",
                     std::any::type_name::<T>()
@@ -109,17 +107,6 @@ impl<T: Asset> AssetReference<T> {
         }
         Handle::INVALID
     }
-}
-
-/// Whether `guid` is being reported as unresolved for the first time in this
-/// process; records it, so later calls return `false`.
-fn first_report_of(guid: AssetGuid) -> bool {
-    static REPORTED: OnceLock<Mutex<HashSet<AssetGuid>>> = OnceLock::new();
-    REPORTED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(guid)
 }
 
 // Written out by hand: a derive would require `T` to implement each trait,
@@ -263,8 +250,8 @@ mod tests {
     #[test]
     fn a_missing_guid_is_reported_once() {
         let guid = AssetGuid::parse("0000000000000000000000000000cafe").unwrap();
-        assert!(first_report_of(guid));
-        assert!(!first_report_of(guid));
-        assert!(!first_report_of(guid));
+        assert!(crate::saved_references::first_report_of(guid));
+        assert!(!crate::saved_references::first_report_of(guid));
+        assert!(!crate::saved_references::first_report_of(guid));
     }
 }

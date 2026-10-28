@@ -321,8 +321,8 @@ impl_system_param_tuple!(A, B);
 impl_system_param_tuple!(A, B, C);
 impl_system_param_tuple!(A, B, C, D);
 impl_system_param_tuple!(A, B, C, D, E);
-impl_system_param_tuple!(A, B, C, D, E, F1);
-impl_system_param_tuple!(A, B, C, D, E, F1, G);
+impl_system_param_tuple!(A, B, C, D, E, F);
+impl_system_param_tuple!(A, B, C, D, E, F, G);
 
 // =============================================================================
 // SystemParamFunction
@@ -351,9 +351,9 @@ pub trait SystemParamFunction<Input: SystemParam>: 'static {
 macro_rules! impl_system_param_function {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
-        impl<F, Output, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for F
+        impl<Function, Output, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for Function
         where
-            F: FnMut($($T),*) -> Output + Send + 'static,
+            Function: FnMut($($T),*) -> Output + Send + 'static,
             Output: SystemOutput,
         {
             type Output = Output;
@@ -385,8 +385,8 @@ impl_system_param_function!(A, B);
 impl_system_param_function!(A, B, C);
 impl_system_param_function!(A, B, C, D);
 impl_system_param_function!(A, B, C, D, E);
-impl_system_param_function!(A, B, C, D, E, F1);
-impl_system_param_function!(A, B, C, D, E, F1, G);
+impl_system_param_function!(A, B, C, D, E, F);
+impl_system_param_function!(A, B, C, D, E, F, G);
 
 // =============================================================================
 // IntoSystem

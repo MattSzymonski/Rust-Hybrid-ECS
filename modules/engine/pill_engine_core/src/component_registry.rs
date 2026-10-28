@@ -140,6 +140,39 @@ pub trait ComponentLayout {
 /// [`World::replace_value_type_layout_resolver`]: crate::World::replace_value_type_layout_resolver
 pub type ValueTypeLayoutResolver = fn(&str) -> Option<&'static [ComponentFieldDescriptor]>;
 
+/// The candidate name a `struct:<path>` field tag refers to.
+///
+/// The tag is the path as written at the field site, which is usually an
+/// imported short name (`Color`), so an exact match is tried first and a unique
+/// `::<path>` suffix second. An ambiguous suffix resolves to `None`: an opaque
+/// field is readable, a wrong one is not.
+///
+/// Both candidate sources - the world's registered component names and the
+/// facade's value-type names - answer through this one rule, so the two can
+/// never disagree about what a tag names.
+pub fn resolve_unique_name<'a>(
+    path: &str,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let suffix = format!("::{path}");
+    let mut suffix_hit = None;
+    let mut suffix_matches = 0usize;
+    for name in candidates {
+        if name == path {
+            return Some(name);
+        }
+        if name.ends_with(&suffix) {
+            suffix_matches += 1;
+            suffix_hit = Some(name);
+        }
+    }
+    if suffix_matches == 1 {
+        suffix_hit
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +187,32 @@ mod tests {
     #[derive(Clone, Debug)]
     struct TestPlainComponent;
     impl Component for TestPlainComponent {}
+
+    /// The name rule both candidate sources use: exact first, then a unique
+    /// suffix, and nothing when the suffix is ambiguous.
+    ///
+    /// An ambiguous tag must resolve to nothing rather than to one of the
+    /// candidates: a wrong layout renders a field the reader will edit as if it
+    /// were another type's.
+    #[test]
+    fn a_path_resolves_by_exact_name_then_a_unique_suffix() {
+        let names = [
+            "project::Color",
+            "project::paint::Color",
+            "project::Mesh",
+            "project::Grid",
+        ];
+        let resolve = |path: &str| resolve_unique_name(path, names.iter().copied());
+
+        assert_eq!(resolve("project::Mesh"), Some("project::Mesh"));
+        assert_eq!(resolve("Grid"), Some("project::Grid"), "a unique suffix");
+        assert_eq!(
+            resolve("Color"),
+            None,
+            "two components end with `::Color`, so neither is the answer"
+        );
+        assert_eq!(resolve("Texture"), None);
+    }
 
     /// A compile-time field layout registered with a component is retrievable,
     /// while a component registered without one reports no layout.

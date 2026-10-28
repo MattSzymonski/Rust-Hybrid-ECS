@@ -3058,7 +3058,7 @@ fn apply_asset_changes(host: &mut DevHost) {
                 let imported =
                     registry.import(assets, path, pill_engine::MetadataPolicy::CreateIfMissing);
                 match imported {
-                    Ok(outcome) if !outcome.previously_loaded => info!(
+                    Ok(outcome) if !outcome.previously_loaded() => info!(
                         target: telemetry_target::HOT_RELOAD,
                         asset = source.as_str(),
                         guid = %guid_text(outcome.guid),

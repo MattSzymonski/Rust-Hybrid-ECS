@@ -24,7 +24,7 @@ use pill_core::rayon;
 use super::filter::QueryFilter;
 use super::target::QueryTarget;
 use super::FilteredArchetypeRange;
-use crate::archetype::{Archetype, ArchetypeId};
+use crate::archetype::ArchetypeId;
 use crate::component::Tick;
 use crate::config;
 use crate::world::World;
@@ -188,15 +188,14 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
                 [("Entities in this archetype: {}", archetype.len())]
             );
 
-            // Cache archetype length and component storage pointers
+            // Cache archetype length and component storage pointers. The
+            // target takes the archetype mutably (it may look up a mutable
+            // column) and the filter takes it shared; the two calls run one
+            // after the other, so reborrowing `archetype` covers both.
             self.current_archetype_len = archetype.len();
-            let archetype_ptr = archetype as *mut Archetype;
-            self.current_state = Some(Q::init_state(&mut *archetype_ptr, self.this_run));
-            self.current_filter_state = Some(F::init_state(
-                &mut *archetype_ptr,
-                self.last_run,
-                self.this_run,
-            ));
+            self.current_state = Some(Q::init_state(archetype, self.this_run));
+            self.current_filter_state =
+                Some(F::init_state(archetype, self.last_run, self.this_run));
             self.current_entity_idx = 0;
             self.current_archetype_idx += 1;
         }
@@ -347,7 +346,7 @@ where
     pub fn entity_count(&self) -> usize {
         self.archetype_ranges
             .iter()
-            .map(|(_, _, _, len)| *len)
+            .map(|range| range.entity_count)
             .sum()
     }
 
@@ -377,9 +376,8 @@ where
 
     /// Execute closure on each entity in parallel.
     ///
-    /// Returns [`ParForEachResult::Tracked`] when `.tracked()` was called,
-    /// [`ParForEachResult::Untracked`] otherwise.
-    pub fn for_each<Func>(self, f: Func) -> ParForEachResult
+    /// Returns [`BatchStats`] when `.tracked()` was called, `None` otherwise.
+    pub fn for_each<Func>(self, f: Func) -> Option<BatchStats>
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
@@ -400,13 +398,32 @@ where
         let label = self.label;
         let iterator_timings = std::sync::Arc::clone(&self.iterator_timings);
 
-        // Step 3: dispatch to tracked or untracked parallel execution.
+        // Step 3: plan the dispatch once, then run it - sequentially below the
+        // parallel threshold, or as the plan's groups across the pool.
         let started = pill_core::platform::Instant::now();
-        let result = if self.tracked {
-            ParForEachResult::Tracked(self.execute_tracked(f, hint_ns))
-        } else {
-            self.execute_untracked(f, hint_ns);
-            ParForEachResult::Untracked
+        let stats = match self.plan(hint_ns) {
+            WorkPlan::Sequential {
+                total_entities,
+                threshold,
+            } => {
+                let processed = self.run_sequential(&f, total_entities, threshold);
+                self.tracked.then(|| BatchStats {
+                    num_threads: rayon::current_num_threads(),
+                    batch_count: 1,
+                    total_entities,
+                    min_batch_size: processed,
+                    max_batch_size: processed,
+                    avg_batch_size: processed as f64,
+                })
+            }
+            WorkPlan::Parallel(plan) => {
+                if self.tracked {
+                    Some(self.execute_tracked(&f, plan))
+                } else {
+                    self.execute_untracked(&f, plan);
+                    None
+                }
+            }
         };
         let elapsed_ns = started.elapsed().as_nanos() as u64;
 
@@ -440,49 +457,51 @@ where
             }
         }
 
-        result
+        stats
     }
 
-    /// Execute the closure on every matching entity (untracked).
+    /// Decides how one dispatch runs.
     ///
-    /// Uses an adaptive fallback: below `num_threads ×
-    /// MINIMUM_SLICE_SIZE` entities the iteration runs sequentially, avoiding
-    /// Rayon scheduling overhead for tiny workloads (common when many small
-    /// archetypes exist). Above it, equal flat work slices - `with_batch_size`
-    /// entities each, or else `default_entities_per_slice`, which
-    /// `ECS_SLICE_SIZE` overrides and which otherwise clamps to 256..4096 - are
-    /// grouped into chunks that [`rayon::scope`] spawns all at once, so every
-    /// thread pulls work from the shared pool.
-    fn execute_untracked<Func>(self, f: Func, hint_ns: u64)
-    where
-        Func: Fn(Q::Item<'_>) + Send + Sync,
-    {
-        // Step 1: sum precomputed entity counts - O(archetypes), negligible.
-        let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
-        let threshold =
-            rayon::current_num_threads() * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
+    /// The one place the parallel threshold, the slice size and the work-group
+    /// count are decided: below `pool threads × MINIMUM_SLICE_SIZE` the rows run
+    /// on the calling thread, otherwise they become equal flat slices grouped
+    /// into contiguous ranges that [`rayon::scope`] spawns all at once. Both
+    /// executors read the plan this returns, so they cannot disagree about the
+    /// split.
+    fn plan(&self, hint_ns: u64) -> WorkPlan {
+        let pool_threads = rayon::current_num_threads();
+        let total_entities: usize = self
+            .archetype_ranges
+            .iter()
+            .map(|range| range.entity_count)
+            .sum();
+        let threshold = pool_threads * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
 
-        // Step 2: adaptive fallback - run sequentially for tiny workloads,
-        // where the overhead of spawning Rayon tasks exceeds the work itself,
-        // especially with many tiny archetypes.
-        if total < threshold {
-            for (_, q_state, f_state, len) in &self.archetype_ranges {
-                for index in 0..*len {
-                    if F::matches(f_state, index) {
-                        f(Q::fetch_with_state(q_state, index));
-                    }
-                }
-            }
-            return;
+        // Adaptive fallback - run sequentially for tiny workloads, where the
+        // overhead of spawning Rayon tasks exceeds the work itself, especially
+        // with many tiny archetypes.
+        if total_entities < threshold {
+            return WorkPlan::Sequential {
+                total_entities,
+                threshold,
+            };
         }
 
-        // Step 3: build flat work slices distributed via rayon::scope.
+        let _zone = crate::profile_scope!(
+            "prepare batches",
+            [
+                ("Total entities to process: {}", total_entities),
+                ("Rayon thread pool size: {}", pool_threads)
+            ]
+        );
+
+        // Step 1: build flat work slices.
         //
         // Pre-build equal-sized entity-range slices, then group them into
-        // `iterator_work_group_count` contiguous chunks. Spawning all chunks
-        // at once through rayon::scope lets every thread pull tasks from a
-        // shared pool at the same time - no work-stealing cascade, no
-        // head-start for the owning thread, no late-arriving outliers.
+        // contiguous chunks. Spawning all chunks at once through rayon::scope
+        // lets every thread pull tasks from a shared pool at the same time - no
+        // work-stealing cascade, no head-start for the owning thread, no
+        // late-arriving outliers.
         let min_len = self
             .min_batch_size
             .unwrap_or(config::default_entities_per_slice(
@@ -491,39 +510,33 @@ where
 
         // Each flat work slice is an (archetype_index, start_entity, end_entity)
         // range; precompute the capacity so the Vec never reallocates on push.
-        let iterator_slice_count: usize = self
+        let slice_count: usize = self
             .archetype_ranges
             .iter()
-            .map(|(_, _, _, len)| len.div_ceil(min_len))
+            .map(|range| range.entity_count.div_ceil(min_len))
             .sum();
-        let mut iterator_slices: Vec<(usize, usize, usize)> =
-            Vec::with_capacity(iterator_slice_count);
-        for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
+        let mut slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
+        for (arch_idx, range) in self.archetype_ranges.iter().enumerate() {
             let mut chunk_start = 0;
-            while chunk_start < *len {
-                let chunk_end = (*len).min(chunk_start + min_len);
-                iterator_slices.push((arch_idx, chunk_start, chunk_end));
+            while chunk_start < range.entity_count {
+                let chunk_end = range.entity_count.min(chunk_start + min_len);
+                slices.push((arch_idx, chunk_start, chunk_end));
                 chunk_start = chunk_end;
             }
         }
 
-        let pool_threads = rayon::current_num_threads();
-
-        // Step 4: choose the work-group count from timing feedback when
+        // Step 2: choose the work-group count from timing feedback when
         // available, then pre-assign contiguous groups of slices so every
         // thread processes ALL its work back-to-back. Groups are stored as
-        // (start_index, count) ranges into the flat iterator_slices array
-        // instead of copying slices with to_vec().
-        let iterator_work_group_count =
-            iterator_work_group_count(hint_ns, pool_threads, iterator_slices.len());
-
-        let base = iterator_slices.len() / iterator_work_group_count;
-        let remainder = iterator_slices.len() % iterator_work_group_count;
-        let mut iterator_work_groups: Vec<(usize, usize)> =
-            Vec::with_capacity(iterator_work_group_count);
+        // (start_index, count) ranges into the flat slice list instead of
+        // copying slices with to_vec().
+        let group_count = iterator_work_group_count(hint_ns, pool_threads, slices.len());
+        let base = slices.len() / group_count;
+        let remainder = slices.len() % group_count;
+        let mut groups: Vec<(usize, usize)> = Vec::with_capacity(group_count);
         let mut offset = 0;
-        for iterator_work_group_index in 0..iterator_work_group_count {
-            let count = if iterator_work_group_index < remainder {
+        for group_index in 0..group_count {
+            let count = if group_index < remainder {
                 base + 1
             } else {
                 base
@@ -531,7 +544,7 @@ where
             if count == 0 {
                 break;
             }
-            iterator_work_groups.push((offset, count));
+            groups.push((offset, count));
             offset += count;
         }
 
@@ -539,40 +552,89 @@ where
             "rayon parallel iteration prepared: {} pool threads, {} archetype ranges totalling {} entities, sliced into {} work items, grouped into {} thread assignments (system splitting hint {} ns)",
             pool_threads,
             self.archetype_ranges.len(),
-            total,
-            iterator_slices.len(),
-            iterator_work_groups.len(),
+            total_entities,
+            slices.len(),
+            groups.len(),
             hint_ns,
         );
 
-        let ranges_ref = &self.archetype_ranges;
-        let func_ref = &f;
-        let scope_label = self.label;
-        let iterator_slices_ref = &iterator_slices;
+        WorkPlan::Parallel(ParallelPlan {
+            slices,
+            groups,
+            total_entities,
+            pool_threads,
+        })
+    }
 
-        // Step 5: wrap the scope itself so the whole parallel section appears
+    /// Runs the rows on the calling thread - the fallback below the parallel
+    /// threshold - and returns how many rows it visited.
+    ///
+    /// Both modes come through here, so the fallback is reported the same way
+    /// whichever result the caller asked for.
+    #[cfg_attr(not(feature = "profiling"), allow(unused_variables))]
+    fn run_sequential<Func>(&self, f: &Func, total_entities: usize, threshold: usize) -> usize
+    where
+        Func: Fn(Q::Item<'_>),
+    {
+        let _zone = crate::profile_scope!("sequential iteration below the parallel threshold");
+        crate::profile_message!(
+            "rayon workload below parallel threshold: {} entities is less than {} ({} threads x {}), falling back to sequential iteration on the calling thread",
+            total_entities,
+            threshold,
+            rayon::current_num_threads(),
+            crate::config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE,
+        );
+
+        // The same row walk the parallel groups use, one whole-archetype slice
+        // at a time, so the two paths cannot diverge on filtering or fetching.
+        let mut visited = 0;
+        for (arch_idx, range) in self.archetype_ranges.iter().enumerate() {
+            visited += run_group::<Q, F, _>(
+                &self.archetype_ranges,
+                &[(arch_idx, 0, range.entity_count)],
+                f,
+            );
+        }
+        visited
+    }
+
+    /// Execute the closure on every matching entity (untracked).
+    ///
+    /// Runs the plan [`plan`](Self::plan) produced: equal flat work slices -
+    /// `with_batch_size` entities each, or else `default_entities_per_slice`,
+    /// which `ECS_SLICE_SIZE` overrides and which otherwise clamps to
+    /// 256..4096 - grouped into chunks that [`rayon::scope`] spawns all at
+    /// once, so every thread pulls work from the shared pool.
+    fn execute_untracked<Func>(&self, f: &Func, plan: ParallelPlan)
+    where
+        Func: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        let ranges_ref = &self.archetype_ranges;
+        let func_ref = f;
+        let scope_label = self.label;
+        let iterator_slices_ref = &plan.slices;
+
+        // Step 1: wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
         let _zone_scope = if let Some(sys) = scope_label {
             crate::profile_scope!(
                 "{} parallel scope",
                 sys;
-                [("Total entities to process: {}", total), ("Rayon thread pool size: {}", pool_threads)]
+                [("Total entities to process: {}", plan.total_entities), ("Rayon thread pool size: {}", plan.pool_threads)]
             )
         } else {
             crate::profile_scope!(
                 "parallel scope",
                 [
-                    ("Total entities to process: {}", total),
-                    ("Rayon thread pool size: {}", pool_threads)
+                    ("Total entities to process: {}", plan.total_entities),
+                    ("Rayon thread pool size: {}", plan.pool_threads)
                 ]
             )
         };
 
         rayon::scope(|scope| {
-            let iterator_work_group_total = iterator_work_groups.len();
-            for (iterator_work_group_index, &(start_idx, count)) in
-                iterator_work_groups.iter().enumerate()
-            {
+            let iterator_work_group_total = plan.groups.len();
+            for (iterator_work_group_index, &(start_idx, count)) in plan.groups.iter().enumerate() {
                 scope.spawn(move |_| {
                     let iterator_work_group_slice =
                         &iterator_slices_ref[start_idx..start_idx + count];
@@ -597,181 +659,64 @@ where
                             [("{} entities in this group", iterator_work_group_slice.iter().map(|(_, start, end)| end - start).sum::<usize>())]
                         )
                     };
-                    for &(arch_idx, start, end) in iterator_work_group_slice {
-                        let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
-                        for index in start..end {
-                            if F::matches(f_state, index) {
-                                func_ref(Q::fetch_with_state(q_state, index));
-                            }
-                        }
-                    }
+                    run_group::<Q, F, _>(ranges_ref, iterator_work_group_slice, func_ref);
                 });
             }
         });
 
         crate::profile_message!(
             "rayon parallel iteration finished: {} entities processed across all work groups",
-            total,
+            plan.total_entities,
         );
     }
 
     /// Execute the closure on every matching entity, collecting
     /// [`BatchStats`] about how Rayon distributed the work.
     ///
-    /// Same adaptive fallback as [`execute_untracked`]: sequential below
-    /// `num_threads × MINIMUM_SLICE_SIZE` entities, flat work slices above.
-    ///
-    /// Tracking adds per-group atomics (count, min, max) so the caller can
-    /// inspect load distribution; each spawned work group reports one stat.
-    ///
-    /// [`execute_untracked`]: Self::execute_untracked
-    fn execute_tracked<Func>(self, f: Func, hint_ns: u64) -> BatchStats
+    /// Runs the same plan [`execute_untracked`](Self::execute_untracked) runs;
+    /// tracking adds per-group atomics (count, min, max) so the caller can
+    /// inspect load distribution, and each spawned work group reports one stat.
+    fn execute_tracked<Func>(&self, f: &Func, plan: ParallelPlan) -> BatchStats
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        let num_threads = rayon::current_num_threads();
-        let total_entities: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
-        let threshold = num_threads * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
-
-        // Step 1: adaptive fallback - run sequentially for tiny workloads.
-        if total_entities < threshold {
-            let mut processed = 0usize;
-            for (_, q_state, f_state, len) in &self.archetype_ranges {
-                for index in 0..*len {
-                    if F::matches(f_state, index) {
-                        f(Q::fetch_with_state(q_state, index));
-                    }
-                    processed += 1;
-                }
-            }
-            crate::profile_message!(
-                "rayon workload below parallel threshold: {} entities is less than {} ({} threads x 256), falling back to sequential iteration on the calling thread",
-                total_entities,
-                threshold,
-                num_threads,
-            );
-            return BatchStats {
-                total_entities,
-                batch_count: 1,
-                min_batch_size: processed,
-                max_batch_size: processed,
-                avg_batch_size: processed as f64,
-                num_threads,
-            };
-        }
-        let _zone_prepare = crate::profile_scope!(
-            "prepare batches",
-            [
-                ("Total entities to process: {}", total_entities),
-                ("Rayon thread pool size: {}", num_threads)
-            ]
-        );
-
-        // Step 2: build flat work slices distributed via rayon::scope.
-        //
-        // Pre-building equal-sized slices and spawning them as scope tasks
-        // lets every thread pull work from a shared pool simultaneously,
-        // eliminating the work-stealing cascade and late-arriving outliers.
-        let min_len = self
-            .min_batch_size
-            .unwrap_or(config::default_entities_per_slice(
-                self.total_components_size,
-            ));
-        let system_label = self.label;
-
-        // Each flat work slice is an (archetype_index, start_entity, end_entity)
-        // range; precompute the capacity so the Vec never reallocates on push.
-        let iterator_slice_count: usize = self
-            .archetype_ranges
-            .iter()
-            .map(|(_, _, _, len)| len.div_ceil(min_len))
-            .sum();
-        let mut iterator_slices: Vec<(usize, usize, usize)> =
-            Vec::with_capacity(iterator_slice_count);
-        for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
-            let mut chunk_start = 0;
-            while chunk_start < *len {
-                let chunk_end = (*len).min(chunk_start + min_len);
-                iterator_slices.push((arch_idx, chunk_start, chunk_end));
-                chunk_start = chunk_end;
-            }
-        }
-
-        // Step 3: choose the work-group count from timing feedback when
-        // available, then pre-assign contiguous groups so every thread
-        // processes all its work back-to-back - no per-chunk queue
-        // contention, no idle gaps between chunks on the same thread.
-        // Groups are stored as (start_index, count) ranges into the flat
-        // iterator_slices array instead of copying slices with to_vec().
-        let iterator_work_group_count =
-            iterator_work_group_count(hint_ns, num_threads, iterator_slices.len());
-
-        let base = iterator_slices.len() / iterator_work_group_count;
-        let remainder = iterator_slices.len() % iterator_work_group_count;
-        let mut iterator_work_groups: Vec<(usize, usize)> =
-            Vec::with_capacity(iterator_work_group_count);
-        let mut offset = 0;
-        for iterator_work_group_index in 0..iterator_work_group_count {
-            let count = if iterator_work_group_index < remainder {
-                base + 1
-            } else {
-                base
-            };
-            if count == 0 {
-                break;
-            }
-            iterator_work_groups.push((offset, count));
-            offset += count;
-        }
-
         let batch_count = Arc::new(AtomicUsize::new(0));
         let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
         let max_batch = Arc::new(AtomicUsize::new(0));
-        drop(_zone_prepare);
         let _zone_dist = crate::profile_scope!(
             "start distribution",
             [
-                ("Work slices prepared: {}", iterator_slices.len()),
-                ("Thread groups assigned: {}", iterator_work_groups.len())
+                ("Work slices prepared: {}", plan.slices.len()),
+                ("Thread groups assigned: {}", plan.groups.len())
             ]
         );
 
-        crate::profile_message!(
-            "rayon tracked parallel iteration prepared: {} pool threads, {} total entities across {} work slices, grouped into {} thread assignments (system splitting hint {} ns)",
-            num_threads,
-            total_entities,
-            iterator_slices.len(),
-            iterator_work_groups.len(),
-            hint_ns,
-        );
-
         let ranges_ref = &self.archetype_ranges;
-        let func_ref = &f;
-        let iterator_slices_ref = &iterator_slices;
+        let func_ref = f;
+        let system_label = self.label;
+        let iterator_slices_ref = &plan.slices;
 
-        // Step 4: wrap the scope itself so the whole parallel section appears
-        // as a single named zone in Tracy.
+        // Wrap the scope itself so the whole parallel section appears as a
+        // single named zone in Tracy.
         let _zone_scope = if let Some(sys) = system_label {
             crate::profile_scope!(
                 "{} parallel scope",
                 sys;
-                [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+                [("Total entities to process: {}", plan.total_entities), ("Rayon thread pool size: {}", plan.pool_threads)]
             )
         } else {
             crate::profile_scope!(
                 "parallel scope",
                 [
-                    ("Total entities to process: {}", total_entities),
-                    ("Rayon thread pool size: {}", num_threads)
+                    ("Total entities to process: {}", plan.total_entities),
+                    ("Rayon thread pool size: {}", plan.pool_threads)
                 ]
             )
         };
 
         rayon::scope(|scope| {
-            let iterator_work_group_total = iterator_work_groups.len();
-            for (iterator_work_group_index, &(start_idx, count)) in
-                iterator_work_groups.iter().enumerate()
-            {
+            let iterator_work_group_total = plan.groups.len();
+            for (iterator_work_group_index, &(start_idx, count)) in plan.groups.iter().enumerate() {
                 let batch_count = &batch_count;
                 let min_batch = &min_batch;
                 let max_batch = &max_batch;
@@ -797,16 +742,7 @@ where
                     };
                     zone.text(format_args!("thread {:?}", std::thread::current().id()));
 
-                    let mut processed = 0usize;
-                    for &(arch_idx, start, end) in iterator_work_group_slice {
-                        let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
-                        for index in start..end {
-                            if F::matches(f_state, index) {
-                                func_ref(Q::fetch_with_state(q_state, index));
-                            }
-                            processed += 1;
-                        }
-                    }
+                    let processed = run_group::<Q, F, _>(ranges_ref, iterator_work_group_slice, func_ref);
 
                     zone.text(format_args!("{} processed", processed));
 
@@ -823,26 +759,26 @@ where
 
         crate::profile_message!(
             "rayon tracked parallel iteration completed: {} total entities distributed across {} rayon tasks (pool has {} threads), batch sizes min {} max {} avg {:.1} entities per task",
-            total_entities,
+            plan.total_entities,
             batch_count,
-            num_threads,
+            plan.pool_threads,
             min_batch_size,
             max_batch_size,
             if batch_count > 0 {
-                total_entities as f64 / batch_count as f64
+                plan.total_entities as f64 / batch_count as f64
             } else {
                 0.0
             }
         );
 
         BatchStats {
-            num_threads,
+            num_threads: plan.pool_threads,
             batch_count,
-            total_entities,
+            total_entities: plan.total_entities,
             min_batch_size: if batch_count > 0 { min_batch_size } else { 0 },
             max_batch_size,
             avg_batch_size: if batch_count > 0 {
-                total_entities as f64 / batch_count as f64
+                plan.total_entities as f64 / batch_count as f64
             } else {
                 0.0
             },
@@ -851,55 +787,60 @@ where
 }
 
 // =============================================================================
-// ParForEachResult
+// Work planning
 // =============================================================================
 
-/// Result of parallel for_each execution.
-#[derive(Debug, Clone, Default)]
-pub enum ParForEachResult {
-    /// Parallel iteration ran without collecting batch statistics.
-    #[default]
-    Untracked,
-    /// Parallel iteration collected [`BatchStats`] about work distribution.
-    Tracked(BatchStats),
+/// How one parallel dispatch runs, decided once per `for_each`.
+enum WorkPlan {
+    /// Below the parallel threshold: walk the rows on the calling thread.
+    Sequential {
+        /// Every row in every matching archetype.
+        total_entities: usize,
+        /// `pool threads × MINIMUM_SLICE_SIZE`, the parallel threshold.
+        threshold: usize,
+    },
+    /// Split the rows into flat slices and run the groups on the pool.
+    Parallel(ParallelPlan),
 }
 
-impl ParForEachResult {
-    /// Get batch stats if tracking was enabled.
-    pub fn stats(self) -> Option<BatchStats> {
-        match self {
-            ParForEachResult::Tracked(stats) => Some(stats),
-            ParForEachResult::Untracked => None,
-        }
-    }
-
-    /// Unwrap the batch stats, panicking if the iteration was not tracked.
-    ///
-    /// # Panics
-    ///
-    /// Panics if this value is [`ParForEachResult::Untracked`], i.e. the
-    /// iteration was not executed via [`ParQueryIter::tracked`].
-    pub fn unwrap(self) -> BatchStats {
-        match self {
-            ParForEachResult::Tracked(stats) => stats,
-            ParForEachResult::Untracked => panic!("for_each was not tracked"),
-        }
-    }
+/// One parallel dispatch's slices and the contiguous groups of them.
+struct ParallelPlan {
+    /// Each slice is an `(archetype index, start row, end row)` range.
+    slices: Vec<(usize, usize, usize)>,
+    /// Each group is `(offset into `slices`, slice count)`; all its slices run
+    /// back-to-back on one Rayon task.
+    groups: Vec<(usize, usize)>,
+    /// Every row in every matching archetype, before the row filter.
+    total_entities: usize,
+    /// Pool size the plan was sized for.
+    pool_threads: usize,
 }
 
-impl From<ParForEachResult> for Option<BatchStats> {
-    fn from(result: ParForEachResult) -> Self {
-        result.stats()
-    }
-}
-
-impl std::fmt::Display for ParForEachResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ParForEachResult::Tracked(stats) => write!(f, "{}", stats),
-            ParForEachResult::Untracked => write!(f, "Untracked"),
+/// Walks one work group's slices and returns how many rows it visited.
+///
+/// The row loop every dispatch path shares: resolve the archetype's cached
+/// states by index, then fetch each row the filter admits.
+fn run_group<Q, F, Func>(
+    ranges: &[FilteredArchetypeRange<Q::State, F::State>],
+    slices: &[(usize, usize, usize)],
+    f: &Func,
+) -> usize
+where
+    Q: QueryTarget,
+    F: QueryFilter,
+    Func: Fn(Q::Item<'_>),
+{
+    let mut visited = 0;
+    for &(arch_idx, start, end) in slices {
+        let range = &ranges[arch_idx];
+        for index in start..end {
+            if F::matches(&range.filter_state, index) {
+                f(Q::fetch_with_state(&range.target_state, index));
+            }
+            visited += 1;
         }
     }
+    visited
 }
 
 /// How many Rayon tasks to split a parallel iteration into.

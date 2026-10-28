@@ -94,11 +94,15 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// Sum of all queried component sizes in bytes - cached for slice clamping.
     total_components_size: usize,
     /// Cached list of matching archetype IDs. Valid when
-    /// `cached_generation == world.archetype_generation`.
+    /// `cached_generation == Some(world.archetype_generation)`.
     cached_matches: Vec<ArchetypeId>,
     /// Archetype generation captured when `cached_matches` was last
-    /// refreshed; the cache is stale whenever this differs from the world's.
-    cached_generation: u64,
+    /// refreshed, or `None` before the first refresh. The cache is stale
+    /// whenever this differs from the world's generation.
+    ///
+    /// An `Option` rather than a zero sentinel: `0` is also a generation a
+    /// fresh world reports, so "never filled" needs a state of its own.
+    cached_generation: Option<u64>,
     /// Carries the `Q` and `F` type parameters so the query owns them for
     /// variance and drop-check purposes.
     _phantom: std::marker::PhantomData<(Q, F)>,
@@ -128,24 +132,31 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// assert_eq!(query.iter_mut().count(), 0);
     /// ```
     pub fn new(world: &'w mut World) -> Self {
-        // Step 1: Measure construction time with a Tracy profile scope.
+        // Step 1: Describe the target once. The aliasing check, the target
+        // mask, the per-slice byte cost and the profile detail all read this
+        // one description, so no two of them can disagree about what the
+        // query touches.
+        let (reads, writes) = Q::report_component_access();
+        let component_ids: Vec<ComponentId> = reads.iter().chain(writes.iter()).copied().collect();
+        let requested_filter_pairs = F::archetype_filter_pairs();
+
+        // Step 2: Measure construction time with a Tracy profile scope.
         let _zone = crate::profile_scope!(
             "create query",
             [
-                ("Query target component types: {}", Q::component_ids().len()),
+                ("Query target component types: {}", component_ids.len()),
                 (
                     "Filter archetype mask pairs: {}",
-                    F::archetype_filter_pairs().len()
+                    requested_filter_pairs.len()
                 )
             ]
         );
 
-        // Step 2: Refuse an aliasing target here, at construction. System
+        // Step 3: Refuse an aliasing target here, at construction. System
         // registration checks the same predicate, but a query built directly -
         // by user code or generated code calling `Query::new` - never passes
         // through registration, and an aliasing target is undefined behavior
         // the moment iteration starts: the borrows overlap in one row.
-        let (reads, writes) = Q::report_component_access();
         if let Some(aliased) = crate::query::target::find_aliasing_component(&reads, &writes) {
             panic!(
                 "query target `{}` reads and writes the same component (`{aliased:?}`); \
@@ -154,18 +165,20 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             );
         }
 
-        // Step 3: Build the target and filter masks from the component registry.
+        // Step 4: Build the target and filter masks from the component registry.
         // A target id the registry cannot resolve is *recorded*, not skipped:
         // skipping would drop the requirement and let archetypes that cannot
         // serve the target match, which panics once iteration reaches a column
         // that is not there.
-        let (target_mask, unresolved_target) = match Self::build_target_mask(world) {
+        let (target_mask, unresolved_target) = match Self::build_target_mask(world, &component_ids)
+        {
             Ok(mask) => (mask, None),
             Err(component_id) => (ComponentMask::empty(), Some(component_id)),
         };
-        let (filter_pairs, filters_unsatisfiable) = Self::build_filter_mask_pairs(world);
+        let (filter_pairs, filters_unsatisfiable) =
+            Self::build_filter_mask_pairs(world, requested_filter_pairs);
 
-        // Step 4: Refuse a stale reader of a shared component: the binary
+        // Step 5: Refuse a stale reader of a shared component: the binary
         // running this query was built against a field layout the registry does
         // not hold. Checked once here per query, not per row.
         let declared_shared = Q::declared_shared_schemas();
@@ -175,17 +188,19 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             world.find_stale_shared_reader(&declared_shared, std::any::type_name::<Q>())
         };
 
-        // Step 5: Sum the sizes of every fetched component type, clamped to
+        // Step 6: Sum the sizes of every fetched component type, clamped to
         // a minimum of 8 bytes. `default_entities_per_slice` divides by this
         // value, so the clamp both avoids division by zero and keeps the
-        // per-slice byte volume bounded.
-        let total_components_size = Q::component_ids()
+        // per-slice byte volume bounded. Sizes come from the factories that
+        // build the columns, which is where a component's storage shape is
+        // recorded.
+        let total_components_size = component_ids
             .iter()
-            .filter_map(|id| world.component_registry.get_size(id))
+            .filter_map(|id| world.component_layout(*id).map(|(size, _)| size))
             .sum::<usize>()
             .max(8);
 
-        // Step 6: Assemble the query with empty caches; the first iterator
+        // Step 7: Assemble the query with empty caches; the first iterator
         // creation populates them.
         Self {
             world,
@@ -196,7 +211,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             filters_unsatisfiable,
             total_components_size,
             cached_matches: Vec::new(),
-            cached_generation: 0,
+            cached_generation: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -210,14 +225,18 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     }
 
     /// Builds the component mask for the query target from the world's
-    /// component registry. Called once during [`new`](Self::new).
+    /// component registry. Called once during [`new`](Self::new) with the
+    /// target's one description.
     ///
     /// Returns the first id the registry cannot resolve: a target id with no
     /// bit cannot be fetched, and the caller turns that into a query that
     /// matches no archetype.
-    fn build_target_mask(world: &World) -> Result<ComponentMask, ComponentId> {
+    fn build_target_mask(
+        world: &World,
+        component_ids: &[ComponentId],
+    ) -> Result<ComponentMask, ComponentId> {
         let mut mask = ComponentMask::empty();
-        for component_id in &Q::component_ids() {
+        for component_id in component_ids {
             match world.component_registry.get_bit(component_id) {
                 Some(bit) => mask.set(bit),
                 None => return Err(*component_id),
@@ -227,25 +246,27 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     }
 
     /// Builds the filter mask pairs from the world's component registry.
-    /// Called once during [`new`](Self::new).
+    /// Called once during [`new`](Self::new) with the pairs the filter was
+    /// already asked for.
     ///
     /// Returns the satisfiable pairs and whether *every* requested pair was
     /// unsatisfiable. An include-side id the registry cannot resolve makes its
     /// pair impossible - no archetype holds a component that was never
     /// registered - so the pair is dropped; an unresolved *exclude* id stays
     /// harmless, since no archetype can hold it either.
-    #[allow(clippy::type_complexity)]
-    fn build_filter_mask_pairs(world: &World) -> (Vec<(ComponentMask, ComponentMask)>, bool) {
+    fn build_filter_mask_pairs(
+        world: &World,
+        requested: Vec<(Vec<ComponentId>, Vec<ComponentId>)>,
+    ) -> (Vec<(ComponentMask, ComponentMask)>, bool) {
         let _zone = crate::profile_scope!(
             "build component query filter mask",
             [(
                 "Filter archetype mask pairs to evaluate: {}",
-                F::archetype_filter_pairs().len()
+                requested.len()
             )]
         );
 
         let registry = &world.component_registry;
-        let requested = F::archetype_filter_pairs();
         let requested_count = requested.len();
         let mut unsatisfiable = 0;
         let pairs: Vec<(ComponentMask, ComponentMask)> = requested
@@ -330,14 +351,14 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
 
         // Step 2: Serve the cached list whenever the world's archetype
         // generation is unchanged since the last cache fill.
-        if self.cached_generation != self.world.archetype_generation {
+        if self.cached_generation != Some(self.world.archetype_generation) {
             // Step 3: Rescan every archetype, keeping only those that match
             // this query's target mask and filter pairs.
             let _zone = crate::profile_scope!(
                 "find matching archetypes",
                 [
                     ("All archetypes in world: {}", self.world.archetypes.len()),
-                    ("Cached archetype generation: {}", self.cached_generation),
+                    ("Cached archetype generation: {:?}", self.cached_generation),
                     (
                         "Current archetype generation: {}",
                         self.world.archetype_generation
@@ -356,7 +377,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             // Sort so iteration order is deterministic across runs.
             matching.sort();
             crate::profile_message!(
-                "query archetype cache miss: generation {} -> {}, rescanned {} archetypes -> {} matched for this query",
+                "query archetype cache miss: generation {:?} -> {}, rescanned {} archetypes -> {} matched for this query",
                 self.cached_generation,
                 self.world.archetype_generation,
                 self.world.archetypes.len(),
@@ -365,7 +386,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
 
             // Step 4: Refresh the cache and the generation it was built from.
             self.cached_matches = matching;
-            self.cached_generation = self.world.archetype_generation;
+            self.cached_generation = Some(self.world.archetype_generation);
         }
         &self.cached_matches
     }
@@ -534,18 +555,21 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = matching_ids
             .iter()
             .filter_map(|id| {
-                // `get_mut` already hands out the `&mut Archetype` both
-                // `init_state` calls take; reborrowing it implicitly is enough,
-                // and the two calls run one after the other, so no raw-pointer
+                // `get_mut` already hands out the `&mut Archetype` the target's
+                // `init_state` takes; reborrowing it implicitly is enough, and
+                // the filter's call follows sequentially, so no raw-pointer
                 // round-trip (or its SAFETY prose) is needed here.
                 self.world.archetypes.get_mut(id).map(|arch| {
-                    let q_state = Q::init_state(arch, this_run);
-                    let f_state = F::init_state(arch, last_run, this_run);
-                    let len = arch.len();
-                    (*id, q_state, f_state, len)
+                    let target_state = Q::init_state(arch, this_run);
+                    let filter_state = F::init_state(arch, last_run, this_run);
+                    FilteredArchetypeRange {
+                        target_state,
+                        filter_state,
+                        entity_count: arch.len(),
+                    }
                 })
             })
-            .filter(|(_, _, _, len)| *len > 0)
+            .filter(|range| range.entity_count > 0)
             .collect();
         // Matching IDs are already sorted by matching_archetype_ids(), and
         // filter_map preserves iteration order, so archetype_ranges is

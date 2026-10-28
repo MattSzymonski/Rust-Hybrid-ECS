@@ -331,31 +331,20 @@ fn a_change_tick_written_by_one_copy_is_seen_by_the_other() {
 /// would race on the same rows.
 ///
 /// This is a soundness property rather than a correctness one, and it is why
-/// binding and mask-sharing cannot be separated: both copies resolve to one
-/// bit at the moment they resolve to one column, never later.
+/// binding and conflict detection cannot be separated: both copies resolve to
+/// one id at the moment they resolve to one column, never later.
 #[test]
 fn two_systems_writing_through_different_copies_conflict() {
     use pill_engine::scheduler::SystemAccess;
 
-    let mut world = World::new();
-    world.register_component::<ProjectSpline>();
-    world.register_component::<ModuleSpline>();
-    let registry = world.component_registry();
-
     // The project's system writes the component under its own type.
     let mut project_access = SystemAccess::new();
     project_access.add_write(ComponentId::of::<ProjectSpline>());
-    project_access.build_component_masks(registry);
 
     // The module's system writes it under its own type.
     let mut module_access = SystemAccess::new();
     module_access.add_write(ComponentId::of::<ModuleSpline>());
-    module_access.build_component_masks(registry);
 
-    assert!(
-        project_access.masks_are_complete() && module_access.masks_are_complete(),
-        "both accesses resolved to registry bits, so the fast path applies"
-    );
     assert!(
         project_access.conflicts_with(&module_access),
         "two writes to one column must never be batched in parallel"
@@ -364,19 +353,12 @@ fn two_systems_writing_through_different_copies_conflict() {
     // A write and a read of the same shared component conflict as well.
     let mut reader_access = SystemAccess::new();
     reader_access.add_read(ComponentId::of::<ModuleSpline>());
-    reader_access.build_component_masks(registry);
     assert!(project_access.conflicts_with(&reader_access));
 
     // An unrelated component still does not conflict, so the check has not
     // simply become "everything conflicts".
-    world.register_component::<PlainMarker>();
-    let registry = world.component_registry();
     let mut unrelated_access = SystemAccess::new();
     unrelated_access.add_write(ComponentId::of::<PlainMarker>());
-    unrelated_access.build_component_masks(registry);
-    let mut project_access = SystemAccess::new();
-    project_access.add_write(ComponentId::of::<ProjectSpline>());
-    project_access.build_component_masks(registry);
     assert!(!project_access.conflicts_with(&unrelated_access));
 }
 

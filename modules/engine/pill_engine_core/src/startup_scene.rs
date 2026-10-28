@@ -22,15 +22,11 @@
 //! unreadable scene must not stop a project from starting with its own scene.
 
 // Standard library
-use std::path::Path;
 
 // Current crate
-use crate::asset::AssetManager;
-use crate::asset_database::AssetDatabase;
-use crate::asset_import_registry::ImportRegistry;
 use crate::engine::Engine;
 use crate::resource::Resource;
-use crate::scene::{load_scene, Scene, SceneLoad};
+use crate::scene::SceneLoad;
 use crate::world::World;
 
 /// A scene the front end asked the engine to load before the project starts.
@@ -68,32 +64,14 @@ pub fn apply_startup_scene(engine: &mut Engine) -> Option<Result<SceneLoad, Stri
     Some(load_startup_scene(engine, &queued.path))
 }
 
-/// Load the scene at `path` into `engine`, resolving it below the mounted asset
-/// directory.
+/// Load the scene at `path` into `engine`, through the one scene loader every
+/// entry point shares.
+///
+/// References resolve through the world's asset database when the host built
+/// one - a shipped pack's index, or a host that indexed the project - so a
+/// guid-only reference resolves in a pack build, where no directory is mounted.
 fn load_startup_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
-    let registry = engine
-        .world()
-        .get_resource::<ImportRegistry>()
-        .cloned()
-        .ok_or_else(|| "no asset types are registered".to_string())?;
-    if !registry.is_standalone_extension(extension_of(path)) {
-        return Err(format!("`{path}` is not a scene file"));
-    }
-    let document = {
-        let assets = engine
-            .world_mut()
-            .get_resource_mut::<AssetManager>()
-            .ok_or_else(|| "the engine has no AssetManager".to_string())?;
-        let imported = assets
-            .import_standalone::<Scene>(Path::new(path))
-            .map_err(|error| format!("{error}"))?;
-        assets
-            .get(imported.handle)
-            .map(|scene| scene.document().clone())
-            .ok_or_else(|| "the scene did not stay loaded".to_string())?
-    };
-    let database = start_database(&registry);
-    let report = load_scene(engine, &database, &document);
+    let report = crate::asset_loading::load_scene_asset(engine, path)?;
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ENGINE,
         path,
@@ -104,21 +82,4 @@ fn load_startup_scene(engine: &mut Engine, path: &str) -> Result<SceneLoad, Stri
         "[engine] startup scene loaded"
     );
     Ok(report)
-}
-
-/// The database a startup load resolves references through: the project's asset
-/// directory, when one is mounted.
-fn start_database(registry: &ImportRegistry) -> AssetDatabase {
-    match crate::asset_store::mounted_directory() {
-        Some(root) => AssetDatabase::from_directory(&root, registry),
-        None => AssetDatabase::new(),
-    }
-}
-
-/// The extension of `path`, lowercase and without the dot.
-fn extension_of(path: &str) -> &str {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
 }

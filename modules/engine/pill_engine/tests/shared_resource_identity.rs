@@ -17,11 +17,11 @@
 //!
 //! The cross-artifact behaviour itself is covered end to end by
 //! `devops/tests/test_shared_component_identity.py`. The scheduler side is
-//! covered here at five levels: the pairwise answer (`conflicts_with`), the
-//! fallback when a caller mutates the sets after `build_component_masks`, the
-//! batching decision above both (`SystemScheduler::build_execution_graph`), the
-//! rebuild a reload's `retain` does, and the running engine, where two systems
-//! batched together would trip the debug write lock.
+//! covered here at four levels: the pairwise answer (`conflicts_with`), the
+//! live sets it reads, the batching decision above both
+//! (`SystemScheduler::ensure_execution_graph`), the rebuild a reload takes, and
+//! the running engine, where two systems batched together would trip the debug
+//! write lock.
 
 use pill_engine::query::{Res, ResMut};
 use pill_engine::scheduler::{SystemAccess, SystemScheduler};
@@ -90,14 +90,14 @@ impl Resource for UnrelatedSettings {
     }
 }
 
-/// One artifact's copy of a hashed resource: same name, same size, one field
-/// shape.
+/// One artifact's copy of `demo::Hashed`: same name, same `{u32}` shape, and
+/// a declared schema hash only this copy knows.
 pub mod hashed_a {
     /// `demo::Hashed` as one artifact compiled it.
-    pub struct Settings {
+    pub struct Hashed {
         pub value: u32,
     }
-    impl pill_engine::Resource for Settings {
+    impl pill_engine::Resource for Hashed {
         fn shared_name() -> Option<&'static str> {
             Some("demo::Hashed")
         }
@@ -107,14 +107,14 @@ pub mod hashed_a {
     }
 }
 
-/// The other artifact's copy of the same name: `{u32}` reinterpreted as another
-/// shape that agrees on size and alignment, which only the hooks can tell apart.
+/// The other artifact's copy of `demo::Hashed`: the same name and the same
+/// `{u32}` shape, with a different declared schema hash.
 pub mod hashed_b {
     /// `demo::Hashed` as the other artifact compiled it.
-    pub struct Settings {
+    pub struct Hashed {
         pub value: u32,
     }
-    impl pill_engine::Resource for Settings {
+    impl pill_engine::Resource for Hashed {
         fn shared_name() -> Option<&'static str> {
             Some("demo::Hashed")
         }
@@ -241,16 +241,17 @@ fn has_resource_reports_the_readable_shape_not_the_id() {
     assert!(world.get_resource::<artifact_a::Settings>().is_some());
 }
 
-/// Two copies whose declared fields disagree are refused even though name,
-/// size and alignment all agree: the schema hook is the only evidence that can
-/// tell a reinterpretation from a matching pair.
+/// Two copies that agree on name, size and field shape are still refused when
+/// their declared schema hashes differ: this pins the declared-hash half of the
+/// guard, not shape detection (the shape half is pinned by the relayout and
+/// `ResourceHolder` tests above).
 #[test]
-fn differing_shapes_under_one_name_are_refused() {
+fn a_differing_declared_schema_hash_is_refused() {
     let mut world = World::new();
-    world.register_resource::<hashed_a::Settings>();
+    world.register_resource::<hashed_a::Hashed>();
     assert!(world.take_registration_error().is_none());
 
-    world.register_resource::<hashed_b::Settings>();
+    world.register_resource::<hashed_b::Hashed>();
     let error = world
         .take_registration_error()
         .expect("the second shape is refused");
@@ -444,19 +445,11 @@ fn system_parameters_resolve_a_shared_resource_across_copies() {
 /// systems compare as disjoint.
 #[test]
 fn two_systems_writing_through_different_copies_conflict() {
-    let mut world = World::new();
-    world.insert_resource(artifact_a::Settings { value: 0 });
-    world.insert_resource(PlainCounter::default());
-    world.insert_resource(OtherCounter::default());
-    let registry = world.component_registry();
-
     let mut writer_a = SystemAccess::new();
     writer_a.add_resource_write(ResourceId::of::<artifact_a::Settings>());
-    writer_a.build_component_masks(registry);
 
     let mut writer_b = SystemAccess::new();
     writer_b.add_resource_write(ResourceId::of::<artifact_b::Settings>());
-    writer_b.build_component_masks(registry);
 
     assert!(
         writer_a.conflicts_with(&writer_b),
@@ -466,41 +459,37 @@ fn two_systems_writing_through_different_copies_conflict() {
     // A write and a read of the same shared resource conflict as well.
     let mut reader_b = SystemAccess::new();
     reader_b.add_resource_read(ResourceId::of::<artifact_b::Settings>());
-    reader_b.build_component_masks(registry);
     assert!(writer_a.conflicts_with(&reader_b));
 
     // Unrelated resources still do not conflict, so the check has not simply
     // become "everything conflicts".
     let mut unrelated = SystemAccess::new();
     unrelated.add_resource_write(ResourceId::of::<OtherCounter>());
-    unrelated.build_component_masks(registry);
     assert!(!writer_a.conflicts_with(&unrelated));
 }
 
-/// A resource id registered *after* the masks were built must still conflict.
+/// An access added after an earlier comparison is seen by the next one.
 ///
-/// `conflicts_with` trusts its sorted snapshot only while it mirrors the live
-/// set, and falls back to the sets otherwise. Nothing else pins that fallback
-/// for resources, and a mistyped length check there would turn two writers of
-/// one resource into a parallel batch - silently, because the sets are correct
-/// and only the shortcut is wrong.
+/// `conflicts_with` reads the live access sets, so no cached snapshot can go
+/// stale behind them. A stale shortcut here would turn two writers of one
+/// resource into a parallel batch - silently, because the sets are correct and
+/// only the shortcut is wrong.
 #[test]
-fn a_resource_registered_after_the_masks_still_conflicts() {
-    let world = World::new();
-    let registry = world.component_registry();
-
+fn a_resource_added_after_a_comparison_still_conflicts() {
     let mut first = SystemAccess::new();
     first.add_resource_write(ResourceId::of::<artifact_a::Settings>());
-    first.build_component_masks(registry);
 
-    // Built empty, then mutated: the snapshot is stale, the set is not.
     let mut second = SystemAccess::new();
-    second.build_component_masks(registry);
-    second.add_resource_write(ResourceId::of::<artifact_b::Settings>());
+    assert!(
+        !first.conflicts_with(&second),
+        "an empty access conflicts with nothing"
+    );
 
+    // Mutated after the first comparison: the next one has to see it.
+    second.add_resource_write(ResourceId::of::<artifact_b::Settings>());
     assert!(
         first.conflicts_with(&second),
-        "the second access's snapshot is stale, so the sets have to decide"
+        "the sets are the source of truth, so the shared resource still conflicts"
     );
 }
 
@@ -508,40 +497,31 @@ fn a_resource_registered_after_the_masks_still_conflicts() {
 /// systems that write one shared resource through different copies must be
 /// placed in different batches.
 ///
-/// This is the path a real engine takes - `Engine::register_system` adds the
-/// resources, then calls `build_component_masks`, which snapshots them for the
-/// allocation-free comparison - so the graph below is decided by the snapshots
-/// and not by the sets. It asserts the third system's placement too: a resource
-/// conflict must serialize the two writers, not push everything else out of
-/// every batch with them.
+/// This is the path a real engine takes - the access patterns are handed to
+/// `ensure_execution_graph`, which compares them pairwise - so the graph below
+/// is decided by the same comparison the pairwise test covers. It asserts the
+/// third system's placement too: a resource conflict must serialize the two
+/// writers, not push everything else out of every batch with them.
 #[test]
 fn two_systems_writing_one_shared_resource_are_never_batched_together() {
-    let world = World::new();
-    let registry = world.component_registry();
-    let mut scheduler = SystemScheduler::new();
-
     let mut project_writer = SystemAccess::new();
     project_writer.add_resource_write(ResourceId::of::<artifact_a::Settings>());
-    project_writer.build_component_masks(registry);
-    let project_system = scheduler.register_system(project_writer);
 
     let mut module_writer = SystemAccess::new();
     module_writer.add_resource_write(ResourceId::of::<artifact_b::Settings>());
-    module_writer.build_component_masks(registry);
-    let module_system = scheduler.register_system(module_writer);
 
     let mut unrelated_writer = SystemAccess::new();
     unrelated_writer.add_resource_write(ResourceId::of::<OtherCounter>());
-    unrelated_writer.build_component_masks(registry);
-    let unrelated_system = scheduler.register_system(unrelated_writer);
 
-    scheduler.build_execution_graph();
+    let accesses = [project_writer, module_writer, unrelated_writer];
+    let mut scheduler = SystemScheduler::new();
+    scheduler.ensure_execution_graph(accesses.iter());
     let batches = scheduler.execution_graph();
 
     let batch_of = |system: usize| batches.iter().position(|batch| batch.contains(&system));
-    let project_batch = batch_of(project_system).expect("project writer scheduled");
-    let module_batch = batch_of(module_system).expect("module writer scheduled");
-    let unrelated_batch = batch_of(unrelated_system).expect("unrelated writer scheduled");
+    let project_batch = batch_of(0).expect("project writer scheduled");
+    let module_batch = batch_of(1).expect("module writer scheduled");
+    let unrelated_batch = batch_of(2).expect("unrelated writer scheduled");
 
     assert_ne!(
         project_batch, module_batch,
@@ -553,53 +533,49 @@ fn two_systems_writing_one_shared_resource_are_never_batched_together() {
     );
 }
 
-/// The third level, and the one a reload takes: `retain` drops the reloaded
-/// generation's systems and *rebuilds* the conflict matrix from the survivors
-/// rather than filtering it in place.
+/// The third level, and the one a reload takes: the graph is rebuilt from the
+/// systems that survive the swap rather than filtered in place.
 ///
 /// A shared resource has to come out of that rebuild conflicting the way it went
 /// in, or the two writers would start sharing a batch from the first frame after
 /// the swap - which is the frame after the identities were proved to work.
-///
-/// The two survivors register the way `Engine::register_system` does, masks
-/// included, so the rebuild compares snapshots the same way registration did.
 #[test]
-fn a_shared_resource_still_conflicts_after_retaining_systems() {
-    let world = World::new();
-    let registry = world.component_registry();
-    let mut scheduler = SystemScheduler::new();
-
+fn a_shared_resource_still_conflicts_after_a_rebuild() {
     let mut project_writer = SystemAccess::new();
     project_writer.add_resource_write(ResourceId::of::<artifact_a::Settings>());
-    project_writer.build_component_masks(registry);
-    let project_system = scheduler.register_system(project_writer);
 
     let mut module_writer = SystemAccess::new();
     module_writer.add_resource_write(ResourceId::of::<artifact_b::Settings>());
-    module_writer.build_component_masks(registry);
-    let module_system = scheduler.register_system(module_writer);
 
-    // Stands in for a generation the reload drops. Registered last, so the two
-    // writers keep their indices through the filter - the reindexing is the
-    // caller's half of the contract and not what this test is about.
-    let doomed_system = scheduler.register_system(SystemAccess::new());
+    // Stands in for a generation the reload drops; the engine removes it from
+    // its system list and the survivors keep their order.
+    let doomed_system = SystemAccess::new();
+    let with_doomed = vec![project_writer, module_writer, doomed_system];
+    let mut scheduler = SystemScheduler::new();
+    scheduler.ensure_execution_graph(with_doomed.iter());
+    assert!(
+        scheduler
+            .execution_graph()
+            .iter()
+            .any(|batch| batch.contains(&2)),
+        "the doomed system is scheduled before the reload"
+    );
 
-    // What the host passes: one flag per system, false for the dropped one.
-    let mut keep = vec![true; doomed_system + 1];
-    keep[doomed_system] = false;
-    scheduler.retain(&keep);
-
-    // `retain` clears the graph, so the host rebuilds it after the swap.
-    scheduler.build_execution_graph();
+    // What the engine does after `clear_systems_owned_by`: the list is shorter
+    // and the graph is derived again from the survivors.
+    let mut survivors = with_doomed;
+    survivors.pop();
+    scheduler.invalidate();
+    scheduler.ensure_execution_graph(survivors.iter());
     let batches = scheduler.execution_graph();
 
     let batch_of = |system: usize| batches.iter().position(|batch| batch.contains(&system));
     assert!(
-        batch_of(doomed_system).is_none(),
+        batch_of(2).is_none(),
         "the dropped system is still scheduled: {batches:?}"
     );
-    let project_batch = batch_of(project_system).expect("the surviving writer is scheduled");
-    let module_batch = batch_of(module_system).expect("the surviving writer is scheduled");
+    let project_batch = batch_of(0).expect("the surviving writer is scheduled");
+    let module_batch = batch_of(1).expect("the surviving writer is scheduled");
     assert_ne!(
         project_batch, module_batch,
         "the shared conflict did not survive the rebuild: {batches:?}"

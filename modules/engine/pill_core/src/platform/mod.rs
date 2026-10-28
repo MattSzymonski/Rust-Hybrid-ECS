@@ -7,6 +7,8 @@
 //! - Provide the log outputs: terminal and file on native, the browser
 //!   console on the web.
 //! - Provide the way to run a future: block on native, spawn on the web.
+//! - Provide the terminal styling implementation for `&str`: colored on
+//!   native, plain on the web.
 //!
 //! # Design
 //!
@@ -26,6 +28,8 @@ pub mod clock;
 pub mod futures;
 /// Where log output goes: terminal and file on native, the console on the web.
 pub mod log_output;
+/// Terminal styling: colored and bold on native, plain on the web.
+pub mod styling;
 
 /// The monotonic clock, re-exported so callers write `platform::Instant`.
 pub use clock::Instant;

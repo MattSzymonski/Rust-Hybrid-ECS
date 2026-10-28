@@ -10,11 +10,15 @@
 //! # Design
 //!
 //! A script component is an ordinary component first: it registers through the
-//! same path as any other, and the script half is a second table beside it.
-//! Dispatch goes through a plain function pointer rather than a trait object,
-//! so the only thing an updater can be is a non-capturing function: it cannot
-//! capture state, stash the raw pointers it is handed, or keep anything alive
-//! past the call. Registering the type again overwrites its entry.
+//! same path as any other, and the script half is one table of updaters keyed by
+//! component id. Dispatching asks the registry for the component's bit each
+//! frame instead of storing it, so a retired and re-registered type cannot be
+//! dispatched through a stale bit, and registering twice cannot queue the same
+//! update twice. Dispatch goes through a plain function pointer rather than a
+//! trait object, so the only thing an updater can be is a non-capturing
+//! function: it cannot capture state, stash the raw pointers it is handed, or
+//! keep anything alive past the call. Registering the type again overwrites its
+//! entry.
 //!
 //! The updater receives raw pointers to the world and the command queue because
 //! it needs both while the world is already borrowed to walk the columns. They
@@ -50,8 +54,9 @@ impl World {
     /// Registers a component type whose `update` runs once per frame per
     /// entity.
     ///
-    /// Registers `T` as an ordinary component first, then records the bit and
-    /// the updater `update_scripts` dispatches through.
+    /// Registers `T` as an ordinary component first, then records the updater
+    /// `update_scripts` dispatches through. Registering the same type again
+    /// replaces its updater instead of adding a second one.
     pub fn register_script_component<T>(&mut self)
     where
         T: ScriptComponent,
@@ -67,36 +72,30 @@ impl World {
         // a bit to address its column by.
         self.register_component::<T>();
 
-        // Step 2: Record the bit and the updater beside it.
-        let component_id = ComponentId::of::<T>();
-        if let Some(bit) = self.component_registry.get_bit(&component_id) {
-            self.script_components.push((component_id, bit));
-
-            // Step 3: Store the updater. The closure captures nothing, so it
-            // coerces to the function pointer; the raw pointers are handed in
-            // fresh on every dispatch.
-            self.script_updaters.insert(
-                component_id,
-                (|storage: &mut ComponentColumns,
-                  index: usize,
-                  entity: Entity,
-                  world_ptr: *mut World,
-                  commands_ptr: *mut CommandQueue| {
-                    let component = storage.column_of_mut::<T>().get_mut::<T>(index);
-                    // SAFETY: `world_ptr` and `commands_ptr` are derived from
-                    // `&mut World` / `&mut CommandQueue` that are valid for the
-                    // entire duration of `update_scripts`, which is the sole
-                    // caller of every stored updater. The function-pointer
-                    // representation prevents these pointers from being cached
-                    // across calls.
-                    unsafe {
-                        let mut script_context =
-                            ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
-                        component.update(&mut script_context);
-                    }
-                }) as ScriptUpdater,
-            );
-        }
+        // Step 2: Store the updater. The closure captures nothing, so it
+        // coerces to the function pointer; the raw pointers are handed in
+        // fresh on every dispatch.
+        self.script_updaters.insert(
+            ComponentId::of::<T>(),
+            (|storage: &mut ComponentColumns,
+              index: usize,
+              entity: Entity,
+              world_ptr: *mut World,
+              commands_ptr: *mut CommandQueue| {
+                let component = storage.column_of_mut::<T>().get_mut::<T>(index);
+                // SAFETY: `world_ptr` and `commands_ptr` are derived from
+                // `&mut World` / `&mut CommandQueue` that are valid for the
+                // entire duration of `update_scripts`, which is the sole
+                // caller of every stored updater. The function-pointer
+                // representation prevents these pointers from being cached
+                // across calls.
+                unsafe {
+                    let mut script_context =
+                        ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
+                    component.update(&mut script_context);
+                }
+            }) as ScriptUpdater,
+        );
     }
 
     /// Runs `update` on every script component of every entity that carries
@@ -112,7 +111,7 @@ impl World {
             "update scripts",
             [(
                 "Script component types in world: {}",
-                self.script_components.len()
+                self.script_updaters.len()
             )]
         );
         // Step 1: Reserve the per-frame work list and capture raw pointers to
@@ -125,21 +124,18 @@ impl World {
         let world_ptr = self as *mut World;
         let commands_ptr = commands as *mut CommandQueue;
 
-        // Step 2: For each script component type, gather every entity that
-        // carries it.
-        for &(component_id, comp_bit) in &self.script_components {
-            // A type that registered no updater is skipped.
-            let updater = match self.script_updaters.get(&component_id) {
-                Some(&u) => u,
-                None => continue,
+        // Step 2: For each registered script type, gather every entity that
+        // carries it. The bit is read from the registry here rather than
+        // stored at registration time, so a type that was retired and
+        // re-registered on another bit is still found.
+        for (&component_id, &updater) in &self.script_updaters {
+            let Some(script_bit) = self.component_registry.get_bit(&component_id) else {
+                continue;
             };
 
             // Every entity of an archetype whose mask carries the script bit.
             for (archetype_id, archetype) in &self.archetypes {
-                let mut mask = ComponentMask::empty();
-                mask.set(comp_bit);
-
-                if archetype.matches_mask(&mask) {
+                if archetype.has_component_bit(script_bit) {
                     for (index, &entity) in archetype.entities.iter().enumerate() {
                         entities_to_update.push((entity, *archetype_id, index));
                     }

@@ -7,16 +7,25 @@
 //!   [`CommandError`], [`AddComponentError`], [`RemoveComponentError`],
 //!   [`BuildError`], [`PersistenceError`], [`SystemError`] and
 //!   [`SystemFailure`]).
-//! - Compose them transparently into the top-level [`EngineError`] together
-//!   with the shared host errors from `pill_core`.
+//! - Compose [`WorldError`], [`CommandError`] and [`PersistenceError`] into the
+//!   top-level [`EngineError`] with the shared host errors from `pill_core`.
+//!   [`AddComponentError`], [`RemoveComponentError`] and [`BuildError`] are
+//!   returned directly by the call that raises them, and [`SystemError`]
+//!   travels inside [`SystemFailure`] because a failing system never aborts the
+//!   frame.
 //!
 //! # Design
 //!
 //! Each error variant states its wording once, as a `#[message(...)]`
 //! definition rendered through the `pill_core` diagnostics runtime. Error enums
-//! never import a styling crate and never convert sources to text; they compose
-//! with `?` through transparent `#[from]` wrappers. Frontends receive the
-//! composed [`EngineError`] at their boundary and report it exactly once.
+//! never import a styling crate and never convert sources to text; the ones
+//! that compose do so with `?` through transparent `#[from]` wrappers. A
+//! frontend's frame boundary does not receive an [`EngineError`]:
+//! [`Engine::process_frame`](crate::Engine::process_frame) reports
+//! `Result<(), Vec<CommandError>>` and
+//! [`Engine::drain_system_failures`](crate::Engine::drain_system_failures)
+//! returns the collected [`SystemFailure`]s. [`EngineError`] is the composed
+//! type for host code that wants one error.
 
 // Standard library
 use std::fmt;

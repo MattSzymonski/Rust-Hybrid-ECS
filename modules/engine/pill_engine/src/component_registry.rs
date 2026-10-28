@@ -147,12 +147,22 @@ pub struct PillFieldAccessorDescriptor {
 /// copy of this descriptor. The mirror codegen then emits a typed C# member
 /// that calls it.
 ///
-/// A row named [`MIRROR_TYPE_ROW`] describes a type rather than a function:
-/// what kind it is (`owner_kind`), its drop trampoline for an object, its
-/// variants for an enum (`arg_names`, with the discriminants in `arg_tags` and
-/// the representation in `return_tag`), or its shared name for a resource
-/// (`arg_names[0]`). Rows whose name starts with `__` are never emitted as C#
-/// members: the runtime reaches them by name.
+/// A row named [`MIRROR_TYPE_ROW`] describes a type rather than a function.
+/// Rows whose name starts with `__` are never emitted as C# members: the
+/// runtime reaches them by name. The six shapes and the fields each one fills:
+///
+/// | Shape | `name` | `owner_kind` | `return_tag` | `arg_tags` | `arg_names` | `symbol` / `address` |
+/// | --- | --- | --- | --- | --- | --- | --- |
+/// | method (`#[pill_mirror_impl]`) | Rust method name | the owner's kind (`"value"` for a value type or component row) | return value | argument types | argument names | trampoline |
+/// | free function (`#[pill_mirror_fn]`) | function name | `"module"` | return value | argument types | argument names | trampoline |
+/// | object type row | [`MIRROR_TYPE_ROW`] | `"object"` | empty | empty | feature flags (`asset`, `import`, `standalone`) | drop trampoline |
+/// | object asset-operation row | `__asset_<op>` | `"object"` | empty | empty | empty | the operation's trampoline |
+/// | enum type row | [`MIRROR_TYPE_ROW`] | `"enum"` | the representation type | one discriminant per variant | variant names | empty / null |
+/// | resource type row | [`MIRROR_TYPE_ROW`] | `"resource"` | empty | empty | `[0]` is the shared name | empty / null |
+///
+/// The C# codegen reads these rows back in `mirror_codegen.rs`: the object
+/// flags are recovered from `arg_names`, the enum's discriminants from
+/// `arg_tags`, and the `__asset_*` rows are reached by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PillMethodDescriptor {
     /// Fully-qualified type name the method belongs to, as `std::any::type_name`
@@ -190,9 +200,9 @@ pub struct PillMethodDescriptor {
     /// associated function), `"ref"` as `&self`, `"mut"` as `&mut self`, or
     /// `"value"` as `self`.
     pub receiver: &'static str,
-    /// What the owning type is: `"value"` for a `#[derive(PillMirror)]` value
-    /// type or a component row, `"object"` for a `#[pill_mirror_object]`,
-    /// `"enum"`, `"resource"`, or `"module"` for a free function.
+    /// What the owning type is, as one of the [`OWNER_KIND_OBJECT`],
+    /// [`OWNER_KIND_ENUM`], [`OWNER_KIND_RESOURCE`], [`OWNER_KIND_MODULE`] or
+    /// [`OWNER_KIND_UNKNOWN`] constants.
     pub owner_kind: &'static str,
     /// The trampoline's address; null for a type row with no trampoline.
     pub address: ExportAddress,
@@ -201,6 +211,21 @@ pub struct PillMethodDescriptor {
 /// The name of a [`PillMethodDescriptor`] row that describes a type rather
 /// than a function.
 pub const MIRROR_TYPE_ROW: &str = "__type";
+
+/// A row whose owner is a `#[pill_mirror_object]`.
+pub const OWNER_KIND_OBJECT: &str = "object";
+
+/// A row whose owner is a mirrored enum.
+pub const OWNER_KIND_ENUM: &str = "enum";
+
+/// A row whose owner is a mirrored resource.
+pub const OWNER_KIND_RESOURCE: &str = "resource";
+
+/// A row for a free function, whose owner is the declaring module.
+pub const OWNER_KIND_MODULE: &str = "module";
+
+/// A row whose owner kind the attribute could not determine.
+pub const OWNER_KIND_UNKNOWN: &str = "";
 
 /// A named C-ABI function an artifact offers to the host, found by name.
 ///
@@ -281,6 +306,29 @@ pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor>
         inventory::iter::<PillFieldAccessorDescriptor>().collect();
     descriptors.sort_by_key(|descriptor| (descriptor.type_name, descriptor.field_name));
     descriptors
+}
+
+/// Copy up to `max` descriptors into `out`, returning how many were written.
+///
+/// Every `pill_copy_*_descriptors` export answers the same question - the host
+/// sizes a buffer from the matching `*_count` export, then asks for a copy of
+/// at most that many - so the clamp and the write loop live here once rather
+/// than in each expansion. A `max` larger than the list copies the list; a
+/// `max` of zero writes nothing.
+///
+/// # Safety
+///
+/// `out` must point at `max` writable `T` slots owned by the caller for the
+/// duration of this call, or be null when `max` is zero.
+pub unsafe fn copy_descriptors<T: Copy>(descriptors: &[&'static T], out: *mut T, max: u32) -> u32 {
+    let count = (descriptors.len() as u32).min(max);
+    for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
+        // SAFETY: `index < count <= max`, so `out.add(index)` stays inside the
+        // buffer the caller promised, and `T: Copy` makes the write a copy out
+        // of the static descriptor.
+        unsafe { out.add(index).write(**descriptor) };
+    }
+    count
 }
 
 /// Register every component this artifact declares with the derive.
@@ -400,23 +448,15 @@ pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u3
 /// `::<path>` suffix second. An ambiguous suffix resolves to `None`: an opaque
 /// field is readable, a wrong one is not.
 pub fn resolve_value_type_layout(path: &str) -> Option<&'static [ComponentFieldDescriptor]> {
-    let suffix = format!("::{path}");
-    let mut suffix_hit = None;
-    let mut suffix_matches = 0usize;
-    for descriptor in value_type_descriptors() {
-        if descriptor.type_name == path {
-            return Some(descriptor.fields);
-        }
-        if descriptor.type_name.ends_with(&suffix) {
-            suffix_matches += 1;
-            suffix_hit = Some(descriptor.fields);
-        }
-    }
-    if suffix_matches == 1 {
-        suffix_hit
-    } else {
-        None
-    }
+    let descriptors = value_type_descriptors();
+    let name = pill_engine_core::component_registry::resolve_unique_name(
+        path,
+        descriptors.iter().map(|descriptor| descriptor.type_name),
+    )?;
+    descriptors
+        .into_iter()
+        .find(|descriptor| descriptor.type_name == name)
+        .map(|descriptor| descriptor.fields)
 }
 
 /// Aggregate schema fingerprint of every persistable component.

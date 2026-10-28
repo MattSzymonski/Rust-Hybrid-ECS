@@ -618,7 +618,7 @@ pub struct ComponentRegistry {
 /// how a stale recorded layout goes unnoticed after a reload replaces a
 /// component's definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "registration reports whether the type was already present; use               `register_bit` if only the bit index is wanted"]
+#[must_use = "registration reports whether the type was already present; use `register_bit` if only the bit index is wanted"]
 pub enum Registration {
     /// The type was not present and has been assigned this bit.
     Created(u8),
@@ -831,7 +831,7 @@ impl ComponentRegistry {
         // Step 2: Assign the next bit - either one reclaimed by `remove`, or a
         // fresh one. When neither is available the 128-type ceiling is hit,
         // which is reported as a typed error rather than an assert.
-        let Some(bit) = self.allocate_bit(std::any::type_name::<T>()) else {
+        let Some(bit) = self.allocate_bit() else {
             return Err(WorldError::ComponentTypeLimitExceeded {
                 type_name: std::any::type_name::<T>().to_string(),
                 count: self.id_to_bit.len() as u8,
@@ -902,6 +902,11 @@ impl ComponentRegistry {
 
     /// Register a component whose concrete type is defined outside Rust.
     ///
+    /// Records only what registration itself owns: the bit index and the name.
+    /// A descriptor component's storage shape lives with the factory that
+    /// builds its columns, which is the record the readers consult - a second
+    /// copy here could only be a placeholder until something repaired it.
+    ///
     /// # Errors
     ///
     /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
@@ -910,7 +915,6 @@ impl ComponentRegistry {
         &mut self,
         stable_id: u128,
         name: impl Into<String>,
-        size: usize,
     ) -> Result<u8, WorldError> {
         // Step 1: Return the existing bit index when the stable ID is already registered.
         let component_id = ComponentId::descriptor(stable_id);
@@ -921,27 +925,16 @@ impl ComponentRegistry {
         // Step 2: Assign the next bit - reclaimed or fresh - reporting the
         // ceiling as a typed error instead of panicking.
         let name = name.into();
-        let Some(bit) = self.allocate_bit(&name) else {
+        let Some(bit) = self.allocate_bit() else {
             return Err(WorldError::ComponentTypeLimitExceeded {
                 type_name: name,
                 count: self.id_to_bit.len() as u8,
             });
         };
 
-        // Step 3: Record the descriptor component's metadata.
+        // Step 3: Record the descriptor component's identity.
         self.id_to_bit.insert(component_id, bit);
         self.names.insert(component_id, name);
-        // A descriptor component's alignment lives with its storage factory, and
-        // its schema hash is carried by the manifest, so the registry records
-        // only what it is asked for here.
-        self.layouts.insert(
-            component_id,
-            ComponentRegistration {
-                size,
-                align: 1,
-                schema_hash: None,
-            },
-        );
         Ok(bit)
     }
 
@@ -950,7 +943,7 @@ impl ComponentRegistry {
     ///
     /// Returns `None` once both the reclaimed pool and the fresh range are
     /// exhausted - that is, at the 128-type ceiling.
-    fn allocate_bit(&mut self, _for_type: &str) -> Option<u8> {
+    fn allocate_bit(&mut self) -> Option<u8> {
         if let Some(bit) = self.free_bits.pop() {
             return Some(bit);
         }
@@ -997,35 +990,16 @@ impl ComponentRegistry {
         self.names.get(component_id).map(|s| s.as_str())
     }
 
-    /// Get the size in bytes of a registered component type.
-    pub fn get_size(&self, component_id: &ComponentId) -> Option<usize> {
-        self.layouts.get(component_id).map(|layout| layout.size)
-    }
-
-    /// Get the recorded memory layout of a registered component type.
+    /// Get the layout a Rust type declared when it registered.
+    ///
+    /// The *declaration*, not the storage: the migration lanes compare a new
+    /// generation's declared shape against the one its predecessor registered,
+    /// and a descriptor component - which declares nothing in Rust - has no
+    /// entry here. Storage shapes are read through
+    /// [`World::component_layout`](crate::World::component_layout), which
+    /// consults the factory that builds the columns.
     pub fn get_layout(&self, component_id: &ComponentId) -> Option<ComponentRegistration> {
         self.layouts.get(component_id).copied()
-    }
-
-    /// Republish a descriptor component's whole registry layout.
-    ///
-    /// The registry record and the storage factory describe one column, so a
-    /// relayout that moves alignment or the schema hash has to move both:
-    /// `get_layout`/`get_size` read here, and the placeholder alignment
-    /// registration started with would describe a layout that never existed.
-    /// The bit index, the name and the id stay put - replacing the
-    /// registration instead would allocate a fresh bit index, and that index is
-    /// baked into archetype masks and scheduled access masks.
-    pub(crate) fn update_descriptor_layout(
-        &mut self,
-        component_id: &ComponentId,
-        layout: &crate::archetype::ColumnLayout,
-    ) {
-        if let Some(record) = self.layouts.get_mut(component_id) {
-            record.size = layout.size;
-            record.align = layout.align;
-            record.schema_hash = Some(layout.schema_hash);
-        }
     }
 
     /// Check whether a component type has been registered.
@@ -1111,7 +1085,7 @@ mod tests {
         assert!(!registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), None);
         assert_eq!(registry.get_name(&component_id), None);
-        assert_eq!(registry.get_size(&component_id), None);
+        assert_eq!(registry.get_layout(&component_id), None);
 
         // Re-registering works and reuses the freed bit: `remove` returns the
         // bit to the reclaim pool, so a descriptor manifest that retires and
@@ -1134,18 +1108,15 @@ mod tests {
         // from descriptors so the test does not need 129 real Rust types.
         let mut registry = ComponentRegistry::new();
         for index in 0..128 {
-            let result = registry.register_descriptor(
-                index as u128 + 1,
-                format!("Project.FakeType{index}"),
-                4,
-            );
+            let result =
+                registry.register_descriptor(index as u128 + 1, format!("Project.FakeType{index}"));
             assert!(result.is_ok(), "slot {index} must register");
         }
 
         // One more than the ceiling: the registry reports the limit, naming
         // the offending type and the current count.
         let error = registry
-            .register_descriptor(u128::MAX, "Project.OneTooMany", 4)
+            .register_descriptor(u128::MAX, "Project.OneTooMany")
             .unwrap_err();
         assert_eq!(
             error,
@@ -1160,7 +1131,7 @@ mod tests {
         // registered type (stable id 1) holds bit 0, so freeing it reopens bit 0.
         registry.remove(&ComponentId::descriptor(1));
         let reused = registry
-            .register_descriptor(u128::MAX - 1, "Project.AfterFree", 4)
+            .register_descriptor(u128::MAX - 1, "Project.AfterFree")
             .unwrap();
         assert_eq!(reused, 0, "the reclaimed bit is handed out again");
     }
@@ -1172,7 +1143,7 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         for index in 0..8 {
             registry
-                .register_descriptor(index as u128 + 10, format!("Project.C{index}"), 4)
+                .register_descriptor(index as u128 + 10, format!("Project.C{index}"))
                 .unwrap();
         }
         assert_eq!(registry.available_slots(), 120);
@@ -1185,7 +1156,7 @@ mod tests {
 
         // New registrations reuse the reclaimed bits (LIFO: the most recently
         // freed first) rather than consuming fresh ones.
-        let new_bit = registry.register_descriptor(999, "Project.New", 4).unwrap();
+        let new_bit = registry.register_descriptor(999, "Project.New").unwrap();
         assert_eq!(new_bit, 3, "the most recently freed bit is reused first");
         assert_eq!(registry.available_slots(), 123);
     }

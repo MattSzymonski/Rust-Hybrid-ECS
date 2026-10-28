@@ -21,13 +21,13 @@
 use std::path::Path;
 
 // Current crate
-use crate::asset::Handle;
+use crate::asset::{AssetGuid, Handle};
 use crate::asset_database::AssetDatabase;
 use crate::asset_import_registry::ImportRegistry;
 use crate::asset_metadata::{ImportedAsset, MetadataPolicy};
 use crate::asset_store;
 use crate::engine::Engine;
-use crate::scene::{load_scene, Scene, SceneLoad};
+use crate::scene::{load_scene, Scene, SceneDocument, SceneLoad};
 use crate::world::World;
 
 impl World {
@@ -70,43 +70,102 @@ impl Engine {
 
     /// Instantiate the scene at `path` into this engine's world.
     ///
-    /// The scene is read through the asset manager and its references resolve
-    /// through the world's asset database - the project's `.meta` index when
-    /// the host built one, otherwise the mounted asset directory. Entities are
-    /// created under the stable ids the file carries, so references between
-    /// them resolve.
+    /// See [`load_scene_asset`], the one scene loader this and every other
+    /// scene entry point share. Entities are created under the stable ids the
+    /// file carries, so references between them resolve.
     ///
     /// # Errors
     ///
     /// Returns why the file could not be read or named another asset type.
     pub fn load_scene_file(&mut self, path: &str) -> Result<SceneLoad, String> {
-        let registry = self
-            .world()
-            .get_resource::<ImportRegistry>()
-            .cloned()
-            .ok_or_else(|| format!("no asset types are registered (loading `{path}`)"))?;
-        let document = {
-            let assets = self
-                .world_mut()
-                .get_resource_mut::<crate::asset::AssetManager>()
-                .ok_or_else(|| "the engine has no AssetManager".to_string())?;
-            let imported = assets
-                .import_standalone::<Scene>(Path::new(path))
-                .map_err(|error| format!("`{path}` did not load: {error}"))?;
-            assets
-                .get(imported.handle)
-                .map(|scene| scene.document().clone())
-                .ok_or_else(|| format!("`{path}` did not stay loaded"))?
-        };
-        let database = match self.world().get_resource::<AssetDatabase>() {
-            Some(database) => database.clone(),
-            None => match asset_store::mounted_directory() {
-                Some(root) => AssetDatabase::from_directory(&root, &registry),
-                None => AssetDatabase::new(),
-            },
-        };
-        Ok(load_scene(self, &database, &document))
+        load_scene_asset(self, path)
     }
+}
+
+/// Reads the `.scene` at `path` and returns its document and the guid the file
+/// carries.
+///
+/// The one import step behind every scene launcher - the engine's
+/// [`Engine::load_scene_file`], the startup scene and the editor's Open - so
+/// they cannot disagree about what a scene document is or which asset types it
+/// needs.
+///
+/// # Errors
+///
+/// Returns why no asset types are registered, why `path` is not a scene file,
+/// or why it could not be imported and kept loaded.
+pub fn import_scene_document(
+    engine: &mut Engine,
+    path: &str,
+) -> Result<(SceneDocument, Option<AssetGuid>), String> {
+    let registry = engine
+        .world()
+        .get_resource::<ImportRegistry>()
+        .cloned()
+        .ok_or_else(|| format!("no asset types are registered (loading `{path}`)"))?;
+    if !registry.is_standalone_extension(extension_of(path)) {
+        return Err(format!("`{path}` is not a scene file"));
+    }
+    let assets = engine
+        .world_mut()
+        .get_resource_mut::<crate::asset::AssetManager>()
+        .ok_or_else(|| "the engine has no AssetManager".to_string())?;
+    let imported = assets
+        .import_standalone::<Scene>(Path::new(path))
+        .map_err(|error| format!("`{path}` did not load: {error}"))?;
+    // A standalone scene carries its guid in the file's own header; a file with
+    // no header yet has none.
+    let guid = imported.guid;
+    let document = assets
+        .get(imported.handle)
+        .map(|scene| scene.document().clone())
+        .ok_or_else(|| format!("`{path}` did not stay loaded"))?;
+    Ok((document, guid))
+}
+
+/// The asset index a scene load resolves its references through.
+///
+/// The world's [`AssetDatabase`] when the host built one - a shipped pack's
+/// index, or a host that indexed the project - otherwise an index built from
+/// the mounted asset directory, otherwise an empty one. Preferring the resource
+/// is what lets a guid-only reference resolve in a pack build, where no
+/// directory is mounted.
+pub fn scene_database(engine: &Engine) -> AssetDatabase {
+    let world = engine.world();
+    if let Some(database) = world.get_resource::<AssetDatabase>() {
+        return database.clone();
+    }
+    let Some(root) = asset_store::mounted_directory() else {
+        return AssetDatabase::new();
+    };
+    match world.get_resource::<ImportRegistry>() {
+        Some(registry) => AssetDatabase::from_directory(&root, registry),
+        None => AssetDatabase::new(),
+    }
+}
+
+/// Instantiates the `.scene` at `path` into the engine's world.
+///
+/// The one scene loader: the document comes from [`import_scene_document`] and
+/// the references resolve through [`scene_database`], so every entry point -
+/// the engine's own, the startup scene and the editor's Open - resolves an
+/// asset reference by guid under the same rules.
+///
+/// # Errors
+///
+/// As [`import_scene_document`].
+pub fn load_scene_asset(engine: &mut Engine, path: &str) -> Result<SceneLoad, String> {
+    let (document, _guid) = import_scene_document(engine, path)?;
+    let database = scene_database(engine);
+    Ok(load_scene(engine, &database, &document))
+}
+
+/// The extension of `path`, lowercase and without the dot.
+fn extension_of(path: &str) -> &str {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -206,6 +265,55 @@ mod tests {
             .load_asset::<Prop>("props/a.prop")
             .expect("the second load reuses the asset");
         assert_eq!(again, first, "one path is one handle");
+    }
+
+    /// A scene load resolves its references through the world's asset database
+    /// when the host built one, even with a directory mounted.
+    ///
+    /// A pack build mounts nothing, so its index exists only as the world
+    /// resource; preferring the mounted directory would leave every guid in a
+    /// shipped startup scene unresolved.
+    #[test]
+    fn the_scene_database_prefers_the_worlds_index() {
+        // The mounted directory maps the guid to one path...
+        let scratch = Scratch::new("database-preference");
+        let guid = AssetGuid::random().expect("a fresh guid");
+        scratch.write("props/a.prop", "a note");
+        scratch.write_meta("props/a.prop", guid);
+
+        let mut engine = Engine::new();
+        engine.world_mut().register_imported_asset::<Prop>();
+        let registry = engine
+            .world()
+            .get_resource::<ImportRegistry>()
+            .expect("an engine owns an import registry")
+            .clone();
+
+        // ...and the index the host would insert maps it to another, so which
+        // one a load used is visible in the record it finds.
+        let other_root =
+            std::env::temp_dir().join(format!("pill-load-asset-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&other_root);
+        std::fs::create_dir_all(other_root.join("props")).unwrap();
+        std::fs::write(other_root.join("props/other.prop"), "a note").unwrap();
+        std::fs::write(
+            other_root.join("props/other.prop.meta"),
+            format!(
+                r#"{{"format_version": 1, "asset_type": "pill_engine_core::asset_loading::tests::Prop", "guid": "{guid}", "settings": null}}"#
+            ),
+        )
+        .unwrap();
+        let index = AssetDatabase::from_directory(&other_root, &registry);
+
+        engine.world_mut().insert_resource(index);
+        let database = scene_database(&engine);
+        assert_eq!(
+            database.by_guid(guid).map(|record| record.path.as_str()),
+            Some("props/other.prop"),
+            "the world's index is the one a scene load uses"
+        );
+
+        let _ = std::fs::remove_dir_all(&other_root);
     }
 
     /// A file with no sidecar gets one, so the handle it returns can be saved

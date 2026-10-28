@@ -227,6 +227,35 @@ fn plan_between_copies_the_smaller_of_two_sizes() {
 }
 
 #[test]
+fn applying_a_plan_writes_every_instruction() {
+    // One instruction per arm: a carried value, a zero fill and a default.
+    let mut plan = FieldPlan::new();
+    plan.push(0, 4, FieldSource::OldOffset(8));
+    plan.push(4, 4, FieldSource::ZeroFill);
+    plan.push(8, 4, FieldSource::ZeroFill);
+    plan.set_default(8, &[7, 0, 0, 0])
+        .expect("the field is planned");
+
+    let source = [1_u8; 16];
+    let mut destination = [0_u8; 12];
+    plan.validate(source.len(), destination.len())
+        .expect("the plan fits both rows");
+    plan.apply(&source, &mut destination);
+
+    assert_eq!(&destination[..4], &[1, 1, 1, 1], "an old offset is copied");
+    assert_eq!(
+        &destination[4..8],
+        &[0, 0, 0, 0],
+        "a zero fill leaves the destination's zero"
+    );
+    assert_eq!(
+        &destination[8..12],
+        &[7, 0, 0, 0],
+        "a default lands even though the source has bytes there"
+    );
+}
+
+#[test]
 fn relayout_moves_rows_through_the_plan() {
     // Two rows, `a` and `b` each holding a distinct u32.
     let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0], [3, 0, 0, 0, 4, 0, 0, 0]]);

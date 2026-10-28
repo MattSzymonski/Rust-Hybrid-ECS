@@ -201,8 +201,10 @@ impl<T: Copy> DynamicBuffer<T> {
     /// Rewrite the buffer to `new_len` elements.
     ///
     /// Growing fills the new elements with `value`; shrinking keeps the first
-    /// `new_len`. Either direction may retire the current block (it is always
-    /// retired when it is shared), which is what ends any view taken from it.
+    /// `new_len`. Growing copies the block first when another handle shares it,
+    /// so the grown block is this handle's alone; shrinking writes nothing and
+    /// leaves a shared block where it is, so a view taken through another handle
+    /// stays valid across it.
     pub fn resize(&mut self, new_len: usize, value: T) {
         if new_len > self.cap {
             self.grow_to(new_len);
@@ -528,8 +530,27 @@ mod tests {
         assert_eq!(native_buffer::live_bytes(), bytes_before);
     }
 
+    /// A truncate writes nothing, so a shared block stays shared.
+    #[test]
+    fn truncate_keeps_a_shared_block() {
+        let _guard = guarded();
+
+        let buffer = DynamicBuffer::from_slice(&[1i64, 2, 3, 4]);
+        let mut shared = buffer.clone();
+        let address = buffer.as_ptr();
+
+        shared.truncate(2);
+        assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(shared.as_slice(), &[1, 2]);
+        assert_eq!(buffer.as_ptr(), address);
+        assert_eq!(shared.as_ptr(), address);
+
+        drop(shared);
+        drop(buffer);
+    }
+
     /// A resize that only shrinks writes nothing, so a shared block stays
-    /// shared.
+    /// shared and the view another handle holds survives it.
     #[test]
     fn shrinking_resize_keeps_a_shared_block() {
         let _guard = guarded();
@@ -538,7 +559,7 @@ mod tests {
         let mut shared = buffer.clone();
         let address = buffer.as_ptr();
 
-        shared.truncate(2);
+        shared.resize(2, 0);
         assert_eq!(buffer.as_slice(), &[1, 2, 3, 4]);
         assert_eq!(shared.as_slice(), &[1, 2]);
         assert_eq!(buffer.as_ptr(), address);

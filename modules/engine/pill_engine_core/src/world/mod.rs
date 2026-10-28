@@ -29,7 +29,7 @@ use pill_core::{error, info, warn};
 // Current crate
 use crate::archetype::{
     validate_component_layout, Archetype, ArchetypeId, Blittability, ColumnLayout,
-    ComponentColumns, FieldPlan, FieldSource, StorageFactory,
+    ComponentColumns, FieldPlan, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -51,6 +51,8 @@ mod reflection;
 mod resources;
 mod scripting;
 mod ticks;
+
+pub use components::ColumnChunk;
 
 // =============================================================================
 // Re-exports
@@ -302,6 +304,7 @@ impl ComponentFieldLayout {
 /// tracks entity-to-archetype locations, stores singleton resources, and
 /// maintains the component type registry used to build archetype storage.
 pub struct World {
+    // --- Entity allocation and locations ---
     /// Next fresh entity ID handed out when the free list is empty.
     next_free_entity_id: u64,
     /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
@@ -317,6 +320,7 @@ pub struct World {
     /// Seeds the counter-derived ids used when the platform has no random
     /// source; see [`Self::mint_entity_id`].
     entity_id_fallback: u64,
+    // --- Archetypes, columns and entity locations ---
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
     /// Tracks where each entity is located in the archetype system
@@ -333,12 +337,15 @@ pub struct World {
     /// `register_component_inner` records the outgoing table here so the
     /// migration can put it back for the removal that drops those rows.
     pub(crate) retired_native_storage_ops: HashMap<ComponentId, crate::archetype::ColumnOps>,
-    /// Script component types (ComponentId, component mask bit)
-    script_components: Vec<(ComponentId, u8)>,
     /// Script updaters for calling update() on script components
     script_updaters: HashMap<ComponentId, scripting::ScriptUpdater>,
+    // --- Component registry ---
     /// Component registry for bit indices and names
     pub(crate) component_registry: ComponentRegistry,
+    // --- Resources (the six per-id maps are swept together by
+    //     `remove_resource_records`; `resource_claim_counts` is owned by
+    //     `release_resource_claims` and `resource_registration_sequence` is a
+    //     world-wide counter) ---
     /// Resources (singleton data) stored by type.
     ///
     /// [`ErasedResource`] rather than `Box<dyn Any>`: a trait object carries
@@ -395,6 +402,7 @@ pub struct World {
     /// first subject to retire the id destroys a value the other still uses,
     /// claim and all. Ids with no entry are dropped unconditionally.
     pub(crate) resource_claim_counts: HashMap<ResourceId, u32>,
+    // --- Per-frame bookkeeping ---
     /// Monotonically increasing world tick used for change detection.
     ///
     /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and by
@@ -450,6 +458,7 @@ pub struct World {
     /// systems in the same engine batch.
     pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
 
+    // --- Persistence registries ---
     /// Per-component-type serialize fn for snapshotting (persistence module).
     pub(crate) persist_serializers: HashMap<ComponentId, crate::persistence::SerializeComponentFn>,
     /// Per-type-name deserialize fn for restoring (persistence module).
@@ -491,6 +500,7 @@ pub struct World {
     /// Stale shared-component readers already reported, as (component,
     /// declared hash), so a query rebuilt every frame logs its refusal once.
     pub(crate) reported_schema_mismatches: Vec<(ComponentId, u64)>,
+    // --- Component registration log and field layouts ---
     /// Monotonic counter bumped on every component registration (plain or
     /// persistable), letting the host enumerate which types one module's
     /// `init` registered at all — the distinction between a type that was
@@ -543,7 +553,6 @@ impl World {
             entity_locations: HashMap::new(),
             storage_factories: HashMap::new(),
             retired_native_storage_ops: HashMap::new(),
-            script_components: Vec::new(),
             script_updaters: HashMap::new(),
             component_registry: ComponentRegistry::new(),
             resources: HashMap::new(),
@@ -672,70 +681,16 @@ impl World {
             }
         }
 
-        // Step 2: Allocate an entity handle and get or create the archetype
-        // for this component set.
+        // Step 2: Insert the entity through the shared append ritual, which
+        // grows one zeroed row per descriptor column and stamps the arrival
+        // tick, then write each payload into its row. The pre-flight pass above
+        // rules out a missing column and a wrong payload size, so a payload
+        // write can only fail on a world invariant that no longer holds.
         let entity = self.allocate_entity();
-        let archetype_id = self.get_or_create_archetype(component_ids);
-        let current_tick = Tick::new(self.change_tick);
-        let Some(archetype) = self.archetypes.get_mut(&archetype_id) else {
-            return Err(WorldError::ArchetypeMissing {
-                entity,
-                archetype_id,
-            });
-        };
-
-        // Step 3: Confirm every requested column exists before touching any of
-        // them. A manifest that registers a component without creating its
-        // storage would otherwise leave a half-populated row behind, so this
-        // pre-flight pass keeps the failure atomic.
-        for (id, _) in components {
-            if !archetype.component_storages.contains(*id) {
-                return Err(WorldError::DescriptorStorageMissing {
-                    component_id: *id,
-                    archetype_id,
-                });
-            }
-        }
-
-        let index = archetype.entities.len();
-        archetype.entities.push(entity);
-
-        // Step 4: Push each raw byte payload into the entity's new row and
-        // stamp its arrival tick. The push grows the column's ticks with it, so
-        // there is one lookup rather than two; the pass above rules out its
-        // failure, and the error is propagated rather than unwound so a lost
-        // pre-flight check still reports instead of panicking.
+        self.insert_entity_with_components(entity, component_ids, None, |_| {});
         for (id, bytes) in components {
-            match archetype.component_storages.get_mut(*id) {
-                Some(storage) => {
-                    storage.push_bytes(bytes)?;
-                    storage.set_row_ticks(index, ComponentTicks::new(current_tick));
-                }
-                None => {
-                    return Err(WorldError::DescriptorStorageMissing {
-                        component_id: *id,
-                        archetype_id,
-                    })
-                }
-            }
+            self.set_descriptor_component_bytes(entity, *id, bytes)?;
         }
-
-        // Step 5: Record where the entity lives so random access stays O(1).
-        self.entity_locations.insert(
-            entity,
-            EntityLocation {
-                archetype_id,
-                index_in_archetype: index,
-            },
-        );
-
-        // Step 6: give the entity its stable id, indexed both ways. A
-        // descriptor entity is always created here rather than loaded from a
-        // file, so it never arrives with an id of its own; a scene load that
-        // must keep its ids goes through `EntityBuilder::with_id`.
-        let stable_id = self.mint_entity_id();
-        self.entity_ids.insert(entity, stable_id);
-        self.entity_handles.insert(stable_id, entity);
         Ok(entity)
     }
 
@@ -1132,7 +1087,7 @@ impl World {
         // the move. Moving a row needs `&mut` on both archetypes at once, which
         // the borrow checker cannot express through one `HashMap`; owning one
         // of them outright states the aliasing rule instead of leaving it to
-        // the caller. It goes back in Step 7 unless the move emptied it.
+        // the caller.
         let Some(mut old_archetype) = self.archetypes.remove(&old_archetype_id) else {
             return Err(WorldError::ArchetypeMissing {
                 entity,
@@ -1140,7 +1095,56 @@ impl World {
             });
         };
 
-        // Step 4: Verify the destination and reserve its rows before anything
+        // Step 4: Move the row. Every step that can refuse runs in the helper
+        // below, against the archetype it was handed, so this one exit accounts
+        // for the source whatever the helper returns.
+        let outcome = self.move_row_into_destination(
+            &mut old_archetype,
+            entity,
+            old_index,
+            new_archetype_id,
+            attach,
+        );
+
+        // Step 5: Account for the source archetype. A move that succeeded and
+        // emptied it drops it, so its columns do not hold allocations for a
+        // component set nothing uses; every other exit - a refusal, or rows
+        // still in it - puts it back exactly as it was found.
+        if outcome.is_ok() && old_archetype.entities.is_empty() {
+            self.archetype_generation = self.archetype_generation.wrapping_add(1);
+        } else {
+            self.archetypes.insert(old_archetype_id, old_archetype);
+        }
+
+        outcome
+    }
+
+    /// Move one entity's row into `new_archetype_id`.
+    ///
+    /// Split out of [`Self::move_entity_to_archetype`], which removed the source
+    /// archetype from the world first: a refusal here returns freely because the
+    /// caller accounts for that archetype at its single exit, not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ArchetypeMissing`] when the destination archetype
+    /// is absent, [`WorldError::DescriptorStorageMissing`] when a component named
+    /// by an archetype has no storage column - the desync a partially applied hot
+    /// reload can leave behind - [`WorldError::DescriptorSizeMismatch`] when two
+    /// columns claiming one component id disagree on their row width, and
+    /// whatever `attach` reports.
+    fn move_row_into_destination<F>(
+        &mut self,
+        old_archetype: &mut Archetype,
+        entity: Entity,
+        old_index: usize,
+        new_archetype_id: ArchetypeId,
+        attach: F,
+    ) -> Result<(), WorldError>
+    where
+        F: FnOnce(&mut ComponentColumns) -> Result<(), WorldError>,
+    {
+        // Step 1: Verify the destination and reserve its rows before anything
         // moves. A component the destination archetype has no column for is the
         // manifest/storage desync `DescriptorStorageMissing` reports, and two
         // columns claiming one id at different widths is the reload equivalent;
@@ -1156,17 +1160,15 @@ impl World {
             new_archetype_id,
         );
         if let Err(error) = prepared {
-            // Nothing has moved, so putting the source archetype back restores
-            // the world exactly as the caller handed it over.
-            self.archetypes.insert(old_archetype_id, old_archetype);
+            // Nothing has moved, so the caller's restored archetype is the
+            // world exactly as this was handed over.
             return Err(error);
         }
 
-        // Step 5: Write the entity's row into the destination. The attached
+        // Step 2: Write the entity's row into the destination. The attached
         // component goes first, while a refusal is still free; the carried rows
-        // follow, and Step 4 has ruled out every way those can fail.
+        // follow, and Step 1 has ruled out every way those can fail.
         let Some(new_archetype) = self.archetypes.get_mut(&new_archetype_id) else {
-            self.archetypes.insert(old_archetype_id, old_archetype);
             return Err(WorldError::ArchetypeMissing {
                 entity,
                 archetype_id: new_archetype_id,
@@ -1180,7 +1182,6 @@ impl World {
             // The entity is not yet anywhere but this list, and no row has
             // moved, so dropping its place undoes the whole attempt.
             new_archetype.entities.truncate(new_index);
-            self.archetypes.insert(old_archetype_id, old_archetype);
             return Err(error);
         }
 
@@ -1192,7 +1193,7 @@ impl World {
                 continue;
             };
             let Some(destination) = new_archetype.component_storages.get_mut(*component_id) else {
-                // Step 4 proved every destination column exists.
+                // Step 1 proved every destination column exists.
                 carried_result = Err(WorldError::DescriptorStorageMissing {
                     component_id: *component_id,
                     archetype_id: new_archetype_id,
@@ -1205,12 +1206,9 @@ impl World {
             }
         }
         if let Err(error) = carried_result {
-            // Unreachable after Step 4: the widths agree, the row exists and
-            // every destination column has room. Should an invariant break get
-            // here anyway, the source archetype goes back into the world so the
-            // entities that are not being migrated keep their rows, and the
-            // failure is reported rather than swallowed.
-            self.archetypes.insert(old_archetype_id, old_archetype);
+            // Unreachable after Step 1: the widths agree, the row exists and
+            // every destination column has room. The caller reports the broken
+            // invariant instead of the move being swallowed.
             return Err(error);
         }
 
@@ -1254,7 +1252,7 @@ impl World {
             },
         );
 
-        // Step 6: Remove the entity from the old archetype with swap_remove for
+        // Step 3: Remove the entity from the old archetype with swap_remove for
         // O(1) removal. A carried column was already swap-removed by the move
         // that took its row, so what is left is the entity list and the columns
         // the destination did not take - the components this migration drops,
@@ -1287,15 +1285,6 @@ impl World {
                     swapped_location.index_in_archetype = old_index;
                 }
             }
-        }
-
-        // Step 7: Put the source archetype back, unless the move emptied it -
-        // an empty archetype is dropped rather than kept, so its columns do not
-        // hold allocations for a component set nothing uses.
-        if old_archetype.entities.is_empty() {
-            self.archetype_generation = self.archetype_generation.wrapping_add(1);
-        } else {
-            self.archetypes.insert(old_archetype_id, old_archetype);
         }
 
         Ok(())

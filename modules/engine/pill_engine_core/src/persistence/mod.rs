@@ -414,7 +414,7 @@ mod tests {
         let successor_id = ComponentId::of::<DropTestSupersedingComponent>();
         assert_ne!(successor_id, stranded_id);
 
-        let dropped = world.drop_forgotten_component_ids(&[stranded_id]);
+        let dropped = world.retire_component_storage(&[stranded_id]);
         assert_eq!(dropped, 1, "the stranded type's row was removed with it");
 
         // The failed generation's id holds nothing anywhere...

@@ -65,7 +65,6 @@ mod resource;
 mod target;
 
 // Current crate
-use crate::archetype::ArchetypeId;
 
 // =============================================================================
 // Re-exports
@@ -75,7 +74,7 @@ use crate::archetype::ArchetypeId;
 pub use filter::{Added, Changed, Or, QueryFilter, With, Without};
 
 // Sequential and parallel query iterators.
-pub use iter::{BatchStats, ParForEachResult, ParQueryIter, QueryIterMut};
+pub use iter::{BatchStats, ParQueryIter, QueryIterMut};
 
 // Core query type and resource accessors.
 pub use query::Query;
@@ -86,9 +85,19 @@ pub use target::QueryTarget;
 // Types
 // =============================================================================
 
-/// Cached archetype state for filtered parallel iteration:
-/// `(archetype_id, target_state, filter_state, entity_count)`.
-pub(crate) type FilteredArchetypeRange<QS, FS> = (ArchetypeId, QS, FS, usize);
+/// Cached per-archetype state for parallel iteration.
+///
+/// One record per matching archetype, built once per `par_iter_mut` call: the
+/// storage pointers the target and the filter resolved, and the row count they
+/// were resolved against.
+pub(crate) struct FilteredArchetypeRange<TargetState, FilterState> {
+    /// Cached storage pointers for the queried components.
+    pub(crate) target_state: TargetState,
+    /// Cached state the row filter needs for this archetype.
+    pub(crate) filter_state: FilterState,
+    /// Rows in the archetype when the states were built.
+    pub(crate) entity_count: usize,
+}
 
 // =============================================================================
 // Tests

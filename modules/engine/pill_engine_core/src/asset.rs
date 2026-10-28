@@ -239,11 +239,21 @@ pub struct Handle<T: Asset> {
     _marker: PhantomData<fn() -> T>,
 }
 
+/// The slot index [`Handle::INVALID`] carries.
+///
+/// Named rather than written inline: the field layer stores a reference as a
+/// bare index/generation pair, so the "points at nothing" sentinel has to be
+/// spelled the same way wherever a reference is saved, restored or cleared.
+pub const INVALID_ASSET_INDEX: u32 = u32::MAX;
+
+/// The generation [`Handle::INVALID`] carries.
+pub const INVALID_ASSET_GENERATION: u32 = u32::MAX;
+
 impl<T: Asset> Handle<T> {
     /// Sentinel for an optional asset reference that has not been assigned.
     pub const INVALID: Self = Self {
-        index: u32::MAX,
-        generation: u32::MAX,
+        index: INVALID_ASSET_INDEX,
+        generation: INVALID_ASSET_GENERATION,
         _marker: PhantomData,
     };
 
@@ -339,6 +349,71 @@ impl<T: Asset> std::fmt::Debug for Handle<T> {
 // AssetColumn
 // =============================================================================
 
+/// One key namespace of an asset column: key to slot, and slot back to key.
+///
+/// Every namespace has to drop its key when the slot is freed without scanning
+/// the whole map, so each is this pair. Keeping the pair in one type means the
+/// reverse half cannot be forgotten at one of the sites that bind or release a
+/// key - the failure that would let a freed name resolve to whatever refilled
+/// the slot.
+#[derive(Debug)]
+struct KeyIndex<K> {
+    by_key: HashMap<K, u32>,
+    by_slot: HashMap<u32, K>,
+}
+
+// Written out rather than derived: the derive would require `K: Default`, which
+// no key type here has - an empty map needs nothing from its key.
+impl<K> Default for KeyIndex<K> {
+    fn default() -> Self {
+        Self {
+            by_key: HashMap::new(),
+            by_slot: HashMap::new(),
+        }
+    }
+}
+
+impl<K> KeyIndex<K>
+where
+    K: std::hash::Hash + Eq + Clone,
+{
+    /// Bind `key` to `slot`, dropping the key the slot held and the slot the
+    /// key named: one key, one slot, one slot, one key.
+    ///
+    /// Shared by every binding site, so a displaced reverse entry cannot be
+    /// left behind. Callers still refuse a key another live asset holds where
+    /// that is an error rather than a move.
+    fn bind(&mut self, key: K, slot: u32) {
+        if let Some(previous) = self.by_slot.insert(slot, key.clone()) {
+            self.by_key.remove(&previous);
+        }
+        if let Some(previous) = self.by_key.insert(key, slot) {
+            self.by_slot.remove(&previous);
+        }
+    }
+
+    /// Drop `slot`'s key, returning it.
+    fn release(&mut self, slot: u32) -> Option<K> {
+        let key = self.by_slot.remove(&slot)?;
+        self.by_key.remove(&key);
+        Some(key)
+    }
+
+    /// The slot `key` names, when it is bound.
+    fn slot_of<Q>(&self, key: &Q) -> Option<u32>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.by_key.get(key).copied()
+    }
+
+    /// The key `slot` holds, when it holds one.
+    fn key_of(&self, slot: u32) -> Option<&K> {
+        self.by_slot.get(&slot)
+    }
+}
+
 /// Per-type slot bookkeeping that sits alongside one asset column.
 ///
 /// The column in the [`TraitTypeMap`] holds the values; this holds everything
@@ -374,24 +449,18 @@ struct AssetColumn {
     slot_rows: Vec<u32>,
     /// Slot owning each row; the reverse of `slot_rows`.
     row_slots: Vec<u32>,
-    /// Name lookup for assets added with one.
+    /// Name lookup for assets added with one, and its reverse.
     ///
-    /// Holds the index only: the generation is read from `generations` at
+    /// Holds the slot index only: the generation is read from `generations` at
     /// lookup time, so a name that outlived a free cannot resolve to whatever
     /// refilled the slot.
-    by_name: HashMap<String, u32>,
-    /// Reverse of `by_name`, so freeing a slot can drop its name without
-    /// scanning the whole map.
-    names: HashMap<u32, String>,
-    /// Guid lookup, holding the index exactly as `by_name` does.
+    names: KeyIndex<String>,
+    /// Guid lookup, and its reverse.
     ///
-    /// A separate map rather than hashing the name at lookup time: a guid may
-    /// be assigned without a name (an asset cooked to an id), and the two
-    /// namespaces must not alias.
-    by_guid: HashMap<AssetGuid, u32>,
-    /// Reverse of `by_guid`, so freeing a slot can drop its guid without
-    /// scanning the whole map.
-    guids: HashMap<u32, AssetGuid>,
+    /// A namespace of its own rather than hashing the name at lookup time: a
+    /// guid may be assigned without a name (an asset cooked to an id), and the
+    /// two namespaces must not alias.
+    guids: KeyIndex<AssetGuid>,
     /// Import settings each slot was decoded with, as JSON.
     ///
     /// Only an asset decoded without a metadata file has an entry: that is the
@@ -664,18 +733,18 @@ impl AssetManager {
 
     /// Store `asset` and return a handle to it.
     ///
-    /// Reuses a slot freed by [`Self::remove`] when one is available, so a
-    /// project that repeatedly loads and unloads does not grow the column
-    /// without bound.
+    /// Registers `T` first: adding an asset type is also when its column,
+    /// metadata and function table are created or refreshed, and the shared
+    /// column's layout is checked. Reuses a slot freed by [`Self::remove`] when
+    /// one is available, so a project that repeatedly loads and unloads does
+    /// not grow the column without bound.
     pub fn add<T>(&mut self, asset: T) -> Handle<T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        self.ensure_column::<T>();
+        self.register::<T>();
 
-        let key = self
-            .key_of::<T>()
-            .expect("ensure_column registered the type");
+        let key = self.key_of::<T>().expect("register created the type");
         let storage = self
             .columns
             .get_trait_storage_mut(key)
@@ -743,8 +812,7 @@ impl AssetManager {
         let metadata = self
             .metadata_of_mut::<T>()
             .expect("add created the column metadata");
-        metadata.by_name.insert(name.clone(), handle.index);
-        metadata.names.insert(handle.index, name);
+        metadata.names.bind(name, handle.index);
         Ok(handle)
     }
 
@@ -780,10 +848,7 @@ impl AssetManager {
         let metadata = self
             .metadata_of_mut::<T>()
             .expect("a live handle has column metadata");
-        if let Some(old_name) = metadata.names.insert(handle.index, new_name.clone()) {
-            metadata.by_name.remove(&old_name);
-        }
-        metadata.by_name.insert(new_name, handle.index);
+        metadata.names.bind(new_name, handle.index);
         Ok(())
     }
 
@@ -826,9 +891,7 @@ impl AssetManager {
 
     /// Point `guid` at the asset already living in `index`.
     ///
-    /// Shared by the two guid-assigning entry points. Drops any previous
-    /// reverse entry so `guids` cannot accumulate stale index -> guid pairs
-    /// when a guid is rebound.
+    /// Shared by the two guid-assigning entry points.
     fn bind_guid<T>(&mut self, guid: AssetGuid, index: u32)
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -836,10 +899,7 @@ impl AssetManager {
         let metadata = self
             .metadata_of_mut::<T>()
             .expect("add created the column metadata");
-        if let Some(previous_index) = metadata.by_guid.insert(guid, index) {
-            metadata.guids.remove(&previous_index);
-        }
-        metadata.guids.insert(index, guid);
+        metadata.guids.bind(guid, index);
     }
 
     /// Borrow the asset `handle` refers to, or `None` when it is stale.
@@ -881,7 +941,7 @@ impl AssetManager {
         T: Asset + TraitAccessible<dyn Asset>,
     {
         let metadata = self.metadata_of::<T>()?;
-        let index = *metadata.by_name.get(name)?;
+        let index = metadata.names.slot_of(name)?;
         Some(Handle {
             index,
             generation: *metadata.generations.get(index as usize)?,
@@ -903,7 +963,7 @@ impl AssetManager {
         T: Asset + TraitAccessible<dyn Asset>,
     {
         let metadata = self.metadata_of::<T>()?;
-        let index = *metadata.by_guid.get(&guid)?;
+        let index = metadata.guids.slot_of(&guid)?;
         Some(Handle {
             index,
             generation: *metadata.generations.get(index as usize)?,
@@ -945,7 +1005,7 @@ impl AssetManager {
         }
         self.metadata_of::<T>()?
             .names
-            .get(&handle.index)
+            .key_of(handle.index)
             .map(String::as_str)
     }
 
@@ -957,7 +1017,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.metadata_of::<T>()?.guids.get(&handle.index).copied()
+        self.metadata_of::<T>()?.guids.key_of(handle.index).copied()
     }
 
     /// Record the import settings `handle` was decoded with, as the JSON a
@@ -1045,12 +1105,8 @@ impl AssetManager {
             metadata.free_slots.push(handle.index);
         }
 
-        if let Some(name) = metadata.names.remove(&handle.index) {
-            metadata.by_name.remove(&name);
-        }
-        if let Some(guid) = metadata.guids.remove(&handle.index) {
-            metadata.by_guid.remove(&guid);
-        }
+        metadata.names.release(handle.index);
+        metadata.guids.release(handle.index);
         metadata.import_settings.remove(&handle.index);
 
         self.revision = self.revision.wrapping_add(1);
@@ -1223,14 +1279,6 @@ impl AssetManager {
         for (key, refresher) in &self.ops_refreshers {
             refresher(&mut self.columns, *key);
         }
-    }
-
-    /// Create the column and metadata for `T` if this is its first use.
-    fn ensure_column<T>(&mut self)
-    where
-        T: Asset + TraitAccessible<dyn Asset>,
-    {
-        self.register::<T>();
     }
 }
 

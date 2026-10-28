@@ -15,7 +15,7 @@
 //! `process_frame` advances it rather than a registered system, deliberately.
 //! A "time system" would only be ordered ahead of its readers if every project
 //! registered it first: the scheduler batches in registration order (see
-//! [`build_execution_graph`](crate::scheduler::SystemScheduler::build_execution_graph)),
+//! [`ensure_execution_graph`](crate::scheduler::SystemScheduler::ensure_execution_graph)),
 //! so a project that registers one late hands its earlier systems values a
 //! frame stale. Advancing outside the system set is the only way to guarantee
 //! every system in a frame sees the same current time.

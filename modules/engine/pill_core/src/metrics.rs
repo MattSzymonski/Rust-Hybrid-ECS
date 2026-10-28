@@ -3,24 +3,29 @@
 //! # Responsibilities
 //!
 //! - Install one process-wide [`metrics::Recorder`] for the engine.
-//! - Keep the most recent counter, gauge, and histogram values in memory for
-//!   diagnostics and UI overlays.
-//! - Forward gauges and histograms to Tracy plots when the `tracy` feature
-//!   is active, so repeated numbers appear as native Tracy graphs.
+//! - Forward gauges and histograms to Tracy plots when the `tracy` feature is
+//!   active, so repeated numbers appear as native Tracy graphs.
 //!
 //! # Design
 //!
 //! Call [`install_metrics`] once at the reporting boundary (usually from the
 //! host telemetry bootstrap). After that, the `metrics::gauge!`,
 //! `metrics::counter!`, and `metrics::histogram!` macros record into this
-//! recorder from any crate. The recorder is a fan-out hub: it keeps a
-//! recent-value store and optionally forwards to Tracy, matching the "one
-//! metrics API, many sinks" goal. Tracy plot names are cached so the leaked
-//! `PlotName` is created once per distinct metric name.
+//! recorder from any crate.
+//!
+//! The recorder keeps nothing: a value goes to Tracy when a profiler is
+//! attached and nowhere otherwise. `metrics` requires a recorder to exist so
+//! those macros have a sink, not so the engine can hold its own copy - the
+//! build and the shipping bundle report numbers by reading Tracy or by logging
+//! them. Tracy plot names are cached so the leaked `PlotName` is created once
+//! per distinct metric name.
 
 // Standard library
+#[cfg(feature = "tracy")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+#[cfg(feature = "tracy")]
+use std::sync::{Mutex, Weak};
 
 // External crates
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit};
@@ -29,36 +34,17 @@ use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, SharedString, U
 // Types
 // =============================================================================
 
-/// One recorded metric with its latest value, for diagnostics and UI.
-///
-/// The recorder keeps only the most recent sample per metric name, so the
-/// store stays small even under high-frequency updates. Snapshots are taken
-/// on demand and sorted by name for stable rendering.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MetricSnapshot {
-    /// Latest counter value.
-    Counter(u64),
-    /// Latest gauge value.
-    Gauge(f64),
-    /// Latest histogram sample.
-    Histogram(f64),
-}
-
-/// Shared state behind the recorder and its delegated handles.
-///
-/// Delegated handles hold a [`Weak`] reference to this state so the store is
-/// freed once the last live handle drops, even if the recorder is gone.
+/// Shared state behind the recorder and its delegated handles: the plot-name
+/// cache and the switch that turns forwarding off.
+#[cfg(feature = "tracy")]
 struct Inner {
-    store: Mutex<HashMap<String, MetricSnapshot>>,
-    #[cfg(feature = "tracy")]
     plots: Mutex<HashMap<String, tracy_client::PlotName>>,
-    #[cfg(feature = "tracy")]
     forward_to_tracy: bool,
 }
 
+#[cfg(feature = "tracy")]
 impl Inner {
     /// Pushes one point into a native Tracy plot when a profiler is connected.
-    #[cfg(feature = "tracy")]
     fn emit_tracy_plot(&self, name: &str, value: f64) {
         // Step 1: Bail out when forwarding is disabled or no profiler is running.
         if !self.forward_to_tracy || !tracy_client::Client::is_running() {
@@ -87,76 +73,28 @@ impl Inner {
     }
 }
 
-/// Process-wide recorder that keeps recent values and forwards to Tracy.
+/// Process-wide recorder: accepts every `metrics` update and forwards the
+/// plottable ones to Tracy.
 ///
-/// The recorder is cheap: updates lock a `HashMap` and, when Tracy is
-/// running, push a single plot point. It implements the full [`Recorder`]
-/// surface so `metrics` handles can be returned to callers.
+/// It implements the full [`Recorder`] surface because the `metrics` crate
+/// requires one, and it holds nothing else: no store, no lookup per update
+/// beyond the plot-name cache a profiler needs anyway.
 #[derive(Clone)]
 pub struct EngineMetricsRecorder {
+    #[cfg(feature = "tracy")]
     inner: Arc<Inner>,
 }
 
 impl EngineMetricsRecorder {
-    /// Creates a recorder with a fresh recent-value store.
+    /// Creates a recorder with an empty plot-name cache.
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "tracy")]
             inner: Arc::new(Inner {
-                store: Mutex::new(HashMap::new()),
-                #[cfg(feature = "tracy")]
                 plots: Mutex::new(HashMap::new()),
-                #[cfg(feature = "tracy")]
                 forward_to_tracy: true,
             }),
         }
-    }
-
-    /// Snapshots every metric recorded so far, sorted by name.
-    pub fn snapshot(&self) -> Vec<(String, MetricSnapshot)> {
-        let mut values: Vec<_> = self
-            .inner
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|(name, value)| (name.clone(), *value))
-            .collect();
-        values.sort_by(|left, right| left.0.cmp(&right.0));
-        values
-    }
-
-    /// Directly records one gauge value into the store (test helper).
-    #[cfg(test)]
-    fn record_gauge(&self, name: &str, value: f64) {
-        self.inner
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_owned(), MetricSnapshot::Gauge(value));
-        #[cfg(feature = "tracy")]
-        self.inner.emit_tracy_plot(name, value);
-    }
-
-    /// Directly records one counter value into the store (test helper).
-    #[cfg(test)]
-    fn record_counter(&self, name: &str, value: u64) {
-        self.inner
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_owned(), MetricSnapshot::Counter(value));
-    }
-
-    /// Directly records one histogram sample into the store (test helper).
-    #[cfg(test)]
-    fn record_histogram(&self, name: &str, value: f64) {
-        self.inner
-            .store
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(name.to_owned(), MetricSnapshot::Histogram(value));
-        #[cfg(feature = "tracy")]
-        self.inner.emit_tracy_plot(name, value);
     }
 
     /// Installs this recorder as the process-wide metrics recorder.
@@ -181,140 +119,100 @@ impl Recorder for EngineMetricsRecorder {
     fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
 
     fn register_counter(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> Counter {
-        Counter::from_arc(Arc::new(DelegatingCounter {
-            name: key.name().to_owned(),
-            inner: Arc::downgrade(&self.inner),
-        }))
+        // Counters never reach a Tracy plot, so this handle has nothing to do
+        // with or without the feature.
+        let _ = key;
+        Counter::from_arc(Arc::new(NullHandle))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> Gauge {
-        Gauge::from_arc(Arc::new(DelegatingGauge {
-            name: key.name().to_owned(),
-            inner: Arc::downgrade(&self.inner),
-        }))
+        #[cfg(feature = "tracy")]
+        {
+            Gauge::from_arc(Arc::new(DelegatingGauge {
+                name: key.name().to_owned(),
+                inner: Arc::downgrade(&self.inner),
+            }))
+        }
+        #[cfg(not(feature = "tracy"))]
+        {
+            let _ = key;
+            Gauge::from_arc(Arc::new(NullHandle))
+        }
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &metrics::Metadata<'_>) -> Histogram {
-        Histogram::from_arc(Arc::new(DelegatingHistogram {
-            name: key.name().to_owned(),
-            inner: Arc::downgrade(&self.inner),
-        }))
-    }
-}
-
-/// `metrics::Counter` handle delegating into the recorder store.
-struct DelegatingCounter {
-    name: String,
-    inner: Weak<Inner>,
-}
-
-impl metrics::CounterFn for DelegatingCounter {
-    fn increment(&self, value: u64) {
-        if let Some(inner) = self.inner.upgrade() {
-            let mut store = inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Add to the last recorded value, defaulting to zero when no
-            // counter has been recorded for this name yet.
-            let current = match store.get(&self.name) {
-                Some(MetricSnapshot::Counter(previous)) => *previous,
-                _ => 0,
-            };
-            store.insert(self.name.clone(), MetricSnapshot::Counter(current + value));
+        #[cfg(feature = "tracy")]
+        {
+            Histogram::from_arc(Arc::new(DelegatingHistogram {
+                name: key.name().to_owned(),
+                inner: Arc::downgrade(&self.inner),
+            }))
         }
-    }
-    fn absolute(&self, value: u64) {
-        if let Some(inner) = self.inner.upgrade() {
-            inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.name.clone(), MetricSnapshot::Counter(value));
+        #[cfg(not(feature = "tracy"))]
+        {
+            let _ = key;
+            Histogram::from_arc(Arc::new(NullHandle))
         }
     }
 }
 
-/// `metrics::Gauge` handle delegating into the recorder store.
+/// A handle that drops every update.
+///
+/// Without a profiler there is no sink and the recorder keeps no copy, so a
+/// metric update is a call that does nothing - which is what a recorder with
+/// no backend means.
+struct NullHandle;
+
+impl metrics::CounterFn for NullHandle {
+    fn increment(&self, _value: u64) {}
+    fn absolute(&self, _value: u64) {}
+}
+
+impl metrics::GaugeFn for NullHandle {
+    fn increment(&self, _value: f64) {}
+    fn decrement(&self, _value: f64) {}
+    fn set(&self, _value: f64) {}
+}
+
+impl metrics::HistogramFn for NullHandle {
+    fn record(&self, _value: f64) {}
+    fn record_many(&self, _value: f64, _count: usize) {}
+}
+
+/// `metrics::Gauge` handle forwarding into the Tracy plot cache.
+#[cfg(feature = "tracy")]
 struct DelegatingGauge {
     name: String,
     inner: Weak<Inner>,
 }
 
+#[cfg(feature = "tracy")]
 impl metrics::GaugeFn for DelegatingGauge {
-    fn increment(&self, value: f64) {
-        if let Some(inner) = self.inner.upgrade() {
-            let mut store = inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Add to the last recorded value, defaulting to zero when no
-            // gauge has been recorded for this name yet.
-            let current = match store.get(&self.name) {
-                Some(MetricSnapshot::Gauge(previous)) => *previous,
-                _ => 0.0,
-            };
-            store.insert(self.name.clone(), MetricSnapshot::Gauge(current + value));
-        }
-    }
-    fn decrement(&self, value: f64) {
-        if let Some(inner) = self.inner.upgrade() {
-            let mut store = inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Subtract from the last recorded value, defaulting to zero when
-            // no gauge has been recorded for this name yet.
-            let current = match store.get(&self.name) {
-                Some(MetricSnapshot::Gauge(previous)) => *previous,
-                _ => 0.0,
-            };
-            store.insert(self.name.clone(), MetricSnapshot::Gauge(current - value));
-        }
-    }
+    fn increment(&self, _value: f64) {}
+    fn decrement(&self, _value: f64) {}
     fn set(&self, value: f64) {
         if let Some(inner) = self.inner.upgrade() {
-            inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.name.clone(), MetricSnapshot::Gauge(value));
-            #[cfg(feature = "tracy")]
             inner.emit_tracy_plot(&self.name, value);
         }
     }
 }
 
-/// `metrics::Histogram` handle delegating into the recorder store.
+/// `metrics::Histogram` handle forwarding into the Tracy plot cache.
+#[cfg(feature = "tracy")]
 struct DelegatingHistogram {
     name: String,
     inner: Weak<Inner>,
 }
 
+#[cfg(feature = "tracy")]
 impl metrics::HistogramFn for DelegatingHistogram {
     fn record(&self, value: f64) {
         if let Some(inner) = self.inner.upgrade() {
-            inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.name.clone(), MetricSnapshot::Histogram(value));
-            #[cfg(feature = "tracy")]
             inner.emit_tracy_plot(&self.name, value);
         }
     }
     fn record_many(&self, value: f64, count: usize) {
-        // Without the `tracy` feature, the recent-value store keeps only the
-        // latest sample, so `count` is intentionally unused.
-        #[cfg(not(feature = "tracy"))]
-        let _ = count;
         if let Some(inner) = self.inner.upgrade() {
-            inner
-                .store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(self.name.clone(), MetricSnapshot::Histogram(value));
-            #[cfg(feature = "tracy")]
             for _ in 0..count {
                 inner.emit_tracy_plot(&self.name, value);
             }
@@ -367,49 +265,31 @@ pub fn install_metrics_with(recorder: EngineMetricsRecorder) -> bool {
 mod tests {
     use super::*;
 
-    /// Gauges, counters, and histograms are all captured in the store.
+    /// Every handle accepts every update and keeps nothing.
+    ///
+    /// `metrics` requires a recorder so the macros have a sink; a value goes to
+    /// a Tracy plot when a profiler is attached and nowhere otherwise, so there
+    /// is no retained state to assert on. This test is the recorder's contract:
+    /// nothing panics, and no update needs a lock or an allocation to be
+    /// accepted.
     #[test]
-    fn recorder_captures_gauge_counter_and_histogram() {
-        let recorder = EngineMetricsRecorder::new();
-        recorder.record_gauge("engine.fps", 144.0);
-        recorder.record_counter("ecs.entities", 54_120);
-        recorder.record_histogram("engine.frame_time_ms", 6.9);
-
-        let snapshot = recorder.snapshot();
-        assert!(snapshot.contains(&("engine.fps".to_owned(), MetricSnapshot::Gauge(144.0))));
-        assert!(snapshot.contains(&("ecs.entities".to_owned(), MetricSnapshot::Counter(54_120))));
-        assert!(snapshot.contains(&(
-            "engine.frame_time_ms".to_owned(),
-            MetricSnapshot::Histogram(6.9)
-        )));
-    }
-
-    /// Repeated gauge updates overwrite the previous value.
-    #[test]
-    fn gauge_updates_overwrite_previous_value() {
-        let recorder = EngineMetricsRecorder::new();
-        recorder.record_gauge("engine.fps", 60.0);
-        recorder.record_gauge("engine.fps", 144.0);
-        assert_eq!(recorder.snapshot()[0].1, MetricSnapshot::Gauge(144.0));
-    }
-
-    /// The delegated handles record into the shared store.
-    #[test]
-    fn delegated_handles_reach_the_shared_store() {
+    fn handles_accept_every_update_and_keep_nothing() {
         use metrics::Level;
         let recorder = EngineMetricsRecorder::new();
         let metadata = metrics::Metadata::new("test", Level::INFO, None);
+
         let gauge = recorder.register_gauge(&Key::from_name("test.gauge"), &metadata);
         gauge.set(7.0);
+        gauge.increment(1.0);
+        gauge.decrement(0.5);
+
         let histogram = recorder.register_histogram(&Key::from_name("test.histogram"), &metadata);
         histogram.record(1.5);
+        histogram.record_many(1.5, 3);
+
         let counter = recorder.register_counter(&Key::from_name("test.counter"), &metadata);
         counter.increment(3);
-        counter.increment(2);
-        let snapshot = recorder.snapshot();
-        assert!(snapshot.contains(&("test.gauge".to_owned(), MetricSnapshot::Gauge(7.0))));
-        assert!(snapshot.contains(&("test.histogram".to_owned(), MetricSnapshot::Histogram(1.5))));
-        assert!(snapshot.contains(&("test.counter".to_owned(), MetricSnapshot::Counter(5))));
+        counter.absolute(9);
     }
 
     /// Tracy plot names sanitize punctuation into identifiers.

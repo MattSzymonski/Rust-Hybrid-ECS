@@ -1583,7 +1583,7 @@ mod tests {
         assert_eq!(
             world.descriptor_component_bytes(entity, descriptor_b),
             Some(&22_u32.to_ne_bytes()[..]),
-            "a refused migration leaves the entity where it was, with the              component the removal targeted still on it"
+            "a refused migration leaves the entity where it was, with the component the removal targeted still on it"
         );
         assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
     }
