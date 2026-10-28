@@ -7,6 +7,8 @@
 //
 // Edit here - `pill_assets` regenerates the .wgsl.
 
+#include "common.hlsl"
+
 // No input struct: the only stage input is SV_VertexID, and wrapping a system
 // value in a struct would invent an interface that does not exist.
 struct VertexOutput
@@ -19,15 +21,7 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vs_main(uint vertex_index : SV_VertexID)
 {
-    // Oversized on purpose: the triangle covers the target without touching its
-    // edges, so no interpolation runs off the end of the visible area.
-    float2 corner[3] = {
-        float2(-1.0, -3.0),
-        float2( 3.0,  1.0),
-        float2(-1.0,  1.0)
-    };
-
-    float2 position = corner[vertex_index];
+    float2 position = fullscreen_triangle_corner(vertex_index);
 
     VertexOutput output;
     output.position = float4(position, 0.0, 1.0);

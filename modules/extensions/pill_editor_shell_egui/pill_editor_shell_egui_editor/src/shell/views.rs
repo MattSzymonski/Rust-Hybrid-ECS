@@ -4,8 +4,7 @@
 //!
 //! - The measured scene body rectangle the frontend places the scene's child
 //!   window at, and the game view's own rectangle.
-//! - The per-viewport overlay chips (the frame counter and the Example
-//!   button) and the regions they mark.
+//! - The per-viewport overlay chip (the frame counter) and the region it marks.
 //!
 //! The globs below are absolute paths: a generated patch crate replays this
 //! file's top-level `use` lines, so a `super::`-relative glob would not
@@ -35,12 +34,6 @@ pub const SCENE_COUNTER_HEIGHT: f32 = 20.0;
 
 pub const SCENE_COUNTER_MARGIN: f32 = 8.0;
 
-/// The Example button beside the counter: its width, and the gap between
-/// the two.
-pub const SCENE_BUTTON_WIDTH: f32 = 72.0;
-
-pub const SCENE_BUTTON_GAP: f32 = 6.0;
-
 /// Convert an egui rectangle into the boundary's plain rectangle.
 pub fn shell_rect(rect: egui::Rect) -> ShellRect {
     ShellRect {
@@ -58,40 +51,18 @@ pub fn scene_body_rect(ui: &egui::Ui) -> ShellRect {
     shell_rect(ui.max_rect().expand(SCENE_RECT_OVERSHOOT))
 }
 
-/// A scene tab's overlay strip, anchored to the viewport's top-right corner:
-/// an Example button and the frame counter, both painted from the theme. The
-/// overlay paints above the scene's child window, so both sit over the
-/// viewport, and both take input, so a click on either never reaches the
-/// project. Both rectangles join the frame's overlay regions, so a click on
-/// them is never read as a scene pick.
+/// A scene tab's overlay strip: the frame counter, anchored to the viewport's
+/// top-right corner and painted from the theme. The overlay paints above the
+/// scene's child window, so the counter sits over the viewport, and it takes
+/// input, so a click on it never reaches the project. Its rectangle joins the
+/// frame's overlay regions, so a click on it is never read as a scene pick.
 pub fn scene_overlay(
     ui: &mut egui::Ui,
     frames_per_second: f32,
     overlay_regions: &mut Vec<ShellRect>,
 ) {
     let counter_rect = frame_counter_rect(ui);
-    let button_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            counter_rect.left() - SCENE_BUTTON_WIDTH - SCENE_BUTTON_GAP,
-            counter_rect.top(),
-        ),
-        egui::vec2(SCENE_BUTTON_WIDTH, SCENE_COUNTER_HEIGHT),
-    );
     overlay_regions.push(shell_rect(counter_rect));
-    overlay_regions.push(shell_rect(button_rect));
-    let button = ui.put(
-        button_rect,
-        egui::Button::new("Example")
-            .min_size(button_rect.size())
-            .fill(style::control())
-            .corner_radius(egui::CornerRadius::same(4)),
-    );
-    if button.clicked() {
-        pill_core::info!(
-            target: pill_core::telemetry::telemetry_target::ENGINE,
-            "[editor] example button clicked"
-        );
-    }
     // The counter is painted rather than laid out, so it costs the tab body
     // no layout space; its rectangle still senses clicks.
     let _ = ui.interact(

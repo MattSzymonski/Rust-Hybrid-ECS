@@ -342,14 +342,6 @@ impl PillRenderer for ModuleRenderer {
         self.backend().metrics()
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        self.backend_mut().resize(width, height);
-    }
-
-    fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.backend_mut().set_viewport(viewport);
-    }
-
     fn render(
         &mut self,
         frame: &RenderFrame,

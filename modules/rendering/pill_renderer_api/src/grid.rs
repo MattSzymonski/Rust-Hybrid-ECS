@@ -4,9 +4,8 @@
 //!
 //! - Carry a frontend's grid choice ([`SceneGrid`]: the switch and the
 //!   distance between its lines) beside the surface camera bindings.
-//! - Carry the grid one frame draws ([`FrameGrid`]: the lines' spacing and
-//!   the surfaces that draw it) and resolve one from the other
-//!   ([`frame_grid`]).
+//! - Resolve the spacing the grid one frame draws ([`frame_grid`]) and name
+//!   the surfaces that draw it ([`editor_view_surfaces`]).
 //!
 //! # Design
 //!
@@ -19,12 +18,15 @@
 //! triangle whose fragment shader intersects each pixel's ray with the y=0
 //! plane, so the grid has no size to run out of and nothing to rebuild as
 //! the view moves - only its spacing, its fade and its colours are data.
+//!
+//! The frame names the grid by its spacing alone: the surfaces that draw it are
+//! the frame's editor views, one list rather than two that could disagree.
 
-// External crates
+// Standard library
 use std::collections::BTreeMap;
 
 // Current crate
-use crate::{CameraBinding, SurfaceCameras};
+use crate::{CameraBinding, SurfaceCameras, SurfaceId};
 
 /// The cell size a grid falls back to when a frontend asks for an unusable
 /// one: the shader divides by it, so zero or negative would paint nothing.
@@ -52,43 +54,30 @@ impl Default for SceneGrid {
     }
 }
 
-/// The grid one frame draws: its spacing, and the surfaces that draw it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrameGrid {
-    /// The distance between the minor lines, in world units.
-    pub cell_size: f32,
-    /// The surfaces that draw it, ascending.
-    pub surfaces: Vec<u32>,
-}
-
 /// Resolves the grid one frame draws from the camera bindings.
 ///
 /// A surface draws the grid when it is bound to a view camera and the grid
-/// is on. The result names every such surface - including the primary one,
-/// when a frontend bound it that way - or nothing when the grid is off or no
+/// is on; the surfaces are the frame's [`editor_view_surfaces`], so this
+/// answers only the spacing. `None` means no grid: the switch is off, or no
 /// surface is view-bound. A cell size the shader could not divide by falls
 /// back to the default.
-pub fn frame_grid(bindings: &SurfaceCameras, grid: SceneGrid) -> Option<FrameGrid> {
-    if !grid.enabled {
+pub fn frame_grid(bindings: &SurfaceCameras) -> Option<f32> {
+    if !bindings.grid.enabled {
         return None;
     }
-    let surfaces = view_bound_surfaces(&bindings.bindings);
-    if surfaces.is_empty() {
+    if view_bound_surfaces(&bindings.bindings).is_empty() {
         return None;
     }
-    let cell_size = if grid.cell_size > 0.0 && grid.cell_size.is_finite() {
-        grid.cell_size
+    let cell_size = bindings.grid.cell_size;
+    Some(if cell_size > 0.0 && cell_size.is_finite() {
+        cell_size
     } else {
         DEFAULT_CELL_SIZE
-    };
-    Some(FrameGrid {
-        cell_size,
-        surfaces,
     })
 }
 
 /// Every surface bound to a view camera, ascending by id.
-fn view_bound_surfaces(bindings: &BTreeMap<u32, CameraBinding>) -> Vec<u32> {
+fn view_bound_surfaces(bindings: &BTreeMap<SurfaceId, CameraBinding>) -> Vec<SurfaceId> {
     bindings
         .iter()
         .filter(|(_, binding)| matches!(binding, CameraBinding::View { .. }))
@@ -99,17 +88,17 @@ fn view_bound_surfaces(bindings: &BTreeMap<u32, CameraBinding>) -> Vec<u32> {
 /// The surfaces an editor's own viewports draw through: every surface bound
 /// to a view camera, whether or not the grid is on.
 ///
-/// This is the same set [`frame_grid`] draws the grid on, named separately
-/// because the editor's gizmo handles and selection outlines need the answer
-/// even when the grid is off.
-pub fn editor_view_surfaces(cameras: &SurfaceCameras) -> Vec<u32> {
+/// These are the surfaces the grid is drawn on, and the ones that carry an
+/// editor's chrome - the gizmo handles and the selection outlines - which need
+/// the answer even when the grid is off. The frame carries the list once, as
+/// its editor views.
+pub fn editor_view_surfaces(cameras: &SurfaceCameras) -> Vec<SurfaceId> {
     view_bound_surfaces(&cameras.bindings)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SurfaceId;
 
     // External crates
     use pill_engine::common_components::TransformComponent;
@@ -128,7 +117,7 @@ mod tests {
         assert!(!SceneGrid::default().enabled);
         let mut cameras = SurfaceCameras::default();
         cameras.set(SurfaceId(1), Some(view_binding()));
-        assert_eq!(frame_grid(&cameras, SceneGrid::default()), None);
+        assert_eq!(frame_grid(&cameras), None);
     }
 
     /// With the grid on, exactly the view-bound surfaces draw it - the
@@ -141,13 +130,15 @@ mod tests {
         cameras.set(SurfaceId(1), Some(view_binding()));
         cameras.set(SurfaceId(2), Some(view_binding()));
         cameras.set(SurfaceId(3), Some(CameraBinding::Entity(camera_entity)));
-        let grid = SceneGrid {
+        cameras.grid = SceneGrid {
             enabled: true,
             cell_size: 0.5,
         };
-        let resolved = frame_grid(&cameras, grid).expect("the grid resolves");
-        assert_eq!(resolved.surfaces, vec![1, 2]);
-        assert_eq!(resolved.cell_size, 0.5);
+        assert_eq!(frame_grid(&cameras), Some(0.5));
+        assert_eq!(
+            editor_view_surfaces(&cameras),
+            vec![SurfaceId(1), SurfaceId(2)]
+        );
     }
 
     /// The primary surface draws the grid too, when a frontend bound it to a
@@ -156,32 +147,33 @@ mod tests {
     fn a_view_bound_primary_draws_the_grid() {
         let mut cameras = SurfaceCameras::default();
         cameras.set(SurfaceId::PRIMARY, Some(view_binding()));
-        let grid = SceneGrid {
+        cameras.grid = SceneGrid {
             enabled: true,
             cell_size: 1.0,
         };
-        let resolved = frame_grid(&cameras, grid).expect("the grid resolves");
-        assert_eq!(resolved.surfaces, vec![SurfaceId::PRIMARY.0]);
+        assert_eq!(frame_grid(&cameras), Some(1.0));
+        assert_eq!(editor_view_surfaces(&cameras), vec![SurfaceId::PRIMARY]);
     }
 
     /// No view binding, or an unusable cell size, resolves the way the
     /// shader needs it: nothing, and a positive spacing.
     #[test]
     fn an_empty_binding_set_draws_nothing_and_a_bad_cell_falls_back() {
-        let mut cameras = SurfaceCameras::default();
-        let grid = SceneGrid {
-            enabled: true,
-            cell_size: 1.0,
+        let mut cameras = SurfaceCameras {
+            grid: SceneGrid {
+                enabled: true,
+                cell_size: 1.0,
+            },
+            ..SurfaceCameras::default()
         };
-        assert_eq!(frame_grid(&cameras, grid), None);
+        assert_eq!(frame_grid(&cameras), None);
         cameras.set(SurfaceId(1), Some(view_binding()));
         for cell_size in [0.0, -2.0, f32::NAN] {
-            let grid = SceneGrid {
+            cameras.grid = SceneGrid {
                 enabled: true,
                 cell_size,
             };
-            let resolved = frame_grid(&cameras, grid).expect("the grid resolves");
-            assert_eq!(resolved.cell_size, DEFAULT_CELL_SIZE);
+            assert_eq!(frame_grid(&cameras), Some(DEFAULT_CELL_SIZE));
         }
     }
 }

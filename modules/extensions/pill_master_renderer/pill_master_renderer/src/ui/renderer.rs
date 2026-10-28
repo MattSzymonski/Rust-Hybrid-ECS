@@ -160,6 +160,10 @@ pub struct UiRenderer {
     /// Every list of the surface being drawn: its vertices, then its indices.
     vertices: StreamBuffer,
     indices: StreamBuffer,
+    /// One frame's vertices and indices, converted here and reused for every
+    /// surface it draws on: cleared between surfaces, never reallocated.
+    scratch_vertices: Vec<GpuVertex>,
+    scratch_indices: Vec<u32>,
 }
 
 impl UiRenderer {
@@ -303,6 +307,8 @@ impl UiRenderer {
             textures: HashMap::new(),
             vertices: StreamBuffer::new("pill_ui_frame vertices", wgpu::BufferUsages::VERTEX),
             indices: StreamBuffer::new("pill_ui_frame indices", wgpu::BufferUsages::INDEX),
+            scratch_vertices: Vec::new(),
+            scratch_indices: Vec::new(),
         }
     }
 
@@ -395,8 +401,12 @@ impl UiRenderer {
         );
         // One upload for the surface: each list's vertices after the previous
         // list's, its indices unchanged and offset by `base_vertex` per draw.
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        // The two vectors are the painter's own, so a frame that draws on four
+        // surfaces converts its UI once per surface but allocates nothing.
+        let mut vertices = std::mem::take(&mut self.scratch_vertices);
+        vertices.clear();
+        let mut indices = std::mem::take(&mut self.scratch_indices);
+        indices.clear();
         let mut placements = Vec::with_capacity(lists.len());
         for (list, scale_factor) in lists {
             placements.push((vertices.len() as i32, indices.len() as u32));
@@ -415,6 +425,8 @@ impl UiRenderer {
             .indices
             .write(device, queue, bytemuck::cast_slice(&indices))
             .cloned();
+        self.scratch_vertices = vertices;
+        self.scratch_indices = indices;
         let (Some(vertex_buffer), Some(index_buffer)) = (vertex_buffer, index_buffer) else {
             return;
         };

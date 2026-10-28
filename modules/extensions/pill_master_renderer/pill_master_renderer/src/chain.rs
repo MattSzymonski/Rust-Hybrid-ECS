@@ -40,9 +40,10 @@ use pill_engine::AssetManager;
 use crate::{
     assets::{asset_key, Shader},
     frame::{PassKind, PassTarget, ResolvedPass},
-    render_queue::{decompose_render_queue_key, RenderQueueItem},
+    render_queue::RenderQueueItem,
     renderer::{State, OFFSCREEN_FORMAT},
-    resources::{RendererPass, RendererShaderHandle, RendererTextureHandle},
+    rendering_resources_manager::GpuColumn,
+    resources::{RendererPass, RendererShaderHandle, RendererTexture, RendererTextureHandle},
 };
 
 /// Where a pass writes.
@@ -154,15 +155,23 @@ impl PassPlan<'_> {
 /// The chain names its shaders and textures by asset key and the renderer caches
 /// their GPU objects by the same key, so it is handed the caches rather than a
 /// way to look them up. Bundled because the borrow split demands it - the
-/// pipeline is mutated while all of this is borrowed - and because four separate
+/// chain is mutated while all of this is borrowed - and because four separate
 /// arguments at every call site would stop the chain reading as one unit.
 pub(crate) struct ChainContext<'a> {
-    /// The device, caches, and surface-sized targets the passes are built from.
+    /// The device, caches and layouts the passes are built from.
     pub(crate) state: &'a mut State,
+    /// The colour format a pass writing the surface declares.
+    pub(crate) surface_format: wgpu::TextureFormat,
+    /// The surface size, in pixels: every offscreen target is sized from it.
+    pub(crate) size: (u32, u32),
+    /// The depth buffer every geometry pass writes.
+    pub(crate) depth_texture: &'a RendererTexture,
+    /// The offscreen colour targets the chain declares, by name.
+    pub(crate) offscreen: &'a mut HashMap<String, RendererTexture>,
     /// Shader objects by asset key: a pass names its shader by key.
-    pub(crate) shader_handles: &'a HashMap<u64, RendererShaderHandle>,
+    pub(crate) shader_handles: &'a GpuColumn<RendererShaderHandle>,
     /// Texture objects by asset key: a pass's committed textures.
-    pub(crate) texture_handles: &'a HashMap<u64, RendererTextureHandle>,
+    pub(crate) texture_handles: &'a GpuColumn<RendererTextureHandle>,
     /// Bumped whenever a shader or texture object is created, recreated, or
     /// dropped. Part of both signatures, because a pass's bind groups reference
     /// those objects by handle.
@@ -176,19 +185,25 @@ pub(crate) struct ChainContext<'a> {
 /// resource epoch, or the surface size - and asked for a plan on every frame.
 /// The plan borrows the frame it came from, so a plan never outlives the frame
 /// that produced it.
-pub(crate) struct ScriptableRenderingPipeline {
+pub(crate) struct GpuChain {
     /// One entry per pass of the current chain, in the chain's order.
     passes: Vec<PassSlot>,
-    /// The chain those passes were built from.
-    signature: Option<String>,
-    /// What `signature` was last checked against: the frame's chain generation,
+    /// The chain those passes were built from, with the resource epoch they
+    /// were built at.
+    ///
+    /// Compared, never serialized: [`ResolvedPass`] derives equality, so a field
+    /// added to it is compared here without any change in this file - which a
+    /// hand-built string could not promise.
+    built_from: Option<(Vec<ResolvedPass>, u64)>,
+    /// What `built_from` was last checked against: the frame's chain generation,
     /// the resource epoch and the surface size. One tuple compare per frame - no
-    /// strings built - until the frame's chain or the GPU objects behind it
-    /// actually move.
+    /// chain copied or compared - until the frame's chain or the GPU objects
+    /// behind it actually move.
     inputs: Option<(u64, u64, u32, u32)>,
-    /// The offscreen layout the current targets were built for.
-    offscreen_key: Option<String>,
-    /// Passes this pipeline cannot record yet, remembered so each one is named
+    /// The offscreen layout the current targets were built for: every target
+    /// name with the scale of the pass that names it, and the surface size.
+    offscreen_key: Option<OffscreenKey>,
+    /// Passes this chain cannot record yet, remembered so each one is named
     /// once in the log instead of once per frame.
     skipped_passes: HashSet<String>,
     /// The chain last written to the log, so a chain that does not change does
@@ -196,12 +211,12 @@ pub(crate) struct ScriptableRenderingPipeline {
     chain_log: Option<String>,
 }
 
-impl ScriptableRenderingPipeline {
+impl GpuChain {
     /// A chain with nothing built and nothing planned.
     pub(crate) fn new() -> Self {
         Self {
             passes: Vec::new(),
-            signature: None,
+            built_from: None,
             inputs: None,
             offscreen_key: None,
             skipped_passes: HashSet::new(),
@@ -219,10 +234,11 @@ impl ScriptableRenderingPipeline {
     ///
     /// Two keys decide. The offscreen layout - every target and scale the chain
     /// declares, at the surface size - decides the render target textures;
-    /// everything else (the chain's serialized content and the resource epoch)
-    /// decides the pass pipelines and their bind groups. An unchanged frame
-    /// costs one tuple comparison: signature strings are only built when the
-    /// chain generation, the resource epoch or the surface size moved.
+    /// everything else (the chain itself, compared field by field, and the
+    /// resource epoch) decides the pass pipelines and their bind groups. An
+    /// unchanged frame costs one tuple comparison: the chain is only cloned and
+    /// compared when the chain generation, the resource epoch or the surface
+    /// size moved.
     ///
     /// Infallible on purpose: a pass that would not build is recorded as
     /// [`PassSlot::Unsupported`] and named in the log, so one bad shader does
@@ -234,22 +250,27 @@ impl ScriptableRenderingPipeline {
         chain_generation: u64,
         context: ChainContext<'_>,
     ) {
-        let (width, height) = context.state.surface.size();
+        let (width, height) = context.size;
         let inputs = (chain_generation, context.resource_epoch, width, height);
         if self.inputs == Some(inputs) {
             return;
         }
 
-        let offscreen_key = offscreen_signature(chain, width, height);
-        let targets_changed = self.offscreen_key.as_deref() != Some(offscreen_key.as_str());
-        let signature = chain_signature(chain, context.resource_epoch);
-        if !targets_changed && self.signature.as_deref() == Some(signature.as_str()) {
+        let offscreen_key = offscreen_layout(chain, width, height);
+        let targets_changed = self.offscreen_key.as_ref() != Some(&offscreen_key);
+        let built_from = (chain.to_vec(), context.resource_epoch);
+        if !targets_changed && self.built_from.as_ref() == Some(&built_from) {
             self.inputs = Some(inputs);
             return;
         }
 
         if targets_changed {
-            context.state.ensure_offscreen_targets(chain);
+            ensure_offscreen_targets(
+                &context.state.device,
+                context.size,
+                context.offscreen,
+                chain,
+            );
             self.offscreen_key = Some(offscreen_key);
         }
 
@@ -280,14 +301,16 @@ impl ScriptableRenderingPipeline {
                 &defined_targets,
                 &context,
             ));
-            for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
+            for target in
+                std::iter::once(&pass.settings.target).chain(pass.settings.extra_targets.iter())
+            {
                 if let PassTarget::Offscreen(name) = target {
                     defined_targets.insert(name.clone());
                 }
             }
         }
         self.passes = passes;
-        self.signature = Some(signature);
+        self.built_from = Some(built_from);
         self.inputs = Some(inputs);
     }
 
@@ -302,32 +325,36 @@ impl ScriptableRenderingPipeline {
         &mut self,
         chain: &'a [ResolvedPass],
         render_queue: &'a [RenderQueueItem],
-        shader_handles: &HashMap<u64, RendererShaderHandle>,
+        shader_handles: &GpuColumn<RendererShaderHandle>,
     ) -> Vec<PassPlan<'a>> {
         let mut plan = Vec::with_capacity(chain.len());
         // The shaders a geometry pass in this chain draws, and whether the runs
         // no pass claimed have been handed to a pass yet. One pass takes them,
         // so nothing is drawn twice.
-        let mut claimed: std::collections::HashSet<u8> = std::collections::HashSet::new();
-        for pass in chain.iter().filter(|pass| pass.kind == PassKind::Geometry) {
+        let mut claimed: std::collections::HashSet<RendererShaderHandle> =
+            std::collections::HashSet::new();
+        for pass in chain
+            .iter()
+            .filter(|pass| pass.settings.kind == PassKind::Geometry)
+        {
             if let Some(key) = &pass.shader {
-                if let Some(handle) = shader_handles.get(key) {
-                    claimed.insert(handle.data().index as u8);
+                if let Some(handle) = shader_handles.handle(key.0) {
+                    claimed.insert(handle);
                 }
             }
         }
         let mut unclaimed_given = false;
         for (index, pass) in chain.iter().enumerate() {
             // The pass's own target first, then the ones it writes beside it.
-            let outputs: Vec<PassOutput<'_>> = std::iter::once(&pass.target)
-                .chain(pass.extra_targets.iter())
+            let outputs: Vec<PassOutput<'_>> = std::iter::once(&pass.settings.target)
+                .chain(pass.settings.extra_targets.iter())
                 .map(|target| match target {
                     PassTarget::Surface => PassOutput::Surface,
                     PassTarget::Offscreen(name) => PassOutput::Offscreen(name.as_str()),
                 })
                 .collect();
 
-            match pass.kind {
+            match pass.settings.kind {
                 PassKind::Geometry => {
                     let reason = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => None,
@@ -346,8 +373,8 @@ impl ScriptableRenderingPipeline {
                         // longer is draws nothing: falling back to the default
                         // shader would hand this pass instances another pass
                         // already took.
-                        Some(key) => match shader_handles.get(&key) {
-                            Some(handle) => shader_ranges(render_queue, handle.data().index as u8)
+                        Some(key) => match shader_handles.handle(key.0) {
+                            Some(handle) => shader_ranges(render_queue, handle)
                                 .into_iter()
                                 .map(|range| DrawRange {
                                     range,
@@ -421,7 +448,7 @@ impl ScriptableRenderingPipeline {
                             pass_index: index,
                             outputs,
                             clear: plan.is_empty(),
-                            tests_depth: pass.kind == PassKind::Skybox,
+                            tests_depth: pass.settings.kind == PassKind::Skybox,
                         }),
                         Some(reason) => self.report_skip(&pass.name, &reason),
                     }
@@ -464,7 +491,7 @@ impl ScriptableRenderingPipeline {
     /// here, or a pass that breaks, is fixed and breaks again stays silent.
     fn forget_passes(&mut self) {
         self.passes.clear();
-        self.signature = None;
+        self.built_from = None;
         self.inputs = None;
         self.skipped_passes.clear();
     }
@@ -525,17 +552,17 @@ impl ScriptableRenderingPipeline {
 /// depth writes only its own target, so a scale there is the pass's own
 /// business.
 fn scaled_target_refusal(pass: &ResolvedPass) -> Option<String> {
-    if pass.target_scale.max(1) == 1 {
+    if pass.settings.target_scale.max(1) == 1 {
         return None;
     }
-    let depth = match pass.kind {
+    let depth = match pass.settings.kind {
         PassKind::Geometry => "writes",
         PassKind::Skybox => "reads",
         PassKind::Fullscreen => return None,
     };
     Some(format!(
         "it {depth} the full-size depth buffer, so it cannot write a target scaled by {}",
-        pass.target_scale
+        pass.settings.target_scale
     ))
 }
 
@@ -547,13 +574,13 @@ fn scaled_target_refusal(pass: &ResolvedPass) -> Option<String> {
 /// the surface would be recorded against the wrong format, so the pass is
 /// refused at plan time instead of refusing every draw.
 fn shaderless_target_refusal(pass: &ResolvedPass) -> Option<String> {
-    if pass.kind != PassKind::Geometry || pass.shader.is_some() {
+    if pass.settings.kind != PassKind::Geometry || pass.shader.is_some() {
         return None;
     }
     // The first target that is not the surface, if any: that one has no
     // material pipeline behind it.
-    std::iter::once(&pass.target)
-        .chain(pass.extra_targets.iter())
+    std::iter::once(&pass.settings.target)
+        .chain(pass.settings.extra_targets.iter())
         .find_map(|target| match target {
             PassTarget::Surface => None,
             PassTarget::Offscreen(name) => Some(format!(
@@ -586,7 +613,7 @@ fn build_pass(
     // A geometry pass with no shader of its own is the only kind that needs no
     // object built here: it draws through each material's pipeline.
     let Some(shader_key) = pass.shader else {
-        return match pass.kind {
+        return match pass.settings.kind {
             PassKind::Geometry => PassSlot::Unshaded,
             PassKind::Fullscreen => {
                 PassSlot::Unsupported("it names no shader the renderer loaded".to_owned())
@@ -598,25 +625,24 @@ fn build_pass(
         };
     };
 
-    let Some(shader) = shaders_by_key.get(&shader_key).copied() else {
+    let Some(shader) = shaders_by_key.get(&shader_key.0).copied() else {
         return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
     };
     let Some(renderer_shader) = chain
         .shader_handles
-        .get(&shader_key)
-        .and_then(|handle| chain.state.renderer_resource_storage.shaders.get(*handle))
+        .handle(shader_key.0)
+        .and_then(|handle| chain.state.renderer_resource_storage.shaders.get(handle))
     else {
         return PassSlot::Unsupported("its shader has no pipeline".to_owned());
     };
     // One format per target the pass writes, in the order the shader's
     // `SV_TARGET` list names them. A target the pass writes beside its own is
     // what a geometry pass leaves a normal buffer in.
-    let target_formats: Vec<wgpu::TextureFormat> = std::iter::once(&pass.target)
-        .chain(pass.extra_targets.iter())
+    let target_formats: Vec<wgpu::TextureFormat> = std::iter::once(&pass.settings.target)
+        .chain(pass.settings.extra_targets.iter())
         .map(|target| match target {
-            PassTarget::Surface => chain.state.surface.format(),
+            PassTarget::Surface => chain.surface_format,
             PassTarget::Offscreen(name) => chain
-                .state
                 .offscreen
                 .get(name)
                 .map(|texture| texture.texture.format())
@@ -631,8 +657,8 @@ fn build_pass(
     // quietly showing the wrong map.
     let mut textures: Vec<(String, RendererTextureHandle)> = Vec::new();
     for (slot, key) in &pass.textures {
-        match chain.texture_handles.get(key) {
-            Some(handle) => textures.push((slot.clone(), *handle)),
+        match chain.texture_handles.handle(key.0) {
+            Some(handle) => textures.push((slot.clone(), handle)),
             None => warn!(
                 target: pill_core::telemetry::telemetry_target::RENDERING,
                 "Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
@@ -653,8 +679,8 @@ fn build_pass(
         renderer_shader,
         &target_formats,
         chain.state.depth_format,
-        &chain.state.offscreen,
-        &chain.state.depth_texture,
+        chain.offscreen,
+        chain.depth_texture,
         &textures,
         defined_targets,
     ) {
@@ -678,11 +704,11 @@ fn whole_queue(render_queue: &[RenderQueueItem]) -> Vec<Range<u32>> {
 /// would draw: one run per shader, in queue order.
 fn unclaimed_ranges(
     render_queue: &[RenderQueueItem],
-    claimed: &std::collections::HashSet<u8>,
+    claimed: &std::collections::HashSet<RendererShaderHandle>,
 ) -> Vec<Range<u32>> {
     let mut ranges: Vec<Range<u32>> = Vec::new();
     for (position, item) in render_queue.iter().enumerate() {
-        if claimed.contains(&decompose_render_queue_key(item.key).shader_index) {
+        if claimed.contains(&item.shader) {
             continue;
         }
         let position = position as u32;
@@ -694,14 +720,17 @@ fn unclaimed_ranges(
     ranges
 }
 
-/// The runs of the queue drawn by the shader in slot `shader_index`.
+/// The runs of the queue drawn by `shader`.
 ///
 /// The queue is sorted by draw order first and shader second, so one shader's
 /// items are one run per draw order they appear in: usually a single run.
-fn shader_ranges(render_queue: &[RenderQueueItem], shader_index: u8) -> Vec<Range<u32>> {
+fn shader_ranges(
+    render_queue: &[RenderQueueItem],
+    shader: RendererShaderHandle,
+) -> Vec<Range<u32>> {
     let mut ranges: Vec<Range<u32>> = Vec::new();
     for (position, item) in render_queue.iter().enumerate() {
-        if decompose_render_queue_key(item.key).shader_index != shader_index {
+        if item.shader != shader {
             continue;
         }
         let position = position as u32;
@@ -714,111 +743,101 @@ fn shader_ranges(render_queue: &[RenderQueueItem], shader_index: u8) -> Vec<Rang
     ranges
 }
 
-/// A signature of everything a chain's GPU objects depend on.
+/// What the offscreen targets were built for: every target with the scale of
+/// the pass that names it, and the surface size.
+type OffscreenKey = (Vec<(String, u32)>, u32, u32);
+
+/// A layout of the offscreen targets a chain needs: every target name with the
+/// scale of the pass that names it, plus the surface size they are built at.
 ///
-/// The chain is read every frame but its pipelines are not rebuilt every frame:
-/// this is what decides whether they have to be. It covers the chain's content,
-/// including pass parameters and the textures a pass names - both iterated in
-/// slot order so a `HashMap`'s arbitrary order cannot make an unchanged chain
-/// look new - plus the resource epoch, which moves whenever a shader or texture
-/// the bind groups reference was recreated.
-fn chain_signature(chain: &[ResolvedPass], resource_epoch: u64) -> String {
-    let mut signature = format!("e{resource_epoch}");
+/// Kept apart from the chain itself on purpose: editing an asset moves the
+/// chain (a pass's parameters are part of it) but changes none of this, so the
+/// offscreen textures survive an asset edit.
+fn offscreen_layout(chain: &[ResolvedPass], width: u32, height: u32) -> OffscreenKey {
+    let mut targets = Vec::new();
     for pass in chain {
-        signature.push('|');
-        signature.push_str(&pass.name);
-        signature.push_str(match pass.kind {
-            PassKind::Geometry => " geometry",
-            PassKind::Fullscreen => " fullscreen",
-            PassKind::Skybox => " skybox",
-        });
-        match &pass.target {
-            PassTarget::Surface => signature.push_str(" surface"),
-            PassTarget::Offscreen(name) => {
-                signature.push_str(" offscreen:");
-                signature.push_str(name);
+        let scale = pass.settings.target_scale.max(1);
+        for target in
+            std::iter::once(&pass.settings.target).chain(pass.settings.extra_targets.iter())
+        {
+            if let PassTarget::Offscreen(name) = target {
+                targets.push((name.clone(), scale));
             }
         }
-        if let Some(shader) = pass.shader {
-            signature.push_str(&format!(" shader:{shader}"));
-        }
-        for extra in &pass.extra_targets {
-            match extra {
-                PassTarget::Surface => signature.push_str(" also:surface"),
-                PassTarget::Offscreen(name) => {
-                    signature.push_str(" also:offscreen:");
-                    signature.push_str(name);
+    }
+    (targets, width, height)
+}
+
+/// Create a target for every offscreen output the chain declares.
+///
+/// Rebuilt whenever the chain is, and sized to the surface: one that no longer
+/// matches the window would be sampled at a different scale from the pass that
+/// wrote it, which shows up as a picture that shrinks with the window rather
+/// than one that resizes with it.
+fn ensure_offscreen_targets(
+    device: &wgpu::Device,
+    (width, height): (u32, u32),
+    targets: &mut HashMap<String, RendererTexture>,
+    chain: &[ResolvedPass],
+) {
+    targets.clear();
+    for pass in chain {
+        // The pass's own target first, then the ones it writes beside it. The
+        // scale is the first pass's: a target belongs to the chain, and the
+        // pass that names it first is asking on everyone's behalf.
+        let scale = pass.settings.target_scale.max(1);
+        let written =
+            std::iter::once(&pass.settings.target).chain(pass.settings.extra_targets.iter());
+        for target in written {
+            let PassTarget::Offscreen(name) = target else {
+                continue;
+            };
+            if targets.contains_key(name) {
+                continue;
+            }
+            match RendererTexture::new_render_target(
+                device,
+                name,
+                (width / scale).max(1),
+                (height / scale).max(1),
+                OFFSCREEN_FORMAT,
+            ) {
+                Ok(texture) => {
+                    targets.insert(name.clone(), texture);
+                }
+                // Reported instead of fatal: the passes that read it each say
+                // they are not drawn, which is the same outcome their own
+                // failure path would produce.
+                Err(error) => {
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        "offscreen target `{name}` was not created: {error}"
+                    );
                 }
             }
         }
-        signature.push_str(&format!(
-            " scale:{} blend:{} depth_write:{} cull:{:?}",
-            pass.target_scale, pass.blend, pass.depth_write, pass.cull
-        ));
-        let mut inputs: Vec<_> = pass.inputs.iter().collect();
-        inputs.sort();
-        for (slot, target) in inputs {
-            signature.push_str(&format!(" input:{slot}={target}"));
-        }
-        // A pass's textures are part of it for the same reason its parameters
-        // are: the handle the bind group reads is resolved here, and it is
-        // built once and then kept.
-        let mut textures: Vec<_> = pass.textures.iter().collect();
-        textures.sort();
-        for (slot, texture) in textures {
-            signature.push_str(&format!(" texture:{slot}={texture}"));
-        }
-        // Serialized, not hashed: a pass's parameters live in a uniform buffer
-        // the bind group keeps, so this is what makes editing one rebuild it.
-        let mut parameters: Vec<_> = pass.parameters.iter().collect();
-        parameters.sort_by_key(|(name, _)| name.as_str());
-        for (name, parameter) in parameters {
-            signature.push_str(&format!(" param:{name}={parameter:?}"));
-        }
     }
-    signature
-}
-
-/// A signature of the offscreen targets a chain needs: every target name, the
-/// scale of the pass that names it, and the surface size it is built at.
-///
-/// Kept apart from the pipeline signature on purpose: editing an asset moves
-/// the pipeline signature (a pass's parameters are part of it) but changes none
-/// of this, so the offscreen textures survive an asset edit.
-fn offscreen_signature(chain: &[ResolvedPass], width: u32, height: u32) -> String {
-    let mut signature = format!("{width}x{height}");
-    for pass in chain {
-        let scale = pass.target_scale.max(1);
-        for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
-            if let PassTarget::Offscreen(name) = target {
-                signature.push('|');
-                signature.push_str(name);
-                signature.push_str(&format!("@{scale}"));
-            }
-        }
-    }
-    signature
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::{RendererMaterialHandle, RendererMeshHandle};
+    use pill_renderer_api::frame::PassSettings;
+    use pill_renderer_api::{AssetKey, MaterialParameter};
 
     fn pass(kind: PassKind, target: PassTarget) -> ResolvedPass {
         ResolvedPass {
             name: "p".to_owned(),
             shader: None,
-            kind,
-            target,
-            extra_targets: Vec::new(),
-            target_scale: 1,
-            blend: false,
-            depth_write: true,
-            cull: crate::frame::CullMode::Back,
+            settings: PassSettings {
+                kind,
+                target,
+                ..PassSettings::default()
+            },
             parameters: std::collections::BTreeMap::new(),
             inputs: std::collections::BTreeMap::new(),
             textures: std::collections::BTreeMap::new(),
-            order: 0,
         }
     }
 
@@ -831,13 +850,13 @@ mod tests {
     #[test]
     fn a_pass_that_names_a_shader_takes_the_runs_no_pass_claims() {
         let mut naming = pass(PassKind::Geometry, PassTarget::Surface);
-        naming.shader = Some(7);
+        naming.shader = Some(AssetKey(7));
         let chain = vec![naming];
         let queue = vec![item_of_shader(3), item_of_shader(3), item_of_shader(3)];
-        let mut pipeline = ScriptableRenderingPipeline::new();
+        let mut pipeline = GpuChain::new();
         pipeline.passes.push(PassSlot::Unshaded);
 
-        let plan = pipeline.plan(&chain, &queue, &HashMap::new());
+        let plan = pipeline.plan(&chain, &queue, &no_shaders());
 
         assert_eq!(plan.len(), 1);
         match &plan[0] {
@@ -858,13 +877,13 @@ mod tests {
     #[test]
     fn an_offscreen_pass_leaves_the_unclaimed_runs_alone() {
         let mut naming = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
-        naming.shader = Some(7);
+        naming.shader = Some(AssetKey(7));
         let chain = vec![naming];
         let queue = vec![item_of_shader(3)];
-        let mut pipeline = ScriptableRenderingPipeline::new();
+        let mut pipeline = GpuChain::new();
         pipeline.passes.push(PassSlot::Unshaded);
 
-        let plan = pipeline.plan(&chain, &queue, &HashMap::new());
+        let plan = pipeline.plan(&chain, &queue, &no_shaders());
 
         match &plan[0] {
             PassPlan::Geometry { ranges, .. } => assert!(ranges.is_empty()),
@@ -872,22 +891,52 @@ mod tests {
         }
     }
 
+    /// The rebuild check compares the chain itself, so every field of
+    /// [`ResolvedPass`] is covered by construction - including the ones a
+    /// hand-built string could forget.
     #[test]
-    fn a_chain_signature_covers_everything_the_gpu_objects_depend_on() {
+    fn the_stored_chain_covers_every_field_a_pass_has() {
         let surface = pass(PassKind::Geometry, PassTarget::Surface);
         let offscreen = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
         let mut reading = pass(PassKind::Geometry, PassTarget::Surface);
         reading.inputs.insert("hdr".to_owned(), "hdr".to_owned());
+        let mut parameterised = pass(PassKind::Geometry, PassTarget::Surface);
+        parameterised
+            .parameters
+            .insert("roughness".to_owned(), MaterialParameter::Scalar(0.5));
 
-        let base = chain_signature(std::slice::from_ref(&surface), 1);
+        let base = (vec![surface.clone()], 1u64);
 
-        assert_eq!(base, chain_signature(std::slice::from_ref(&surface), 1));
-        assert_ne!(base, chain_signature(std::slice::from_ref(&offscreen), 1));
-        assert_ne!(base, chain_signature(std::slice::from_ref(&reading), 1));
+        assert_eq!(base, (vec![surface.clone()], 1));
+        assert_ne!(base, (vec![offscreen], 1), "the target is part of it");
+        assert_ne!(base, (vec![reading], 1), "the inputs are part of it");
         assert_ne!(
             base,
-            chain_signature(std::slice::from_ref(&surface), 2),
-            "a pass's parameters live in the asset, so the asset revision is part of it"
+            (vec![parameterised], 1),
+            "the parameters are part of it"
+        );
+        assert_ne!(base, (vec![surface], 2), "the resource epoch is part of it");
+    }
+
+    /// The offscreen layout ignores what a pass reads and what it is set to,
+    /// because neither changes a target's size.
+    #[test]
+    fn the_offscreen_layout_counts_targets_scales_and_the_surface_size() {
+        let mut surface = pass(PassKind::Geometry, PassTarget::Surface);
+        surface
+            .parameters
+            .insert("roughness".to_owned(), MaterialParameter::Scalar(0.5));
+        let hdr = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
+
+        assert_eq!(offscreen_layout(&[surface.clone()], 1920, 1080).0, vec![]);
+        assert_eq!(
+            offscreen_layout(std::slice::from_ref(&hdr), 1920, 1080).0,
+            vec![("hdr".to_owned(), 1)]
+        );
+        assert_ne!(
+            offscreen_layout(std::slice::from_ref(&hdr), 1920, 1080),
+            offscreen_layout(&[hdr], 1280, 720),
+            "a surface size moves every target"
         );
     }
 
@@ -897,9 +946,9 @@ mod tests {
         // frame a chain first arrives: none of them may be skipped without the
         // frame targets being opened anyway.
         let chain = vec![pass(PassKind::Geometry, PassTarget::Surface)];
-        let mut pipeline = ScriptableRenderingPipeline::new();
+        let mut pipeline = GpuChain::new();
 
-        let plan = pipeline.plan(&chain, &[], &HashMap::new());
+        let plan = pipeline.plan(&chain, &[], &no_shaders());
 
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].label(), "frame.clear");
@@ -914,17 +963,19 @@ mod tests {
         let queue = vec![
             RenderQueueItem {
                 key: 0,
-                entity_index: 0,
+                frame_instance_index: 0,
+                ..item_of_shader(0)
             },
             RenderQueueItem {
                 key: 0,
-                entity_index: 1,
+                frame_instance_index: 1,
+                ..item_of_shader(0)
             },
         ];
-        let mut pipeline = ScriptableRenderingPipeline::new();
+        let mut pipeline = GpuChain::new();
         pipeline.passes.push(PassSlot::Unshaded);
 
-        let plan = pipeline.plan(&chain, &queue, &HashMap::new());
+        let plan = pipeline.plan(&chain, &queue, &no_shaders());
 
         assert_eq!(plan.len(), 1);
         match &plan[0] {
@@ -944,12 +995,29 @@ mod tests {
     }
 
     /// A queue item drawn by the shader in slot `shader_index`; only the
-    /// shader byte of the key matters to the ranges.
+    /// shader handle matters to the ranges.
     fn item_of_shader(shader_index: u8) -> RenderQueueItem {
         RenderQueueItem {
             key: u64::from(shader_index) << 48,
-            entity_index: 0,
+            frame_instance_index: 0,
+            shader: shader_handle(shader_index),
+            material: RendererMaterialHandle::new(0, std::num::NonZeroU32::new(1).unwrap()),
+            mesh: RendererMeshHandle::new(0, std::num::NonZeroU32::new(1).unwrap()),
         }
+    }
+
+    /// The handle of the shader in slot `shader_index`.
+    fn shader_handle(shader_index: u8) -> RendererShaderHandle {
+        RendererShaderHandle::new(
+            u32::from(shader_index),
+            std::num::NonZeroU32::new(1).unwrap(),
+        )
+    }
+
+    /// No shader is mirrored in these tests, so the planner gets an empty
+    /// column to look names up in.
+    fn no_shaders() -> GpuColumn<RendererShaderHandle> {
+        GpuColumn::new()
     }
 
     /// The runs no pass in the chain claims are exactly the shaders it never
@@ -963,12 +1031,17 @@ mod tests {
             item_of_shader(2),
             item_of_shader(1),
         ];
-        let claimed: std::collections::HashSet<u8> = [0u8, 1u8].into_iter().collect();
+        let claimed: std::collections::HashSet<RendererShaderHandle> =
+            [shader_handle(0), shader_handle(1)].into_iter().collect();
         assert_eq!(unclaimed_ranges(&queue, &claimed), vec![3..4]);
-        let nothing: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        let nothing: std::collections::HashSet<RendererShaderHandle> =
+            std::collections::HashSet::new();
         // Adjacent runs of unclaimed shaders join into one range.
         assert_eq!(unclaimed_ranges(&queue, &nothing), vec![0..5]);
-        let everything: std::collections::HashSet<u8> = [0u8, 1u8, 2u8].into_iter().collect();
+        let everything: std::collections::HashSet<RendererShaderHandle> =
+            [shader_handle(0), shader_handle(1), shader_handle(2)]
+                .into_iter()
+                .collect();
         assert_eq!(
             unclaimed_ranges(&queue, &everything),
             Vec::<Range<u32>>::new()
@@ -980,16 +1053,19 @@ mod tests {
         // Shader 2's items in two runs, as two draw orders would leave them.
         let queue = [1, 2, 2, 3, 2, 2, 2, 1].map(item_of_shader);
 
-        assert_eq!(shader_ranges(&queue, 2), vec![1..3, 4..7]);
-        assert_eq!(shader_ranges(&queue, 1), vec![0..1, 7..8]);
-        assert_eq!(shader_ranges(&queue, 9), Vec::<Range<u32>>::new());
+        assert_eq!(shader_ranges(&queue, shader_handle(2)), vec![1..3, 4..7]);
+        assert_eq!(shader_ranges(&queue, shader_handle(1)), vec![0..1, 7..8]);
+        assert_eq!(
+            shader_ranges(&queue, shader_handle(9)),
+            Vec::<Range<u32>>::new()
+        );
     }
 
     #[test]
     fn a_pass_that_uses_the_shared_depth_buffer_refuses_a_scaled_target() {
         let scaled = |kind| {
             let mut pass = pass(kind, PassTarget::Offscreen("half".to_owned()));
-            pass.target_scale = 2;
+            pass.settings.target_scale = 2;
             pass
         };
 
@@ -1032,6 +1108,7 @@ mod tests {
 
         let mut extra = pass(PassKind::Geometry, PassTarget::Surface);
         extra
+            .settings
             .extra_targets
             .push(PassTarget::Offscreen("normals".to_owned()));
         assert!(
@@ -1045,7 +1122,7 @@ mod tests {
     /// new breakage is silent.
     #[test]
     fn a_pass_that_breaks_again_after_a_rebuild_is_named_again() {
-        let mut pipeline = ScriptableRenderingPipeline::new();
+        let mut pipeline = GpuChain::new();
         pipeline.report_skip("p", "it has no pipeline");
         assert!(pipeline.skipped_passes.contains("p"));
 
@@ -1071,7 +1148,7 @@ mod tests {
         );
 
         let mut shaded = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
-        shaded.shader = Some(0);
+        shaded.shader = Some(AssetKey(0));
         assert!(
             shaderless_target_refusal(&shaded).is_none(),
             "a pass with a shader of its own gets a pipeline for its targets"

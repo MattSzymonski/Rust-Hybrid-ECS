@@ -197,14 +197,8 @@ pub fn inspector_field_row(
             // narrow dock moves the overflowing fields to the next line
             // instead of clipping them past the panel's edge.
             ui.horizontal_wrapped(|ui| {
-                let label = ui.add_sized(
-                    egui::vec2(ROW_LABEL_WIDTH, ROW_HEIGHT),
-                    egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
-                        .truncate(),
-                );
-                if let Some(text) = tooltip.as_deref() {
-                    label.on_hover_text(text);
-                }
+                label_cell_in(ui, ROW_LABEL_WIDTH, field, tooltip.as_deref());
+                label_gap(ui);
                 for (element_index, element) in values.iter().take(*elements).enumerate() {
                     // One axis letter with its field as a unit, so a wrap
                     // never separates a label from its widget. The letter's
@@ -331,14 +325,8 @@ pub fn inspector_field_row(
             // The same row a `[f32; 3]` field draws, assembled from leaves
             // that live in fields of their own.
             ui.horizontal_wrapped(|ui| {
-                let label = ui.add_sized(
-                    egui::vec2(ROW_LABEL_WIDTH, ROW_HEIGHT),
-                    egui::Label::new(egui::RichText::new(field).color(style::text_muted()))
-                        .truncate(),
-                );
-                if let Some(text) = tooltip.as_deref() {
-                    label.on_hover_text(text);
-                }
+                label_cell_in(ui, ROW_LABEL_WIDTH, field, tooltip.as_deref());
+                label_gap(ui);
                 for (axis, leaf) in leaves.iter().enumerate() {
                     let Some(value) = component.values.get(leaf.index) else {
                         continue;

@@ -137,7 +137,7 @@ public static class SceneStartup
                 .WithVertexSource(AssetLoader.Path("shaders/default_vertex.wgsl"))
                 .WithFragmentSource(AssetLoader.Path("shaders/unlit_fragment.wgsl"))
                 .WithParameterSlots([new ShaderParameterSlot("tint", ShaderParameterType.Color)])
-                .WithTextureSlots([new ShaderTextureSlot("color", TextureType.Color, (0, 1))])
+                .WithTextureSlots([new ShaderTextureSlot("color", ShaderTextureKind.Color, (0, 1))])
                 .WithEngineParameters(true)
                 .WithCameraParameters(true)
                 .Build());
@@ -147,7 +147,7 @@ public static class SceneStartup
                 .WithVertexSource(AssetLoader.Path("shaders/default_vertex.wgsl"))
                 .WithFragmentSource(AssetLoader.Path("shaders/cartoon_fragment.wgsl"))
                 .WithParameterSlots([new ShaderParameterSlot("posterize_level", ShaderParameterType.Scalar)])
-                .WithTextureSlots([new ShaderTextureSlot("color", TextureType.Color, (0, 1))])
+                .WithTextureSlots([new ShaderTextureSlot("color", ShaderTextureKind.Color, (0, 1))])
                 .WithEngineParameters(true)
                 .WithCameraParameters(true)
                 .Build());

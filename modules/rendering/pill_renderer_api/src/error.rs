@@ -21,43 +21,25 @@ use pill_core_macros::engine_error;
 
 /// Failures the renderer reports to its host.
 ///
-/// Covers the startup path - surface, adapter, device - and frame
-/// acquisition, so the host handles one enum instead of the wgpu error types
-/// behind it.
+/// Only the failures a host or frontend acts on are variants of their own; the
+/// backend's own startup and swapchain failures arrive as [`Self::Backend`],
+/// with the GPU module's text, so a new way for a device to fail needs no edit
+/// here.
 #[engine_error(namespace = engine::renderer, runtime = ::pill_core::error)]
 pub enum RendererError {
     /// The GPU surface could not be created for the supplied window.
     #[message("failed to create the GPU surface: ", value(detail))]
     SurfaceCreation { detail: String },
-    /// No compatible GPU adapter was found for the surface.
-    #[message("failed to find a compatible GPU adapter: ", value(detail))]
-    AdapterRequest { detail: String },
-    /// The GPU device could not be created from the adapter.
-    #[message("failed to create the GPU device: ", value(detail))]
-    DeviceCreation { detail: String },
-    /// The surface advertises no texture formats to render into.
-    #[message("GPU surface exposes no texture formats")]
-    NoTextureFormats,
-    /// The surface advertises no alpha modes to present with.
-    #[message("GPU surface exposes no alpha modes")]
-    NoAlphaModes,
-    /// The surface stayed lost or outdated even after one reconfiguration.
-    #[message("GPU surface was lost")]
-    SurfaceLost,
-    /// The surface ran out of memory while providing a frame.
-    #[message("GPU surface is out of memory")]
-    SurfaceOutOfMemory,
-    /// Acquiring the surface texture failed for a reason other than loss or
-    /// out-of-memory, such as a timeout.
-    #[message("failed to acquire the GPU surface texture: ", value(detail))]
-    SurfaceTextureFailed { detail: String },
-    /// Every candidate surface configuration was refused by the driver, with
-    /// each refusal collected into `detail`.
-    #[message(
-        "no surface configuration was accepted by the GPU driver: ",
-        value(detail)
-    )]
-    SurfaceConfigurationRefused { detail: String },
+    /// The GPU backend failed: no adapter or no device, no format or alpha mode
+    /// to present with, a configuration the driver refused, or a swapchain that
+    /// stayed lost or gave no texture.
+    ///
+    /// The renderer module keeps its own error type for these - the wgpu status
+    /// and its finer-grained codes stay there - and reports them here as the one
+    /// thing its host acts on: the backend did not start, or did not hand this
+    /// frame a surface.
+    #[message("the GPU backend failed: ", value(detail))]
+    Backend { detail: String },
     /// The renderer cannot draw into another surface, or not into this one.
     #[message("the renderer cannot draw into this surface: ", value(detail))]
     UnsupportedSurface { detail: String },

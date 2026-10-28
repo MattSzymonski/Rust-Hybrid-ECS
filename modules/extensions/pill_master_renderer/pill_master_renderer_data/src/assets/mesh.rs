@@ -23,8 +23,8 @@
 
 // External crates
 use pill_engine::{
-    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadError,
-    AssetLoadResult, ImportedAsset, PillMirror,
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadError, AssetLoadResult,
+    ImportedAsset, PillMirror,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +60,7 @@ pub struct MeshVertex {
 /// version moves, so a game edits the mesh it holds and lets the renderer
 /// notice rather than touching buffers itself.
 #[derive(Clone, Debug)]
-#[pill_mirror_object(asset, import)]
+#[pill_mirror_object(asset, import, shared = "pill_master_renderer::assets::Mesh")]
 pub struct Mesh {
     /// Label used in logs, profiling, and error messages.
     pub name: String,
@@ -285,27 +285,6 @@ fn normalized_or(value: glam::Vec3, fallback: glam::Vec3) -> glam::Vec3 {
         value.normalize()
     } else {
         fallback
-    }
-}
-
-/// The pinned shared name of [`Mesh`]; see the comment on its `Asset` impl.
-const MESH_SHARED_NAME: &str = "pill_master_renderer::assets::Mesh";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for Mesh {
-    fn shared_name() -> Option<&'static str> {
-        Some(MESH_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 = pill_engine::component::shared_component_identity(MESH_SHARED_NAME);
-        Some(IDENTITY)
     }
 }
 

@@ -43,14 +43,11 @@
 use std::collections::BTreeMap;
 
 // External crates
-use pill_engine::{AssetGuid, AssetLoadResult, AssetManager, Handle};
+use pill_engine::{AssetGuid, AssetManager, Handle};
 
 // Current crate
-use crate::assets::{
-    Material, MaterialParameter, PassKind, PassTarget, RenderPass, Shader, ShaderParameterSlot,
-    ShaderParameterType, ShaderTextureSlot, TextureType,
-};
-use crate::config::{ConfigShaderFile, ShaderSourceRecord};
+use crate::assets::{Material, MaterialParameter, PassKind, PassTarget, RenderPass, Shader};
+use crate::config::ShaderSourceRecord;
 
 config_shader_file!(
     /// The skybox vertex stage: a fullscreen triangle at the far plane.
@@ -65,23 +62,25 @@ config_shader_file!(
     CUBEMAP_FRAGMENT, "skybox/shaders/skybox_cubemap_fragment.wgsl"
 );
 
-/// Asset name of the skybox shader that samples an equirectangular panorama.
-pub const EQUIRECT_SHADER_NAME: &str = "pill.skybox.shader.equirect";
+/// Asset name of the skybox shader that samples an equirectangular panorama:
+/// the path its `.hlsl` source is imported under.
+pub const EQUIRECT_SHADER_PATH: &str = "skybox/shaders/skybox_equirect_fragment.hlsl";
 
 /// The guid the equirect skybox shader is stored under, so a sky material file
 /// can name it.
 ///
-/// Derived from [`EQUIRECT_SHADER_NAME`] rather than drawn at random: the shader
-/// is built in code, with no `.meta` file to keep a random guid in, and every
-/// run must give it the same one.
-pub const EQUIRECT_SHADER_GUID: AssetGuid = AssetGuid::from_name(EQUIRECT_SHADER_NAME);
+/// Derived from a name rather than drawn at random, so every checkout and every
+/// run gives it the same one; the `.hlsl.meta` beside the source carries this
+/// value and [`install_shaders`] asserts the two agree.
+pub const EQUIRECT_SHADER_GUID: AssetGuid = AssetGuid::from_name("pill.skybox.shader.equirect");
 
-/// Asset name of the skybox shader that samples a cubemap.
-pub const CUBEMAP_SHADER_NAME: &str = "pill.skybox.shader.cubemap";
+/// Asset name of the skybox shader that samples a cubemap: the path its `.hlsl`
+/// source is imported under.
+pub const CUBEMAP_SHADER_PATH: &str = "skybox/shaders/skybox_cubemap_fragment.hlsl";
 
 /// The guid the cubemap skybox shader is stored under; see
 /// [`EQUIRECT_SHADER_GUID`].
-pub const CUBEMAP_SHADER_GUID: AssetGuid = AssetGuid::from_name(CUBEMAP_SHADER_NAME);
+pub const CUBEMAP_SHADER_GUID: AssetGuid = AssetGuid::from_name("pill.skybox.shader.cubemap");
 
 /// The texture slot both skybox shaders read the sky from.
 pub const SKY_SLOT: &str = "sky";
@@ -90,14 +89,14 @@ pub const SKY_SLOT: &str = "sky";
 /// from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[
     ShaderSourceRecord {
-        shader_asset_name: EQUIRECT_SHADER_NAME,
-        vertex: SKYBOX_VERTEX,
-        fragment: EQUIRECT_FRAGMENT,
+        shader_asset_name: EQUIRECT_SHADER_PATH,
+        vertex_path: SKYBOX_VERTEX.relative_path,
+        fragment_path: EQUIRECT_FRAGMENT.relative_path,
     },
     ShaderSourceRecord {
-        shader_asset_name: CUBEMAP_SHADER_NAME,
-        vertex: SKYBOX_VERTEX,
-        fragment: CUBEMAP_FRAGMENT,
+        shader_asset_name: CUBEMAP_SHADER_PATH,
+        vertex_path: SKYBOX_VERTEX.relative_path,
+        fragment_path: CUBEMAP_FRAGMENT.relative_path,
     },
 ];
 
@@ -110,35 +109,13 @@ pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[
 ///
 /// # Errors
 ///
-/// Returns an error when a name this owns is already taken by an asset of a
-/// different type, or when a shader fails to build.
+/// Returns the store's import error when a source or its meta will not load.
 pub fn install_shaders(
     assets: &mut AssetManager,
 ) -> Result<(Handle<Shader>, Handle<Shader>), Box<dyn std::error::Error>> {
-    let equirect = match assets.handle_by_name::<Shader>(EQUIRECT_SHADER_NAME) {
-        Some(handle) => handle,
-        None => assets.add_named_with_guid(
-            EQUIRECT_SHADER_NAME,
-            EQUIRECT_SHADER_GUID,
-            skybox_shader(
-                "pill_skybox_equirect",
-                EQUIRECT_FRAGMENT,
-                TextureType::Equirect,
-            )?,
-        )?,
-    };
-    let cubemap = match assets.handle_by_name::<Shader>(CUBEMAP_SHADER_NAME) {
-        Some(handle) => handle,
-        None => assets.add_named_with_guid(
-            CUBEMAP_SHADER_NAME,
-            CUBEMAP_SHADER_GUID,
-            skybox_shader(
-                "pill_skybox_cubemap",
-                CUBEMAP_FRAGMENT,
-                TextureType::Cubemap,
-            )?,
-        )?,
-    };
+    let equirect =
+        crate::config::import_shader(assets, EQUIRECT_SHADER_PATH, EQUIRECT_SHADER_GUID)?;
+    let cubemap = crate::config::import_shader(assets, CUBEMAP_SHADER_PATH, CUBEMAP_SHADER_GUID)?;
     Ok((equirect, cubemap))
 }
 
@@ -175,29 +152,10 @@ pub fn skybox_pass(
         .with_enabled(material != Handle::INVALID)
 }
 
-/// One skybox shader: the far-plane vertex stage, `fragment`, the three sky
-/// parameters, and a `sky` slot of `sky_type`.
-fn skybox_shader(
-    name: &str,
-    fragment: ConfigShaderFile,
-    sky_type: TextureType,
-) -> AssetLoadResult<Shader> {
-    Shader::new(name)
-        .with_wgsl(SKYBOX_VERTEX.embedded_source, fragment.embedded_source)
-        .with_parameter_slots([
-            ShaderParameterSlot::new("skybox_tint", ShaderParameterType::Color),
-            ShaderParameterSlot::new("skybox_exposure", ShaderParameterType::Scalar),
-            ShaderParameterSlot::new("skybox_rotation", ShaderParameterType::Scalar),
-        ])
-        .with_texture_slots([ShaderTextureSlot::new(SKY_SLOT, sky_type, (0, 1))])
-        .with_engine_parameters(true)
-        .with_camera_parameters(true)
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::ShaderTextureKind;
 
     /// Sky material files name the shaders by these digits, so they may never
     /// change; renaming a shader asset would.
@@ -216,6 +174,7 @@ mod tests {
     #[test]
     fn installing_twice_returns_the_same_shaders() {
         let mut assets = AssetManager::new();
+        crate::declare_crate_roots();
 
         let first = install_shaders(&mut assets).expect("free names");
         let second = install_shaders(&mut assets).expect("already installed");
@@ -228,20 +187,20 @@ mod tests {
     #[test]
     fn each_shader_declares_its_sky_slot_by_type() {
         let mut assets = AssetManager::new();
+        crate::declare_crate_roots();
         let (equirect, cubemap) = install_shaders(&mut assets).expect("free names");
 
-        let slot_type =
-            |handle| assets.get::<Shader>(handle).unwrap().texture_slots[SKY_SLOT].texture_type;
+        let slot_kind = |handle| assets.get::<Shader>(handle).unwrap().texture_slots[SKY_SLOT].kind;
 
-        assert_eq!(slot_type(equirect), TextureType::Equirect);
-        assert_eq!(slot_type(cubemap), TextureType::Cubemap);
+        assert_eq!(slot_kind(equirect), ShaderTextureKind::Equirect);
+        assert_eq!(slot_kind(cubemap), ShaderTextureKind::Cubemap);
     }
 
     #[test]
     fn a_pass_without_a_material_starts_disabled() {
         let pass = skybox_pass("sky", Handle::INVALID, PassTarget::Surface, 0);
 
-        assert_eq!(pass.kind, PassKind::Skybox);
-        assert!(!pass.enabled && !pass.depth_write);
+        assert_eq!(pass.settings.kind, PassKind::Skybox);
+        assert!(!pass.enabled && !pass.settings.depth_write);
     }
 }

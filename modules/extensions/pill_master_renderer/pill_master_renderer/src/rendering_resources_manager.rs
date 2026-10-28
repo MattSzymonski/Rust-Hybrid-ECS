@@ -33,21 +33,81 @@ use pill_engine::{AssetManager, Handle};
 // Current crate
 use crate::{
     assets::{
-        asset_key, parameter_slots_by_name, texture_slots_by_name, Material, MaterialParameter,
-        Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture,
-        TextureType,
+        asset_key, slots_by_name, Material, MaterialParameter, Mesh, Shader, ShaderParameterSlot,
+        ShaderParameterType, ShaderTextureKind, ShaderTextureSlot, Texture,
     },
+    chain::ChainContext,
     error::Result,
     frame::RenderFrame,
-    pipeline::ChainContext,
     render_queue::{compose_render_queue_key, RenderQueueItem},
     renderer::State,
     resources::{
         RendererMaterial, RendererMaterialHandle, RendererMesh, RendererMeshHandle, RendererShader,
-        RendererShaderHandle, RendererTexture, RendererTextureHandle, Vertex,
+        RendererShaderHandle, RendererTexture, RendererTextureHandle, UniformGroups, Vertex,
     },
     Instance,
 };
+
+/// One asset type's GPU objects, keyed by asset key.
+///
+/// An entry is the handle of the object on the GPU plus the content version it
+/// was built from. `None` for the version is the fourth state the sync needs:
+/// the handle is still there, but the object behind it is stale, so the next sync
+/// rebuilds it - which is what a material whose shader or texture moved asks for
+/// without its own content changing.
+pub(crate) struct GpuColumn<H> {
+    entries: HashMap<u64, (H, Option<u64>)>,
+}
+
+impl<H: Copy> GpuColumn<H> {
+    /// A column with nothing mirrored.
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The object behind `key`, when one is there.
+    pub(crate) fn handle(&self, key: u64) -> Option<H> {
+        self.entries.get(&key).map(|(handle, _)| *handle)
+    }
+
+    /// Whether `key`'s object was built from content version `version`.
+    fn is_current(&self, key: u64, version: u64) -> bool {
+        matches!(self.entries.get(&key), Some((_, Some(built))) if *built == version)
+    }
+
+    /// Records `handle` as `key`'s object, built from `version`.
+    fn insert(&mut self, key: u64, handle: H, version: u64) {
+        self.entries.insert(key, (handle, Some(version)));
+    }
+
+    /// Takes `key`'s object out, for the rebuild that replaces or drops it.
+    fn remove(&mut self, key: u64) -> Option<H> {
+        self.entries.remove(&key).map(|(handle, _)| handle)
+    }
+
+    /// Keeps `key`'s handle but forgets the version, so the next sync rebuilds
+    /// it against whatever the object now depends on.
+    fn invalidate(&mut self, key: u64) {
+        if let Some((_, version)) = self.entries.get_mut(&key) {
+            *version = None;
+        }
+    }
+
+    /// Every key the column holds.
+    fn keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.keys().copied()
+    }
+
+    /// Forgets every object's version, keeping the handles: the next sync
+    /// rebuilds all of them.
+    fn invalidate_all(&mut self) {
+        for (_, version) in self.entries.values_mut() {
+            *version = None;
+        }
+    }
+}
 
 /// The GPU objects behind the asset store, and what they were built from.
 pub(crate) struct RenderingResourcesManager {
@@ -55,17 +115,13 @@ pub(crate) struct RenderingResourcesManager {
     /// explicit invalidation; the sync runs when it does not match the store's.
     synced_revision: Option<u64>,
     /// Content version of every asset the GPU object behind a key was built
-    /// from, one map per asset type. A key whose version moved - or that is not
-    /// recorded here at all - is rebuilt; a key whose version matches keeps its
-    /// object.
-    shader_versions: HashMap<u64, u64>,
-    material_versions: HashMap<u64, u64>,
-    texture_versions: HashMap<u64, u64>,
-    mesh_versions: HashMap<u64, u64>,
-    shader_handles: HashMap<u64, RendererShaderHandle>,
-    material_handles: HashMap<u64, RendererMaterialHandle>,
-    texture_handles: HashMap<u64, RendererTextureHandle>,
-    mesh_handles: HashMap<u64, RendererMeshHandle>,
+    /// from, one column per asset type. A key whose version moved - or that is
+    /// not recorded here at all - is rebuilt; a key whose version matches keeps
+    /// its object.
+    shaders: GpuColumn<RendererShaderHandle>,
+    materials: GpuColumn<RendererMaterialHandle>,
+    textures: GpuColumn<RendererTextureHandle>,
+    meshes: GpuColumn<RendererMeshHandle>,
     /// What an asset that names no shader, or no material, draws with.
     default_shader: RendererShaderHandle,
     default_material: RendererMaterialHandle,
@@ -97,14 +153,10 @@ impl RenderingResourcesManager {
         let (default_shader, default_material) = install_default_material(state)?;
         Ok(Self {
             synced_revision: None,
-            shader_versions: HashMap::new(),
-            material_versions: HashMap::new(),
-            texture_versions: HashMap::new(),
-            mesh_versions: HashMap::new(),
-            shader_handles: HashMap::new(),
-            material_handles: HashMap::new(),
-            texture_handles: HashMap::new(),
-            mesh_handles: HashMap::new(),
+            shaders: GpuColumn::new(),
+            materials: GpuColumn::new(),
+            textures: GpuColumn::new(),
+            meshes: GpuColumn::new(),
             default_shader,
             default_material,
             resource_epoch: 0,
@@ -158,10 +210,10 @@ impl RenderingResourcesManager {
     /// again.
     pub(crate) fn invalidate(&mut self) {
         self.synced_revision = None;
-        self.texture_versions.clear();
-        self.shader_versions.clear();
-        self.mesh_versions.clear();
-        self.material_versions.clear();
+        self.textures.invalidate_all();
+        self.shaders.invalidate_all();
+        self.meshes.invalidate_all();
+        self.materials.invalidate_all();
     }
 
     /// One queue item per drawable instance, sorted for recording.
@@ -189,8 +241,10 @@ impl RenderingResourcesManager {
                     resolved
                 }
                 _ => {
+                    // The renderer's own caches key by the raw value; the frame
+                    // names it as a typed key.
                     let resolved =
-                        self.resolve_draw_handles(instance.mesh, instance.material, state);
+                        self.resolve_draw_handles(instance.mesh.0, instance.material.0, state);
                     last_resolved = Some((instance.mesh, instance.material, resolved));
                     resolved
                 }
@@ -200,7 +254,10 @@ impl RenderingResourcesManager {
             };
             queue.push(RenderQueueItem {
                 key: compose_render_queue_key(instance.rendering_order, shader, material, mesh),
-                entity_index: index as u32,
+                frame_instance_index: index as u32,
+                shader,
+                material,
+                mesh,
             });
         }
         drop(resolve_zone);
@@ -224,11 +281,10 @@ impl RenderingResourcesManager {
         RendererMaterialHandle,
         RendererMeshHandle,
     )> {
-        let mesh = self.mesh_handles.get(&mesh_key).copied()?;
+        let mesh = self.meshes.handle(mesh_key)?;
         let material = self
-            .material_handles
-            .get(&material_key)
-            .copied()
+            .materials
+            .handle(material_key)
             .unwrap_or(self.default_material);
         let shader = state
             .renderer_resource_storage
@@ -239,21 +295,37 @@ impl RenderingResourcesManager {
         Some((shader, material, mesh))
     }
 
-    /// The shader objects by key, for naming a pass's shader in the queue.
-    pub(crate) fn shader_handles(&self) -> &HashMap<u64, RendererShaderHandle> {
-        &self.shader_handles
+    /// The shader column, for naming a pass's shader in the queue.
+    pub(crate) fn shader_handles(&self) -> &GpuColumn<RendererShaderHandle> {
+        &self.shaders
     }
 
     /// What the chain needs of these caches to build its GPU objects.
     ///
     /// The chain reads the shader and texture caches by key and the epoch that
-    /// moves when one of them is rebuilt; bundling them here keeps the borrow
-    /// split in one place instead of at every call site.
-    pub(crate) fn chain_context<'a>(&'a self, state: &'a mut State) -> ChainContext<'a> {
+    /// moves when one of them is rebuilt, beside the surface it is built for;
+    /// bundling them here keeps the borrow split in one place instead of at
+    /// every call site. The surface arrives as the pieces the chain reads -
+    /// its format, its size, its depth buffer and its offscreen targets -
+    /// rather than as the whole target, so the chain they belong to can be
+    /// rebuilt at the same time.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn chain_context<'a>(
+        &'a self,
+        state: &'a mut State,
+        surface_format: wgpu::TextureFormat,
+        size: (u32, u32),
+        depth_texture: &'a RendererTexture,
+        offscreen: &'a mut HashMap<String, RendererTexture>,
+    ) -> ChainContext<'a> {
         ChainContext {
             state,
-            shader_handles: &self.shader_handles,
-            texture_handles: &self.texture_handles,
+            surface_format,
+            size,
+            depth_texture,
+            offscreen,
+            shader_handles: &self.shaders,
+            texture_handles: &self.textures,
             resource_epoch: self.resource_epoch,
         }
     }
@@ -273,7 +345,7 @@ impl RenderingResourcesManager {
                 .values()
                 .any(|texture| self.changed.contains(&asset_key(texture.texture)));
             if shader_changed || texture_changed {
-                self.material_versions.remove(&asset_key(handle));
+                self.materials.invalidate(asset_key(handle));
             }
         }
     }
@@ -295,13 +367,13 @@ impl RenderingResourcesManager {
             let key = asset_key(handle);
             self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
-            if self.texture_versions.get(&key) == Some(&version) {
+            if self.textures.is_current(key, version) {
                 continue;
             }
             // Recorded before the rebuild: even a failed creation dropped the
             // texture the old materials were built against.
             self.changed.insert(key);
-            if let Some(old) = self.texture_handles.remove(&key) {
+            if let Some(old) = self.textures.remove(key) {
                 state.renderer_resource_storage.textures.remove(old);
             }
             match RendererTexture::new_texture(
@@ -315,8 +387,7 @@ impl RenderingResourcesManager {
             ) {
                 Ok(value) => {
                     let gpu = state.renderer_resource_storage.textures.insert(value);
-                    self.texture_handles.insert(key, gpu);
-                    self.texture_versions.insert(key, version);
+                    self.textures.insert(key, gpu, version);
                     epoch_moved = true;
                 }
                 // Left unrecorded, so a later revision tries again - and named,
@@ -332,15 +403,13 @@ impl RenderingResourcesManager {
         // A cached key the store no longer holds: its asset was removed, so its
         // object goes with it.
         let removed: Vec<u64> = self
-            .texture_handles
+            .textures
             .keys()
             .filter(|key| !self.live.contains(key))
-            .copied()
             .collect();
         for key in removed {
-            if let Some(gpu) = self.texture_handles.remove(&key) {
+            if let Some(gpu) = self.textures.remove(key) {
                 state.renderer_resource_storage.textures.remove(gpu);
-                self.texture_versions.remove(&key);
                 self.changed.insert(key);
                 epoch_moved = true;
             }
@@ -363,17 +432,17 @@ impl RenderingResourcesManager {
             let key = asset_key(handle);
             self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
-            if self.shader_versions.get(&key) == Some(&version) {
+            if self.shaders.is_current(key, version) {
                 continue;
             }
             self.changed.insert(key);
-            if let Some(old) = self.shader_handles.remove(&key) {
+            if let Some(old) = self.shaders.remove(key) {
                 state.renderer_resource_storage.shaders.remove(old);
             }
             let value = RendererShader::new(
                 &shader.name,
                 &state.device,
-                state.surface.format(),
+                state.surface_format,
                 Some(state.depth_format),
                 &[
                     RendererMesh::data_layout_descriptor(),
@@ -388,14 +457,15 @@ impl RenderingResourcesManager {
                     .engine_parameters
                     .bind_group_layout,
                 &state.camera_bind_group_layout,
-                shader.pass_engine_parameters,
-                shader.pass_camera_parameters,
+                UniformGroups {
+                    engine: shader.pass_engine_parameters,
+                    camera: shader.pass_camera_parameters,
+                },
             );
             match value {
                 Ok(value) => {
                     let gpu = state.renderer_resource_storage.shaders.insert(value);
-                    self.shader_handles.insert(key, gpu);
-                    self.shader_versions.insert(key, version);
+                    self.shaders.insert(key, gpu, version);
                     epoch_moved = true;
                 }
                 Err(error) => pill_core::warn!(
@@ -407,15 +477,13 @@ impl RenderingResourcesManager {
         }
 
         let removed: Vec<u64> = self
-            .shader_handles
+            .shaders
             .keys()
             .filter(|key| !self.live.contains(key))
-            .copied()
             .collect();
         for key in removed {
-            if let Some(gpu) = self.shader_handles.remove(&key) {
+            if let Some(gpu) = self.shaders.remove(key) {
                 state.renderer_resource_storage.shaders.remove(gpu);
-                self.shader_versions.remove(&key);
                 self.changed.insert(key);
                 epoch_moved = true;
             }
@@ -434,17 +502,16 @@ impl RenderingResourcesManager {
             let key = asset_key(handle);
             self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
-            if self.mesh_versions.get(&key) == Some(&version) {
+            if self.meshes.is_current(key, version) {
                 continue;
             }
-            if let Some(old) = self.mesh_handles.remove(&key) {
+            if let Some(old) = self.meshes.remove(key) {
                 state.renderer_resource_storage.meshes.remove(old);
             }
             match RendererMesh::new(&state.device, &mesh.name, mesh) {
                 Ok(value) => {
                     let gpu = state.renderer_resource_storage.meshes.insert(value);
-                    self.mesh_handles.insert(key, gpu);
-                    self.mesh_versions.insert(key, version);
+                    self.meshes.insert(key, gpu, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -455,15 +522,13 @@ impl RenderingResourcesManager {
         }
 
         let removed: Vec<u64> = self
-            .mesh_handles
+            .meshes
             .keys()
             .filter(|key| !self.live.contains(key))
-            .copied()
             .collect();
         for key in removed {
-            if let Some(gpu) = self.mesh_handles.remove(&key) {
+            if let Some(gpu) = self.meshes.remove(key) {
                 state.renderer_resource_storage.meshes.remove(gpu);
-                self.mesh_versions.remove(&key);
             }
         }
     }
@@ -476,10 +541,10 @@ impl RenderingResourcesManager {
             let key = asset_key(handle);
             self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
-            if self.material_versions.get(&key) == Some(&version) {
+            if self.materials.is_current(key, version) {
                 continue;
             }
-            if let Some(old) = self.material_handles.remove(&key) {
+            if let Some(old) = self.materials.remove(key) {
                 state.renderer_resource_storage.materials.remove(old);
             }
             let shader_key = asset_key(material.shader);
@@ -487,8 +552,8 @@ impl RenderingResourcesManager {
                 // A material built without a shader is documented to draw with
                 // the renderer's own; that is a choice, not a fault.
                 self.default_shader
-            } else if let Some(gpu) = self.shader_handles.get(&shader_key) {
-                *gpu
+            } else if let Some(gpu) = self.shaders.handle(shader_key) {
+                gpu
             } else {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -501,9 +566,8 @@ impl RenderingResourcesManager {
                 .textures
                 .iter()
                 .filter_map(|(slot, texture)| {
-                    self.texture_handles
-                        .get(&asset_key(texture.texture))
-                        .copied()
+                    self.textures
+                        .handle(asset_key(texture.texture))
                         .map(|gpu| (slot.clone(), gpu))
                 })
                 .collect::<Vec<_>>();
@@ -518,8 +582,7 @@ impl RenderingResourcesManager {
             ) {
                 Ok(value) => {
                     let gpu = state.renderer_resource_storage.materials.insert(value);
-                    self.material_handles.insert(key, gpu);
-                    self.material_versions.insert(key, version);
+                    self.materials.insert(key, gpu, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -530,15 +593,13 @@ impl RenderingResourcesManager {
         }
 
         let removed: Vec<u64> = self
-            .material_handles
+            .materials
             .keys()
             .filter(|key| !self.live.contains(key))
-            .copied()
             .collect();
         for key in removed {
-            if let Some(gpu) = self.material_handles.remove(&key) {
+            if let Some(gpu) = self.materials.remove(key) {
                 state.renderer_resource_storage.materials.remove(gpu);
-                self.material_versions.remove(&key);
             }
         }
     }
@@ -558,24 +619,26 @@ impl RenderingResourcesManager {
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
-    let parameter_slots = parameter_slots_by_name(
+    let parameter_slots = slots_by_name(
         "pill_default_lit",
+        "parameter",
         [
             ShaderParameterSlot::new("tint", ShaderParameterType::Color),
             ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
         ],
     );
-    let texture_slots = texture_slots_by_name(
+    let texture_slots = slots_by_name(
         "pill_default_lit",
+        "texture",
         [
-            ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
-            ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
+            ShaderTextureSlot::new("color", ShaderTextureKind::Color, (0, 1)),
+            ShaderTextureSlot::new("normal", ShaderTextureKind::Normal, (2, 3)),
         ],
     );
     let shader = RendererShader::new(
         "pill_default_lit",
         &state.device,
-        state.surface.format(),
+        state.surface_format,
         Some(state.depth_format),
         &[
             RendererMesh::data_layout_descriptor(),
@@ -590,8 +653,10 @@ fn install_default_material(
             .engine_parameters
             .bind_group_layout,
         &state.camera_bind_group_layout,
-        true,
-        true,
+        UniformGroups {
+            engine: true,
+            camera: true,
+        },
     )?;
     let shader = state.renderer_resource_storage.shaders.insert(shader);
     let parameters = std::collections::BTreeMap::from([
@@ -609,4 +674,52 @@ fn install_default_material(
     )?;
     let material = state.renderer_resource_storage.materials.insert(material);
     Ok((shader, material))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fourth state the sync needs: a material whose shader or texture moved
+    /// keeps its handle but loses its version, so the next sync rebuilds it
+    /// against the new object.
+    #[test]
+    fn forgetting_a_version_keeps_the_handle_and_asks_for_a_rebuild() {
+        let mut column: GpuColumn<u32> = GpuColumn::new();
+        column.insert(7, 42, 3);
+        assert!(column.is_current(7, 3));
+
+        column.invalidate(7);
+
+        assert_eq!(column.handle(7), Some(42), "the handle stays");
+        assert!(!column.is_current(7, 3), "and the next sync rebuilds it");
+    }
+
+    /// A column hands back the object it drops, which is what lets the sync
+    /// remove it from the resource storage.
+    #[test]
+    fn removing_an_entry_hands_back_its_handle() {
+        let mut column: GpuColumn<u32> = GpuColumn::new();
+        column.insert(1, 10, 0);
+
+        assert_eq!(column.remove(1), Some(10));
+        assert_eq!(column.handle(1), None);
+        assert_eq!(column.remove(1), None, "removing twice is harmless");
+    }
+
+    /// Versions are compared per key, so one asset moving leaves its
+    /// neighbours' objects alone.
+    #[test]
+    fn a_moved_version_only_touches_its_own_key() {
+        let mut column: GpuColumn<u32> = GpuColumn::new();
+        column.insert(1, 10, 0);
+        column.insert(2, 20, 0);
+
+        column.insert(1, 11, 1);
+
+        assert!(column.is_current(1, 1));
+        assert!(!column.is_current(1, 0));
+        assert!(column.is_current(2, 0), "its neighbour is untouched");
+        assert_eq!(column.handle(2), Some(20));
+    }
 }

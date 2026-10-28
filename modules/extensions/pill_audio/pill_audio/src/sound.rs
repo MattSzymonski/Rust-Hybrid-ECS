@@ -64,40 +64,17 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// Mirrored to C# as `pill_audio.Sound`: a managed project imports one with
 /// `assets.Import<Sound>(path, ...)` and builds one with `Sound.Load` or
 /// `Sound.FromBytes`.
-#[pill_engine::pill_mirror_object(asset, import)]
+// One asset column for the module DLL and every project that links this crate:
+// without the pinned name, a `Handle<Sound>` a project issued would address a
+// column the module's playback system never reads. Keep this string and
+// `metadata_type_name` in step: the `.meta` files name the type by the same
+// string, so moving the type does not orphan them.
+#[pill_engine::pill_mirror_object(asset, import, shared = "pill_audio::Sound")]
 pub struct Sound {
     /// Path the bytes were read from, kept for diagnostics and reloading.
     path: std::path::PathBuf,
     /// The file's bytes, exactly as they were on disk.
     bytes: std::sync::Arc<[u8]>,
-}
-
-/// The pinned shared name of [`Sound`]; see the comment on its `Asset` impl.
-const SOUND_SHARED_NAME: &str = "pill_audio::Sound";
-
-// Shared across binaries: the module DLL and every project that links this
-// crate hold their own `Sound` type, and one shared name gives them one asset
-// column (see `Asset::shared_name`). Without it a `Handle<Sound>` a project
-// issued would address a column the module's playback system never reads.
-// Keep this string and `metadata_type_name` in step: the `.meta` files name
-// the type by the same string, so moving the type does not orphan them.
-// The trait's full path, not the imported name: the hot-patch inventory is
-// generated at the crate root and cannot see this module's `use` lines.
-impl pill_engine::Asset for Sound {
-    fn shared_name() -> Option<&'static str> {
-        Some(SOUND_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        /// The stable identity of [`Sound`]'s shared name.
-        ///
-        /// The same construction a shared component identity uses, so a
-        /// cooking step and a runtime agree on the column without agreeing on
-        /// a `TypeId`.
-        const IDENTITY: u128 = pill_engine::component::shared_component_identity(SOUND_SHARED_NAME);
-
-        Some(IDENTITY)
-    }
 }
 trait_type_map::impl_trait_accessible!(dyn Asset; Sound);
 

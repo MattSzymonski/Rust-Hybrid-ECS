@@ -11,9 +11,10 @@
 //!   [`pbr_pipeline`] with its [`post_processing`] and [`skybox`] parts - so a
 //!   project can run a frame without declaring one, each with its stages under a
 //!   `shaders/` directory in the crate's `shader_sources/` tree.
-//! - Declare every cooked shader file once ([`ConfigShaderFile`]), and which
-//!   shader asset each pair of them builds ([`all_shader_sources`]), so the
-//!   embedded text and a runtime reload of it can never name different files.
+//! - Import every one of their shaders from its `.hlsl` source and `.hlsl.meta`
+//!   ([`import_shader`]), the same route a project's own shaders take, and name
+//!   the cooked files each was built from ([`all_shader_sources`]) so a runtime
+//!   reload of a source reaches the assets built from it.
 //!
 //! # Design
 //!
@@ -22,6 +23,14 @@
 //! each `install` is idempotent - it returns what the store already holds rather
 //! than adding a second copy - which is what lets the renderer's own
 //! registration call one of them on every generation.
+//!
+//! One construction route, not two: a built-in shader is imported exactly as a
+//! project's shader is, so its slots, its bindings and the guid material files
+//! name live beside its source in a `.hlsl.meta`, and the store lists it as the
+//! file it is. The only stage text this crate embeds is the pair the GPU module's
+//! fallback shader is built from ([`DEFAULT_VERTEX`] and
+//! [`simple_pipeline::DEFAULT_LIT_FRAGMENT`]), which has no store of its own to
+//! be read from.
 //!
 //! [`pbr_pipeline`] is the default: [`register`](crate::register) installs it and
 //! points [`RenderingManager`](crate::RenderingManager) at it. A project that
@@ -57,7 +66,20 @@ pub mod simple_pipeline;
 /// The sky pass drawn where the lit pass wrote nothing.
 pub mod skybox;
 
-/// A cooked WGSL file the renderer's own pipelines are built from.
+// Standard library
+
+// External crates
+use pill_engine::{AssetGuid, AssetImport, AssetManager, Handle, MetadataPolicy};
+
+// Current crate
+use crate::assets::Shader;
+
+/// A cooked WGSL file the renderer embeds at build time.
+///
+/// Only the two stages the GPU module's fallback shader is built from are
+/// embedded: every other built-in shader is imported from its source like a
+/// project's, so its text is read from the store rather than compiled into
+/// this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigShaderFile {
     /// Path relative to the crate's `shader_sources/`, e.g.
@@ -67,15 +89,22 @@ pub struct ConfigShaderFile {
     pub embedded_source: &'static str,
 }
 
-/// Which cooked files a named shader asset of the renderer's is built from.
+/// Which cooked files a built-in shader asset was built from.
+///
+/// One entry per shader the renderer's own pipelines install, so the
+/// development shader reload can map an edited cooked file back to the assets
+/// built from it. The paths are the cooked `.wgsl` files the host hands over,
+/// not the `.hlsl` sources it cooked them from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShaderSourceRecord {
-    /// The name the shader asset is stored under.
+    /// The name the shader asset is stored under: the path of the `.hlsl`
+    /// source it was imported from, because an imported asset is named by the
+    /// path it came from.
     pub shader_asset_name: &'static str,
     /// Its vertex stage.
-    pub vertex: ConfigShaderFile,
+    pub vertex_path: &'static str,
     /// Its fragment stage.
-    pub fragment: ConfigShaderFile,
+    pub fragment_path: &'static str,
 }
 
 config_shader_file!(
@@ -83,11 +112,44 @@ config_shader_file!(
     pub DEFAULT_VERTEX, "common_shaders/default_vertex.wgsl"
 );
 
+/// Import one of the renderer's own shaders, or hand back the one a store
+/// already holds.
+///
+/// The path is the `.hlsl` source, relative to this crate's `shader_sources/`;
+/// the settings come from the `.hlsl.meta` beside it, so the slots, the
+/// bindings and the guid are declared once, next to the source, exactly as a
+/// project's shader declares them. A meta carrying a guid other than `guid` is
+/// a packaging fault and stops here: the store would otherwise hold a shader no
+/// material file could name.
+///
+/// # Errors
+///
+/// Returns the store's import error when the source or its meta will not load.
+pub(crate) fn import_shader(
+    assets: &mut AssetManager,
+    path: &str,
+    guid: AssetGuid,
+) -> Result<Handle<Shader>, Box<dyn std::error::Error>> {
+    if let Some(handle) = assets.handle_by_name::<Shader>(path) {
+        return Ok(handle);
+    }
+    let imported = assets.import(AssetImport::<Shader>::new(
+        path,
+        MetadataPolicy::ReadIfPresent,
+    ))?;
+    assert_eq!(
+        imported.guid,
+        Some(guid),
+        "`{path}` must carry the guid its module declares"
+    );
+    Ok(imported.handle)
+}
+
 /// Every shader asset the renderer's own pipelines install, with its files.
 ///
 /// Used by the development shader reload to map an edited file back to the
-/// assets built from it; the pipelines' `install` functions build from the
-/// same constants, so the two cannot drift.
+/// assets built from it; the pipelines' `install` functions import from the
+/// same paths, so the two cannot drift.
 pub fn all_shader_sources() -> impl Iterator<Item = &'static ShaderSourceRecord> {
     pbr_pipeline::SHADER_SOURCES
         .iter()
@@ -120,9 +182,19 @@ mod tests {
     use super::*;
     use crate::assets::Shader;
     use pill_engine::{AssetManager, Engine};
+    use std::path::PathBuf;
 
-    /// Every record names a shader the pipelines really install, built from
-    /// exactly the files the record points at.
+    /// The crate's own `shader_sources/` directory.
+    fn sources_directory() -> PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shader_sources")
+    }
+
+    /// Every record names a shader the pipelines really install, and the two
+    /// cooked files its stages came from are the ones the record points at.
+    ///
+    /// This is what keeps the reload table honest: a record whose paths moved
+    /// would send an edited file nowhere, and a meta naming a different vertex
+    /// stage would be caught here rather than as a shader that draws wrong.
     #[test]
     fn every_shader_source_record_matches_an_installed_shader() {
         let mut engine = Engine::new();
@@ -134,27 +206,33 @@ mod tests {
         // `register` installs the PBR chain; the simple one is opt-in.
         simple_pipeline::install(assets).expect("a free name");
 
+        let sources = sources_directory();
         for record in all_shader_sources() {
             let shader = assets
                 .get_by_name::<Shader>(record.shader_asset_name)
                 .unwrap_or_else(|| panic!("{} is not installed", record.shader_asset_name));
-            assert_eq!(shader.vertex_wgsl, record.vertex.embedded_source);
-            assert_eq!(shader.fragment_wgsl, record.fragment.embedded_source);
+            for path in [record.vertex_path, record.fragment_path] {
+                let on_disk = std::fs::read_to_string(sources.join(path))
+                    .unwrap_or_else(|error| panic!("{path}: {error}"));
+                let stage = if path == record.vertex_path {
+                    &shader.vertex_wgsl
+                } else {
+                    &shader.fragment_wgsl
+                };
+                assert_eq!(stage, &on_disk, "{}", record.shader_asset_name);
+            }
         }
     }
 
-    /// The embedded text is the file on disk, so a path typo cannot hide
-    /// behind an `include_str!` of some other file.
+    /// The two embedded stages are the files they name, so a path typo cannot
+    /// hide behind an `include_str!` of some other file.
     #[test]
-    fn every_declared_file_is_the_file_it_names() {
-        let config_directory =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shader_sources");
-        for record in all_shader_sources() {
-            for file in [record.vertex, record.fragment] {
-                let on_disk = std::fs::read_to_string(config_directory.join(file.relative_path))
-                    .unwrap_or_else(|error| panic!("{}: {error}", file.relative_path));
-                assert_eq!(on_disk, file.embedded_source, "{}", file.relative_path);
-            }
+    fn every_embedded_stage_is_the_file_it_names() {
+        let sources = sources_directory();
+        for file in [DEFAULT_VERTEX, simple_pipeline::DEFAULT_LIT_FRAGMENT] {
+            let on_disk = std::fs::read_to_string(sources.join(file.relative_path))
+                .unwrap_or_else(|error| panic!("{}: {error}", file.relative_path));
+            assert_eq!(on_disk, file.embedded_source, "{}", file.relative_path);
         }
     }
 }

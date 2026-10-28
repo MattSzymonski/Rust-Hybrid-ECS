@@ -1,7 +1,7 @@
 // Default lit fragment shader. Edit here — `pill_assets` regenerates the .wgsl.
 // Diffuse + normal mapped, single point light, exp-squared depth fog.
 
-#include "common.hlsl"
+#include "lit_common.hlsl"
 
 // The two slots the default shader declares for this material: a `tint` colour
 // and a `specularity` scalar, in that order.
@@ -31,23 +31,13 @@ Texture2D normal_texture;
 [[vk::binding(3, 3)]]
 SamplerState normal_sampler;
 
-struct PixelInput
-{
-    [[vk::location(0)]] float3 vertex_position       : TEXCOORD0;
-    [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD1;
-    [[vk::location(2)]] float3 TBN_tangent           : TEXCOORD2;
-    [[vk::location(3)]] float3 TBN_bitangent         : TEXCOORD3;
-    [[vk::location(4)]] float3 TBN_normal            : TEXCOORD4;
-    [[vk::location(5)]] float3 world_position        : TEXCOORD5;
-};
-
 struct PixelOutput
 {
     [[vk::location(0)]] float4 output : SV_TARGET0;
 };
 
 [shader("fragment")]
-PixelOutput fs_main(PixelInput input)
+PixelOutput fs_main(LitVaryings input)
 {
     PixelOutput result;
 
@@ -77,7 +67,7 @@ PixelOutput fs_main(PixelInput input)
     // Diffuse — normal map is in [0,1]; rescale to [-1,1].
     float3 normal = normalize(object_normal.rgb * 2.0 - 1.0);
     float3 light_direction = normalize(
-        mul(TBN_matrix, light_position) - input.vertex_position
+        mul(TBN_matrix, light_position) - input.tangent_space_position
     );
 
     float diffuse_light_strength = max(dot(normal, light_direction), 0.0);
@@ -85,7 +75,7 @@ PixelOutput fs_main(PixelInput input)
 
     // Specular (Blinn-Phong, fixed exponent 32).
     float3 view_direction = normalize(
-        mul(TBN_matrix, camera.camera_position) - input.vertex_position
+        mul(TBN_matrix, camera.camera_position) - input.tangent_space_position
     );
     float3 half_direction = normalize(view_direction + light_direction);
     float specular_light_strength = pow(max(dot(normal, half_direction), 0.0), 32)
@@ -95,15 +85,7 @@ PixelOutput fs_main(PixelInput input)
     float3 final_color = (ambient_light_factor + diffuse_light_factor + specular_light_factor)
                        * object_color.xyz
                        * material.tint.xyz;
-
-    // Exponential-squared depth fog. density = 0 → no fog, bit-identical output.
-    float fog_dist = length(camera.camera_position - input.world_position);
-    float fog_factor = clamp(
-        1.0 - exp(-engine.fog_density * engine.fog_density * fog_dist * fog_dist),
-        0.0,
-        1.0
-    );
-    final_color = lerp(final_color, engine.fog_color, fog_factor);
+    final_color = apply_fog(final_color, input.world_position);
 
     result.output = float4(final_color, 1.0);
     return result;

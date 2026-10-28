@@ -1,5 +1,4 @@
-// The mesh preview: a lit triangle mesh framed in the preview's square
-// (W-0049 Stage 11).
+// The mesh preview: a lit triangle mesh framed in the preview's square.
 //
 // A mesh tile asks for this when the preference is on. The model is centred on
 // the origin by the transform the caller frames it with, so the same pipeline

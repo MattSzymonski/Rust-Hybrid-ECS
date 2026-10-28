@@ -84,7 +84,12 @@ pub struct RenderMetrics {
     /// CPU time spent submitting the recorded work to the GPU.
     pub submit_micros: u64,
     /// Passes of the chain that were planned with at least one draw.
-    pub draw_calls: u32,
+    ///
+    /// A pass count, not a count of GPU draw commands: one pass draws every
+    /// instance run it was planned with, in as many commands as the runs it
+    /// found. Read it beside `passes` to see how much of the chain drew, and
+    /// not to judge batching.
+    pub passes_with_draws: u32,
     /// Passes the frame ran, whether or not they drew anything.
     pub passes: u32,
     /// Instance bytes the frame's draw queue carried.
@@ -126,17 +131,23 @@ pub trait PillRenderer {
         RenderMetrics::default()
     }
 
-    /// Tells the renderer that its surface now measures `width` by `height`
-    /// physical pixels.
+    /// Tells the renderer that surface `id` now measures `width` by `height`
+    /// physical pixels; an id the renderer does not draw does nothing.
     ///
-    /// A zero dimension means the surface is minimized; frames skip until a
-    /// usable size arrives.
-    fn resize(&mut self, width: u32, height: u32);
+    /// A zero dimension means the surface is minimized; frames skip it until a
+    /// usable size arrives. The primary surface is resized through its own id
+    /// ([`SurfaceId::PRIMARY`]) like any other.
+    ///
+    /// Required rather than defaulted: a renderer that forgot to forward a
+    /// resize would keep drawing at the old size with nothing in the log to
+    /// say why.
+    fn resize_surface(&mut self, id: SurfaceId, width: u32, height: u32);
 
-    /// Restricts drawing to a sub-region of the surface.
+    /// Restricts drawing to a sub-region of surface `id`.
     ///
-    /// `None` restores full-surface rendering.
-    fn set_viewport(&mut self, viewport: Option<RenderViewport>);
+    /// `None` restores full-surface rendering. Required for the same reason
+    /// [`Self::resize_surface`] is.
+    fn set_surface_viewport(&mut self, id: SurfaceId, viewport: Option<RenderViewport>);
 
     /// Draws one resolved frame from `assets` and presents it.
     ///
@@ -203,13 +214,6 @@ pub trait PillRenderer {
     /// releases it; an unknown id does nothing.
     fn detach_surface(&mut self, _id: SurfaceId) {}
 
-    /// [`Self::resize`] for an attached surface; an unknown id does nothing.
-    fn resize_surface(&mut self, _id: SurfaceId, _width: u32, _height: u32) {}
-
-    /// [`Self::set_viewport`] for an attached surface; an unknown id does
-    /// nothing.
-    fn set_surface_viewport(&mut self, _id: SurfaceId, _viewport: Option<RenderViewport>) {}
-
     /// Tells the renderer whether `id` may present on the next
     /// [`Self::render`].
     ///
@@ -250,8 +254,8 @@ pub trait PillRenderer {
 pub struct HeadlessRenderer;
 
 impl PillRenderer for HeadlessRenderer {
-    fn resize(&mut self, _: u32, _: u32) {}
-    fn set_viewport(&mut self, _: Option<RenderViewport>) {}
+    fn resize_surface(&mut self, _: SurfaceId, _: u32, _: u32) {}
+    fn set_surface_viewport(&mut self, _: SurfaceId, _: Option<RenderViewport>) {}
     fn render(&mut self, _: &RenderFrame, _: &AssetManager) -> Result<FrameOutcome, RendererError> {
         Ok(FrameOutcome::Skipped)
     }

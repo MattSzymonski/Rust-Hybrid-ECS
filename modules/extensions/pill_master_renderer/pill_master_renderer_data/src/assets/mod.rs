@@ -38,10 +38,10 @@ pub use render_pass::RenderPassDocument;
 // re-exported so `assets::` reaches it beside the types that carry it.
 pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 pub use rendering_pipeline::{RenderingPipeline, RenderingPipelineDocument};
-pub use shader::{parameter_slots_by_name, texture_slots_by_name};
+pub use shader::{slots_by_name, SlotName};
 pub use shader::{
-    Shader, ShaderBuilder, ShaderImportSettings, ShaderParameterDeclaration, ShaderParameterSlot,
-    ShaderParameterType, ShaderTextureDeclaration, ShaderTextureSlot,
+    Shader, ShaderBuilder, ShaderImportSettings, ShaderParameterSlot, ShaderParameterType,
+    ShaderTextureKind, ShaderTextureSlot,
 };
 pub use texture::{
     cube_face_direction, equirect_uv, load_shipped_texture, project_equirect_to_cubemap, Texture,
@@ -93,5 +93,33 @@ mod tests {
                 Some("pill_master_renderer::assets::RenderingPipeline"),
             ]
         );
+    }
+
+    /// Each asset's identity is the hash of its pinned name, not the
+    /// per-binary `TypeId` the trait falls back to - which is what makes the
+    /// six columns one column across the module, the GPU module and a project.
+    ///
+    /// The value is bound as a `const` by the attribute that declares the
+    /// name, so the same number comes back on every call without hashing.
+    #[test]
+    fn an_asset_identity_is_the_hash_of_its_pinned_name() {
+        for (identity, name) in [
+            (Mesh::shared_identity(), Mesh::shared_name()),
+            (Texture::shared_identity(), Texture::shared_name()),
+            (Shader::shared_identity(), Shader::shared_name()),
+            (Material::shared_identity(), Material::shared_name()),
+            (RenderPass::shared_identity(), RenderPass::shared_name()),
+            (
+                RenderingPipeline::shared_identity(),
+                RenderingPipeline::shared_name(),
+            ),
+        ] {
+            let name = name.expect("every renderer asset pins a name");
+            assert_eq!(
+                identity,
+                Some(pill_engine::component::shared_component_identity(name)),
+                "`{name}`"
+            );
+        }
     }
 }

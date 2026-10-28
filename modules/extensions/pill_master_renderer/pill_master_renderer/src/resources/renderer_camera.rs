@@ -28,10 +28,7 @@ use pill_core::math::{Matrix4f, Vector3f, Vector4f};
 use wgpu::util::DeviceExt;
 
 // Current crate
-use crate::{
-    components::{CameraComponent, TransformComponent},
-    error::Result,
-};
+use crate::components::{CameraComponent, TransformComponent};
 
 // --- Handle ---
 
@@ -234,15 +231,7 @@ impl RendererCamera {
     /// The layout is the one the renderer creates at startup and hands to
     /// both the camera and every camera-reading shader, which is what makes
     /// the bind group compatible with those pipelines.
-    ///
-    /// # Errors
-    ///
-    /// Never returns an error: buffer and bind group creation are wgpu calls
-    /// that report nothing to check, and `Ok` is the only value produced.
-    pub fn new(
-        device: &wgpu::Device,
-        camera_bind_group_layout: wgpu::BindGroupLayout,
-    ) -> Result<Self> {
+    pub fn new(device: &wgpu::Device, camera_bind_group_layout: wgpu::BindGroupLayout) -> Self {
         let parameters_data = CameraParametersData::new();
 
         let parameters_uniform_buffer =
@@ -261,15 +250,13 @@ impl RendererCamera {
             label: Some("camera_parameters_bind_group"),
         });
 
-        let camera = Self {
+        Self {
             parameters_data,
             parameters_uniform_buffer,
             bind_group_layout: camera_bind_group_layout,
             bind_group,
             projection_reported: false,
-        };
-
-        Ok(camera)
+        }
     }
 
     /// Uploads the camera's values for this frame to the uniform buffer.

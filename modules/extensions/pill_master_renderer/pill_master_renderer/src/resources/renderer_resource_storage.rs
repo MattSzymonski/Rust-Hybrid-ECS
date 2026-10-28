@@ -19,7 +19,7 @@ use pill_core::slot_map::SlotMap;
 
 // Current crate
 use crate::{
-    assets::TextureType,
+    assets::{ShaderTextureKind, TextureType},
     error::Result,
     resources::{
         EngineParameters, RendererCamera, RendererCameraHandle, RendererMaterial,
@@ -99,7 +99,7 @@ impl RendererResourceStorage {
             cameras: SlotMap::<RendererCameraHandle, RendererCamera>::with_capacity_and_key(
                 INITIAL_CAMERA_CAPACITY,
             ),
-            engine_parameters: EngineParameters::new(device)?,
+            engine_parameters: EngineParameters::new(device),
             default_color_texture: RendererTextureHandle::new(
                 0,
                 std::num::NonZeroU32::new(1).unwrap(),
@@ -121,18 +121,17 @@ impl RendererResourceStorage {
         Ok(storage)
     }
 
-    /// The stand-in a slot of `texture_type` falls back to when it binds
-    /// nothing, or `None` for depth, which only a pass's own input can supply.
+    /// The stand-in a slot of `kind` falls back to when it binds nothing, or
+    /// `None` for depth, which only a pass's own input can supply.
     pub(crate) fn default_texture_for(
         &self,
-        texture_type: TextureType,
+        kind: ShaderTextureKind,
     ) -> Option<RendererTextureHandle> {
-        match texture_type {
+        match kind.texture_type()? {
             TextureType::Color => Some(self.default_color_texture),
             TextureType::Normal => Some(self.default_normal_texture),
             TextureType::Equirect => Some(self.default_equirect_texture),
             TextureType::Cubemap => Some(self.default_cubemap_texture),
-            TextureType::Depth => None,
         }
     }
 

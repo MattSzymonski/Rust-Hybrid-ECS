@@ -19,8 +19,9 @@ struct MaterialParams
     float4 gamma;
     // x = edge0, y = edge1, z = mix. A descending ramp (edge0 > edge1) inverts.
     float4 grade;
-    // x = grain amplitude, y = pixels of screen per grain texel, z and w
-    // unused.
+    // x = grain amplitude, y = pixels of screen per grain texel, z = the grain
+    // tile's edge in texels (the pass passes the size of the texture it
+    // generated), w unused.
     float4 grain;
 };
 
@@ -92,7 +93,7 @@ PixelOutput fs_main(PixelInput input)
     // Film grain, the reference's formulation: the tile is sampled in screen
     // pixels, so its texels stay the size the amplitude was chosen for. The
     // black limit keeps a negative grain from crushing blacks.
-    float2 grain_uv = input.position.xy / (material.grain.y * 256.0);
+    float2 grain_uv = input.position.xy / (material.grain.y * material.grain.z);
     float3 grain = grain_texture.Sample(grain_sampler, grain_uv).rgb * 2.0 - 1.0;
     float black_limit = material.grain.x * 0.5;
     float grain_amount = material.grain.x * 0.75;

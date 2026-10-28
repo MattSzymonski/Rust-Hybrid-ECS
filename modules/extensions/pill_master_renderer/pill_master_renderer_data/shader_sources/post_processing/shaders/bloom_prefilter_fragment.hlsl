@@ -3,11 +3,12 @@
 // Edit here - `pill_assets` regenerates the .wgsl.
 //
 // The reference builds bloom as a pyramid: a chain of downsampled targets and a
-// matching upsample chain. This engine holds one target per name at frame size,
-// so the chain here is a single level, and what survives is the part the
-// composite needs - the light above the cut-off, softened so the bloom does not
-// look like it was cut out with scissors. The reference's threshold-free
-// downsample would need the pyramid to be a threshold at all.
+// matching upsample chain. This engine gives each named target one size, chosen
+// by the first pass that writes it, so the chain here is a single level, and
+// what survives is the part the composite needs - the light above the cut-off,
+// softened so the bloom does not look like it was cut out with scissors. The
+// reference's threshold-free downsample would need the pyramid to be a
+// threshold at all.
 
 struct MaterialParams
 {

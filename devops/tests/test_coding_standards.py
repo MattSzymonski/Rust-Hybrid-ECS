@@ -163,6 +163,32 @@ IMPORT_GROUP_HEADERS = (
     ("// Current crate", "'// Current crate'"),
 )
 
+# Header text to the group it labels, for the content rule.
+GROUP_NAMES = {
+    "// Standard library": "standard",
+    "// External crates": "external",
+    "// Current crate": "crate",
+}
+
+# Which `use` root belongs to which group. `crate`, `super` and `self` are
+# this crate's own modules; everything else that is not the standard library
+# comes from another crate.
+USE_PATH_PATTERN = re.compile(r"^use\s+([A-Za-z0-9_:]+)")
+USE_STANDARD_ROOTS = frozenset({"std", "core", "alloc"})
+USE_CRATE_ROOTS = frozenset({"crate", "super", "self"})
+
+# The import-group content rule covers the renderer. The rest of the
+# repository still carries imports under the wrong header; widening this is
+# tracked as follow-up work, and the order rule above keeps gating every
+# crate in the meantime.
+IMPORT_GROUP_CONTENT_SCOPE = (
+    "modules/extensions/pill_master_renderer/",
+    "modules/rendering/",
+)
+
+# Shader sources carry the same comment ban as Rust sources.
+SHADER_SUFFIXES = (".wgsl", ".hlsl")
+
 # A `mod tests` inside a file this short is not worth flagging.
 TESTS_PLACEMENT_MINIMUM_LINES = 20
 
@@ -451,6 +477,32 @@ def find_rust_files(root: Path, excludes: Optional[List[Path]] = None) -> List[P
         ):
             continue
         discovered.append(path)
+    return sorted(discovered, key=lambda path: path.as_posix())
+
+
+def find_shader_files(root: Path, excludes: Optional[List[Path]] = None) -> List[Path]:
+    """Returns every shader source under a root, skipping build and VCS output.
+
+    Shaders are not Rust, so they are not part of the per-file checks; the
+    comment-content rule reaches them because a shader carries the same
+    process-reference ban as a Rust comment.
+    """
+    if root.is_file():
+        return [root] if root.suffix in SHADER_SUFFIXES else []
+
+    resolved_excludes = [path.resolve() for path in (excludes or [])]
+    discovered: List[Path] = []
+    for suffix in SHADER_SUFFIXES:
+        for path in root.rglob(f"*{suffix}"):
+            if any(part in EXCLUDED_DIRECTORY_NAMES for part in path.parts):
+                continue
+            resolved = path.resolve()
+            if any(
+                resolved == exclude or exclude in resolved.parents
+                for exclude in resolved_excludes
+            ):
+                continue
+            discovered.append(path)
     return sorted(discovered, key=lambda path: path.as_posix())
 
 
@@ -815,6 +867,134 @@ def check_comment_content(
     )
 
 
+def check_shader_comment_content(
+    text: str,
+    display_path: str,
+    collector: ViolationCollector,
+) -> None:
+    """Refuses a process reference anywhere in a shader source.
+
+    A shader has no code that could plausibly name a work item, so the whole
+    file is measured rather than only its comment lines: `//` and `/* */`
+    comments, and the header block a shader file opens with, carry the same
+    ban the Rust rule enforces.
+    """
+    if not display_path.startswith(COMMENT_CONTENT_SCOPE):
+        return
+    total, details = count_process_references(text.splitlines())
+    if total == 0:
+        return
+    detail = ", ".join(details) if details else "no details"
+    collector.record(
+        display_path,
+        "shader comment content",
+        f"{total} process reference(s): {detail}",
+    )
+
+
+def check_import_group_contents(
+    lines: List[str],
+    display_path: str,
+    collector: ViolationCollector,
+) -> None:
+    """Refuses a `use` that sits under the wrong group header.
+
+    The standard names three groups and what belongs in each: the standard
+    library, other crates, and this crate. The order check proves the groups
+    are ordered; this one proves each `use` sits under the header its path
+    belongs to, so a `pill_*` or `wgpu` import cannot hide under `// Current
+    crate`. A file with more than one group must label each of them.
+
+    Only the file's import block is measured - the run from its first `use`
+    to the first line that starts a declaration - so a `use` inside a re-export
+    region in the module body is not misread as an import.
+    """
+    if not display_path.startswith(IMPORT_GROUP_CONTENT_SCOPE):
+        return
+    block = import_block(lines)
+    if not block:
+        return
+    uses = [
+        (number, match.group(1))
+        for number, stripped in block
+        if (match := USE_PATH_PATTERN.match(stripped))
+    ]
+    groups = {classify_use_group(path) for _, path in uses}
+    labelled = {
+        GROUP_NAMES[stripped] for _, stripped in block if stripped in GROUP_NAMES
+    }
+    if len(groups) > 1 and not labelled:
+        collector.record(
+            display_path,
+            "import group contents",
+            f"{len(uses)} imports across {sorted(groups)} carry no group header",
+        )
+    current: Optional[str] = None
+    for number, stripped in block:
+        if stripped in GROUP_NAMES:
+            current = GROUP_NAMES[stripped]
+            continue
+        match = USE_PATH_PATTERN.match(stripped)
+        if not match:
+            continue
+        group = classify_use_group(match.group(1))
+        if current is None:
+            if len(groups) > 1:
+                collector.record(
+                    display_path,
+                    "import group contents",
+                    f"line {number}: {stripped} is outside any group header",
+                )
+        elif current != group:
+            collector.record(
+                display_path,
+                "import group contents",
+                f"line {number}: {stripped} is {group} but sits under {current}",
+            )
+
+
+def import_block(lines: List[str]) -> List[Tuple[int, str]]:
+    """Returns the file's import block as (line number, stripped line) pairs.
+
+    The block runs from the header above the first top-level `use` to the
+    first line that is neither a use, a group header, a blank line nor a plain
+    comment. A file with no top-level use has no block.
+    """
+    first_use: Optional[int] = None
+    for number, line in enumerate(lines):
+        if line.startswith("use "):
+            first_use = number
+            break
+    if first_use is None:
+        return []
+    while first_use > 0 and lines[first_use - 1].strip() in GROUP_NAMES:
+        first_use -= 1
+    block: List[Tuple[int, str]] = []
+    for number in range(first_use, len(lines)):
+        line = lines[number]
+        stripped = line.strip()
+        if (
+            line.startswith("use ")
+            or stripped in GROUP_NAMES
+            or not stripped
+            or stripped.startswith("//")
+        ):
+            block.append((number + 1, stripped))
+            continue
+        break
+    return block
+
+
+def classify_use_group(path: str) -> str:
+    """Returns which of the three groups a `use` path belongs to."""
+    root = path.split("::", 1)[0]
+    if root in USE_STANDARD_ROOTS:
+        return "standard"
+    if root in USE_CRATE_ROOTS:
+        return "crate"
+    return "external"
+
+
 # =============================================================================
 # Self test
 # =============================================================================
@@ -1006,6 +1186,76 @@ def self_test() -> int:
         outcome = "PASS" if collector.violation_count == expected else "FAIL"
         passed &= outcome == "PASS"
         print(f"  {outcome}  {description}")
+
+    # Rule 9: the same ban reaches a shader source, which has no code that
+    # could name a work item.
+    shader_cases = (
+        (
+            "a work item in a shader header fails",
+            "modules/extensions/acme/acme/src/preview.wgsl",
+            "// The preview (W-0049 Stage 11).\n",
+            1,
+        ),
+        (
+            "a clean shader header passes",
+            "modules/extensions/acme/acme/src/preview.wgsl",
+            "// The preview draws one asset into a square target.\n",
+            0,
+        ),
+        (
+            "a shader outside modules/ is outside the guard",
+            "examples/acme/shaders/preview.wgsl",
+            "// W-0049\n",
+            0,
+        ),
+    )
+    for description, display_path, source, expected in shader_cases:
+        collector = SilentCollector()
+        check_shader_comment_content(source, display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
+
+    # Rule 4b: a `use` under the wrong group header, and a file whose groups
+    # carry no headers at all.
+    import_cases = (
+        (
+            "a std import under the external header fails",
+            "modules/rendering/acme/src/lib.rs",
+            "// External crates\nuse std::path::Path;\n\n// Current crate\nuse crate::Thing;\n",
+            1,
+        ),
+        (
+            "a std import under its own header passes",
+            "modules/rendering/acme/src/lib.rs",
+            "// Standard library\nuse std::path::Path;\n\n// Current crate\nuse crate::Thing;\n",
+            0,
+        ),
+        (
+            "unlabelled groups fail once per import",
+            "modules/rendering/acme/src/lib.rs",
+            "use std::path::Path;\n\nuse crate::Thing;\n",
+            3,
+        ),
+        (
+            "a file outside the content scope passes",
+            "modules/engine/acme/src/lib.rs",
+            "// External crates\nuse std::path::Path;\n\n// Current crate\nuse crate::Thing;\n",
+            0,
+        ),
+        (
+            "a workspace crate under the current-crate header fails",
+            "modules/rendering/acme/src/lib.rs",
+            "// Current crate\nuse crate::Thing;\nuse pill_core::slot_map::SlotMap;\n",
+            1,
+        ),
+    )
+    for description, display_path, source, expected in import_cases:
+        collector = SilentCollector()
+        check_import_group_contents(source.splitlines(), display_path, collector)
+        outcome = "PASS" if collector.violation_count == expected else "FAIL"
+        passed &= outcome == "PASS"
+        print(f"  {outcome}  {description}")
     return 0 if passed else 1
 
 
@@ -1156,37 +1406,47 @@ def main() -> int:
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/8) Module header")
+    section("(1/9) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/8) Safety comments")
+    section("(2/9) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/8) Public item docs")
+    section("(3/9) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/8) Import group order")
+    section("(4/9) Import groups")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
+        check_import_group_contents(lines, display_path, collector)
 
-    section("(5/8) Tests at the bottom")
+    section("(5/9) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/8) egui state (reloadable crates)")
+    section("(6/9) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
 
-    section("(7/8) colour literals (editor UI)")
+    section("(7/9) colour literals (editor UI)")
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
 
-    section("(8/8) comment content (modules/)")
+    section("(8/9) comment content (modules/)")
     for _, display_path, lines, _text in sources:
         check_comment_content(lines, display_path, collector)
+
+    shaders: List[Path] = []
+    excluded = [Path(entry) for entry in arguments.exclude]
+    for target in targets:
+        shaders.extend(find_shader_files(target, excluded))
+    section(f"(9/9) shader comment content ({len(shaders)} shader source(s))")
+    for path in shaders:
+        _lines, text = read_lines(path)
+        check_shader_comment_content(text, display_path_for(path), collector)
 
     if arguments.report:
         write_report(Path(arguments.report), files, collector)

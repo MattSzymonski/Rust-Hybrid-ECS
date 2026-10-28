@@ -1,5 +1,5 @@
 // The asset preview: a fullscreen triangle whose fragment shader draws one
-// asset into a 128x128 target (W-0049 Stage 11).
+// asset into a 128x128 target.
 //
 // A texture is sampled as a quad that keeps its aspect inside the square; a
 // material is a shaded sphere in the material's colour. The background is the

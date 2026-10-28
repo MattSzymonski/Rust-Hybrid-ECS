@@ -25,8 +25,7 @@
 
 // External crates
 use pill_engine::{
-    pill_mirror_object, Asset, AssetLoadResult, AssetManager, AssetReference, Handle,
-    StandaloneAsset,
+    pill_mirror_object, AssetLoadResult, AssetManager, AssetReference, Handle, StandaloneAsset,
 };
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +34,7 @@ use crate::RenderPass;
 
 /// The passes a frame runs, in the order they were added.
 #[derive(Clone, Debug, Default)]
-#[pill_mirror_object(asset)]
+#[pill_mirror_object(asset, shared = "pill_master_renderer::assets::RenderingPipeline")]
 pub struct RenderingPipeline {
     /// Pass handles, in the order they run. A pass's own `order` key refines
     /// this when the renderer sorts the chain.
@@ -57,28 +56,6 @@ impl RenderingPipeline {
     pub fn with_pass(mut self, pass: Handle<RenderPass>) -> Self {
         self.passes.push(pass);
         self
-    }
-}
-
-/// The pinned shared name of [`RenderingPipeline`]; see the comment on its `Asset` impl.
-const RENDERING_PIPELINE_SHARED_NAME: &str = "pill_master_renderer::assets::RenderingPipeline";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for RenderingPipeline {
-    fn shared_name() -> Option<&'static str> {
-        Some(RENDERING_PIPELINE_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 =
-            pill_engine::component::shared_component_identity(RENDERING_PIPELINE_SHARED_NAME);
-        Some(IDENTITY)
     }
 }
 

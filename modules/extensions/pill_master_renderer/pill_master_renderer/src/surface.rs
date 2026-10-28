@@ -21,9 +21,8 @@
 //!
 //! Nothing here names a windowing crate: the surface is built from a
 //! [`RawWindowData`] - the window's platform handles as plain data - and the
-//! sizes that reach it are plain pixels, which is what lets a frontend on any
-//! windowing crate (winit in the standalone host, tao in the editor) attach
-//! this renderer.
+//! sizes that reach it are plain pixels, which is what lets any winit frontend
+//! (the standalone host, the editor) attach this renderer.
 
 // External crates
 use pill_core::{info, warn};
@@ -219,8 +218,8 @@ impl Surface {
                 apply_limit_buckets: false,
             })
             .await
-            .map_err(|error| RendererError::AdapterRequest {
-                detail: error.to_string(),
+            .map_err(|error| RendererError::Backend {
+                detail: format!("no compatible GPU adapter: {error}"),
             })?;
         let info = adapter.get_info();
         let backend = info.backend;
@@ -242,14 +241,16 @@ impl Surface {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
-            .map_err(|error| RendererError::DeviceCreation {
-                detail: error.to_string(),
+            .map_err(|error| RendererError::Backend {
+                detail: format!("no GPU device from the adapter: {error}"),
             })?;
         crate::error::report_uncaptured_errors(&device);
         crate::error::latch_device_loss(&device);
         let capabilities = surface.get_capabilities(&adapter);
         let color_format =
-            pick_color_format(&capabilities.formats).ok_or(RendererError::NoTextureFormats)?;
+            pick_color_format(&capabilities.formats).ok_or_else(|| RendererError::Backend {
+                detail: "the surface offers no texture format to render into".to_owned(),
+            })?;
         // Pipelines draw through an sRGB view, so the hardware encodes the
         // linear colours they write. A surface that offers no sRGB format - a
         // WebGPU canvas never does - is configured in its plain format with
@@ -257,7 +258,9 @@ impl Surface {
         // format directly would put linear values on screen, far too dark.
         let render_format = color_format.add_srgb_suffix();
         let alpha_mode =
-            pick_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
+            pick_alpha_mode(&capabilities.alpha_modes).ok_or_else(|| RendererError::Backend {
+                detail: "the surface offers no alpha mode to present with".to_owned(),
+            })?;
         // `Fifo` is the one present mode a surface is required to support, and
         // a mode listed by `Surface::get_capabilities` is not thereby
         // creatable: the NVIDIA Vulkan driver on Windows advertises `Mailbox`
@@ -370,7 +373,9 @@ impl Surface {
                 ),
             })?;
         let alpha_mode =
-            pick_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
+            pick_alpha_mode(&capabilities.alpha_modes).ok_or_else(|| RendererError::Backend {
+                detail: "the surface offers no alpha mode to present with".to_owned(),
+            })?;
         let present_mode = preferred_present_mode(present, &capabilities.present_modes);
         let mut configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -449,8 +454,8 @@ impl Surface {
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::SurfaceConfigurationRefused`] when every
-    /// candidate configuration was refused, with each refusal collected.
+    /// Returns [`RendererError::Backend`] when every candidate configuration
+    /// was refused, with each refusal collected.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) -> Result<()> {
         let mut configuration = self.configuration.clone();
         configuration.width = width;
@@ -464,10 +469,9 @@ impl Surface {
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::SurfaceLost`] when the swapchain is still lost
-    /// or outdated after one reconfiguration, and
-    /// [`RendererError::SurfaceTextureFailed`] with wgpu's status for any other
-    /// acquisition failure.
+    /// Returns [`RendererError::Backend`] when the swapchain is still lost or
+    /// outdated after one reconfiguration, and again with wgpu's status for any
+    /// other acquisition failure.
     pub fn acquire(&mut self, device: &wgpu::Device) -> Result<wgpu::SurfaceTexture> {
         match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -481,15 +485,18 @@ impl Surface {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Ok(frame),
                     wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                        Err(RendererError::SurfaceLost)
+                        Err(RendererError::Backend {
+                            detail: "the swapchain stayed lost or outdated after reconfiguring"
+                                .to_owned(),
+                        })
                     }
-                    status => Err(RendererError::SurfaceTextureFailed {
-                        detail: format!("{status:?}"),
+                    status => Err(RendererError::Backend {
+                        detail: format!("no surface texture: {status:?}"),
                     }),
                 }
             }
-            other => Err(RendererError::SurfaceTextureFailed {
-                detail: format!("{other:?}"),
+            other => Err(RendererError::Backend {
+                detail: format!("no surface texture: {other:?}"),
             }),
         }
     }
@@ -535,8 +542,11 @@ async fn configure_first(
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
         }
     }
-    Err(RendererError::SurfaceConfigurationRefused {
-        detail: failures.join("; "),
+    Err(RendererError::Backend {
+        detail: format!(
+            "no surface configuration was accepted by the driver: {}",
+            failures.join("; ")
+        ),
     })
 }
 
@@ -564,8 +574,11 @@ fn configure(
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
         }
     }
-    Err(RendererError::SurfaceConfigurationRefused {
-        detail: failures.join("; "),
+    Err(RendererError::Backend {
+        detail: format!(
+            "no surface configuration was accepted by the driver: {}",
+            failures.join("; ")
+        ),
     })
 }
 

@@ -41,7 +41,7 @@ use pill_editor_core::scripted::{Dump, ScriptedCommand};
 use pill_editor_core::{entities, systems};
 use pill_engine_core::input::InputEvent;
 use pill_input::winit_events::translate_window_event;
-use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject};
+use pill_runtime::{FrameDriver, RenderingRuntime, Runtime, StaticProject, SurfaceId};
 use web_sys::HtmlCanvasElement;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -220,7 +220,7 @@ impl ApplicationHandler for WebEditorApplication {
                         && size.height > 0
                         && (size.width, size.height) != (width, height)
                     {
-                        attached.resize(size.width, size.height);
+                        attached.resize_surface(SurfaceId::PRIMARY, size.width, size.height);
                     }
                     *driver.borrow_mut() = Some(attached);
                     info!(target: telemetry_target::RENDERING, "renderer attached to the scene canvas");
@@ -276,7 +276,7 @@ impl ApplicationHandler for WebEditorApplication {
         match event {
             WindowEvent::Resized(size) => {
                 if let Some(driver) = self.driver.borrow_mut().as_mut() {
-                    driver.resize(size.width, size.height);
+                    driver.resize_surface(SurfaceId::PRIMARY, size.width, size.height);
                 }
             }
             WindowEvent::RedrawRequested => self.frame(),

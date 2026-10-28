@@ -3,20 +3,33 @@
 //!
 //! # Responsibilities
 //!
-//! - [`UiTextureSet`]: every texture a frame's draw lists sample, each with a
-//!   monotonically increasing revision, plus the textures to free.
+//! - [`UiTextureSet`]: the textures whose content moved since the producer
+//!   last carried them, each with a monotonically increasing revision, plus the
+//!   textures to free.
 //! - [`UiTexture`]: one texture's size, sampling and whole image at this
 //!   revision, as owned plain data.
 //!
 //! # Design
 //!
-//! The revision is the reload rule: a painter keeps `texture -> revision` for
+//! The revision drives the uploads: a painter keeps `texture -> revision` for
 //! what it has applied and uploads whenever the carried revision is not the
-//! applied one, so a painter that was rebuilt - and therefore remembers
-//! nothing - uploads everything the set carries. That only works if every
-//! entry can *rebuild* its texture, so an entry always carries the whole
-//! image: one full-image copy per changed texture per frame, with nothing
-//! replayed from history, so no back-channel and no cadence is involved.
+//! applied one. The producer therefore carries a texture only when that
+//! revision moved, not every texture every frame (`crate::frame::UiFrame`).
+//!
+//! A carried set is applied once per frame, before any surface decides whether
+//! it draws: the textures belong to the update, not to a surface, so a frame
+//! that draws nothing - a minimized window, a surface that may not present yet -
+//! still hands them over and the next drawn frame has them. A painter's revision
+//! map makes the second and later application in a frame a no-op; it is an
+//! optimisation, not the rule.
+//!
+//! A painter that starts with no textures at all needs more than the dirty set,
+//! because nothing is dirty by then: a renderer module that was just rebuilt
+//! asks for everything it holds through
+//! [`UiFrameSlot::request_texture_resend`](crate::slot::UiFrameSlot::request_texture_resend),
+//! and the producer re-carries its whole set when that request moves. An entry
+//! always carries the whole image rather than a patch, so a re-carried texture
+//! needs no history to apply.
 //!
 //! Every buffer is an [`Arc`] allocated by the producing side's own code and
 //! handed over as plain data: a project reload may drop the producer while a
@@ -73,7 +86,8 @@ pub struct UiTexture {
 /// A frame's textures: what to carry to the backend, and what to free.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiTextureSet {
-    /// The textures this frame's draws use, one entry per texture.
+    /// The textures whose revision moved since the producer last carried them,
+    /// one entry per texture; empty when the backend already holds everything.
     pub textures: Vec<UiTexture>,
     /// Textures the producer no longer uses; a backend drops them.
     pub frees: Vec<TextureId>,

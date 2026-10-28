@@ -56,8 +56,8 @@ pub fn apply_shader_source<'a>(
 ) -> Vec<&'static str> {
     let mut updated = Vec::new();
     for record in records {
-        let feeds_vertex = record.vertex.relative_path == relative_path;
-        let feeds_fragment = record.fragment.relative_path == relative_path;
+        let feeds_vertex = record.vertex_path == relative_path;
+        let feeds_fragment = record.fragment_path == relative_path;
         if !feeds_vertex && !feeds_fragment {
             continue;
         }
@@ -147,29 +147,23 @@ unsafe fn read_text<'a>(pointer: *const u8, length: usize) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ConfigShaderFile;
 
     /// A record for one vertex and one fragment file, stored as `test.shader`.
     const RECORD: ShaderSourceRecord = ShaderSourceRecord {
         shader_asset_name: "test.shader",
-        vertex: ConfigShaderFile {
-            relative_path: "test/test_vertex.wgsl",
-            embedded_source: "vertex one",
-        },
-        fragment: ConfigShaderFile {
-            relative_path: "test/test_fragment.wgsl",
-            embedded_source: "fragment one",
-        },
+        vertex_path: "test/test_vertex.wgsl",
+        fragment_path: "test/test_fragment.wgsl",
     };
 
-    /// A store holding `test.shader`, built from the embedded text.
+    /// The text `RECORD`'s stages were built from.
+    const RECORD_VERTEX: &str = "vertex one";
+    const RECORD_FRAGMENT: &str = "fragment one";
+
+    /// A store holding `test.shader`, built from that text.
     fn store_with_shader() -> (AssetManager, pill_engine::Handle<Shader>) {
         let mut assets = AssetManager::new();
         let shader = Shader::new("test")
-            .with_wgsl(
-                RECORD.vertex.embedded_source,
-                RECORD.fragment.embedded_source,
-            )
+            .with_wgsl(RECORD_VERTEX, RECORD_FRAGMENT)
             .build()
             .expect("both stages set");
         let handle = assets
@@ -193,7 +187,7 @@ mod tests {
         assert_eq!(updated, ["test.shader"]);
         let shader = assets.get(handle).expect("still live");
         assert_eq!(shader.fragment_wgsl, "fragment two");
-        assert_eq!(shader.vertex_wgsl, "vertex one");
+        assert_eq!(shader.vertex_wgsl, RECORD_VERTEX);
         assert_ne!(assets.content_version(handle), before);
     }
 
@@ -205,7 +199,7 @@ mod tests {
         let updated = apply_shader_source(
             &mut assets,
             "test/test_vertex.wgsl",
-            "vertex one",
+            RECORD_VERTEX,
             [&RECORD],
         );
 
@@ -241,10 +235,7 @@ mod tests {
             .expect("the crate records shaders");
         let mut assets = AssetManager::new();
         let shader = Shader::new("recorded")
-            .with_wgsl(
-                record.vertex.embedded_source,
-                record.fragment.embedded_source,
-            )
+            .with_wgsl("vertex one", "fragment one")
             .build()
             .expect("both stages set");
         let handle = assets
@@ -252,7 +243,7 @@ mod tests {
             .expect("a free name");
         let mut world = World::new();
         world.insert_resource(assets);
-        let path = record.fragment.relative_path;
+        let path = record.fragment_path;
         let text = "edited fragment";
 
         // SAFETY: a live, unshared world and two valid UTF-8 buffers.
@@ -270,7 +261,7 @@ mod tests {
         let assets = world.get_resource::<AssetManager>().expect("inserted");
         let shader = assets.get(handle).expect("still live");
         assert_eq!(shader.fragment_wgsl, text);
-        assert_eq!(shader.vertex_wgsl, record.vertex.embedded_source);
+        assert_eq!(shader.vertex_wgsl, "vertex one");
     }
 
     #[test]

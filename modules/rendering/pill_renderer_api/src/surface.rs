@@ -94,8 +94,8 @@ pub enum CameraBinding {
 /// frame would make among the world's cameras.
 #[derive(Debug, Clone, Default)]
 pub struct SurfaceCameras {
-    /// Binding per surface id (`SurfaceId.0`).
-    pub bindings: BTreeMap<u32, CameraBinding>,
+    /// Binding per surface.
+    pub bindings: BTreeMap<SurfaceId, CameraBinding>,
     /// The scene grid the view-bound surfaces draw; off until a frontend
     /// turns it on.
     pub grid: crate::SceneGrid,
@@ -106,10 +106,10 @@ impl SurfaceCameras {
     pub fn set(&mut self, surface: SurfaceId, binding: Option<CameraBinding>) {
         match binding {
             Some(binding) => {
-                self.bindings.insert(surface.0, binding);
+                self.bindings.insert(surface, binding);
             }
             None => {
-                self.bindings.remove(&surface.0);
+                self.bindings.remove(&surface);
             }
         }
     }
@@ -207,7 +207,7 @@ mod tests {
         let entity = world.reserve_entity();
         let mut cameras = SurfaceCameras::default();
         cameras.set(SurfaceId(1), Some(CameraBinding::Entity(entity)));
-        assert!(cameras.bindings.contains_key(&1));
+        assert!(cameras.bindings.contains_key(&SurfaceId(1)));
         cameras.set(SurfaceId(1), None);
         assert!(cameras.bindings.is_empty());
     }

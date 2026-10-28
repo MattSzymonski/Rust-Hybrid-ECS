@@ -125,7 +125,7 @@ fn the_tab_bodies_draw_without_panicking() {
             scene_overlay(ui, 120.0, &mut regions);
         });
     });
-    assert_eq!(regions.len(), 2, "the two chips are the UI's regions");
+    assert_eq!(regions.len(), 1, "the frame counter is the UI's region");
 }
 
 /// The Add list the popup and the component menu share omits every component

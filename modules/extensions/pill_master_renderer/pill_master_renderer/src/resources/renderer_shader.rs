@@ -29,7 +29,7 @@ use pill_core::debug;
 
 // Current crate
 use crate::{
-    assets::{ShaderParameterSlot, ShaderTextureSlot, TextureType},
+    assets::{ShaderParameterSlot, ShaderTextureKind, ShaderTextureSlot},
     error::{RendererError, Result},
 };
 
@@ -67,10 +67,23 @@ pub struct RendererShader {
 
     /// Whether the shader reads the engine's parameters, in which case a
     /// drawer binds that group before the draw.
-    pub pass_engine_parameters: bool,
+    pub reads_engine_parameters: bool,
     /// Whether the shader reads the camera's parameters, in which case a
     /// drawer binds that group before the draw.
-    pub pass_camera_parameters: bool,
+    pub reads_camera_parameters: bool,
+}
+
+/// Which of the renderer's shared uniforms a shader reads.
+///
+/// Grouped rather than passed as two bare booleans: `RendererShader::new` takes
+/// a dozen arguments, and a trailing `true, true` says nothing about which
+/// group either one asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UniformGroups {
+    /// The shader reads group 0, the engine's parameters.
+    pub engine: bool,
+    /// The shader reads group 1, the camera's parameters.
+    pub camera: bool,
 }
 
 impl RendererShader {
@@ -99,8 +112,7 @@ impl RendererShader {
         texture_slots: &IndexMap<String, ShaderTextureSlot>,
         engine_bind_group_layout: &wgpu::BindGroupLayout,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
-        pass_engine_parameters: bool,
-        pass_camera_parameters: bool,
+        uniform_groups: UniformGroups,
     ) -> Result<Self> {
         // Nothing compiles a shader at runtime: the authored sources are HLSL
         // under the data crate's `shader_sources`, its build script cooks them
@@ -147,15 +159,15 @@ impl RendererShader {
                     // A depth slot is bound as depth, with a sampler that does not
                     // filter: a depth buffer is not a filterable colour texture,
                     // and wgpu refuses the pipeline that pretends otherwise.
-                    let (sample_type, sampler_type) = match texture_slot.texture_type {
-                        TextureType::Depth => (
+                    let (sample_type, sampler_type) = match texture_slot.kind {
+                        ShaderTextureKind::Depth => (
                             wgpu::TextureSampleType::Depth,
                             wgpu::SamplerBindingType::NonFiltering,
                         ),
-                        TextureType::Color
-                        | TextureType::Normal
-                        | TextureType::Equirect
-                        | TextureType::Cubemap => (
+                        ShaderTextureKind::Color
+                        | ShaderTextureKind::Normal
+                        | ShaderTextureKind::Equirect
+                        | ShaderTextureKind::Cubemap => (
                             wgpu::TextureSampleType::Float { filterable: true },
                             wgpu::SamplerBindingType::Filtering,
                         ),
@@ -168,7 +180,7 @@ impl RendererShader {
                         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
-                            view_dimension: slot_view_dimension(texture_slot.texture_type),
+                            view_dimension: slot_view_dimension(texture_slot.kind),
                             sample_type,
                         },
                         count: None,
@@ -289,8 +301,8 @@ impl RendererShader {
             textures_bind_group_layout,
             texture_slots: texture_slots.clone(),
             parameters_bind_group_layout,
-            pass_engine_parameters,
-            pass_camera_parameters,
+            reads_engine_parameters: uniform_groups.engine,
+            reads_camera_parameters: uniform_groups.camera,
         };
 
         // One line per shader, hidden unless `engine::rendering` is at debug:
@@ -307,8 +319,8 @@ impl RendererShader {
             shader = name,
             parameters = %slot_names(parameter_slots.keys().collect()),
             textures = %slot_names(texture_slots.keys().collect()),
-            engine_parameters = pass_engine_parameters,
-            camera_parameters = pass_camera_parameters,
+            engine_parameters = uniform_groups.engine,
+            camera_parameters = uniform_groups.camera,
             "shader created"
         );
 
@@ -316,11 +328,11 @@ impl RendererShader {
     }
 }
 
-/// The view shape a texture slot of `texture_type` binds: a cube for a
-/// cubemap, a 2D image for everything else.
-pub(crate) fn slot_view_dimension(texture_type: TextureType) -> wgpu::TextureViewDimension {
-    match texture_type {
-        TextureType::Cubemap => wgpu::TextureViewDimension::Cube,
+/// The view shape a texture slot of `kind` binds: a cube for a cubemap, a 2D
+/// image for everything else, depth included.
+pub(crate) fn slot_view_dimension(kind: ShaderTextureKind) -> wgpu::TextureViewDimension {
+    match kind {
+        ShaderTextureKind::Cubemap => wgpu::TextureViewDimension::Cube,
         _ => wgpu::TextureViewDimension::D2,
     }
 }
@@ -337,16 +349,16 @@ pub(crate) fn slot_view_dimension(texture_type: TextureType) -> wgpu::TextureVie
 pub(crate) fn check_slot_shape(
     owner: &str,
     slot_name: &str,
-    slot_type: TextureType,
+    slot_kind: ShaderTextureKind,
     texture: &crate::resources::RendererTexture,
 ) -> Result<()> {
-    let expected = slot_view_dimension(slot_type);
+    let expected = slot_view_dimension(slot_kind);
     if texture.view_dimension == expected {
         return Ok(());
     }
     Err(RendererError::Other {
         detail: format!(
-            "{owner} binds a {:?} texture to slot `{slot_name}`, which its shader declares as {slot_type:?}",
+            "{owner} binds a {:?} texture to slot `{slot_name}`, which its shader declares as {slot_kind:?}",
             texture.view_dimension
         ),
     })

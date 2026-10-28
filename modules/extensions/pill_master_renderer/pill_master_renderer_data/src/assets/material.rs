@@ -20,18 +20,21 @@
 //! a material and a pass through one code path, and a material's
 //! `rendering_order` decides where it sorts within the pass that draws it.
 
+// Standard library
 use std::collections::BTreeMap;
 
+// External crates
 use pill_engine::{
-    pill_mirror_impl, pill_mirror_method, pill_mirror_object, Asset, AssetLoadResult, AssetManager,
+    pill_mirror_impl, pill_mirror_method, pill_mirror_object, AssetLoadResult, AssetManager,
     AssetReference, Handle, StandaloneAsset,
 };
-use serde::{Deserialize, Serialize};
-
-use super::{Shader, Texture};
-use crate::config::pbr_pipeline;
 // Part of the frame contract (a resolved pass carries parameters too).
 use pill_renderer_api::frame::MaterialParameter;
+use serde::{Deserialize, Serialize};
+
+// Current crate
+use super::{Shader, Texture};
+use crate::config::pbr_pipeline;
 
 /// A texture handle bound to one of a material's slots.
 ///
@@ -57,7 +60,7 @@ pub struct MaterialTexture {
 /// that built it is reloaded and its retired image eventually unmapped - and
 /// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
-#[pill_mirror_object(asset, standalone)]
+#[pill_mirror_object(asset, standalone, shared = "pill_master_renderer::assets::Material")]
 pub struct Material {
     /// Label used in logs, profiling and error messages.
     pub name: String,
@@ -250,28 +253,6 @@ impl StandaloneAsset for Material {
     }
 }
 
-/// The pinned shared name of [`Material`]; see the comment on its `Asset` impl.
-const MATERIAL_SHARED_NAME: &str = "pill_master_renderer::assets::Material";
-
-// Shared across binaries: the data module, the GPU module and every project
-// compile their own copy of this crate, each with its own `TypeId`. The pinned
-// name makes them one asset column (see `Asset::shared_name`); keep it
-// verbatim when moving the type.
-impl Asset for Material {
-    fn shared_name() -> Option<&'static str> {
-        Some(MATERIAL_SHARED_NAME)
-    }
-
-    fn shared_identity() -> Option<u128> {
-        // A `const`, so the name is hashed at compile time. The default hashes
-        // it on every call, and every `AssetManager` lookup makes that call:
-        // the renderer does it several times per drawn entity, every frame.
-        const IDENTITY: u128 =
-            pill_engine::component::shared_component_identity(MATERIAL_SHARED_NAME);
-        Some(IDENTITY)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,7 +279,7 @@ mod tests {
         assert_eq!(material.rendering_order, u8::MAX);
         // The chain's own default material starts from the same values.
         let chain_default = assets
-            .get_by_name::<Material>(pbr_pipeline::MATERIAL_NAME)
+            .get_by_name::<Material>(pbr_pipeline::DEFAULT_MATERIAL_PATH)
             .unwrap();
         assert_eq!(chain_default.parameters, material.parameters);
         assert_eq!(

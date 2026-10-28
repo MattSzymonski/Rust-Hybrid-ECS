@@ -107,7 +107,6 @@ pub fn asset_settings_rows(
                     settings,
                     value,
                     key.clone(),
-                    0,
                     assets,
                     pending,
                     session,
@@ -168,9 +167,9 @@ pub struct ListEntryDrag {
     pub index: usize,
 }
 
-/// The list families a reference field set names - `passes[0]`, `passes[1]`, ...
-/// - as one editable list each: a draggable row per entry, and the picker that
-/// appends the next one.
+/// The list families a reference field set names - `passes[0]`, `passes[1]`,
+/// ... - as one editable list each: a draggable row per entry, and the picker
+/// that appends the next one.
 ///
 /// A chain's pass list is the first such family. A drag reorders the list, and
 /// a drag or a remove rewrites the whole array in one recorded step, so undo
@@ -647,14 +646,13 @@ pub fn remember_list_row_rect(
 /// A leaf draws from its key and its value alone; the row's assets, session
 /// and overlay regions exist for the rows below it, so the attributes are the
 /// recursion's own shape rather than an unused argument.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 pub fn asset_settings_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     value: &JsonValue,
     key: String,
-    depth: usize,
     assets: &[AssetListing],
     pending: &mut PendingEditorCommands,
     session: &mut InspectorSession,
@@ -680,7 +678,6 @@ pub fn asset_settings_row(
                         root,
                         child,
                         format!("{key}.{child_key}"),
-                        depth + 1,
                         assets,
                         pending,
                         session,
@@ -701,7 +698,6 @@ pub fn asset_settings_row(
                         root,
                         child,
                         format!("{key}[{index}]"),
-                        depth + 1,
                         assets,
                         pending,
                         session,

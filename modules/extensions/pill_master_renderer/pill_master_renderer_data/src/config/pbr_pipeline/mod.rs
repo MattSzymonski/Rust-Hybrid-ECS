@@ -21,8 +21,8 @@
 //! manager at the result.
 //!
 //! ```text
-//! pill.pbr.opaque   geometry → hdr    the lit surface, in the range lighting produces
-//! pill.pbr.skybox   skybox   → hdr    the sky, where the lit pass drew nothing (off until set)
+//! pill.pbr.pass.opaque   geometry → hdr    the lit surface, in the range lighting produces
+//! pill.pbr.pass.skybox   skybox   → hdr    the sky, where the lit pass drew nothing (off until set)
 //! ─── the four post-processing passes, declared in `super::post_processing` ───
 //! ```
 //!
@@ -34,33 +34,33 @@
 //! `../../common_shaders/default_vertex.wgsl`, because every lit pass in the
 //! crate starts from the same instance layout.
 
-// External crates
+// Standard library
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use pill_engine::{AssetGuid, AssetImport, AssetManager, Handle, MetadataPolicy, StandaloneAsset};
+// External crates
+use pill_engine::{AssetGuid, AssetManager, Handle};
 use pill_renderer_api::frame::MaterialParameter;
 
 // Current crate
 use crate::{
-    assets::{
-        Material, MaterialDocument, PassKind, PassTarget, RenderPass, RenderingPipeline, Shader,
-    },
+    assets::{Material, PassKind, PassTarget, RenderPass, RenderingPipeline, Shader},
     config::post_processing::{self, HDR_TARGET},
     config::skybox,
     config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
 
 config_shader_file!(
-    /// The geometry pass's fragment stage, cooked from `pbr_fragment.hlsl`.
+    /// The geometry pass's fragment stage, cooked from `pbr_fragment.hlsl` and
+    /// embedded for the development reload table.
     PBR_FRAGMENT, "pbr_pipeline/shaders/pbr_fragment.wgsl"
 );
 
 /// The shader assets [`install`] creates, and the files each is built from.
 pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
     shader_asset_name: SHADER_PATH,
-    vertex: DEFAULT_VERTEX,
-    fragment: PBR_FRAGMENT,
+    vertex_path: DEFAULT_VERTEX.relative_path,
+    fragment_path: PBR_FRAGMENT.relative_path,
 }];
 
 /// Asset name the installed chain is stored under.
@@ -81,63 +81,15 @@ const SHADER_GUID_SOURCE: &str = "pill.pbr.shader";
 /// The guid the PBR shader is stored under, so a material file can name it.
 pub const SHADER_GUID: AssetGuid = AssetGuid::from_name(SHADER_GUID_SOURCE);
 
-/// Asset name of the material a mesh with none of its own draws with.
-pub const MATERIAL_NAME: &str = "pill.pbr.material";
-
-/// The material file [`MATERIAL_NAME`] is loaded from, relative to this
-/// module's `res`.
+/// The material file the chain's default material is imported from, relative
+/// to this module's `res`.
 ///
 /// The chain's default material is content, not code: the file is the one
 /// definition of it, the editor lists it read-only under the `extensions` root,
-/// and an engine that cannot read it stops with this path in the message.
+/// and it is imported like any other standalone `.material` - named by this
+/// path and keyed by the guid in its own header, so a reference to it survives
+/// the file being renamed.
 pub const DEFAULT_MATERIAL_PATH: &str = "defaults/pill.pbr.material";
-
-/// The standalone asset file a `.material` holds: the header, then the document.
-#[derive(serde::Deserialize)]
-struct MaterialFile {
-    asset: MaterialDocument,
-}
-
-/// The chain's default material, read from the file this module ships.
-///
-/// A development host finds it through the module's `res` root, which
-/// [`register`](crate::register) declares and asserts; a crate that links this
-/// one without declaring a root - this crate's own tests, a frontend that
-/// embeds the data directly - reads the same file beside the crate.
-///
-/// # Errors
-///
-/// Returns an error when the file is not a material document, or when the
-/// document does not load against `assets`.
-///
-/// # Panics
-///
-/// Panics when the file cannot be read: a scene silently drawn without its
-/// neutral material is a packaging fault, and the message names the module and
-/// the path.
-fn load_default_material(assets: &AssetManager) -> Result<Material, Box<dyn std::error::Error>> {
-    let beside_the_crate = || {
-        std::fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("res")
-                .join(DEFAULT_MATERIAL_PATH),
-        )
-    };
-    let bytes = pill_engine::asset_store::read(Path::new(DEFAULT_MATERIAL_PATH))
-        .or_else(|_| beside_the_crate())
-        .unwrap_or_else(|error| {
-            panic!(
-                "module '{}' requires its resource '{DEFAULT_MATERIAL_PATH}', which cannot be read: {error}",
-                crate::MODULE_NAME
-            )
-        });
-    let source = String::from_utf8_lossy(&bytes);
-    let file: MaterialFile = serde_json::from_str(&source).map_err(|error| {
-        format!("`{DEFAULT_MATERIAL_PATH}` is not a material document: {error}")
-    })?;
-    Material::from_document(MATERIAL_NAME, file.asset, assets)
-        .map_err(|error| format!("`{DEFAULT_MATERIAL_PATH}` did not load: {error}").into())
-}
 
 /// The PBR shader's parameters at their neutral values, by slot name.
 ///
@@ -167,29 +119,31 @@ const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
 /// Asset name of the skybox pass, which [`set_skybox`] gives a material.
 pub const SKYBOX_PASS: &str = "pill.pbr.pass.skybox";
 
+/// The sky pass: a fullscreen triangle at the far plane, into the lit target,
+/// with no material.
+///
+/// Behind the lit surface and into the same target, so it reads the depth the
+/// lit pass left. A pass with no material cannot be drawn, so it starts
+/// disabled until [`set_skybox`] gives it one.
+fn default_sky_pass() -> RenderPass {
+    skybox::skybox_pass(
+        SKYBOX_PASS,
+        Handle::INVALID,
+        PassTarget::Offscreen(HDR_TARGET.to_owned()),
+        0,
+    )
+}
+
 /// Import the chain's shader from its source, or hand back the one a store
 /// already holds.
 ///
 /// The source lives in this module's `shader_sources` root, which `register`
-/// declares; its `.hlsl.meta` carries the guid every material file names, so a
-/// meta that drifted from [`SHADER_GUID`] is a packaging fault and stops here
-/// rather than leaving a scene whose materials name a shader that is not there.
+/// declares; its `.hlsl.meta` carries the guid every material file names and
+/// the slots the pass reads.
 fn install_pbr_shader(
     assets: &mut AssetManager,
 ) -> Result<Handle<Shader>, Box<dyn std::error::Error>> {
-    if let Some(handle) = assets.handle_by_name::<Shader>(SHADER_PATH) {
-        return Ok(handle);
-    }
-    let imported = assets.import(AssetImport::<Shader>::new(
-        SHADER_PATH,
-        MetadataPolicy::ReadIfPresent,
-    ))?;
-    assert_eq!(
-        imported.guid,
-        Some(SHADER_GUID),
-        "`{SHADER_PATH}` must carry the guid every material file names"
-    );
-    Ok(imported.handle)
+    crate::config::import_shader(assets, SHADER_PATH, SHADER_GUID)
 }
 
 /// Install the PBR chain, and return the pipeline asset.
@@ -226,13 +180,20 @@ pub fn install(
     // The maps carry the look; these factors are neutral, so what a mesh shows is
     // its own albedo, roughness and metalness. A slot left unbound falls back to
     // the renderer's own default texture, which is what lets this material exist
-    // before anyone has supplied a map. Nothing here needs the handle: a project
-    // that wants it asks the store for `pill.pbr.material` by name.
-    let material = load_default_material(assets)?;
-    assets.add_named(MATERIAL_NAME, material)?;
+    // before anyone has supplied a map. Imported like every other `.material`, it
+    // is named by its path and keyed by the guid in its header; a project that
+    // wants it asks the store for that path.
+    assets
+        .import_standalone::<Material>(Path::new(DEFAULT_MATERIAL_PATH))
+        .map_err(|error| {
+            format!(
+                "module '{}' requires its resource '{DEFAULT_MATERIAL_PATH}', which did not import: {error}",
+                crate::MODULE_NAME
+            )
+        })?;
 
     // The lit geometry, into a target that can hold what the lighting produces.
-    let opaque = RenderPass::new("pill.pbr.opaque")
+    let opaque = RenderPass::new(OPAQUE_PASS)
         .with_shader(pbr)
         .with_kind(PassKind::Geometry)
         .with_target(PassTarget::Offscreen(HDR_TARGET.to_owned()))
@@ -245,13 +206,7 @@ pub fn install(
 
     // The sky, behind the lit surface and into the same target, so it reads the
     // depth the lit pass left. Off until a project gives it a material.
-    let sky = skybox::skybox_pass(
-        "pill.pbr.skybox",
-        Handle::INVALID,
-        PassTarget::Offscreen(HDR_TARGET.to_owned()),
-        0,
-    );
-    let sky = assets.add_named(SKYBOX_PASS, sky)?;
+    let sky = assets.add_named(SKYBOX_PASS, default_sky_pass())?;
 
     // The other half of the frame, which reads the target this one just wrote.
     let post = post_processing::install(assets)?;
@@ -287,17 +242,8 @@ pub fn set_skybox(
     let material = material.unwrap_or(Handle::INVALID);
     let pass = match assets.handle_by_name::<RenderPass>(SKYBOX_PASS) {
         Some(pass) => pass,
-        None => assets.add_named(
-            SKYBOX_PASS,
-            skybox::skybox_pass(
-                "pill.pbr.skybox",
-                Handle::INVALID,
-                PassTarget::Offscreen(HDR_TARGET.to_owned()),
-                0,
-            ),
-        )?,
+        None => assets.add_named(SKYBOX_PASS, default_sky_pass())?,
     };
-
     // A chain that does not hold the pass yet gets it right after the lit pass,
     // whose depth it tests against.
     let in_chain = assets
@@ -329,6 +275,7 @@ pub fn set_skybox(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::MaterialDocument;
     use pill_engine::Engine;
 
     /// The material the chain draws with is the file this crate ships: its
@@ -343,7 +290,10 @@ mod tests {
                 .join(DEFAULT_MATERIAL_PATH),
         )
         .expect("the shipped file is in the crate);");
-        let file: MaterialFile = serde_json::from_str(&source).expect("the shipped file parses");
+        let file: serde_json::Value =
+            serde_json::from_str(&source).expect("the shipped file parses");
+        let file_document: MaterialDocument = serde_json::from_value(file["asset"].clone())
+            .expect("the shipped file carries a document");
         let mut assets = AssetManager::new();
         crate::declare_crate_roots();
         install(&mut assets).expect("a free name");
@@ -352,16 +302,16 @@ mod tests {
             .handle_by_name::<Shader>(SHADER_PATH)
             .expect("the chain's shader");
         let material = assets
-            .get_by_name::<Material>(MATERIAL_NAME)
+            .get_by_name::<Material>(DEFAULT_MATERIAL_PATH)
             .expect("the chain's default material");
 
         assert_eq!(material.shader, shader);
         assert_eq!(material.parameters, neutral_parameters());
         assert!(material.textures.is_empty());
         assert_eq!(material.rendering_order, u8::MAX);
-        assert_eq!(file.asset.parameters, neutral_parameters());
+        assert_eq!(file_document.parameters, neutral_parameters());
         assert_eq!(
-            file.asset.shader,
+            file_document.shader,
             MaterialDocument::default().shader,
             "the file names the shader a new material names"
         );

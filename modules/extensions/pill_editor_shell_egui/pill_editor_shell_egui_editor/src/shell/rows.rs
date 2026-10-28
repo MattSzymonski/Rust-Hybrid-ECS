@@ -59,9 +59,9 @@ pub fn label_cell(ui: &mut egui::Ui, text: &str, tooltip: Option<&str>) -> egui:
 
 /// One row's label in a column `width` points wide.
 ///
-/// The cell is allocated as its own rectangle and the label's text starts at
-/// its left edge: a label centred in its cell would drift with its own length
-/// instead of starting where the column does.
+/// The cell is allocated as its own rectangle and the label laid out from its
+/// left edge: a label placed by the row itself is centred in whatever width the
+/// cell has, so a short name would drift away from the column it belongs to.
 pub fn label_cell_in(
     ui: &mut egui::Ui,
     width: f32,
@@ -69,12 +69,13 @@ pub fn label_cell_in(
     tooltip: Option<&str>,
 ) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::hover());
-    let mut label = ui.put(
-        rect,
-        egui::Label::new(egui::RichText::new(text).color(style::text_muted()))
-            .truncate()
-            .halign(egui::Align::LEFT),
-    );
+    let mut label = ui
+        .new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        )
+        .add(egui::Label::new(egui::RichText::new(text).color(style::text_muted())).truncate());
     if let Some(tooltip) = tooltip {
         label = label.on_hover_text(tooltip);
     }

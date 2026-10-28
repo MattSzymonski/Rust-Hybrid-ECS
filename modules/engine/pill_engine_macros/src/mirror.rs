@@ -9,7 +9,7 @@
 //!   vocabulary `lower_parameter` and `lower_return` accept.
 //! - Emit what a mirrored type needs: the drop trampoline and asset store
 //!   operations of an object, the encodings of an enum or a value type, and
-//!   the shared name of a resource.
+//!   the pinned identity of an asset or a resource.
 //!
 //! # Design
 //!
@@ -1074,31 +1074,74 @@ struct ObjectFlags {
     import: bool,
     /// The type is a `StandaloneAsset`: emit the standalone import.
     standalone: bool,
+    /// The type's pinned shared name, when it declares one: an `Asset` whose
+    /// copies in several binaries are one column.
+    shared: Option<syn::LitStr>,
 }
 
-/// Parse the attribute's comma-separated flags.
+/// Parse the attribute's comma-separated flags and `shared = "..."` option.
 fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
     let mut flags = ObjectFlags::default();
-    let parser = syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated;
-    let idents = syn::parse::Parser::parse2(parser, attribute)?;
-    for ident in idents {
-        match ident.to_string().as_str() {
-            "asset" => flags.asset = true,
-            "import" => flags.import = true,
-            "standalone" => flags.standalone = true,
+    let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+    let items = syn::parse::Parser::parse2(parser, attribute)?;
+    for item in items {
+        if let syn::Meta::Path(path) = &item {
+            let Some(ident) = path.get_ident() else {
+                return Err(syn::Error::new_spanned(
+                    path,
+                    "expected `asset`, `import`, `standalone` or `shared = \"...\"`",
+                ));
+            };
+            match ident.to_string().as_str() {
+                "asset" => flags.asset = true,
+                "import" => flags.import = true,
+                "standalone" => flags.standalone = true,
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        format!(
+                            "unknown `#[pill_mirror_object]` flag `{other}`; expected `asset`, \
+                             `import`, `standalone` or `shared = \"...\"`"
+                        ),
+                    ))
+                }
+            }
+            continue;
+        }
+        let syn::Meta::NameValue(option) = item else {
+            return Err(syn::Error::new_spanned(item, "expected `shared = \"...\"`"));
+        };
+        let option_name = option.path.get_ident().map(|ident| ident.to_string());
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(shared_name),
+            ..
+        }) = &option.value
+        else {
+            return Err(syn::Error::new_spanned(
+                &option.value,
+                "`shared` takes a string: `shared = \"my_crate::MyAsset\"`",
+            ));
+        };
+        match option_name.as_deref() {
+            Some("shared") => flags.shared = Some(shared_name.clone()),
             other => {
                 return Err(syn::Error::new_spanned(
-                    &ident,
+                    &option.path,
                     format!(
-                    "unknown `#[pill_mirror_object]` flag `{other}`; expected `asset`, `import` \
-                         or `standalone`"
-                ),
+                        "unknown `#[pill_mirror_object]` option `{other:?}`; expected `shared`"
+                    ),
                 ))
             }
         }
     }
     if (flags.import || flags.standalone) && !flags.asset {
         flags.asset = true;
+    }
+    if flags.shared.is_some() && !flags.asset {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`shared` describes an `Asset`, so it goes with `asset`",
+        ));
     }
     Ok(flags)
 }
@@ -1112,6 +1155,10 @@ fn object_flags(attribute: TokenStream2) -> syn::Result<ObjectFlags> {
 /// also gets the asset store operations the runtime's `AssetManager`
 /// extension methods reach (`__asset_add`, ...); `import` and `standalone`
 /// add the two import paths for an `ImportedAsset` or `StandaloneAsset`.
+///
+/// `shared = "my_crate::MyAsset"` pins the identity every binary's copy of an
+/// asset type is known by, and emits its `Asset` impl from it: the name, and
+/// the identity hashed from that name at compile time.
 pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Result<TokenStream2> {
     let flags = object_flags(attribute)?;
     let (ident, generics) = match &item {
@@ -1196,10 +1243,37 @@ pub(crate) fn mirror_object(attribute: TokenStream2, item: syn::Item) -> syn::Re
         }));
     }
 
+    // The pinned identity, emitted only by the attribute that declares it: it
+    // is the contract that makes every binary's copy of the type one asset
+    // column, and its correct form (a name, hashed at compile time) is the
+    // same for every asset - so it is stated once, here, instead of per type.
+    let shared_identity = match &flags.shared {
+        Some(name) => quote! {
+            impl ::pill_engine::Asset for #ident {
+                fn shared_name() -> ::core::option::Option<&'static str> {
+                    ::core::option::Option::Some(#name)
+                }
+
+                fn shared_identity() -> ::core::option::Option<u128> {
+                    // A `const` item, not the trait's default: that would hash
+                    // the name on every `AssetManager` lookup, which the
+                    // renderer makes several times per drawn entity, every
+                    // frame. Bound here, it is folded at compile time.
+                    const IDENTITY: u128 =
+                        ::pill_engine::component::shared_component_identity(#name);
+                    ::core::option::Option::Some(IDENTITY)
+                }
+            }
+        },
+        None => quote! {},
+    };
+
     Ok(quote! {
         #item
 
         impl ::pill_engine::mirror::MirrorObject for #ident {}
+
+        #shared_identity
 
         // SAFETY: the slot and every slice element hold the box's address,
         // which is what the managed `RustObject` passes for this type.
@@ -1465,5 +1539,59 @@ fn discriminant_value(expression: &syn::Expr) -> syn::Result<i128> {
             other.span(),
             "a mirrored enum's discriminants must be integer literals",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The expansion with every space removed, so a needle reads the same
+    /// whatever `TokenStream::to_string` puts between tokens.
+    fn expansion(attribute: TokenStream2) -> String {
+        let item: syn::Item = syn::parse_quote! {
+            pub struct Thing;
+        };
+        mirror_object(attribute, item)
+            .expect("the attribute is well formed")
+            .to_string()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// An asset that pins its shared name gets the `Asset` impl, and the
+    /// identity is a `const` item: hashed once at compile time, not on every
+    /// store lookup.
+    #[test]
+    fn a_shared_asset_gets_a_const_folded_identity() {
+        let expanded = expansion(quote! { asset, shared = "my_crate::Thing" });
+
+        assert!(
+            expanded.contains("pill_engine::AssetforThing"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("constIDENTITY:u128="), "{expanded}");
+        assert!(expanded.contains("shared_component_identity"), "{expanded}");
+        assert!(expanded.contains("\"my_crate::Thing\""), "{expanded}");
+    }
+
+    /// An asset that pins nothing keeps the trait's defaults, so nothing about
+    /// its identity is emitted.
+    #[test]
+    fn an_asset_without_a_shared_name_gets_no_identity() {
+        let expanded = expansion(quote! { asset });
+
+        assert!(!expanded.contains("pill_engine::Assetfor"), "{expanded}");
+        assert!(!expanded.contains("constIDENTITY"), "{expanded}");
+    }
+
+    /// `shared` describes an asset, so it cannot stand alone.
+    #[test]
+    fn a_shared_name_without_asset_is_refused() {
+        let item: syn::Item = syn::parse_quote! {
+            pub struct Thing;
+        };
+
+        assert!(mirror_object(quote! { shared = "my_crate::Thing" }, item).is_err());
     }
 }
