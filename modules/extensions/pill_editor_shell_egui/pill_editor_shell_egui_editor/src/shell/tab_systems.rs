@@ -8,15 +8,17 @@
 //!
 //! # Design
 //!
-//! The tab bodies call their siblings by bare name, which a patch crate
-//! resolves through this file's glob and the crate root's re-export (see the
-//! shell module header): the glob below is what the generated patch crate
-//! replays, so it must stay in the file's top-level `use` lines.
+//! A patch crate is this file's top-level `use` lines plus the crate's own
+//! glob, so the two openings below are the whole rule: `shell::prelude::*`
+//! reaches the shared model's vocabulary (icons, systems, the snapshot types)
+//! and `shell::*` reaches the sibling modules this crate declares. A body that
+//! names either by bare name compiles as a patch only while both are here.
 
 // External crates
 use pill_engine::pill_hot_fn;
 
 // Current crate
+use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
 /// The Systems tab: the engine's pause and single-step controls in a header

@@ -20,6 +20,10 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+// Deliberately unused in this compilation: a patch crate replays this
+// file's opening, and the first sibling this body names resolves through it.
+#[allow(unused_imports)]
+use pill_editor_shell_egui_editor::shell::*;
 
 /// Where the stack's first row sits, just below the menu bar.
 const TOAST_TOP: f32 = menubar::MENU_BAR_HEIGHT + 6.0;

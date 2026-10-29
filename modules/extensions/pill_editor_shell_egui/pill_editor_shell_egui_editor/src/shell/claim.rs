@@ -32,6 +32,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+// Deliberately unused in this compilation: a patch crate replays this
+// file's opening, and the first sibling this body names resolves through it.
+#[allow(unused_imports)]
+use pill_editor_shell_egui_editor::shell::*;
 
 /// Whether this shell generation has cleared egui's temporary data yet.
 ///

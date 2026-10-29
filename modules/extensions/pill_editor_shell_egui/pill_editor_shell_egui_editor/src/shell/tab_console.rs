@@ -17,6 +17,10 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+// Deliberately unused in this compilation: a patch crate replays this
+// file's opening, and the first sibling this body names resolves through it.
+#[allow(unused_imports)]
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The levels the filter row offers, lowest first.
 pub const CONSOLE_LEVELS: [(u8, &str); 5] = [

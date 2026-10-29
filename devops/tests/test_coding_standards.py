@@ -205,6 +205,15 @@ PROCESS_REFERENCE_PATTERNS = (
 # the non-Rust tooling have their own cleanup item.
 COMMENT_CONTENT_SCOPE = "modules/"
 
+# The editor shell's hot-patch contract. A patch crate is the edited file's
+# top-level `use` lines plus the crate's own glob, so a module that names
+# anything from the shared model or from a sibling needs both globs. The
+# prelude defines itself and the test module imports what it uses.
+SHELL_SOURCES_MARKER = "/pill_editor_shell_egui_editor/src/shell/"
+SHELL_PRELUDE_USE = "use pill_editor_shell_egui_editor::shell::prelude::*;"
+SHELL_SIBLING_USE = "use pill_editor_shell_egui_editor::shell::*;"
+SHELL_EXEMPT_FILES = ("prelude.rs", "tests.rs")
+
 # The APIs that keep boxed `Any`/`Fn` values inside egui's `Context` (plan
 # decision E4, W-0017). A reloadable crate that stores its own types or
 # callbacks through them leaves dangling type IDs, drop code and vtables
@@ -734,6 +743,42 @@ def check_tests_at_bottom(
                 f"the tests module at line {tests_line}",
             )
             return
+
+
+# Flags a shell module that cannot compile as a patch crate; see
+# `SHELL_PRELUDE_USE` and `SHELL_SIBLING_USE`.
+def check_shell_patch_openings(
+    lines: List[str], display_path: str, collector: ViolationCollector
+) -> None:
+    """Requires both hot-patch globs in every editor shell module.
+
+    The rule the shell module header states: a patch crate replays the edited
+    file's top-level `use` lines, so a body that names the shared model's
+    vocabulary (`shell::prelude::*`) or a sibling module (`shell::*`) compiles
+    only while both globs are in that opening. A module missing one still runs -
+    until an edit names it, at which point the host silently reloads instead of
+    patching.
+    """
+    if SHELL_SOURCES_MARKER not in "/" + display_path.lstrip("/"):
+        return
+    file_name = display_path.rsplit("/", 1)[-1]
+    if file_name in SHELL_EXEMPT_FILES:
+        return
+    top_level_uses = [line.strip() for line in lines if line.startswith("use ")]
+    missing = [
+        glob
+        for glob in (SHELL_PRELUDE_USE, SHELL_SIBLING_USE)
+        if glob not in top_level_uses
+    ]
+    if not missing:
+        return
+    collector.record(
+        display_path,
+        "shell patch opening",
+        "a patch crate replays this file's top-level `use` lines, so the shell "
+        "module must open with both `shell::prelude::*` and `shell::*`; "
+        f"missing {', '.join('`' + glob + '`' for glob in missing)}",
+    )
 
 
 # =============================================================================
@@ -1406,36 +1451,36 @@ def main() -> int:
     # shell version re-read each file per check.
     sources = [(path, display_path_for(path), *read_lines(path)) for path in files]
 
-    section("(1/9) Module header")
+    section("(1/10) Module header")
     for _, display_path, lines, text in sources:
         check_module_header(lines, text, display_path, collector)
 
-    section("(2/9) Safety comments")
+    section("(2/10) Safety comments")
     for _, display_path, lines, _text in sources:
         check_safety_comments(lines, display_path, collector)
 
-    section("(3/9) Public item docs")
+    section("(3/10) Public item docs")
     for _, display_path, lines, _text in sources:
         check_public_item_docs(lines, display_path, collector)
 
-    section("(4/9) Import groups")
+    section("(4/10) Import groups")
     for _, display_path, lines, _text in sources:
         check_import_group_order(lines, display_path, collector)
         check_import_group_contents(lines, display_path, collector)
 
-    section("(5/9) Tests at the bottom")
+    section("(5/10) Tests at the bottom")
     for _, display_path, lines, text in sources:
         check_tests_at_bottom(lines, text, display_path, collector)
 
-    section("(6/9) egui state (reloadable crates)")
+    section("(6/10) egui state (reloadable crates)")
     for _, display_path, lines, _text in sources:
         check_egui_context_storage(lines, display_path, collector)
 
-    section("(7/9) colour literals (editor UI)")
+    section("(7/10) colour literals (editor UI)")
     for _, display_path, lines, _text in sources:
         check_colour_literals(lines, display_path, collector)
 
-    section("(8/9) comment content (modules/)")
+    section("(8/10) comment content (modules/)")
     for _, display_path, lines, _text in sources:
         check_comment_content(lines, display_path, collector)
 
@@ -1443,7 +1488,11 @@ def main() -> int:
     excluded = [Path(entry) for entry in arguments.exclude]
     for target in targets:
         shaders.extend(find_shader_files(target, excluded))
-    section(f"(9/9) shader comment content ({len(shaders)} shader source(s))")
+    section("(10/10) shell patch openings (editor shell)")
+    for _, display_path, lines, _text in sources:
+        check_shell_patch_openings(lines, display_path, collector)
+
+    section(f"(9/10) shader comment content ({len(shaders)} shader source(s))")
     for path in shaders:
         _lines, text = read_lines(path)
         check_shader_comment_content(text, display_path_for(path), collector)
