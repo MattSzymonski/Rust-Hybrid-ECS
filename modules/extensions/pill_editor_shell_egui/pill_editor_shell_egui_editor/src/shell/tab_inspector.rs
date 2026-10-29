@@ -92,13 +92,13 @@ pub fn inspector_tab(
     {
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("asset {}", detail.key())).strong());
-        read_only_row(ui, "kind", &detail.kind);
-        if detail.standalone {
+        read_only_row(ui, "kind", detail.row.kind.text());
+        if detail.row.standalone {
             read_only_row(ui, "standalone", "yes");
         }
         // A module's resource is shown as it is: every row reads, and nothing
         // here can repoint it.
-        if detail.read_only {
+        if detail.row.read_only {
             ui.label(
                 egui::RichText::new("provided by the engine - read-only")
                     .weak()
@@ -118,7 +118,7 @@ pub fn inspector_tab(
                     pending,
                     session,
                     overlay_regions,
-                    read_only: detail.read_only,
+                    read_only: detail.row.read_only,
                 },
             ),
             None => {

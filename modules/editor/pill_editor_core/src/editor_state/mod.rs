@@ -406,18 +406,11 @@ pub struct StandaloneTypeInfo {
 /// and the import settings document the editable rows build on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetDetail {
-    /// The root the asset came from: empty for the project, else the module
-    /// whose read-only resources it is.
-    pub root: String,
-    /// The path within its root, forward slashes.
-    pub path: String,
-    /// Whether the asset is one of a module's resources: shown, never edited -
-    /// every one of its rows is read-only.
-    pub read_only: bool,
-    /// A short kind label: the asset type, `file`, or `folder`.
-    pub kind: String,
-    /// Whether the entry is a standalone asset (its own document).
-    pub standalone: bool,
+    /// The listing row the detail was captured from. Its
+    /// [`AssetListing::key`] is the selection identity the Inspector matches
+    /// on, so the row - not a copy of five of its fields - is what the detail
+    /// carries.
+    pub row: AssetListing,
     /// The import settings document (a standalone asset's body, or the
     /// sidecar's `settings`); `None` for folders and unknown extensions.
     pub settings: Option<serde_json::Value>,
@@ -446,16 +439,10 @@ pub struct AssetReferenceField {
 }
 
 impl AssetDetail {
-    /// The asset as the tree, the grid and the selection name it; see
-    /// [`AssetListing::key`].
+    /// The asset as the tree, the grid and the selection name it: the row's
+    /// own key, so a detail and the row it came from cannot disagree.
     pub fn key(&self) -> String {
-        if self.root.is_empty() {
-            self.path.clone()
-        } else if self.path.is_empty() {
-            format!("{EXTENSIONS_ROOT}/{}", self.root)
-        } else {
-            format!("{EXTENSIONS_ROOT}/{}/{}", self.root, self.path)
-        }
+        self.row.key()
     }
 }
 

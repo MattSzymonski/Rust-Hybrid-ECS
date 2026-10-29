@@ -284,31 +284,34 @@ impl EditorWindow {
         }
         self.asset_detail_path = selected.clone();
         self.asset_detail = selected.map(|key| {
-            let row = self.asset_entries.iter().find(|row| row.key() == key);
-            let kind = row
-                .map(|row| row.kind.text().to_string())
-                .unwrap_or_else(|| "file".to_string());
-            let standalone = row.map(|row| row.standalone).unwrap_or(false);
-            let root = row.map(|row| row.root.clone()).unwrap_or_default();
-            let read_only = row.map(|row| row.read_only).unwrap_or(false);
+            // A selection the listing no longer holds - an asset deleted
+            // between two refreshes - reads as a file-shaped row at its own
+            // path, which is what the Inspector drew before the detail moved.
+            let row = self
+                .asset_entries
+                .iter()
+                .find(|row| row.key() == key)
+                .cloned()
+                .unwrap_or_else(|| AssetListing {
+                    root: String::new(),
+                    path: key.clone(),
+                    read_only: false,
+                    kind: AssetKind::Type("file".to_string()),
+                    standalone: false,
+                    has_meta: false,
+                    guid: None,
+                });
             // The settings document is read by the path inside the root: the
             // store searches the module roots, so a module resource reads
             // like a project asset.
-            let path = row
-                .map(|row| row.path.clone())
-                .unwrap_or_else(|| key.clone());
-            let settings = if row.is_some_and(|row| row.kind.is_folder()) {
+            let settings = if row.kind.is_folder() {
                 None
             } else {
-                self.read_asset_settings(&path)
+                self.read_asset_settings(&row.path)
             };
-            let references = self.asset_reference_fields(&kind, &settings);
+            let references = self.asset_reference_fields(row.kind.text(), &settings);
             AssetDetail {
-                root,
-                path,
-                read_only,
-                kind,
-                standalone,
+                row,
                 settings,
                 references,
             }

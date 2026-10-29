@@ -116,8 +116,7 @@ impl EditorWindow {
             self.scene_cursor.push(None);
             let opened = SceneView::open(event_loop, &self.window, view);
             if let Some(mut scene) = opened {
-                let size = scene.window.size();
-                scene.attach(&mut self.host, &self.cameras[view], size);
+                scene.attach(&mut self.host, &self.cameras[view]);
                 info!(
                     target: telemetry_target::ENGINE,
                     view,
@@ -148,7 +147,7 @@ impl EditorWindow {
         let left = side + margin;
         let width = (width - 2 * side - 2 * margin).max(1) as u32;
         let height = (height - top - bottom - margin).max(1) as u32;
-        scene.window.place(left, top, width, height);
+        scene.window.place(left, top, width, height, false);
     }
 
     /// Give a popped-out scene view its top-level window, placed at the
@@ -174,8 +173,9 @@ impl EditorWindow {
             match SurfaceWindow::open_top_level(event_loop, &title) {
                 Ok(window) => {
                     let host = &mut self.host;
+                    let camera = self.cameras[view].clone();
                     if let Some(Some(scene)) = self.views.get_mut(view) {
-                        scene.rebind_window(host, window, true);
+                        scene.rebind_window(host, window, true, &camera);
                     }
                 }
                 Err(error) => {
@@ -190,7 +190,7 @@ impl EditorWindow {
             }
         }
         if let Some(Some(scene)) = self.views.get_mut(view) {
-            scene.window.place_screen(x, y, width, height);
+            scene.window.place(x, y, width, height, true);
         }
     }
 
@@ -210,8 +210,9 @@ impl EditorWindow {
         match SurfaceWindow::open(event_loop, &self.window, &title, "scene") {
             Ok(window) => {
                 let host = &mut self.host;
+                let camera = self.cameras[view].clone();
                 if let Some(Some(scene)) = self.views.get_mut(view) {
-                    scene.rebind_window(host, window, false);
+                    scene.rebind_window(host, window, false, &camera);
                 }
             }
             Err(error) => warn!(
@@ -230,7 +231,7 @@ impl EditorWindow {
         let Some(scene) = &mut self.views[view] else {
             return;
         };
-        scene.window.place(x, y, width, height);
+        scene.window.place(x, y, width, height, false);
     }
 
     /// Place the game window at the dock's game rectangle, in logical
@@ -240,7 +241,7 @@ impl EditorWindow {
         let Some(game) = &mut self.game_surface else {
             return;
         };
-        game.place(x, y, width, height);
+        game.place(x, y, width, height, false);
     }
 
     /// A dock rectangle in logical points as the client area's physical

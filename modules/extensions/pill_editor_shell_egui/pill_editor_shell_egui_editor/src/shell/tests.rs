@@ -906,11 +906,15 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     selection.select_only(entity);
     selection.asset = Some("textures/rock.png".to_string());
     snapshot.asset_detail = Some(pill_editor_core::editor_state::AssetDetail {
-        root: String::new(),
-        path: "textures/rock.png".to_string(),
-        read_only: false,
-        kind: "pill_master_renderer::assets::Texture".to_string(),
-        standalone: false,
+        row: pill_editor_core::editor_state::AssetListing {
+            root: String::new(),
+            path: "textures/rock.png".to_string(),
+            read_only: false,
+            kind: pill_editor_core::editor_state::AssetKind::Type("file".to_string()),
+            standalone: false,
+            has_meta: false,
+            guid: None,
+        },
         settings: Some(serde_json::json!({
             "texture_type": "Color",
             "mips": 4,
