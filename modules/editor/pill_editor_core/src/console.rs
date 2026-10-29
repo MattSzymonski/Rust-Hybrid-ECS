@@ -26,6 +26,22 @@ use crate::notices::NoticeLevel;
 /// How many lines the history keeps; older ones drop off.
 pub const CONSOLE_LINES_MAX: usize = 2000;
 
+/// The prefixes this engine's own code logs under.
+///
+/// Every crate in this workspace is named `pill_*`, and the engine's own
+/// tracing roots are `engine::…` and `profile::…`. A target's first segment is
+/// matched against these prefixes, so `pill_master_renderer_data::scene` and
+/// `pill_engine::asset::AssetManager` are engine output, while
+/// `master_renderer_test::controls` - the renderer example's own crate - is the
+/// game's.
+///
+/// The one boundary the rule has: a project crate that names itself `pill_*`
+/// is filed as the engine's, exactly as one named `engine_tools` would be
+/// filed by the `engine` prefix. That is a naming collision, not a
+/// classification bug, and it is visible here rather than hidden in a
+/// substring test.
+pub const ENGINE_PREFIXES: [&str; 3] = ["engine", "pill_", "profile"];
+
 /// Which side of the editor a line came from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ConsoleChannel {
@@ -47,14 +63,18 @@ impl ConsoleChannel {
 
     /// The channel a target belongs to.
     ///
-    /// The engine, the host, the editor and the renderers log under a crate
-    /// path whose first segment names them (`engine::ecs`,
-    /// `pill_host::loader`, `pill_editor_core::...`); a project's own logs
-    /// carry the project's, so anything else is the game's.
+    /// The engine, the host, the editor and the renderers own a fixed set of
+    /// crate prefixes ([`ENGINE_PREFIXES`]); a project's crate is anything
+    /// else, whatever its name happens to contain. The distinction is by whole
+    /// prefix, not by substring, so the repository's own renderer example -
+    /// whose crate is `master_renderer_test` - logs into its own channel
+    /// instead of being filed as engine output by the `render` it contains.
     pub fn of_target(target: &str) -> Self {
-        let engine_roots = ["engine", "host", "editor", "pill_core", "render"];
         let head = target.split("::").next().unwrap_or(target);
-        if engine_roots.iter().any(|root| head.contains(root)) {
+        let engine_owned = ENGINE_PREFIXES
+            .iter()
+            .any(|prefix| head.starts_with(prefix));
+        if engine_owned {
             ConsoleChannel::Engine
         } else {
             ConsoleChannel::Game
@@ -272,18 +292,44 @@ mod tests {
 
     #[test]
     fn engine_targets_and_project_targets_land_in_their_channels() {
-        assert_eq!(
-            ConsoleChannel::of_target("engine::ecs"),
-            ConsoleChannel::Engine
-        );
-        assert_eq!(
-            ConsoleChannel::of_target("pill_host::loader"),
-            ConsoleChannel::Engine
-        );
-        assert_eq!(
-            ConsoleChannel::of_target("italian_brainrot::game"),
-            ConsoleChannel::Game
-        );
+        // The engine, host, editor, renderer and profiler crates own their
+        // prefixes...
+        for target in [
+            "engine::ecs",
+            "engine::rendering",
+            "pill_core::platform",
+            "pill_engine::asset::AssetManager",
+            "pill_host::loader",
+            "pill_editor_core::menu",
+            "pill_editor::runner",
+            "pill_master_renderer_data::scene",
+            "pill_renderer_api::limits",
+            "profile::coarse",
+        ] {
+            assert_eq!(
+                ConsoleChannel::of_target(target),
+                ConsoleChannel::Engine,
+                "{target} is one of the engine's own crates"
+            );
+        }
+        // ...and a project's crate is the game's whatever its name contains:
+        // `master_renderer_test` is the renderer example, whose lines used to
+        // be filed as engine output because the name holds `render`, and
+        // `acme_editor` is a project-side extension.
+        for target in [
+            "italian_brainrot::game",
+            "project_rs::systems",
+            "master_renderer_test::controls",
+            "render_demo::controls",
+            "acme_editor::panel",
+            "head_circus::tick",
+        ] {
+            assert_eq!(
+                ConsoleChannel::of_target(target),
+                ConsoleChannel::Game,
+                "{target} is a project's crate"
+            );
+        }
     }
 
     #[test]
