@@ -226,6 +226,14 @@ const GIZMO_SCREEN_FRACTION: f32 = 0.18;
 /// fraction of its length.
 const GIZMO_PRESS_FRACTION: f32 = 0.92;
 
+/// Frames between the run's own frame-rate heartbeats, for the person reading
+/// the log.
+const FRAME_HEARTBEAT_FRAMES: u64 = 210;
+
+/// The wall-clock backstop for the same heartbeat, so a slow posture still
+/// reports inside a measurement window.
+const FRAME_HEARTBEAT_SECONDS: f32 = 2.0;
+
 /// Frames between gizmo anchor logs while the handle layout stands still.
 const GIZMO_HEARTBEAT_FRAMES: u64 = 210;
 
@@ -4432,10 +4440,29 @@ impl EditorWindow {
     /// Returns whether the run should end. The event loop is what a scene
     /// view the dock opened this frame needs: a child window is created
     /// through it.
+    ///
+    /// The phases are named because their order is load-bearing: the resources
+    /// a pass reads are published before [`Self::run_world`], the answers that
+    /// pass produced are consumed after it, and presentation is last. Anything
+    /// a later phase needs from an earlier one is a field or a return value,
+    /// never a call that happens to sit above it.
     fn frame(&mut self, event_loop: &ActiveEventLoop) -> Result<bool, EditorError> {
         self.frame_index += 1;
-        // Step 1: the frame rate heartbeat, for the person reading the log.
         let frame_started = Instant::now();
+        self.begin_frame(frame_started);
+        self.publish_frame_inputs();
+        self.service_editor_requests();
+        self.publish_frame_resources();
+        self.run_world()?;
+        self.consume_frame_answers();
+        self.present_frame(event_loop);
+        self.end_frame(frame_started);
+        Ok(self.quit)
+    }
+
+    /// Step 1: the frame rate heartbeat, for the person reading the log.
+    fn begin_frame(&mut self, frame_started: Instant) {
+        // Step 1: the frame rate heartbeat, for the person reading the log.
         let now = frame_started;
         if let Some(last) = self.last_frame_time {
             let delta_time = now.duration_since(last).as_secs_f32();
@@ -4449,10 +4476,10 @@ impl EditorWindow {
             }
         }
         self.last_frame_time = Some(now);
-        if self.frame_index.is_multiple_of(210)
+        if self.frame_index.is_multiple_of(FRAME_HEARTBEAT_FRAMES)
             || self
                 .last_heartbeat
-                .is_none_or(|at| now.duration_since(at).as_secs_f32() >= 2.0)
+                .is_none_or(|at| now.duration_since(at).as_secs_f32() >= FRAME_HEARTBEAT_SECONDS)
         {
             self.last_heartbeat = Some(now);
             let overlay_frames = self
@@ -4471,6 +4498,14 @@ impl EditorWindow {
                 "[editor] frame heartbeat"
             );
         }
+    }
+
+    /// Step 2: this frame's inputs, and the state the shell's pass reads.
+    ///
+    /// The window events become engine input, the cameras and badges the frame
+    /// draws are published, and the shell's own input record is filled before
+    /// the pass that reads it.
+    fn publish_frame_inputs(&mut self) {
         // Step 2: the window events of the last request become engine input
         // events; the shell's egui pass reads the same input, so the UI and
         // the game see one event stream.
@@ -4545,6 +4580,14 @@ impl EditorWindow {
         // window reports them and cleared when the frame that read them is
         // presented, so a record never replays an event.
         self.publish_popout_geometry();
+    }
+
+    /// Step 3b-3d: what the editor asked for since the last frame.
+    ///
+    /// The queued [`EditorCommand`]s drain here - the frame boundary their
+    /// contract names - then the watchers, the panels and the clipboard, all
+    /// before the snapshot so a tab never reads a frame-stale state.
+    fn service_editor_requests(&mut self) {
         // Step 3b: apply the engine mutations the shell's assets actions and
         // the scripted channel queued - the frame boundary the
         // `EditorCommand` contract names. A failed command never aborts the
@@ -4573,6 +4616,10 @@ impl EditorWindow {
         // half is this executable's, applied here like every other queued
         // request.
         self.apply_clipboard();
+    }
+
+    /// Steps 4-5: the resources the frame reads, published before it runs.
+    fn publish_frame_resources(&mut self) {
         // Step 4: the frame's snapshot for the shell's data tabs, when the
         // shell loaded and registered its resources.
         self.publish_snapshot();
@@ -4581,11 +4628,19 @@ impl EditorWindow {
         // write per change) and the gizmo handles for it.
         self.publish_selection_outline();
         self.publish_gizmo_geometry();
+    }
+
+    /// Step 6: run the world frame, the shell's egui pass inside it.
+    fn run_world(&mut self) -> Result<(), EditorError> {
         // Step 6: run the world frame; the shell's egui pass runs inside it
         // (a registered post-update system) and leaves the frame resource
-        // for Step 8.
-        let report = self.host.run_one_frame().map_err(EditorError::Renderer)?;
-        let _ = report;
+        // for presentation.
+        self.host.run_one_frame().map_err(EditorError::Renderer)?;
+        Ok(())
+    }
+
+    /// Step 7: the answers this frame's pass produced.
+    fn consume_frame_answers(&mut self) {
         // Step 7: answers to scene picks that arrived during the frame
         // move the shared selection; the outline follows on the next
         // publish.
@@ -4596,8 +4651,16 @@ impl EditorWindow {
         // Step 7b: the menu bar's requests - undo/redo, a window switch and a
         // quit - taken through the same paths the scripted channel uses.
         self.drain_menu_requests();
+    }
+
+    /// Step 8: draw the shell frame through the overlay, which is last.
+    fn present_frame(&mut self, event_loop: &ActiveEventLoop) {
         // Step 8: draw the shell frame through the overlay.
         self.present_ui(event_loop);
+    }
+
+    /// Steps 9-10: the scripted channel, the deadline and the next wake.
+    fn end_frame(&mut self, frame_started: Instant) {
         // Step 9: the scripted channel, then the auto-quit deadline.
         self.poll_test_channel();
         if let Some(seconds) = self.test_seconds {
@@ -4617,7 +4680,6 @@ impl EditorWindow {
             self.idle_frame_millis_max = self.idle_frame_millis_max.max(frame_millis);
         }
         self.decide_next_wake(frame_millis);
-        Ok(self.quit)
     }
 
     /// Decide when the loop draws next, from what asked for this frame.

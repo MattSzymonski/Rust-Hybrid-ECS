@@ -383,10 +383,9 @@ pub fn run_frame(
     // borrow and the dialog's state borrow coexist.
     let context = state.context.clone();
     // What the module panels read this pass: only built when a panel is
-    // registered, so a build with none costs nothing.
-    let panel_feed = panel_feed(snapshot, panels);
-    // The panels see this frame's rate, the same number the scene chips show.
-    let mut panel_feed = panel_feed;
+    // registered, so a build with none costs nothing. The panels see this
+    // frame's rate, the same number the scene chips show.
+    let mut panel_feed = panel_feed(snapshot, panels);
     panel_feed.frames_per_second = shell_input.frames_per_second;
     // A window the scripted channel asked for: the panel itself decides what
     // that id means. Kept until the pinged panel is drawn - a request must not
