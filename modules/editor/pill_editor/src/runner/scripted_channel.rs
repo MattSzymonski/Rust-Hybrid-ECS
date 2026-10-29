@@ -15,9 +15,47 @@
 //! the browser editor shares; this module is the native executable's dispatch
 //! and its dumps. Every verb here exists to observe something a real press
 //! could not reach.
+//!
+//! Refusals come in two kinds. A line whose own target is wrong - a handle no
+//! entity answers to, a field that is not editable, a value the field's kind
+//! cannot read, a drag asked to start while another is in flight - is refused
+//! through the one rejection token, so a suite's typo fails the way a
+//! malformed verb does instead of waiting out a timeout. A line that is right
+//! but has arrived before the shell module attached keeps its own warning:
+//! the same line works a moment later, so it was never a refused line.
 
 // Current crate
 use super::*;
+
+/// Refuses one scripted line, naming it and why it cannot run.
+///
+/// Every refusal - an unknown verb, an unknown target, a missing or malformed
+/// argument, a handle that resolves to nothing - prints this one token, so a
+/// suite can tell a rejected line from a slow answer without pinning twenty
+/// messages, and `EditorSession` raises on it the moment it lands instead of
+/// timing out.
+fn reject_scripted(command: &str, reason: &str) {
+    warn!(
+        target: telemetry_target::ENGINE,
+        command,
+        reason,
+        "[editor] scripted command rejected"
+    );
+}
+
+/// Refuses a fallible scripted step's failure on the one rejection token.
+///
+/// The handlers that answer `Result<(), String>` fail for reasons about the
+/// line itself - a handle that resolves to nothing, a field that is not
+/// editable, a value the field's kind cannot read. Both this and
+/// [`reject_scripted`] take no window, because a refusal is about the line: an
+/// arm can hand the handler's own result straight here without borrowing the
+/// window a second time.
+fn refuse_on(line: &str, outcome: Result<(), String>) {
+    if let Err(reason) = outcome {
+        reject_scripted(line, &reason);
+    }
+}
 
 impl EditorWindow {
     /// Advance a scripted drag one frame: the press first, then the move,
@@ -28,7 +66,7 @@ impl EditorWindow {
         };
         let (from, to, stage) = (drag.from, drag.to, drag.stage);
         match stage {
-            0 => {
+            ScriptedDragStage::PressPending => {
                 self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(from.0, from.1),
                 });
@@ -37,18 +75,18 @@ impl EditorWindow {
                     state: ButtonState::Pressed,
                 });
                 if let Some(drag) = self.scripted_drag.as_mut() {
-                    drag.stage = 1;
+                    drag.stage = ScriptedDragStage::MovePending;
                 }
             }
-            1 => {
+            ScriptedDragStage::MovePending => {
                 self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(to.0, to.1),
                 });
                 if let Some(drag) = self.scripted_drag.as_mut() {
-                    drag.stage = 2;
+                    drag.stage = ScriptedDragStage::ReleasePending;
                 }
             }
-            _ => {
+            ScriptedDragStage::ReleasePending => {
                 self.queue_input(InputEvent::MouseButton {
                     button: MouseButton::Left,
                     state: ButtonState::Released,
@@ -856,7 +894,7 @@ impl EditorWindow {
             self.demand.scripted = true;
             match ScriptedCommand::parse(&line) {
                 Ok(command) => self.run_scripted(&line, command),
-                Err(error) => self.reject_scripted(&line, &error.reason),
+                Err(error) => reject_scripted(&line, &error.reason),
             }
             self.apply_pending_commands();
         }
@@ -878,21 +916,6 @@ impl EditorWindow {
             .engine_mut()
             .push_input_event(event.clone());
         self.shell_events.push(event);
-    }
-
-    /// Refuses one scripted line, naming it and why it cannot run.
-    ///
-    /// Every refusal - an unknown verb, an unknown target, a missing or
-    /// malformed argument - prints this one token, so a suite can tell a
-    /// rejected line from a slow answer without pinning twenty messages, and
-    /// `EditorSession` raises on it the moment it lands instead of timing out.
-    pub(super) fn reject_scripted(&self, command: &str, reason: &str) {
-        warn!(
-            target: telemetry_target::ENGINE,
-            command,
-            reason,
-            "[editor] scripted command rejected"
-        );
     }
 
     /// Run one parsed scripted command.
@@ -919,7 +942,7 @@ impl EditorWindow {
                 component,
                 field,
                 value,
-            } => self.scripted_panel_field(&component, &field, &value),
+            } => refuse_on(line, self.scripted_panel_field(&component, &field, &value)),
             ScriptedCommand::Reveal(path) => {
                 let world = self.host.host_mut().engine_mut().world_mut();
                 if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -954,24 +977,27 @@ impl EditorWindow {
                         );
                         self.pick_reference(&asset, &key, &guid);
                     }
-                    None => self
-                        .reject_scripted(line, "pick reference needs a candidate carrying a guid"),
+                    None => {
+                        reject_scripted(line, "pick reference needs a candidate carrying a guid")
+                    }
                 }
             }
             ScriptedCommand::Click { x, y } => self.inject_click(x, y),
             ScriptedCommand::RightClick { x, y } => self.inject_rclick(x, y),
-            ScriptedCommand::Drag { from, to } => self.start_scripted_drag(from, to),
+            ScriptedCommand::Drag { from, to } => {
+                refuse_on(line, self.start_scripted_drag(from, to))
+            }
             ScriptedCommand::GizmoDrag { target, delta } => {
                 match self.scripted_gizmo_handle(&target) {
                     Some(handle) => self.start_synthetic_gizmo_drag(handle, Some(delta)),
-                    None => self.reject_scripted(line, "gizmo drag needs a known axis or plane"),
+                    None => reject_scripted(line, "gizmo drag needs a known axis or plane"),
                 }
             }
             ScriptedCommand::GizmoPress { target } => match self.scripted_gizmo_handle(&target) {
                 Some(handle) => self.start_synthetic_gizmo_drag(handle, None),
-                None => self.reject_scripted(line, "gizmo press needs a known axis or plane"),
+                None => reject_scripted(line, "gizmo press needs a known axis or plane"),
             },
-            ScriptedCommand::GizmoRelease => self.scripted_gizmo_release(),
+            ScriptedCommand::GizmoRelease => refuse_on(line, self.scripted_gizmo_release()),
             ScriptedCommand::GizmoTool(mode) => self.set_gizmo_tool(mode),
             ScriptedCommand::Key(chord) => self.inject_key(&chord),
             ScriptedCommand::Dump(dump) => match dump {
@@ -1006,25 +1032,31 @@ impl EditorWindow {
                 self.scripted_camera(navigation, delta.0, delta.1)
             }
             ScriptedCommand::CameraZoom(lines) => self.zoom_camera(self.active_view, lines),
-            ScriptedCommand::Hover { view, x, y } => self.scripted_hover(view, x, y),
+            ScriptedCommand::Hover { view, x, y } => {
+                refuse_on(line, self.scripted_hover(view, x, y))
+            }
             ScriptedCommand::HoverUi { x, y } => self.scripted_hover_ui(x, y),
             ScriptedCommand::Drop(path) => self.drop_files(vec![std::path::PathBuf::from(path)]),
             ScriptedCommand::HoverFile(path) => self.preview_drop(std::path::Path::new(&path)),
             ScriptedCommand::DragOut(path) => self.start_drag_out(&path),
             ScriptedCommand::SelectAsset(path) => self.scripted_select_asset(&path),
-            ScriptedCommand::SelectEntity(handle) => self.scripted_select_entity(&handle),
-            ScriptedCommand::SelectAdd(handle) => {
-                self.scripted_select_extend(&handle, SelectionClick::Add)
+            ScriptedCommand::SelectEntity(handle) => {
+                refuse_on(line, self.scripted_select_entity(&handle))
             }
-            ScriptedCommand::SelectRange(handle) => {
-                self.scripted_select_extend(&handle, SelectionClick::Range)
-            }
+            ScriptedCommand::SelectAdd(handle) => refuse_on(
+                line,
+                self.scripted_select_extend(&handle, SelectionClick::Add),
+            ),
+            ScriptedCommand::SelectRange(handle) => refuse_on(
+                line,
+                self.scripted_select_extend(&handle, SelectionClick::Range),
+            ),
             ScriptedCommand::SelectResource(name) => self.scripted_select_resource(&name),
             ScriptedCommand::EditResource {
                 resource,
                 field,
                 value,
-            } => self.scripted_edit_resource(&resource, &field, &value),
+            } => refuse_on(line, self.scripted_edit_resource(&resource, &field, &value)),
             ScriptedCommand::Toolbar(action) => self.scripted_toolbar(action),
             ScriptedCommand::SceneNew => self.scripted_scene(EditorCommand::SceneNew),
             ScriptedCommand::SceneOpen(path) => {
@@ -1041,27 +1073,36 @@ impl EditorWindow {
                 entity,
                 component,
                 field,
-            } => self.scripted_pick_entity(&entity, &component, &field),
+            } => refuse_on(line, self.scripted_pick_entity(&entity, &component, &field)),
             ScriptedCommand::EditSet {
                 entity,
                 component,
                 field,
                 value,
-            } => self.scripted_edit_set(&entity, &component, &field, &value),
+            } => refuse_on(
+                line,
+                self.scripted_edit_set(&entity, &component, &field, &value),
+            ),
             ScriptedCommand::EditArray {
                 entity,
                 component,
                 field,
                 index,
                 value,
-            } => self.scripted_edit_array(&entity, &component, &field, index, &value),
+            } => refuse_on(
+                line,
+                self.scripted_edit_array(&entity, &component, &field, index, &value),
+            ),
             ScriptedCommand::EditSelection {
                 component,
                 field,
                 value,
-            } => self.scripted_edit_selection(&component, &field, &value),
+            } => refuse_on(
+                line,
+                self.scripted_edit_selection(&component, &field, &value),
+            ),
             ScriptedCommand::EditAssetSettings { path, key, value } => {
-                self.scripted_asset_settings(&path, &key, &value)
+                refuse_on(line, self.scripted_asset_settings(&path, &key, &value))
             }
             ScriptedCommand::EditSystem { index, enabled } => {
                 self.scripted_edit_system(index, enabled)
@@ -1073,15 +1114,17 @@ impl EditorWindow {
                 entity,
                 component,
                 add,
-            } => self.scripted_component_edit(&entity, &component, add),
+            } => refuse_on(line, self.scripted_component_edit(&entity, &component, add)),
             ScriptedCommand::Undo => self.scripted_undo(),
             ScriptedCommand::Redo => self.scripted_redo(),
             ScriptedCommand::Copy => self.scripted_clipboard(ClipboardAction::Copy),
             ScriptedCommand::Cut => self.scripted_clipboard(ClipboardAction::Cut),
             ScriptedCommand::Paste => self.scripted_clipboard(ClipboardAction::Paste),
             ScriptedCommand::PauseToggle => self.scripted_pause_toggle(),
-            ScriptedCommand::NewSceneView => self.scripted_new_scene_view(),
-            ScriptedCommand::Popout { tab, redock } => self.scripted_popout(tab, redock),
+            ScriptedCommand::NewSceneView => refuse_on(line, self.scripted_new_scene_view()),
+            ScriptedCommand::Popout { tab, redock } => {
+                refuse_on(line, self.scripted_popout(tab, redock))
+            }
             ScriptedCommand::Step => self.scripted_step(),
             ScriptedCommand::EntityCreate => self.scripted_entity_create(),
             ScriptedCommand::EntityDelete => self.scripted_entity_delete(),
@@ -1142,52 +1185,27 @@ impl EditorWindow {
     /// One scripted asset-settings edit (`edit asset-settings <path> <key>
     /// <value>`): the same recorded `SetAssetSettings` batch the Inspector's
     /// settings rows queue, parsed against the leaf's current JSON kind.
-    pub(super) fn scripted_asset_settings(&mut self, path: &str, key: &str, value_text: &str) {
-        let Ok(key_path) = inspector::parse_settings_key_path(key) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                key,
-                "[editor] asset settings edit refused"
-            );
-            return;
-        };
+    pub(super) fn scripted_asset_settings(
+        &mut self,
+        path: &str,
+        key: &str,
+        value_text: &str,
+    ) -> Result<(), String> {
+        let key_path = inspector::parse_settings_key_path(key)?;
         let Some(document) = self.read_asset_settings(path) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                path,
-                "[editor] asset settings edit refused"
-            );
-            return;
+            return Err(format!("no asset at '{path}' has a settings document"));
         };
         // A leaf the document does not hold yet reads as text: that is the
         // unbound-slot case, and the picker's value is a guid string.
         let kind = inspector::settings_field(&document, &key_path)
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String(String::new()));
-        let value = match inspector::parse_settings_value(value_text, &kind) {
-            Ok(value) => value,
-            Err(message) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    key,
-                    message = message.as_str(),
-                    "[editor] inspector value not understood"
-                );
-                return;
-            }
-        };
+        let value = inspector::parse_settings_value(value_text, &kind)?;
         let mut patched = document;
         // The same inserting rule the Inspector's settings rows use.
-        if let Err(message) = inspector::patch_settings_inserting(&mut patched, &key_path, value) {
-            warn!(
-                target: telemetry_target::ENGINE,
-                key,
-                message = message.as_str(),
-                "[editor] asset settings edit refused"
-            );
-            return;
-        }
+        inspector::patch_settings_inserting(&mut patched, &key_path, value)?;
         self.queue_settings_value(path, key, patched);
+        Ok(())
     }
 
     /// Open a folder in the Assets tab's browser (`root` opens the asset
@@ -1277,23 +1295,13 @@ impl EditorWindow {
         entity_text: &str,
         component_text: &str,
         add: bool,
-    ) {
+    ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = resolve_display_entity(world, entity_text) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                entity = entity_text,
-                "[editor] inspector set target not resolvable"
-            );
-            return;
+            return Err(format!("no entity named '{entity_text}'"));
         };
         let Some(component) = resolve_component_name(world, component_text) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                component = component_text,
-                "[editor] inspector set target not resolvable"
-            );
-            return;
+            return Err(format!("no component named '{component_text}'"));
         };
         let (edit, label) = if add {
             inspector::component_add(entity, &component)
@@ -1309,6 +1317,7 @@ impl EditorWindow {
             add,
             "[editor] component edit queued"
         );
+        Ok(())
     }
 
     /// Run `console filter <level>`: the lowest level the Console tab shows,
@@ -1412,30 +1421,16 @@ impl EditorWindow {
         field: &str,
         index: usize,
         value_text: &str,
-    ) {
-        let Some((entity, component, current)) =
-            self.resolve_edit_target(entity_text, component_text, field)
-        else {
-            return;
-        };
-        let recorded = match inspector::element_write(
-            entity, &component, field, &current, index, value_text,
-        ) {
-            Ok(recorded) => recorded,
-            Err(message) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    field,
-                    message = message.as_str(),
-                    "[editor] edit array refused"
-                );
-                return;
-            }
-        };
+    ) -> Result<(), String> {
+        let (entity, component, current) =
+            self.resolve_edit_target(entity_text, component_text, field)?;
+        let recorded =
+            inspector::element_write(entity, &component, field, &current, index, value_text)?;
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
+        Ok(())
     }
 
     /// One scripted preferences row (`edit preference <key> <value...>`):
@@ -1458,34 +1453,22 @@ impl EditorWindow {
     }
 
     /// `edit resource <field> <value>`: one recorded `SetResourceField`.
-    pub(super) fn scripted_edit_resource(&mut self, resource: &str, field: &str, value_text: &str) {
+    pub(super) fn scripted_edit_resource(
+        &mut self,
+        resource: &str,
+        field: &str,
+        value_text: &str,
+    ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
         let current = world.get_resource::<GizmoState>().and_then(|state| {
             pill_editor_core::gizmo::resource_field_value(&state.settings, resource, field).ok()
         });
         let Some(current) = current else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                resource,
-                field,
-                "[editor] resource edit: not an editable field"
-            );
-            return;
+            return Err(format!("'{resource}' has no editable field '{field}'"));
         };
-        let value = match inspector::parse_field_value(value_text, &current) {
-            Ok(value) => value,
-            Err(message) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    field,
-                    message = message.as_str(),
-                    "[editor] resource edit: value not understood"
-                );
-                return;
-            }
-        };
+        let value = inspector::parse_field_value(value_text, &current)?;
         let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() else {
-            return;
+            return Ok(());
         };
         pending.push_recorded(
             vec![EditorCommand::SetResourceField {
@@ -1503,6 +1486,7 @@ impl EditorWindow {
             value = value_text,
             "[editor] resource edit queued"
         );
+        Ok(())
     }
 
     /// One scripted whole-field edit over the whole selection (`edit selection
@@ -1518,18 +1502,14 @@ impl EditorWindow {
         component_text: &str,
         field: &str,
         value_text: &str,
-    ) {
+    ) -> Result<(), String> {
         let (primary, details) = {
             let world = self.host.host_mut().engine_mut().world_mut();
             let Some(primary) = world
                 .get_resource::<EditorSelection>()
                 .and_then(|selection| selection.primary())
             else {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    "[editor] selection edit needs a selected entity"
-                );
-                return;
+                return Err("edit selection needs a selected entity".to_string());
             };
             let details = world
                 .get_resource::<EditorSnapshot>()
@@ -1537,26 +1517,11 @@ impl EditorWindow {
                 .unwrap_or_default();
             (primary, details)
         };
-        let Some((entity, component, current)) =
-            self.resolve_edit_target(&primary.to_string(), component_text, field)
-        else {
-            return;
-        };
+        let (entity, component, current) =
+            self.resolve_edit_target(&primary.to_string(), component_text, field)?;
         let targets = inspector::selection_targets(&details, entity, &component);
-        let recorded = match inspector::selection_write(
-            &targets, entity, &component, field, &current, value_text,
-        ) {
-            Ok(recorded) => recorded,
-            Err(message) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    field,
-                    message = message.as_str(),
-                    "[editor] inspector value not understood"
-                );
-                return;
-            }
-        };
+        let recorded =
+            inspector::selection_write(&targets, entity, &component, field, &current, value_text)?;
         let written = recorded.commands.len();
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
@@ -1569,6 +1534,7 @@ impl EditorWindow {
             entities = written,
             "[editor] selection field edit queued"
         );
+        Ok(())
     }
 
     /// One scripted whole-field edit (`edit set <entity> <component>
@@ -1580,29 +1546,15 @@ impl EditorWindow {
         component_text: &str,
         field: &str,
         value_text: &str,
-    ) {
-        let Some((entity, component, current)) =
-            self.resolve_edit_target(entity_text, component_text, field)
-        else {
-            return;
-        };
-        let recorded = match inspector::field_write(entity, &component, field, &current, value_text)
-        {
-            Ok(recorded) => recorded,
-            Err(message) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    field,
-                    message = message.as_str(),
-                    "[editor] inspector value not understood"
-                );
-                return;
-            }
-        };
+    ) -> Result<(), String> {
+        let (entity, component, current) =
+            self.resolve_edit_target(entity_text, component_text, field)?;
+        let recorded = inspector::field_write(entity, &component, field, &current, value_text)?;
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
+        Ok(())
     }
 
     /// Run `edit system <index> on|off` from the scripted channel: the same
@@ -1690,16 +1642,13 @@ impl EditorWindow {
     }
 
     /// Finish the drag a `gizmo press` started, like a mouse release.
-    pub(super) fn scripted_gizmo_release(&mut self) {
+    pub(super) fn scripted_gizmo_release(&mut self) -> Result<(), String> {
         if self.gizmo_drag.is_none() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] gizmo release needs a drag in flight"
-            );
-            return;
+            return Err("gizmo release needs a drag in flight".to_string());
         }
         self.synthetic_gizmo_press = None;
         self.end_gizmo_drag();
+        Ok(())
     }
 
     /// `editor.tool_*` from the scripted channel: queue the same
@@ -1719,14 +1668,9 @@ impl EditorWindow {
 
     /// Move one view's pointer and update the hovered handle - the scripted
     /// channel's stand-in for a real pointer move.
-    pub(super) fn scripted_hover(&mut self, view: usize, x: f32, y: f32) {
+    pub(super) fn scripted_hover(&mut self, view: usize, x: f32, y: f32) -> Result<(), String> {
         if view >= self.views.len() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                view,
-                "[editor] hover needs an existing scene view"
-            );
-            return;
+            return Err(format!("there is no scene view {view}"));
         }
         self.scene_cursor[view] = Some((x, y));
         self.update_hover(view, (x, y));
@@ -1737,6 +1681,7 @@ impl EditorWindow {
             y,
             "[editor] hover injected"
         );
+        Ok(())
     }
 
     /// Move the shell's own pointer, as a real move arrives.
@@ -1761,7 +1706,7 @@ impl EditorWindow {
     /// Dock one more scene view, the Window menu's own request: the tab goes
     /// in exactly where the menu would put it, and the executable's activation
     /// path brings it to the front.
-    pub(super) fn scripted_new_scene_view(&mut self) {
+    pub(super) fn scripted_new_scene_view(&mut self) -> Result<(), String> {
         let next = {
             let world = self.host.host_mut().engine_mut().world_mut();
             world.get_resource::<EguiShellState>().map(|state| {
@@ -1771,20 +1716,20 @@ impl EditorWindow {
                 )
             })
         };
+        // The shell not being attached yet is a moment, not a refused line:
+        // the same command works once it is.
         let Some((tab, fits)) = next else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] scene view needs the shell module's state"
             );
-            return;
+            return Ok(());
         };
         if !fits {
-            warn!(
-                target: telemetry_target::ENGINE,
-                limit = pill_editor_core::boundary::SCENE_VIEWS_MAX,
-                "[editor] scene view refused: the view limit is reached"
-            );
-            return;
+            return Err(format!(
+                "the editor shows at most {} scene views",
+                pill_editor_core::boundary::SCENE_VIEWS_MAX
+            ));
         }
         self.activate_tab(tab);
         info!(
@@ -1793,6 +1738,7 @@ impl EditorWindow {
             view = tab.scene_view().unwrap_or_default(),
             "[editor] scene view added"
         );
+        Ok(())
     }
 
     /// Run `palette <query>` / `palette run` / `palette close` from the
@@ -1838,19 +1784,18 @@ impl EditorWindow {
     /// by [`Self::apply_panel_commands`] at the next frame boundary. What a test
     /// drives is therefore the panel contract itself - the queue, the recorded
     /// field edit and its undo step - not a second write path.
-    pub(super) fn scripted_panel_field(&mut self, component: &str, field: &str, value: &str) {
+    pub(super) fn scripted_panel_field(
+        &mut self,
+        component: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = world
             .get_resource::<EditorSelection>()
             .and_then(|selection| selection.primary())
         else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                component,
-                field,
-                "[editor] panel field needs a selected entity"
-            );
-            return;
+            return Err("panel field needs a selected entity".to_string());
         };
         let mut queued = false;
         if let Some(commands) = world.get_resource_mut::<PanelCommands>() {
@@ -1872,6 +1817,7 @@ impl EditorWindow {
                 "[editor] panel field queued"
             );
         }
+        Ok(())
     }
 
     /// `panel restore <source>`: bind that module's panels again.
@@ -1981,19 +1927,11 @@ impl EditorWindow {
         entity_text: &str,
         component_text: &str,
         field: &str,
-    ) {
-        let Some((entity, component, current)) =
-            self.resolve_edit_target(entity_text, component_text, field)
-        else {
-            return;
-        };
+    ) -> Result<(), String> {
+        let (entity, component, current) =
+            self.resolve_edit_target(entity_text, component_text, field)?;
         if !matches!(current, FieldValue::Entity { .. }) {
-            warn!(
-                target: telemetry_target::ENGINE,
-                field,
-                "[editor] inspector value not understood"
-            );
-            return;
+            return Err(format!("'{field}' does not hold an entity reference"));
         }
         let command = EditorCommand::ArmEntityPick {
             entity,
@@ -2004,25 +1942,23 @@ impl EditorWindow {
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
             pending.push(vec![command]);
         }
+        Ok(())
     }
 
     /// `popout <tab>` / `popout <tab> redock`: the same dock
     /// move the tab menu makes, driven from the scripted channel.
-    pub(super) fn scripted_popout(&mut self, tab: EditorTab, redock: bool) {
+    pub(super) fn scripted_popout(&mut self, tab: EditorTab, redock: bool) -> Result<(), String> {
         if tab == EditorTab::Game {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] popout refused: the game view is the primary surface's window"
-            );
-            return;
+            return Err("the game view is the primary surface's window".to_string());
         }
         let world = self.host.host_mut().engine_mut().world_mut();
+        // The shell not being attached yet is a moment, not a refused line.
         let Some(state) = world.get_resource_mut::<EguiShellState>() else {
             warn!(
                 target: telemetry_target::ENGINE,
                 "[editor] popout needs the shell module's state"
             );
-            return;
+            return Ok(());
         };
         let moved = if redock {
             state.dock.redock(tab)
@@ -2037,13 +1973,13 @@ impl EditorWindow {
                 "[editor] popout moved"
             );
         } else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                tab = tab.name().as_str(),
-                redock,
-                "[editor] popout unchanged: the tab cannot move"
-            );
+            return Err(format!(
+                "the {} tab is already {}",
+                tab.name(),
+                if redock { "docked" } else { "out" }
+            ));
         }
+        Ok(())
     }
 
     /// Run `problem open <index>`: the same request a click on the row makes.
@@ -2105,10 +2041,10 @@ impl EditorWindow {
     ///
     /// A screen-space click cannot re-select an entity a gizmo drag moved;
     /// the handle a pick logged still resolves here.
-    pub(super) fn scripted_select_entity(&mut self, handle: &str) {
+    pub(super) fn scripted_select_entity(&mut self, handle: &str) -> Result<(), String> {
         // A plain click is the reset shape of the same rule, so the two scripted
         // verbs and the pointer path share one path.
-        self.scripted_select_extend(handle, SelectionClick::Reset);
+        self.scripted_select_extend(handle, SelectionClick::Reset)
     }
 
     /// The scripted selection extension (`select add` / `select range`): the
@@ -2118,15 +2054,14 @@ impl EditorWindow {
     /// The click rule itself lives in the core's `EditorSelection::clicked`, so
     /// the pointer path and this channel cannot disagree about what a click
     /// means; what the modifiers do is the shell's `click_from_modifiers`.
-    pub(super) fn scripted_select_extend(&mut self, handle: &str, click: SelectionClick) {
+    pub(super) fn scripted_select_extend(
+        &mut self,
+        handle: &str,
+        click: SelectionClick,
+    ) -> Result<(), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = resolve_display_entity(world, handle) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                handle = %handle,
-                "[editor] select entity target not resolvable"
-            );
-            return;
+            return Err(format!("no entity named '{handle}'"));
         };
         // The Entities list's row order, which a range click reads.
         let rows: Vec<Entity> = world
@@ -2134,7 +2069,7 @@ impl EditorWindow {
             .map(|snapshot| snapshot.entities.iter().map(|row| row.entity).collect())
             .unwrap_or_default();
         let Some(selection) = world.get_resource::<EditorSelection>() else {
-            return;
+            return Ok(());
         };
         let entities = selection.clicked(click, entity, &rows);
         let asset = selection.asset.clone();
@@ -2156,6 +2091,7 @@ impl EditorWindow {
             count,
             "[editor] selection changed"
         );
+        Ok(())
     }
 
     /// `select resource <name>`: the recorded selection a resource row makes.
@@ -2249,15 +2185,19 @@ impl EditorWindow {
     /// [`Self::advance_scripted_drag`], the shape egui's drag detection
     /// needs. The same engine input seam a real drag enters, so a panel's
     /// drag handle reacts exactly as it does for a user.
-    pub(super) fn start_scripted_drag(&mut self, from: (f32, f32), to: (f32, f32)) {
+    pub(super) fn start_scripted_drag(
+        &mut self,
+        from: (f32, f32),
+        to: (f32, f32),
+    ) -> Result<(), String> {
         if self.scripted_drag.is_some() {
-            warn!(
-                target: telemetry_target::ENGINE,
-                "[editor] drag refused: one is already in flight"
-            );
-            return;
+            return Err("a scripted drag is already in flight".to_string());
         }
-        self.scripted_drag = Some(ScriptedDrag { from, to, stage: 0 });
+        self.scripted_drag = Some(ScriptedDrag {
+            from,
+            to,
+            stage: ScriptedDragStage::PressPending,
+        });
         info!(
             target: telemetry_target::ENGINE,
             from_x = from.0,
@@ -2266,5 +2206,6 @@ impl EditorWindow {
             to_y = to.1,
             "[editor] pointer drag queued"
         );
+        Ok(())
     }
 }

@@ -974,6 +974,28 @@ def main() -> int:
         assert elapsed < 15, f"the refusal took {elapsed:.1f}s"
         print(f"  [OK] a misspelled verb was refused in {elapsed:.1f}s: {refusal.reason}")
 
+        # The same rule for a line whose grammar is right and whose target is
+        # not: a handle no entity answers to is refused at once, so a suite that
+        # mistypes an entity sees the refusal instead of a step that times out
+        # looking like a slow editor.
+        started = time.monotonic()
+        refusal = None
+        try:
+            session.request(
+                "select entity 9v999",
+                "an answer that never comes",
+                30,
+                "a target refusal",
+            )
+        except ScriptedCommandRejected as error:
+            refusal = error
+        elapsed = time.monotonic() - started
+        assert refusal is not None, "the channel resolved an entity that is not there"
+        assert refusal.command == "select entity 9v999", f"refused {refusal.command!r}"
+        assert "9v999" in refusal.reason, f"unexpected reason: {refusal.reason}"
+        assert elapsed < 15, f"the refusal took {elapsed:.1f}s"
+        print(f"  [OK] an unresolvable entity was refused in {elapsed:.1f}s: {refusal.reason}")
+
         def field_values(entity: str, field: str) -> "list[float]":
             """One array field of `entity`, from a scripted `dump field`."""
             dump = session.request(

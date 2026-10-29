@@ -354,6 +354,19 @@ impl WakeTimer {
     }
 }
 
+/// Owes the loop one frame now: the timer off, a redraw asked for, and the
+/// loop waiting for whatever asks next.
+///
+/// This is the one statement of the wake rule. `window_event` owes a frame
+/// twice - once for a dropped file, which skips the rest of the walk, and once
+/// at the tail for everything else - and both answer here, so a changed rule
+/// (a delayed wake, a second window) changes in one place.
+fn owe_frame(editor: &EditorWindow, timer: &mut WakeTimer, event_loop: &ActiveEventLoop) {
+    timer.clear();
+    editor.window.request_redraw();
+    event_loop.set_control_flow(ControlFlow::Wait);
+}
+
 impl ApplicationHandler for EditorApplication {
     /// Create the editor window on the first resume.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -532,9 +545,7 @@ impl ApplicationHandler for EditorApplication {
                 }
                 if handled {
                     if editor.demand.any() {
-                        self.timer.clear();
-                        editor.window.request_redraw();
-                        event_loop.set_control_flow(ControlFlow::Wait);
+                        owe_frame(editor, &mut self.timer, event_loop);
                     }
                     return;
                 }
@@ -600,9 +611,7 @@ impl ApplicationHandler for EditorApplication {
         // A frame is owed as soon as anything here happened; a redraw request
         // already is one.
         if editor.demand.any() && !redraw_request {
-            self.timer.clear();
-            editor.window.request_redraw();
-            event_loop.set_control_flow(ControlFlow::Wait);
+            owe_frame(editor, &mut self.timer, event_loop);
         }
     }
 
@@ -631,7 +640,7 @@ mod windows;
 
 // The window's state and its constructor, re-exported so the method
 // modules above read them through `use super::*`.
-use editor_window::{EditorWindow, FontSource, ScriptedDrag};
+use editor_window::{EditorWindow, FontSource, ScriptedDrag, ScriptedDragStage};
 
 // =============================================================================
 // EditorWindow
@@ -1338,37 +1347,19 @@ impl EditorWindow {
         entity_text: &str,
         component_text: &str,
         field: &str,
-    ) -> Option<(Entity, String, FieldValue)> {
+    ) -> Result<(Entity, String, FieldValue), String> {
         let world = self.host.host_mut().engine_mut().world_mut();
         let Some(entity) = resolve_display_entity(world, entity_text) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                entity = entity_text,
-                "[editor] inspector set target not resolvable"
-            );
-            return None;
+            return Err(format!("no entity named '{entity_text}'"));
         };
         let Some(component) = resolve_component_name(world, component_text) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                component = component_text,
-                "[editor] inspector set target not resolvable"
-            );
-            return None;
+            return Err(format!("no component named '{component_text}'"));
         };
-        match world.read_component_field(entity, &component, field) {
-            Ok(current) => Some((entity, component, current)),
-            Err(_) => {
-                warn!(
-                    target: telemetry_target::ENGINE,
-                    field,
-                    "[editor] inspector set target not resolvable"
-                );
-                None
-            }
-        }
+        let current = world
+            .read_component_field(entity, &component, field)
+            .map_err(|_| format!("'{component}' has no field '{field}'"))?;
+        Ok((entity, component, current))
     }
-
     /// Queue the recorded step that writes `patched` over `path`'s settings.
     fn queue_settings_value(&mut self, path: &str, key: &str, patched: serde_json::Value) {
         let (edit, label) = inspector::settings_edit(path, patched, key);
