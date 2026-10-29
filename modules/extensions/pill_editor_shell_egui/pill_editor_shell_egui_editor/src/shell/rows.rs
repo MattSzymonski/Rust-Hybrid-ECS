@@ -31,6 +31,10 @@
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
+// Deliberately unused in this compilation: a patch crate replays this
+// file's opening, and the first sibling this body names resolves through it.
+#[allow(unused_imports)]
+use pill_editor_shell_egui_editor::shell::*;
 
 /// The width of a row's label column where labels are field names, in points:
 /// the Inspector's dense rows, and a module panel's control points.

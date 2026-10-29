@@ -834,6 +834,11 @@ def main() -> int:
     tab_entities_source = shell_source.parent / "shell" / "tab_entities.rs"
     with tab_entities_source.open("r", encoding="utf-8", newline="") as file:
         original_tab_source = file.read()
+    # The Systems tab's body has a file of its own too; its patch case proves
+    # the module whose opening once reached only the sibling glob.
+    tab_systems_source = shell_source.parent / "shell" / "tab_systems.rs"
+    with tab_systems_source.open("r", encoding="utf-8", newline="") as file:
+        original_systems_source = file.read()
     project_source = REPOSITORY_ROOT / "examples" / "italian_brainrot" / "src" / "scene.rs"
     # The Assets step's meta probe: a sourced file with no `.meta` sidecar
     # yet, staged before the editor starts so the res watcher never sees a
@@ -5023,6 +5028,41 @@ def main() -> int:
         )
         highest = wait_for_frames_past(session, highest, 120, "frame counter continued")
         print(f"  [OK] tab body patched live, frame counter continued past {highest}")
+
+        # The Systems tab's body names `icons` and `systems` by bare name, both
+        # of which only `shell::prelude::*` publishes: a patch crate replaying
+        # this file's opening compiles only because that glob is there. The
+        # probe goes inside the header closure, where a statement is legal.
+        systems_anchor = (
+            "        let enabled = snapshot.systems.iter().filter(|row| row.enabled).count();"
+        )
+        assert (
+            systems_anchor in original_systems_source
+        ), "the Systems tab body moved; update the step"
+        patched_systems = original_systems_source.replace(
+            systems_anchor,
+            newline.join(
+                (
+                    "        // A patch probe: one statement, inside the tab body only.",
+                    "        let _hot_systems_probe = 0u8;",
+                    systems_anchor,
+                )
+            ),
+            1,
+        )
+        begin = len(session.read_log())
+        session.edit_source(tab_systems_source, patched_systems)
+        session.wait(
+            HOT_PATCH_LIVE_PATTERN.format("systems_tab"),
+            180,
+            "the Systems tab body patched live",
+            begin,
+        )
+        highest = wait_for_frames_past(session, highest, 120, "frame counter continued")
+        print(
+            "  [OK] Systems tab body patched live, frame counter continued past "
+            f"{highest}"
+        )
 
         # The same for a body in `run_frame`: the heartbeat cadence, a read of
         # `SLOW_UPDATE_MICROS` and a bare call to the menu bar all sit in it.
