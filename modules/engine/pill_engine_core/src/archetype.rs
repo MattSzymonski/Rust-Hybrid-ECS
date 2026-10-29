@@ -1252,7 +1252,7 @@ impl ComponentColumn {
     //
     // Available only where a Rust type names the rows; `assert_element_type`
     // is what separates the two lanes at the point of use. The arithmetic is
-    // the same either way - `data + index * elem_size` - so a typed read costs
+    // the same either way - `data + index * element_size` - so a typed read costs
     // exactly what a byte read costs.
     // ---------------------------------------------------------------------
 
@@ -1403,16 +1403,6 @@ impl ComponentColumn {
         self.grow_to(target)?;
         self.ticks.reserve(additional);
         Ok(())
-    }
-
-    /// Size of one row in bytes; the byte-level twin of [`Self::element_size`].
-    pub fn elem_size(&self) -> usize {
-        self.layout.size
-    }
-
-    /// Alignment of one row in bytes; the byte-level twin of [`Self::alignment`].
-    pub fn elem_align(&self) -> usize {
-        self.layout.align
     }
 
     /// Read pointer to one row's bytes.

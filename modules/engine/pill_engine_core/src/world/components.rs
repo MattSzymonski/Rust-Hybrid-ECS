@@ -833,7 +833,7 @@ impl World {
             .nth(chunk_position)?;
         let archetype_id = archetype.id;
         let column = archetype.component_storages.get_mut(component_id)?;
-        let element_size = column.elem_size();
+        let element_size = column.element_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
         Some(ColumnChunk {
             archetype: archetype_id,
@@ -868,7 +868,7 @@ impl World {
             .nth(chunk_position)?;
         let archetype_id = archetype.id;
         let column = archetype.component_storages.get_mut(component_id)?;
-        let element_size = column.elem_size();
+        let element_size = column.element_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
         Some(ColumnChunk {
             archetype: archetype_id,
@@ -889,7 +889,7 @@ impl World {
     ) -> Option<ColumnChunk<'_>> {
         let archetype = self.archetypes.get_mut(&archetype_id)?;
         let column = archetype.component_storages.get_mut(component_id)?;
-        let element_size = column.elem_size();
+        let element_size = column.element_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
         Some(ColumnChunk {
             archetype: archetype_id,
@@ -916,7 +916,7 @@ impl World {
             return None;
         }
         let column = archetype.component_storages.get_mut(component_id)?;
-        let element_size = column.elem_size();
+        let element_size = column.element_size();
         let (data, len, ticks) = column.raw_rows_and_ticks_mut();
         Some(ColumnChunk {
             archetype: archetype_id,
@@ -1324,7 +1324,9 @@ impl World {
                 // internal-invariant break. The descriptor paths propagate the
                 // same failure as a typed error instead, because their inputs
                 // come from outside the engine.
-                other => panic!("internal invariant broken while migrating entity {entity:?}: {other}"),
+                other => {
+                    panic!("internal invariant broken while migrating entity {entity:?}: {other}")
+                }
             })
     }
 
@@ -1339,6 +1341,11 @@ impl World {
     /// already carries the component `T`, and
     /// [`AddComponentError::ComponentNotRegistered`] if `T` was never
     /// registered with this world.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the migration itself fails, which the checks above make an
+    /// internal-invariant break rather than a caller error.
     pub fn add_component<T>(
         &mut self,
         entity: Entity,
@@ -1355,54 +1362,24 @@ impl World {
                 std::any::type_name::<T>()
             )]
         );
-        let component_id = ComponentId::of::<T>();
-
-        // Step 1: Validate - the entity must exist and must not already
-        // carry T.
-        let location = match self.entity_locations.get(&entity) {
-            Some(loc) => *loc,
-            None => return Err(AddComponentError::EntityNotFound),
-        };
-
-        let old_archetype = match self.archetypes.get(&location.archetype_id) {
-            Some(arch) => arch,
-            None => return Err(AddComponentError::EntityNotFound),
-        };
-
-        // Check if entity already has this component
-        if old_archetype.component_types.contains(&component_id) {
-            return Err(AddComponentError::ComponentAlreadyExists);
-        }
-
-        // Step 2: Refuse a type this world never registered. The destination
-        // archetype is derived from component bits, and registration is what
-        // allocates one, so an unregistered type would resolve the destination
-        // back to the entity's current archetype - storing nothing while
-        // reporting success. `EntityBuilder::build` asks the same table.
-        if !self.storage_factories.contains_key(&component_id) {
-            return Err(AddComponentError::ComponentNotRegistered { id: component_id });
-        }
-
-        // Step 3: Build the destination component set with T appended.
-        let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
-        new_component_ids.extend_from_slice(&old_archetype.component_types);
-        new_component_ids.push(component_id);
-        new_component_ids.sort();
-
-        // Step 4: Migrate the entity. Existing components are carried by the
-        // move; the only thing left to write is the component being added.
-        self.move_entity_to_archetype(entity, new_component_ids, |new_storage| {
+        self.try_add_component_by_id(entity, ComponentId::of::<T>(), |new_storage| {
             new_storage.column_of_mut::<T>().push::<T>(component);
             Ok(())
         })
-        .unwrap_or_else(|error| {
-            // As in `remove_component_by_id`: the entity and its archetype
-            // were validated above, so this failure is an internal-invariant
-            // break, not a user error.
-            panic!("internal invariant broken while migrating entity {entity:?}: {error}")
-        });
-
-        Ok(())
+        .map_err(|error| match error {
+            WorldError::EntityNotFound | WorldError::ArchetypeMissing { .. } => {
+                AddComponentError::EntityNotFound
+            }
+            WorldError::DescriptorComponentAlreadyPresent => {
+                AddComponentError::ComponentAlreadyExists
+            }
+            WorldError::DescriptorComponentNotRegistered { id } => {
+                AddComponentError::ComponentNotRegistered { id }
+            }
+            // The entity and its archetype were validated before the migration
+            // started, so a failure here is an internal-invariant break.
+            other => panic!("internal invariant broken while migrating entity {entity:?}: {other}"),
+        })
     }
 
     /// Add a runtime-defined component and migrate the entity's other columns.
@@ -1421,19 +1398,8 @@ impl World {
         component_id: ComponentId,
         bytes: &[u8],
     ) -> Result<(), WorldError> {
-        let location = *self
-            .entity_locations
-            .get(&entity)
-            .ok_or(WorldError::EntityNotFound)?;
-        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
-            return Err(WorldError::ArchetypeMissing {
-                entity,
-                archetype_id: location.archetype_id,
-            });
-        };
-        if old_archetype.component_types.contains(&component_id) {
-            return Err(WorldError::DescriptorComponentAlreadyPresent);
-        }
+        // The byte-length refusal is about the payload, not the component set,
+        // so it is checked here; the set-level checks live in the shared core.
         let expected_size = match self.storage_factories.get(&component_id) {
             Some(StorageFactory::Descriptor(layout)) => layout.size,
             _ => return Err(WorldError::DescriptorComponentNotRegistered { id: component_id }),
@@ -1441,14 +1407,11 @@ impl World {
         if bytes.len() != expected_size {
             return Err(WorldError::DescriptorByteLengthMismatch { id: component_id });
         }
-        let mut new_ids = old_archetype.component_types.clone();
-        new_ids.push(component_id);
-        new_ids.sort();
         // The migration carries every existing column; the arriving component
         // is the one column the destination has and the source does not, so it
         // is written by the attach step rather than patched in afterwards.
-        self.move_entity_to_archetype(entity, new_ids, |new_storage| {
-            // The destination archetype was built from `new_ids`, which names
+        self.try_add_component_by_id(entity, component_id, |new_storage| {
+            // The destination archetype was built from the id set, which names
             // this component, so the column is there; the refusal covers a
             // registry/storage desync rather than a reachable state.
             let Some(column) = new_storage.get_mut(component_id) else {

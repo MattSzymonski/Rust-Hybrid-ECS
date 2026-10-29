@@ -512,17 +512,6 @@ impl KeySet {
         self.0[index / 64] & (1 << (index % 64)) != 0
     }
 
-    /// Add or remove `key`.
-    fn set(&mut self, key: KeyCode, present: bool) {
-        let index = key as usize;
-        let bit = 1 << (index % 64);
-        if present {
-            self.0[index / 64] |= bit;
-        } else {
-            self.0[index / 64] &= !bit;
-        }
-    }
-
     /// Every key in the set, in [`KeyCode`] order.
     fn iter(&self) -> impl Iterator<Item = KeyCode> + '_ {
         KeyCode::ALL
@@ -530,6 +519,117 @@ impl KeySet {
             .copied()
             .filter(|key| self.contains(*key))
     }
+}
+
+// =============================================================================
+// Edge Tracking
+// =============================================================================
+
+/// A fixed set of button bits, one bit per button.
+///
+/// Each device kind widens its bits differently - [`KeySet`] words, a `u8` for
+/// the mouse, a `u32` per gamepad - so this trait is the only thing the edge
+/// rule below needs to know about them.
+trait EdgeBits: Copy + Default {
+    /// Whether `bit` is set.
+    fn has(&self, bit: u32) -> bool;
+
+    /// Sets or clears `bit`.
+    fn set(&mut self, bit: u32, present: bool);
+
+    /// Adds every bit of `other`.
+    fn merge(&mut self, other: Self);
+}
+
+impl EdgeBits for KeySet {
+    fn has(&self, bit: u32) -> bool {
+        let index = bit as usize;
+        self.0[index / 64] & (1 << (index % 64)) != 0
+    }
+
+    fn set(&mut self, bit: u32, present: bool) {
+        let index = bit as usize;
+        let mask = 1 << (index % 64);
+        if present {
+            self.0[index / 64] |= mask;
+        } else {
+            self.0[index / 64] &= !mask;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for (word, incoming) in self.0.iter_mut().zip(other.0) {
+            *word |= incoming;
+        }
+    }
+}
+
+impl EdgeBits for u8 {
+    fn has(&self, bit: u32) -> bool {
+        *self & (1u8 << bit) != 0
+    }
+
+    fn set(&mut self, bit: u32, present: bool) {
+        if present {
+            *self |= 1u8 << bit;
+        } else {
+            *self &= !(1u8 << bit);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        *self |= other;
+    }
+}
+
+impl EdgeBits for u32 {
+    fn has(&self, bit: u32) -> bool {
+        *self & (1u32 << bit) != 0
+    }
+
+    fn set(&mut self, bit: u32, present: bool) {
+        if present {
+            *self |= 1u32 << bit;
+        } else {
+            *self &= !(1u32 << bit);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        *self |= other;
+    }
+}
+
+/// Applies one button edge.
+///
+/// A press of a bit already held is the operating system's repeat and changes
+/// nothing; a release of a bit that is not held (one already released by
+/// [`InputEvent::FocusLost`]) changes nothing either. Keys, mouse buttons and
+/// gamepad buttons all come through here, so the rule is stated once.
+fn apply_edge<B: EdgeBits>(
+    held: &mut B,
+    pressed: &mut B,
+    released: &mut B,
+    bit: u32,
+    state: ButtonState,
+) {
+    match state {
+        ButtonState::Pressed if !held.has(bit) => {
+            held.set(bit, true);
+            pressed.set(bit, true);
+        }
+        ButtonState::Released if held.has(bit) => {
+            held.set(bit, false);
+            released.set(bit, true);
+        }
+        ButtonState::Pressed | ButtonState::Released => {}
+    }
+}
+
+/// Releases every held bit, reporting each as released.
+fn release_edges<B: EdgeBits>(held: &mut B, released: &mut B) {
+    released.merge(*held);
+    *held = B::default();
 }
 
 // =============================================================================
@@ -878,20 +978,13 @@ impl Input {
                 state,
             } => {
                 let gamepad = &mut self.gamepads[player.index()];
-                let bit = button.bit();
-                match state {
-                    // Held already: a repeat, not a new press.
-                    ButtonState::Pressed if gamepad.held & bit == 0 => {
-                        gamepad.held |= bit;
-                        gamepad.pressed |= bit;
-                    }
-                    ButtonState::Pressed => {}
-                    ButtonState::Released if gamepad.held & bit != 0 => {
-                        gamepad.held &= !bit;
-                        gamepad.released |= bit;
-                    }
-                    ButtonState::Released => {}
-                }
+                apply_edge(
+                    &mut gamepad.held,
+                    &mut gamepad.pressed,
+                    &mut gamepad.released,
+                    button.bit().trailing_zeros(),
+                    state,
+                );
             }
             InputEvent::GamepadAxis {
                 player,
@@ -912,45 +1005,30 @@ impl Input {
     /// repeat and changes nothing; a release of a key that is not held (one
     /// already released by [`InputEvent::FocusLost`]) changes nothing either.
     fn apply_key(&mut self, key: KeyCode, state: ButtonState) {
-        let held = self.keys_held.contains(key);
-        match state {
-            ButtonState::Pressed if !held => {
-                self.keys_held.set(key, true);
-                self.keys_pressed.set(key, true);
-            }
-            ButtonState::Released if held => {
-                self.keys_held.set(key, false);
-                self.keys_released.set(key, true);
-            }
-            ButtonState::Pressed | ButtonState::Released => {}
-        }
+        apply_edge(
+            &mut self.keys_held,
+            &mut self.keys_pressed,
+            &mut self.keys_released,
+            key as u32,
+            state,
+        );
     }
 
     /// Apply a mouse button change, with the same rules as [`Self::apply_key`].
     fn apply_mouse_button(&mut self, button: MouseButton, state: ButtonState) {
-        let bit = button.bit();
-        let held = self.mouse_held & bit != 0;
-        match state {
-            ButtonState::Pressed if !held => {
-                self.mouse_held |= bit;
-                self.mouse_pressed |= bit;
-            }
-            ButtonState::Released if held => {
-                self.mouse_held &= !bit;
-                self.mouse_released |= bit;
-            }
-            ButtonState::Pressed | ButtonState::Released => {}
-        }
+        apply_edge(
+            &mut self.mouse_held,
+            &mut self.mouse_pressed,
+            &mut self.mouse_released,
+            button.bit().trailing_zeros(),
+            state,
+        );
     }
 
     /// Release every held key and mouse button, reporting each as released.
     fn release_keyboard_and_mouse(&mut self) {
-        for word in 0..KEY_SET_WORDS {
-            self.keys_released.0[word] |= self.keys_held.0[word];
-        }
-        self.keys_held = KeySet::default();
-        self.mouse_released |= self.mouse_held;
-        self.mouse_held = 0;
+        release_edges(&mut self.keys_held, &mut self.keys_released);
+        release_edges(&mut self.mouse_held, &mut self.mouse_released);
     }
 }
 
@@ -1344,5 +1422,132 @@ mod tests {
         frame(&mut input, &[InputEvent::FocusLost]);
         assert_eq!(input.modifiers(), Modifiers::default());
         assert_eq!(input.ime_preedit(), None);
+    }
+
+    /// Keys, mouse buttons and gamepad buttons report the same edge pattern.
+    ///
+    /// The three device kinds share one edge rule, so a sequence driven through
+    /// each of them must produce identical press/repeat/release answers: a
+    /// press is one press, a repeat while held is nothing, and the release is
+    /// one release.
+    #[test]
+    fn every_device_kind_reports_the_same_press_repeat_release_pattern() {
+        let mut input = Input::new();
+        frame(
+            &mut input,
+            &[InputEvent::GamepadConnected {
+                player: PlayerId::Player1,
+            }],
+        );
+        assert!(!input.gamepad_button_held(PlayerId::Player1, GamepadButton::A));
+
+        // One press through all three kinds at once.
+        frame(
+            &mut input,
+            &[
+                key(KeyCode::KeyW, ButtonState::Pressed),
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: ButtonState::Pressed,
+                },
+                InputEvent::GamepadButton {
+                    player: PlayerId::Player1,
+                    button: GamepadButton::A,
+                    state: ButtonState::Pressed,
+                },
+            ],
+        );
+        let first = (
+            input.key_pressed(KeyCode::KeyW),
+            input.mouse_button_pressed(MouseButton::Left),
+            input.gamepad_button_pressed(PlayerId::Player1, GamepadButton::A),
+        );
+        assert_eq!(
+            first,
+            (true, true, true),
+            "a press is an edge on every kind"
+        );
+
+        // A repeat press of something already held is not a new edge.
+        frame(
+            &mut input,
+            &[
+                key(KeyCode::KeyW, ButtonState::Pressed),
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: ButtonState::Pressed,
+                },
+                InputEvent::GamepadButton {
+                    player: PlayerId::Player1,
+                    button: GamepadButton::A,
+                    state: ButtonState::Pressed,
+                },
+            ],
+        );
+        let repeat = (
+            input.key_pressed(KeyCode::KeyW),
+            input.mouse_button_pressed(MouseButton::Left),
+            input.gamepad_button_pressed(PlayerId::Player1, GamepadButton::A),
+        );
+        assert_eq!(repeat, (false, false, false), "a repeat is not an edge");
+        assert!(
+            input.key_held(KeyCode::KeyW)
+                && input.mouse_button_held(MouseButton::Left)
+                && input.gamepad_button_held(PlayerId::Player1, GamepadButton::A),
+            "a repeat leaves every kind held"
+        );
+
+        // One release, and the second release of the same button is nothing.
+        frame(
+            &mut input,
+            &[
+                key(KeyCode::KeyW, ButtonState::Released),
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: ButtonState::Released,
+                },
+                InputEvent::GamepadButton {
+                    player: PlayerId::Player1,
+                    button: GamepadButton::A,
+                    state: ButtonState::Released,
+                },
+            ],
+        );
+        let released = (
+            input.key_released(KeyCode::KeyW),
+            input.mouse_button_released(MouseButton::Left),
+            input.gamepad_button_released(PlayerId::Player1, GamepadButton::A),
+        );
+        assert_eq!(
+            released,
+            (true, true, true),
+            "a release is an edge on every kind"
+        );
+
+        frame(
+            &mut input,
+            &[
+                key(KeyCode::KeyW, ButtonState::Released),
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    state: ButtonState::Released,
+                },
+                InputEvent::GamepadButton {
+                    player: PlayerId::Player1,
+                    button: GamepadButton::A,
+                    state: ButtonState::Released,
+                },
+            ],
+        );
+        let double_release = (
+            input.key_released(KeyCode::KeyW),
+            input.mouse_button_released(MouseButton::Left),
+            input.gamepad_button_released(PlayerId::Player1, GamepadButton::A),
+        );
+        assert_eq!(
+            double_release,
+            (false, false, false),
+            "releasing something already released is not an edge"
+        );
     }
 }

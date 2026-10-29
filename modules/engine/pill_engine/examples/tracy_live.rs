@@ -318,7 +318,7 @@ fn main() {
 
     // No frame cap is set, so the loop runs as fast as the machine allows. The
     // limiter's Tracy zone is off to keep the timeline readable.
-    engine.trace_frame_wait = false;
+    engine.set_trace_frame_wait(false);
 
     // Step 4: Spawn the initial 30 000 entity population with mixed component
     // sizes so cache pressure and parallel distribution are representative.

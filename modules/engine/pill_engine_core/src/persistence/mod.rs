@@ -28,7 +28,7 @@
 //!
 //! | Function        | Signature | Purpose |
 //! |-----------------|-----------|---------|
-//! | `serialize`     | `fn(&ComponentColumns, index) → Vec<u8>` | Read concrete component from archetype column, JSON-encode it |
+//! | `serialize`     | `fn(&ComponentColumns, index) → Option<Vec<u8>>` | Read concrete component from archetype column, JSON-encode it; `None` when the type's `Serialize` refuses |
 //! | `deserialize`   | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; returns None on schema mismatch |
 //! | `insert_boxed`  | `fn(&mut ComponentColumns, Box<dyn Component>)` | Downcast and push into the archetype's column |
 //!
@@ -1145,5 +1145,61 @@ mod tests {
         let second = other.persist_resource_manifest();
 
         assert_eq!(first[0].schema_hash, second[0].schema_hash);
+    }
+
+    /// A component whose own `Serialize` refuses every value.
+    #[derive(Clone, Debug, Default)]
+    struct RefusingSerializeComponent {
+        value: u32,
+    }
+
+    impl Component for RefusingSerializeComponent {}
+
+    impl serde::Serialize for RefusingSerializeComponent {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(
+                "this component refuses to serialize",
+            ))
+        }
+    }
+
+    /// A refused serialization reports `None` instead of aborting the reload.
+    ///
+    /// The migration reads every row through this glue, and its inverse already
+    /// reports a type it cannot decode as a skipped type. A type it cannot
+    /// encode must reach that same report: the panic this replaced fired inside
+    /// the transaction, after earlier archetypes of the type had been swapped.
+    #[test]
+    fn a_refusing_serializer_reports_none_instead_of_panicking() {
+        let mut world = World::new();
+        world.register_component::<RefusingSerializeComponent>();
+        world
+            .create_entity()
+            .with(RefusingSerializeComponent { value: 7 })
+            .build()
+            .expect("the entity builds");
+
+        let component_id = ComponentId::of::<RefusingSerializeComponent>();
+        let mut serialized = None;
+        for archetype in world.archetypes_iter() {
+            if archetype.component_types.contains(&component_id) {
+                let column = archetype
+                    .component_storages
+                    .column_of::<RefusingSerializeComponent>();
+                assert_eq!(
+                    column.get::<RefusingSerializeComponent>(0).value,
+                    7,
+                    "the row the glue refused to encode is the one this test wrote"
+                );
+                serialized = Some(super::components::serialize_component::<
+                    RefusingSerializeComponent,
+                >(&archetype.component_storages, 0));
+            }
+        }
+
+        assert!(
+            matches!(serialized, Some(None)),
+            "a refused serialization is a report, not a panic"
+        );
     }
 }

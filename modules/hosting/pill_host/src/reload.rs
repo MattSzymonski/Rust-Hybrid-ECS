@@ -1060,11 +1060,11 @@ impl ReloadTransaction<'_> {
                 migrated_entities = report.migrated_entity_count,
                 "persistable migration complete"
             );
-            if !report.skipped_type_names.is_empty() {
+            if !report.skipped_types.is_empty() {
                 warn!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = self.subject,
-                    skipped_types = ?report.skipped_type_names,
+                    skipped_types = ?report.skipped_types,
                     "migration skipped some module component types"
                 );
             }

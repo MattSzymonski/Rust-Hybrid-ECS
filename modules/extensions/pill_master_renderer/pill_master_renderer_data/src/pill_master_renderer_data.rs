@@ -464,6 +464,6 @@ f 1/1 2/2 3/3
 
         register(&mut engine);
 
-        assert!(engine.is_system_enabled("rendering").is_none());
+        assert!(!engine.is_registered("rendering"));
     }
 }

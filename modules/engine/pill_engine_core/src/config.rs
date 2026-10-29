@@ -27,24 +27,15 @@ use pill_core::rayon;
 use pill_core::telemetry::log_block;
 
 // =============================================================================
-// ProfilingConfig
+// Profiling
 // =============================================================================
 
-/// Zero-sized struct grouping profiling-related configuration constants.
+/// Sampling rate for `tracy_client::ProfiledAllocator`.
 ///
-/// Holds the allocation-sampling frequency consumed by the Tracy profiler
-/// integration; kept in its own type so callers can reference the knob via
-/// `crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`.
-pub struct ProfilingConfig;
-
-impl ProfilingConfig {
-    /// Sampling rate for `tracy_client::ProfiledAllocator`.
-    ///
-    /// `1` = track every allocation (complete picture, higher overhead).
-    /// `10` = track 1 in 10 allocations (good balance).
-    /// `100` = track 1 in 100 allocations (minimal overhead, statistical).
-    pub const MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
-}
+/// `1` = track every allocation (complete picture, higher overhead).
+/// `10` = track 1 in 10 allocations (good balance).
+/// `100` = track 1 in 100 allocations (minimal overhead, statistical).
+pub const PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 
 // =============================================================================
 // ParallelProcessingConfig

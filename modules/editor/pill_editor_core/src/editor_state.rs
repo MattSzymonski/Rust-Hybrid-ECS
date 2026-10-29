@@ -875,15 +875,15 @@ fn resolve_asset_reference(engine: &mut Engine, reference: &str) -> Result<Field
 
 /// Label a system owner using the host's extension names.
 ///
-/// `SystemOwner(0)` is the project, `SystemOwner(n)` labels module `n - 1`;
-/// anything out of range renders as "unknown".
+/// The numbering is decoded by [`SystemOwner::extension_index`]; an extension
+/// the host does not name falls back to the owner's own rendering.
 fn owner_label(owner: SystemOwner, extension_names: &[String]) -> String {
-    match owner.0 {
-        0 => "project".to_string(),
-        index => extension_names
-            .get(index as usize - 1)
+    match owner.extension_index() {
+        None => owner.to_string(),
+        Some(index) => extension_names
+            .get(index)
             .cloned()
-            .unwrap_or_else(|| "unknown".to_string()),
+            .unwrap_or_else(|| owner.to_string()),
     }
 }
 
