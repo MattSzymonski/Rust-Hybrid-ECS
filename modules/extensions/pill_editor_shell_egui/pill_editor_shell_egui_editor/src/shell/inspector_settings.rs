@@ -66,25 +66,40 @@ pub fn settings_level(ui: &mut egui::Ui, add_contents: &mut dyn FnMut(&mut egui:
     ui.spacing_mut().indent = previous;
 }
 
+/// What the settings walk carries from row to row.
+///
+/// A leaf draws from its key and its value alone; these exist for the rows
+/// below it - the pickers' listing and store, the writes they queue, the
+/// session's collapse state and the frame's overlay regions - so they travel as
+/// one value instead of eight positional arguments.
+pub struct SettingsWalk<'a> {
+    /// The listing the pickers read.
+    pub assets: &'a [AssetListing],
+    /// The store's own assets the pickers offer.
+    pub engine_assets: &'a [EngineAsset],
+    /// The writes the rows queue.
+    pub pending: &'a mut PendingEditorCommands,
+    /// The session the collapse state and remembered rectangles live in.
+    pub session: &'a mut InspectorSession,
+    /// The frame's overlay regions, so a picker's rectangle is the UI's.
+    pub overlay_regions: &'a mut Vec<ShellRect>,
+    /// Whether the asset belongs to a module, so nothing writes it.
+    pub read_only: bool,
+}
+
 /// The settings document's rows: objects and arrays nest their children,
-/// every scalar leaf edits - unless `read_only`, when every row reads a module
-/// resource that nothing may write.
+/// every scalar leaf edits - unless `walk.read_only`, when every row reads a
+/// module resource that nothing may write.
 ///
 /// `references` are the reference fields the asset's type declares: each gets a
 /// picker row, whether or not the document binds it yet, and the document key
 /// behind it is left out of the walk so one field has one row.
-#[allow(clippy::too_many_arguments)]
 pub fn asset_settings_rows(
     ui: &mut egui::Ui,
     asset_path: &str,
     settings: &JsonValue,
-    assets: &[AssetListing],
-    engine_assets: &[EngineAsset],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
-    read_only: bool,
     references: &[AssetReferenceField],
+    walk: &mut SettingsWalk<'_>,
 ) {
     match settings {
         JsonValue::Object(entries) => {
@@ -101,20 +116,9 @@ pub fn asset_settings_rows(
                 if owned {
                     continue;
                 }
-                asset_settings_row(
-                    ui,
-                    asset_path,
-                    settings,
-                    value,
-                    key.clone(),
-                    assets,
-                    pending,
-                    session,
-                    overlay_regions,
-                    read_only,
-                );
+                asset_settings_row(ui, asset_path, settings, value, key.clone(), walk);
             }
-            if read_only {
+            if walk.read_only {
                 return;
             }
             for field in references {
@@ -128,11 +132,11 @@ pub fn asset_settings_rows(
                     asset_path,
                     settings,
                     field,
-                    assets,
-                    engine_assets,
-                    pending,
-                    session,
-                    overlay_regions,
+                    walk.assets,
+                    walk.engine_assets,
+                    walk.pending,
+                    walk.session,
+                    walk.overlay_regions,
                 );
             }
             reference_list_rows(
@@ -140,11 +144,11 @@ pub fn asset_settings_rows(
                 asset_path,
                 settings,
                 references,
-                assets,
-                engine_assets,
-                pending,
-                session,
-                overlay_regions,
+                walk.assets,
+                walk.engine_assets,
+                walk.pending,
+                walk.session,
+                walk.overlay_regions,
             );
         }
         other => {
@@ -643,27 +647,21 @@ pub fn remember_list_row_rect(
 /// over its children one level in - except the two shapes that get a control
 /// of their own, a texture slot and a colour parameter.
 ///
-/// A leaf draws from its key and its value alone; the row's assets, session
-/// and overlay regions exist for the rows below it, so the attributes are the
-/// recursion's own shape rather than an unused argument.
-#[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
+/// A leaf draws from its key and its value alone; what the rows below it need
+/// travels in [`SettingsWalk`], so the recursion's shape is one argument.
 pub fn asset_settings_row(
     ui: &mut egui::Ui,
     asset_path: &str,
     root: &JsonValue,
     value: &JsonValue,
     key: String,
-    assets: &[AssetListing],
-    pending: &mut PendingEditorCommands,
-    session: &mut InspectorSession,
-    overlay_regions: &mut Vec<ShellRect>,
-    read_only: bool,
+    walk: &mut SettingsWalk<'_>,
 ) {
     // The colour parameter is the one array drawn as a control of its own, so
     // it is claimed before the container shapes below take the value.
-    if !read_only {
+    if !walk.read_only {
         if let Some(channels) = colour_parameter(&key, value) {
-            colour_parameter_row(ui, asset_path, root, &key, channels, pending);
+            colour_parameter_row(ui, asset_path, root, &key, channels, walk.pending);
             return;
         }
     }
@@ -678,11 +676,7 @@ pub fn asset_settings_row(
                         root,
                         child,
                         format!("{key}.{child_key}"),
-                        assets,
-                        pending,
-                        session,
-                        overlay_regions,
-                        read_only,
+                        walk,
                     );
                 }
             });
@@ -698,11 +692,7 @@ pub fn asset_settings_row(
                         root,
                         child,
                         format!("{key}[{index}]"),
-                        assets,
-                        pending,
-                        session,
-                        overlay_regions,
-                        read_only,
+                        walk,
                     );
                 }
             });
@@ -712,7 +702,7 @@ pub fn asset_settings_row(
     }
     // A leaf: the shared row, its label the leaf of the key.
     let label = settings_row_label(&key);
-    if read_only {
+    if walk.read_only {
         read_only_row(ui, &label, &value.to_string());
         return;
     }
@@ -724,7 +714,13 @@ pub fn asset_settings_row(
                 changed = ui.checkbox(&mut edited, "").changed();
             });
             if changed {
-                settings_commit(pending, asset_path, root, &key, JsonValue::Bool(edited));
+                settings_commit(
+                    walk.pending,
+                    asset_path,
+                    root,
+                    &key,
+                    JsonValue::Bool(edited),
+                );
             }
         }
         JsonValue::Number(current) => {
@@ -739,7 +735,7 @@ pub fn asset_settings_row(
                     });
                     if changed {
                         settings_commit(
-                            pending,
+                            walk.pending,
                             asset_path,
                             root,
                             &key,
@@ -762,7 +758,7 @@ pub fn asset_settings_row(
                     if changed {
                         if let Some(number) = serde_json::Number::from_f64(edited) {
                             settings_commit(
-                                pending,
+                                walk.pending,
                                 asset_path,
                                 root,
                                 &key,
@@ -783,7 +779,13 @@ pub fn asset_settings_row(
                 commit = response.lost_focus() && edited != *current;
             });
             if commit {
-                settings_commit(pending, asset_path, root, &key, JsonValue::String(edited));
+                settings_commit(
+                    walk.pending,
+                    asset_path,
+                    root,
+                    &key,
+                    JsonValue::String(edited),
+                );
             }
         }
         other => {

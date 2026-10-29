@@ -19,13 +19,33 @@
 use pill_editor_shell_egui_editor::shell::prelude::*;
 use pill_editor_shell_egui_editor::shell::*;
 
+/// Log one drawn Inspector row once per session.
+///
+/// The gate and its line belong together: nine arms open with them, and each
+/// spelled the token and the field list itself. A macro rather than a function
+/// because the log's fields are typed - a `pixels` number and a `text` string
+/// must reach the log as themselves - and because the patch scanner lists every
+/// module-level function of this crate.
+macro_rules! log_row_once {
+    ($session:expr, $type_name:expr, $kind:literal, [$($part:expr),* $(,)?], $($field:tt)*) => {
+        if remember_inspector_row($session, $type_name, $kind, &[$($part),*]) {
+            pill_core::info!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                component = $type_name,
+                $($field)*
+                concat!("[editor] inspector row kind=", $kind)
+            );
+        }
+    };
+}
+
+// The parameters are the borrows one row draws from; a grouping struct would
+// have to be rebuilt for every row of every component.
+#[allow(clippy::too_many_arguments)]
 /// One row of a component section, drawn from the Inspector's row model: a
 /// separator line or gap a field's decorators declared, a single widget, a
 /// vector row (side-by-side fields with axis labels in the gizmo's colours),
 /// or a read-only value.
-// The parameters are the borrows one row draws from; a grouping struct would
-// have to be rebuilt for every row of every component.
-#[allow(clippy::too_many_arguments)]
 pub fn inspector_field_row(
     ui: &mut egui::Ui,
     entity: Entity,
@@ -43,27 +63,25 @@ pub fn inspector_field_row(
     let type_name = component.type_name.as_str();
     match row {
         inspector::FieldRow::Header { text } => {
-            if remember_inspector_row(session, type_name, "header", &[text.as_str()]) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    text = text.as_str(),
-                    "[editor] inspector row kind=header"
-                );
-            }
+            log_row_once!(
+                session,
+                type_name,
+                "header",
+                [text.as_str()],
+                text = text.as_str(),
+            );
             ui.add_space(6.0);
             ui.label(egui::RichText::new(text).strong());
             ui.add_space(2.0);
         }
         inspector::FieldRow::Space { pixels } => {
-            if remember_inspector_row(session, type_name, "space", &[&pixels.to_string()]) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    pixels = *pixels,
-                    "[editor] inspector row kind=space"
-                );
-            }
+            log_row_once!(
+                session,
+                type_name,
+                "space",
+                [&pixels.to_string()],
+                pixels = *pixels,
+            );
             ui.add_space(*pixels);
         }
         inspector::FieldRow::Single {
@@ -76,36 +94,29 @@ pub fn inspector_field_row(
                 return;
             };
             let tooltip = tooltip.as_deref();
-            if row_is_mixed(details, type_name, *index, value)
-                && remember_inspector_row(session, type_name, "mixed", &[field.as_str()])
-            {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
+            if row_is_mixed(details, type_name, *index, value) {
+                log_row_once!(
+                    session,
+                    type_name,
+                    "mixed",
+                    [field.as_str()],
                     field = field.as_str(),
                     entities = targets.len(),
-                    "[editor] inspector row kind=mixed"
                 );
             }
-            if remember_inspector_row(
+            log_row_once!(
                 session,
                 type_name,
                 "field",
-                &[
+                [
                     field.as_str(),
                     field_widget_name(widget),
                     tooltip.unwrap_or_default(),
                 ],
-            ) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    field = field.as_str(),
-                    widget = field_widget_name(widget),
-                    tooltip = tooltip.unwrap_or_default(),
-                    "[editor] inspector row kind=field"
-                );
-            }
+                field = field.as_str(),
+                widget = field_widget_name(widget),
+                tooltip = tooltip.unwrap_or_default(),
+            );
             match value {
                 FieldValue::Text(current) => {
                     let mut edited = current.clone();
@@ -169,30 +180,24 @@ pub fn inspector_field_row(
                 type_name,
                 *index,
                 &FieldValue::Array(values.clone()),
-            ) && remember_inspector_row(session, type_name, "mixed", &[field.as_str()])
-            {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
+            ) {
+                log_row_once!(
+                    session,
+                    type_name,
+                    "mixed",
+                    [field.as_str()],
                     field = field.as_str(),
                     entities = targets.len(),
-                    "[editor] inspector row kind=mixed"
                 );
             }
-            if remember_inspector_row(
+            log_row_once!(
                 session,
                 type_name,
                 "vector",
-                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
-            ) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    field = field.as_str(),
-                    tooltip = tooltip.as_deref().unwrap_or_default(),
-                    "[editor] inspector row kind=vector"
-                );
-            }
+                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
+                field = field.as_str(),
+                tooltip = tooltip.as_deref().unwrap_or_default(),
+            );
             // One row that wraps: a wide panel shows X/Y/Z side by side, a
             // narrow dock moves the overflowing fields to the next line
             // instead of clipping them past the panel's edge.
@@ -233,21 +238,15 @@ pub fn inspector_field_row(
             tooltip,
         } => {
             let values = leaf_values(component, leaves);
-            if remember_inspector_row(
+            log_row_once!(
                 session,
                 type_name,
                 "color",
-                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
-            ) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    field = field.as_str(),
-                    channels = leaves.len(),
-                    tooltip = tooltip.as_deref().unwrap_or_default(),
-                    "[editor] inspector row kind=color"
-                );
-            }
+                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
+                field = field.as_str(),
+                channels = leaves.len(),
+                tooltip = tooltip.as_deref().unwrap_or_default(),
+            );
             inspector_row(ui, field, tooltip.as_deref(), &mut |ui| {
                 let Some(mut channels) = color_channels(&values) else {
                     // Channels the picker cannot read (integer kinds) stay
@@ -307,21 +306,22 @@ pub fn inspector_field_row(
             field,
             tooltip,
         } => {
-            if remember_inspector_row(
+            // The grouped row is a second shape under the same token; its
+            // signature carries the shape so it is not deduped against the
+            // ungrouped vector row of the same field.
+            log_row_once!(
                 session,
                 type_name,
                 "vector",
-                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
-            ) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    field = field.as_str(),
-                    axes = leaves.len(),
-                    tooltip = tooltip.as_deref().unwrap_or_default(),
-                    "[editor] inspector row kind=vector"
-                );
-            }
+                [
+                    field.as_str(),
+                    tooltip.as_deref().unwrap_or_default(),
+                    "group",
+                ],
+                field = field.as_str(),
+                axes = leaves.len(),
+                tooltip = tooltip.as_deref().unwrap_or_default(),
+            );
             // The same row a `[f32; 3]` field draws, assembled from leaves
             // that live in fields of their own.
             ui.horizontal_wrapped(|ui| {
@@ -407,20 +407,14 @@ pub fn inspector_field_row(
             let Some(value) = component.values.get(*index) else {
                 return;
             };
-            if remember_inspector_row(
+            log_row_once!(
                 session,
                 type_name,
                 "read-only",
-                &[field.as_str(), tooltip.as_deref().unwrap_or_default()],
-            ) {
-                pill_core::info!(
-                    target: pill_core::telemetry::telemetry_target::ENGINE,
-                    component = type_name,
-                    field = field.as_str(),
-                    tooltip = tooltip.as_deref().unwrap_or_default(),
-                    "[editor] inspector row kind=read-only"
-                );
-            }
+                [field.as_str(), tooltip.as_deref().unwrap_or_default()],
+                field = field.as_str(),
+                tooltip = tooltip.as_deref().unwrap_or_default(),
+            );
             inspector_row(ui, field, tooltip.as_deref(), &mut |ui| {
                 ui.label(egui::RichText::new(format_field_value(value)).weak());
             });
