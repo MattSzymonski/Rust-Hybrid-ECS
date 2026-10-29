@@ -2934,6 +2934,7 @@ impl EditorWindow {
             current_pivot: origin,
             reference,
             last_value: None,
+            written: None,
         });
         // The grabbed handle is the active one from here on, so it draws
         // dimmed for as long as the drag runs.
@@ -3092,44 +3093,125 @@ impl EditorWindow {
     /// Write a translation straight into the world; false when a component
     /// refused the write.
     fn write_translation(&mut self, entity: Entity, translation: [f32; 3]) -> bool {
-        self.write_transform_field(entity, "translation", &translation)
+        let written = self.write_transform_field(entity, "translation", &translation);
+        if written {
+            self.note_gizmo_write("translation", &translation);
+        }
+        written
     }
 
     /// Write a rotation straight into the world.
     fn write_rotation(&mut self, entity: Entity, rotation: [f32; 4]) -> bool {
-        self.write_transform_field(entity, "rotation", &rotation)
+        let written = self.write_transform_field(entity, "rotation", &rotation);
+        if written {
+            self.note_gizmo_write("rotation", &rotation);
+        }
+        written
     }
 
     /// Write a scale straight into the world.
     fn write_scale(&mut self, entity: Entity, scale: [f32; 3]) -> bool {
-        self.write_transform_field(entity, "scale", &scale)
+        let written = self.write_transform_field(entity, "scale", &scale);
+        if written {
+            self.note_gizmo_write("scale", &scale);
+        }
+        written
+    }
+
+    /// Note what the drag in flight last wrote, so its release can record one
+    /// step for it. A restore writes with no drag in flight and notes nothing.
+    fn note_gizmo_write(&mut self, field: &'static str, values: &[f32]) {
+        if let Some(drag) = self.gizmo_drag.as_mut() {
+            drag.written = Some((field, values.to_vec()));
+        }
     }
 
     /// Write one transform field's components, in order; false when any of
     /// them was refused.
+    ///
+    /// A refusal is logged here, where the entity, field and element index are
+    /// still known: the callers only see a `false` folded into "the move did
+    /// not land", which reads exactly like a drag that never moved.
     fn write_transform_field(&mut self, entity: Entity, field: &str, values: &[f32]) -> bool {
         let world = self.host.host_mut().engine_mut().world_mut();
         let mut written = true;
         for (index, value) in values.iter().enumerate() {
-            written &= world
-                .write_component_array_element(
-                    entity,
-                    TRANSFORM_SHARED_NAME,
-                    field,
+            if let Err(error) = world.write_component_array_element(
+                entity,
+                TRANSFORM_SHARED_NAME,
+                field,
+                index,
+                FieldValue::F32(*value),
+            ) {
+                warn!(
+                    target: telemetry_target::ENGINE,
+                    entity = %entity,
+                    field = %field,
                     index,
-                    FieldValue::F32(*value),
-                )
-                .is_ok();
+                    error = %error,
+                    "[editor] gizmo write refused"
+                );
+                written = false;
+            }
         }
         written
     }
 
     /// Write the press's whole transform back: a cancelled drag leaves the
-    /// object exactly where it started.
-    fn restore_transform(&mut self, entity: Entity, transform: &TransformComponent) {
-        let _ = self.write_translation(entity, transform.translation);
-        let _ = self.write_rotation(entity, transform.rotation);
-        let _ = self.write_scale(entity, transform.scale);
+    /// object exactly where it started. False when any of the three writes was
+    /// refused, so the cancel can say so instead of reporting a clean restore.
+    fn restore_transform(&mut self, entity: Entity, transform: &TransformComponent) -> bool {
+        let mut restored = self.write_translation(entity, transform.translation);
+        restored &= self.write_rotation(entity, transform.rotation);
+        restored &= self.write_scale(entity, transform.scale);
+        restored
+    }
+
+    /// Turn the drag that just ended into one recorded step, so `Ctrl+Z` after
+    /// a drag undoes it the way it undoes every other edit.
+    ///
+    /// The press's value is written back first, and that write is load-bearing:
+    /// the command's apply arm takes its inverse from the world's current
+    /// value, which the drag has already overwritten with the final one.
+    /// Queued on top of that, the step would record "final -> final" and the
+    /// first undo would consume a history entry and change nothing.
+    fn record_gizmo_drag(&mut self, drag: &GizmoDrag, mode: GizmoMode) {
+        let Some((field, values)) = drag.written.as_ref() else {
+            return;
+        };
+        let original = match *field {
+            "rotation" => drag.original.rotation.to_vec(),
+            "scale" => drag.original.scale.to_vec(),
+            _ => drag.original.translation.to_vec(),
+        };
+        let Some(edits) = gizmo::release_edits(&original, values) else {
+            return;
+        };
+        self.write_transform_field(drag.entity, field, &original);
+        let commands = edits
+            .into_iter()
+            .map(|(index, value)| {
+                inspector::element_edit(
+                    drag.entity,
+                    TRANSFORM_SHARED_NAME,
+                    field,
+                    index,
+                    FieldValue::F32(value),
+                )
+                .0
+            })
+            .collect();
+        let label = format!("gizmo {}", gizmo_mode_name(mode));
+        let world = self.host.host_mut().engine_mut().world_mut();
+        if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
+            pending.push_recorded(commands, label, None);
+        }
+        info!(
+            target: telemetry_target::ENGINE,
+            entity = %drag.entity,
+            field = %field,
+            "[editor] gizmo drag recorded"
+        );
     }
 
     /// End the drag in flight, reporting what it wrote. The guides and the
@@ -3175,6 +3257,7 @@ impl EditorWindow {
                 "[editor] gizmo drag ended without a move"
             ),
         }
+        self.record_gizmo_drag(&drag, mode);
         self.set_hovered_handle(drag.view, None);
     }
 
@@ -3185,7 +3268,14 @@ impl EditorWindow {
         let Some(drag) = self.gizmo_drag.take() else {
             return;
         };
-        self.restore_transform(drag.entity, &drag.original);
+        let restored = self.restore_transform(drag.entity, &drag.original);
+        if !restored {
+            warn!(
+                target: telemetry_target::ENGINE,
+                entity = %drag.entity,
+                "[editor] gizmo drag restore failed"
+            );
+        }
         info!(
             target: telemetry_target::ENGINE,
             mode = gizmo_mode_name(gizmo_drag_mode(drag.kind)),
@@ -9371,6 +9461,9 @@ struct GizmoDrag {
     reference: f32,
     /// The value written on the previous move, for the end log.
     last_value: Option<[f32; 4]>,
+    /// The transform field the last move wrote and the values it wrote there:
+    /// the release turns these into one recorded step.
+    written: Option<(&'static str, Vec<f32>)>,
 }
 
 /// The pick a scene press asked: the view and press pixel it happened at,

@@ -1319,6 +1319,7 @@ def main() -> int:
         # Translate: drag the X arrow 120 px right; the entity's x moves.
         before_x = field_values(gizmo_entity, "translation")[0]
         begin = len(session.read_log())
+        applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
         session.send("gizmo drag x 120 0")
         session.wait(
             re.escape(GIZMO_DRAG_PRESS_TOKEN) + r'\s+axis="x"',
@@ -1347,11 +1348,45 @@ def main() -> int:
             "the drag ended, unsnapped, with a value",
             begin,
         )
+        wait_applied(applied_before, "the drag's step applied")
         after_x = field_values(gizmo_entity, "translation")[0]
         assert abs(after_x - before_x) > 0.5, (
             f"the translate drag barely moved the entity: {before_x} -> {after_x}"
         )
         print(f"  [OK] translate drag moved x {before_x:.3f} -> {after_x:.3f}")
+
+        # A released drag is one recorded step: undo puts the press's
+        # translation back and redo returns the drag's, so the one
+        # manipulation a person is most likely to undo is undoable.
+        begin = len(session.read_log())
+        applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
+        session.send("command editor.undo")
+        session.wait(
+            re.escape(HISTORY_UNDO_TOKEN) + r'\s+label="gizmo translate"',
+            30,
+            "the drag undid as one step",
+            begin,
+        )
+        wait_applied(applied_before, "the drag's undo applied")
+        undone_x = field_values(gizmo_entity, "translation")[0]
+        assert abs(undone_x - before_x) < 1e-3, (
+            f"the undo did not restore the press's x: {undone_x} vs {before_x}"
+        )
+        begin = len(session.read_log())
+        applied_before = occurrence_count(session, re.escape(ENGINE_COMMANDS_APPLIED_TOKEN))
+        session.send("command editor.redo")
+        session.wait(
+            re.escape(HISTORY_REDO_TOKEN) + r'\s+label="gizmo translate"',
+            30,
+            "the drag redid",
+            begin,
+        )
+        wait_applied(applied_before, "the drag's redo applied")
+        redone_x = field_values(gizmo_entity, "translation")[0]
+        assert abs(redone_x - after_x) < 1e-3, (
+            f"the redo did not return the drag's x: {redone_x} vs {after_x}"
+        )
+        print(f"  [OK] drag undo/redo round-trip x {undone_x:.3f} -> {redone_x:.3f}")
 
         # Rotate: the Y ring turns the entity; the ended token carries the
         # quaternion the drag wrote. The project's own system animates this

@@ -26,22 +26,16 @@ pub struct ResourceEntry {
     pub name: &'static str,
     /// The label the Inspector's section shows.
     pub label: &'static str,
-    /// The editable fields, in row order, with their labels.
-    pub fields: &'static [(&'static str, &'static str)],
+    /// The editable fields, in row order: the resource's own table, the same
+    /// one its write path goes through.
+    pub fields: &'static [gizmo::ResourceField],
 }
 
 /// The resources the Inspector can show, in list order.
 pub const EDITABLE_RESOURCES: &[ResourceEntry] = &[ResourceEntry {
     name: gizmo::RESOURCE_NAME,
     label: "Gizmo Settings",
-    fields: &[
-        ("settings.mode", "Mode"),
-        ("settings.space", "Space"),
-        ("settings.snap", "Snapping"),
-        ("settings.translate_step", "Move step"),
-        ("settings.rotate_step_degrees", "Rotate step"),
-        ("settings.scale_step", "Scale step"),
-    ],
+    fields: gizmo::RESOURCE_FIELDS,
 }];
 
 /// The resource an entry names, when the list has one.

@@ -62,49 +62,49 @@ pub fn component_menu_items(
 #[pill_hot_fn]
 pub fn scene_context_menu(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui) {
     let settings = viewer.snapshot.gizmo;
-    let grid_enabled = viewer.snapshot.grid_enabled;
+    let state = toolbox::ToolboxState {
+        gizmo: settings,
+        grid: viewer.snapshot.grid_enabled,
+    };
     let pending = &mut viewer.pending;
     let response = ui.allocate_response(ui.available_size_before_wrap(), egui::Sense::click());
     context_menu("scene", &response, &mut viewer.overlay_regions, &mut |ui| {
-        for (mode, label, icon) in TOOL_ROWS {
-            let button = icons::IconButton::new(icon, label).active(settings.mode == mode);
+        // The rows are the toolbox's own, so a tool, a toggle or a space cannot
+        // be labelled or enabled one way here and another way on the panel.
+        for item in toolbox::TOOL_ROWS {
+            let button = icons::IconButton::new(item.icon(&state), item.menu_label())
+                .active(item.active(&state));
             if ui.add(button).clicked() {
-                pending.push(vec![EditorCommand::SetGizmoTool {
-                    mode: Some(mode),
-                    space: None,
-                    snap: None,
-                }]);
+                pending.push(vec![item.command(&state)]);
                 ui.close();
             }
         }
         ui.separator();
-        let snapping =
-            icons::IconButton::new(icons::Icon::Magnet, "Snapping").active(settings.snap);
+        let snapping = icons::IconButton::new(
+            toolbox::ToolboxItem::Snap.icon(&state),
+            toolbox::ToolboxItem::Snap.menu_label(),
+        )
+        .active(toolbox::ToolboxItem::Snap.active(&state));
         if ui.add(snapping).clicked() {
-            pending.push(vec![EditorCommand::SetGizmoTool {
-                mode: None,
-                space: None,
-                snap: Some(!settings.snap),
-            }]);
+            pending.push(vec![toolbox::ToolboxItem::Snap.command(&state)]);
             ui.close();
         }
-        for (space, label, icon) in SPACE_ROWS {
-            let button = icons::IconButton::new(icon, label).active(settings.space == space);
+        for row in toolbox::SPACE_ROWS {
+            let button =
+                icons::IconButton::new(row.icon, row.menu).active(settings.space == row.space);
             if ui.add(button).clicked() {
-                pending.push(vec![EditorCommand::SetGizmoTool {
-                    mode: None,
-                    space: Some(space),
-                    snap: None,
-                }]);
+                pending.push(vec![toolbox::space_command(row.space)]);
                 ui.close();
             }
         }
         ui.separator();
-        let grid = icons::IconButton::new(icons::Icon::GridFour, "Grid").active(grid_enabled);
+        let grid = icons::IconButton::new(
+            toolbox::ToolboxItem::Grid.icon(&state),
+            toolbox::ToolboxItem::Grid.menu_label(),
+        )
+        .active(toolbox::ToolboxItem::Grid.active(&state));
         if ui.add(grid).clicked() {
-            pending.push(vec![EditorCommand::SetGrid {
-                enabled: !grid_enabled,
-            }]);
+            pending.push(vec![toolbox::ToolboxItem::Grid.command(&state)]);
             ui.close();
         }
     });

@@ -737,7 +737,8 @@ impl EditorSnapshot {
     ///
     /// The engine keeps no resource reflection, so a resource that is not in
     /// [`crate::resources::EDITABLE_RESOURCES`] is not captured at all - there
-    /// is nothing to read it through.
+    /// is nothing to read it through. Every row of a table reads, because the
+    /// table is the same one the write path goes through.
     fn capture_resources(engine: &Engine) -> Vec<ResourceView> {
         let world = engine.world();
         let Some(settings) = world
@@ -754,14 +755,10 @@ impl EditorSnapshot {
                 fields: entry
                     .fields
                     .iter()
-                    .filter_map(|(field, label)| {
-                        crate::gizmo::resource_field_value(&settings, entry.name, field)
-                            .ok()
-                            .map(|value| ResourceFieldView {
-                                field: field.to_string(),
-                                label: label.to_string(),
-                                value,
-                            })
+                    .map(|field| ResourceFieldView {
+                        field: field.name.to_string(),
+                        label: field.label.to_string(),
+                        value: (field.read)(&settings),
                     })
                     .collect(),
             })
