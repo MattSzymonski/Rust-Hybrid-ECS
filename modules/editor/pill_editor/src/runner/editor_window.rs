@@ -527,8 +527,7 @@ impl EditorWindow {
             let Some(mut scene) = SceneView::open(event_loop, &window, view) else {
                 continue;
             };
-            let scene_size = scene.window.size();
-            scene.attach(&mut host, &cameras[view], scene_size);
+            scene.attach(&mut host, &cameras[view]);
             views[view] = Some(scene);
         }
         // The scene grid: the editor's view-bound viewports draw

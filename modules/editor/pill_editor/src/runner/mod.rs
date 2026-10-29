@@ -3285,11 +3285,17 @@ impl SurfaceWindow {
         })
     }
 
-    /// Place the window at the layout rectangle, in physical pixels,
-    /// showing it if it was hidden, and skipping redundant moves. The
-    /// detached fallback ignores the position: it is its own top-level
-    /// window.
-    fn place(&mut self, x: i32, y: i32, width: u32, height: u32) {
+    /// Place the window at a rectangle in physical pixels, showing it if it
+    /// was hidden and skipping redundant moves.
+    ///
+    /// `screen_owned` is a popped-out view's window: the pop-out owns a screen
+    /// rectangle on whatever monitor it is on, so the position always applies
+    /// and the client origin is read back after the move, because decorations
+    /// make it differ from the outer position. A docked view instead ignores
+    /// the position when the platform forced it to the detached fallback - it
+    /// is its own top-level window then - and its origin is the rectangle's
+    /// own corner.
+    fn place(&mut self, x: i32, y: i32, width: u32, height: u32, screen_owned: bool) {
         // A placement means the dock shows this window's tab again after a
         // switch or an undock; a hidden window still sits where it was, so
         // only the visibility changes.
@@ -3300,36 +3306,20 @@ impl SurfaceWindow {
         if self.placed == Some((x, y, width, height)) {
             return;
         }
-        if !self.detached {
+        if screen_owned || !self.detached {
             self.window.set_outer_position(PhysicalPosition::new(x, y));
-            // Recorded separately from the placement cache: pointer events
-            // this window reports are relative to it, and a resize (which
-            // clears the cache) does not move the window.
-            self.origin = (x, y);
         }
-        let _ = self
-            .window
-            .request_inner_size(PhysicalSize::new(width, height));
-        self.placed = Some((x, y, width, height));
-    }
-
-    /// Place a popped-out view's top-level window at a screen position: the
-    /// pop-out owns its screen rectangle, so the view window follows it there,
-    /// on whatever monitor that is.
-    fn place_screen(&mut self, x: i32, y: i32, width: u32, height: u32) {
-        if !self.visible {
-            self.window.set_visible(true);
-            self.visible = true;
-        }
-        if self.placed == Some((x, y, width, height)) {
-            return;
-        }
-        self.window.set_outer_position(PhysicalPosition::new(x, y));
         // The client origin is what a pointer event from this window is
-        // relative to; decorations make it differ from the outer position, so
-        // it is read back once the move was applied.
-        if let Ok(inner) = self.window.inner_position() {
-            self.origin = (inner.x, inner.y);
+        // relative to: a docked view's is the rectangle's corner, and a
+        // screen-owned one's is read back. Both are recorded outside the
+        // placement cache, because a resize clears the cache and never moves
+        // the window.
+        if screen_owned {
+            if let Ok(inner) = self.window.inner_position() {
+                self.origin = (inner.x, inner.y);
+            }
+        } else if !self.detached {
+            self.origin = (x, y);
         }
         let _ = self
             .window
@@ -3376,37 +3366,15 @@ impl SurfaceWindow {
 }
 
 impl SceneView {
-    /// Move the view onto `window` and re-attach its renderer surface to it:
-    /// a popped-out view needs a top-level window, and a redocked one needs a
-    /// child of the editor window again. The surface's previous window is
-    /// dropped by the host when the new one replaces it.
-    fn rebind_window(&mut self, host: &mut RenderingHost, window: SurfaceWindow, popped: bool) {
-        self.window = window;
-        self.popped = popped;
+    /// Attach the view's surface to the window it has now and publish the
+    /// view's camera binding for that surface.
+    ///
+    /// The one attach path: the startup window, a popped-out top-level and a
+    /// redocked child all come through here, so the camera publish cannot be
+    /// forgotten on one of them - which is what happened while the startup and
+    /// rebind copies were separate.
+    fn attach_to(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, rebound: bool) {
         let size = self.window.size();
-        match host.attach_surface(
-            self.surface_id,
-            Arc::clone(&self.window.window),
-            size.0,
-            size.1,
-            SurfaceOptions::default(),
-        ) {
-            Ok(()) => info!(
-                target: telemetry_target::ENGINE,
-                surface = self.surface_id.0,
-                popped,
-                "[editor] scene view rebound"
-            ),
-            Err(error) => warn!(
-                target: telemetry_target::ENGINE,
-                surface = self.surface_id.0,
-                error = %error,
-                "[editor] scene view rebind refused"
-            ),
-        }
-    }
-
-    fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera, size: (u32, u32)) {
         match host.attach_surface(
             self.surface_id,
             Arc::clone(&self.window.window),
@@ -3416,19 +3384,50 @@ impl SceneView {
         ) {
             Ok(()) => {
                 host.set_surface_camera(self.surface_id, Some(camera_binding(camera)));
-                info!(
-                    target: telemetry_target::ENGINE,
-                    surface = self.surface_id.0,
-                    detached = self.window.detached,
-                    "[editor] scene surface attached"
-                );
+                if rebound {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        surface = self.surface_id.0,
+                        popped = self.popped,
+                        "[editor] scene view rebound"
+                    );
+                } else {
+                    info!(
+                        target: telemetry_target::ENGINE,
+                        surface = self.surface_id.0,
+                        detached = self.window.detached,
+                        "[editor] scene surface attached"
+                    );
+                }
             }
             Err(error) => warn!(
                 target: telemetry_target::ENGINE,
+                surface = self.surface_id.0,
                 error = %error,
                 "[editor] scene surface refused; the scene view stays empty"
             ),
         }
+    }
+
+    /// Attach the view to the window it was opened with.
+    fn attach(&mut self, host: &mut RenderingHost, camera: &OrbitCamera) {
+        self.attach_to(host, camera, false);
+    }
+
+    /// Move the view onto `window` and attach to it: a popped-out view needs a
+    /// top-level window, and a redocked one needs a child of the editor window
+    /// again. The surface's previous window is dropped by the host when the new
+    /// one replaces it.
+    fn rebind_window(
+        &mut self,
+        host: &mut RenderingHost,
+        window: SurfaceWindow,
+        popped: bool,
+        camera: &OrbitCamera,
+    ) {
+        self.window = window;
+        self.popped = popped;
+        self.attach_to(host, camera, true);
     }
 }
 
