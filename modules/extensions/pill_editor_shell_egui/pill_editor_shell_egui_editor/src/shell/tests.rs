@@ -244,8 +244,7 @@ fn drawing_every_tab_body_queues_nothing() {
     style::apply(&context);
     let mut regions = Vec::new();
     let mut inspector_session = InspectorSession::default();
-    let previews = std::collections::BTreeMap::new();
-    let mut preview_visible = Vec::new();
+    let mut previews = pill_editor_core::session::PreviewStates::default();
     run_pass(&context, &mut |ui| {
         egui::CentralPanel::default().show(ui, |ui| {
             entities_tab(
@@ -272,8 +271,7 @@ fn drawing_every_tab_body_queues_nothing() {
                     pending: &mut pending,
                     overlay_regions: &mut regions,
                     drag_out: &mut drag_out,
-                    previews: &previews,
-                    preview_visible: &mut preview_visible,
+                    previews: &mut previews,
                 };
                 assets_tab(ui, &snapshot, &mut browser, &mut writes);
             }
@@ -362,16 +360,14 @@ fn the_assets_panel_wraps_a_long_tile_caption_and_queues_nothing() {
             assets_path_bar(ui, &mut browser);
             assets_zoom_bar(ui, &snapshot.assets, &mut browser);
             {
-                let previews = std::collections::BTreeMap::new();
-                let mut preview_visible = Vec::new();
+                let mut previews = pill_editor_core::session::PreviewStates::default();
                 let mut writes = AssetTileWrites {
                     selection: &mut selection,
                     dialog: &mut dialog,
                     pending: &mut pending,
                     overlay_regions: &mut regions,
                     drag_out: &mut drag_out,
-                    previews: &previews,
-                    preview_visible: &mut preview_visible,
+                    previews: &mut previews,
                 };
                 assets_grid(ui, &snapshot, &mut browser, &mut writes);
             }
@@ -511,16 +507,14 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
         run_pass_with(context, events, &mut |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.allocate_ui(egui::vec2(640.0, 300.0), |ui| {
-                    let previews = std::collections::BTreeMap::new();
-                    let mut preview_visible = Vec::new();
+                    let mut previews = pill_editor_core::session::PreviewStates::default();
                     let mut writes = AssetTileWrites {
                         selection,
                         dialog,
                         pending,
                         overlay_regions: regions,
                         drag_out,
-                        previews: &previews,
-                        preview_visible: &mut preview_visible,
+                        previews: &mut previews,
                     };
                     assets_grid(ui, snapshot, browser, &mut writes);
                 });

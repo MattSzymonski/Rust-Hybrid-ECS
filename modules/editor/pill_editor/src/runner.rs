@@ -2095,7 +2095,7 @@ impl EditorWindow {
                 // and the grid moves on, rather than waiting on this file
                 // forever.
                 if image.is_empty() {
-                    state.preview_refused.insert(path.clone());
+                    state.previews.mark_refused(&path);
                     info!(
                         target: telemetry_target::ENGINE,
                         path = path.as_str(),
@@ -2110,7 +2110,7 @@ impl EditorWindow {
                     egui::ColorImage::from_rgba_unmultiplied(size, &image.rgba),
                     egui::TextureOptions::LINEAR,
                 );
-                state.previews.insert(path.clone(), texture);
+                state.previews.mark_ready(&path, texture);
                 info!(
                     target: telemetry_target::ENGINE,
                     path = path.as_str(),
@@ -2130,11 +2130,10 @@ impl EditorWindow {
                 return;
             };
             state
-                .preview_visible
+                .previews
+                .visible()
                 .iter()
-                .filter(|key| {
-                    !state.previews.contains_key(*key) && !state.preview_refused.contains(*key)
-                })
+                .filter(|key| state.previews.wants(key))
                 .cloned()
                 .collect()
         };
@@ -2171,7 +2170,7 @@ impl EditorWindow {
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(state) = world.get_resource_mut::<EguiShellState>() {
                 for key in &skipped {
-                    state.preview_refused.insert(key.clone());
+                    state.previews.mark_refused(key);
                 }
             }
             for key in &skipped {
@@ -5277,12 +5276,10 @@ impl EditorWindow {
             let world = self.host.host_mut().engine_mut().world_mut();
             if let Some(state) = world.get_resource_mut::<EguiShellState>() {
                 if tree_moved {
-                    state.previews.retain(|key, _| unchanged.contains(key));
-                    state.preview_refused.retain(|key| unchanged.contains(key));
+                    state.previews.retain_keys(&unchanged);
                 } else {
                     self.preview_in_flight.clear();
                     state.previews.clear();
-                    state.preview_refused.clear();
                 }
             }
         }
@@ -5770,7 +5767,6 @@ impl EditorWindow {
                     .get_resource_mut::<EguiShellState>()
                 {
                     state.previews.clear();
-                    state.preview_refused.clear();
                 }
             } else if let Some(state) = self
                 .host
@@ -5782,7 +5778,7 @@ impl EditorWindow {
                 // Turning previews on asks again for everything a refusal left
                 // behind, so a tile refused while the switch was off does not
                 // stay blank for the session.
-                state.preview_refused.clear();
+                state.previews.clear_refused();
             }
             info!(
                 target: telemetry_target::ENGINE,

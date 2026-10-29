@@ -7,7 +7,6 @@
 //!   flips in the Preferences tab.
 //! - [`preview_asset`]: which renderer preview a listing row asks for, from its
 //!   asset type, its file and its guid.
-//! - [`PreviewQueue`]: the tile paths one grid pass drew, in draw order.
 //!
 //! # Design
 //!
@@ -85,30 +84,6 @@ pub fn preview_asset_for<'a>(
         .into_iter()
         .find(|row| row.key() == key)
         .and_then(|row| preview_asset(row, root))
-}
-
-/// The tile paths one pass of the Assets grid drew, in draw order.
-///
-/// [`PreviewQueue::clear`] starts a pass and [`PreviewQueue::push`] records a
-/// drawn tile, so a reader can ask for previews only for what is visible.
-#[derive(Default)]
-pub struct PreviewQueue {
-    /// The visible tiles' paths, in draw order.
-    pub paths: Vec<String>,
-}
-
-impl pill_engine::Resource for PreviewQueue {}
-
-impl PreviewQueue {
-    /// Start a new pass's list of visible tiles.
-    pub fn clear(&mut self) {
-        self.paths.clear();
-    }
-
-    /// Record one tile that was drawn.
-    pub fn push(&mut self, path: &str) {
-        self.paths.push(path.to_string());
-    }
 }
 
 #[cfg(test)]

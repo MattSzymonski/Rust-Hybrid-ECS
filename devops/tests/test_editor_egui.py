@@ -288,7 +288,6 @@ POPOUT_MOVED_TOKEN = "[editor] popout moved"
 POPOUT_OPENED_TOKEN = "[editor] popout opened"
 POPOUT_CLOSED_TOKEN = "[editor] popout closed"
 POPOUT_PRESENTED_TOKEN = "[editor] popout presented"
-POPOUT_CLAIMED_TOKEN = "[editor] popout contexts claimed"
 DOCK_POPOUT_TOKEN = "[editor] egui dock popout"
 SCENE_VIEW_REBOUND_TOKEN = "[editor] scene view rebound"
 TOOLBOX_RECT_TOKEN = "[editor] toolbox rect"
@@ -5270,12 +5269,13 @@ def main() -> int:
 
         # The pop-out that was open across the reload kept its window: the
         # new generation cleared its context before drawing into it, and the
-        # dock model still lists the tab as popped out. The claim line is the
-        # first one in the log - the generation before the reload had already
-        # claimed, so it never logged - which is why it is waited for by
-        # occurrence rather than by offset.
+        # dock model still lists the tab as popped out. One claim line covers
+        # every context the session owns, so the wait is for the line naming
+        # the popped-out window, by occurrence rather than by offset: the
+        # generation before the reload had already claimed and never logged a
+        # window.
         session.wait_occurrence(
-            re.escape(POPOUT_CLAIMED_TOKEN) + r"\s+windows=1\b",
+            re.escape(SHELL_CONTEXT_CLAIMED_TOKEN) + r"\s+entries=\d+\s+windows=1\b",
             1,
             60,
             "the reloaded shell claimed the pop-out's context",
