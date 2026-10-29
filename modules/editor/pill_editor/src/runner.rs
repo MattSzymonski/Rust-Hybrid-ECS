@@ -73,6 +73,7 @@ use pill_editor_core::scripted::{
     AssetEdit, Dump, KeyChord, PaletteRequest, ScriptedCommand, ToolbarAction,
 };
 use pill_editor_core::session::{EguiShellState, HistoryRequest};
+use pill_editor_core::state_watch::StateFileWatch;
 use pill_editor_core::style::{
     layers_text, merge_layers, ThemeLayer, ThemeLayerInfo, UserThemeSelection,
 };
@@ -260,11 +261,10 @@ const ASSET_REFRESH_FRAMES: u64 = 120;
 /// rewriting the file every frame.
 const RECOVERY_AUTOSAVE_FRAMES: u64 = 120;
 
-/// Frames between unconditional re-reads of the editor's state files:
-/// a frame reads `preferences.json` and `keybindings.json` only when their
-/// metadata moved, so this is the longest an edit can take to reach the editor
-/// on a filesystem whose timestamps are too coarse to see it.
-const STATE_FILE_POLL_FRAMES: u64 = 30;
+/// Frames between unconditional re-reads of the editor's state files - the
+/// theme's layers poll on it, and the watchers in
+/// [`pill_editor_core::state_watch`] do.
+const STATE_FILE_POLL_FRAMES: u64 = pill_editor_core::state_watch::STATE_FILE_POLL_FRAMES;
 
 /// How many walked asset rows the listing keeps, before the module group
 /// rows the frame adds on top.
@@ -780,19 +780,16 @@ struct EditorWindow {
     /// The path `asset_detail` was captured for, so the capture follows the
     /// selection without a disk read every frame.
     asset_detail_path: Option<String>,
-    /// The preferences file's text last read; the live reader applies the
-    /// history limits and the snapping steps when it changes.
-    preferences_text: Option<String>,
-    /// The preferences file's metadata when it was last read, so a frame only
-    /// reads a file that moved.
-    preferences_stamp: FileStamp,
-    /// The keybindings file's text last read; a change re-applies the preset
-    /// and the overrides to the command registry.
-    keybindings_text: Option<String>,
-    /// The keybindings file's metadata when it was last read.
-    keybindings_stamp: FileStamp,
-    /// Whether the keybindings watcher ran once: the first pass applies the
-    /// editor's default preset even when there is no file to differ from it.
+    /// The preferences file: its text and stamp, read when the file moves. The
+    /// live reader applies the history limits and the snapping steps when it
+    /// changes.
+    preferences: StateFileWatch,
+    /// The keybindings file: a change re-applies the preset and the overrides
+    /// to the command registry.
+    keybindings: StateFileWatch,
+    /// Whether the keybindings watcher has applied once: the first pass
+    /// applies the editor's default preset even when there is no file, and
+    /// until it has applied, the file is re-read every frame.
     keybindings_applied: bool,
     /// The telemetry capture ring the Console tab reads.
     log_buffer: pill_core::telemetry::capture::LogBuffer,
@@ -1207,10 +1204,8 @@ impl EditorWindow {
             ime_rect: None,
             asset_detail: None,
             asset_detail_path: None,
-            preferences_text: None,
-            preferences_stamp: FileStamp::default(),
-            keybindings_text: None,
-            keybindings_stamp: FileStamp::default(),
+            preferences: StateFileWatch::new(layout_directory().join(PREFERENCES_FILE)),
+            keybindings: StateFileWatch::new(layout_directory().join(KEYBINDINGS_FILE)),
             keybindings_applied: false,
             log_buffer,
             preferences_document: serde_json::Map::new(),
@@ -5712,25 +5707,15 @@ impl EditorWindow {
     /// the stale copy a persisting write leaves behind never moves the live
     /// tool; the snapping steps are the file's, one set for every project.
     fn watch_preferences(&mut self) {
-        let directory = layout_directory();
-        let path = directory.join(PREFERENCES_FILE);
-        let stamp = FileStamp::of(&path);
-        let due = self.frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
-        if !due && stamp == self.preferences_stamp {
+        if self.preferences.poll(self.frame_index).is_none() {
             return;
         }
-        self.preferences_stamp = stamp;
-        let text = std::fs::read_to_string(&path).ok();
-        if text == self.preferences_text {
-            return;
-        }
-        self.preferences_text = text;
-        let preferences = self
-            .preferences_text
+        let text = self.preferences.text().map(str::to_string);
+        let preferences = text
             .as_deref()
             .and_then(|text| serde_json::from_str::<EditorPreferences>(text).ok())
             .unwrap_or_default();
-        self.preferences_document = match self.preferences_text.as_deref() {
+        self.preferences_document = match text.as_deref() {
             Some(text) => match preferences::parse_document(text) {
                 Ok(document) => document,
                 Err(message) => {
@@ -6222,22 +6207,19 @@ impl EditorWindow {
     /// per chord that two commands now answer to. A missing or malformed file
     /// is an empty one: the built-ins' own bindings stand.
     fn watch_keybindings(&mut self) {
-        let directory = layout_directory();
-        let path = directory.join(KEYBINDINGS_FILE);
-        let stamp = FileStamp::of(&path);
-        let due = self.frame_index.is_multiple_of(STATE_FILE_POLL_FRAMES);
-        if !due && self.keybindings_applied && stamp == self.keybindings_stamp {
+        // Until the registry has applied a file, every frame re-reads it: a
+        // file that could not be applied is retried rather than skipped as
+        // unchanged. Once it has, the watch's own stamp rule takes over.
+        let changed = if self.keybindings_applied {
+            self.keybindings.poll(self.frame_index)
+        } else {
+            self.keybindings.poll_now()
+        };
+        let Some(text) = changed else {
             return;
-        }
-        self.keybindings_stamp = stamp;
-        let text = std::fs::read_to_string(&path).ok();
-        if self.keybindings_applied && text == self.keybindings_text {
-            return;
-        }
+        };
         self.keybindings_applied = true;
-        self.keybindings_text = text;
-        let file = self
-            .keybindings_text
+        let file = text
             .as_deref()
             .and_then(|text| serde_json::from_str::<KeybindingsFile>(text).ok())
             .unwrap_or_else(editor_default_keybindings);
@@ -6317,8 +6299,8 @@ impl EditorWindow {
             None => file,
         };
         let command = self
-            .preferences_text
-            .as_deref()
+            .preferences
+            .text()
             .and_then(|text| serde_json::from_str::<EditorPreferences>(text).ok())
             .and_then(|preferences| preferences.code_editor_command)
             .filter(|command| !command.trim().is_empty())
@@ -9194,29 +9176,10 @@ enum CommandAction {
 /// A state file's metadata: what a frame compares to decide whether the file
 /// needs reading at all.
 ///
-/// The editor's state files are written by hand or by another tool, so there
-/// is no in-process writer to hook; the metadata is the signal. A missing file
-/// stamps as the default, which differs from any file that exists, so creating
-/// one is noticed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct FileStamp {
-    /// The file's modification time, when the filesystem reports one.
-    modified: Option<std::time::SystemTime>,
-    /// Its length in bytes.
-    length: u64,
-}
-
-impl FileStamp {
-    /// The stamp of `path`, or the default when it cannot be read.
-    fn of(path: &std::path::Path) -> Self {
-        std::fs::metadata(path)
-            .map(|metadata| Self {
-                modified: metadata.modified().ok(),
-                length: metadata.len(),
-            })
-            .unwrap_or_default()
-    }
-}
+/// The theme's layers keep their own stamps - they name a selection to
+/// re-resolve rather than a document to read - and the rule itself lives in
+/// [`pill_editor_core::state_watch`], where the two plain watchers share it.
+type FileStamp = pill_editor_core::state_watch::FileStamp;
 
 /// The snapshot fields that differ between two captures, comma-joined.
 ///

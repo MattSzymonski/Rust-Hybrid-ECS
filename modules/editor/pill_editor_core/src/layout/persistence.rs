@@ -171,52 +171,15 @@ pub fn save(dock: &EditorDock) {
 fn save_to_path(dock: &EditorDock, path: PathBuf) -> Result<(), LayoutPersistenceError> {
     let document = serde_json::to_vec_pretty(&dock.settled())
         .map_err(|source| LayoutPersistenceError::Serialization { source })?;
-    write_atomic(&path, &document)
-}
-
-/// Write `document` to `path` through a temporary file and a recoverable
-/// replace, so a crash mid-write never corrupts the previous document.
-fn write_atomic(path: &Path, document: &[u8]) -> Result<(), LayoutPersistenceError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| LayoutPersistenceError::Filesystem {
+    crate::editor_files::write_bytes(&path, &document).map_err(|error| match error {
+        crate::editor_files::FileError::Write { path, source } => {
+            LayoutPersistenceError::Filesystem { path, source }
+        }
+        other => LayoutPersistenceError::Filesystem {
             path: path.display().to_string(),
-            source: io::Error::new(io::ErrorKind::InvalidInput, "layout path has no parent"),
-        })?;
-    std::fs::create_dir_all(parent).map_err(|source| LayoutPersistenceError::Filesystem {
-        path: parent.display().to_string(),
-        source,
-    })?;
-    let temporary = path.with_extension("json.tmp");
-    let backup = path.with_extension("json.bak");
-    std::fs::write(&temporary, document).map_err(|source| LayoutPersistenceError::Filesystem {
-        path: temporary.display().to_string(),
-        source,
-    })?;
-
-    // Unix rename replaces atomically. Windows rename does not replace an
-    // existing target, so keep the previous valid file as a short-lived
-    // backup while installing the new document.
-    if std::fs::rename(&temporary, path).is_err() {
-        let _ = std::fs::remove_file(&backup);
-        if path.exists() {
-            std::fs::rename(path, &backup).map_err(|source| {
-                LayoutPersistenceError::Filesystem {
-                    path: backup.display().to_string(),
-                    source,
-                }
-            })?;
-        }
-        if let Err(source) = std::fs::rename(&temporary, path) {
-            let _ = std::fs::rename(&backup, path);
-            return Err(LayoutPersistenceError::Filesystem {
-                path: path.display().to_string(),
-                source,
-            });
-        }
-    }
-    let _ = std::fs::remove_file(&backup);
-    Ok(())
+            source: io::Error::other(other.message()),
+        },
+    })
 }
 
 /// The directory the editor's layout files live in.
@@ -312,6 +275,31 @@ mod tests {
                 "{tab:?} moved between the file and the load"
             );
         }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Saving twice replaces the document: the rename the shared state-file
+    /// rule relies on is a replace on this platform too, so the writer no
+    /// longer keeps a `.bak` fallback for the opposite belief.
+    #[test]
+    fn a_second_save_replaces_the_first_layout() {
+        let directory = scratch_directory("second_save");
+        let path = directory.join(LAYOUT_FILE);
+        save_to_path(&EditorDock::new(), path.clone()).expect("the first save");
+        let mut moved = EditorDock::new();
+        moved.pop_out(EditorTab::Console);
+        save_to_path(&moved, path.clone()).expect("the second save");
+
+        let loaded = load_from_path(&path);
+
+        assert!(
+            loaded.is_popped_out(EditorTab::Console),
+            "the second save did not land"
+        );
+        assert!(
+            !path.with_extension("json.bak").exists(),
+            "the writer kept a backup file"
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 

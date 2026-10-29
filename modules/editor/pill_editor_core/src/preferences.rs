@@ -337,12 +337,12 @@ pub fn set_key(document: &mut Map<String, Value>, key: &str, value: Value) -> Re
 /// JSON object.
 pub fn read_document(directory: &Path) -> Result<Map<String, Value>, String> {
     let path = directory.join(PREFERENCES_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(error) => return Err(format!("{PREFERENCES_FILE}: {error}")),
-    };
-    parse_document(&text)
+    match crate::editor_files::read_json::<Value>(&path) {
+        Ok(Some(Value::Object(document))) => Ok(document),
+        Ok(Some(_)) => Err(format!("{PREFERENCES_FILE} is not a JSON object")),
+        Ok(None) => Ok(Map::new()),
+        Err(error) => Err(error.message()),
+    }
 }
 
 /// Parse a preferences file's text into its document.
@@ -359,21 +359,36 @@ pub fn parse_document(text: &str) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// Write the document through a temporary file and a rename, creating the
-/// directory when the profile never saved a layout.
+/// Write the document through the shared state-file rule: a temporary file
+/// and a rename, creating the directory when the profile never saved a layout.
 ///
 /// # Errors
 ///
 /// A message when the document cannot be serialized or the file cannot be
 /// replaced.
 pub fn write_document(directory: &Path, document: &Map<String, Value>) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(&Value::Object(document.clone()))
-        .map_err(|error| error.to_string())?;
-    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     let path = directory.join(PREFERENCES_FILE);
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, text).map_err(|error| error.to_string())?;
-    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
+    crate::editor_files::write_json(&path, &Value::Object(document.clone()))
+        .map_err(|error| error.message())
+}
+
+/// Read, edit and write the preferences document in one step.
+///
+/// This is the only way a part of the editor updates its own keys: a caller
+/// says what it owns and leaves the rest of the document alone, and a document
+/// that cannot be read stops the edit instead of being replaced by one holding
+/// only the caller's keys.
+///
+/// # Errors
+///
+/// The read's or the write's message; the edit's own error when it refuses.
+pub fn update(
+    directory: &Path,
+    edit: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut document = read_document(directory)?;
+    edit(&mut document)?;
+    write_document(directory, &document)
 }
 
 #[cfg(test)]
@@ -607,5 +622,72 @@ mod tests {
         assert!(parse_document("{\"theme\": \"dark\"}")
             .expect("an object is a document")
             .contains_key("theme"));
+    }
+
+    /// Two saves in a row land: the second replaces the first, which is the
+    /// fact the layout writer's removed `.bak` fallback doubted.
+    #[test]
+    fn a_second_save_replaces_the_first_document() {
+        let directory = scratch_directory("second-save");
+        let mut first = Map::new();
+        first.insert("theme".to_owned(), Value::String("dark".to_owned()));
+        write_document(&directory, &first).expect("the first save");
+        let mut second = Map::new();
+        second.insert("theme".to_owned(), Value::String("light".to_owned()));
+        write_document(&directory, &second).expect("the second save");
+        let read = read_document(&directory).expect("the read");
+        assert_eq!(lookup(&read, THEME_PREFERENCE_KEY), second.get("theme"));
+        assert!(!directory
+            .join(PREFERENCES_FILE)
+            .with_extension("tmp")
+            .exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An update owns its own key and leaves every other one alone, which is
+    /// what the gizmo's save used to fail to do.
+    #[test]
+    fn an_update_keeps_the_keys_it_does_not_own() {
+        let directory = scratch_directory("update");
+        std::fs::write(
+            directory.join(PREFERENCES_FILE),
+            r#"{ "theme": "dark", "editor.history_step_cap": 42 }"#,
+        )
+        .expect("the seeded document");
+        update(&directory, |document| {
+            document.insert("gizmo".to_owned(), Value::String("written".to_owned()));
+            Ok(())
+        })
+        .expect("the update");
+        let read = read_document(&directory).expect("the read");
+        assert!(read.contains_key("gizmo"));
+        assert!(read.contains_key("theme"), "the update erased `theme`");
+        assert!(read.contains_key("editor.history_step_cap"));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A document that cannot be parsed stops the update: the file still holds
+    /// the caller's own text, and no partial document replaces it.
+    #[test]
+    fn an_update_refuses_a_document_it_cannot_read() {
+        let directory = scratch_directory("update-corrupt");
+        let path = directory.join(PREFERENCES_FILE);
+        let broken = "{ \"theme\": \"dark\", }";
+        std::fs::write(&path, broken).expect("the broken document");
+        let error = update(&directory, |document| {
+            document.insert("gizmo".to_owned(), Value::String("written".to_owned()));
+            Ok(())
+        })
+        .expect_err("a broken document stops the update");
+        assert!(
+            error.contains("is not valid JSON"),
+            "unexpected message: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the document"),
+            broken,
+            "the failed update rewrote the document"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

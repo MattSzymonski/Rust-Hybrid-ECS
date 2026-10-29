@@ -84,13 +84,7 @@ pub fn recovery_path() -> std::path::PathBuf {
 /// running, because losing recoverability must never stop the editor.
 pub fn write(document: &RecoveryDocument) -> bool {
     let path = recovery_path();
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let written = std::fs::create_dir_all(parent)
-        .map_err(|error| error.to_string())
-        .and_then(|()| serde_json::to_vec_pretty(document).map_err(|error| error.to_string()))
-        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|error| error.to_string()));
+    let written = crate::editor_files::write_json(&path, document).map_err(|error| error.message());
     match written {
         Ok(()) => true,
         Err(message) => {

@@ -80,6 +80,9 @@ pub mod commands;
 pub mod console;
 /// The frame boundary: the pending-command drain and the undo/redo walk.
 pub mod drain;
+/// The editor's own state documents on disk: one durability rule, one error
+/// surface.
+pub mod editor_files;
 /// The editor's snapshots of the engine and the commands it applies to it.
 pub mod editor_state;
 /// The Entities tab's shared actions: the recorded create and delete.
@@ -121,6 +124,8 @@ pub mod scene_workflow;
 pub mod scripted;
 /// The egui shell's long-lived session state.
 pub mod session;
+/// Polling the editor's state files for changes.
+pub mod state_watch;
 /// The editor's egui theme.
 pub mod style;
 /// The Systems tab's shared logic: row labels, system toggles and the

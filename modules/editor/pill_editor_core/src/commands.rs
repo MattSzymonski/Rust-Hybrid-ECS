@@ -993,42 +993,34 @@ pub fn write_gizmo_preferences(
     project: &str,
     settings: &crate::gizmo::GizmoSettings,
 ) -> Result<(), String> {
-    let path = directory.join(PREFERENCES_FILE);
-    let mut document = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    let mut gizmo = document
-        .get("gizmo")
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    gizmo.insert("mode".to_string(), serde_json::json!(settings.mode));
-    gizmo.insert("space".to_string(), serde_json::json!(settings.space));
-    gizmo.insert("snap".to_string(), serde_json::json!(settings.snap));
-    let mut projects = gizmo
-        .get("projects")
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    projects.insert(
-        project.to_string(),
-        serde_json::json!({
-            "mode": settings.mode,
-            "space": settings.space,
-            "snap": settings.snap,
-        }),
-    );
-    gizmo.insert("projects".to_string(), serde_json::Value::Object(projects));
-    document.insert("gizmo".to_string(), serde_json::Value::Object(gizmo));
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(document))
-        .map_err(|error| error.to_string())?;
-    // The directory belongs to the layout, which may never have been saved
-    // in this profile: the write creates it rather than assuming a save
-    // came first.
-    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, text).map_err(|error| error.to_string())?;
-    std::fs::rename(&temporary, &path).map_err(|error| error.to_string())
+    // The preferences document has one owner: this is an edit of it, not a
+    // second reader. A document that cannot be read stops the save instead of
+    // being replaced by one holding only `gizmo`, which used to erase every
+    // other key.
+    crate::preferences::update(directory, |document| {
+        let mut gizmo = document
+            .get("gizmo")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        gizmo.insert("mode".to_string(), serde_json::json!(settings.mode));
+        gizmo.insert("space".to_string(), serde_json::json!(settings.space));
+        gizmo.insert("snap".to_string(), serde_json::json!(settings.snap));
+        let mut projects = gizmo
+            .get("projects")
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        projects.insert(
+            project.to_string(),
+            serde_json::json!({
+                "mode": settings.mode,
+                "space": settings.space,
+                "snap": settings.snap,
+            }),
+        );
+        gizmo.insert("projects".to_string(), serde_json::Value::Object(projects));
+        document.insert("gizmo".to_string(), serde_json::Value::Object(gizmo));
+        Ok(())
+    })
 }
 
 /// The world resource carrying commands executed this frame to their owners.

@@ -213,14 +213,7 @@ pub fn write_scene(engine: &mut Engine, path: Option<&str>) -> Result<OpenScene,
     };
     let bytes = render_standalone::<Scene>(guid, &document)
         .map_err(|error| format!("the scene cannot be rendered: {error}"))?;
-    if let Some(parent) = file.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
-        }
-    }
-    std::fs::write(&file, &bytes)
-        .map_err(|error| format!("cannot write `{}`: {error}", file.display()))?;
+    crate::editor_files::write_bytes(&file, &bytes).map_err(|error| error.message())?;
 
     // Re-read the file: the world and the loaded asset then agree, and a file
     // the engine cannot read back is caught here rather than at the next open.
