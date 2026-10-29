@@ -5081,12 +5081,50 @@ def main() -> int:
         )
         print("  [OK] frame body patched live")
 
+        # The tab dispatch itself: this body lived in `impl TabViewer for
+        # EditorTabViewer<'_>` until it moved to the free `tab_body`, and the
+        # scanner refuses an impl header carrying a lifetime, so a patch could
+        # never address it there. The probe sits in the Scene arm, the first
+        # one, where a statement is legal.
+        dispatch_anchor = newline.join(
+            (
+                "        EditorTab::Scene(view) => {",
+                "            let view = view as usize;",
+            )
+        )
+        assert dispatch_anchor in patched_frame, "the tab dispatch moved; update the step"
+        patched_dispatch = patched_frame.replace(
+            dispatch_anchor,
+            newline.join(
+                (
+                    "        EditorTab::Scene(view) => {",
+                    "            // A patch probe: one statement, inside the dispatch only.",
+                    "            let _hot_dispatch_probe = 0u8;",
+                    "            let view = view as usize;",
+                )
+            ),
+            1,
+        )
+        begin = len(session.read_log())
+        session.edit_source(shell_source, patched_dispatch)
+        session.wait(
+            HOT_PATCH_LIVE_PATTERN.format("tab_body"),
+            180,
+            "the tab dispatch patched live",
+            begin,
+        )
+        highest = wait_for_frames_past(session, highest, 120, "frame counter continued")
+        print(
+            "  [OK] tab dispatch patched live, frame counter continued past "
+            f"{highest}"
+        )
+
         # Step 7: a structural edit of the shell reloads it; the rearranged
         # dock (a second surface) must survive the reload. An item added
         # outside every hot body cannot be patched at all, so the host reloads
         # and the waits below count occurrences rather than assuming how many
         # happened.
-        structural = patched_frame + (
+        structural = patched_dispatch + (
             "\n/// A marker the egui suite adds so the module grows an item and "
             "must reload, not patch.\npub fn egui_suite_marker() -> u32 {\n    1\n}\n"
         )
