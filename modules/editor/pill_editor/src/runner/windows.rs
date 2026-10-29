@@ -173,7 +173,7 @@ impl EditorWindow {
             match SurfaceWindow::open_top_level(event_loop, &title) {
                 Ok(window) => {
                     let host = &mut self.host;
-                    let camera = self.cameras[view].clone();
+                    let camera = self.cameras[view];
                     if let Some(Some(scene)) = self.views.get_mut(view) {
                         scene.rebind_window(host, window, true, &camera);
                     }
@@ -210,7 +210,7 @@ impl EditorWindow {
         match SurfaceWindow::open(event_loop, &self.window, &title, "scene") {
             Ok(window) => {
                 let host = &mut self.host;
-                let camera = self.cameras[view].clone();
+                let camera = self.cameras[view];
                 if let Some(Some(scene)) = self.views.get_mut(view) {
                     scene.rebind_window(host, window, false, &camera);
                 }

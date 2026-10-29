@@ -343,11 +343,11 @@ pub(super) struct ScriptedDrag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScriptedDragStage {
     /// The pointer has not gone down yet.
-    PressPending,
+    Press,
     /// The button is down and the pointer has not moved yet.
-    MovePending,
+    Move,
     /// The move landed and the button is still down.
-    ReleasePending,
+    Release,
 }
 
 impl EditorWindow {

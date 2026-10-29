@@ -66,7 +66,7 @@ impl EditorWindow {
         };
         let (from, to, stage) = (drag.from, drag.to, drag.stage);
         match stage {
-            ScriptedDragStage::PressPending => {
+            ScriptedDragStage::Press => {
                 self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(from.0, from.1),
                 });
@@ -75,18 +75,18 @@ impl EditorWindow {
                     state: ButtonState::Pressed,
                 });
                 if let Some(drag) = self.scripted_drag.as_mut() {
-                    drag.stage = ScriptedDragStage::MovePending;
+                    drag.stage = ScriptedDragStage::Move;
                 }
             }
-            ScriptedDragStage::MovePending => {
+            ScriptedDragStage::Move => {
                 self.queue_input(InputEvent::CursorMoved {
                     position: pill_core::math::Vector2f::new(to.0, to.1),
                 });
                 if let Some(drag) = self.scripted_drag.as_mut() {
-                    drag.stage = ScriptedDragStage::ReleasePending;
+                    drag.stage = ScriptedDragStage::Release;
                 }
             }
-            ScriptedDragStage::ReleasePending => {
+            ScriptedDragStage::Release => {
                 self.queue_input(InputEvent::MouseButton {
                     button: MouseButton::Left,
                     state: ButtonState::Released,
@@ -2196,7 +2196,7 @@ impl EditorWindow {
         self.scripted_drag = Some(ScriptedDrag {
             from,
             to,
-            stage: ScriptedDragStage::PressPending,
+            stage: ScriptedDragStage::Press,
         });
         info!(
             target: telemetry_target::ENGINE,
