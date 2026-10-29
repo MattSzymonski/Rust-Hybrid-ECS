@@ -2511,7 +2511,7 @@ mod tests {
         std::fs::write(&path, b"kept").unwrap();
         let path_text = path.display().to_string();
 
-        let left = roll_back_files_with(&[path_text.clone()], &mut |_| {
+        let left = roll_back_files_with(std::slice::from_ref(&path_text), &mut |_| {
             Err(std::io::Error::other("a handle holds it"))
         });
         assert_eq!(left, vec![path_text.clone()], "the file is still there");
@@ -2524,7 +2524,7 @@ mod tests {
 
         // A rollback that finishes adds nothing to the message and leaves no
         // file behind.
-        let cleaned = roll_back_files(&[path_text.clone()]);
+        let cleaned = roll_back_files(std::slice::from_ref(&path_text));
         assert!(cleaned.is_empty());
         assert!(!path.exists());
         assert_eq!(
