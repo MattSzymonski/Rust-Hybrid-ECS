@@ -33,7 +33,8 @@ macro_rules! log_row_once {
                 target: pill_core::telemetry::telemetry_target::ENGINE,
                 component = $type_name,
                 $($field)*
-                concat!("[editor] inspector row kind=", $kind)
+                "[editor] inspector row kind={}",
+                $kind
             );
         }
     };

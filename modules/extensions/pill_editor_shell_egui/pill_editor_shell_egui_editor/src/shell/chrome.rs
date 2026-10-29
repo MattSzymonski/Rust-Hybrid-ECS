@@ -306,30 +306,6 @@ pub fn engine_badge(ui: &mut egui::Ui) {
     );
 }
 
-/// The three transform tools with their menu labels and icons, in the order
-/// every surface lists them: the viewport menu, the toolbox and the
-/// Preferences tab.
-pub const TOOL_ROWS: [(GizmoMode, &str, icons::Icon); 3] = [
-    (
-        GizmoMode::Translate,
-        "Translate",
-        icons::Icon::ArrowsOutCardinal,
-    ),
-    (GizmoMode::Rotate, "Rotate", icons::Icon::ArrowsClockwise),
-    (GizmoMode::Scale, "Scale", icons::Icon::ArrowsOut),
-];
-
-/// The two gizmo spaces with their menu labels and icons, in the order every
-/// surface lists them.
-pub const SPACE_ROWS: [(GizmoSpace, &str, icons::Icon); 2] = [
-    (
-        GizmoSpace::World,
-        "World space",
-        icons::Icon::GlobeHemisphereWest,
-    ),
-    (GizmoSpace::Local, "Local space", icons::Icon::MapPin),
-];
-
 /// Note one keyed rectangle, answering whether it is new or has moved, so a
 /// section that shifts as the panel grows or collapses reports its place
 /// again instead of leaving a stale one in the log.

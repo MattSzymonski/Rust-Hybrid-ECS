@@ -149,42 +149,33 @@ pub fn preferences_tab(
             &snapshot.gizmo.snap.to_string(),
         );
         row_in(ui, WIDE_ROW_LABEL_WIDTH, "gizmo", None, &mut |ui| {
-            for (mode, label, icon) in TOOL_ROWS {
-                let button =
-                    icons::IconButton::new(icon, label).active(snapshot.gizmo.mode == mode);
+            let state = toolbox::ToolboxState {
+                gizmo: snapshot.gizmo,
+                grid: snapshot.grid_enabled,
+            };
+            for item in toolbox::TOOL_ROWS {
+                let button = icons::IconButton::new(item.icon(&state), item.label(&state))
+                    .active(item.active(&state));
                 if ui.add(button).clicked() {
-                    pending.push(vec![EditorCommand::SetGizmoTool {
-                        mode: Some(mode),
-                        space: None,
-                        snap: None,
-                    }]);
+                    pending.push(vec![item.command(&state)]);
                 }
             }
             // The Preferences row is narrow, so the spaces use their short
             // names here rather than the menu's.
-            for (space, _label, icon) in SPACE_ROWS {
-                let short = match space {
-                    GizmoSpace::World => "World",
-                    GizmoSpace::Local => "Local",
-                };
-                let button =
-                    icons::IconButton::new(icon, short).active(snapshot.gizmo.space == space);
+            for row in toolbox::SPACE_ROWS {
+                let button = icons::IconButton::new(row.icon, row.short)
+                    .active(snapshot.gizmo.space == row.space);
                 if ui.add(button).clicked() {
-                    pending.push(vec![EditorCommand::SetGizmoTool {
-                        mode: None,
-                        space: Some(space),
-                        snap: None,
-                    }]);
+                    pending.push(vec![toolbox::space_command(row.space)]);
                 }
             }
-            let snap =
-                icons::IconButton::new(icons::Icon::Magnet, "Snap").active(snapshot.gizmo.snap);
+            let snap = icons::IconButton::new(
+                toolbox::ToolboxItem::Snap.icon(&state),
+                toolbox::ToolboxItem::Snap.label(&state),
+            )
+            .active(toolbox::ToolboxItem::Snap.active(&state));
             if ui.add(snap).clicked() {
-                pending.push(vec![EditorCommand::SetGizmoTool {
-                    mode: None,
-                    space: None,
-                    snap: Some(!snapshot.gizmo.snap),
-                }]);
+                pending.push(vec![toolbox::ToolboxItem::Snap.command(&state)]);
             }
         });
     });

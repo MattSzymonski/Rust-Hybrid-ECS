@@ -146,8 +146,6 @@ pub use chrome::select_entity;
 pub use chrome::select_entity_click;
 pub use chrome::tab_icon;
 pub use chrome::SelectionClick;
-pub use chrome::SPACE_ROWS;
-pub use chrome::TOOL_ROWS;
 
 /// The [`menus`] module: the context menus the tabs open.
 pub mod menus;

@@ -55,13 +55,108 @@ impl pill_engine::Resource for GizmoState {
 /// the resource registers under, so a command written by hand finds it.
 pub const RESOURCE_NAME: &str = "pill_editor_core::gizmo::GizmoState";
 
+/// One editable field of the gizmo settings: the name a command addresses it
+/// by, the label the Inspector's row shows, and how to read and write it.
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceField {
+    /// The field's name in a `SetResourceField` command.
+    pub name: &'static str,
+    /// The label the Inspector's row shows.
+    pub label: &'static str,
+    /// Read the field out of the settings.
+    pub read: fn(&GizmoSettings) -> FieldValue,
+    /// Write the field, answering its previous value for the command's
+    /// inverse.
+    pub write: fn(&mut GizmoSettings, &FieldValue) -> Result<FieldValue, String>,
+}
+
+/// Every editable field, in row order.
+///
+/// One table serves the write path ([`set_resource_field`]), the read path
+/// ([`resource_field_value`]) and the Inspector's rows
+/// ([`crate::resources::EDITABLE_RESOURCES`] derives its entries from here), so
+/// a field cannot be offered by the tab and refused by the write, nor be
+/// readable and not writable.
+///
+/// An enum field travels as its `U32` discriminant, in declaration order, and a
+/// step as `F32`.
+pub const RESOURCE_FIELDS: &[ResourceField] = &[
+    ResourceField {
+        name: "settings.mode",
+        label: "Mode",
+        read: |settings| FieldValue::U32(mode_index(settings.mode)),
+        write: |settings, value| {
+            let previous = settings.mode;
+            settings.mode = mode_from_index(field_u32("settings.mode", value)?)?;
+            Ok(FieldValue::U32(mode_index(previous)))
+        },
+    },
+    ResourceField {
+        name: "settings.space",
+        label: "Space",
+        read: |settings| FieldValue::U32(space_index(settings.space)),
+        write: |settings, value| {
+            let previous = settings.space;
+            settings.space = space_from_index(field_u32("settings.space", value)?)?;
+            Ok(FieldValue::U32(space_index(previous)))
+        },
+    },
+    ResourceField {
+        name: "settings.snap",
+        label: "Snapping",
+        read: |settings| FieldValue::Bool(settings.snap),
+        write: |settings, value| {
+            let previous = settings.snap;
+            settings.snap = match value {
+                FieldValue::Bool(value) => *value,
+                other => return Err(format!("`settings.snap` expects a Bool, got {other:?}")),
+            };
+            Ok(FieldValue::Bool(previous))
+        },
+    },
+    ResourceField {
+        name: "settings.translate_step",
+        label: "Move step",
+        read: |settings| FieldValue::F32(settings.translate_step),
+        write: |settings, value| {
+            swap_f32(
+                &mut settings.translate_step,
+                "settings.translate_step",
+                value,
+            )
+        },
+    },
+    ResourceField {
+        name: "settings.rotate_step_degrees",
+        label: "Rotate step",
+        read: |settings| FieldValue::F32(settings.rotate_step_degrees),
+        write: |settings, value| {
+            swap_f32(
+                &mut settings.rotate_step_degrees,
+                "settings.rotate_step_degrees",
+                value,
+            )
+        },
+    },
+    ResourceField {
+        name: "settings.scale_step",
+        label: "Scale step",
+        read: |settings| FieldValue::F32(settings.scale_step),
+        write: |settings, value| swap_f32(&mut settings.scale_step, "settings.scale_step", value),
+    },
+];
+
+/// The table's row for `field`, when it has one.
+pub fn resource_field(field: &str) -> Option<&'static ResourceField> {
+    RESOURCE_FIELDS.iter().find(|row| row.name == field)
+}
+
 /// Set one field of the gizmo settings from a field value, and return the
 /// previous value for the command's inverse.
 ///
 /// The engine cannot read or write a Rust resource's fields generically, so
-/// the writable fields are named here, one arm each; [`resource_field_value`]
-/// reads them back through the same table. An enum field travels as its `U32`
-/// discriminant, in declaration order, and a step as `F32`.
+/// [`RESOURCE_FIELDS`] names the writable ones; this is a lookup plus the row's
+/// own write.
 pub fn set_resource_field(
     settings: &mut GizmoSettings,
     resource: &str,
@@ -69,55 +164,27 @@ pub fn set_resource_field(
     value: &FieldValue,
 ) -> Result<FieldValue, String> {
     check_resource(resource)?;
-    match field {
-        "settings.mode" => {
-            let previous = settings.mode;
-            settings.mode = mode_from_index(field_u32(field, value)?)?;
-            Ok(FieldValue::U32(mode_index(previous)))
-        }
-        "settings.space" => {
-            let previous = settings.space;
-            settings.space = space_from_index(field_u32(field, value)?)?;
-            Ok(FieldValue::U32(space_index(previous)))
-        }
-        "settings.snap" => {
-            let previous = settings.snap;
-            settings.snap = match value {
-                FieldValue::Bool(value) => *value,
-                other => return Err(format!("`{field}` expects a Bool, got {other:?}")),
-            };
-            Ok(FieldValue::Bool(previous))
-        }
-        "settings.translate_step" => swap_f32(&mut settings.translate_step, field, value),
-        "settings.rotate_step_degrees" => swap_f32(&mut settings.rotate_step_degrees, field, value),
-        "settings.scale_step" => swap_f32(&mut settings.scale_step, field, value),
-        _ => Err(format!(
-            "`{field}` is not an editable field of `{RESOURCE_NAME}` (settings.mode, \
-             settings.space, settings.snap, settings.translate_step, \
-             settings.rotate_step_degrees, settings.scale_step)"
-        )),
-    }
+    let row = resource_field(field).ok_or_else(|| {
+        let names: Vec<&str> = RESOURCE_FIELDS.iter().map(|row| row.name).collect();
+        format!(
+            "`{field}` is not an editable field of `{RESOURCE_NAME}` ({})",
+            names.join(", ")
+        )
+    })?;
+    (row.write)(settings, value)
 }
 
-/// Read one editable field of the gizmo settings: the reading half of the
-/// table [`set_resource_field`] writes through.
+/// Read one editable field of the gizmo settings: the reading half of the table
+/// [`set_resource_field`] writes through.
 pub fn resource_field_value(
     settings: &GizmoSettings,
     resource: &str,
     field: &str,
 ) -> Result<FieldValue, String> {
     check_resource(resource)?;
-    match field {
-        "settings.mode" => Ok(FieldValue::U32(mode_index(settings.mode))),
-        "settings.space" => Ok(FieldValue::U32(space_index(settings.space))),
-        "settings.snap" => Ok(FieldValue::Bool(settings.snap)),
-        "settings.translate_step" => Ok(FieldValue::F32(settings.translate_step)),
-        "settings.rotate_step_degrees" => Ok(FieldValue::F32(settings.rotate_step_degrees)),
-        "settings.scale_step" => Ok(FieldValue::F32(settings.scale_step)),
-        _ => Err(format!(
-            "`{field}` is not a readable field of `{RESOURCE_NAME}`"
-        )),
-    }
+    let row = resource_field(field)
+        .ok_or_else(|| format!("`{field}` is not a readable field of `{RESOURCE_NAME}`"))?;
+    Ok((row.read)(settings))
 }
 
 /// Refuse any resource but the gizmo state, naming it in the message.
@@ -1075,6 +1142,26 @@ pub fn distance(left: [f32; 3], right: [f32; 3]) -> f32 {
     dot(delta, delta).sqrt()
 }
 
+/// The element writes a released drag records, as `(index, value)` in array
+/// order; `None` when the drag ended where it started, because a click that
+/// moved nothing is not an undo step.
+///
+/// `original` is the field's value at the press and `released` the value the
+/// drag wrote, so the answer covers a field of any length a transform's arrays
+/// use (`translation`/`scale` 3, `rotation` 4).
+pub fn release_edits(original: &[f32], released: &[f32]) -> Option<Vec<(usize, f32)>> {
+    if original == released {
+        return None;
+    }
+    Some(
+        released
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index, *value))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,5 +1431,93 @@ mod tests {
         // A ray into empty space finds nothing.
         let miss = hit_test(&geometry, [10.0, 10.0, 10.0], [0.0, 1.0, 0.0], 0.05);
         assert_eq!(miss, None);
+    }
+
+    /// A released drag records one step, and only when it moved: the press's
+    /// value on its own is not an undo entry.
+    #[test]
+    fn a_release_records_one_step_only_when_it_moved() {
+        let press = [1.0, 2.0, 3.0];
+        assert_eq!(release_edits(&press, &press), None);
+        let released = [1.0, 2.0, 4.5];
+        assert_eq!(
+            release_edits(&press, &released),
+            Some(vec![(0, 1.0), (1, 2.0), (2, 4.5)]),
+            "every element of the field is written, in array order"
+        );
+        // A rotation is four wide; the same rule covers it.
+        let released = [0.0, 0.0, 0.0, 1.0];
+        assert_eq!(
+            release_edits(&[0.0; 4], &released).map(|edits| edits.len()),
+            Some(4)
+        );
+    }
+
+    /// Every row of the field table reads, writes and round-trips, a value it
+    /// cannot hold leaves it alone, and the Inspector's list is exactly the
+    /// table - the three lists the audit found drifting.
+    #[test]
+    fn every_resource_field_reads_writes_and_round_trips() {
+        let entry = crate::resources::EDITABLE_RESOURCES
+            .iter()
+            .find(|entry| entry.name == RESOURCE_NAME)
+            .expect("the gizmo settings are an editable resource");
+        let listed: Vec<&str> = entry.fields.iter().map(|field| field.name).collect();
+        let table: Vec<&str> = RESOURCE_FIELDS.iter().map(|field| field.name).collect();
+        assert_eq!(
+            listed, table,
+            "the Inspector offers the table's fields in order"
+        );
+
+        for field in RESOURCE_FIELDS {
+            let mut settings = GizmoSettings::default();
+            let before = (field.read)(&settings);
+            // A value the kind accepts and that differs from the current one.
+            let changed = match &before {
+                FieldValue::Bool(value) => FieldValue::Bool(!*value),
+                FieldValue::F32(value) => FieldValue::F32(value + 1.0),
+                FieldValue::U32(value) => FieldValue::U32(u32::from(*value == 0)),
+                other => panic!("{} reads an unexpected kind {other:?}", field.name),
+            };
+            let previous = set_resource_field(&mut settings, RESOURCE_NAME, field.name, &changed)
+                .unwrap_or_else(|error| panic!("{} refused its own kind: {error}", field.name));
+            assert_eq!(
+                previous, before,
+                "{} answers the value it replaced, for the inverse",
+                field.name
+            );
+            assert_eq!((field.read)(&settings), changed, "{}", field.name);
+            assert_eq!(
+                resource_field_value(&settings, RESOURCE_NAME, field.name),
+                Ok(changed.clone()),
+                "{} reads back what the write took",
+                field.name
+            );
+            set_resource_field(&mut settings, RESOURCE_NAME, field.name, &before)
+                .unwrap_or_else(|error| panic!("{} could not be put back: {error}", field.name));
+            assert_eq!(
+                (field.read)(&settings),
+                before,
+                "{} round-trips",
+                field.name
+            );
+
+            // A kind the field cannot hold is refused, and changes nothing.
+            let refused = match &before {
+                FieldValue::Bool(_) => FieldValue::U32(1),
+                _ => FieldValue::Bool(true),
+            };
+            assert!(
+                set_resource_field(&mut settings, RESOURCE_NAME, field.name, &refused).is_err(),
+                "{} accepted {refused:?}",
+                field.name
+            );
+            assert_eq!(
+                (field.read)(&settings),
+                before,
+                "{} changed on a refused write",
+                field.name
+            );
+        }
     }
 }

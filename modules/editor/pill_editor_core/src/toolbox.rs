@@ -165,6 +165,48 @@ pub const TOOLBOX_ITEMS: [ToolboxItem; 6] = [
     ToolboxItem::Grid,
 ];
 
+/// The three tools, in the order every surface lists them: the viewport menu
+/// and the Preferences row draw these rows, so a new tool is one row here.
+pub const TOOL_ROWS: [ToolboxItem; 3] = [
+    ToolboxItem::Translate,
+    ToolboxItem::Rotate,
+    ToolboxItem::Scale,
+];
+
+/// One gizmo space as the surfaces that list both spaces draw it: the value,
+/// the longer label the viewport menu shows, the short one the Preferences row
+/// shows, and the icon both carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceRow {
+    /// The space this row selects.
+    pub space: GizmoSpace,
+    /// The label the viewport menu shows.
+    pub menu: &'static str,
+    /// The label a narrow row shows.
+    pub short: &'static str,
+    /// The row's icon.
+    pub icon: Icon,
+}
+
+/// Both spaces, in the order every surface lists them. The toolbox's own space
+/// row toggles between the two and takes its label and icon from
+/// [`ToolboxItem::label`] and [`ToolboxItem::icon`], which read the same two
+/// values.
+pub const SPACE_ROWS: [SpaceRow; 2] = [
+    SpaceRow {
+        space: GizmoSpace::World,
+        menu: "World space",
+        short: "World",
+        icon: Icon::GlobeHemisphereWest,
+    },
+    SpaceRow {
+        space: GizmoSpace::Local,
+        menu: "Local space",
+        short: "Local",
+        icon: Icon::MapPin,
+    },
+];
+
 impl ToolboxItem {
     /// The row's name in the log and the scripted channel's assertions.
     pub fn name(self) -> &'static str {
@@ -225,6 +267,20 @@ impl ToolboxItem {
         }
     }
 
+    /// The longer label the viewport menu shows. The tools and the two toggles
+    /// read as a menu item; the space row's menu lists the two spaces instead
+    /// of this toggle, so it answers the toggle's own name.
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            ToolboxItem::Translate => "Translate",
+            ToolboxItem::Rotate => "Rotate",
+            ToolboxItem::Scale => "Scale",
+            ToolboxItem::Space => "Space",
+            ToolboxItem::Snap => "Snapping",
+            ToolboxItem::Grid => "Grid",
+        }
+    }
+
     /// The command a click queues: the tool rows select, the toggles flip
     /// the state they show.
     pub fn command(self, state: &ToolboxState) -> EditorCommand {
@@ -261,6 +317,25 @@ impl ToolboxItem {
                 enabled: !state.grid,
             },
         }
+    }
+}
+
+/// The edit that selects one tool: the command the toolbox's row, the viewport
+/// menu's row and the Preferences row all queue.
+pub fn mode_command(mode: GizmoMode) -> EditorCommand {
+    EditorCommand::SetGizmoTool {
+        mode: Some(mode),
+        space: None,
+        snap: None,
+    }
+}
+
+/// The edit that switches the gizmo to one space.
+pub fn space_command(space: GizmoSpace) -> EditorCommand {
+    EditorCommand::SetGizmoTool {
+        mode: None,
+        space: Some(space),
+        snap: None,
     }
 }
 
@@ -442,6 +517,45 @@ mod tests {
         assert_eq!(
             ToolboxItem::Grid.command(&flipped),
             EditorCommand::SetGrid { enabled: false }
+        );
+    }
+
+    /// The rows the menu and the Preferences tab draw are the panel's own rows,
+    /// in the panel's order, and the spaces they list are the ones the panel's
+    /// toggle names: one vocabulary, not three that agree by hand.
+    #[test]
+    fn the_menu_rows_are_the_panels_rows() {
+        assert_eq!(TOOL_ROWS.as_slice(), &TOOLBOX_ITEMS[..3]);
+        for item in TOOL_ROWS {
+            assert!(TOOLBOX_ITEMS.contains(&item), "{item:?} is not a panel row");
+            assert!(!item.menu_label().is_empty(), "{item:?} has no menu label");
+        }
+        for row in SPACE_ROWS {
+            let state = ToolboxState {
+                gizmo: GizmoSettings {
+                    space: row.space,
+                    ..GizmoSettings::default()
+                },
+                grid: false,
+            };
+            assert_eq!(ToolboxItem::Space.label(&state), row.short);
+            assert_eq!(ToolboxItem::Space.icon(&state), row.icon);
+            assert_eq!(
+                space_command(row.space),
+                EditorCommand::SetGizmoTool {
+                    mode: None,
+                    space: Some(row.space),
+                    snap: None,
+                }
+            );
+        }
+        assert_eq!(
+            mode_command(GizmoMode::Rotate),
+            EditorCommand::SetGizmoTool {
+                mode: Some(GizmoMode::Rotate),
+                space: None,
+                snap: None,
+            }
         );
     }
 }
