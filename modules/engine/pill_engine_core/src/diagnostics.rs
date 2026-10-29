@@ -171,7 +171,7 @@ impl EcsSnapshot {
                 let (stride, rows, descriptor) =
                     if let Some(column) = archetype.component_storages.get(component_id) {
                         (
-                            column.elem_size(),
+                            column.element_size(),
                             column.len(),
                             matches!(column.identity(), ColumnIdentity::Descriptor),
                         )

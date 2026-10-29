@@ -52,7 +52,7 @@ impl Instant {
     ///
     /// [`saturating_duration_since`]: Instant::saturating_duration_since
     pub fn duration_since(&self, earlier: Instant) -> Duration {
-        self.0.saturating_duration_since(earlier.0)
+        self.saturating_duration_since(earlier)
     }
 
     /// The time from `earlier` to this instant, zero if `earlier` is later.

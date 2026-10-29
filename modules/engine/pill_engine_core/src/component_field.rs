@@ -919,7 +919,7 @@ impl World {
                 },
             );
         }
-        let element_size = column.elem_size();
+        let element_size = column.element_size();
         let mut buffer = vec![0u8; element_size];
         // SAFETY: the row is within the column (`row < len`, checked by the
         // lookup) and the buffer is exactly one element long; nothing mutates
@@ -1098,6 +1098,20 @@ impl World {
 /// would only bloat every layout, so the rest stays reachable through the
 /// field's own accessors.
 pub const MAX_EXPANDED_ELEMENTS: usize = 64;
+
+/// The row one field write targets, and the names its refusals report.
+struct RowWriteTarget<'a> {
+    /// Archetype holding the row.
+    archetype_id: ArchetypeId,
+    /// Row within that archetype.
+    row: usize,
+    /// Component whose column holds the field.
+    component_id: ComponentId,
+    /// Component name the error paths report.
+    component_name: &'a str,
+    /// Field name the error paths report.
+    field_name: &'a str,
+}
 
 impl World {
     /// Record a component's editor field layout, expanding nested struct
@@ -1539,10 +1553,13 @@ impl World {
         // an equal baseline and never observe the edit.
         let current_tick = self.increment_change_tick();
         self.apply_row_write(
-            archetype_id,
-            row,
-            component_id,
-            component_name,
+            RowWriteTarget {
+                archetype_id,
+                row,
+                component_id,
+                component_name,
+                field_name,
+            },
             write.row_offset,
             &write.bytes,
         )?;
@@ -1662,10 +1679,13 @@ impl World {
         let row_offset = descriptor.offset + index * element_size;
         let current_tick = self.increment_change_tick();
         self.apply_row_write(
-            archetype_id,
-            row,
-            component_id,
-            component_name,
+            RowWriteTarget {
+                archetype_id,
+                row,
+                component_id,
+                component_name,
+                field_name,
+            },
             row_offset,
             &bytes,
         )?;
@@ -1680,23 +1700,33 @@ impl World {
 
     /// Overwrite `bytes.len()` bytes at `row_offset` of one component row.
     ///
-    /// `component_name` only feeds the error paths: the caller resolved the
-    /// component through the entity, so a missing column or row here is a
+    /// `target.component_name` only feeds the error paths: the caller resolved
+    /// the component through the entity, so a missing column or row here is a
     /// storage desync and reports the component the caller named.
     fn apply_row_write(
         &mut self,
-        archetype_id: ArchetypeId,
-        row: usize,
-        component_id: ComponentId,
-        component_name: &str,
+        target: RowWriteTarget<'_>,
         row_offset: usize,
         bytes: &[u8],
     ) -> Result<(), ComponentFieldError> {
+        let RowWriteTarget {
+            archetype_id,
+            row,
+            component_id,
+            component_name,
+            field_name,
+        } = target;
+        // One construction for every "the payload does not fit the row" refusal
+        // in this function, so the message always names the field.
+        let past_the_row = || ComponentFieldError::UnsupportedField {
+            field: field_name.to_string(),
+            reason: "write extends past the component row",
+        };
         match component_id {
             _ if component_id.is_native_storage() => {
                 let column =
                     self.row_column_mut(archetype_id, row, component_id, component_name)?;
-                let element_size = column.elem_size();
+                let element_size = column.element_size();
                 // SAFETY: the lookup checked `row < column.len()`, so the
                 // pointer stays inside the column's allocation, and the column
                 // borrow keeps that allocation alive through this statement.
@@ -1708,10 +1738,7 @@ impl World {
                     .checked_add(bytes.len())
                     .filter(|end| *end <= element_size)
                 else {
-                    return Err(ComponentFieldError::UnsupportedField {
-                        field: String::new(),
-                        reason: "write extends past the component row",
-                    });
+                    return Err(past_the_row());
                 };
                 // SAFETY: the destination row is initialized (`row < len`) and
                 // the payload fits within it (checked above); the column is not
@@ -1740,17 +1767,12 @@ impl World {
                     .checked_add(bytes.len())
                     .filter(|end| *end <= element_size)
                 else {
-                    return Err(ComponentFieldError::UnsupportedField {
-                        field: String::new(),
-                        reason: "write extends past the component row",
-                    });
+                    return Err(past_the_row());
                 };
-                let target = row_bytes.get_mut(row_offset..end).ok_or(
-                    ComponentFieldError::UnsupportedField {
-                        field: String::new(),
-                        reason: "write extends past the component row",
-                    },
-                )?;
+                let target = row_bytes
+                    .get_mut(row_offset..end)
+                    .ok_or_else(past_the_row)?;
+
                 target.copy_from_slice(bytes);
                 self.row_column_mut(archetype_id, row, component_id, component_name)?
                     .set_bytes(row, &row_bytes)
@@ -2663,10 +2685,13 @@ mod tests {
         let (archetype_id, row) = world.entity_row_location(entity).expect("entity is live");
         assert_eq!(
             world.apply_row_write(
-                archetype_id,
-                row,
-                ComponentId::of::<OtherComponent>(),
-                "OtherComponent",
+                super::RowWriteTarget {
+                    archetype_id,
+                    row,
+                    component_id: ComponentId::of::<OtherComponent>(),
+                    component_name: "OtherComponent",
+                    field_name: "other",
+                },
                 0,
                 &[0u8; 4],
             ),

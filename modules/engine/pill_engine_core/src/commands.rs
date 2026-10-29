@@ -530,20 +530,19 @@ impl CommandQueue {
         // would unwind inside the flush - and for a managed project, across
         // the C ABI.
         let mut errors = Vec::new();
-        if let Some((component_id, _error)) = write_failure {
+        if let Some((component_id, error)) = write_failure {
             errors.push(CommandError::ComponentWriteFailed {
                 entity,
                 component_id,
+                reason: error.to_string(),
             });
         }
         for (component_id, bytes) in descriptor_components {
-            if world
-                .set_descriptor_component_bytes(entity, component_id, &bytes)
-                .is_err()
-            {
+            if let Err(error) = world.set_descriptor_component_bytes(entity, component_id, &bytes) {
                 errors.push(CommandError::ComponentWriteFailed {
                     entity,
                     component_id,
+                    reason: error.to_string(),
                 });
             }
         }
@@ -594,10 +593,11 @@ impl CommandQueue {
         // failure is collected with the rest of the batch. A panic here would
         // unwind inside the flush - and for a managed project, across the C
         // ABI.
-        if let Err(_error) = world.add_descriptor_component(entity, component_id, &bytes) {
+        if let Err(error) = world.add_descriptor_component(entity, component_id, &bytes) {
             errors.push(CommandError::ComponentWriteFailed {
                 entity,
                 component_id,
+                reason: error.to_string(),
             });
         }
     }
@@ -605,141 +605,50 @@ impl CommandQueue {
     /// Executes a queued native component addition.
     ///
     /// Migrates the entity to a new archetype that includes the component,
-    /// copying every existing component and writing the new one.
+    /// copying every existing component and writing the new one. Runs the same
+    /// core the eager [`World::add_component`] runs, so the registration and
+    /// duplicate refusals hold on the deferred path too.
     fn execute_add_component(
         world: &mut World,
         entity: Entity,
         component_adder: Box<dyn ComponentAdder>,
         errors: &mut Vec<CommandError>,
     ) {
-        // Step 1: Locate the entity and reject stale handles.
-        let entity_location = match world.entity_locations.get(&entity) {
-            Some(location) => *location,
-            None => {
-                errors.push(CommandError::EntityNotFound {
-                    entity,
-                    operation: "add_component",
-                });
-                return;
-            }
-        };
-
-        // Step 2: Compute the target archetype's component-ID set, rejecting
-        // components the entity already has.
-        let Some(old_archetype) = world.archetypes.get(&entity_location.archetype_id) else {
-            // The entity's location references an archetype that no longer
-            // exists - the desync a partially applied hot reload can leave
-            // behind. The entity is effectively unreachable, so report it as
-            // not found rather than panicking inside the flush.
-            errors.push(CommandError::EntityNotFound {
+        let component_id = component_adder.component_id();
+        // The attach closure hands back a refused write: the migration restores
+        // the source archetype and undoes the destination row when it gets an
+        // error, so a column that would not take the new component fails the
+        // whole migration rather than leaving a half-written archetype behind.
+        if let Err(error) = world.try_add_component_by_id(entity, component_id, |new_storage| {
+            component_adder.add_component_to_storage(new_storage)
+        }) {
+            errors.push(Self::command_error_of(
                 entity,
-                operation: "add_component",
-            });
-            return;
-        };
-        let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
-        new_component_ids.extend_from_slice(&old_archetype.component_types);
-        let new_component_id = component_adder.component_id();
-        if new_component_ids.contains(&new_component_id) {
-            errors.push(CommandError::ComponentAlreadyExists {
-                entity,
-                component_id: new_component_id,
-            });
-            return;
-        }
-
-        new_component_ids.push(new_component_id);
-        new_component_ids.sort();
-
-        // Step 3: Migrate the entity row. Every surviving component is carried
-        // by the move itself, so the only thing left to write is the component
-        // being added. A migration failure (archetype missing, component column
-        // missing) is collected rather than panicking inside the flush.
-        //
-        // The attach closure hands back a refused write for the same reason:
-        // `move_entity_to_archetype` restores the source archetype and undoes
-        // the destination row when it gets an error, so a column that would not
-        // take the new component fails the whole migration rather than leaving
-        // a half-written archetype behind.
-        if let Err(error) =
-            world.move_entity_to_archetype(entity, new_component_ids, |new_storage| {
-                component_adder.add_component_to_storage(new_storage)
-            })
-        {
-            errors.push(CommandError::MigrationFailed {
-                entity,
-                reason: error.to_string(),
-            });
+                "add_component",
+                component_id,
+                error,
+            ));
         }
     }
 
     /// Executes a queued component removal.
     ///
     /// Migrates the entity to a new archetype without the component, or
-    /// destroys it outright when no components remain.
+    /// destroys it outright when no components remain. Runs the same core the
+    /// eager removal runs.
     fn execute_remove_component(
         world: &mut World,
         entity: Entity,
         component_id: ComponentId,
         errors: &mut Vec<CommandError>,
     ) {
-        // Step 1: Locate the entity and reject stale handles.
-        let entity_location = match world.entity_locations.get(&entity) {
-            Some(location) => *location,
-            None => {
-                errors.push(CommandError::EntityNotFound {
-                    entity,
-                    operation: "remove_component",
-                });
-                return;
-            }
-        };
-
-        // Step 2: Reject removal of a component the entity does not have, and
-        // compute the surviving component-ID set.
-        let Some(old_archetype) = world.archetypes.get(&entity_location.archetype_id) else {
-            // As in `execute_add_component`: the entity's recorded archetype
-            // is gone, so the entity is effectively unreachable. Report it as
-            // not found rather than panicking inside the flush.
-            errors.push(CommandError::EntityNotFound {
+        if let Err(error) = world.try_remove_component_by_id(entity, component_id) {
+            errors.push(Self::command_error_of(
                 entity,
-                operation: "remove_component",
-            });
-            return;
-        };
-
-        if !old_archetype.component_types.contains(&component_id) {
-            errors.push(CommandError::ComponentNotFound {
-                entity,
+                "remove_component",
                 component_id,
-            });
-            return;
-        }
-
-        let new_component_ids: Vec<ComponentId> = old_archetype
-            .component_types
-            .iter()
-            .filter(|&id| *id != component_id)
-            .cloned()
-            .collect();
-
-        // Step 3: An entity with no remaining components is destroyed outright.
-        if new_component_ids.is_empty() {
-            // If destroy_entity fails (entity already gone) we still want to
-            // bail out - no components remain to migrate.
-            let _ = world.destroy_entity(entity);
-            return;
-        }
-
-        // Step 4: Migrate surviving components to the new archetype. The move
-        // carries them; the removed component is left behind in the source
-        // archetype and released there. A migration failure is collected rather
-        // than panicking inside the flush, matching `execute_add_component`.
-        if let Err(error) = world.move_entity_to_archetype(entity, new_component_ids, |_| Ok(())) {
-            errors.push(CommandError::MigrationFailed {
-                entity,
-                reason: error.to_string(),
-            });
+                error,
+            ));
         }
     }
 
@@ -753,6 +662,47 @@ impl CommandQueue {
                 entity,
                 operation: "destroy_entity",
             });
+        }
+    }
+
+    /// Classifies a structural edit's world-level failure as a command error.
+    ///
+    /// The two structural executors share this because they now share one
+    /// implementation: a rule that refuses the edit reaches the same
+    /// classification whichever command queued it.
+    fn command_error_of(
+        entity: Entity,
+        operation: &'static str,
+        component_id: ComponentId,
+        error: WorldError,
+    ) -> CommandError {
+        match error {
+            // A stale location record leaves the entity unreachable, which is
+            // what the flush reports.
+            WorldError::EntityNotFound | WorldError::ArchetypeMissing { .. } => {
+                CommandError::EntityNotFound { entity, operation }
+            }
+            WorldError::DescriptorComponentAlreadyPresent => CommandError::ComponentAlreadyExists {
+                entity,
+                component_id,
+            },
+            WorldError::DescriptorComponentMissing => CommandError::ComponentNotFound {
+                entity,
+                component_id,
+            },
+            // A type this world no longer registers, so there is no column to
+            // write - the same report a queued creation gives.
+            WorldError::DescriptorComponentNotRegistered { .. } => {
+                CommandError::ComponentWriteFailed {
+                    entity,
+                    component_id,
+                    reason: error.to_string(),
+                }
+            }
+            other => CommandError::MigrationFailed {
+                entity,
+                reason: other.to_string(),
+            },
         }
     }
 
@@ -1447,6 +1397,7 @@ mod tests {
             [CommandError::ComponentWriteFailed {
                 entity,
                 component_id,
+                ..
             }] if *entity == entity_b && *component_id == descriptor_a
         ));
     }
@@ -1623,7 +1574,7 @@ mod tests {
 
         assert!(matches!(
             errors.as_slice(),
-            [CommandError::ComponentWriteFailed { entity: failed_entity, component_id: failed_component }]
+            [CommandError::ComponentWriteFailed { entity: failed_entity, component_id: failed_component, .. }]
                 if *failed_entity == entity && *failed_component == component_id
         ));
     }
@@ -1668,6 +1619,44 @@ mod tests {
         assert_ne!(
             recycled, entity,
             "the recycled slot carries the next generation, so a handle the caller kept cannot name it"
+        );
+    }
+
+    /// A queued add of a type this world never registered is refused.
+    ///
+    /// The deferred twin of the eager refusal: an unregistered id has no bit,
+    /// so the destination archetype derives back to the source and the entity
+    /// would store nothing while the flush counted the command as done.
+    #[test]
+    fn a_queued_add_of_an_unregistered_component_is_refused() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .build()
+            .unwrap();
+
+        let unregistered = ComponentId::of::<Health>();
+        let mut queue = CommandQueue::new();
+        queue.add_component_adder_to_entity(entity, boxed_component_adder(Health(5)));
+        let errors = queue
+            .execute_queued_commands(&mut world, true)
+            .expect_err("an unregistered component must fail the flush");
+
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::ComponentWriteFailed { entity: failed_entity, component_id, .. }]
+                if *failed_entity == entity && *component_id == unregistered
+        ));
+        assert!(
+            world.get_component::<Health>(entity).is_none(),
+            "a refused add stores nothing"
+        );
+        assert_eq!(
+            world.get_component::<Position>(entity).unwrap().x,
+            1.0,
+            "the entity keeps the component it already had"
         );
     }
 }

@@ -15,8 +15,8 @@
 //! through `pill_module_init` and the shipping runtime makes directly.
 
 // Standard library
+use std::cell::Cell;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 // External crates
 use pill_engine::asset_store::mount_directory;
@@ -34,18 +34,30 @@ pub struct Beacon {
     power: f32,
 }
 
-/// Entities the world held when the project's `init` body ran.
-static ENTITIES_AT_INIT: AtomicUsize = AtomicUsize::new(0);
-/// Entities carrying a [`Beacon`] when the project's `init` body ran.
-static BEACONS_AT_INIT: AtomicUsize = AtomicUsize::new(0);
+// Entities and beacons counted when the project's `init` body ran.
+//
+// A thread-local rather than a static because the two tests in this file both
+// call `run_project_init` with the same `fn` pointer - the only shape that
+// signature accepts - so a shared static would let either test read the
+// other's value. Each test reads what its own thread recorded.
+thread_local! {
+    static AT_INIT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
 
 /// A project init that records the world it was handed.
 fn recording_init(engine: &mut Engine) -> u32 {
     let world = engine.world_mut();
-    ENTITIES_AT_INIT.store(world.entity_rows().len(), Ordering::SeqCst);
+    let entities = world.entity_rows().len();
     let beacons = pill_engine::Query::<&Beacon>::new(world).iter_mut().count();
-    BEACONS_AT_INIT.store(beacons, Ordering::SeqCst);
+    AT_INIT.with(|slot| slot.set(Some((entities, beacons))));
     0
+}
+
+/// What the current thread's `init` recorded, or a panic when it never ran.
+fn recorded_at_init() -> (usize, usize) {
+    AT_INIT
+        .with(|slot| slot.get())
+        .expect("init ran on this thread")
 }
 
 /// A scene file with one beacon entity, and the project starts with it.
@@ -102,12 +114,12 @@ fn the_startup_scene_is_in_the_world_before_init_runs() {
     assert_eq!(status, 0, "the project initializes");
 
     // Step 3: the init body saw the scene's entity, and only it.
+    let (entities, beacons) = recorded_at_init();
     assert_eq!(
-        BEACONS_AT_INIT.load(Ordering::SeqCst),
-        1,
+        beacons, 1,
         "the scene's beacon existed before the project's init"
     );
-    assert_eq!(ENTITIES_AT_INIT.load(Ordering::SeqCst), 1);
+    assert_eq!(entities, 1, "the init body saw exactly the scene's entity");
     let world = engine.world_mut();
     let beacon = world
         .entity_by_id(beacon_id)
@@ -125,6 +137,7 @@ fn a_project_without_a_startup_scene_is_untouched() {
     let mut engine = Engine::new();
     let status = run_project_init(&mut engine, recording_init);
     assert_eq!(status, 0);
-    assert_eq!(ENTITIES_AT_INIT.load(Ordering::SeqCst), 0);
-    assert_eq!(BEACONS_AT_INIT.load(Ordering::SeqCst), 0);
+    let (entities, beacons) = recorded_at_init();
+    assert_eq!(entities, 0, "an empty project seeds no entity");
+    assert_eq!(beacons, 0, "an empty project owns no beacon");
 }

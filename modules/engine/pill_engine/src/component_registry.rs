@@ -360,66 +360,115 @@ pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
 /// Install this artifact's value types as the world's field-layout resolver,
 /// returning the resolver that was installed before.
 ///
-/// A caller that registers components outside `register_all_components` - a
-/// project's own `init`, the `__pill_register_<Type>` calls the derives
-/// generate, or the runtime running a linked entry point - installs this around
-/// the whole entry point and restores it with [`restore_value_type_layouts`],
-/// or a `struct:`-tagged field (a value type, or an array of one) cannot expand
-/// into editable rows.
-pub fn install_value_type_layouts(world: &mut World) -> Option<ValueTypeLayoutResolver> {
+/// Private on purpose: the raw pair lets a caller forget the restore, which
+/// leaves the world holding a function pointer into an image the host may have
+/// unmapped. [`ValueTypeLayoutScope`] owns both halves, and
+/// [`run_artifact_entry`] is the only code that needs them.
+fn install_value_type_layouts(world: &mut World) -> Option<ValueTypeLayoutResolver> {
     world.replace_value_type_layout_resolver(Some(resolve_value_type_layout))
 }
 
 /// Put back the resolver [`install_value_type_layouts`] replaced.
-pub fn restore_value_type_layouts(world: &mut World, previous: Option<ValueTypeLayoutResolver>) {
+fn restore_value_type_layouts(world: &mut World, previous: Option<ValueTypeLayoutResolver>) {
     world.replace_value_type_layout_resolver(previous);
 }
 
-/// Register this artifact's components and run its `init`, with the artifact's
-/// value types installed as the world's field-layout resolver for the whole
-/// entry point.
+/// Holds this artifact's value types installed as the world's layout resolver.
 ///
-/// `register_all_components` installs the resolver around its own loop, but a
-/// project or module also registers components from its own `init` - the
-/// `__pill_register_<Type>` calls the derives generate - and a `struct:`-tagged
-/// field (a value type, or an array of one) can only expand into editable rows
-/// while a resolver is installed. Holding it for the whole entry point keeps
-/// such a field editable in the editor.
+/// Restores the previous resolver when it drops, which is the point: an `init`
+/// that unwinds would otherwise leave the world holding a resolver that is a
+/// function pointer into the generation the host just rejected - the one
+/// pointer into a DLL the world keeps.
+struct ValueTypeLayoutScope {
+    /// World whose resolver this scope owns.
+    ///
+    /// Raw because the guard must outlive the borrow that created it: the entry
+    /// point calls back into the engine between construction and drop, and no
+    /// reference is held across that.
+    world: *mut World,
+    /// Resolver the world held before this scope installed its own.
+    previous: Option<ValueTypeLayoutResolver>,
+}
+
+impl ValueTypeLayoutScope {
+    /// Installs this artifact's resolver and takes responsibility for it.
+    fn install(engine: &mut Engine) -> Self {
+        let world = engine.world_mut();
+        let previous = install_value_type_layouts(world);
+        Self {
+            world: world as *mut World,
+            previous,
+        }
+    }
+}
+
+impl Drop for ValueTypeLayoutScope {
+    fn drop(&mut self) {
+        // SAFETY: the scope is created and dropped inside one call to
+        // `run_artifact_entry`, which owns the engine for its whole body; no
+        // borrow of the world outlives the call, and nothing else observes the
+        // pointer in between, so it is still the live world here.
+        let world = unsafe { &mut *self.world };
+        restore_value_type_layouts(world, self.previous);
+    }
+}
+
+/// Run one artifact entry point: the transaction every posture shares.
 ///
-/// The previous resolver is restored before returning, on every path, so no
-/// resolver is left pointing into this DLL after it unloads.
-pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
-    let previous = engine
-        .world_mut()
-        .replace_value_type_layout_resolver(Some(resolve_value_type_layout));
+/// The order is the whole contract, and it lives here once so a DLL wrapper, a
+/// linked project and anything added later cannot disagree about it:
+///
+/// 1. this artifact's value types become the world's field-layout resolver;
+/// 2. every component the artifact declares is registered;
+/// 3. `before_init` runs - a project loads the startup scene it queued here,
+///    because the component types exist and the project has not yet seeded its
+///    own entities over them;
+/// 4. the user's `init` runs;
+/// 5. the registration-error slot is read once more, because a `class:`- or
+///    `resource:`-tagged guard is raised from the user's own code after the
+///    drain in step 2 looked at it.
+///
+/// The resolver is held for the whole entry point - a `struct:`-tagged field (a
+/// value type, or an array of one) only expands into editable rows while one is
+/// installed - and [`ValueTypeLayoutScope`] puts the previous one back on every
+/// exit, including an unwind out of `init`.
+pub fn run_artifact_entry(
+    engine: &mut Engine,
+    before_init: impl FnOnce(&mut Engine),
+    init: impl FnOnce(&mut Engine) -> u32,
+) -> u32 {
+    let scope = ValueTypeLayoutScope::install(engine);
     let mut status = match register_all_components(engine.world_mut()) {
-        Ok(()) => init(engine),
+        Ok(()) => {
+            before_init(engine);
+            init(engine)
+        }
         // The failure was logged; a half-registered artifact must not run.
         Err(_error) => u32::MAX,
     };
-    // A guard raised from the user's own registration code is recorded after
-    // the drain above read the slot, so it is read once more here.
     if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
         status = u32::MAX;
     }
-    engine
-        .world_mut()
-        .replace_value_type_layout_resolver(previous);
+    drop(scope);
     status
 }
 
-/// [`run_artifact_init`] for a project, which also loads the startup scene the
+/// [`run_artifact_entry`] for a module or a project that loads no startup
+/// document.
+pub fn run_artifact_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
+    run_artifact_entry(engine, |_engine| {}, init)
+}
+
+/// [`run_artifact_entry`] for a project, which also loads the startup scene the
 /// front end queued.
 ///
 /// The load runs after registration and before the user's `init`: a scene
 /// loaded earlier would find no component types to attach, and one loaded later
 /// would double every entity the project seeds.
 pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u32 {
-    let previous = engine
-        .world_mut()
-        .replace_value_type_layout_resolver(Some(resolve_value_type_layout));
-    let mut status = match register_all_components(engine.world_mut()) {
-        Ok(()) => {
+    run_artifact_entry(
+        engine,
+        |engine| {
             if let Some(Err(reason)) = pill_engine_core::apply_startup_scene(engine) {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::ENGINE,
@@ -427,17 +476,9 @@ pub fn run_project_init(engine: &mut Engine, init: fn(&mut Engine) -> u32) -> u3
                     "[engine] startup scene not loaded"
                 );
             }
-            init(engine)
-        }
-        Err(_error) => u32::MAX,
-    };
-    if status != u32::MAX && engine.world_mut().take_registration_error().is_some() {
-        status = u32::MAX;
-    }
-    engine
-        .world_mut()
-        .replace_value_type_layout_resolver(previous);
-    status
+        },
+        init,
+    )
 }
 
 /// The layout of the value type a `struct:<path>` field tag names, among the

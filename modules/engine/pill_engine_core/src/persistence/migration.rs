@@ -67,12 +67,17 @@ impl World {
 
         for type_name in &sorted_changed_type_names {
             let Some(previous_metadata) = previous_metadata_by_name.get(*type_name) else {
+                let reason = "missing previous metadata".to_string();
                 debug!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    "[persistence]   '{}' -> SKIP (missing previous metadata)",
+                    "[persistence]   '{}' -> SKIP ({})",
                     type_name,
+                    reason,
                 );
-                report.skipped_type_names.push((*type_name).to_string());
+                report.skipped_types.push(SkippedType {
+                    type_name: (*type_name).to_string(),
+                    reason,
+                });
                 continue;
             };
 
@@ -102,10 +107,15 @@ impl World {
                     report.migrated_entity_count += migrated_entity_count_for_type;
                 }
                 Err(error) => {
+                    let reason = error.to_string();
                     debug!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        "[persistence]   '{type_name}' -> SKIP ({error})",);
-                    report.skipped_type_names.push((*type_name).to_string());
+                        "[persistence]   '{type_name}' -> SKIP ({reason})",
+                    );
+                    report.skipped_types.push(SkippedType {
+                        type_name: (*type_name).to_string(),
+                        reason,
+                    });
                 }
             }
         }
@@ -115,7 +125,7 @@ impl World {
             "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped.",
             report.migrated_type_count,
             report.migrated_entity_count,
-            report.skipped_type_names.len(),
+            report.skipped_types.len(),
         );
 
         report
@@ -266,18 +276,23 @@ impl World {
                     continue;
                 };
 
-                (0..archetype.entities.len())
-                    .map(|entity_index| {
-                        let spawned_this_generation = pre_swap_entities.is_some_and(|entities| {
-                            !entities.contains(&archetype.entities[entity_index])
-                        });
-                        if spawned_this_generation {
-                            serialize_current_component(&archetype.component_storages, entity_index)
-                        } else {
-                            serialize_old_component(&archetype.component_storages, entity_index)
-                        }
-                    })
-                    .collect()
+                let mut serialized = Vec::with_capacity(archetype.entities.len());
+                for entity_index in 0..archetype.entities.len() {
+                    let spawned_this_generation = pre_swap_entities.is_some_and(|entities| {
+                        !entities.contains(&archetype.entities[entity_index])
+                    });
+                    // A refused serialization is reported before the column is
+                    // touched, so the archetype still holds every row.
+                    let Some(bytes) = (if spawned_this_generation {
+                        serialize_current_component(&archetype.component_storages, entity_index)
+                    } else {
+                        serialize_old_component(&archetype.component_storages, entity_index)
+                    }) else {
+                        return Err(PersistenceError::SerializationFailed { component_id });
+                    };
+                    serialized.push(bytes);
+                }
+                serialized
             };
 
             // Step 3: Decode each value with the new schema, falling back to
@@ -398,12 +413,23 @@ impl World {
             let destination_archetype_id = self.get_or_create_archetype(destination_component_ids);
 
             // Step 3: Serialize the old component values and decode them with
-            // the new schema, falling back to `{}`.
-            let serialized_components: Vec<Vec<u8>> = (0..source_archetype.entities.len())
-                .map(|entity_index| {
+            // the new schema, falling back to `{}`. A refused serialization
+            // puts the source archetype back before reporting, so a skipped
+            // type leaves the world exactly as it was found.
+            let mut serialized_components: Vec<Vec<u8>> =
+                Vec::with_capacity(source_archetype.entities.len());
+            for entity_index in 0..source_archetype.entities.len() {
+                let Some(bytes) =
                     serialize_old_component(&source_archetype.component_storages, entity_index)
-                })
-                .collect();
+                else {
+                    self.archetypes
+                        .insert(source_archetype_id, source_archetype);
+                    return Err(PersistenceError::SerializationFailed {
+                        component_id: old_component_id,
+                    });
+                };
+                serialized_components.push(bytes);
+            }
 
             let mut migrated_components: Vec<Box<dyn Component>> =
                 Vec::with_capacity(serialized_components.len());

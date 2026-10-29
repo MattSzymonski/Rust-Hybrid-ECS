@@ -120,7 +120,7 @@ pub use resources::RenderingManager;
 /// that reloads most often.
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
-    if engine.is_system_enabled("rendering").is_none() {
+    if !engine.is_registered("rendering") {
         engine.register_post_update_system("rendering", rendering_system);
     }
     0
@@ -167,6 +167,6 @@ mod tests {
         assert_eq!(register(&mut engine), 0);
         assert_eq!(register(&mut engine), 0);
 
-        assert!(engine.is_system_enabled("rendering").is_some());
+        assert!(engine.is_registered("rendering"));
     }
 }

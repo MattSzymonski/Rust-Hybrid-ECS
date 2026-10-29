@@ -218,6 +218,12 @@ pub(crate) enum ManagedRuntimeContext {
 pub struct CSharpRuntime {
     /// Unmanaged export polling the collectible loader for a rebuilt assembly.
     poll_reload: PollReloadFn,
+    /// The project assembly this runtime hosts, as configured.
+    ///
+    /// Carried so a refusal on the reload path - "declares no `[EcsSystem]`
+    /// methods" is the one that needs it - names the artifact that failed
+    /// rather than a fixed project name.
+    subject: String,
     /// Byte length of the manifest a parked version carries.
     #[cfg(feature = "hot_reload")]
     pending_manifest_length: PendingManifestLengthFn,
@@ -341,10 +347,13 @@ struct PreparedManagedSystem {
 fn prepare_managed_systems(
     bindings: &Arc<BindingStore>,
     exports: SystemExports,
+    subject: &str,
 ) -> Result<Vec<PreparedManagedSystem>, CSharpError> {
     let count = (exports.system_count)();
     if count == 0 {
-        return Err(CSharpError::NoSystems);
+        return Err(CSharpError::NoSystems {
+            subject: subject.to_string(),
+        });
     }
     let mut prepared = Vec::new();
     prepared
@@ -485,8 +494,9 @@ fn register_managed_systems(
     engine: &mut Engine,
     bindings: &Arc<BindingStore>,
     exports: SystemExports,
+    subject: &str,
 ) -> Result<Vec<ManagedSystemSnapshot>, CSharpError> {
-    let prepared = prepare_managed_systems(bindings, exports)?;
+    let prepared = prepare_managed_systems(bindings, exports, subject)?;
     Ok(commit_managed_systems(engine, bindings, exports, prepared))
 }
 
@@ -822,6 +832,7 @@ impl CSharpRuntime {
             exports,
             module_exposed,
             mirror_methods,
+            &config.project_assembly_name,
         )
     }
 
@@ -839,6 +850,7 @@ impl CSharpRuntime {
         exports: ManagedExports,
         module_exposed: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
+        subject: &str,
     ) -> Result<Self, CSharpError> {
         // Step 1: Byte-level bindings for every native component exposed to
         // managed code - the renderer data's and each extension's - so a
@@ -922,10 +934,11 @@ impl CSharpRuntime {
             system_error_length: exports.system_error_length,
             copy_system_error: exports.copy_system_error,
         };
-        let system_snapshot = register_managed_systems(engine, &bindings, system_exports)?;
+        let system_snapshot = register_managed_systems(engine, &bindings, system_exports, subject)?;
 
         Ok(Self {
             poll_reload: exports.poll_reload,
+            subject: subject.to_string(),
             exports: system_exports,
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
@@ -1002,6 +1015,7 @@ impl CSharpRuntime {
             exports,
             module_exposed,
             mirror_methods,
+            &config.project_assembly_name,
         )
     }
 
@@ -1197,7 +1211,7 @@ impl CSharpRuntime {
         // component the arriving assembly never registered is the usual one -
         // must leave the running generation's systems in place, because there
         // is nothing to fall back to once they are cleared.
-        let prepared = prepare_managed_systems(&self.bindings, self.exports)?;
+        let prepared = prepare_managed_systems(&self.bindings, self.exports, &self.subject)?;
         let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
         self.system_snapshot.clear();
         self.system_snapshot =

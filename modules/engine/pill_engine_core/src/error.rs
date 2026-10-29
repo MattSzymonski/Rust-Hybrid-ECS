@@ -637,7 +637,7 @@ pub(crate) const COMPONENT_LAYOUT_CHANGED_REFUSAL: &str =
 /// Error returned when a deferred command cannot be executed.
 ///
 /// Command errors are non-fatal by default — the engine logs them and
-/// continues. Set `Engine::should_exit_on_error` to `true` for strict mode
+/// continues. Call `Engine::set_should_exit_on_error(true)` for strict mode
 /// where any command failure stops the frame immediately.
 #[engine_error(namespace = engine::commands, runtime = ::pill_core::error)]
 pub enum CommandError {
@@ -661,11 +661,15 @@ pub enum CommandError {
         debug_value(entity),
         " was created but component ",
         debug_value(component_id),
-        " could not be written"
+        " could not be written: ",
+        value(reason)
     )]
     ComponentWriteFailed {
         entity: Entity,
         component_id: ComponentId,
+        /// The failure the write caught, so the report says why. Built only on
+        /// a failed command, never on the frame path.
+        reason: String,
     },
 
     /// The queued creation listed one component id more than once.
@@ -874,6 +878,13 @@ pub enum PersistenceError {
     /// The persisted bytes could not be decoded into the new schema.
     #[message("deserialization failed for component ", debug_value(component_id))]
     DeserializationFailed { component_id: ComponentId },
+    /// A value could not be encoded; the type's own `Serialize` refused it.
+    ///
+    /// The inverse of [`Self::DeserializationFailed`], and reported the same
+    /// way: the pass records the type as skipped and leaves the world as it
+    /// found it, rather than aborting a reload halfway through its transaction.
+    #[message("serialization failed for component ", debug_value(component_id))]
+    SerializationFailed { component_id: ComponentId },
 
     /// The old component column could not be removed from its archetype.
     #[message(

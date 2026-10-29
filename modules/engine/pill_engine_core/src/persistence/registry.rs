@@ -404,8 +404,14 @@ impl World {
 // =============================================================================
 
 /// Serializes the component at `index` in the given storage map into a
-/// JSON-encoded byte vector.
-pub(crate) type SerializeComponentFn = fn(storage: &ComponentColumns, index: usize) -> Vec<u8>;
+/// JSON-encoded byte vector, or `None` when the type's `Serialize`
+/// implementation refuses the value.
+///
+/// Infallible by signature would be a lie: `serde_json::to_vec` can fail on a
+/// user type, and the migration that reads through this pointer must report
+/// that as a skipped type rather than abort the reload.
+pub(crate) type SerializeComponentFn =
+    fn(storage: &ComponentColumns, index: usize) -> Option<Vec<u8>>;
 
 /// Deserializes JSON bytes back into a heap-allocated component.
 ///

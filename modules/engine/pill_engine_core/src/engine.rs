@@ -232,13 +232,18 @@ pub struct Engine {
     /// If true, `process_frame` returns every deferred-command failure it
     /// collected. When false (default), failures are logged and the frame
     /// reports success.
-    pub should_exit_on_error: bool,
+    ///
+    /// Set through [`Engine::set_should_exit_on_error`], like every other knob
+    /// on this type.
+    should_exit_on_error: bool,
     /// Optional frame rate limit. When set, `process_frame` sleeps the
     /// remaining budget after completing the frame's work.
     frame_budget: Option<Duration>,
     /// When true, the FPS limiter sleep is wrapped in a Tracy zone
     /// (`frame_wait`). Turn off to declutter the timeline.
-    pub trace_frame_wait: bool,
+    ///
+    /// Set through [`Engine::set_trace_frame_wait`].
+    trace_frame_wait: bool,
     /// Last seen archetype generation, used to detect when archetypes are
     /// added or removed so we can emit per-archetype memory breakdowns.
     last_archetype_generation: u64,
@@ -505,7 +510,32 @@ impl Engine {
         };
     }
 
+    /// Chooses whether a deferred-command failure fails the frame.
+    ///
+    /// When `true`, `process_frame` returns every failure it collected and the
+    /// caller decides what to do; when `false` (the default), failures are
+    /// logged and the frame reports success.
+    pub fn set_should_exit_on_error(&mut self, should_exit: bool) {
+        self.should_exit_on_error = should_exit;
+    }
+
+    /// Whether a deferred-command failure fails the frame.
+    pub fn should_exit_on_error(&self) -> bool {
+        self.should_exit_on_error
+    }
+
+    /// Chooses whether the frame-rate limiter's sleep is traced.
+    ///
+    /// The zone is named `frame_wait`; turn it off to declutter the timeline.
+    pub fn set_trace_frame_wait(&mut self, trace: bool) {
+        self.trace_frame_wait = trace;
+    }
+
     /// Enables a system by name.
+    ///
+    /// The name-keyed convenience over [`Self::set_system_enabled_at`]. Names
+    /// are not unique, so a caller that has a [`SystemSnapshot`] should use
+    /// that snapshot's index instead: this one hits the first match.
     ///
     /// Returns `true` if the system was found and enabled, `false` otherwise.
     pub fn enable_system(&mut self, name: &str) -> bool {
@@ -514,7 +544,9 @@ impl Engine {
 
     /// Disables a system by name.
     ///
-    /// Disabled systems are skipped during frame processing.
+    /// The name-keyed convenience over [`Self::set_system_enabled_at`]; see
+    /// [`Self::enable_system`] for the caveat about duplicate names.
+    ///
     /// Returns `true` if the system was found and disabled, `false` otherwise.
     pub fn disable_system(&mut self, name: &str) -> bool {
         self.set_system_enabled(name, false)
@@ -547,6 +579,24 @@ impl Engine {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.enabled)
+    }
+
+    /// Whether a system with this name is registered.
+    ///
+    /// The existence question on its own; [`Self::is_system_enabled`] also
+    /// answers it, but reads as a predicate about enabled-ness. Names are not
+    /// unique, so this says `true` for any registration carrying the name.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.system_index(name).is_some()
+    }
+
+    /// The registration index of the first system named `name`.
+    ///
+    /// That index is what [`Self::set_system_enabled_at`] takes and what
+    /// [`SystemSnapshot::index`] carries, so a caller that needs to mutate a
+    /// specific registration resolves it here rather than by name.
+    pub fn system_index(&self, name: &str) -> Option<usize> {
+        self.systems.iter().position(|s| s.name == name)
     }
 
     /// Snapshot of every registered system, in registration order.

@@ -688,9 +688,9 @@ fn shared_rows_survive_a_migration_from_either_copy() {
         "the shared name migrates as one type"
     );
     assert!(
-        report.skipped_type_names.is_empty(),
+        report.skipped_types.is_empty(),
         "no copy may be skipped: {:?}",
-        report.skipped_type_names
+        report.skipped_types
     );
     assert_eq!(
         report.migrated_entity_count, 2,

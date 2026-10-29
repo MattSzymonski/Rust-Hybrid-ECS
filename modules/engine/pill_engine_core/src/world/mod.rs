@@ -1151,19 +1151,16 @@ impl World {
         // finding both here is what keeps a failed migration atomic, because the
         // destination would otherwise already hold part of the entity's row
         // while the source still holds the entity. The reservation is here for
-        // the same reason: afterwards no carried row can fail to land.
-        let prepared = Self::prepare_destination_columns(
+        // the same reason: afterwards no carried row can fail to land. Nothing
+        // has moved when this refuses, so the caller's restored archetype is the
+        // world exactly as this was handed over.
+        Self::prepare_destination_columns(
             &mut self.archetypes,
-            &old_archetype,
+            old_archetype,
             entity,
             old_index,
             new_archetype_id,
-        );
-        if let Err(error) = prepared {
-            // Nothing has moved, so the caller's restored archetype is the
-            // world exactly as this was handed over.
-            return Err(error);
-        }
+        )?;
 
         // Step 2: Write the entity's row into the destination. The attached
         // component goes first, while a refusal is still free; the carried rows
@@ -1205,12 +1202,10 @@ impl World {
                 break;
             }
         }
-        if let Err(error) = carried_result {
-            // Unreachable after Step 1: the widths agree, the row exists and
-            // every destination column has room. The caller reports the broken
-            // invariant instead of the move being swallowed.
-            return Err(error);
-        }
+        // Unreachable after Step 1: the widths agree, the row exists and every
+        // destination column has room. The caller reports the broken invariant
+        // instead of the move being swallowed.
+        carried_result?;
 
         // Stamp the arrival tick on the component this migration attached.
         // A carried row brought its ticks with it - they are part of the row

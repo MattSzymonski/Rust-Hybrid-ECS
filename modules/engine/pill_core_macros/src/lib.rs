@@ -563,6 +563,14 @@ fn existing_derives(item: &ItemEnum) -> HashSet<String> {
 /// - A `#[message(...)]` is empty or references an unknown field.
 /// - A `#[transparent]` variant does not wrap exactly one error field.
 ///
+/// # Debug aid
+///
+/// Set `ENGINE_ERROR_MACRO_DEBUG=1` to write each expanded enum to its own file
+/// (`engine_error_<Enum>.rs`) and print that path to the build log. The file
+/// goes to `ENGINE_ERROR_MACRO_DEBUG_DIR` when that names a directory, and to
+/// the system temp directory otherwise - never to the compiler's working
+/// directory.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -717,20 +725,22 @@ fn expand(arguments: MacroArguments, item: &mut ItemEnum) -> syn::Result<TokenSt
         }
     };
 
-    // Debug aid: dump the expansion when the env var is set.
+    // Debug aid: write this enum's expansion to a file when the variable is
+    // set. The directory is `ENGINE_ERROR_MACRO_DEBUG_DIR` or the system temp
+    // directory - never the compiler's working directory, where an untracked
+    // `.rs` beside the workspace manifest would be a surprise. The path is
+    // printed because a proc macro's only other output is tokens.
     if std::env::var_os("ENGINE_ERROR_MACRO_DEBUG").is_some() {
-        if let Ok(mut dump) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("engine_error_macro_debug.rs")
-        {
-            use std::io::Write as _;
-            let _ = writeln!(
-                dump,
-                "\n// ==== {} ====\n{}",
-                enum_ident,
-                output.to_token_stream()
-            );
+        let directory = std::env::var_os("ENGINE_ERROR_MACRO_DEBUG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dump_path = directory.join(format!("engine_error_{}.rs", enum_ident));
+        match std::fs::write(&dump_path, output.to_token_stream().to_string()) {
+            Ok(()) => eprintln!("engine_error: wrote {}", dump_path.display()),
+            Err(error) => eprintln!(
+                "engine_error: could not write {}: {error}",
+                dump_path.display()
+            ),
         }
     }
 

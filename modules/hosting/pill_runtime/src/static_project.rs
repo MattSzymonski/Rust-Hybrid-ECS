@@ -361,39 +361,26 @@ fn initialize_linked(
     scope: Option<SystemOwner>,
     startup_scene: Option<&'static str>,
 ) -> Result<(), u32> {
-    // Exactly what `#[pill_project]` and `#[pill_module]` emit ahead of the
-    // user's function. Idempotent, so running it once per entry point costs one
-    // pass over a static list and keeps this identical to the wrappers rather
-    // than merely equivalent to them.
-    // The failure, if any, is also recorded in the world's registration-error
-    // slot, which is checked below; the direct error would duplicate it.
-    //
-    // The resolver is held across the entry point, exactly like
-    // `run_artifact_init` holds it in the DLL wrappers: a linked project
-    // registers its own components from `init`, and a value-type field only
-    // expands into editable rows while a resolver is installed.
-    let previous = pill_engine::component_registry::install_value_type_layouts(engine.world_mut());
-    let _ = pill_engine::component_registry::register_all_components(engine.world_mut());
-    // A project's startup scene goes in here: the component types exist, and
-    // the project has not yet seeded its own entities over them.
-    if let Some(path) = startup_scene {
-        apply_project_startup_scene(engine, path);
-    }
-    let status = register_scoped(engine, scope, init);
-    let registration_error = engine.world_mut().take_registration_error();
-    pill_engine::component_registry::restore_value_type_layouts(engine.world_mut(), previous);
+    // The same transaction the generated wrappers run, ordering included: this
+    // used to be a hand-maintained copy that had to stay identical to
+    // `run_artifact_init` by comment.
+    let status = pill_engine::component_registry::run_artifact_entry(
+        engine,
+        |engine| {
+            // A project's startup scene goes in here: the component types
+            // exist, and the project has not yet seeded its own entities over
+            // them.
+            if let Some(path) = startup_scene {
+                apply_project_startup_scene(engine, path);
+            }
+        },
+        |engine| register_scoped(engine, scope, init),
+    );
 
-    // The generated wrappers read the world's registration-error slot once more
-    // after the user's function, because resource guards are raised from that
-    // code rather than from `register_all_components` above. Same here, so a
-    // shared-name conflict fails this entry point instead of being recorded and
-    // forgotten.
-    if status != 0 {
-        Err(status)
-    } else if registration_error.is_some() {
-        Err(u32::MAX)
-    } else {
+    if status == 0 {
         Ok(())
+    } else {
+        Err(status)
     }
 }
 

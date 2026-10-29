@@ -45,19 +45,30 @@ pub struct PersistTypeManifestEntry {
     pub schema_hash: u64,
 }
 
+/// One component type the selective pass could not migrate.
+#[derive(Debug, Clone)]
+pub struct SkippedType {
+    /// Registered type name the pass skipped.
+    pub type_name: String,
+    /// Why the pass skipped it, as the migration error renders. Carried so a
+    /// single default-level log line answers "why", instead of a re-run with
+    /// per-target logging.
+    pub reason: String,
+}
+
 /// Result of selective migration.
 ///
 /// Aggregates how many component types and entities were migrated by
-/// [`World::migrate_changed_persistable_components`], plus the names of the
-/// types that could not be migrated selectively.
+/// [`World::migrate_changed_persistable_components`], plus the types that could
+/// not be migrated selectively and why.
 #[derive(Debug, Default)]
 pub struct SelectiveMigrationReport {
     /// Number of component types that were migrated.
     pub migrated_type_count: usize,
     /// Number of entities touched by selective migration.
     pub migrated_entity_count: usize,
-    /// Component type names that could not be migrated selectively.
-    pub skipped_type_names: Vec<String>,
+    /// Types that could not be migrated selectively, with the reason.
+    pub skipped_types: Vec<SkippedType>,
 }
 
 // =============================================================================
@@ -346,13 +357,18 @@ impl World {
 // =============================================================================
 
 /// Serialize a single component at `index` from storage into JSON bytes.
-pub(super) fn serialize_component<T>(storage: &ComponentColumns, index: usize) -> Vec<u8>
+///
+/// Returns `None` when the type's own `Serialize` implementation refuses the
+/// value, which the caller reports as a skipped type: a reload that cannot
+/// serialize one type must still complete for the others, and aborting the
+/// host is not an option the signature should hide.
+pub(super) fn serialize_component<T>(storage: &ComponentColumns, index: usize) -> Option<Vec<u8>>
 where
     T: Component + Serialize,
 {
     let typed_storage = storage.column_of::<T>();
     let value: &T = typed_storage.get::<T>(index);
-    serde_json::to_vec(value).expect("JSON serialization failed")
+    serde_json::to_vec(value).ok()
 }
 
 /// Deserialize JSON bytes into a heap-allocated component.

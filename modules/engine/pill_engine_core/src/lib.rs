@@ -32,7 +32,7 @@ extern crate self as pill_engine;
 /// Tracy profiled allocator that tracks allocations in Tracy's memory view.
 ///
 /// Only active with the opt-in `profiling-memory` feature. The sampling rate is
-/// controlled by [`crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
+/// controlled by [`crate::config::PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
 ///
 /// Not part of `profiling`: the allocator is generic, so it is instantiated in
 /// every DLL that links it and calls Tracy's C entry points directly.
@@ -43,7 +43,7 @@ extern crate self as pill_engine;
 static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(
         std::alloc::System,
-        crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
+        crate::config::PROFILING_MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
     );
 
 // ===== Public Modules =====

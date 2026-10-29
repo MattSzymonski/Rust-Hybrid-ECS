@@ -2837,7 +2837,7 @@ fn relayout_moves_the_factory_and_the_column_together() {
         .find_map(|archetype| archetype.component_storages.get(component_id))
         .expect("the row's column");
     assert_eq!(
-        (column.element_size(), column.elem_align()),
+        (column.element_size(), column.alignment()),
         (16, 8),
         "the column that allocates the rows carries the same shape"
     );
