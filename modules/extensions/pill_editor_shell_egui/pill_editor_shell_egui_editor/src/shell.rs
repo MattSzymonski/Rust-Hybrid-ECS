@@ -41,7 +41,6 @@ pub mod prelude;
 pub mod claim;
 
 pub use claim::claim_context_once;
-pub use claim::claim_popout_contexts;
 pub use claim::claim_shell_context;
 
 /// The [`tab_systems`] module: the Systems tab's pause and step controls and
@@ -364,10 +363,12 @@ pub fn run_frame(
             "[editor] egui shell rows"
         );
     }
-    // The first frame of a shell generation owns the shared egui context:
-    // whatever the previous generation left in its temporary data would be a
-    // dangling read once this one draws (claim.rs has the reasoning).
-    claim_shell_context(&state.context);
+    // The first frame of a shell generation owns every egui context the
+    // session holds - the main one and each popped-out window's: whatever the
+    // previous generation left in their temporary data would be a dangling
+    // read once this one draws (claim.rs has the reasoning). It runs here,
+    // before any borrow of the dock or the popout map.
+    claim_shell_context(state);
     // The UI heartbeat: one full shell update (input conversion, the egui
     // dock and its tabs, the frame conversion) in microseconds. The shell
     // benchmark reads the UI-redraw case from it; the GPU overlay draw is
@@ -421,12 +422,11 @@ pub fn run_frame(
         panel_window_ping: window_ping,
         popout_contexts,
         previews,
-        preview_visible,
         ..
     } = state;
     // The grid reports what it drew, so the executable asks for previews of
     // what is on screen only.
-    preview_visible.clear();
+    previews.begin_pass();
     // The rows record their rectangles either way - the shell's own tests read
     // them - but only a scripted run asks for them in the log.
     inspector.log_rects = shell_input.scripted;
@@ -474,7 +474,6 @@ pub fn run_frame(
         clipboard,
         drag_out: &mut drag_out,
         previews,
-        preview_visible,
         badges: &shell_input.badges,
     };
     let output = context.run_ui(raw_input, |ui| {
@@ -574,7 +573,6 @@ pub fn run_frame(
     // nothing draws into would be cleared on every generation's first frame
     // and kept for the life of the session otherwise.
     popout_contexts.retain(|tab, _| dock.is_popped_out(*tab));
-    claim_popout_contexts(popout_contexts);
     shell_frame.popout_frames =
         run_popout_passes(dock, popout_contexts, popout_inputs, &mut viewer);
     // A tab menu's pop-out request lands here for the same reason a re-dock
@@ -886,11 +884,9 @@ pub struct EditorTabViewer<'a> {
     /// The asset path a tile drag handed to the OS: the
     /// executable starts an OLE drag with it.
     pub drag_out: &'a mut Option<String>,
-    /// The rendered asset previews, by path.
-    pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
-    /// The tiles the grid drew this frame, which the executable turns into
-    /// preview requests.
-    pub preview_visible: &'a mut Vec<String>,
+    /// The asset tiles' previews: the textures to draw and the tiles this pass
+    /// drew, so the executable asks only for what is on screen.
+    pub previews: &'a mut pill_editor_core::session::PreviewStates,
     /// The entity badges the executable projected into this frame's scene
     /// views.
     pub badges: &'a [ShellBadge],
@@ -1018,7 +1014,6 @@ pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: Editor
                 overlay_regions: &mut viewer.overlay_regions,
                 drag_out: viewer.drag_out,
                 previews: viewer.previews,
-                preview_visible: viewer.preview_visible,
             };
             assets_tab(ui, viewer.snapshot, viewer.browser, &mut writes);
         }

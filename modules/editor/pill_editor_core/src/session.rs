@@ -58,19 +58,11 @@ pub struct EguiShellState {
     /// The brand mark's texture, uploaded on the first frame and kept for the
     /// session: the context owns it, so a shell reload reuses it.
     pub mark: Option<TextureHandle>,
-    /// The rendered asset previews, by project-relative path: pixels the
-    /// executable read back from the renderer and
-    /// uploaded once, kept in memory so a tile redraws without another
-    /// request.
-    pub previews: BTreeMap<String, TextureHandle>,
-    /// The tiles the renderer answered with no pixels, by project-relative
-    /// path: an undecodable file or a frame that drew nothing is
-    /// answered with a refusal, so the tile keeps its type icon and the grid
-    /// asks for the next one instead of waiting on this one forever.
-    pub preview_refused: BTreeSet<String>,
-    /// The paths of the tiles the Assets grid drew this frame, so the
-    /// executable asks only for previews on screen.
-    pub preview_visible: Vec<String>,
+    /// The asset tiles' previews: the textures the executable read back and
+    /// uploaded, the tiles it answered without pixels, and the tiles this
+    /// pass drew - one value, because the three answer one question (may this
+    /// tile be asked for now?).
+    pub previews: PreviewStates,
     /// The menu bar's already-logged geometry and the requests its items
     /// raised.
     pub menubar: MenubarSession,
@@ -620,9 +612,129 @@ pub struct InspectorSession {
     pub badge_rects: Vec<(String, Rect)>,
 }
 
+/// The preview state of every asset tile, keyed by the panel's row key.
+///
+/// One value instead of three parallel collections. A key is ready, refused or
+/// neither; the visible list is rebuilt every pass; and the two rules that have
+/// to agree live here rather than in a convention between the shell and the
+/// executable: a key is never both ready and refused ([`PreviewStates::mark_ready`]
+/// clears the refusal, [`PreviewStates::mark_refused`] drops the texture), and
+/// only a tile this pass drew is asked for ([`PreviewStates::wants`]).
+#[derive(Default)]
+pub struct PreviewStates {
+    ready: BTreeMap<String, TextureHandle>,
+    refused: BTreeSet<String>,
+    visible: Vec<String>,
+}
+
+impl PreviewStates {
+    /// Start a pass: the visible list is whatever this pass draws.
+    pub fn begin_pass(&mut self) {
+        self.visible.clear();
+    }
+
+    /// Record one tile the grid drew, in draw order.
+    pub fn push_visible(&mut self, key: &str) {
+        self.visible.push(key.to_string());
+    }
+
+    /// The keys this pass drew, in draw order.
+    #[must_use]
+    pub fn visible(&self) -> &[String] {
+        &self.visible
+    }
+
+    /// The rendered texture for `key`, when there is one.
+    #[must_use]
+    pub fn ready(&self, key: &str) -> Option<&TextureHandle> {
+        self.ready.get(key)
+    }
+
+    /// Whether `key` may be requested now: drawn this pass, not ready, not
+    /// refused.
+    #[must_use]
+    pub fn wants(&self, key: &str) -> bool {
+        self.visible.iter().any(|visible| visible == key)
+            && !self.ready.contains_key(key)
+            && !self.refused.contains(key)
+    }
+
+    /// Record a rendered texture for `key`.
+    pub fn mark_ready(&mut self, key: &str, texture: TextureHandle) {
+        self.refused.remove(key);
+        self.ready.insert(key.to_string(), texture);
+    }
+
+    /// Record that `key` was answered without pixels: an undecodable file or a
+    /// frame that drew nothing. The tile keeps its type icon and the grid asks
+    /// for the next one instead of waiting on this one forever.
+    pub fn mark_refused(&mut self, key: &str) {
+        self.ready.remove(key);
+        self.refused.insert(key.to_string());
+    }
+
+    /// Drop every preview whose key the listing still holds, when `unchanged`
+    /// says so.
+    pub fn retain_keys(&mut self, kept: &BTreeSet<String>) {
+        self.ready.retain(|key, _| kept.contains(key));
+        self.refused.retain(|key| kept.contains(key));
+    }
+
+    /// Forget the refusals, so the next pass asks for those tiles again.
+    pub fn clear_refused(&mut self) {
+        self.refused.clear();
+    }
+
+    /// Forget every preview.
+    pub fn clear(&mut self) {
+        self.ready.clear();
+        self.refused.clear();
+    }
+}
+
 impl Resource for EguiShellState {}
 
+/// What one generation's claim on the session's egui contexts cleared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContextClaim {
+    /// The entries the main context's `Memory::data` held.
+    pub main_entries: usize,
+    /// How many popped-out windows' contexts held anything.
+    pub popout_windows: usize,
+}
+
 impl EguiShellState {
+    /// Clear every egui context this session owns, answering what was cleared.
+    ///
+    /// The set of contexts to clear is whatever the session owns - the main one
+    /// and one per popped-out tab - so a third kind of context joins this
+    /// method instead of gaining a flag of its own in the shell. A shell
+    /// generation calls it on its first frame, before its pass: a value the
+    /// previous generation left in `Memory::data` carries that image's drop
+    /// code, and touching it after the reload is a use-after-unmap.
+    pub fn claim_generation(&mut self) -> ContextClaim {
+        let main_entries = self.context.memory_mut(|memory| {
+            let entries = memory.data.len();
+            memory.data.clear();
+            entries
+        });
+        let mut popout_windows = 0;
+        for context in self.popout_contexts.values() {
+            let entries = context.memory_mut(|memory| {
+                let entries = memory.data.len();
+                memory.data.clear();
+                entries
+            });
+            if entries > 0 {
+                popout_windows += 1;
+            }
+        }
+        ContextClaim {
+            main_entries,
+            popout_windows,
+        }
+    }
+
     /// Session state with the editor's theme and the saved dock.
     ///
     /// A document this build cannot use falls back to the default layout and
@@ -643,9 +755,7 @@ impl EguiShellState {
             toolbox: ToolboxSession::default(),
             browser: ProjectBrowser::default(),
             mark: None,
-            previews: BTreeMap::new(),
-            preview_refused: BTreeSet::new(),
-            preview_visible: Vec::new(),
+            previews: PreviewStates::default(),
             menubar: MenubarSession::default(),
             inspector: InspectorSession::default(),
             toasts: ToastSession::default(),

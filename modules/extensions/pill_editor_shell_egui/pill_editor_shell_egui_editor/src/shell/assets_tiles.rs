@@ -50,12 +50,10 @@ pub struct AssetTileWrites<'a> {
     /// The asset path a drag handed to the OS: the shell
     /// reports it, the executable starts the OLE drag.
     pub drag_out: &'a mut Option<String>,
-    /// The rendered previews, by row key: a tile draws the one
-    /// it finds and keeps its icon otherwise.
-    pub previews: &'a std::collections::BTreeMap<String, egui::TextureHandle>,
-    /// The tiles drawn this frame, by row key, which the executable turns into
-    /// preview requests: only what is on screen costs work.
-    pub preview_visible: &'a mut Vec<String>,
+    /// The asset tiles' previews: a tile draws the texture it finds and keeps
+    /// its icon otherwise, and records itself as drawn so the executable asks
+    /// only for what is on screen.
+    pub previews: &'a mut pill_editor_core::session::PreviewStates,
 }
 
 /// Log a tile's rectangle once per placement, so a suite can drag a file onto
@@ -171,8 +169,8 @@ pub fn asset_tile(
     // A finished preview takes the tile's picture area; the type icon stays in
     // the picture's bottom-left corner, so a person still reads what the file
     // is. Until one exists the icon alone stands.
-    let preview = writes.previews.get(&key);
-    writes.preview_visible.push(key.clone());
+    let preview = writes.previews.ready(&key).cloned();
+    writes.previews.push_visible(&key);
     match preview {
         Some(preview) => {
             let size = preview.size_vec2();
