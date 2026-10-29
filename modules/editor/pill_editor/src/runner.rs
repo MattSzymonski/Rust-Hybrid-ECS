@@ -5152,7 +5152,8 @@ impl EditorWindow {
             .get_resource::<EditorSelection>()
             .map(|selection| selection.entities().to_vec())
             .unwrap_or_default();
-        let mut snapshot = EditorSnapshot::capture_list(engine, self.frame_index, &[], Vec::new());
+        let mut snapshot =
+            EditorSnapshot::capture_engine_tiers(engine, self.frame_index, &[], Vec::new());
         snapshot.detail =
             selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
         // Every selected entity's detail: a shared-field edit

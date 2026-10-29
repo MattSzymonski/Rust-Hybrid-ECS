@@ -42,7 +42,7 @@ fn entity_rows_list_the_worlds_entities() {
         .create_entity()
         .build()
         .expect("entity builds");
-    let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     let rows = entity_rows(&snapshot);
     assert_eq!(rows.len(), 2);
     let expected = format!("{}v{}", second.id(), second.generation());
@@ -58,7 +58,7 @@ fn the_systems_rows_name_the_worlds_systems() {
     let mut engine = Engine::new();
     engine.register_system("tick", || {});
     engine.register_system("render", || {});
-    let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     let rows: Vec<String> = snapshot
         .systems
         .iter()
@@ -233,7 +233,7 @@ fn drawing_every_tab_body_queues_nothing() {
         .build()
         .expect("entity builds");
     engine.register_system("tick", || {});
-    let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     let mut selection = EditorSelection::default();
     let mut dialog: Option<AssetDialog> = None;
     let mut pending = PendingEditorCommands::default();
@@ -296,7 +296,7 @@ fn the_addable_list_omits_the_components_the_entity_carries() {
         .create_entity()
         .build()
         .expect("entity builds");
-    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     snapshot.components = vec![
         pill_editor_core::editor_state::RegisteredComponent {
             type_name: "demo::Carried".to_string(),
@@ -333,7 +333,7 @@ fn the_addable_list_omits_the_components_the_entity_carries() {
 #[test]
 fn the_assets_panel_wraps_a_long_tile_caption_and_queues_nothing() {
     let engine = Engine::new();
-    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     snapshot.assets = browser_fixture!();
     let mut browser = ProjectBrowser::default();
     assert!(browser.open("models"));
@@ -541,7 +541,7 @@ fn a_dropped_asset_tile_queues_the_reference_edit() {
     }
 
     let engine = Engine::new();
-    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     snapshot.assets = vec![AssetListing {
         root: String::new(),
         path: "cube.obj".to_string(),
@@ -858,7 +858,7 @@ fn an_asset_row_click_moves_the_asset_selection() {
 #[test]
 fn the_inspector_lists_the_selections_components_and_fields() {
     use pill_editor_core::editor_state::ComponentView;
-    use pill_engine::component_registry::ComponentFieldDescriptor;
+    use pill_editor_core::editor_state::{ComponentFieldView, EntityDetail};
     let mut engine = Engine::new();
     let entity = engine
         .world_mut()
@@ -874,14 +874,9 @@ fn the_inspector_lists_the_selections_components_and_fields() {
                 type_name: "tests::Health".to_string(),
                 persistable: false,
                 editable: true,
-                fields: vec![ComponentFieldDescriptor {
-                    name: "current",
-                    type_tag: "f32",
-                    offset: 0,
-                    size: 4,
-                    align: 4,
-                    element_count: 0,
-                    decorators: std::borrow::Cow::Borrowed(&[]),
+                fields: vec![ComponentFieldView {
+                    name: "current".to_string(),
+                    decorators: Vec::new(),
                 }],
                 values: vec![FieldValue::F32(3.0)],
             },
@@ -905,7 +900,7 @@ fn the_inspector_lists_the_selections_components_and_fields() {
     assert!(rows[1].1.is_empty());
 
     // The tab draws the detail without panicking.
-    let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
     snapshot.detail = Some(detail);
     let mut selection = EditorSelection::default();
     selection.select_only(entity);
