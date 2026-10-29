@@ -12,8 +12,9 @@ DESCRIPTION:
   runs each area's checks - formatting/lint on Rust changes, the crate's unit
   tests, the named devops suites and the few verify.py steps that guard the
   area. A file that no rule recognizes falls back to `verify.py --quick`, so
-  an unknown area can never pass unchecked. Editor suites get the editor build
-  (the uplift) prepended automatically.
+  an unknown area can never pass unchecked. Editor-tier suites (the `TIER:`
+  header they declare) get the editor build (the uplift) prepended
+  automatically.
 
   This is the inner loop after a change; the full gate (`verify.py`) and the
   milestone tiers stay for stage boundaries and milestones. See
@@ -44,7 +45,9 @@ EXAMPLE USAGE:
 """
 
 import argparse
+import ast
 import fnmatch
+import re
 import subprocess
 import sys
 import time
@@ -54,6 +57,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MODULES = "modules"
+SUITES_DIR = REPOSITORY_ROOT / "devops" / "tests"
 
 # Paths that never carry code: documentation and local-only or workflow
 # state. A change that touches only these needs no checks.
@@ -97,6 +101,27 @@ def suite_check(name: str, reason: str) -> Check:
         command=("python", "devops/tests/run_all.py", "--only", name),
         reasons=[reason],
     )
+
+
+def suite_tier(name: str) -> str:
+    """The `TIER:` value a suite declares in its header, or "" when unreadable.
+
+    The suites' own headers are the convention `run_all.py` orders its run by,
+    so a new editor-tier suite joins the editor lane - its build uplift and
+    its last position - without a list to keep in sync here.
+    """
+    try:
+        source = (SUITES_DIR / name).read_text(encoding="utf-8")
+        docstring = ast.get_docstring(ast.parse(source)) or ""
+    except (OSError, SyntaxError):
+        return ""
+    match = re.search(r"^TIER:\s*(\w+)", docstring, re.MULTILINE)
+    return match.group(1).lower() if match else ""
+
+
+def is_editor_suite(check: Check) -> bool:
+    """Whether the check runs a suite that declares itself in the editor tier."""
+    return check.label.startswith("suite:") and suite_tier(check.label.split(":", 1)[1]) == "editor"
 
 
 def cargo_check(label: str, arguments: Sequence[str], reason: str) -> Check:
@@ -150,17 +175,18 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                     ("test", "-p", "pill_ui_frame", "-p", "pill_project_ui", "--offline"),
                                     "shared draw data changed"))
 
-    # The egui editor: the shared model crate, the UI library, the reloadable
-    # shell module and the frontend. Its suites are the crates' own unit
-    # tests plus the egui editor suite; the editor build uplift is added
-    # below, since only that build re-freezes the shared dylibs.
-    if has("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
-           "modules/extensions/pill_editor_shell_egui/**"):
+    # The egui editor's crates: the shared model crate and the reloadable shell
+    # module. Their own unit tests are the per-change net. The end-to-end suite
+    # drives the real executable - a frontend build plus a full scripted
+    # session - so only the code that session exercises, the shell module and
+    # the frontend, selects it; a model-only change keeps its unit tests.
+    if has("modules/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**"):
         selected.append(cargo_check("test egui editor crates",
                                     ("test", "-p", "pill_editor_core",
                                      "-p", "pill_editor_shell_egui_editor", "--offline"),
                                     "egui editor crates changed"))
-        selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
+    if has("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**"):
+        selected.append(suite_check("test_editor_egui.py", "editor shell or frontend changed"))
 
     # pill_project_ui: the in-game egui UI (W-0028). Its own unit tests cover the
     # input bridge, the tessellator and the texture mirror; the painter it
@@ -178,8 +204,8 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
     # places that configure it - the editor's style module, the editor's
     # settings file in the host, and the game UI that installs it. The crates'
     # unit tests plus the two suites that read the pipeline's log lines; the
-    # editor's own rule below already selects its crate tests and suite when
-    # the style module moves.
+    # editor's own rule below already selects its crate tests when the style
+    # module moves.
     if has("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
            "modules/editor/pill_editor_core/src/style.rs",
            "modules/hosting/pill_host/src/config.rs"):
@@ -188,20 +214,6 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                      "-p", "pill_project_ui", "--offline"),
                                     "theme pipeline changed"))
         selected.append(suite_check("test_ui_theme.py", "theme pipeline changed"))
-
-    # The editor: the shell module, frontend and the editor-side crates.
-    # The frontend-facing suites are picked per area; run_all handles the rest.
-    # The egui editor: the shared model crate, the UI library, the reloadable
-    # shell module and the frontend. Its suites are the crates' own unit
-    # tests plus the egui editor suite; the editor build uplift is added
-    # below, since only that build re-freezes the shared dylibs.
-    if has("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
-           "modules/extensions/pill_editor_shell_egui/**"):
-        selected.append(cargo_check("test egui editor crates",
-                                    ("test", "-p", "pill_editor_core",
-                                     "-p", "pill_editor_shell_egui_editor", "--offline"),
-                                    "egui editor crates changed"))
-        selected.append(suite_check("test_editor_egui.py", "egui editor changed"))
 
     # The browser frontend: the crate only compiles for wasm, so its check is
     # the wasm target, and the page smoke suite builds a project and draws it
@@ -238,8 +250,12 @@ def area_checks(paths: Sequence[str]) -> List[Check]:
                                                        "--offline"), "runtime changed"))
         selected.append(suite_check("test_shipping_smoke.py", "runtime changed"))
 
-    # Extensions: reload through the host, so the reload suite is the net.
-    if has("modules/extensions/**"):
+    # Extensions: reload through the host, so the reload suite is the net. The
+    # editor shell is an extension only in its build shape - no reload suite
+    # starts an editor host - and the editor lane below patches and reloads it.
+    extension_paths = [path for path in has("modules/extensions/**")
+                       if not matches(path, "modules/extensions/pill_editor_shell_egui/**")]
+    if extension_paths:
         selected.append(suite_check("test_hot_reload_suite.py", "extension changed"))
 
     # The renderer's data crate and GPU module: boundaries plus the asset
@@ -308,8 +324,8 @@ RULE_GLOBS: List[Tuple[str, Tuple[str, ...]]] = [
     ("theme-pipeline", ("modules/ui/pill_ui_theme/**", "modules/ui/pill_ui_kit/**",
                         "modules/editor/pill_editor_core/src/style.rs",
                         "modules/hosting/pill_host/src/config.rs")),
-    ("egui-editor", ("modules/editor/pill_editor_core/**", "modules/editor/pill_editor/**",
-                     "modules/extensions/pill_editor_shell_egui/**")),
+    ("editor-crates", ("modules/editor/pill_editor_core/**", "modules/extensions/pill_editor_shell_egui/**")),
+    ("editor-frontend", ("modules/editor/pill_editor/**", "modules/extensions/pill_editor_shell_egui/**")),
     ("web-frontend", ("modules/frontends/pill_web/**", "devops/tools/build_web.py", "devops/tools/web/**")),
     ("engine-core", ("modules/engine/pill_engine_core/**", "modules/engine/pill_engine/**", "modules/engine/pill_engine_macros/**")),
     ("pill-core", ("modules/engine/pill_core/**",)),
@@ -352,14 +368,14 @@ def select_checks(paths: Sequence[str]) -> List[Check]:
 
     ordered.sort(key=rank)
 
-    # Editor suites run last, and the uplift runs immediately before them:
-    # every cargo test or check rewrites the shared dylibs with that
+    # Editor-tier suites run last, and the uplift runs immediately before
+    # them: every cargo test or check rewrites the shared dylibs with that
     # invocation's feature unification, and an editor binary built against a
     # later-overwritten dylib dies at process start (0xC0000139
     # STATUS_ENTRYPOINT_NOT_FOUND). Nothing may run between the two.
-    editor_rows = [check for check in ordered if check.label.startswith("suite:test_editor_")]
+    editor_rows = [check for check in ordered if is_editor_suite(check)]
     if editor_rows:
-        ordered = [check for check in ordered if not check.label.startswith("suite:test_editor_")]
+        ordered = [check for check in ordered if not is_editor_suite(check)]
         uplift = cargo_check("editor build", ("build", "-p", "pill_editor", "--offline"),
                              "editor suites selected")
         uplift.reasons = ["editor suites need the frontend built on the current dylibs"]
