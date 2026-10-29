@@ -79,7 +79,13 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
             failed,
             "[editor] engine commands applied"
         );
-        follow_selection(engine, &batch.commands);
+        // The selection follows what happened on disk, not what was asked for:
+        // a refused move or delete must leave the selection where the file
+        // still is, or the Inspector shows an asset that is not the one the
+        // failure left behind.
+        let refused: std::collections::HashSet<usize> =
+            recorded.failures.iter().map(|(index, _)| *index).collect();
+        follow_selection(engine, &batch.commands, &refused);
         // A batch that moved files on disk brings the rows up to date at
         // once: the Assets toolbar acts on what the rows say.
         if batch.commands.iter().any(command_touches_files) {
@@ -179,9 +185,18 @@ pub fn apply_pending(engine: &mut Engine, now_millis: u64) -> DrainOutcome {
 /// Move the shared selection with the file a batch moved or deleted.
 ///
 /// The selection is a view of the disk, not a step: it follows here, so undo
-/// never has to replay a selection change to keep the two agreeing.
-fn follow_selection(engine: &mut Engine, commands: &[EditorCommand]) {
-    for command in commands {
+/// never has to replay a selection change to keep the two agreeing. A command
+/// that did not apply is skipped - a move refused because its destination
+/// exists must not leave the selection on a file that is not there.
+fn follow_selection(
+    engine: &mut Engine,
+    commands: &[EditorCommand],
+    refused: &std::collections::HashSet<usize>,
+) {
+    for (index, command) in commands.iter().enumerate() {
+        if refused.contains(&index) {
+            continue;
+        }
         let world = engine.world_mut();
         let Some(selection) = world.get_resource_mut::<EditorSelection>() else {
             break;
@@ -449,6 +464,79 @@ mod tests {
         let engine = engine();
         let first = registry_stamp(engine.world());
         assert_eq!(first, registry_stamp(engine.world()));
+    }
+
+    /// The selection follows the files that moved and clears with the ones that
+    /// went, and it stays where it was when the command was refused: a move
+    /// whose destination already exists must not point the selection at that
+    /// other file.
+    #[test]
+    fn the_selection_follows_the_moves_that_applied() {
+        let _mount = crate::test_support::asset_mount_lock();
+        let root = std::env::temp_dir().join(format!(
+            "pill-editor-drain-selection-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("from.material"), b"source").unwrap();
+        std::fs::write(root.join("taken.material"), b"taken").unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+
+        let mut engine = engine();
+        {
+            let world = engine.world_mut();
+            let mut selection = EditorSelection::default();
+            selection.asset = Some("from.material".to_string());
+            world.insert_resource(selection);
+            world.insert_resource(PendingEditorCommands::default());
+        }
+        let queue = |engine: &mut Engine, commands: Vec<EditorCommand>| {
+            let world = engine.world_mut();
+            let pending = world
+                .get_resource_mut::<PendingEditorCommands>()
+                .expect("the test engine carries the queue");
+            pending.push(commands);
+        };
+        let selected = |engine: &Engine| {
+            engine
+                .world()
+                .get_resource::<EditorSelection>()
+                .and_then(|selection| selection.asset.clone())
+        };
+
+        // Refused: `taken.material` exists, so nothing moved and the selection
+        // stays on the source.
+        queue(
+            &mut engine,
+            vec![EditorCommand::MoveAssetFile {
+                from: "from.material".to_string(),
+                to: "taken.material".to_string(),
+            }],
+        );
+        apply_pending(&mut engine, 0);
+        assert_eq!(
+            selected(&engine).as_deref(),
+            Some("from.material"),
+            "a refused move must leave the selection on the file that is still there"
+        );
+
+        // Applied: the file moved, so the selection follows it.
+        queue(
+            &mut engine,
+            vec![EditorCommand::MoveAssetFile {
+                from: "from.material".to_string(),
+                to: "moved.material".to_string(),
+            }],
+        );
+        apply_pending(&mut engine, 0);
+        assert_eq!(
+            selected(&engine).as_deref(),
+            Some("moved.material"),
+            "an applied move still carries the selection with it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
