@@ -58,27 +58,18 @@ pub(super) fn apply(
                 }
             }
 
-            // Step 2: Reserve the handle and queue the creation inside the
-            // same closure that holds the world; the closure records the
-            // assigned handle so the inverse can name it.
-            let slot: std::sync::Arc<std::sync::Mutex<Option<Entity>>> =
-                std::sync::Arc::new(std::sync::Mutex::new(None));
-            let writer = std::sync::Arc::clone(&slot);
-            engine.queue_deferred_commands(move |world, queue| {
-                let entity = world.reserve_entity();
-                if let Ok(mut cell) = writer.lock() {
-                    *cell = Some(entity);
-                }
-                queue.create_mixed_entity(entity, native, descriptor_components);
+            // Step 2: reserve the handle, then queue the creation. `Entity` is
+            // a `Copy` value and `queue_deferred_commands` runs its closure
+            // immediately, so the handle crosses by value and the inverse names
+            // it directly - no shared cell, no lock, and no failure branch for
+            // a write that cannot fail.
+            let assigned = engine.world_mut().reserve_entity();
+            engine.queue_deferred_commands(move |_world, queue| {
+                queue.create_mixed_entity(assigned, native, descriptor_components);
             });
             engine
                 .flush_deferred_commands()
                 .map_err(|errors| format!("{command:?}: {errors:?}"))?;
-            let assigned = slot
-                .lock()
-                .ok()
-                .and_then(|cell| *cell)
-                .ok_or_else(|| format!("{command:?}: the creation reserved no handle"))?;
             Ok(CommandOutcome::inverse(EditorCommand::DestroyEntity {
                 entity: assigned,
             }))
