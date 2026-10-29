@@ -740,9 +740,9 @@ impl EditorSnapshot {
                 .map(|cameras| cameras.grid.enabled)
                 .unwrap_or(false),
             preferences: crate::preferences::PreferencesView::default(),
-            // The code default until the executable resolves its layers
-            //: every postures' first frame paints the editor
-            // look rather than the crate's neutral fallback.
+            // The code default until the executable resolves its layers,
+            // so that every posture's first frame paints the editor's look
+            // rather than the crate's neutral fallback.
             theme: crate::style::default_theme(),
             theme_generation: 1,
             theme_layers: vec![crate::style::ThemeLayerInfo::code()],
@@ -781,6 +781,89 @@ impl EditorSnapshot {
             errors,
             resources: Self::capture_resources(engine),
         }
+    }
+
+    /// The snapshot fields that differ from `previous`, comma-joined.
+    ///
+    /// The redraw cadence treats any change as a reason to draw, so this
+    /// answers the question that follows: which fields moved. A field that
+    /// changes on its own - a timer, a counter, an unordered collection -
+    /// would keep the editor drawing forever, and naming it in the log is how
+    /// that is caught rather than suspected.
+    ///
+    /// This is also the change test itself: an empty answer means the two
+    /// captures draw the same data. The frame index and the two tiers a frame
+    /// feeds itself - the console and the problems - are deliberately not
+    /// compared, so a capture that only added log lines is not a reason to
+    /// draw. The test lives here, beside the fields it walks, so a new field
+    /// is one line away from the decision that has to include it.
+    #[must_use]
+    pub fn changed_fields(&self, current: &Self) -> String {
+        let previous = self;
+        let mut changed: Vec<&str> = Vec::new();
+        if previous.entities != current.entities {
+            changed.push("entities");
+        }
+        if previous.detail != current.detail {
+            changed.push("detail");
+        }
+        if previous.selected_details != current.selected_details {
+            changed.push("selected_details");
+        }
+        if previous.systems != current.systems {
+            changed.push("systems");
+        }
+        if previous.components != current.components {
+            changed.push("components");
+        }
+        if previous.assets != current.assets {
+            changed.push("assets");
+        }
+        if previous.engine_assets != current.engine_assets {
+            changed.push("engine_assets");
+        }
+        if previous.standalone_types != current.standalone_types {
+            changed.push("standalone_types");
+        }
+        if previous.asset_detail != current.asset_detail {
+            changed.push("asset_detail");
+        }
+        if previous.paused != current.paused {
+            changed.push("paused");
+        }
+        if previous.gizmo != current.gizmo {
+            changed.push("gizmo");
+        }
+        if previous.grid_enabled != current.grid_enabled {
+            changed.push("grid_enabled");
+        }
+        if previous.preferences != current.preferences {
+            changed.push("preferences");
+        }
+        if previous.theme_generation != current.theme_generation
+            || previous.theme_layers != current.theme_layers
+        {
+            changed.push("theme");
+        }
+        if previous.undo_depth != current.undo_depth || previous.redo_depth != current.redo_depth {
+            changed.push("history");
+        }
+        if previous.scene_title != current.scene_title
+            || previous.scene_open != current.scene_open
+            || previous.scene_save_path != current.scene_save_path
+        {
+            changed.push("scene");
+        }
+        if previous.commands != current.commands {
+            changed.push("commands");
+        }
+        if previous.errors != current.errors {
+            changed.push("errors");
+        }
+        if previous.resources != current.resources {
+            changed.push("resources");
+        }
+        changed.join(",")
     }
 
     /// The editable resources' values, read through their curated tables.

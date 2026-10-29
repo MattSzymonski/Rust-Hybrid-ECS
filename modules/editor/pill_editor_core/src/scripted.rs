@@ -1544,31 +1544,11 @@ fn point(cursor: &mut Cursor<'_>, reason: &str) -> Result<(f32, f32), ParseError
     Ok((x, y))
 }
 
-/// The tab a scripted name selects.
-///
-/// Every tab answers to the wire name it logs under, so a new tab needs no
-/// entry here.
+/// The tab a scripted name selects: [`EditorTab::from_wire`], the one parser
+/// every side of the editor shares, so a name this channel accepts is a name
+/// the dock and the popout map accept too.
 fn tab_by_name(name: &str) -> Option<EditorTab> {
-    // A module panel's tab is named by its slot: `module:0`. The registry owns
-    // the ids, so the parser only carries the number and the executable
-    // resolves it.
-    if let Some(slot) = name.strip_prefix("module:") {
-        return slot.parse().ok().map(EditorTab::Module);
-    }
-    // A scene view is `scene`, `scene2`, `scene3`: one past the view's own
-    // index, because a person counts views from one.
-    if let Some(count) = name.strip_prefix("scene") {
-        if count.is_empty() {
-            return Some(EditorTab::Scene(0));
-        }
-        return count
-            .parse::<u16>()
-            .ok()
-            .and_then(|count| count.checked_sub(1))
-            .and_then(|index| u8::try_from(index).ok())
-            .map(EditorTab::Scene);
-    }
-    EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
+    EditorTab::from_wire(name)
 }
 
 /// The tool a scripted name selects.
