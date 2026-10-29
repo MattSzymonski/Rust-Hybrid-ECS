@@ -236,6 +236,61 @@ pub struct SystemSummary {
 /// resources hang under, beside the project's own tree rather than inside it.
 pub const EXTENSIONS_ROOT: &str = "extensions";
 
+/// The listing label a folder row carries; every other label is a file's type.
+pub const FOLDER_KIND: &str = "folder";
+
+/// What a listing row is: the one kind the browser treats differently, or the
+/// type the host's listing reported for the file.
+///
+/// The kind used to be a bare `String` compared against `"folder"` at nine
+/// sites, so a misspelt label silently reclassified a row - a directory that
+/// Rename and Delete would queue a move against. The enum is parsed once, where
+/// the snapshot is built, and every branch that cares now asks the type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetKind {
+    /// A directory: the tree expands it, the grid opens it, and no toolbar
+    /// action writes to it.
+    Folder,
+    /// A file's type, as the host reported it: `Texture`, `file`, or a
+    /// registered path like `pill_master_renderer::Material`.
+    Type(String),
+}
+
+impl AssetKind {
+    /// The kind a listing label names: [`FOLDER_KIND`] is the folder, anything
+    /// else the type path it spells.
+    pub fn parse(text: &str) -> Self {
+        if text == FOLDER_KIND {
+            Self::Folder
+        } else {
+            Self::Type(text.to_string())
+        }
+    }
+
+    /// Whether the row is a directory.
+    pub fn is_folder(&self) -> bool {
+        matches!(self, Self::Folder)
+    }
+
+    /// The label a dump, a scripted channel or a settings document prints:
+    /// [`FOLDER_KIND`] or the type path.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Folder => FOLDER_KIND,
+            Self::Type(path) => path,
+        }
+    }
+
+    /// The type name's last `::` segment, which is what a preview and a picker
+    /// compare; `None` for a folder, which has no type.
+    pub fn type_leaf(&self) -> Option<&str> {
+        match self {
+            Self::Folder => None,
+            Self::Type(path) => Some(path.rsplit("::").next().unwrap_or(path)),
+        }
+    }
+}
+
 /// One row of the Assets panel: a file or folder the browser knows about.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssetListing {
@@ -248,8 +303,8 @@ pub struct AssetListing {
     /// Whether the row is one of a module's resources: listed and inspected,
     /// never written.
     pub read_only: bool,
-    /// A short kind label: the asset type, `file`, or `folder`.
-    pub kind: String,
+    /// What the row is: a folder, or the file's type.
+    pub kind: AssetKind,
     /// Whether the entry is a standalone asset (it holds its own header).
     pub standalone: bool,
     /// Whether a `.meta` sidecar - or a standalone header - carries a guid;

@@ -1188,7 +1188,7 @@ mod tests {
             root: String::new(),
             path: path.to_string(),
             read_only: false,
-            kind: kind.to_string(),
+            kind: AssetKind::parse(kind),
             standalone: true,
             has_meta: guid.is_some(),
             guid: guid.map(str::to_owned),

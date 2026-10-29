@@ -43,15 +43,14 @@ pub fn render_previews(document: &Map<String, Value>) -> bool {
 /// name or not load it at all; a material is named by the guid its sidecar
 /// carries.
 pub fn preview_asset(row: &AssetListing, root: &Path) -> Option<pill_renderer_api::PreviewAsset> {
-    let kind = row.kind.rsplit("::").next().unwrap_or(row.kind.as_str());
-    match kind {
-        "Texture" => Some(pill_renderer_api::PreviewAsset::Texture {
+    match row.kind.type_leaf() {
+        Some("Texture") => Some(pill_renderer_api::PreviewAsset::Texture {
             path: preview_path(row, root)?.to_string_lossy().into_owned(),
         }),
-        "Material" => Some(pill_renderer_api::PreviewAsset::Material {
+        Some("Material") => Some(pill_renderer_api::PreviewAsset::Material {
             guid: row.guid.clone()?,
         }),
-        "Mesh" => Some(pill_renderer_api::PreviewAsset::Mesh {
+        Some("Mesh") => Some(pill_renderer_api::PreviewAsset::Mesh {
             path: preview_path(row, root)?.to_string_lossy().into_owned(),
         }),
         _ => None,
@@ -115,13 +114,14 @@ impl PreviewQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_state::AssetKind;
 
     fn row(path: &str, kind: &str, guid: Option<&str>) -> AssetListing {
         AssetListing {
             root: String::new(),
             path: path.to_string(),
             read_only: false,
-            kind: kind.to_string(),
+            kind: AssetKind::parse(kind),
             standalone: false,
             has_meta: guid.is_some(),
             guid: guid.map(str::to_string),

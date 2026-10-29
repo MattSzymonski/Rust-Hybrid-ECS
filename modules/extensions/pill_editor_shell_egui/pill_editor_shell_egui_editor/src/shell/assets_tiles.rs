@@ -299,7 +299,7 @@ pub fn asset_icon(row: &AssetListing) -> icons::Icon {
     if browser::is_folder(row) {
         return icons::Icon::Folder;
     }
-    let type_icon = asset_type_icon(&row.kind);
+    let type_icon = asset_type_icon(row.kind.text());
     if !matches!(type_icon, icons::Icon::File) {
         return type_icon;
     }
