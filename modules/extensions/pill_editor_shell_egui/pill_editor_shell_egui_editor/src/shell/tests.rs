@@ -68,8 +68,164 @@ fn the_systems_rows_name_the_worlds_systems() {
     assert!(rows.iter().any(|row| row.contains("render")), "{rows:?}");
 }
 
+/// The assets the tree and the grid tests draw: a folder, a folder inside it,
+/// a mesh and a shader.
+///
+/// A macro rather than a function because the patch scanner lists every
+/// module-level function of this crate and the inventory is compiled into the
+/// library as well as the tests, where `#[cfg(test)] mod tests` does not exist.
+macro_rules! browser_fixture {
+    () => {
+        vec![
+            AssetListing {
+                root: String::new(),
+                path: "models".to_string(),
+                read_only: false,
+                kind: AssetKind::Folder,
+                standalone: false,
+                has_meta: false,
+                guid: None,
+            },
+            AssetListing {
+                root: String::new(),
+                path: "models/nested".to_string(),
+                read_only: false,
+                kind: AssetKind::Folder,
+                standalone: false,
+                has_meta: false,
+                guid: None,
+            },
+            AssetListing {
+                root: String::new(),
+                path: "models/cube.obj".to_string(),
+                read_only: false,
+                kind: AssetKind::parse("pill_master_renderer::assets::Mesh"),
+                standalone: false,
+                has_meta: true,
+                guid: None,
+            },
+            AssetListing {
+                root: String::new(),
+                path: "shaders/code.wgsl".to_string(),
+                read_only: false,
+                kind: AssetKind::parse("file"),
+                standalone: false,
+                has_meta: false,
+                guid: None,
+            },
+        ]
+    };
+}
+
+/// The tree and the grid agree about where the panel is looking: `open`
+/// expands a folder's ancestors (not the folder itself), a row's caret toggles
+/// that folder, and the path bar names every segment of the open folder.
 #[test]
-fn the_tab_bodies_draw_without_panicking() {
+fn the_browser_opens_a_folder_and_the_tree_follows() {
+    let assets = browser_fixture!();
+    let mut browser = ProjectBrowser::default();
+    assert!(browser.open("models/nested"));
+    assert!(
+        browser.is_expanded("models"),
+        "the open folder's ancestor must be expanded, or its row is unreachable"
+    );
+    assert!(
+        !browser.is_expanded("models/nested"),
+        "opening a folder lists its children in the grid; it does not expand its row"
+    );
+    assert!(browser.toggle_expanded("models/nested"));
+    assert!(browser.is_expanded("models/nested"));
+    assert!(!browser.toggle_expanded("models/nested"));
+    assert!(!browser.is_expanded("models/nested"));
+    // The path bar the panel draws above the grid: one segment per folder, the
+    // root first, each cumulative.
+    let segments: Vec<String> = browser::breadcrumb(&browser.folder)
+        .into_iter()
+        .map(|(path, _label)| path)
+        .collect();
+    assert_eq!(
+        segments,
+        vec![
+            String::new(),
+            "models".to_string(),
+            "models/nested".to_string()
+        ],
+        "every segment of the open folder must appear in the path bar"
+    );
+    assert_eq!(
+        browser::children(&assets, "models")
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["models/nested", "models/cube.obj"],
+        "the grid lists the open folder's own children, folders first"
+    );
+}
+
+/// The dismissal rule the three pickers share now lives in
+/// `chrome::floating_popup`: a press outside the popup and its anchor closes
+/// it, a press on either keeps it. The entity reference row had no dismissal
+/// at all before the rule moved here.
+#[test]
+fn a_press_outside_a_floating_popup_is_reported_outside() {
+    let context = egui::Context::default();
+    style::apply(&context);
+    let anchor = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(120.0, 20.0));
+    let press_at = |at: egui::Pos2| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    };
+    let draw = |ui: &mut egui::Ui| {
+        let mut regions: Vec<ShellRect> = Vec::new();
+        let popup = floating_popup(
+            ui,
+            egui::Id::new("pill_editor_shell_egui.test_picker"),
+            anchor,
+            120.0,
+            &mut regions,
+            &mut |ui| {
+                ui.label("a candidate");
+            },
+        );
+        assert_eq!(regions.len(), 1, "the popup claims its rectangle");
+        popup
+    };
+
+    let mut popup_rect = None;
+    let mut on_anchor = None;
+    let mut outside = None;
+    let mut inside = None;
+    // One pass per press: `any_pressed` is the frame's edge, so each press
+    // needs its own frame. The area keeps its rectangle across passes.
+    run_pass_with(&context, Vec::new(), &mut |ui| {
+        popup_rect = Some(draw(ui).response.rect);
+    });
+    run_pass_with(&context, vec![press_at(anchor.center())], &mut |ui| {
+        on_anchor = Some(draw(ui).pressed_outside)
+    });
+    let rect = popup_rect.expect("the popup drew its rectangle");
+    run_pass_with(&context, vec![press_at(rect.center())], &mut |ui| {
+        inside = Some(draw(ui).pressed_outside)
+    });
+    run_pass_with(
+        &context,
+        vec![press_at(egui::pos2(900.0, 600.0))],
+        &mut |ui| outside = Some(draw(ui).pressed_outside),
+    );
+
+    assert_eq!(on_anchor, Some(false), "the press that opened it keeps it");
+    assert_eq!(inside, Some(false), "a press inside the list keeps it");
+    assert_eq!(outside, Some(true), "a press away from it closes it");
+}
+
+/// Drawing the tab bodies is a smoke test: the assertions are that nothing
+/// panics, that no tab queues a command, and that the one overlay the frame
+/// draws is the scene counter. It is named for that, not for what the tabs
+/// show.
+#[test]
+fn drawing_every_tab_body_queues_nothing() {
     let mut engine = Engine::new();
     engine
         .world_mut()
@@ -126,6 +282,10 @@ fn the_tab_bodies_draw_without_panicking() {
         });
     });
     assert_eq!(regions.len(), 1, "the frame counter is the UI's region");
+    assert!(
+        pending.batches.is_empty(),
+        "drawing every tab body queues no command"
+    );
 }
 
 /// The Add list the popup and the component menu share omits every component
@@ -173,50 +333,12 @@ fn the_addable_list_omits_the_components_the_entity_carries() {
 }
 
 #[test]
-fn the_browser_draws_its_tree_path_and_tiles() {
+fn the_assets_panel_wraps_a_long_tile_caption_and_queues_nothing() {
     let engine = Engine::new();
     let mut snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
-    snapshot.assets = vec![
-        AssetListing {
-            root: String::new(),
-            path: "models".to_string(),
-            read_only: false,
-            kind: AssetKind::Folder,
-            standalone: false,
-            has_meta: false,
-            guid: None,
-        },
-        AssetListing {
-            root: String::new(),
-            path: "models/nested".to_string(),
-            read_only: false,
-            kind: AssetKind::Folder,
-            standalone: false,
-            has_meta: false,
-            guid: None,
-        },
-        AssetListing {
-            root: String::new(),
-            path: "models/cube.obj".to_string(),
-            read_only: false,
-            kind: AssetKind::parse("pill_master_renderer::assets::Mesh"),
-            standalone: false,
-            has_meta: true,
-            guid: None,
-        },
-        AssetListing {
-            root: String::new(),
-            path: "shaders/code.wgsl".to_string(),
-            read_only: false,
-            kind: AssetKind::parse("file"),
-            standalone: false,
-            has_meta: false,
-            guid: None,
-        },
-    ];
+    snapshot.assets = browser_fixture!();
     let mut browser = ProjectBrowser::default();
     assert!(browser.open("models"));
-    assert!(browser.is_expanded("models") || browser.folder == "models");
     let mut selection = EditorSelection::default();
     let mut dialog: Option<AssetDialog> = None;
     let mut pending = PendingEditorCommands::default();

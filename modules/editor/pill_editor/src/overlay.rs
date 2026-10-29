@@ -97,7 +97,6 @@ impl OverlaySurface {
         window: Arc<Window>,
         format: wgpu::TextureFormat,
         size: (u32, u32),
-        _scale_factor: f32,
     ) -> Result<OverlaySurface, OverlayError> {
         // Step 1: the composition visual comes first - the surface is created
         // from it, and wgpu keeps the visual alive as long as the surface.

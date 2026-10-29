@@ -381,7 +381,7 @@ pub fn paste_plan(
                     skipped.push(component.type_name.clone());
                     continue;
                 }
-                seeds.push(seeded_component(component));
+                seeds.push(seeded_component(component, &mut skipped));
             }
             Ok(PastePlan {
                 commands: vec![EditorCommand::CreateEntity { components: seeds }],
@@ -474,12 +474,19 @@ pub fn paste_plan(
 }
 
 /// One payload component as the seed a create or an add rebuilds.
-fn seeded_component(component: &SeededComponent) -> ComponentSeed {
-    let fields = component
-        .fields
-        .iter()
-        .filter_map(|(field, token)| Some((field.clone(), parse_value(token)?)))
-        .collect();
+///
+/// A field whose token does not parse is left out and named in `skipped`,
+/// exactly as the single-component paste names it: a paste across two versions
+/// of a component creates the entity with the fields it could read and the
+/// component's defaults for the rest, and the person can see which.
+fn seeded_component(component: &SeededComponent, skipped: &mut Vec<String>) -> ComponentSeed {
+    let mut fields = Vec::with_capacity(component.fields.len());
+    for (field, token) in &component.fields {
+        match parse_value(token) {
+            Some(value) => fields.push((field.clone(), value)),
+            None => skipped.push(format!("{}.{}", component.type_name, field)),
+        }
+    }
     ComponentSeed {
         type_name: component.type_name.clone(),
         fields,
@@ -793,6 +800,35 @@ mod tests {
                 assert_eq!(
                     components[0].fields,
                     vec![("x".to_string(), FieldValue::F32(1.5))]
+                );
+            }
+            other => panic!("an entity paste queued {other:?}"),
+        }
+    }
+
+    /// An entity paste whose component carries a token this build cannot parse
+    /// names the field it dropped, exactly as the single-component paste does:
+    /// a lossy paste says what it lost.
+    #[test]
+    fn an_entity_paste_names_the_field_it_could_not_read() {
+        let text = concat!(
+            r#"{"pill": 1, "kind": "entity", "components": ["#,
+            r#"{"type": "Demo", "fields": [["first", "1.5f"], ["second", "nonsense"]]}]}"#
+        );
+        let payload = decode(text).expect("a well-formed payload");
+        let plan = paste_plan(
+            &payload,
+            &selection_with(Entity::from_raw(1, 0)),
+            &snapshot_with(&["Demo"]),
+        )
+        .expect("the paste plans");
+        assert_eq!(plan.skipped, vec!["Demo.second".to_string()]);
+        match &plan.commands[0] {
+            EditorCommand::CreateEntity { components } => {
+                assert_eq!(
+                    components[0].fields,
+                    vec![("first".to_string(), FieldValue::F32(1.5))],
+                    "the unparsable field is left out of the seed"
                 );
             }
             other => panic!("an entity paste queued {other:?}"),

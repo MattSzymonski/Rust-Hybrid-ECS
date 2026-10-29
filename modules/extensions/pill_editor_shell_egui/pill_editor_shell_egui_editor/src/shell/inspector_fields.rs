@@ -554,7 +554,7 @@ pub fn inspector_asset_row(
     if session.asset_picker.as_deref() == Some(key.as_str()) {
         if let Some((rect, _)) = button_rect {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.asset_picker", key.as_str()));
-            let area =
+            let popup =
                 floating_popup(
                     ui,
                     picker_id,
@@ -642,16 +642,10 @@ pub fn inspector_asset_row(
                             });
                     },
                 );
-            // Any press outside the picker and its row closes it, whatever
-            // button it was: a picker that only closes by picking fights the
-            // person who changed their mind. The press that opens the picker
-            // is on the row, so it never closes what it just opened.
-            let press =
-                ui.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
-            if let (true, Some(at)) = press {
-                if !rect.contains(at) && !area.response.rect.contains(at) {
-                    session.asset_picker = None;
-                }
+            // The row's own picker closes on a press outside it, the rule the
+            // helper states; the press that opened it landed on the row.
+            if popup.pressed_outside {
+                session.asset_picker = None;
             }
         }
     }
@@ -797,7 +791,7 @@ pub fn inspector_entity_row(
     if session.entity_picker.as_deref() == Some(key.as_str()) {
         if let Some((rect, _)) = button_rect {
             let picker_id = egui::Id::new(("pill_editor_shell_egui.entity_picker", key.as_str()));
-            floating_popup(
+            let popup = floating_popup(
                 ui,
                 picker_id,
                 rect,
@@ -829,6 +823,13 @@ pub fn inspector_entity_row(
                         });
                 },
             );
+            // The entity picker had no dismissal at all: it stayed over the
+            // inspector until it was picked from. Its asset twin is 245 lines
+            // above and the rule is the helper's now, so both close on a press
+            // outside.
+            if popup.pressed_outside {
+                session.entity_picker = None;
+            }
         }
     }
 

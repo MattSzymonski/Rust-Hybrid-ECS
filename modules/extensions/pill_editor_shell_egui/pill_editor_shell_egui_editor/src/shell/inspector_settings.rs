@@ -1039,7 +1039,7 @@ pub fn reference_picker(
     let clearable = reference_family(field).is_none();
     let mut chosen: Option<Option<String>> = None;
     let picker_id = egui::Id::new(("pill_editor_shell_egui.reference_picker", key.to_string()));
-    let area = floating_popup(
+    let popup = floating_popup(
         ui,
         picker_id,
         anchor,
@@ -1121,15 +1121,11 @@ pub fn reference_picker(
                 });
         },
     );
-    // Any press outside the picker and its button closes it, whatever
-    // button it was: a picker that only closes by picking fights the
-    // person who changed their mind. The press that opens the picker is
-    // on the button, so it never closes what it just opened.
-    let press = ui.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
-    if let (true, Some(at)) = press {
-        if !anchor.contains(at) && !area.response.rect.contains(at) {
-            session.settings_picker = None;
-        }
+    // A press outside the picker and its button closes it, whatever button it
+    // was: a picker that only closes by picking fights the person who changed
+    // their mind. The press that opens it landed on the button.
+    if popup.pressed_outside {
+        session.settings_picker = None;
     }
     chosen
 }
