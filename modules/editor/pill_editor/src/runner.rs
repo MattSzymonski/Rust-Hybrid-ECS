@@ -132,7 +132,6 @@ fn create_overlay(
     device: &wgpu::Device,
     window: Arc<Window>,
     size: (u32, u32),
-    scale_factor: f32,
 ) -> Option<OverlaySurface> {
     if no_overlay {
         warn!(
@@ -149,7 +148,6 @@ fn create_overlay(
         Arc::clone(&window),
         EDITOR_FORMAT,
         size,
-        scale_factor,
     ) {
         Ok(overlay) => Some(overlay),
         Err(error) => {
@@ -572,7 +570,7 @@ impl ApplicationHandler for EditorApplication {
                         editor.popout_event(tab, event);
                         continue;
                     }
-                    match route_event(&event, is_game) {
+                    match route_event(is_game) {
                         EventRoute::Game => editor.pending_events.push(event),
                         EventRoute::Shell => {
                             match &event {
@@ -1010,7 +1008,6 @@ impl EditorWindow {
             &device,
             Arc::clone(&window),
             size,
-            scale_factor,
         );
         if let Some(overlay) = &overlay {
             info!(
@@ -7767,7 +7764,6 @@ impl EditorWindow {
             Arc::clone(&self.window),
             EDITOR_FORMAT,
             self.size,
-            self.scale_factor,
         ) {
             Ok(overlay) => {
                 info!(
@@ -9005,7 +9001,11 @@ enum EventRoute {
 
 /// The focus rule in one place: the game's window feeds the game, every
 /// editor window feeds the shell.
-fn route_event(_event: &InputEvent, is_game_window: bool) -> EventRoute {
+///
+/// The event is not a parameter because it cannot matter: routing is decided
+/// by the window a click or key came through, and a signature that took the
+/// event would promise otherwise.
+fn route_event(is_game_window: bool) -> EventRoute {
     if is_game_window {
         EventRoute::Game
     } else {
@@ -9711,17 +9711,8 @@ mod tests {
     /// and one from any editor window is the shell's alone.
     #[test]
     fn only_the_game_window_feeds_the_game() {
-        let key = InputEvent::Key {
-            key: KeyCode::KeyA,
-            state: ButtonState::Pressed,
-        };
-        assert_eq!(route_event(&key, true), EventRoute::Game);
-        assert_eq!(route_event(&key, false), EventRoute::Shell);
-        let pointer = InputEvent::CursorMoved {
-            position: pill_core::math::Vector2f::new(4.0, 9.0),
-        };
-        assert_eq!(route_event(&pointer, true), EventRoute::Game);
-        assert_eq!(route_event(&pointer, false), EventRoute::Shell);
+        assert_eq!(route_event(true), EventRoute::Game);
+        assert_eq!(route_event(false), EventRoute::Shell);
     }
 
     /// A rectangle inside the window scales with the display and lands where

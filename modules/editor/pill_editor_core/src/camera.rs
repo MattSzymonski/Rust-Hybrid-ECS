@@ -224,14 +224,9 @@ pub fn navigation_binding(
 /// Blender's middle-button navigation, which Godot shares: the plain drag
 /// orbits, shift pans, control dollies.
 fn middle_button_table(button: CameraButton, modifiers: Modifiers) -> Option<CameraNavigation> {
-    if button != CameraButton::Middle {
+    if button != CameraButton::Middle || modifiers.alt {
         return None;
     }
-    let modifiers = if modifiers.alt {
-        return None;
-    } else {
-        modifiers
-    };
     match (modifiers.shift, modifiers.control) {
         (false, false) => Some(CameraNavigation::Orbit),
         (true, false) => Some(CameraNavigation::Pan),
@@ -371,6 +366,20 @@ mod tests {
                 }
             ),
             Some(CameraNavigation::Dolly)
+        );
+        // Alt means "left-button navigation" in the presets that use it, so a
+        // middle-button drag with Alt held navigates nothing - the guard that
+        // used to be spelled as a rebinding of `modifiers`.
+        assert_eq!(
+            navigation_binding(
+                KeymapPreset::Blender,
+                CameraButton::Middle,
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                }
+            ),
+            None
         );
         // The left button is selection's, whatever the modifiers.
         assert_eq!(

@@ -977,6 +977,7 @@ pub fn parse_field_value(text: &str, current: &FieldValue) -> Result<FieldValue,
         FieldValue::U32(_) => FieldValue::U32(text.parse().map_err(|_| "not an unsigned")?),
         FieldValue::U64(_) => FieldValue::U64(text.parse().map_err(|_| "not an unsigned")?),
         FieldValue::Usize(_) => FieldValue::Usize(text.parse().map_err(|_| "not an unsigned")?),
+        FieldValue::Isize(_) => FieldValue::Isize(text.parse().map_err(|_| "not an integer")?),
         FieldValue::Bool(_) => FieldValue::Bool(text.parse().map_err(|_| "not a boolean")?),
         FieldValue::Text(_) => FieldValue::Text(text.to_string()),
         other => return Err(format!("`{other:?}` fields are not editable here")),
@@ -1043,11 +1044,19 @@ pub fn parse_settings_key_path(text: &str) -> Result<Vec<SettingsKey>, String> {
                     path.push(SettingsKey::Key(std::mem::take(&mut key)));
                 }
                 let mut digits = String::new();
+                let mut closed = false;
                 for digit in characters.by_ref() {
                     if digit == ']' {
+                        closed = true;
                         break;
                     }
                     digits.push(digit);
+                }
+                // A run of digits that reaches the end of the input is an
+                // unbalanced bracket, not an index: accepting it would edit a
+                // leaf the person did not name.
+                if !closed {
+                    return Err(format!("`{text}` has an unbalanced `[`"));
                 }
                 let index: usize = digits
                     .parse()
@@ -1354,6 +1363,28 @@ mod tests {
             Ok(FieldValue::Text("hello world".to_string()))
         );
         assert!(parse_field_value("1", &FieldValue::Array(Vec::new())).is_err());
+        // Every kind the widget table calls an Integer parses: the two tables
+        // are read 800 lines apart, and the missing `Isize` arm made a drawn
+        // integer field refuse every edit with "not editable here".
+        let integers = [
+            (FieldValue::I8(0), FieldValue::I8(7)),
+            (FieldValue::I16(0), FieldValue::I16(7)),
+            (FieldValue::I32(0), FieldValue::I32(7)),
+            (FieldValue::I64(0), FieldValue::I64(7)),
+            (FieldValue::U8(0), FieldValue::U8(7)),
+            (FieldValue::U16(0), FieldValue::U16(7)),
+            (FieldValue::U32(0), FieldValue::U32(7)),
+            (FieldValue::U64(0), FieldValue::U64(7)),
+            (FieldValue::Usize(0), FieldValue::Usize(7)),
+            (FieldValue::Isize(0), FieldValue::Isize(7)),
+        ];
+        for (sample, expected) in integers {
+            assert_eq!(
+                parse_field_value("7", &sample),
+                Ok(expected),
+                "an integer field the widget table draws must accept its own edit"
+            );
+        }
     }
 
     #[test]
@@ -1383,6 +1414,11 @@ mod tests {
         assert!(parse_settings_key_path("").is_err());
         assert!(parse_settings_key_path("a..b").is_err());
         assert!(parse_settings_key_path("a[x]").is_err());
+        // Both halves of a broken bracket are refused: an index that runs off
+        // the end used to parse as `waves[0]`, editing a leaf nobody named.
+        assert!(parse_settings_key_path("waves[0").is_err());
+        assert!(parse_settings_key_path("waves[").is_err());
+        assert!(parse_settings_key_path("waves]").is_err());
     }
 
     #[test]

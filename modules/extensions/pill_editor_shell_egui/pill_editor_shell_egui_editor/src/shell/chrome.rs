@@ -217,13 +217,29 @@ pub fn mark_menu_region(opened: Option<egui::InnerResponse<()>>, regions: &mut V
     }
 }
 
-/// Open a floating popup under an anchor rectangle, and claim its area.
+/// A floating popup as its caller sees it: the area it drew and whether this
+/// frame's press landed outside it.
+pub struct FloatingPopup {
+    /// The area's own response: its rectangle is the popup's.
+    pub response: egui::Response,
+    /// Whether the frame pressed somewhere outside both the anchor and the
+    /// popup - the answer every picker uses to close itself.
+    pub pressed_outside: bool,
+}
+
+/// Open a floating popup under an anchor rectangle, claim its area, and say
+/// whether a press landed outside it.
 ///
 /// A picker draws in a foreground `Area` anchored under the field it belongs
 /// to, so it floats over the rows below instead of pushing them down, and
 /// its rectangle joins the frame's overlay regions, so a click inside it never
-/// becomes a scene pick. The area's response is returned, so the caller can
-/// tell whether a press landed outside it.
+/// becomes a scene pick.
+///
+/// The dismissal rule lives here too, because this is what knows the popup's
+/// rectangle: any press outside the popup and its anchor closes it, whatever
+/// button it was - a list that only closes by being picked from fights the
+/// person who changed their mind. The press that opens a picker landed on its
+/// anchor, so it never closes what it just opened.
 pub fn floating_popup(
     ui: &egui::Ui,
     id: egui::Id,
@@ -231,7 +247,7 @@ pub fn floating_popup(
     width: f32,
     regions: &mut Vec<ShellRect>,
     contents: &mut dyn FnMut(&mut egui::Ui),
-) -> egui::InnerResponse<()> {
+) -> FloatingPopup {
     let area = egui::Area::new(id)
         .order(egui::Order::Foreground)
         .fixed_pos(egui::pos2(anchor.left(), anchor.bottom() + 2.0))
@@ -242,7 +258,15 @@ pub fn floating_popup(
             });
         });
     claim_pointer(area.response.rect, regions);
-    area
+    let press = ui.input(|input| (input.pointer.any_pressed(), input.pointer.interact_pos()));
+    let pressed_outside = match press {
+        (true, Some(at)) => !anchor.contains(at) && !area.response.rect.contains(at),
+        _ => false,
+    };
+    FloatingPopup {
+        response: area.response,
+        pressed_outside,
+    }
 }
 
 /// Open a panel's context menu on a secondary click: the area is logged once
