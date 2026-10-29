@@ -642,19 +642,13 @@ pub fn summarize(payload: &Payload) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor_state::{ComponentView, EntityDetail};
-    use pill_engine::component_registry::ComponentFieldDescriptor;
+    use crate::editor_state::{ComponentFieldView, ComponentView, EntityDetail};
     use pill_engine::Entity;
 
-    fn descriptor(name: &'static str) -> ComponentFieldDescriptor {
-        ComponentFieldDescriptor {
-            name,
-            type_tag: "f32",
-            offset: 0,
-            size: 4,
-            align: 4,
-            element_count: 1,
-            decorators: std::borrow::Cow::Borrowed(&[]),
+    fn view(name: &str) -> ComponentFieldView {
+        ComponentFieldView {
+            name: name.to_string(),
+            decorators: Vec::new(),
         }
     }
 
@@ -676,7 +670,7 @@ mod tests {
                     type_name: "Position".to_string(),
                     persistable: true,
                     editable: true,
-                    fields: vec![descriptor("x"), descriptor("y")],
+                    fields: vec![view("x"), view("y")],
                     values: vec![FieldValue::F32(1.5), FieldValue::F32(-2.25)],
                 },
                 ComponentView {
@@ -886,7 +880,7 @@ mod tests {
                 type_name: "Position".to_string(),
                 persistable: true,
                 editable: true,
-                fields: vec![descriptor("x")],
+                fields: vec![view("x")],
                 values: vec![FieldValue::F32(1.0)],
             }],
         });

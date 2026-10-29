@@ -716,7 +716,7 @@ fn publish_snapshot(engine: &mut pill_engine_core::Engine, frame_index: u64) {
         .get_resource::<EditorSelection>()
         .map(|selection| selection.entities().to_vec())
         .unwrap_or_default();
-    let mut snapshot = EditorSnapshot::capture_list(engine, frame_index, &[], Vec::new());
+    let mut snapshot = EditorSnapshot::capture_engine_tiers(engine, frame_index, &[], Vec::new());
     snapshot.detail = selected.and_then(|entity| EditorSnapshot::capture_detail(engine, entity));
     snapshot.selected_details = selected_entities
         .iter()

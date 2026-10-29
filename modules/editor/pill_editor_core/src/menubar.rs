@@ -774,6 +774,6 @@ mod tests {
     /// A snapshot over a fresh engine, which the entry tests take views of.
     fn snapshot_fixture() -> EditorSnapshot {
         let engine = pill_engine::Engine::new();
-        EditorSnapshot::capture_list(&engine, 0, &[], Vec::new())
+        EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new())
     }
 }

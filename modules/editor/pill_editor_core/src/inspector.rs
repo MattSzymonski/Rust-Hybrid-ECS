@@ -544,7 +544,7 @@ fn grouped_label(component: &ComponentView, start: usize, kind: &str) -> String 
     match component
         .fields
         .get(start)
-        .map(|field| leaf_parts(field.name))
+        .map(|field| leaf_parts(field.name.as_str()))
     {
         Some((prefix, _)) if !prefix.is_empty() => prefix.to_string(),
         _ => kind.to_string(),
@@ -574,7 +574,7 @@ fn channel_run(
     minimum: usize,
 ) -> Option<Vec<RowLeaf>> {
     let first = component.fields.get(start)?;
-    let (prefix, first_suffix) = leaf_parts(first.name);
+    let (prefix, first_suffix) = leaf_parts(first.name.as_str());
     if first_suffix != suffixes[0] || !first.decorators.contains(decorator) {
         return None;
     }
@@ -586,7 +586,7 @@ fn channel_run(
         let Some(value) = component.values.get(start + offset) else {
             break;
         };
-        let (prefix_here, suffix_here) = leaf_parts(descriptor.name);
+        let (prefix_here, suffix_here) = leaf_parts(descriptor.name.as_str());
         if prefix_here != prefix
             || suffix_here != *suffix
             || !descriptor.decorators.contains(decorator)
@@ -1704,17 +1704,10 @@ mod tests {
             fields: values
                 .iter()
                 .enumerate()
-                .map(
-                    |(index, _)| pill_engine::component_registry::ComponentFieldDescriptor {
-                        name: NAMES[index],
-                        type_tag: "f32",
-                        offset: 0,
-                        size: 4,
-                        align: 4,
-                        element_count: 0,
-                        decorators: std::borrow::Cow::Borrowed(&[]),
-                    },
-                )
+                .map(|(index, _)| crate::editor_state::ComponentFieldView {
+                    name: NAMES[index].to_string(),
+                    decorators: Vec::new(),
+                })
                 .collect(),
             values,
         }
@@ -1870,17 +1863,10 @@ mod tests {
             fields: values
                 .iter()
                 .enumerate()
-                .map(
-                    |(index, _)| pill_engine::component_registry::ComponentFieldDescriptor {
-                        name: NAMES[index],
-                        type_tag: "f32",
-                        offset: 0,
-                        size: 4,
-                        align: 4,
-                        element_count: 0,
-                        decorators: std::borrow::Cow::Owned(decorators[index].clone()),
-                    },
-                )
+                .map(|(index, _)| crate::editor_state::ComponentFieldView {
+                    name: NAMES[index].to_string(),
+                    decorators: decorators[index].clone(),
+                })
                 .collect(),
             values,
         }
@@ -2371,17 +2357,12 @@ mod tests {
             editable: true,
             fields: entries
                 .iter()
-                .map(|(name, _, decorators)| {
-                    pill_engine::component_registry::ComponentFieldDescriptor {
-                        name,
-                        type_tag: "f32",
-                        offset: 0,
-                        size: 4,
-                        align: 4,
-                        element_count: 0,
-                        decorators: std::borrow::Cow::Owned(decorators.clone()),
-                    }
-                })
+                .map(
+                    |(name, _, decorators)| crate::editor_state::ComponentFieldView {
+                        name: name.to_string(),
+                        decorators: decorators.clone(),
+                    },
+                )
                 .collect(),
             values: entries.into_iter().map(|(_, value, _)| value).collect(),
         }

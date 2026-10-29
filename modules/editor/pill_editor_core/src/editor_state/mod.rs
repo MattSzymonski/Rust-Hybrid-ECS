@@ -58,6 +58,32 @@ impl EntityListEntry {
     }
 }
 
+/// One field of a component's layout, as the editor's own snapshot keeps it.
+///
+/// The registry's [`ComponentFieldDescriptor`] borrows its name and its
+/// decorators from the artifact that declared them, and that artifact can be
+/// unloaded between two captures - a project module a reload replaced. This
+/// type owns both, so nothing reachable from [`EditorSnapshot`] extends a
+/// module image's lifetime.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentFieldView {
+    /// The field's registered name.
+    pub name: String,
+    /// The presentation decorators the field declared, in declaration order.
+    pub decorators: Vec<pill_engine::component_registry::FieldDecorator>,
+}
+
+impl ComponentFieldView {
+    /// The editor's own copy of one registry descriptor: the two things the
+    /// editor reads from it, owned rather than borrowed.
+    fn of(descriptor: &ComponentFieldDescriptor) -> Self {
+        Self {
+            name: descriptor.name.to_string(),
+            decorators: descriptor.decorators.to_vec(),
+        }
+    }
+}
+
 /// One attached component of the selected entity, with its current values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComponentView {
@@ -67,8 +93,9 @@ pub struct ComponentView {
     pub persistable: bool,
     /// Whether the component has a non-empty field layout and is editable.
     pub editable: bool,
-    /// Field layout descriptors (owned clone, refreshed per capture).
-    pub fields: Vec<ComponentFieldDescriptor>,
+    /// The field layout, owned: the declaring image may unload before the next
+    /// capture.
+    pub fields: Vec<ComponentFieldView>,
     /// One current value per field, parallel to `fields`.
     pub values: Vec<FieldValue>,
     /// What each asset reference field names, parallel to `values`: `None`
@@ -666,8 +693,25 @@ pub struct ResourceFieldView {
 impl pill_engine::Resource for EditorSnapshot {}
 
 impl EditorSnapshot {
-    /// Rebuild every tier from a live engine. Never mutates the world.
-    pub fn capture_list(
+    /// The engine-owned tiers, rebuilt from a live engine. Never mutates the
+    /// world.
+    ///
+    /// This is a partial build, and the name says so. It fills what the model
+    /// crate can read for itself - `entities`, `systems`, `components`, the
+    /// command registry, the console, the problems, the resources, the scene's
+    /// document state and the paused, gizmo and grid settings - and leaves the
+    /// rest for the frame's caller to supply before publishing:
+    ///
+    /// - `assets`, `engine_assets`, `standalone_types` and `asset_detail` (the
+    ///   listing the executable walks),
+    /// - `detail` and `selected_details` (the selected entities' rows),
+    /// - `preferences` (the reader's view of the preferences document),
+    /// - the four theme fields (the executable resolves the layers),
+    /// - `undo_depth` and `redo_depth` (the executable owns the history).
+    ///
+    /// The shell only ever reads the published value, so a tier added here
+    /// still has to be filled - or published - by the executable.
+    pub fn capture_engine_tiers(
         engine: &Engine,
         revision: u64,
         extension_names: &[String],
@@ -830,7 +874,13 @@ impl EditorSnapshot {
                 let component_id = world.resolve_entity_component_id(entity, &type_name)?;
                 let persistable = world.component_is_persistable(component_id);
                 let (fields, editable) = match world.component_field_layout(component_id) {
-                    Some(layout) if !layout.is_empty() => (layout.to_vec(), true),
+                    // The registry's descriptors borrow from the declaring
+                    // artifact; the snapshot keeps its own copy, so a module
+                    // reloaded between two captures cannot dangle under the
+                    // shell.
+                    Some(layout) if !layout.is_empty() => {
+                        (layout.iter().map(ComponentFieldView::of).collect(), true)
+                    }
                     _ => (Vec::new(), false),
                 };
                 // Values are only decodable when a layout exists; a component
@@ -1199,7 +1249,7 @@ mod tests {
             .build()
             .expect("entity builds");
 
-        let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+        let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
         assert_eq!(snapshot.entities.len(), 1);
         assert_eq!(snapshot.entities[0].entity, entity);
         assert_eq!(snapshot.entities[0].component_count, 1);
@@ -1294,7 +1344,7 @@ mod tests {
         );
         assert!(failures.is_empty(), "create failed: {failures:?}");
 
-        let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+        let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
         assert_eq!(snapshot.entities.len(), 1);
         let entity = snapshot.entities[0].entity;
         let detail = EditorSnapshot::capture_detail(&engine, entity).expect("detail");
@@ -1321,7 +1371,7 @@ mod tests {
         let failures =
             EditorCommand::apply(&mut engine, &[EditorCommand::DestroyEntity { entity }]);
         assert!(failures.is_empty(), "destroy failed: {failures:?}");
-        let snapshot = EditorSnapshot::capture_list(&engine, 0, &[], Vec::new());
+        let snapshot = EditorSnapshot::capture_engine_tiers(&engine, 0, &[], Vec::new());
         assert!(snapshot.entities.is_empty());
 
         // Editing a dead entity surfaces an error instead of panicking.
