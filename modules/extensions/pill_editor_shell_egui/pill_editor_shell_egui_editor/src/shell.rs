@@ -24,6 +24,12 @@
 //! here - and every module is, because the build script's function inventory
 //! names each addressable function by its module path. A body that names a
 //! private item fails to compile as a patch, and the host reloads.
+//!
+//! That rule has a shape too: the scanner refuses an `impl` header containing
+//! `<` or `where`, so a method in `impl TabViewer for EditorTabViewer<'_>` is
+//! never addressable and no body inside it can be patched. Such a method
+//! forwards to a `#[pill_hot_fn] pub fn` beside the impl, and the body lives
+//! there.
 
 // Current crate
 use pill_editor_shell_egui_editor::shell::prelude::*;
@@ -891,6 +897,13 @@ pub struct EditorTabViewer<'a> {
     pub badges: &'a [ShellBadge],
 }
 
+// The dock's tab methods, forwarded to the free functions below.
+//
+// `impl TabViewer for EditorTabViewer<'_>` is a trait impl whose receiver
+// carries a lifetime, and the patch scanner refuses any impl header containing
+// `<` or `where` - so no body in this block can be addressed, and an edit to one
+// reloads the shell. Each method here is therefore one call. The bodies live in
+// the `#[pill_hot_fn]` functions below, which a patch crate can compile.
 impl TabViewer for EditorTabViewer<'_> {
     type Tab = EditorTab;
 
@@ -900,182 +913,18 @@ impl TabViewer for EditorTabViewer<'_> {
     }
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        // A module panel's title is the registry's: it changes when the module
-        // unloads, and it carries the over-budget badge.
-        if let Some(slot) = tab.module_slot() {
-            let title = self.panels.tab_title(slot);
-            let label = if self.panel_budget.is_slow(slot) {
-                format!("{} (slow)", title)
-            } else {
-                title
-            };
-            return icons::rich(tab_icon(*tab), label.as_str()).into();
-        }
-        icons::rich(tab_icon(*tab), (*tab).title().as_str()).into()
+        tab_title(self, *tab)
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
-        // Every tab body is timed, because the Statistics tab's whole point is
-        // that its rows are measurements rather than estimates.
-        let started = pill_core::platform::Instant::now();
-        let tab = *tab;
-        match tab {
-            EditorTab::Scene(view) => {
-                let view = view as usize;
-                if let Some(slot) = self.scene_rects.get_mut(view) {
-                    *slot = Some(scene_body_rect(ui));
-                }
-                scene_context_menu(self, ui);
-                scene_overlay(ui, self.frames_per_second, &mut self.overlay_regions);
-                toolbox_overlay(self, ui, view);
-                scene_badges(self, ui, view);
-            }
-            EditorTab::Game => {
-                // The game viewport is the primary surface's child window: a
-                // hole, measured like a scene tab, with no menu and no
-                // overlay chips - it is the project's own view.
-                self.game_rect = Some(scene_body_rect(ui));
-            }
-            EditorTab::Entities => entities_tab(
-                ui,
-                self.snapshot,
-                self.selection,
-                self.pending,
-                &mut self.overlay_regions,
-                self.inspector,
-            ),
-            EditorTab::Systems => systems_tab(ui, self.snapshot, self.pending),
-            EditorTab::Inspector => inspector_tab(
-                ui,
-                self.snapshot,
-                &*self.selection,
-                self.pending,
-                &mut self.overlay_regions,
-                self.inspector,
-            ),
-            EditorTab::Assets => {
-                // One bundle of the handles the panel writes through, the
-                // same shape a grid tile takes (see `AssetTileWrites`).
-                let mut writes = AssetTileWrites {
-                    selection: self.selection,
-                    dialog: self.asset_dialog,
-                    pending: self.pending,
-                    overlay_regions: &mut self.overlay_regions,
-                    drag_out: self.drag_out,
-                    previews: self.previews,
-                    preview_visible: self.preview_visible,
-                };
-                assets_tab(ui, self.snapshot, self.browser, &mut writes);
-            }
-            EditorTab::Preferences => {
-                preferences_tab(ui, self.snapshot, self.preferences_draft, self.pending)
-            }
-            EditorTab::Console => console_tab(ui, self.snapshot, self.console_filters),
-            EditorTab::Problems => problems_tab(ui, self.snapshot, self.problem_open),
-            EditorTab::Statistics => {
-                statistics_tab(ui, self.snapshot, self.stats, self.frames_per_second)
-            }
-            EditorTab::Module(slot) => {
-                // The panel belongs to a module: its draw function is called
-                // only while that module's liveness marker is alive, and the
-                // tab says so when it is not.
-                match self.panels.draw_of(slot) {
-                    Some(draw) => {
-                        let requested_window = self
-                            .panel_window_ping
-                            .filter(|(pinged, _)| *pinged == slot)
-                            .map(|(_, window)| window);
-                        if requested_window.is_some() {
-                            self.panel_window_ping_used = true;
-                        }
-                        let mut context = PanelContext {
-                            frames_per_second: self.frames_per_second,
-                            selected_entity: self.selection.primary(),
-                            entities: self.panel_entities,
-                            detail: self.panel_detail,
-                            window: None,
-                            requested_window,
-                            answer: self.panel_answer,
-                            commands: self.panel_commands,
-                        };
-                        let started = pill_core::platform::Instant::now();
-                        draw(ui, &mut context);
-                        let micros = started.elapsed().as_micros() as f32;
-                        // The window requests belong to this panel, and only
-                        // this arm knows which slot asked.
-                        let mut kept = Vec::with_capacity(context.commands.len());
-                        for command in context.commands.drain(..) {
-                            match command {
-                                PanelCommand::OpenWindow(_) | PanelCommand::CloseWindow(_) => {
-                                    self.panel_window_requests.push((slot, command))
-                                }
-                                other => kept.push(other),
-                            }
-                        }
-                        *context.commands = kept;
-                        let over_budget = self.panel_budget.record(slot, micros);
-                        if over_budget {
-                            pill_core::warn!(
-                                target: pill_core::telemetry::telemetry_target::ECS,
-                                slot,
-                                micros,
-                                budget = PANEL_BUDGET_MICROS,
-                                frames = PANEL_BUDGET_FRAMES,
-                                "[editor] module panel over budget"
-                            );
-                        }
-                    }
-                    None => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(12.0);
-                            ui.strong("Module not loaded");
-                            ui.label(
-                                self.panels
-                                    .get(slot)
-                                    .map(|entry| entry.source.clone())
-                                    .unwrap_or_else(|| "unknown panel".to_string()),
-                            );
-                        });
-                    }
-                }
-            }
-        }
-        self.stats.record(tab, started.elapsed().as_micros() as f64);
+        tab_body(self, ui, *tab);
     }
 
     /// The dock tab's menu. The dock itself offers Eject (into a window)
     /// and Close; a floating window's tab gets Redock, which brings the
     /// surface's tabs back into the dock.
     fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, path: NodePath) {
-        // Popping a tab out is offered wherever a tab is, docked or floating;
-        // the window carries the way back.
-        if ui
-            .add(icons::IconButton::new(
-                icons::Icon::ArrowSquareOut,
-                "Pop Out",
-            ))
-            .clicked()
-        {
-            self.tab_popout = Some(*tab);
-            ui.close();
-        }
-        if !path.surface.is_main()
-            && ui
-                .add(icons::IconButton::new(icons::Icon::ArrowSquareIn, "Redock"))
-                .clicked()
-        {
-            self.tab_redock = Some(path.surface);
-            ui.close();
-        }
-        // The dock owns this menu's shell, so its drawn content is what is
-        // reported: an item click over the viewport must not pick either.
-        let rect = ui.min_rect();
-        self.overlay_regions.push(ShellRect {
-            x: rect.min.x,
-            y: rect.min.y,
-            width: rect.width(),
-            height: rect.height(),
-        });
+        tab_context_menu(self, ui, *tab, path);
     }
 
     /// The tab button hook: the selected tab's accent underline is painted
@@ -1083,12 +932,7 @@ impl TabViewer for EditorTabViewer<'_> {
     /// all of them), and a right-click that opens the tab menu is logged
     /// here, once per click - the menu content runs every frame it is open.
     fn on_tab_button(&mut self, tab: &mut Self::Tab, response: &egui::Response) {
-        if self.active_tabs.contains(&*tab) {
-            pill_editor_shell_egui_editor::shell::paint_active_tab_underline(response);
-        }
-        if response.secondary_clicked() {
-            log_context_menu("tab");
-        }
+        tab_button(self, *tab, response);
     }
 
     /// The scene and game tabs keep their bodies transparent: the scene and
@@ -1103,5 +947,217 @@ impl TabViewer for EditorTabViewer<'_> {
             EditorTab::Scene(_) | EditorTab::Game => [false, false],
             _ => [true, true],
         }
+    }
+}
+
+/// One tab's dock title.
+///
+/// A module panel's title is the registry's: it changes when the module unloads,
+/// and it carries the over-budget badge every other tab lacks.
+#[pill_hot_fn]
+pub fn tab_title(viewer: &mut EditorTabViewer<'_>, tab: EditorTab) -> egui::WidgetText {
+    if let Some(slot) = tab.module_slot() {
+        let title = viewer.panels.tab_title(slot);
+        let label = if viewer.panel_budget.is_slow(slot) {
+            format!("{} (slow)", title)
+        } else {
+            title
+        };
+        return icons::rich(tab_icon(tab), label.as_str()).into();
+    }
+    icons::rich(tab_icon(tab), tab.title().as_str()).into()
+}
+
+/// The dock's tab dispatch: every tab body, each timed for the Statistics tab.
+///
+/// The timing is here because the Statistics tab's whole point is that its rows
+/// are measurements rather than estimates.
+#[pill_hot_fn]
+pub fn tab_body(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, tab: EditorTab) {
+    let started = pill_core::platform::Instant::now();
+    match tab {
+        EditorTab::Scene(view) => {
+            let view = view as usize;
+            if let Some(slot) = viewer.scene_rects.get_mut(view) {
+                *slot = Some(scene_body_rect(ui));
+            }
+            scene_context_menu(viewer, ui);
+            scene_overlay(ui, viewer.frames_per_second, &mut viewer.overlay_regions);
+            toolbox_overlay(viewer, ui, view);
+            scene_badges(viewer, ui, view);
+        }
+        EditorTab::Game => {
+            // The game viewport is the primary surface's child window: a hole,
+            // measured like a scene tab, with no menu and no overlay chips - it
+            // is the project's own view.
+            viewer.game_rect = Some(scene_body_rect(ui));
+        }
+        EditorTab::Entities => entities_tab(
+            ui,
+            viewer.snapshot,
+            viewer.selection,
+            viewer.pending,
+            &mut viewer.overlay_regions,
+            viewer.inspector,
+        ),
+        EditorTab::Systems => systems_tab(ui, viewer.snapshot, viewer.pending),
+        EditorTab::Inspector => inspector_tab(
+            ui,
+            viewer.snapshot,
+            &*viewer.selection,
+            viewer.pending,
+            &mut viewer.overlay_regions,
+            viewer.inspector,
+        ),
+        EditorTab::Assets => {
+            // One bundle of the handles the panel writes through, the same
+            // shape a grid tile takes (see `AssetTileWrites`).
+            let mut writes = AssetTileWrites {
+                selection: viewer.selection,
+                dialog: viewer.asset_dialog,
+                pending: viewer.pending,
+                overlay_regions: &mut viewer.overlay_regions,
+                drag_out: viewer.drag_out,
+                previews: viewer.previews,
+                preview_visible: viewer.preview_visible,
+            };
+            assets_tab(ui, viewer.snapshot, viewer.browser, &mut writes);
+        }
+        EditorTab::Preferences => preferences_tab(
+            ui,
+            viewer.snapshot,
+            viewer.preferences_draft,
+            viewer.pending,
+        ),
+        EditorTab::Console => console_tab(ui, viewer.snapshot, viewer.console_filters),
+        EditorTab::Problems => problems_tab(ui, viewer.snapshot, viewer.problem_open),
+        EditorTab::Statistics => {
+            statistics_tab(ui, viewer.snapshot, viewer.stats, viewer.frames_per_second)
+        }
+        EditorTab::Module(slot) => draw_module_panel(viewer, ui, slot),
+    }
+    viewer
+        .stats
+        .record(tab, started.elapsed().as_micros() as f64);
+}
+
+/// One module panel's pass: liveness, its draw, the window requests it makes,
+/// and its share of the panel budget.
+///
+/// The panel belongs to a module: its draw function runs only while that
+/// module's liveness marker is alive, and the tab says so when it is not.
+#[pill_hot_fn]
+pub fn draw_module_panel(viewer: &mut EditorTabViewer<'_>, ui: &mut egui::Ui, slot: u16) {
+    let Some(draw) = viewer.panels.draw_of(slot) else {
+        ui.vertical_centered(|ui| {
+            ui.add_space(12.0);
+            ui.strong("Module not loaded");
+            ui.label(
+                viewer
+                    .panels
+                    .get(slot)
+                    .map(|entry| entry.source.clone())
+                    .unwrap_or_else(|| "unknown panel".to_string()),
+            );
+        });
+        return;
+    };
+
+    let requested_window = viewer
+        .panel_window_ping
+        .filter(|(pinged, _)| *pinged == slot)
+        .map(|(_, window)| window);
+    if requested_window.is_some() {
+        viewer.panel_window_ping_used = true;
+    }
+    let mut context = PanelContext {
+        frames_per_second: viewer.frames_per_second,
+        selected_entity: viewer.selection.primary(),
+        entities: viewer.panel_entities,
+        detail: viewer.panel_detail,
+        window: None,
+        requested_window,
+        answer: viewer.panel_answer,
+        commands: viewer.panel_commands,
+    };
+    // Timed here rather than reusing `tab_body`'s clock: the panel budget is a
+    // per-slot measurement over its own draw, not the tab's total.
+    let started = pill_core::platform::Instant::now();
+    draw(ui, &mut context);
+    let micros = started.elapsed().as_micros() as f32;
+    // The window requests belong to this panel, and only this function knows
+    // which slot asked.
+    let mut kept = Vec::with_capacity(context.commands.len());
+    for command in context.commands.drain(..) {
+        match command {
+            PanelCommand::OpenWindow(_) | PanelCommand::CloseWindow(_) => {
+                viewer.panel_window_requests.push((slot, command))
+            }
+            other => kept.push(other),
+        }
+    }
+    *context.commands = kept;
+    let over_budget = viewer.panel_budget.record(slot, micros);
+    if over_budget {
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            slot,
+            micros,
+            budget = PANEL_BUDGET_MICROS,
+            frames = PANEL_BUDGET_FRAMES,
+            "[editor] module panel over budget"
+        );
+    }
+}
+
+/// The dock tab's menu rows: Pop Out wherever a tab is, Redock on a floating
+/// surface.
+#[pill_hot_fn]
+pub fn tab_context_menu(
+    viewer: &mut EditorTabViewer<'_>,
+    ui: &mut egui::Ui,
+    tab: EditorTab,
+    path: NodePath,
+) {
+    // Popping a tab out is offered wherever a tab is, docked or floating; the
+    // window carries the way back.
+    if ui
+        .add(icons::IconButton::new(
+            icons::Icon::ArrowSquareOut,
+            "Pop Out",
+        ))
+        .clicked()
+    {
+        viewer.tab_popout = Some(tab);
+        ui.close();
+    }
+    if !path.surface.is_main()
+        && ui
+            .add(icons::IconButton::new(icons::Icon::ArrowSquareIn, "Redock"))
+            .clicked()
+    {
+        viewer.tab_redock = Some(path.surface);
+        ui.close();
+    }
+    // The dock owns this menu's shell, so its drawn content is what is
+    // reported: an item click over the viewport must not pick either.
+    let rect = ui.min_rect();
+    viewer.overlay_regions.push(ShellRect {
+        x: rect.min.x,
+        y: rect.min.y,
+        width: rect.width(),
+        height: rect.height(),
+    });
+}
+
+/// The tab button hook: the active tab's accent underline, and the tab menu's
+/// once-per-click log.
+#[pill_hot_fn]
+pub fn tab_button(viewer: &mut EditorTabViewer<'_>, tab: EditorTab, response: &egui::Response) {
+    if viewer.active_tabs.contains(&tab) {
+        paint_active_tab_underline(response);
+    }
+    if response.secondary_clicked() {
+        log_context_menu("tab");
     }
 }
