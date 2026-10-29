@@ -1129,11 +1129,9 @@ pub fn remember_inspector_row(
         signature.push('|');
         signature.push_str(part);
     }
-    if session.rows_logged.contains(&signature) {
-        return false;
-    }
-    session.rows_logged.push(signature);
-    true
+    // One lookup, not a scan: the set grows with the subject's component model,
+    // and the answer only changes on the first draw of a row.
+    session.rows_logged.insert(signature)
 }
 
 /// The wire name a row's widget logs under, so suites can assert what the
