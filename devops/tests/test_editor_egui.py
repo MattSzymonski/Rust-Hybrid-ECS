@@ -137,6 +137,7 @@ PALETTE_OPENED_TOKEN = "[editor] palette opened"
 PALETTE_QUERY_TOKEN = "[editor] palette query"
 PALETTE_RECT_TOKEN = "[editor] palette rect"
 PALETTE_CLOSED_TOKEN = "[editor] palette closed"
+COMMAND_NO_ACTION_TOKEN = "[editor] command has no action"
 PALETTE_DISMISSED_TOKEN = "[editor] palette dismissed"
 CONSOLE_DUMP_TOKEN = "[test] console"
 PROBLEMS_DUMP_TOKEN = "[test] problems"
@@ -1565,6 +1566,30 @@ def main() -> int:
             re.escape(PALETTE_DISMISSED_TOKEN), 30, "the palette closed on request", begin
         )
         print("  [OK] the palette closed without running")
+
+        # A registered command this build has no action for must not be offered:
+        # the layout commands lost their menu path with the Layout menu that the
+        # bar never had, so the palette names each one and lists no row. Before
+        # this the row appeared, a run closed the popup, and nothing happened.
+        begin = len(session.read_log())
+        session.send("palette save layout")
+        session.wait(
+            re.escape(COMMAND_NO_ACTION_TOKEN) + r'\s+command="editor\.save_layout"',
+            30,
+            "the palette named the command it cannot run",
+            begin,
+        )
+        session.wait(
+            re.escape(PALETTE_QUERY_TOKEN) + r'\s+query="save layout"\s+matches=0',
+            30,
+            "the palette listed no command without an action",
+            begin,
+        )
+        session.send("palette close")
+        session.wait(
+            re.escape(PALETTE_DISMISSED_TOKEN), 30, "the palette closed on request", begin
+        )
+        print("  [OK] the palette named and dropped a command with no action")
 
         # Step 3a4: the Console panel (W-0038 Stage 5). The tab reads the
         # telemetry capture ring, so the project's own log line is in the game

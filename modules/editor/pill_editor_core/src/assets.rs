@@ -490,6 +490,27 @@ pub fn queue_move(pending: &mut PendingEditorCommands, from: &str, to: &str) {
     );
 }
 
+/// Whether the row is a file a `.meta` sidecar can be written for, ignoring
+/// whether its tree is read-only - the per-row half of
+/// [`can_write_meta`] and of [`write_meta_selection`]'s refusal.
+fn takes_meta(row: &AssetListing) -> bool {
+    row.kind != "folder" && !row.standalone && !row.has_meta
+}
+
+/// Whether the toolbar's Write Asset Meta can act on the selection.
+///
+/// The one answer the menu row, the assets panel and the scripted path read,
+/// so an enabled row cannot be a write [`write_meta_selection`] refuses.
+pub fn can_write_meta(selection: &EditorSelection, assets: &[AssetListing]) -> bool {
+    selected_row(selection, assets).is_some_and(|row| takes_meta(row) && !row.read_only)
+}
+
+/// Whether the toolbar's Delete Asset can act on the selection: a file, in a
+/// tree this editor may write.
+pub fn can_delete(selection: &EditorSelection, assets: &[AssetListing]) -> bool {
+    selected_row(selection, assets).is_some_and(|row| row.kind != "folder" && !row.read_only)
+}
+
 /// The toolbar's Delete Asset: needs a selected file; refuses (and warns)
 /// otherwise, so the scripted path takes the same rule the button's
 /// enablement does.
@@ -505,7 +526,8 @@ pub fn delete_selection(
         );
         return false;
     };
-    if row.read_only {
+    if !can_delete(selection, assets) {
+        // The only remaining refusal once a file is selected.
         pill_core::warn!(
             target: telemetry_target::ECS,
             path = row.key().as_str(),
@@ -524,16 +546,15 @@ pub fn write_meta_selection(
     selection: &EditorSelection,
     assets: &[AssetListing],
 ) -> bool {
-    let Some(row) = selected_row(selection, assets)
-        .filter(|row| row.kind != "folder" && !row.standalone && !row.has_meta)
-    else {
+    let Some(row) = selected_row(selection, assets).filter(|row| takes_meta(row)) else {
         pill_core::warn!(
             target: telemetry_target::ECS,
             "[editor] write asset meta needs a sourced file without one"
         );
         return false;
     };
-    if row.read_only {
+    if !can_write_meta(selection, assets) {
+        // The only remaining refusal once a sidecar-less file is selected.
         pill_core::warn!(
             target: telemetry_target::ECS,
             path = row.key().as_str(),
@@ -765,6 +786,55 @@ mod tests {
             has_meta: kind == "pill_master_renderer::Material",
             guid: None,
         }
+    }
+
+    /// The enablement predicates and the acting functions answer the same
+    /// question for the same rows: a project file with a sidecar, a sourced
+    /// file without one, a module's read-only file, and a folder.
+    #[test]
+    fn the_asset_predicates_agree_with_the_actions_they_gate() {
+        let rows = vec![
+            listing("shaders/lit.hlsl", "Shader", false, true),
+            listing("shaders/plain.hlsl", "Shader", false, false),
+            module_row(
+                "pill_master_renderer_data",
+                "defaults/pill.pbr.material",
+                "pill_master_renderer::Material",
+            ),
+            listing("shaders", "folder", false, false),
+        ];
+        let select = |path: &str| {
+            let mut selection = EditorSelection::default();
+            selection.asset = Some(path.to_string());
+            selection
+        };
+        let mut pending = PendingEditorCommands::default();
+        let sidecar = select("shaders/lit.hlsl");
+        assert!(
+            !can_write_meta(&sidecar, &rows),
+            "a sidecar is already there"
+        );
+        assert!(can_delete(&sidecar, &rows));
+        let sourced = select("shaders/plain.hlsl");
+        assert!(can_write_meta(&sourced, &rows));
+        let module = select("extensions/pill_master_renderer_data/defaults/pill.pbr.material");
+        assert!(
+            !can_write_meta(&module, &rows),
+            "a module's resources are read-only, so the row must not offer a write"
+        );
+        assert!(!can_delete(&module, &rows));
+        let folder = select("shaders");
+        assert!(!can_write_meta(&folder, &rows));
+        assert!(!can_delete(&folder, &rows));
+
+        // The actions agree with every answer above.
+        assert!(delete_selection(&mut pending, &sidecar, &rows));
+        assert!(!write_meta_selection(&mut pending, &sidecar, &rows));
+        assert!(write_meta_selection(&mut pending, &sourced, &rows));
+        assert!(!delete_selection(&mut pending, &module, &rows));
+        assert!(!write_meta_selection(&mut pending, &module, &rows));
+        assert!(!delete_selection(&mut pending, &folder, &rows));
+        assert!(!write_meta_selection(&mut pending, &folder, &rows));
     }
 
     /// A module's resource tree is recognised by the extensions root and every

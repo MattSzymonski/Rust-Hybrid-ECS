@@ -368,7 +368,10 @@ pub fn asset_menu_items(
         ui.close();
     }
     if ui
-        .add(icons::IconButton::new(icons::Icon::Trash, "Delete Asset"))
+        .add_enabled(
+            assets::can_delete(selection, &snapshot.assets),
+            icons::IconButton::new(icons::Icon::Trash, "Delete Asset"),
+        )
         .clicked()
     {
         assets::delete_selection(pending, selection, &snapshot.assets);

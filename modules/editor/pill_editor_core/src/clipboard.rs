@@ -265,6 +265,18 @@ pub fn selection_payload(selection: &EditorSelection, snapshot: &EditorSnapshot)
     None
 }
 
+/// Whether the selection carries something a copy would write.
+///
+/// The boolean form of [`selection_payload`], and the one the Edit menu's Copy
+/// and Cut rows read: the row is offered exactly when the copy it runs would
+/// carry something. A selection whose detail has not been captured yet - the
+/// entity is selected but the snapshot still describes the last one - has no
+/// payload, so the row greys out instead of copying the asset the selection
+/// replaced.
+pub fn can_copy(selection: &EditorSelection, snapshot: &EditorSnapshot) -> bool {
+    selection_payload(selection, snapshot).is_some()
+}
+
 /// Queue one clipboard command from the shell.
 ///
 /// A copy writes the selection's payload; a cut writes it and queues the

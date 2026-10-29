@@ -30,7 +30,8 @@ pub const PALETTE_WIDTH: f32 = 360.0;
 /// The commands whose titles contain `query`, in registration order.
 ///
 /// A case-insensitive substring match on the title; an empty query matches
-/// every command.
+/// every command. This is the title filter only - the window drops the rows no
+/// action answers, which needs the frame's snapshot.
 pub fn matches<'a>(commands: &'a [CommandView], query: &str) -> Vec<&'a CommandView> {
     let needle = query.trim().to_lowercase();
     commands
@@ -49,15 +50,25 @@ pub fn palette_window(
     if !palette.open {
         return;
     }
-    let rows: Vec<CommandView> = matches(&viewer.snapshot.commands, &palette.query)
-        .into_iter()
-        .cloned()
-        .collect();
+    let (runnable, unresolved): (Vec<&CommandView>, Vec<&CommandView>) =
+        matches(&viewer.snapshot.commands, &palette.query)
+            .into_iter()
+            .partition(|row| menubar::action_for(row, viewer.snapshot, viewer.selection).is_some());
+    let rows: Vec<CommandView> = runnable.into_iter().cloned().collect();
     palette.selected = palette.selected.min(rows.len().saturating_sub(1));
     // One line per query change, so a suite can wait for the filter result
-    // instead of reading the screen.
+    // instead of reading the screen. A command the model has no action for is
+    // named here, once per query, and gets no row: offering it was a no-op the
+    // palette close line used to hide.
     if palette.logged_query.as_deref() != Some(palette.query.as_str()) {
         palette.logged_query = Some(palette.query.clone());
+        for row in &unresolved {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::ENGINE,
+                command = row.id.as_str(),
+                "[editor] command has no action"
+            );
+        }
         pill_core::info!(
             target: pill_core::telemetry::telemetry_target::ENGINE,
             query = palette.query.as_str(),
@@ -165,5 +176,14 @@ pub fn run_selected(
         command = row.id.as_str(),
         "[editor] palette closed"
     );
-    run_menu_action("palette", label.as_str(), action, session, viewer);
+    match action {
+        Some(action) => run_menu_action("palette", label.as_str(), action, session, viewer),
+        // Unreachable through the rows the palette lists, which are the ones
+        // with an action; kept so a scripted run of an unlistable id says so.
+        None => pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            command = row.id.as_str(),
+            "[editor] command has no action"
+        ),
+    }
 }
