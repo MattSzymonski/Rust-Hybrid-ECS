@@ -198,6 +198,33 @@ impl EditorTab {
             _ => None,
         }
     }
+
+    /// The tab a wire name names: the parser [`EditorTab::name`] is the
+    /// writer of.
+    ///
+    /// The one parser every side uses - the scripted channel, the popout map
+    /// and the frontend's window bookkeeping - so a name that parses in one
+    /// place parses in all of them. A module panel's tab carries its slot
+    /// (`module:3`) because the bare word cannot identify one, and a scene
+    /// view is `scene`, `scene2`, `scene3`: one past the view's own index,
+    /// because a person counts views from one.
+    pub fn from_wire(name: &str) -> Option<EditorTab> {
+        if let Some(slot) = name.strip_prefix("module:") {
+            return slot.parse().ok().map(EditorTab::Module);
+        }
+        if let Some(count) = name.strip_prefix("scene") {
+            if count.is_empty() {
+                return Some(EditorTab::Scene(0));
+            }
+            return count
+                .parse::<u16>()
+                .ok()
+                .and_then(|count| count.checked_sub(1))
+                .and_then(|index| u8::try_from(index).ok())
+                .map(EditorTab::Scene);
+        }
+        EditorTab::ALL.into_iter().find(|tab| tab.name() == name)
+    }
 }
 
 /// The editor's dock: an `egui_dock` state with the editor's default
@@ -714,5 +741,27 @@ mod tests {
         // An unknown name is a refusal, not a silently dropped tab.
         assert!(serde_json::from_str::<EditorTab>("\"Nonsense\"").is_err());
         assert!(serde_json::from_str::<EditorTab>("{\"Game\":1}").is_err());
+    }
+
+    #[test]
+    fn every_tab_parses_back_from_the_name_it_logs() {
+        // The parser and the writer are one contract: a name in a log line, a
+        // scripted command or a window title has to reach its tab again.
+        for tab in EditorTab::ALL {
+            let name = tab.name();
+            assert_eq!(EditorTab::from_wire(&name), Some(tab), "{name}");
+        }
+        // A module panel's tab carries its slot, because the bare word names
+        // none of them.
+        assert_eq!(EditorTab::from_wire("module:3"), Some(EditorTab::Module(3)));
+        assert_eq!(EditorTab::from_wire("module:0"), Some(EditorTab::Module(0)));
+        // Scene views count from one: `scene` is the first, `scene4` the
+        // fourth.
+        assert_eq!(EditorTab::from_wire("scene"), Some(EditorTab::Scene(0)));
+        assert_eq!(EditorTab::from_wire("scene4"), Some(EditorTab::Scene(3)));
+        // A name no tab answers to is a refusal, not a guess.
+        assert_eq!(EditorTab::from_wire("module"), None);
+        assert_eq!(EditorTab::from_wire("scene0"), None);
+        assert_eq!(EditorTab::from_wire("nonsense"), None);
     }
 }
