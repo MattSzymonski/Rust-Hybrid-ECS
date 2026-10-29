@@ -569,7 +569,7 @@ pub struct InspectorSession {
     pub add_entries: Vec<(String, Rect)>,
     /// The row signatures already logged, so a panel that redraws every frame
     /// does not flood the log with the same row.
-    pub rows_logged: Vec<String>,
+    pub rows_logged: std::collections::HashSet<String>,
     /// The entity whose rows were last reported. A different subject clears
     /// the row memories below, because the rows on screen are that entity's.
     pub subject: Option<pill_engine::Entity>,
