@@ -264,6 +264,7 @@ NEW_ENTITY_TOKEN = "[editor] new entity queued"
 DELETE_ENTITY_TOKEN = "[editor] delete entity queued"
 SELECTION_FOLLOWED_TOKEN = "[editor] selection followed the move"
 SELECTION_CLEARED_TOKEN = "[editor] selection cleared with the delete"
+COMMAND_FAILED_TOKEN = "[editor] command failed"
 PREFERENCES_DUMP_TOKEN = "[test] preferences"
 PREFERENCES_APPLIED_TOKEN = "[editor] preferences applied"
 PREFERENCES_SAVED_TOKEN = "[editor] preferences saved"
@@ -3177,6 +3178,26 @@ def main() -> int:
             begin,
         )
         wait_for_path(moved_path, True, 30, f"moved to {moved}")
+
+        # A refused move: the destination is an existing folder, so nothing
+        # moves and the selection stays where the file is. The follow reads
+        # what applied rather than what was asked for, or the Inspector would
+        # be pointed at a path the move never made.
+        begin = len(session.read_log())
+        session.send(f"edit asset move {moved} models")
+        session.wait(
+            re.escape(COMMAND_FAILED_TOKEN) + r'(?=[^\n]*already exists)',
+            30,
+            "the move onto an existing path was refused",
+            begin,
+        )
+        refused_window = session.read_log()[begin:]
+        assert SELECTION_FOLLOWED_TOKEN not in refused_window, (
+            "the selection followed a move that never happened: "
+            + refused_window[-800:]
+        )
+        wait_for_path(moved_path, True, 30, "the refused move left the file in place")
+        print("  [OK] a refused move left the selection and the file alone")
 
         # The delete clears the selection and undoes back into the file.
         begin = len(session.read_log())

@@ -128,3 +128,15 @@ pub mod style;
 pub mod systems;
 /// The floating viewport toolbox: rows, geometry and the commanded edits.
 pub mod toolbox;
+
+/// Scaffolding the crate's tests share.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// The mounted asset directory is process-wide, so the tests that mount
+    /// one take this in turn - across modules, which is why the lock lives
+    /// here rather than in one module's private test module.
+    pub(crate) fn asset_mount_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}

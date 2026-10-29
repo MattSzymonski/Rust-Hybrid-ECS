@@ -15,9 +15,12 @@
 //!   except `Entity` handles, so hot reload can never leave stale metadata
 //!   behind: components are addressed by name and re-resolved per capture.
 //! - **Mutations** are queued [`EditorCommand`]s flushed in one batch at the
-//!   frame boundary, before the frame runs. Every engine call this dispatches
-//!   is all-or-nothing; failures are returned as `(index, message)` pairs for
-//!   the Console panel, never partially applied.
+//!   frame boundary, before the frame runs. Engine state is transactional per
+//!   command - every engine call this dispatches is all-or-nothing - and
+//!   failures are returned as `(index, message)` pairs for the Console panel.
+//!   The asset-file commands are the exception, because a filesystem is not a
+//!   transaction: they copy, write and remove files, attempt a rollback when a
+//!   later step fails, and name every file the rollback could not take back.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -1406,6 +1409,56 @@ pub struct RecordedApply {
     pub remaps: Vec<(Entity, Entity)>,
 }
 
+/// Remove the files a command created, and report the ones it could not.
+///
+/// A failed asset-file command takes its own work back so a half-applied change
+/// is not left for the asset watcher to import as an unrecorded edit. The
+/// removal can fail too - a locked file, a permission, a disk error - and that
+/// is the case this reports: the paths that are still on disk.
+fn roll_back_files(paths: &[String]) -> Vec<String> {
+    roll_back_files_with(paths, &mut |path| std::fs::remove_file(path))
+}
+
+/// [`roll_back_files`] with the remover the caller supplies, so the failing
+/// branch is testable without a permission change.
+fn roll_back_files_with(
+    paths: &[String],
+    remove: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> Vec<String> {
+    let mut left_behind = Vec::new();
+    for path in paths {
+        if remove(path).is_err() && Path::new(path).exists() {
+            left_behind.push(path.clone());
+        }
+    }
+    left_behind
+}
+
+/// Report files a command meant to take back and could not.
+fn warn_left_behind(left_behind: &[String]) {
+    if left_behind.is_empty() {
+        return;
+    }
+    pill_core::warn!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        paths = left_behind.join(","),
+        "[editor] rollback left files behind"
+    );
+}
+
+/// A failed command's message, extended with the paths its rollback left on
+/// disk: the Console has to say what is still there, not only what failed.
+fn with_rollback_paths(message: String, left_behind: &[String]) -> String {
+    if left_behind.is_empty() {
+        return message;
+    }
+    warn_left_behind(left_behind);
+    format!(
+        "{message} (rollback incomplete: {})",
+        left_behind.join(", ")
+    )
+}
+
 impl EditorCommand {
     /// Whether this command is an undoable edit.
     ///
@@ -1565,9 +1618,11 @@ impl EditorCommand {
     /// Apply a batch at the frame boundary.
     ///
     /// Returns one `(index, message)` per failed command so the Console panel
-    /// can surface it. A failure never aborts the rest of the batch and never
-    /// leaves partial state: every engine call this dispatches is
-    /// all-or-nothing, and structural commands validate before they commit.
+    /// can surface it. A failure never aborts the rest of the batch. Engine
+    /// state is all-or-nothing per command, and structural commands validate
+    /// before they commit; the asset-file commands are the exception - a
+    /// rollback that cannot finish lists the files it left behind in the
+    /// message.
     pub fn apply(engine: &mut Engine, commands: &[EditorCommand]) -> Vec<(usize, String)> {
         Self::apply_recorded(engine, commands).failures
     }
@@ -1654,7 +1709,11 @@ impl EditorCommand {
         Ok(seeds)
     }
 
-    /// Apply one command; the message is empty on success.
+    /// Apply one command: what it changed, or the message saying why it could
+    /// not.
+    ///
+    /// The `Err` carries the command's own failure and, for an asset-file
+    /// command whose rollback could not finish, the paths still on disk.
     fn apply_one(engine: &mut Engine, command: &EditorCommand) -> Result<CommandOutcome, String> {
         match command {
             EditorCommand::SelectResource { resource } => {
@@ -2012,12 +2071,14 @@ impl EditorCommand {
                         continue;
                     }
                     if let Err(error) = std::fs::copy(source, &target) {
-                        // Best-effort rollback of this command's own copies:
-                        // a partial import must not stay on disk unrecorded.
-                        for path in &created {
-                            let _ = std::fs::remove_file(path);
-                        }
-                        return Err(format!("{command:?}: {error}"));
+                        // The command's own copies go back; a removal that fails
+                        // names the file it left, so the failure is the whole
+                        // story rather than half of it.
+                        let left_behind = roll_back_files(&created);
+                        return Err(with_rollback_paths(
+                            format!("{command:?}: {error}"),
+                            &left_behind,
+                        ));
                     }
                     created.push(target.to_string_lossy().into_owned());
                 }
@@ -2196,21 +2257,30 @@ impl EditorCommand {
                     // takes the write back rather than leaving a file the
                     // project cannot read: a replaced file gets its previous
                     // bytes again, a new one goes.
+                    let mut left_behind = Vec::new();
                     match previous {
                         Some(previous) => {
-                            let _ =
+                            let restored =
                                 pill_engine::asset_store::write_replacing(&destination, &previous);
+                            if restored.is_err() {
+                                left_behind.push(destination.display().to_string());
+                            }
                         }
                         None => {
-                            let _ = std::fs::remove_file(&destination);
+                            let destination = destination.display().to_string();
+                            left_behind.extend(roll_back_files(&[destination]));
                             if let Some(meta) = sidecar.filter(|_| !sidecar_existed) {
-                                let _ = std::fs::remove_file(root.join(meta));
+                                let meta = root.join(meta).display().to_string();
+                                left_behind.extend(roll_back_files(&[meta]));
                             }
                         }
                     }
-                    return Err(format!(
-                        "{command:?}: `{}` did not load: {error}",
-                        asset_slash(&relative)
+                    return Err(with_rollback_paths(
+                        format!(
+                            "{command:?}: `{}` did not load: {error}",
+                            asset_slash(&relative)
+                        ),
+                        &left_behind,
                     ));
                 }
                 Ok(CommandOutcome::inverse(EditorCommand::DeleteAssetFile {
@@ -2292,9 +2362,11 @@ impl EditorCommand {
                         Some(meta) => write_asset_bytes(&meta_path, meta)
                             .map_err(|message| format!("{command:?}: {message}"))?,
                         // A file that had no sidecar restores without one;
-                        // anything sitting there now is an orphan.
+                        // anything sitting there now is an orphan, and a
+                        // removal that fails says which one.
                         None => {
-                            let _ = std::fs::remove_file(&meta_path);
+                            let meta = meta_path.display().to_string();
+                            warn_left_behind(&roll_back_files(&[meta]));
                         }
                     }
                 }
@@ -3690,7 +3762,7 @@ mod tests {
     /// one test: the mounted directory is process-wide.
     #[test]
     fn asset_picks_load_assign_undo_clear_and_refuse() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let (mut engine, entity, name, root) = reference_engine("pick");
         assert_eq!(note_label(&engine, entity), AssetReferenceLabel::Unset);
 
@@ -4014,13 +4086,6 @@ mod tests {
         assert_eq!(target_label(&engine, holder), EntityReferenceLabel::Unset);
     }
 
-    /// The mounted asset directory is process-wide, so the tests that mount
-    /// one take this in turn.
-    fn asset_mount_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
     /// A standalone type that refuses every document, so a create writes its
     /// file and then fails to import it.
     #[derive(Debug)]
@@ -4052,11 +4117,44 @@ mod tests {
     #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
     struct RefusedDocument {}
 
+    /// A rollback that cannot take a file back names it, in the command's
+    /// message and in the log: a failure that changed the disk has to say so.
+    #[test]
+    fn a_rollback_that_cannot_finish_names_the_file_it_left() {
+        let path = std::env::temp_dir().join(format!(
+            "pill-editor-rollback-left-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"kept").unwrap();
+        let path_text = path.display().to_string();
+
+        let left = roll_back_files_with(&[path_text.clone()], &mut |_| {
+            Err(std::io::Error::other("a handle holds it"))
+        });
+        assert_eq!(left, vec![path_text.clone()], "the file is still there");
+        let message = with_rollback_paths("import failed".to_string(), &left);
+        assert!(message.starts_with("import failed"), "{message}");
+        assert!(
+            message.contains(&path_text),
+            "the message must name what the rollback left: {message}"
+        );
+
+        // A rollback that finishes adds nothing to the message and leaves no
+        // file behind.
+        let cleaned = roll_back_files(&[path_text.clone()]);
+        assert!(cleaned.is_empty());
+        assert!(!path.exists());
+        assert_eq!(
+            with_rollback_paths("import failed".to_string(), &cleaned),
+            "import failed"
+        );
+    }
+
     /// A create whose import refuses the file it just wrote leaves no file,
     /// and a delete that cannot remove the sidecar puts the asset back.
     #[test]
     fn a_failed_create_or_delete_leaves_the_directory_as_it_found_it() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let root =
             std::env::temp_dir().join(format!("pill-editor-asset-rollback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4144,7 +4242,7 @@ mod tests {
     /// store still holds.
     #[test]
     fn a_redone_create_writes_the_file_again() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let root =
             std::env::temp_dir().join(format!("pill-editor-asset-redo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4219,7 +4317,7 @@ mod tests {
     /// because the handle stays what it was.
     #[test]
     fn a_replace_keeps_the_guid_the_store_holds_and_reloads_the_value() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let root =
             std::env::temp_dir().join(format!("pill-editor-asset-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4293,7 +4391,7 @@ mod tests {
     /// write the person asked for.
     #[test]
     fn a_create_over_a_stale_loaded_path_binds_the_fresh_guid() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let root =
             std::env::temp_dir().join(format!("pill-editor-asset-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4339,7 +4437,7 @@ mod tests {
     /// back, rather than deleting what was there.
     #[test]
     fn a_refused_replace_restores_the_previous_file() {
-        let _mount = asset_mount_lock();
+        let _mount = crate::test_support::asset_mount_lock();
         let root =
             std::env::temp_dir().join(format!("pill-editor-asset-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
