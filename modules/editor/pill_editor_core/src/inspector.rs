@@ -776,7 +776,7 @@ pub fn picker_candidates<'a>(
     (
         listing
             .iter()
-            .filter(|entry| names_type(&entry.kind, target))
+            .filter(|entry| names_type(entry.kind.text(), target))
             .collect(),
         engine_assets
             .iter()
@@ -1242,6 +1242,7 @@ pub fn settings_coalesce_key(asset_path: &str, key_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_state::AssetKind;
     use serde_json::json;
 
     /// A detail whose components are named by their short names, enough to
@@ -1975,7 +1976,7 @@ mod tests {
             root: String::new(),
             path: path.to_owned(),
             read_only: false,
-            kind: kind.to_owned(),
+            kind: AssetKind::parse(kind),
             standalone: false,
             has_meta: true,
             guid: None,
@@ -2003,7 +2004,7 @@ mod tests {
             root: String::new(),
             path: path.to_owned(),
             read_only: false,
-            kind: kind.to_owned(),
+            kind: AssetKind::parse(kind),
             standalone: true,
             has_meta: true,
             guid: Some(format!("file-{path}")),

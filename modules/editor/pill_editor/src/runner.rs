@@ -49,8 +49,8 @@ use pill_editor_core::commands::{
 use pill_editor_core::console::{ConsoleChannel, ConsoleLine, ConsoleState};
 use pill_editor_core::drain::{self, HistoryDirection};
 use pill_editor_core::editor_state::{
-    AssetDetail, AssetListing, AssetReferenceField, EditorCommand, EditorSelection, EditorSnapshot,
-    EntityPickRequest, SelectionClick, StandaloneTypeInfo,
+    AssetDetail, AssetKind, AssetListing, AssetReferenceField, EditorCommand, EditorSelection,
+    EditorSnapshot, EntityPickRequest, SelectionClick, StandaloneTypeInfo,
 };
 use pill_editor_core::egui;
 use pill_editor_core::entities;
@@ -3608,7 +3608,7 @@ impl EditorWindow {
             info!(
                 target: telemetry_target::ENGINE,
                 path = row.key().as_str(),
-                kind = row.kind.as_str(),
+                kind = row.kind.text(),
                 standalone = row.standalone,
                 has_meta = row.has_meta,
                 root = row.root.as_str(),
@@ -3640,7 +3640,7 @@ impl EditorWindow {
             info!(
                 target: telemetry_target::ENGINE,
                 path = row.path.as_str(),
-                kind = row.kind.as_str(),
+                kind = row.kind.text(),
                 "[test] browser item"
             );
         }
@@ -4393,7 +4393,7 @@ impl EditorWindow {
             .asset_entries
             .iter()
             .find(|row| row.path == path || row.key() == path)
-            .map(|row| row.kind.clone())
+            .map(|row| row.kind.text().to_string())
             .unwrap_or_default();
         let nested = self
             .asset_reference_fields(&kind, &Some(document.clone()))
@@ -5202,9 +5202,9 @@ impl EditorWindow {
                 path: entry.path,
                 read_only: entry.read_only,
                 kind: if entry.is_directory {
-                    "folder".to_string()
+                    AssetKind::Folder
                 } else {
-                    entry.type_name.unwrap_or_else(|| "file".to_string())
+                    AssetKind::parse(&entry.type_name.unwrap_or_else(|| "file".to_string()))
                 },
                 standalone: entry.standalone,
                 has_meta: entry.guid.is_some(),
@@ -5264,7 +5264,7 @@ impl EditorWindow {
                     root,
                     path: String::new(),
                     read_only: true,
-                    kind: "folder".to_string(),
+                    kind: AssetKind::Folder,
                     standalone: false,
                     has_meta: false,
                     guid: None,
@@ -5311,7 +5311,7 @@ impl EditorWindow {
         self.asset_detail = selected.map(|key| {
             let row = self.asset_entries.iter().find(|row| row.key() == key);
             let kind = row
-                .map(|row| row.kind.clone())
+                .map(|row| row.kind.text().to_string())
                 .unwrap_or_else(|| "file".to_string());
             let standalone = row.map(|row| row.standalone).unwrap_or(false);
             let root = row.map(|row| row.root.clone()).unwrap_or_default();
@@ -5322,7 +5322,7 @@ impl EditorWindow {
             let path = row
                 .map(|row| row.path.clone())
                 .unwrap_or_else(|| key.clone());
-            let settings = if row.is_some_and(|row| row.kind == "folder") {
+            let settings = if row.is_some_and(|row| row.kind.is_folder()) {
                 None
             } else {
                 self.read_asset_settings(&path)
@@ -9678,7 +9678,7 @@ mod tests {
             root: String::new(),
             path: path.to_string(),
             read_only: false,
-            kind: "Material".to_string(),
+            kind: AssetKind::parse("Material"),
             standalone: false,
             has_meta: guid.is_some(),
             guid: guid.map(str::to_string),

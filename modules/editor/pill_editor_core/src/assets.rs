@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use pill_core::telemetry::telemetry_target;
 
 // Current crate
+use crate::browser;
 use crate::commands::PendingEditorCommands;
 use crate::editor_state::{AssetListing, EditorCommand, EditorSelection, StandaloneTypeInfo};
 
@@ -119,7 +120,7 @@ pub fn open_create(
         .iter()
         .find(|row| Some(row.key().as_str()) == selection.asset.as_deref())
     {
-        Some(row) if row.kind == "folder" => row.key(),
+        Some(row) if browser::is_folder(row) => row.key(),
         Some(row) => {
             let key = row.key();
             key.rsplit_once('/')
@@ -242,7 +243,7 @@ pub fn open_rename(
     selection: &EditorSelection,
     assets: &[AssetListing],
 ) {
-    let Some(row) = selected_row(selection, assets).filter(|row| row.kind != "folder") else {
+    let Some(row) = selected_row(selection, assets).filter(|row| !browser::is_folder(row)) else {
         pill_core::warn!(
             target: telemetry_target::ECS,
             "[editor] rename asset needs a selected file"
@@ -494,7 +495,7 @@ pub fn queue_move(pending: &mut PendingEditorCommands, from: &str, to: &str) {
 /// whether its tree is read-only - the per-row half of
 /// [`can_write_meta`] and of [`write_meta_selection`]'s refusal.
 fn takes_meta(row: &AssetListing) -> bool {
-    row.kind != "folder" && !row.standalone && !row.has_meta
+    !browser::is_folder(row) && !row.standalone && !row.has_meta
 }
 
 /// Whether the toolbar's Write Asset Meta can act on the selection.
@@ -508,7 +509,7 @@ pub fn can_write_meta(selection: &EditorSelection, assets: &[AssetListing]) -> b
 /// Whether the toolbar's Delete Asset can act on the selection: a file, in a
 /// tree this editor may write.
 pub fn can_delete(selection: &EditorSelection, assets: &[AssetListing]) -> bool {
-    selected_row(selection, assets).is_some_and(|row| row.kind != "folder" && !row.read_only)
+    selected_row(selection, assets).is_some_and(|row| !browser::is_folder(row) && !row.read_only)
 }
 
 /// The toolbar's Delete Asset: needs a selected file; refuses (and warns)
@@ -519,7 +520,7 @@ pub fn delete_selection(
     selection: &EditorSelection,
     assets: &[AssetListing],
 ) -> bool {
-    let Some(row) = selected_row(selection, assets).filter(|row| row.kind != "folder") else {
+    let Some(row) = selected_row(selection, assets).filter(|row| !browser::is_folder(row)) else {
         pill_core::warn!(
             target: telemetry_target::ECS,
             "[editor] delete asset needs a selected file"
@@ -674,6 +675,7 @@ fn close(dialog: &mut Option<AssetDialog>, kind: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_state::AssetKind;
     use crate::editor_state::EditorSelection;
     use crate::editor_state::EXTENSIONS_ROOT;
 
@@ -768,7 +770,7 @@ mod tests {
             root: String::new(),
             path: path.to_string(),
             read_only: false,
-            kind: kind.to_string(),
+            kind: AssetKind::parse(kind),
             standalone,
             has_meta,
             guid: None,
@@ -781,7 +783,7 @@ mod tests {
             root: root.to_string(),
             path: path.to_string(),
             read_only: true,
-            kind: kind.to_string(),
+            kind: AssetKind::parse(kind),
             standalone: kind == "pill_master_renderer::Material",
             has_meta: kind == "pill_master_renderer::Material",
             guid: None,
@@ -835,6 +837,41 @@ mod tests {
         assert!(!write_meta_selection(&mut pending, &module, &rows));
         assert!(!delete_selection(&mut pending, &folder, &rows));
         assert!(!write_meta_selection(&mut pending, &folder, &rows));
+    }
+
+    /// Every action that writes refuses a folder row, and only a folder row: a
+    /// file whose type happens to spell `Folder` is a file. The predicate is
+    /// the one the actions and the panels share, so these answers are one
+    /// decision rather than four string comparisons.
+    #[test]
+    fn every_asset_action_refuses_a_folder_row() {
+        let assets = vec![
+            listing("materials", "folder", false, false),
+            listing("materials/odd.folder", "demo::Folder", false, false),
+        ];
+        let select = |path: &str| {
+            let mut selection = EditorSelection::default();
+            selection.asset = Some(path.to_string());
+            selection
+        };
+        let folder = select("materials");
+        let typed = select("materials/odd.folder");
+        let mut dialog = None;
+        let mut pending = PendingEditorCommands::default();
+
+        open_rename(&mut dialog, &folder, &assets);
+        assert!(dialog.is_none(), "a folder has no name to rename");
+        assert!(!can_delete(&folder, &assets));
+        assert!(!can_write_meta(&folder, &assets));
+        assert!(!delete_selection(&mut pending, &folder, &assets));
+        assert!(!write_meta_selection(&mut pending, &folder, &assets));
+
+        open_rename(&mut dialog, &typed, &assets);
+        assert!(
+            dialog.is_some(),
+            "a type named Folder is not the folder sentinel"
+        );
+        assert!(can_delete(&typed, &assets));
     }
 
     /// A module's resource tree is recognised by the extensions root and every

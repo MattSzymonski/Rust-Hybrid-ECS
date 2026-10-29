@@ -193,7 +193,7 @@ impl ProjectBrowser {
         let exists = is_root(&self.folder)
             || assets
                 .iter()
-                .any(|row| row.kind == "folder" && row.key() == self.folder);
+                .any(|row| is_folder(row) && row.key() == self.folder);
         if exists {
             return false;
         }
@@ -202,7 +202,7 @@ impl ProjectBrowser {
             if is_root(&fallback)
                 || assets
                     .iter()
-                    .any(|row| row.kind == "folder" && row.key() == fallback)
+                    .any(|row| is_folder(row) && row.key() == fallback)
             {
                 return self.open(&fallback);
             }
@@ -215,7 +215,7 @@ impl ProjectBrowser {
 /// Whether a row is a folder: the one kind the tree and the grid treat
 /// differently.
 pub fn is_folder(row: &AssetListing) -> bool {
-    row.kind == "folder"
+    row.kind.is_folder()
 }
 
 /// The folder a path lives in: its parent, or empty for the asset root.
@@ -338,13 +338,14 @@ fn sort_rows(rows: &mut [&AssetListing]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor_state::AssetKind;
 
     fn row(path: &str, kind: &str) -> AssetListing {
         AssetListing {
             root: String::new(),
             path: path.to_string(),
             read_only: false,
-            kind: kind.to_string(),
+            kind: AssetKind::parse(kind),
             standalone: kind == "Material",
             has_meta: false,
             guid: None,
@@ -373,7 +374,7 @@ mod tests {
             root: root.to_string(),
             path: path.to_string(),
             read_only: true,
-            kind: "folder".to_string(),
+            kind: AssetKind::Folder,
             standalone: false,
             has_meta: false,
             guid: None,
@@ -386,6 +387,18 @@ mod tests {
         assets.push(module_row("pill_master_renderer_data", ""));
         assets.push(module_row("pill_master_renderer_data", "defaults"));
         assets
+    }
+
+    /// The folder sentinel is a type now, so only the label `folder` makes a
+    /// row a folder: a type path that ends in `Folder`, or a near miss of the
+    /// label, is a file the tree lists and the toolbar may write.
+    #[test]
+    fn only_the_folder_label_makes_a_folder() {
+        assert!(is_folder(&row("models", "folder")));
+        assert!(!is_folder(&row("models/odd.folder", "demo::Folder")));
+        assert!(!is_folder(&row("models/odd.folder", "Folder")));
+        assert!(!is_folder(&row("models/odd.folder", "folders")));
+        assert!(!is_folder(&row("models/odd.folder", "file")));
     }
 
     /// The panel has two roots, and an extension's resources hang under theirs
