@@ -4093,60 +4093,10 @@ impl EditorWindow {
             return;
         };
         let targets = inspector::selection_targets(&details, entity, &component);
-        // An asset reference: the same recorded step for the whole selection,
-        // resolved where it is applied.
-        if matches!(current, FieldValue::Asset { .. }) {
-            let reference = (!inspector::is_cleared_reference(value_text))
-                .then(|| value_text.trim().to_owned());
-            let (commands, label, coalesce) =
-                inspector::selection_asset_edit(&targets, entity, &component, field, reference);
-            let written = commands.len();
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push_recorded(commands, label, Some(coalesce));
-            }
-            info!(
-                target: telemetry_target::ENGINE,
-                component = component.as_str(),
-                field,
-                entities = written,
-                "[editor] selection field edit queued"
-            );
-            return;
-        }
-        // An entity reference: the value is a Hierarchy label (`3v0`) or the
-        // word that clears it, and the step is one recorded batch for the set.
-        if matches!(current, FieldValue::Entity { .. }) {
-            let reference = match inspector::parse_entity_reference(value_text) {
-                Ok(reference) => reference,
-                Err(message) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        field,
-                        message = message.as_str(),
-                        "[editor] inspector value not understood"
-                    );
-                    return;
-                }
-            };
-            let (commands, label, coalesce) =
-                inspector::selection_entity_edit(&targets, entity, &component, field, reference);
-            let written = commands.len();
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push_recorded(commands, label, Some(coalesce));
-            }
-            info!(
-                target: telemetry_target::ENGINE,
-                component = component.as_str(),
-                field,
-                entities = written,
-                "[editor] selection field edit queued"
-            );
-            return;
-        }
-        let value = match inspector::parse_field_value(value_text, &current) {
-            Ok(value) => value,
+        let recorded = match inspector::selection_write(
+            &targets, entity, &component, field, &current, value_text,
+        ) {
+            Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -4157,12 +4107,10 @@ impl EditorWindow {
                 return;
             }
         };
-        let (commands, label, coalesce) =
-            inspector::selection_field_edit(&targets, entity, &component, field, value);
-        let written = commands.len();
+        let written = recorded.commands.len();
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(commands, label, Some(coalesce));
+            pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
             target: telemetry_target::ENGINE,
@@ -4216,44 +4164,9 @@ impl EditorWindow {
         else {
             return;
         };
-        // An asset reference takes a path or a guid (or `none`), resolved -
-        // and loaded when it is not loaded yet - where the step is applied.
-        if matches!(current, FieldValue::Asset { .. }) {
-            let reference = (!inspector::is_cleared_reference(value_text))
-                .then(|| value_text.trim().to_owned());
-            let (edit, label) = inspector::asset_edit(entity, &component, field, reference);
-            let coalesce = inspector::field_coalesce_key(entity, &component, field);
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push_recorded(vec![edit], label, Some(coalesce));
-            }
-            return;
-        }
-        // An entity reference takes a Hierarchy label (`3v0`) or the word that
-        // clears it.
-        if matches!(current, FieldValue::Entity { .. }) {
-            let reference = match inspector::parse_entity_reference(value_text) {
-                Ok(reference) => reference,
-                Err(message) => {
-                    warn!(
-                        target: telemetry_target::ENGINE,
-                        field,
-                        message = message.as_str(),
-                        "[editor] inspector value not understood"
-                    );
-                    return;
-                }
-            };
-            let (edit, label) = inspector::entity_edit(entity, &component, field, reference);
-            let coalesce = inspector::field_coalesce_key(entity, &component, field);
-            let world = self.host.host_mut().engine_mut().world_mut();
-            if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-                pending.push_recorded(vec![edit], label, Some(coalesce));
-            }
-            return;
-        }
-        let value = match inspector::parse_field_value(value_text, &current) {
-            Ok(value) => value,
+        let recorded = match inspector::field_write(entity, &component, field, &current, value_text)
+        {
+            Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -4264,11 +4177,9 @@ impl EditorWindow {
                 return;
             }
         };
-        let (edit, label) = inspector::field_edit(entity, &component, field, value);
-        let coalesce = inspector::field_coalesce_key(entity, &component, field);
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(vec![edit], label, Some(coalesce));
+            pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
     }
 
@@ -4288,33 +4199,23 @@ impl EditorWindow {
         else {
             return;
         };
-        let Some(element) = inspector::element_field(&current, index) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                field,
-                index,
-                "[editor] edit array index is outside the array"
-            );
-            return;
-        };
-        let value = match inspector::parse_field_value(value_text, &element) {
-            Ok(value) => value,
+        let recorded = match inspector::element_write(
+            entity, &component, field, &current, index, value_text,
+        ) {
+            Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
                     field,
                     message = message.as_str(),
-                    "[editor] inspector value not understood"
+                    "[editor] edit array refused"
                 );
                 return;
             }
         };
-        let (edit, label) = inspector::element_edit(entity, &component, field, index, value);
-        let coalesce =
-            inspector::field_coalesce_key(entity, &component, &format!("{field}[{index}]"));
         let world = self.host.host_mut().engine_mut().world_mut();
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(vec![edit], label, Some(coalesce));
+            pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
     }
 
@@ -5066,8 +4967,11 @@ impl EditorWindow {
                 return;
             }
         };
-        let value = match inspector::parse_field_value(value_text, &current) {
-            Ok(value) => value,
+        // The same write the Inspector and the scripted channel make, so a
+        // panel reaches an asset or entity reference field too.
+        let recorded = match inspector::field_write(entity, &component, field, &current, value_text)
+        {
+            Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -5078,10 +4982,8 @@ impl EditorWindow {
                 return;
             }
         };
-        let (edit, label) = inspector::field_edit(entity, &component, field, value);
-        let coalesce = inspector::field_coalesce_key(entity, &component, field);
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(vec![edit], label, Some(coalesce));
+            pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
             target: telemetry_target::ENGINE,
@@ -5114,17 +5016,11 @@ impl EditorWindow {
             );
             return;
         };
-        let Some(element) = inspector::element_field(&current, index) else {
-            warn!(
-                target: telemetry_target::ENGINE,
-                field,
-                index,
-                "[editor] panel element write: no such element"
-            );
-            return;
-        };
-        let value = match inspector::parse_field_value(value_text, &element) {
-            Ok(value) => value,
+        // The scripted channel's own element write: one rule, one coalesce key.
+        let recorded = match inspector::element_write(
+            entity, &component, field, &current, index, value_text,
+        ) {
+            Ok(recorded) => recorded,
             Err(message) => {
                 warn!(
                     target: telemetry_target::ENGINE,
@@ -5135,10 +5031,8 @@ impl EditorWindow {
                 return;
             }
         };
-        let (edit, label) = inspector::element_edit(entity, &component, field, index, value);
-        let coalesce = inspector::field_coalesce_key(entity, &component, field);
         if let Some(pending) = world.get_resource_mut::<PendingEditorCommands>() {
-            pending.push_recorded(vec![edit], label, Some(coalesce));
+            pending.push_recorded(recorded.commands, recorded.label, Some(recorded.coalesce));
         }
         info!(
             target: telemetry_target::ENGINE,

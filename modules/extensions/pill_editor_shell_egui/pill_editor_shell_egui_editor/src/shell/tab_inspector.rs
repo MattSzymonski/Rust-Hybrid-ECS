@@ -111,13 +111,15 @@ pub fn inspector_tab(
                 ui,
                 &detail.key(),
                 settings,
-                &snapshot.assets,
-                &snapshot.engine_assets,
-                pending,
-                session,
-                overlay_regions,
-                detail.read_only,
                 &detail.references,
+                &mut SettingsWalk {
+                    assets: &snapshot.assets,
+                    engine_assets: &snapshot.engine_assets,
+                    pending,
+                    session,
+                    overlay_regions,
+                    read_only: detail.read_only,
+                },
             ),
             None => {
                 ui.label(egui::RichText::new("no editable settings").weak().italics());

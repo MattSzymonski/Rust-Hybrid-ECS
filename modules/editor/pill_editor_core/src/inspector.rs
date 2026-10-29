@@ -922,6 +922,134 @@ pub fn element_field(value: &FieldValue, index: usize) -> Option<FieldValue> {
     elements.get(index).cloned()
 }
 
+/// What one value edit queues: the step's commands, the label it records
+/// under, and the key that collapses consecutive writes from one drag.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedEdit {
+    /// The commands, in the order the batch applies them.
+    pub commands: Vec<EditorCommand>,
+    /// The history label the step records under.
+    pub label: String,
+    /// Consecutive writes sharing this key merge into one undo step.
+    pub coalesce: String,
+}
+
+impl RecordedEdit {
+    /// One entity's edit, with the key its field coalesces on.
+    fn one(edit: (EditorCommand, String), coalesce: String) -> Self {
+        Self {
+            commands: vec![edit.0],
+            label: edit.1,
+            coalesce,
+        }
+    }
+
+    /// A selection's batch, which carries its own label and key.
+    fn many(edit: (Vec<EditorCommand>, String, String)) -> Self {
+        Self {
+            commands: edit.0,
+            label: edit.1,
+            coalesce: edit.2,
+        }
+    }
+}
+
+/// One field's write, decided in one place.
+///
+/// A field's text means three different things depending on the value it
+/// edits: a path or guid for an asset reference, a Hierarchy label for an
+/// entity reference, and its own text otherwise. Every surface that writes a
+/// field - the Inspector, the scripted channel, a module panel - goes through
+/// here, so a new [`FieldValue`] family is one branch rather than five copies,
+/// and a surface cannot be missing one.
+///
+/// # Errors
+///
+/// The message saying why the text does not name a value for this field.
+pub fn field_write(
+    entity: Entity,
+    component: &str,
+    field: &str,
+    current: &FieldValue,
+    value_text: &str,
+) -> Result<RecordedEdit, String> {
+    let coalesce = field_coalesce_key(entity, component, field);
+    if matches!(current, FieldValue::Asset { .. }) {
+        let reference = (!is_cleared_reference(value_text)).then(|| value_text.trim().to_owned());
+        let edit = asset_edit(entity, component, field, reference);
+        return Ok(RecordedEdit::one(edit, coalesce));
+    }
+    if matches!(current, FieldValue::Entity { .. }) {
+        let reference = parse_entity_reference(value_text)?;
+        let edit = entity_edit(entity, component, field, reference);
+        return Ok(RecordedEdit::one(edit, coalesce));
+    }
+    let value = parse_field_value(value_text, current)?;
+    Ok(RecordedEdit::one(
+        field_edit(entity, component, field, value),
+        coalesce,
+    ))
+}
+
+/// One array element's write, keyed on the element.
+///
+/// The key names `field[index]`, so two drags on two elements of one array are
+/// two undo steps: keying on the whole field collapsed them into one.
+///
+/// # Errors
+///
+/// A message when the index is outside the array or the text does not parse
+/// against the element's kind.
+pub fn element_write(
+    entity: Entity,
+    component: &str,
+    field: &str,
+    current: &FieldValue,
+    index: usize,
+    value_text: &str,
+) -> Result<RecordedEdit, String> {
+    let element = element_field(current, index)
+        .ok_or_else(|| format!("`{field}[{index}]` is outside the array"))?;
+    let value = parse_field_value(value_text, &element)?;
+    let coalesce = field_coalesce_key(entity, component, &format!("{field}[{index}]"));
+    Ok(RecordedEdit::one(
+        element_edit(entity, component, field, index, value),
+        coalesce,
+    ))
+}
+
+/// One field's write over a selection: the same three families as
+/// [`field_write`], recorded once for the whole set.
+///
+/// # Errors
+///
+/// The message saying why the text does not name a value for this field.
+pub fn selection_write(
+    targets: &[Entity],
+    primary: Entity,
+    component: &str,
+    field: &str,
+    current: &FieldValue,
+    value_text: &str,
+) -> Result<RecordedEdit, String> {
+    if matches!(current, FieldValue::Asset { .. }) {
+        let reference = (!is_cleared_reference(value_text)).then(|| value_text.trim().to_owned());
+        return Ok(RecordedEdit::many(selection_asset_edit(
+            targets, primary, component, field, reference,
+        )));
+    }
+    if matches!(current, FieldValue::Entity { .. }) {
+        let reference = parse_entity_reference(value_text)?;
+        return Ok(RecordedEdit::many(selection_entity_edit(
+            targets, primary, component, field, reference,
+        )));
+    }
+    let value = parse_field_value(value_text, current)?;
+    Ok(RecordedEdit::many(selection_field_edit(
+        targets, primary, component, field, value,
+    )))
+}
+
 /// One recorded batch writing every leaf of a grouped row: the colour
 /// or vector a row draws, across the whole selection, as one undo step.
 ///
@@ -1385,6 +1513,50 @@ mod tests {
                 "an integer field the widget table draws must accept its own edit"
             );
         }
+    }
+
+    /// The write paths share one decision: an element write coalesces on the
+    /// element and a field write handles the reference kinds, so a module panel
+    /// reaches them the way the Inspector does.
+    #[test]
+    fn every_write_path_coalesces_and_branches_the_same() {
+        let entity = Entity::from_raw(1, 0);
+        let array = FieldValue::Array(vec![FieldValue::F32(1.0), FieldValue::F32(2.0)]);
+        let first = element_write(entity, "Demo", "path", &array, 0, "5.0").expect("writes");
+        let second = element_write(entity, "Demo", "path", &array, 1, "5.0").expect("writes");
+        assert_ne!(
+            first.coalesce, second.coalesce,
+            "two elements of one array are two undo steps"
+        );
+        assert!(first.coalesce.ends_with("path[0]"), "{}", first.coalesce);
+        assert!(element_write(entity, "Demo", "path", &array, 9, "1.0").is_err());
+
+        // An asset reference takes a path, an entity reference a label (or the
+        // word that clears it), and a scalar its own text.
+        let asset = FieldValue::Asset {
+            asset_type: None,
+            index: 0,
+            generation: 0,
+        };
+        let written =
+            field_write(entity, "Demo", "mesh", &asset, "textures/a.png").expect("writes");
+        assert!(matches!(
+            written.commands[0],
+            EditorCommand::SetFieldAsset { .. }
+        ));
+        let reference = FieldValue::Entity {
+            id: 0,
+            generation: 0,
+        };
+        let cleared = field_write(entity, "Demo", "target", &reference, "none").expect("writes");
+        assert!(matches!(
+            cleared.commands[0],
+            EditorCommand::SetFieldEntity {
+                reference: None,
+                ..
+            }
+        ));
+        assert!(field_write(entity, "Demo", "speed", &FieldValue::F32(0.0), "fast").is_err());
     }
 
     #[test]

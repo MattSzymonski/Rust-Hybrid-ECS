@@ -28,28 +28,17 @@ pub fn resource_section(
     ui.separator();
     for field in &view.fields {
         row(ui, field.label.as_str(), None, &mut |ui| {
-            match &field.value {
-                FieldValue::Bool(value) => {
-                    let mut checked = *value;
-                    if ui.checkbox(&mut checked, "").changed() {
-                        queue_edit(pending, view, field, FieldValue::Bool(checked));
-                    }
-                }
-                FieldValue::F32(value) => {
-                    let mut number = *value;
-                    if ui
-                        .add(egui::DragValue::new(&mut number).speed(0.01))
-                        .changed()
-                    {
-                        queue_edit(pending, view, field, FieldValue::F32(number));
-                    }
-                }
-                // An enum field travels as its discriminant, so the row shows
-                // the number.
-                other => {
-                    ui.monospace(inspector::value_text(other));
-                }
+            // The shell's one scalar editor decides the control, so every
+            // numeric kind a resource exposes is editable - the hand match this
+            // replaces covered a boolean and an `f32` and rendered the rest as
+            // text.
+            if let Some(edited) = scalar_edit(ui, &field.value) {
+                queue_edit(pending, view, field, edited);
+                return;
             }
+            // What has no widget - an enum's discriminant, an opaque blob -
+            // reads as text.
+            ui.monospace(inspector::value_text(&field.value));
         });
     }
 }
@@ -70,4 +59,37 @@ pub fn queue_edit(
         format!("set {}.{}", view.name, field.field),
         Some(format!("resource.{}.{}", view.name, field.field)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rows hand every value to one control, so every kind that control
+    /// edits is editable in a resource: the hand match this replaced covered a
+    /// boolean and an `f32` and painted the rest.
+    #[test]
+    fn every_numeric_kind_a_resource_carries_is_editable() {
+        for value in [
+            FieldValue::Bool(true),
+            FieldValue::F32(1.0),
+            FieldValue::F64(1.0),
+            FieldValue::I8(1),
+            FieldValue::I32(1),
+            FieldValue::U16(1),
+            FieldValue::U64(1),
+            FieldValue::Isize(1),
+        ] {
+            assert_ne!(
+                inspector::widget_for(&value),
+                inspector::FieldWidget::ReadOnly,
+                "{value:?} reaches a control, so the row routes it through `scalar_edit`"
+            );
+        }
+        assert_eq!(
+            inspector::widget_for(&FieldValue::Text("x".to_string())),
+            inspector::FieldWidget::ReadOnly,
+            "text keeps the painted fallback"
+        );
+    }
 }

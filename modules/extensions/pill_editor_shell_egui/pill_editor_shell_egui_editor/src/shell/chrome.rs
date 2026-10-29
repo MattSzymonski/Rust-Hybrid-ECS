@@ -330,25 +330,6 @@ pub const SPACE_ROWS: [(GizmoSpace, &str, icons::Icon); 2] = [
     (GizmoSpace::Local, "Local space", icons::Icon::MapPin),
 ];
 
-/// Whether `rect` is new for `key`, recording it as the placement to compare
-/// against. The caller logs with its own literal message - a token passed as
-/// a variable would become a tracing field instead of the message.
-pub fn remember_entry_rect(
-    logged: &mut Vec<(String, egui::Rect)>,
-    key: &str,
-    rect: egui::Rect,
-) -> bool {
-    if let Some((_, previous)) = logged.iter_mut().find(|(name, _)| name == key) {
-        if *previous == rect {
-            return false;
-        }
-        *previous = rect;
-    } else {
-        logged.push((key.to_string(), rect));
-    }
-    true
-}
-
 /// Note one keyed rectangle, answering whether it is new or has moved, so a
 /// section that shifts as the panel grows or collapses reports its place
 /// again instead of leaving a stale one in the log.

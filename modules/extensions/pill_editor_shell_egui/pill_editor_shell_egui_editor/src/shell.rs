@@ -237,6 +237,7 @@ pub mod inspector_settings;
 pub use inspector_settings::asset_settings_row;
 pub use inspector_settings::asset_settings_rows;
 pub use inspector_settings::settings_commit;
+pub use inspector_settings::SettingsWalk;
 
 /// The [`tab_assets`] module: the assets tab: the folder tree and the open folder's grid.
 pub mod tab_assets;
