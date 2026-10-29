@@ -637,27 +637,25 @@ pub fn menu_tree(registry: &CommandRegistry) -> BTreeMap<String, Vec<&CommandSpe
 fn builtin_commands() -> Vec<CommandSpec> {
     use KeymapPreset::{Blender, Godot, Unity, Unreal};
     let mut commands = vec![
+        // The layout commands: chord-only until the bar grows a Layout menu.
+        // A menu path here would name a menu `Menu::ALL` does not carry, so the
+        // row could never be drawn and the registry would describe a bar that
+        // does not exist.
         CommandSpec::new("editor.save_layout", "Save Layout")
-            .menu(&["Layout", "Save Layout"])
             .bind(Blender, "ctrl+alt+s")
             .bind(Unity, "ctrl+shift+l")
             .bind(Godot, "ctrl+alt+l")
             .bind(Unreal, "ctrl+shift+l"),
         CommandSpec::new("editor.reset_layout", "Reset Layout")
-            .menu(&["Layout", "Reset Layout"])
             .bind(Blender, "ctrl+alt+r")
             .bind(Unity, "alt+r")
             .bind(Godot, "ctrl+alt+r")
             .bind(Unreal, "alt+r"),
-        // The pop-out pair: the tab in the active tabset moves
-        // into its own window, and every floating tab comes home.
-        CommandSpec::new("editor.popout_tab", "Pop Out Panel").menu(&["Layout", "Pop Out Panel"]),
-        CommandSpec::new("editor.redock_tab", "Redock Popped Panels")
-            .menu(&["Layout", "Redock Popped Panels"]),
-        // A second scene view: another scene tab, another
-        // surface, its own editor camera.
-        CommandSpec::new("editor.scene_view_new", "New Scene View")
-            .menu(&["Layout", "New Scene View"]),
+        // The pop-out pair: the tab in the active tabset moves into its own
+        // window, and every floating tab comes home. Both live in the tab's
+        // own context menu, which is the surface that knows which tab.
+        CommandSpec::new("editor.popout_tab", "Pop Out Panel"),
+        CommandSpec::new("editor.redock_tab", "Redock Popped Panels"),
         CommandSpec::new("editor.command_palette", "Command Palette")
             .bind(Blender, "f3")
             .bind(Unity, "ctrl+shift+p")

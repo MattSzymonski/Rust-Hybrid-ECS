@@ -48,7 +48,7 @@ pub struct PreferenceField {
 /// The editable rows, in the order the tab draws them.
 pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
     PreferenceField {
-        key: "keymap_preset",
+        key: KEYMAP_PRESET_KEY,
         label: "keymap preset",
         fallback: "",
     },
@@ -58,7 +58,7 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
         fallback: "true",
     },
     PreferenceField {
-        key: "editor.gizmo_hit_radius",
+        key: GIZMO_HIT_RADIUS_KEY,
         label: "gizmo hit radius",
         fallback: "0.07",
     },
@@ -116,11 +116,14 @@ pub const PREFERENCE_FIELDS: [PreferenceField; 12] = [
 /// directory.
 pub const THEME_PREFERENCE_KEY: &str = "theme";
 
+/// The preference key the keymap preset lives under.
+pub const KEYMAP_PRESET_KEY: &str = "keymap_preset";
+
 /// The keymap preset the file selects, or the default (Blender) when the
 /// key is absent, blank or unknown - the preset the viewport navigation
 /// table reads.
 pub fn keymap_preset(document: &Map<String, Value>) -> KeymapPreset {
-    let Some(Value::String(name)) = lookup(document, "keymap_preset") else {
+    let Some(Value::String(name)) = lookup(document, KEYMAP_PRESET_KEY) else {
         return KeymapPreset::default();
     };
     match name.trim().to_ascii_lowercase().as_str() {
@@ -390,6 +393,27 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    /// Every editable row's key is one the document helpers can write and read
+    /// back: the table, the dotted-key path and the reader agree by
+    /// construction, so a duplicated or malformed key fails here rather than as
+    /// a row that saves a value nothing reads.
+    #[test]
+    fn every_preference_field_round_trips_through_its_key() {
+        for field in &PREFERENCE_FIELDS {
+            let mut document = Map::new();
+            set_key(&mut document, field.key, serde_json::json!("probe"))
+                .unwrap_or_else(|error| panic!("{} cannot be written: {error}", field.key));
+            assert_eq!(
+                lookup(&document, field.key),
+                Some(&serde_json::json!("probe")),
+                "{} did not read back what the table wrote",
+                field.key
+            );
+            let view = PreferencesView::from_document(&document, None);
+            assert_eq!(view.text(field.key), "probe", "{} has no row", field.key);
+        }
     }
 
     #[test]

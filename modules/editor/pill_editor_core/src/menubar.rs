@@ -184,16 +184,23 @@ pub enum MenuAction {
 /// loses its row, a renamed command renames its row, and the rules between
 /// groups are the specs marked with
 /// [`crate::commands::CommandSpec::separator`].
+///
+/// A command this model has no action for gets no row: a greyed-out item says
+/// "not available right now", which would be a lie about a command nothing
+/// implements.
 pub fn entries(menu: Menu, view: &MenuView<'_>) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for command in view.commands {
         if command.menu_path.first().map(String::as_str) != Some(menu.title()) {
             continue;
         }
+        let Some(entry) = row(command, view) else {
+            continue;
+        };
         if command.separator_before && !entries.is_empty() {
             entries.push(MenuEntry::Separator);
         }
-        entries.push(row(command, view));
+        entries.push(entry);
     }
     entries
 }
@@ -202,20 +209,21 @@ pub fn entries(menu: Menu, view: &MenuView<'_>) -> Vec<MenuEntry> {
 ///
 /// The palette calls this rather than a menu row's own copy, so a command run
 /// from the palette and the same command run from its menu entry reach one
-/// action.
+/// action. `None` means this build registers the command but has no action for
+/// it: the palette drops the row rather than offering a no-op.
 pub fn action_for(
     command: &CommandView,
     snapshot: &EditorSnapshot,
     selection: &EditorSelection,
-) -> MenuAction {
+) -> Option<MenuAction> {
     let view = MenuView {
         snapshot,
         selection,
         commands: std::slice::from_ref(command),
     };
-    match row(command, &view) {
-        MenuEntry::Action { action, .. } => action,
-        MenuEntry::Separator => MenuAction::Inert,
+    match row(command, &view)? {
+        MenuEntry::Action { action, .. } => Some(action),
+        MenuEntry::Separator => None,
     }
 }
 
@@ -233,9 +241,10 @@ fn scene_selection(selection: &EditorSelection) -> Option<String> {
 /// editor to do.
 ///
 /// The label is the command's title, except where the row carries the current
-/// state (the gizmo's space). An id that names neither an action here nor a
-/// dock tab is a disabled row.
-fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
+/// state (the gizmo's space). `None` when the command's id names no action
+/// here and no dock tab: that is a gap in this model, not a disabled row, and
+/// [`entries`] and [`action_for`] both treat it as such.
+fn row(command: &CommandView, view: &MenuView<'_>) -> Option<MenuEntry> {
     let state = ToolboxState {
         gizmo: view.snapshot.gizmo,
         grid: view.snapshot.grid_enabled,
@@ -270,17 +279,18 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
                 commands: vec![step],
             }
         }
-        // The clipboard rows: Copy and Cut need a selection
-        // with something to carry, Paste is always offered - whether the
-        // clipboard holds a payload is the executable's answer, and a refusal
-        // there is a toast rather than a greyed row nobody can explain.
+        // The clipboard rows: Paste is always offered - whether the clipboard
+        // holds a payload is the executable's answer, and a refusal there is a
+        // toast rather than a greyed row nobody can explain. Copy and Cut read
+        // the same predicate the copy itself reads, so a row that is offered
+        // is a row with something to carry.
         "editor.copy" | "editor.cut" => {
             let action = if command.id == "editor.copy" {
                 crate::clipboard::ClipboardAction::Copy
             } else {
                 crate::clipboard::ClipboardAction::Cut
             };
-            enabled = view.selection.primary().is_some() || view.selection.asset.is_some();
+            enabled = crate::clipboard::can_copy(view.selection, view.snapshot);
             MenuAction::Clipboard(action)
         }
         "editor.paste" => MenuAction::Clipboard(crate::clipboard::ClipboardAction::Paste),
@@ -309,11 +319,7 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
         "editor.scene_save_as" => MenuAction::SaveSceneAs,
         "editor.asset.create" => MenuAction::CreateAsset,
         "editor.asset_write_meta" => {
-            // The toolbar's rule: only a sourced file without a sidecar can
-            // take one.
-            let selected_row = assets::selected_row(view.selection, &view.snapshot.assets);
-            enabled = selected_row
-                .is_some_and(|row| row.kind != "folder" && !row.standalone && !row.has_meta);
+            enabled = assets::can_write_meta(view.selection, &view.snapshot.assets);
             MenuAction::WriteAssetMeta
         }
         "editor.preferences_open" => MenuAction::ActivateTab(EditorTab::Preferences),
@@ -373,18 +379,15 @@ fn row(command: &CommandView, view: &MenuView<'_>) -> MenuEntry {
             .and_then(|name| EditorTab::ALL.into_iter().find(|tab| tab.name() == name))
         {
             Some(tab) => MenuAction::ActivateTab(tab),
-            None => {
-                enabled = false;
-                MenuAction::Inert
-            }
+            None => return None,
         },
     };
-    MenuEntry::Action {
+    Some(MenuEntry::Action {
         label,
         action,
         enabled,
         checked,
-    }
+    })
 }
 
 /// A toolbox row as menu data: its state-carrying label, the recorded command
@@ -542,7 +545,18 @@ mod tests {
         assert!(rows[0].1);
         assert!(rows[1].1);
         assert!(rows[5].1);
-        // A selection is something to copy and cut.
+        // An entity selected on a snapshot that has not captured it yet has
+        // nothing to carry, so the clipboard rows stay grey: they used to be
+        // enabled here and the copy then carried the asset the selection
+        // replaced - or nothing at all.
+        assert_eq!((rows[2].1, rows[3].1), (false, false));
+        snapshot.detail = Some(crate::editor_state::EntityDetail {
+            entity,
+            components: Vec::new(),
+        });
+        let captured = entries(Menu::Edit, &view_over(&snapshot, &selection, &commands));
+        let rows = actions(&captured);
+        // A captured detail is something to copy and cut.
         assert_eq!((rows[2].1, rows[3].1), (true, true));
         match &enabled[6] {
             MenuEntry::Action {
@@ -665,6 +679,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn every_command_a_drawn_menu_lists_has_an_action() {
+        let commands = commands_fixture();
+        let snapshot = snapshot_fixture();
+        let selection = EditorSelection::default();
+        let titles: Vec<&str> = Menu::ALL.iter().map(|menu| menu.title()).collect();
+        for command in &commands {
+            let Some(top) = command.menu_path.first() else {
+                continue;
+            };
+            if !titles.contains(&top.as_str()) {
+                continue;
+            }
+            assert!(
+                action_for(command, &snapshot, &selection).is_some(),
+                "{} is registered under the {} menu, which the bar draws, but \
+                 no action answers it",
+                command.id,
+                top
+            );
+        }
+    }
+
+    #[test]
+    fn no_registered_menu_path_names_a_menu_the_bar_cannot_draw() {
+        let titles: Vec<&str> = Menu::ALL.iter().map(|menu| menu.title()).collect();
+        for command in commands_fixture() {
+            if let Some(top) = command.menu_path.first() {
+                assert!(
+                    titles.contains(&top.as_str()),
+                    "{} names the {} menu, which Menu::ALL does not carry",
+                    command.id,
+                    top
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_without_an_action_draws_no_row_and_runs_nothing() {
+        let mut commands = commands_fixture();
+        commands.push(CommandView {
+            id: "editor.unimplemented".to_string(),
+            title: "Unimplemented".to_string(),
+            menu_path: vec!["Edit".to_string(), "Unimplemented".to_string()],
+            separator_before: false,
+        });
+        let snapshot = snapshot_fixture();
+        let selection = EditorSelection::default();
+        let menu = entries(Menu::Edit, &view_over(&snapshot, &selection, &commands));
+        assert!(
+            !labels(&menu).iter().any(|label| label == "Unimplemented"),
+            "a command with no action must not draw as a row that does nothing"
+        );
+        let unknown = commands
+            .iter()
+            .find(|command| command.id == "editor.unimplemented")
+            .expect("the fixture pushed it");
+        assert_eq!(action_for(unknown, &snapshot, &selection), None);
     }
 
     #[test]
